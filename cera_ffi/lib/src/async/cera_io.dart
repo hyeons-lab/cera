@@ -95,10 +95,20 @@ Future<List<CeraBundle>> listBundles(CeraOptions options) async {
   // rather than stalling the isolate. A picker is usually opened from a button
   // press, which is exactly the thread not to block.
   final entries = await listLeapBundlesAsync();
-  return [
+  final list = [
     for (final entry in entries)
-      CeraBundle(name: entry.name, quants: entry.quants),
+      CeraBundle(
+        name: entry.name,
+        quants:
+            entry.quants.toList()
+              ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
+      ),
   ];
+  list.sort(
+    (a, b) =>
+        a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+  );
+  return list;
 }
 
 /// Downloads and opens a published bundle. See [Cera.openBundle].
@@ -189,7 +199,18 @@ class _ProgressSink implements DownloadProgressSink {
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
-    : _session = _engine.newSession(const SessionConfig()),
+    : _session = _engine.newSession(
+        SessionConfig(
+          kvCompression:
+              _options.turboQuant
+                  ? const KvCompressionTurboQuant(
+                    seed: 0,
+                    keys: true,
+                    values: true,
+                  )
+                  : null,
+        ),
+      ),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
@@ -211,6 +232,7 @@ class _NativeCera implements Cera {
 
   Session _session;
   bool _closed = false;
+  List<int>? _pendingAudioSuffixTokens;
 
   /// Completes when the generation currently queued or running has finished.
   ///
@@ -277,18 +299,16 @@ class _NativeCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     _ensureOpen();
     // A controller rather than an `async*` body: the tokens arrive on a
     // callback driven by Rust, not from anything this function can await.
     final controller = StreamController<String>();
-    // Built by overriding the generated defaults rather than by restating
-    // them. Spelling `temperature ?? 0.7` here would pin a literal that the
-    // web path does not have: there the sampler falls back to
-    // `cera::GenerateOpts::default()` itself. The two agree today, and would
-    // silently stop agreeing the moment that default changed, since
-    // regenerating the bindings would not touch a hand-written literal.
-    var opts = GenerateOpts(
+    // Built from the session's default options (populated from the bundle
+    // manifest when loaded from a bundle) rather than hardcoded constants,
+    // allowing explicit caller overrides to take precedence.
+    var opts = _session.defaultGenerateOpts().copyWith(
       maxTokens: maxTokens,
       // Emit per token. The default buffers 16, which turns a stream into four
       // lumps for a short reply.
@@ -331,7 +351,9 @@ class _NativeCera implements Cera {
       final ahead = _queue;
       final mine = Completer<void>();
       _queue = mine.future;
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       // Release the queue BEFORE closing the controller on every early exit.
       // `close()`'s future does not complete while a subscription is paused, so
       // awaiting it first would leave `_queue` uncompleted and block every
@@ -352,6 +374,7 @@ class _NativeCera implements Cera {
         emit: (piece) {
           if (!controller.isClosed) controller.add(piece);
         },
+        onAudio: onAudio,
         isOpen: () => !_closed,
         done: (error) {
           finished = true;
@@ -374,11 +397,35 @@ class _NativeCera implements Cera {
           // `close()` calls `cancel()` on it first, which throws in turn and
           // skips `_engine.close()`: the model weights, the largest allocation
           // in the app, would leak until the finalizer ran.
-          final reseeded = _engine.newSession(SessionConfig(seed: seed));
+          final reseeded = _engine.newSession(
+            SessionConfig(
+              seed: seed,
+              kvCompression:
+                  _options.turboQuant
+                      ? const KvCompressionTurboQuant(
+                        seed: 0,
+                        keys: true,
+                        values: true,
+                      )
+                      : null,
+            ),
+          );
           _session.close();
           _session = reseeded;
         }
-        _session.appendTokens(_frame(prompt));
+        List<int> tokens;
+        final pendingSuffix = _pendingAudioSuffixTokens;
+        _pendingAudioSuffixTokens = null;
+        if (pendingSuffix != null && prompt.trim().isEmpty) {
+          tokens = pendingSuffix;
+        } else if (pendingSuffix != null) {
+          tokens = [...pendingSuffix, ..._frame(prompt)];
+        } else {
+          tokens = _frame(prompt);
+        }
+        if (tokens.isNotEmpty) {
+          _session.appendTokens(tokens);
+        }
         unawaited(
           _session
               .generateStreamingAsync(opts, sink)
@@ -423,25 +470,110 @@ class _NativeCera implements Cera {
 
   @override
   Future<void> appendImage(Uint8List bytes, {int? maxLongSize}) async {
-    _ensureOpen();
     // Queued behind any running generation for the same reason generations are
     // queued behind each other: this appends patch embeddings to the very KV
     // cache a decode is writing to, and interleaving the two would splice the
     // image into the middle of the answer.
-    await _queue;
-    _ensureOpen();
-    _session.appendImage(bytes, maxLongSize);
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _ensureOpen();
+      _session.appendImage(bytes, maxLongSize);
+    } finally {
+      mine.complete();
+    }
+  }
+
+  @override
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  }) async {
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _ensureOpen();
+
+      final markerCandidates = [
+        '<|reserved_4|>',
+        '<|reserved_5|>',
+        '<|reserved_6|>',
+        '<|reserved_7|>',
+        '<|audio_start|>',
+      ];
+      String? markerName;
+      int? markerId;
+      for (final candidate in markerCandidates) {
+        final id = _engine.specialTokenId(candidate);
+        if (id != null) {
+          markerName = candidate;
+          markerId = id;
+          break;
+        }
+      }
+      markerName ??= '<|reserved_4|>';
+
+      final userContent =
+          (prompt != null && prompt.trim().isNotEmpty)
+              ? '${prompt.trim()}\n$markerName'
+              : markerName;
+
+      String formatted;
+      try {
+        formatted = _engine.applyChatTemplate([
+          ChatMessage(role: 'user', content: userContent),
+        ], true);
+      } catch (_) {
+        formatted = userContent;
+      }
+
+      final allTokens = _engine.encodeText(formatted);
+      final splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
+
+      if (splitIdx > 0) {
+        _session.appendTokens(allTokens.sublist(0, splitIdx));
+      } else if (splitIdx == -1 && prompt != null && prompt.trim().isNotEmpty) {
+        final promptTokens = _frame(prompt);
+        if (promptTokens.isNotEmpty) _session.appendTokens(promptTokens);
+      }
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      _session.appendAudio(floatList, sampleRate);
+      if (splitIdx >= 0 && splitIdx + 1 < allTokens.length) {
+        _pendingAudioSuffixTokens = allTokens.sublist(splitIdx + 1);
+      } else {
+        _pendingAudioSuffixTokens = null;
+      }
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
-    _ensureOpen();
     // Queued despite not touching the session: it is a full prefill plus decode
     // on the shared engine, so running it under a generation would contend on
     // the same model for the length of the clip.
-    await _queue;
-    _ensureOpen();
-    return _engine.transcribe(pcm, sampleRate);
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _ensureOpen();
+      return _engine.transcribe(pcm, sampleRate);
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -453,16 +585,26 @@ class _NativeCera implements Cera {
     // emitting into a session state it no longer matches, and a GPU-backed
     // model shares KV state across sessions besides.
     _session.cancel();
-    await _queue;
-    // Re-checked: `close()` can land during the await above, and reset would
-    // then run on a disposed handle and surface the binding's raw error
-    // instead of this one.
-    _ensureOpen();
-    // `Session.reset`, not a fresh session. It clears KV, position and token
-    // history and lowers the cancel flag, all of which rebuilding also did,
-    // but it keeps the session's own config: rebuilding with a default
-    // `SessionConfig` silently discarded a seed installed by `generate(seed:)`.
-    _session.reset();
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _pendingAudioSuffixTokens = null;
+      // Re-checked: `close()` can land during the await above, and reset would
+      // then run on a disposed handle and surface the binding's raw error
+      // instead of this one.
+      _ensureOpen();
+      // `Session.reset`, not a fresh session. It clears KV, position and token
+      // history and lowers the cancel flag, all of which rebuilding also did,
+      // but it keeps the session's own config: rebuilding with a default
+      // `SessionConfig` silently discarded a seed installed by `generate(seed:)`.
+      _session.reset();
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -526,6 +668,7 @@ class _StreamingSink implements ModalitySink {
   _StreamingSink({
     required this.engine,
     required this.emit,
+    this.onAudio,
     required this.isOpen,
     required this.done,
   });
@@ -535,6 +678,9 @@ class _StreamingSink implements ModalitySink {
 
   /// Receives each new fragment of text.
   final void Function(String) emit;
+
+  /// Receives raw Float32 PCM audio chunks when model is in audio mode.
+  final void Function(List<double> pcm, int sampleRate)? onAudio;
 
   /// Whether the engine is still open.
   ///
@@ -554,7 +700,7 @@ class _StreamingSink implements ModalitySink {
   bool _finished = false;
 
   /// The replacement character, the signal that a decode ended mid-sequence.
-  static const _replacement = '�';
+  static const _replacement = '\uFFFD';
 
   @override
   void onTextTokens(List<int> tokens) {
@@ -576,8 +722,8 @@ class _StreamingSink implements ModalitySink {
 
   @override
   void onAudioFrames(List<double> pcm, int sampleRate) {
-    // Text-only stream. Audio-capable models are reachable through the
-    // generated bindings directly.
+    if (_finished || !isOpen()) return;
+    onAudio?.call(pcm, sampleRate);
   }
 
   @override
@@ -592,11 +738,15 @@ class _StreamingSink implements ModalitySink {
   void finish() {
     if (_finished) return;
     _finished = true;
-    if (_ids.isNotEmpty && isOpen()) {
-      final full = engine.decodeTokens(_ids);
-      if (full.length > _emitted) emit(full.substring(_emitted));
+    try {
+      if (_ids.isNotEmpty && isOpen()) {
+        final full = engine.decodeTokens(_ids);
+        if (full.length > _emitted) emit(full.substring(_emitted));
+      }
+      done(null);
+    } catch (e) {
+      done(e);
     }
-    done(null);
   }
 
   /// Reports failure. Idempotent, and mutually exclusive with [finish].

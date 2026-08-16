@@ -1246,14 +1246,24 @@ pub(crate) async fn load_manifest(
         None => None,
     };
 
+    let audio_decoder = match manifest.files.audio_decoder.as_deref() {
+        Some(rel) => {
+            let url = join_url(manifest_url, rel).map_err(|e| JsError::new(&e))?;
+            Some(repo.read_or_download(&url, None, on_progress).await?)
+        }
+        None => None,
+    };
+
     Ok(cera::ModelBytes {
         model: model.into(),
         multimodal_projector: mmproj.map(Into::into),
+        audio_decoder: audio_decoder.map(Into::into),
         // The manifest states the modality outright, so unlike
         // `fromGgufParts` this path never has to infer it from whether
         // an mmproj was supplied.
         inference_type: Some(manifest.inference_type),
         chat_template: manifest.chat_template,
+        generation_defaults: Some(manifest.generation_defaults),
     })
 }
 

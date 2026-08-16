@@ -32,6 +32,7 @@ type Macros = HashMap<String, String>;
 
 /// Stateful preprocessor. Holds the in-memory include map; `preprocess`
 /// is called per shader-variant emission.
+#[derive(Clone)]
 pub struct Preprocessor {
     embedded: HashMap<String, &'static str>,
 }

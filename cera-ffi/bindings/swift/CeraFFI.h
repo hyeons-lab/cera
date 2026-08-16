@@ -406,6 +406,11 @@ uint64_t uniffi_cera_ffi_fn_method_ceraengine_context_size(uint64_t ptr, RustCal
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_DEFAULT_GENERATE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_DEFAULT_GENERATE_OPTS
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_encode_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -589,6 +594,11 @@ RustBuffer uniffi_cera_ffi_fn_method_session_capabilities(uint64_t ptr, RustCall
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_CLEAR_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_CLEAR_CANCEL
 void uniffi_cera_ffi_fn_method_session_clear_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_DEFAULT_GENERATE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_DEFAULT_GENERATE_OPTS
+RustBuffer uniffi_cera_ffi_fn_method_session_default_generate_opts(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_GENERATE
@@ -1051,6 +1061,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_DEFAULT_GENERATE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_DEFAULT_GENERATE_OPTS
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_encode_text(void
@@ -1198,6 +1214,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_capabilities(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_CLEAR_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_CLEAR_CANCEL
 uint16_t uniffi_cera_ffi_checksum_method_session_clear_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DEFAULT_GENERATE_OPTS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DEFAULT_GENERATE_OPTS
+uint16_t uniffi_cera_ffi_checksum_method_session_default_generate_opts(void
     
 );
 #endif

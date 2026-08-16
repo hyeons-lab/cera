@@ -306,6 +306,18 @@ fn map_cera_err(err: cera::CeraError) -> JsError {
     JsError::new(&err.to_string())
 }
 
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn console_info(msg: &str) {
+    web_sys::console::info_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn console_warn(msg: &str) {
+    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
 /// Loaded inference engine — wraps `cera::CeraEngine` with sync access
 /// to model metadata and the tokenizer.
 ///
@@ -404,6 +416,7 @@ impl CeraEngine {
         let parts = cera::ModelBytes {
             model: bytes.into(),
             multimodal_projector: mmproj.map(Into::into),
+            audio_decoder: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`, which
             // `from_parts` rejects by name, better than silently falling
             // back to text when a caller fat-fingers the string.
@@ -411,6 +424,7 @@ impl CeraEngine {
                 .as_deref()
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
+            generation_defaults: None,
         };
         cera::CeraEngine::from_parts(parts, cfg)
             .map(|inner| CeraEngine { inner })
@@ -579,6 +593,15 @@ impl CeraEngine {
     #[wasm_bindgen(getter)]
     pub fn metadata(&self) -> ModelMetadata {
         metadata_to_js(self.inner.metadata())
+    }
+
+    /// Constructs a `GenerateOpts` seeded with the advisory defaults from the
+    /// model manifest (if any), falling back to standard defaults for unmentioned fields.
+    #[wasm_bindgen(js_name = defaultGenerateOpts)]
+    pub fn default_generate_opts(&self) -> GenerateOpts {
+        GenerateOpts {
+            inner: cera::GenerateOpts::from_manifest(self.inner.manifest()),
+        }
     }
 
     /// Transcribe mono `f32` PCM audio (roughly normalized to `[-1.0, 1.0]`)
@@ -1609,18 +1632,7 @@ impl Session {
     /// Append PCM audio samples (mono `f32`, normalized to roughly
     /// `[-1.0, 1.0]`) at `sample_rate` Hz.
     ///
-    /// **Status: placeholder.** The wasm shape is wired through to
-    /// `cera::Session::append_audio`, but the cera core method is
-    /// currently a scaffold — for any model it errors, either with
-    /// the `UnsupportedModality` variant (text-only LLMs) or with
-    /// a `Backend(...)` variant (audio-capable models, awaiting
-    /// Session-side audio-tokenizer wiring). This export exists so
-    /// JS / TS consumers can lock in the symbol + signature now and
-    /// the wasm-pack `.d.ts` artifact catches any future shape
-    /// changes; it does **not** yet decode and append audio tokens.
-    /// Mirrors the same placeholder framing that cera-ffi shipped
-    /// in PR #78.
-    ///
+    /// Non-16kHz inputs are automatically linearly resampled to 16 kHz.
     /// `samples` arrives as `Float32Array` on the JS side. The
     /// wasm-bindgen boundary copies the typed-array contents into
     /// wasm linear memory once — there's no per-element boxing
@@ -1815,9 +1827,11 @@ impl Session {
         &mut self,
         opts: &GenerateOpts,
         on_text_tokens: &js_sys::Function,
+        on_audio_frames: Option<js_sys::Function>,
     ) -> Result<GenerateSummary, JsError> {
         let mut sink = JsTextSink {
             on_text: on_text_tokens,
+            on_audio: on_audio_frames.as_ref(),
         };
         self.inner
             .generate(&opts.inner, &mut sink)
@@ -1827,39 +1841,34 @@ impl Session {
 }
 
 /// Internal `ModalitySink` implementation that trampolines text
-/// tokens to a JS callback. Audio frames are dropped (text-only
-/// flow); a separate `JsAudioSink` will land alongside the audio
-/// engine wrapper in a future PR.
+/// tokens and audio frames to JS callbacks.
 struct JsTextSink<'a> {
     on_text: &'a js_sys::Function,
+    on_audio: Option<&'a js_sys::Function>,
 }
 
 impl<'a> cera::ModalitySink for JsTextSink<'a> {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
         // `Uint32Array::from(&[u32])` allocates JS-owned memory and
-        // copies the slice in. We *could* use `Uint32Array::view`
-        // for zero-copy, but the resulting view becomes invalid the
-        // moment Rust grows linear memory mid-call (a footgun JS
-        // callers would hit randomly). Per-flush copy cost is
-        // trivial relative to a forward pass.
+        // copies the slice in.
         let array = js_sys::Uint32Array::from(tokens);
-        // Treat any exception thrown by the JS callback as fatal:
-        // re-throw it across the wasm boundary so it lands in the
-        // JS caller's `try { ... } catch` around `session.generate`.
-        // `wasm_bindgen::throw_val` aborts the current Rust call
-        // immediately — cera's generate loop has no defined
-        // recovery path for sink errors anyway, so unwinding mid-
-        // decode is no worse than a `cancel()` (the KV cache is
-        // left in whatever state the partial decode produced).
         if let Err(err) = self.on_text.call1(&JsValue::null(), &array) {
             wasm_bindgen::throw_val(err);
         }
     }
 
+    fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
+        if let Some(cb) = self.on_audio {
+            let array = js_sys::Float32Array::from(pcm);
+            let rate = JsValue::from_f64(sample_rate as f64);
+            if let Err(err) = cb.call2(&JsValue::null(), &array, &rate) {
+                wasm_bindgen::throw_val(err);
+            }
+        }
+    }
+
     fn on_done(&mut self, _reason: cera::FinishReason) {
-        // The `GenerateSummary` already carries the finish reason;
-        // no need to re-emit it through the sink. JS callers see it
-        // via `summary.finishReason` after `generate` returns.
+        // The `GenerateSummary` already carries the finish reason.
     }
 }
 
@@ -1874,8 +1883,9 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Capabilities, Tokenizer, capabilities_to_js, map_err};
+    use super::{Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err};
     use cera::model::Model;
+    use cera::time::Instant;
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
 
@@ -1907,12 +1917,59 @@ mod webgpu {
         /// it stays off the per-image path. `None` when the upload failed, in
         /// which case encoding falls back to `vision_encoder`.
         gpu_vision_encoder: Option<Arc<dyn cera::model::vision_encoder_gpu::VisionGpuEncode>>,
+        /// CPU audio-encoder weights, parsed from the mmproj passed from an audio bundle.
+        audio_encoder: Option<Arc<cera::model::audio_encoder::AudioEncoderWeights>>,
+        /// GPU audio encoder instance if available.
+        gpu_audio_encoder: Option<Arc<dyn cera::model::audio_encoder_gpu::AudioGpuEncode>>,
+        /// CPU audio decoder weights for vocoder output generation.
+        audio_decoder: Option<Arc<cera::model::audio_decoder::AudioDecoderWeights>>,
+        /// CPU detokenizer weights for vocoder output generation.
+        detok_weights: Option<Arc<cera::model::audio_decoder::DetokenizerWeights>>,
+        /// GPU detokenizer and ISTFT instance if available.
+        gpu_audio_decoder: Option<Arc<cera::model::wgpu_audio_decoder::WgpuAudioDecoder>>,
         /// Session-default cap on an appended image's longest side.
         image_max_long_size: Option<u32>,
+        /// Generation defaults from the bundle manifest.
+        generation_defaults: Option<cera::manifest::GenerationDefaults>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[wasm_bindgen]
+    pub struct WebGpuCancelHandle {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[wasm_bindgen]
+    impl WebGpuCancelHandle {
+        #[wasm_bindgen]
+        pub fn cancel(&self) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        #[wasm_bindgen(js_name = clearCancel)]
+        pub fn clear_cancel(&self) {
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     #[wasm_bindgen]
     impl WebGpuSession {
+        #[wasm_bindgen(js_name = cancelHandle)]
+        pub fn cancel_handle(&self) -> WebGpuCancelHandle {
+            WebGpuCancelHandle {
+                cancel: self.cancel.clone(),
+            }
+        }
+
+        #[wasm_bindgen]
+        pub fn cancel(&self) {
+            self.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        #[wasm_bindgen(js_name = clearCancel)]
+        pub fn clear_cancel(&self) {
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+        }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
         /// GGUF, upload the model to the GPU, and build a fresh inference
@@ -2052,7 +2109,14 @@ mod webgpu {
                 eos,
                 vision_encoder: None,
                 gpu_vision_encoder: None,
+                audio_encoder: None,
+                gpu_audio_encoder: None,
+                audio_decoder: None,
+                detok_weights: None,
+                gpu_audio_decoder: None,
                 image_max_long_size: None,
+                generation_defaults: None,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         }
 
@@ -2075,7 +2139,7 @@ mod webgpu {
             kv_compression: Option<crate::TurboQuantConfig>,
         ) -> Result<WebGpuSession, JsError> {
             let mut session = Self::create(bytes, context_size, kv_compression).await?;
-            session.attach_vision(Arc::from(mmproj))?;
+            session.attach_projector(Arc::from(mmproj))?;
             Ok(session)
         }
 
@@ -2098,8 +2162,7 @@ mod webgpu {
         /// and costs one copy of the model rather than two.
         ///
         /// Throws for every reason `create` does, plus a bundle the GPU path
-        /// cannot serve: it is LFM2-only, and an audio bundle's encoder is
-        /// rejected as a vision tower. A caller wanting a fallback should catch
+        /// cannot serve: it is LFM2-only. A caller wanting a fallback should catch
         /// and retry through `CeraEngine.fromBundleId`, which is what
         /// `cera_worker.js` does for `backend: 'auto'`.
         #[wasm_bindgen(js_name = fromBundleId)]
@@ -2115,46 +2178,121 @@ mod webgpu {
                 crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
             let mut session =
                 Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
-            // A VL bundle names its tower in the manifest, so unlike
+            session.generation_defaults = parts.generation_defaults;
+            // A VL or audio bundle names its tower in the manifest, so unlike
             // `createWithParts` this path never has to be told about it.
             if let Some(mmproj) = parts.multimodal_projector {
-                session.attach_vision(mmproj)?;
+                session.attach_projector(mmproj)?;
+            }
+            if let Some(voc_bytes) = parts.audio_decoder {
+                session.attach_vocoder(voc_bytes)?;
             }
             Ok(session)
         }
 
-        /// Parse `mmproj` as a vision tower and attach it, giving this session
-        /// `appendImage`.
+        /// Parse `vocoder_bytes` as an audio decoder & detokenizer and attach it,
+        /// giving this GPU session audio output synthesis via `AudioOutputDecoder`.
+        fn attach_vocoder(&mut self, vocoder_bytes: Arc<[u8]>) -> Result<(), JsError> {
+            let voc_gguf = cera::gguf::GgufFile::from_bytes(vocoder_bytes).map_err(map_err)?;
+            let voc_arc = Arc::new(voc_gguf);
+            let decoder_weights = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(
+                &voc_arc,
+            )
+            .map_err(|e| JsError::new(&format!("failed to parse audio decoder weights: {e:#}")))?;
+            let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
+            if decoder_weights.decoder_config.n_embd != llm_hidden {
+                return Err(JsError::new(&format!(
+                    "audio vocoder expects an LLM with hidden size {}, but the loaded model has {}",
+                    decoder_weights.decoder_config.n_embd, llm_hidden
+                )));
+            }
+            let detok_weights = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
+                .map_err(|e| {
+                    JsError::new(&format!("failed to parse detokenizer weights: {e:#}"))
+                })?;
+            let ctx = self.model.ctx().clone();
+            match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf_with_context(
+                ctx, &voc_arc,
+            ) {
+                Ok(gad) => {
+                    console_info(&format!(
+                        "[cera-wasm] WgpuAudioDecoder loaded: supports_depthformer={}",
+                        gad.supports_depthformer()
+                    ));
+                    self.gpu_audio_decoder = Some(Arc::new(gad));
+                }
+                Err(e) => {
+                    console_info(&format!(
+                        "[cera-wasm] WgpuAudioDecoder load failed ({e:#}), using CPU decoder"
+                    ));
+                    self.gpu_audio_decoder = None;
+                }
+            }
+            self.audio_decoder = Some(Arc::new(decoder_weights));
+            self.detok_weights = Some(Arc::new(detok_weights));
+            Ok(())
+        }
+
+        /// Parse `mmproj` as a vision tower or audio encoder and attach it, giving
+        /// this session `appendImage` or `appendAudio`.
         ///
         /// Shared by `createWithParts` and `fromBundleId` so the two cannot
         /// drift on the pairing check below.
-        fn attach_vision(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
-            let proj_gguf = cera::gguf::GgufFile::from_bytes(mmproj).map_err(map_err)?;
-            let weights =
-                cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&Arc::new(proj_gguf))
-                    .map_err(map_err)?;
-
-            // Reject a tower trained against a different LLM here rather than
-            // at the first `appendImage`: the projection has to land in this
-            // model's hidden space, and a dimension mismatch is a mispaired
-            // bundle, not a runtime condition.
+        fn attach_projector(&mut self, mmproj: Arc<[u8]>) -> Result<(), JsError> {
+            let proj_gguf = cera::gguf::GgufFile::from_bytes(Arc::clone(&mmproj)).map_err(map_err)?;
+            let proj_arc = Arc::new(proj_gguf);
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
-            let proj_dim = weights.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(JsError::new(&format!(
-                    "vision encoder's projection_dim ({proj_dim}) does not match the \
-                     model's hidden_size ({llm_hidden}); the mmproj must pair with \
-                     the LLM it was trained against"
-                )));
-            }
 
-            let weights = Arc::new(weights);
-            self.gpu_vision_encoder = cera::model::vision_encoder_gpu::build_gpu_vision_encoder(
-                &weights,
-                cera::BackendPreference::Gpu,
-            );
-            self.vision_encoder = Some(weights);
-            Ok(())
+            let is_audio = cera::model::audio_encoder::is_audio_encoder_gguf(&proj_arc);
+
+            if is_audio {
+                let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
+                    .map_err(|e| {
+                        JsError::new(&format!(
+                            "failed to parse audio encoder mmproj weights: {e:#}"
+                        ))
+                    })?;
+                let enc_hidden = weights.config.llm_hidden_size;
+                if enc_hidden != llm_hidden {
+                    return Err(JsError::new(&format!(
+                        "audio encoder's llm_hidden_size ({enc_hidden}) does not match the \
+                         model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                         the LLM it was trained against"
+                    )));
+                }
+                let weights = Arc::new(weights);
+                // Audio encoding on WebGPU falls back to the CPU encoder path.
+                self.gpu_audio_encoder = None;
+                self.audio_encoder = Some(weights);
+                if self.audio_decoder.is_none() {
+                    let _ = self.attach_vocoder(Arc::clone(&mmproj));
+                }
+                Ok(())
+            } else {
+                let weights =
+                    cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&proj_arc)
+                        .map_err(|e| {
+                            JsError::new(&format!(
+                                "failed to parse vision encoder mmproj weights: {e:#}"
+                            ))
+                        })?;
+                let proj_dim = weights.config.projection_dim;
+                if proj_dim != llm_hidden {
+                    return Err(JsError::new(&format!(
+                        "vision encoder's projection_dim ({proj_dim}) does not match the \
+                         model's hidden_size ({llm_hidden}); the mmproj must pair with \
+                         the LLM it was trained against"
+                    )));
+                }
+                let weights = Arc::new(weights);
+                self.gpu_vision_encoder =
+                    cera::model::vision_encoder_gpu::build_wgpu_vision_encoder_with_context(
+                        self.model.ctx().clone(),
+                        &weights,
+                    );
+                self.vision_encoder = Some(weights);
+                Ok(())
+            }
         }
 
         /// Number of tokens currently in the KV cache.
@@ -2169,28 +2307,54 @@ mod webgpu {
             self.state.seq_len as u32
         }
 
+        /// Feed `ids` into the KV cache without running any token generation.
+        #[wasm_bindgen(js_name = appendTokens)]
+        pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError> {
+            let max_seq_len = self.model.config().max_seq_len;
+            let mut pos = self.state.seq_len;
+            if pos.saturating_add(ids.len()) > max_seq_len {
+                return Err(JsError::new(&format!(
+                    "tokens of len {} plus {pos} already in context exceeds max sequence length {max_seq_len}",
+                    ids.len()
+                )));
+            }
+            for tok in ids {
+                self.model.forward_prefill_step(tok, pos, &mut self.state);
+                pos += 1;
+            }
+            self.state.seq_len = pos;
+            Ok(())
+        }
+
         /// Whether this session can accept images, i.e. whether it was built
-        /// by `createWithParts` with a usable mmproj.
+        /// by `createWithParts` or `fromBundleId` with a usable vision mmproj.
         #[wasm_bindgen(getter, js_name = imageIn)]
         pub fn image_in(&self) -> bool {
             self.vision_encoder.is_some()
         }
 
+        /// Whether this session can accept audio, i.e. whether it was built
+        /// from an audio bundle with a usable audio mmproj.
+        #[wasm_bindgen(getter, js_name = audioIn)]
+        pub fn audio_in(&self) -> bool {
+            self.audio_encoder.is_some()
+        }
+
+        /// Whether this session can produce audio output, i.e. whether it was built
+        /// from an audio bundle with an audio vocoder sidecar attached.
+        #[wasm_bindgen(getter, js_name = audioOut)]
+        pub fn audio_out(&self) -> bool {
+            self.audio_decoder.is_some() && self.detok_weights.is_some()
+        }
+
         /// Modality capability flags for this session, same shape as
         /// `Session.capabilities` on the CPU path.
-        ///
-        /// Reports what *this session* can do, which is deliberately not the
-        /// engine's answer. The WebGPU path takes an image only when it was
-        /// built with a usable mmproj, and has no audio path at all, so
-        /// forwarding a VL-or-audio engine's capabilities here would promise
-        /// a modality the live session refuses.
         #[wasm_bindgen(getter)]
         pub fn capabilities(&self) -> Capabilities {
             capabilities_to_js(cera::ModalityCapabilities {
                 image_in: self.image_in(),
-                // `text_only()` supplies text in/out and leaves audio off, so
-                // a new field added upstream lands here as `false` rather than
-                // as a silent `true`.
+                audio_in: self.audio_in(),
+                audio_out: self.audio_out(),
                 ..cera::ModalityCapabilities::text_only()
             })
         }
@@ -2217,12 +2381,12 @@ mod webgpu {
         /// session this cannot shift the KV cache to make room; that
         /// limitation is pre-existing and applies to prompts too.
         #[wasm_bindgen(js_name = appendImage)]
-        pub fn append_image(
+        pub async fn append_image(
             &mut self,
             bytes: &[u8],
             max_long_size: Option<u32>,
         ) -> Result<(), JsError> {
-            let Some(encoder) = self.vision_encoder.clone() else {
+            let Some(encoder) = self.vision_encoder.as_ref() else {
                 return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
             };
             let cap = match max_long_size {
@@ -2231,38 +2395,83 @@ mod webgpu {
                 Some(n) => Some(n),
             };
 
+            let t_start = Instant::now();
             let pre = cera::model::vision_preprocessor::preprocess_image_with_opts(
                 bytes,
                 &encoder.config,
                 cap,
             )
             .map_err(crate::map_cera_err)?;
+            let t_pre = t_start.elapsed();
+
+            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
+            console_info(&format!(
+                "[cera:worker] appendImage: 1/3 Preprocessed image ({}x{} grid = {grid_tokens} patches) in {:.1}ms",
+                pre.grid_w,
+                pre.grid_h,
+                t_pre.as_secs_f64() * 1000.0
+            ));
 
             // Prefer the GPU tower, but only within the attention kernel's
             // token capacity, and fall back rather than fail on a runtime GPU
             // error: the CPU encoder is always attached and numerically
             // equivalent. Same policy as `Session::append_image_with_opts`.
-            let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
             let gpu = self
                 .gpu_vision_encoder
                 .as_ref()
                 .filter(|_| grid_tokens <= cera::model::vision_encoder_gpu::MAX_VIT_TOKENS);
-            let img_tokens = match gpu {
-                Some(g) => match g.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(
-                            "gpu vision encode failed ({e:#}); falling back to CPU encoder"
-                        );
+
+            let t_enc_start = Instant::now();
+            let (img_tokens, backend_name) = match gpu {
+                Some(g) => {
+                    console_info(&format!(
+                        "[cera:worker] appendImage: 2/3 Running WebGPU Vision Tower ({grid_tokens} patches, projection_dim={})...",
+                        encoder.config.projection_dim
+                    ));
+                    match g
+                        .encode_image_async(&pre.pixels, pre.grid_w, pre.grid_h)
+                        .await
+                    {
+                        Ok(t) => (t, "WebGPU"),
+                        Err(e) => {
+                            console_warn(&format!(
+                                "[cera:worker] appendImage: 2/3 WebGPU vision encode failed ({e:#}); falling back to WASM CPU encoder"
+                            ));
+                            (
+                                encoder
+                                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
+                                    .map_err(map_err)?,
+                                "WASM-CPU (fallback)",
+                            )
+                        }
+                    }
+                }
+                None => {
+                    if self.gpu_vision_encoder.is_some()
+                        && grid_tokens > cera::model::vision_encoder_gpu::MAX_VIT_TOKENS
+                    {
+                        console_warn(&format!(
+                            "[cera:worker] appendImage: 2/3 Image grid ({grid_tokens} patches) exceeds WebGPU ViT max ({}); running on WASM CPU (this may be slow)...",
+                            cera::model::vision_encoder_gpu::MAX_VIT_TOKENS
+                        ));
+                    } else {
+                        console_info(&format!(
+                            "[cera:worker] appendImage: 2/3 Running WASM CPU Vision Tower ({grid_tokens} patches)..."
+                        ));
+                    }
+                    (
                         encoder
                             .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                            .map_err(map_err)?
-                    }
-                },
-                None => encoder
-                    .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
-                    .map_err(map_err)?,
+                            .map_err(map_err)?,
+                        "WASM-CPU",
+                    )
+                }
             };
+            let t_enc = t_enc_start.elapsed();
+            console_info(&format!(
+                "[cera:worker] appendImage: 2/3 Vision Tower encoded {grid_tokens} tokens on {backend_name} in {:.1}ms",
+                t_enc.as_secs_f64() * 1000.0
+            ));
 
             let hidden = cera::model::Model::config(&self.model).hidden_size;
             if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
@@ -2283,30 +2492,112 @@ mod webgpu {
             // leave the cache holding half an image.
             let start = self.state.seq_len;
             let max = cera::model::Model::config(&self.model).max_seq_len;
-            let end = start
-                .checked_add(n_tokens)
-                .ok_or_else(|| JsError::new("position overflow appending image embeddings"))?;
+            let end = start.checked_add(n_tokens).ok_or_else(|| {
+                crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: u32::MAX,
+                })
+            })?;
             if end > max {
                 return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
                     max_seq_len: max as u32,
-                    by: (end - max) as u32,
+                    by: u32::try_from(end.saturating_sub(max)).unwrap_or(u32::MAX),
                 }));
             }
 
-            // `seed_embeddings`, not `Model::forward_prefill_from_embeddings`:
-            // the trait method ends in a blocking `download_f32`, and blocking
-            // is exactly what this thread must not do. The readback completes
-            // from the JS event loop, which cannot run until this call returns,
-            // so waiting on it here hangs the worker outright. The logits it
-            // would fetch are discarded on this path anyway; appending an image
-            // wants the KV cache, nothing more.
+            console_info(&format!(
+                "[cera:worker] appendImage: 3/3 Seeding {n_tokens} embeddings into WebGPU LLM KV cache (pos {start} -> {end})..."
+            ));
+            let t_seed_start = Instant::now();
             self.model
                 .seed_embeddings(&img_tokens, n_tokens, start, &mut self.state);
-            // `seed_embeddings` advances `seq_len` itself, once per frame, so
-            // assigning `end` here would be a no-op on a good day and would
-            // paper over a miscount on a bad one. Assert the contract instead:
-            // a mismatch means the KV cache holds a different number of frames
-            // than the session thinks, and every later position is wrong.
+            let t_seed = t_seed_start.elapsed();
+
+            debug_assert_eq!(
+                self.state.seq_len, end,
+                "seed_embeddings must advance seq_len by n_tokens"
+            );
+
+            let t_total = t_start.elapsed();
+            console_info(&format!(
+                "[cera:worker] appendImage: 3/3 KV cache seeded in {:.1}ms (total: {:.1}ms [prep: {:.1}ms, vit: {:.1}ms, kv: {:.1}ms])",
+                t_seed.as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+                t_pre.as_secs_f64() * 1000.0,
+                t_enc.as_secs_f64() * 1000.0,
+                t_seed.as_secs_f64() * 1000.0
+            ));
+            Ok(())
+        }
+
+        /// Feed mono PCM audio into the conversation, to be processed by the
+        /// next `generateTokens`.
+        #[wasm_bindgen(js_name = appendAudio)]
+        pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError> {
+            let Some(encoder) = self.audio_encoder.as_ref() else {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            };
+            if samples.is_empty() {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+            if !(1000..=192_000).contains(&sample_rate) {
+                return Err(crate::map_cera_err(cera::CeraError::Backend(format!(
+                    "unsupported audio sample rate: {sample_rate} Hz (expected 1000..=192000 Hz)"
+                ))));
+            }
+            let target_sr = cera::model::audio_encoder::SAMPLE_RATE;
+            let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
+                std::borrow::Cow::Borrowed(samples)
+            } else {
+                std::borrow::Cow::Owned(cera::model::audio_encoder::resample_linear(
+                    samples,
+                    sample_rate,
+                    target_sr,
+                ))
+            };
+            if resampled.is_empty() {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+            let effective_samples = resampled.as_ref();
+            let (embeddings, n_tokens) = match self.gpu_audio_encoder.as_ref() {
+                Some(gpu) => match gpu.encode_pcm(effective_samples) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        tracing::warn!(
+                            "gpu audio encode failed ({e:#}); falling back to CPU encoder"
+                        );
+                        cera::model::audio_encoder::encode_audio_pcm(
+                            effective_samples,
+                            encoder.as_ref(),
+                        )
+                    }
+                },
+                None => cera::model::audio_encoder::encode_audio_pcm(
+                    effective_samples,
+                    encoder.as_ref(),
+                ),
+            };
+            if n_tokens == 0 {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+
+            let start = self.state.seq_len;
+            let max = cera::model::Model::config(&self.model).max_seq_len;
+            let end = start.checked_add(n_tokens).ok_or_else(|| {
+                crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: u32::MAX,
+                })
+            })?;
+            if end > max {
+                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max as u32,
+                    by: u32::try_from(end.saturating_sub(max)).unwrap_or(u32::MAX),
+                }));
+            }
+
+            self.model
+                .seed_embeddings(&embeddings, n_tokens, start, &mut self.state);
             debug_assert_eq!(
                 self.state.seq_len, end,
                 "seed_embeddings must advance seq_len by n_tokens"
@@ -2379,8 +2670,17 @@ mod webgpu {
             {
                 ids.insert(0, bos);
             }
-            self.generate_ids(ids, max_tokens, temperature, top_p, top_k, seed, on_token)
-                .await
+            self.generate_ids(
+                ids,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                on_token,
+                None,
+            )
+            .await
         }
 
         /// The tokenizer this session's GGUF declares, for callers that need to
@@ -2452,6 +2752,7 @@ mod webgpu {
             top_k: Option<u32>,
             seed: Option<u64>,
             on_token: &js_sys::Function,
+            on_audio: Option<js_sys::Function>,
         ) -> Result<String, JsError> {
             self.generate_ids(
                 tokens,
@@ -2461,6 +2762,7 @@ mod webgpu {
                 top_k,
                 seed,
                 on_token,
+                on_audio.as_ref(),
             )
             .await
         }
@@ -2479,6 +2781,7 @@ mod webgpu {
             top_k: Option<u32>,
             seed: Option<u64>,
             on_token: &js_sys::Function,
+            on_audio: Option<&js_sys::Function>,
         ) -> Result<String, JsError> {
             if ids.is_empty() {
                 return Ok(String::new());
@@ -2513,6 +2816,45 @@ mod webgpu {
                 pos += 1;
             }
 
+            let (def_temp, def_top_p, def_top_k, def_min_p, def_rep_pen, audio_temp, audio_top_k) =
+                match &self.generation_defaults {
+                    Some(cera::manifest::GenerationDefaults::Text {
+                        temperature,
+                        top_p,
+                        top_k,
+                        min_p,
+                        repetition_penalty,
+                        ..
+                    }) => (
+                        *temperature,
+                        *top_p,
+                        *top_k,
+                        *min_p,
+                        *repetition_penalty,
+                        0.8,
+                        4,
+                    ),
+                    Some(cera::manifest::GenerationDefaults::Audio {
+                        temperature,
+                        top_p,
+                        top_k,
+                        min_p,
+                        repetition_penalty,
+                        audio_temperature,
+                        audio_top_k,
+                        ..
+                    }) => (
+                        *temperature,
+                        *top_p,
+                        *top_k,
+                        *min_p,
+                        *repetition_penalty,
+                        audio_temperature.unwrap_or(0.8),
+                        audio_top_k.map(|k| k as usize).unwrap_or(4),
+                    ),
+                    _ => (None, None, None, None, None, 0.8, 4),
+                };
+
             // Greedy stays on the GPU-argmax path, which reads back four bytes
             // per token; sampling needs the whole logits row on the host, which
             // is a vocab-sized readback per token. Deciding once, here, keeps a
@@ -2523,11 +2865,15 @@ mod webgpu {
             // rather than inventing a second threshold.
             let defaults = cera::sampler::SamplerConfig::default();
             let cfg = cera::sampler::SamplerConfig {
-                temperature: temperature.unwrap_or(defaults.temperature),
-                top_p: top_p.unwrap_or(defaults.top_p),
-                top_k: top_k.map(|k| k as usize).unwrap_or(defaults.top_k),
+                temperature: temperature.or(def_temp).unwrap_or(defaults.temperature),
+                top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
+                top_k: top_k
+                    .or(def_top_k)
+                    .map(|k| k as usize)
+                    .unwrap_or(defaults.top_k),
+                min_p: def_min_p.unwrap_or(defaults.min_p),
+                repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
-                ..defaults
             };
             let mut sampler =
                 (cfg.temperature > 0.0 && cfg.top_k != 1).then(|| cera::sampler::Sampler::new(cfg));
@@ -2549,34 +2895,365 @@ mod webgpu {
             };
             pos += 1;
 
+            let mut decoder =
+                if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                    let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
+                        .gpu_audio_decoder
+                        .as_deref()
+                        .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
+                    let use_gpu_df = self
+                        .gpu_audio_decoder
+                        .as_ref()
+                        .is_some_and(|g| g.supports_depthformer());
+                    console_info(&format!(
+                        "[cera-wasm] AudioOutputDecoder: use_gpu_df={use_gpu_df}, gpu_audio_decoder={}",
+                        self.gpu_audio_decoder.is_some()
+                    ));
+                    Some(
+                        cera::audio_engine::AudioOutputDecoder::new(
+                            dec,
+                            detok,
+                            gpu_ref,
+                            audio_temp,
+                            audio_top_k,
+                            use_gpu_df,
+                        )
+                        .with_streaming(true),
+                    )
+                } else {
+                    None
+                };
+            let is_tts = if let Ok(prompt_str) = std::str::from_utf8(&self.tokenizer.decode_bytes(&ids)) {
+                prompt_str.contains("Perform TTS")
+            } else {
+                false
+            };
+            let is_interleaved = on_audio.is_some() && !is_tts;
+            let mut modality_budget = if is_interleaved { 6usize } else { usize::MAX };
+            let mut text_done = false;
+            let mut trailing_audio_segments: usize = 0;
+            const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
+
             // Greedy decode loop. Stream raw bytes through a buffer and emit
             // only complete UTF-8: a multi-byte character can span several
             // byte-fallback tokens, so converting one token at a time would
             // corrupt non-ASCII output into U+FFFD replacement chars.
             let mut out = String::new();
             let mut pending = Vec::<u8>::new();
+            let mut text_tokens_count = 0;
+            let mut audio_frames_count = 0;
+            let mut llm_hidden_passes = 0;
+
+            let mut time_llm_text_ms = 0.0;
+            let mut time_llm_audio_ms = 0.0;
+            let mut time_depthformer_ms = 0.0;
+            let mut time_vocoder_finish_ms = 0.0;
+
+            let gen_start_time = js_sys::Date::now();
+
+            self.cancel.store(false, std::sync::atomic::Ordering::Release);
+
             for _ in 0..max_tokens {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if Some(next) == self.eos {
                     break;
                 }
-                pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
-                let valid = match std::str::from_utf8(&pending) {
-                    Ok(s) => s.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                if valid > 0 {
-                    let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                    out.push_str(&piece);
-                    emit(on_token, &piece);
-                    pending.drain(..valid);
+
+                if next == cera::audio_engine::TOKEN_AUDIO_START
+                    && let Some(ref mut dec) = decoder
+                {
+                    console_info(
+                        &format!("[cera-wasm] WebGpuSession hit audio start token ({}). Beginning sequential vocoder audio decoding...", next),
+                    );
+                    if !pending.is_empty() {
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            out.push_str(&piece);
+                            emit(on_token, &piece);
+                        }
+                        pending.clear();
+                    }
+
+                    if pos < max_seq_len {
+                        let t_emb0 = js_sys::Date::now();
+                        let mut emb = self
+                            .model
+                            .forward_embedding_async(next, pos, &mut self.state)
+                            .await
+                            .map_err(map_err)?;
+                        time_llm_audio_ms += js_sys::Date::now() - t_emb0;
+                        pos += 1;
+
+                        let mut frame_count = 0;
+                        let can_use_gpu_buf = dec.supports_gpu_depthformer();
+                        let mut use_gpu_buf = false;
+                        loop {
+                            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            if pos >= max_seq_len || audio_frames_count >= 4096 {
+                                break;
+                            }
+                            let t_df0 = js_sys::Date::now();
+                            let outcome = if use_gpu_buf && can_use_gpu_buf {
+                                dec.decode_frame_from_gpu_hidden_async(self.model.hidden_buffer())
+                                    .await
+                                    .map_err(map_err)?
+                            } else {
+                                dec.decode_frame_async(&emb).await.map_err(map_err)?
+                            };
+                            time_depthformer_ms += js_sys::Date::now() - t_df0;
+
+                            let audio_emb = match outcome {
+                                cera::audio_engine::FrameOutcome::End => {
+                                    console_info(&format!(
+                                        "[cera-wasm] WebGpuSession vocoder emitted End code after {frame_count} frames"
+                                    ));
+                                    break;
+                                }
+                                cera::audio_engine::FrameOutcome::Codes {
+                                    audio_embedding,
+                                    pcm,
+                                } => {
+                                    frame_count += 1;
+                                    audio_frames_count += 1;
+                                    if !pcm.is_empty()
+                                        && let Some(cb) = on_audio
+                                    {
+                                        let array = js_sys::Float32Array::from(pcm.as_slice());
+                                        let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
+                                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                                    }
+                                    audio_embedding
+                                }
+                            };
+
+                            let t_hid0 = js_sys::Date::now();
+                            if can_use_gpu_buf {
+                                self.model
+                                    .forward_hidden_from_embedding_gpu(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .map_err(map_err)?;
+                                use_gpu_buf = true;
+                            } else {
+                                emb = self
+                                    .model
+                                    .forward_hidden_from_embedding_async(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .await
+                                    .map_err(map_err)?;
+                            }
+                            time_llm_audio_ms += js_sys::Date::now() - t_hid0;
+                            llm_hidden_passes += 1;
+                            pos += 1;
+                        }
+                    }
+                    break;
+                }
+
+                if next == cera::audio_engine::TOKEN_TEXT_END {
+                    text_done = true;
+                }
+
+                if next != cera::audio_engine::TOKEN_TEXT_END {
+                    text_tokens_count += 1;
+                    pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid > 0 {
+                        let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        out.push_str(&piece);
+                        emit(on_token, &piece);
+                        pending.drain(..valid);
+                    }
+                }
+
+                modality_budget = modality_budget.saturating_sub(1);
+
+                // Interleaved audio generation: when modality budget hits 0 or text is done,
+                // extract audio embedding from this token and decode up to 12 audio frames.
+                if is_interleaved
+                    && let Some(ref mut dec) = decoder
+                    && (modality_budget == 0 || text_done)
+                    && pos < max_seq_len
+                {
+                    if text_done {
+                        trailing_audio_segments += 1;
+                        if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
+                            break;
+                        }
+                    }
+
+                    if !pending.is_empty() {
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if valid > 0 {
+                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                            out.push_str(&piece);
+                            emit(on_token, &piece);
+                            pending.drain(..valid);
+                        }
+                    }
+
+                    let t_emb0 = js_sys::Date::now();
+                    let mut emb = self
+                        .model
+                        .forward_embedding_async(next, pos, &mut self.state)
+                        .await
+                        .map_err(map_err)?;
+                    time_llm_audio_ms += js_sys::Date::now() - t_emb0;
+                    pos += 1;
+
+                    let mut audio_budget = 12usize;
+                    let mut end_reached = false;
+                    let can_use_gpu_buf = dec.supports_gpu_depthformer();
+                    let mut use_gpu_buf = false;
+                    loop {
+                        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) || pos >= max_seq_len {
+                            break;
+                        }
+                        let t_df0 = js_sys::Date::now();
+                        let outcome = if use_gpu_buf && can_use_gpu_buf {
+                            dec.decode_frame_from_gpu_hidden_async(self.model.hidden_buffer())
+                                .await
+                                .map_err(map_err)?
+                        } else {
+                            dec.decode_frame_async(&emb).await.map_err(map_err)?
+                        };
+                        time_depthformer_ms += js_sys::Date::now() - t_df0;
+
+                        let audio_emb = match outcome {
+                            cera::audio_engine::FrameOutcome::End => {
+                                if text_done {
+                                    end_reached = true;
+                                    break;
+                                }
+                                // Transition back to text by forwarding the audio end token
+                                let t_trans0 = js_sys::Date::now();
+                                next = match sampler.as_mut() {
+                                    Some(s) => {
+                                        let mut l = self
+                                            .model
+                                            .forward_logits_async(
+                                                cera::audio_engine::TOKEN_TEXT_END,
+                                                pos,
+                                                &mut self.state,
+                                            )
+                                            .await
+                                            .map_err(map_err)?;
+                                        s.sample(&mut l)
+                                    }
+                                    None => self
+                                        .model
+                                        .forward_greedy_async(
+                                            cera::audio_engine::TOKEN_TEXT_END,
+                                            pos,
+                                            &mut self.state,
+                                        )
+                                        .await
+                                        .map_err(map_err)?,
+                                };
+                                time_llm_text_ms += js_sys::Date::now() - t_trans0;
+                                pos += 1;
+                                modality_budget = 6;
+                                break;
+                            }
+                            cera::audio_engine::FrameOutcome::Codes {
+                                audio_embedding,
+                                pcm,
+                            } => {
+                                audio_frames_count += 1;
+                                if !pcm.is_empty()
+                                    && let Some(cb) = on_audio
+                                {
+                                    let array = js_sys::Float32Array::from(pcm.as_slice());
+                                    let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
+                                    let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                                }
+                                audio_embedding
+                            }
+                        };
+                        audio_budget = audio_budget.saturating_sub(1);
+
+                        if audio_budget == 0 && !text_done {
+                            // Transition back to text from the audio embedding
+                            let t_trans0 = js_sys::Date::now();
+                            next = match sampler.as_mut() {
+                                Some(s) => {
+                                    let mut l = self
+                                        .model
+                                        .forward_logits_from_embedding_async(
+                                            &audio_emb,
+                                            pos,
+                                            &mut self.state,
+                                        )
+                                        .await
+                                        .map_err(map_err)?;
+                                    s.sample(&mut l)
+                                }
+                                None => self
+                                    .model
+                                    .forward_greedy_from_embedding_async(
+                                        &audio_emb,
+                                        pos,
+                                        &mut self.state,
+                                    )
+                                    .await
+                                    .map_err(map_err)?,
+                            };
+                            time_llm_text_ms += js_sys::Date::now() - t_trans0;
+                            pos += 1;
+                            modality_budget = 6;
+                            break;
+                        }
+
+                        let t_hid0 = js_sys::Date::now();
+                        if can_use_gpu_buf {
+                            self.model
+                                .forward_hidden_from_embedding_gpu(&audio_emb, pos, &mut self.state)
+                                .map_err(map_err)?;
+                            use_gpu_buf = true;
+                        } else {
+                            emb = self
+                                .model
+                                .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
+                                .await
+                                .map_err(map_err)?;
+                        }
+                        time_llm_audio_ms += js_sys::Date::now() - t_hid0;
+                        llm_hidden_passes += 1;
+                        pos += 1;
+                    }
+
+                    if end_reached {
+                        break;
+                    }
+                    continue;
                 }
 
                 // Stop before the next forward would overflow the context
                 // window (the GPU forward asserts `seq_len < max_seq_len`). The
                 // token just emitted is the last one this call can produce.
-                if pos >= max_seq_len {
+                if pos >= max_seq_len || text_tokens_count >= max_tokens as usize {
                     break;
                 }
+                let t_txt0 = js_sys::Date::now();
                 next = match sampler.as_mut() {
                     Some(s) => {
                         let mut logits = self
@@ -2592,8 +3269,63 @@ mod webgpu {
                         .await
                         .map_err(map_err)?,
                 };
+                time_llm_text_ms += js_sys::Date::now() - t_txt0;
                 pos += 1;
             }
+
+            let mut total_samples = 0;
+            if let Some(mut dec) = decoder
+                && dec.audio_frames() > 0
+                && let Some(cb) = on_audio
+            {
+                let t_fin0 = js_sys::Date::now();
+                dec.finish_async(|pcm, rate| {
+                    total_samples += pcm.len();
+                    console_info(&format!(
+                        "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
+                        pcm.len(),
+                        rate
+                    ));
+                    let array = js_sys::Float32Array::from(pcm);
+                    let rate_val = JsValue::from_f64(rate as f64);
+                    let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                })
+                .await
+                .map_err(map_err)?;
+                time_vocoder_finish_ms += js_sys::Date::now() - t_fin0;
+                let final_samples = if dec.streamed_samples() > 0 {
+                    dec.streamed_samples()
+                } else {
+                    total_samples
+                };
+                total_samples = final_samples;
+                console_info(&format!(
+                    "[cera-wasm] WebGpuSession audio generation finished with {} frames and {} total samples",
+                    dec.audio_frames(),
+                    total_samples
+                ));
+            }
+
+            let total_gen_ms = js_sys::Date::now() - gen_start_time;
+            let audio_dur_sec = total_samples as f64 / 24000.0;
+            let rtf = if total_gen_ms > 0.0 {
+                audio_dur_sec / (total_gen_ms / 1000.0)
+            } else {
+                0.0
+            };
+
+            let avg_txt = if text_tokens_count > 0 { time_llm_text_ms / text_tokens_count as f64 } else { 0.0 };
+            let avg_aud = if llm_hidden_passes > 0 { time_llm_audio_ms / llm_hidden_passes as f64 } else { 0.0 };
+            let avg_df = if audio_frames_count > 0 { time_depthformer_ms / audio_frames_count as f64 } else { 0.0 };
+
+            console_info(&format!(
+                "[cera:perf] Breakdown (total: {total_gen_ms:.1}ms, {audio_dur_sec:.2}s audio, RTF: {rtf:.2}x):\n\
+                 - LLM Text Decode:      {time_llm_text_ms:.1}ms ({text_tokens_count} tokens, {avg_txt:.1}ms/tok)\n\
+                 - LLM Audio Embedding:  {time_llm_audio_ms:.1}ms ({llm_hidden_passes} passes, {avg_aud:.1}ms/pass)\n\
+                 - Depthformer (CPU/GPU):{time_depthformer_ms:.1}ms ({audio_frames_count} frames, {avg_df:.1}ms/frame)\n\
+                 - Vocoder Detok+ISTFT:  {time_vocoder_finish_ms:.1}ms ({total_samples} PCM samples)"
+            ));
+
             // Flush any trailing bytes (an incomplete multi-byte char at the
             // stop boundary — lossy as a last resort).
             if !pending.is_empty() {
@@ -2607,4 +3339,4 @@ mod webgpu {
 }
 
 #[cfg(feature = "wgpu")]
-pub use webgpu::WebGpuSession;
+pub use webgpu::{WebGpuCancelHandle, WebGpuSession};

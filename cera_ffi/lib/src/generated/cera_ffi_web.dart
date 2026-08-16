@@ -2539,6 +2539,10 @@ final class CeraEngine {
   /// invalid IDs should validate against `vocab_size()` first.
   String decodeTokens(List<int> tokens) => _unsupportedOnWeb('CeraEngine.decodeTokens');
 
+  /// Returns default `GenerateOpts` for this engine, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('CeraEngine.defaultGenerateOpts');
+
   /// Encode `text` into token IDs using the model's BPE tokenizer.
   /// Empty input returns an empty vec.
   List<int> encodeText(String text) => _unsupportedOnWeb('CeraEngine.encodeText');
@@ -2887,6 +2891,10 @@ final class Session {
   /// any thread (mirrors the shape of [`Self::cancel`]).
   void clearCancel() => _unsupportedOnWeb('Session.clearCancel');
 
+  /// Returns default `GenerateOpts` for this session, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
+
   /// Run autoregressive decode and return all emitted tokens +
   /// a summary. Synchronous — the call blocks until the decode
   /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -2987,7 +2995,7 @@ final class Session {
   int hiddenSize() => _unsupportedOnWeb('Session.hiddenSize');
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
   Uint8List hiddenStatesForText(String text) => _unsupportedOnWeb('Session.hiddenStatesForText');
 
   /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
