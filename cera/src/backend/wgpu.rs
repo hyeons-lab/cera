@@ -378,6 +378,15 @@ impl GpuContext {
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             features |= wgpu::Features::SHADER_F16;
         }
+        if adapter.features().contains(wgpu::Features::SUBGROUP) {
+            features |= wgpu::Features::SUBGROUP;
+        }
+        if adapter
+            .features()
+            .contains(wgpu::Features::SUBGROUP_BARRIER)
+        {
+            features |= wgpu::Features::SUBGROUP_BARRIER;
+        }
         // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
         // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
         // PowerVR prefill). wgpu-core only accepts a SPIR-V passthrough module on

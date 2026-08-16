@@ -98,6 +98,11 @@ pub struct AudioOutputDecoder<'a> {
     audio_top_k: usize,
     /// Precomputed: `gpu.is_some() && config.gpu_depthformer`.
     use_gpu_df: bool,
+    /// Whether to detokenize and stream audio incrementally per frame,
+    /// or buffer sampled codes and perform a single fused detokenization + iSTFT pass at finish.
+    streaming: bool,
+    /// Buffered sampled codes across frames (used when `streaming == false`).
+    all_codes: Vec<i32>,
 }
 
 impl<'a> AudioOutputDecoder<'a> {
@@ -119,6 +124,12 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Total duration spent in detokenizer spectral processing.
     pub fn time_detokenizer(&self) -> Duration {
         self.time_detokenizer
+    }
+
+    /// Configure whether audio is detokenized per-frame or batched at finish.
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
     }
 
     pub fn new(
@@ -156,6 +167,8 @@ impl<'a> AudioOutputDecoder<'a> {
             audio_temperature,
             audio_top_k,
             use_gpu_df: gpu_depthformer && gpu.is_some(),
+            streaming: true,
+            all_codes: Vec::new(),
         }
     }
 
@@ -186,6 +199,17 @@ impl<'a> AudioOutputDecoder<'a> {
             return FrameOutcome::End;
         }
 
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            };
+        }
+
         let t1 = Instant::now();
         let spectrum = if let Some(g) = self.gpu {
             g.detokenize_to_spectrum(self.detok_weights, &codes)
@@ -199,12 +223,10 @@ impl<'a> AudioOutputDecoder<'a> {
         };
         self.time_detokenizer += t1.elapsed();
         self.all_spectrum.extend_from_slice(&spectrum);
-        self.audio_frames += 1;
 
         let pcm = self.streamer.feed_frames(&spectrum);
         self.streamed_samples += pcm.len();
 
-        let audio_embedding = embed_audio_token(self.weights, &codes);
         FrameOutcome::Codes {
             audio_embedding,
             pcm,
@@ -233,6 +255,17 @@ impl<'a> AudioOutputDecoder<'a> {
             return Ok(FrameOutcome::End);
         }
 
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return Ok(FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            });
+        }
+
         let t1 = Instant::now();
         let spectrum = if let Some(g) = self.gpu {
             g.detokenize_to_spectrum_async(self.detok_weights, &codes)
@@ -247,12 +280,10 @@ impl<'a> AudioOutputDecoder<'a> {
         };
         self.time_detokenizer += t1.elapsed();
         self.all_spectrum.extend_from_slice(&spectrum);
-        self.audio_frames += 1;
 
         let pcm = self.streamer.feed_frames(&spectrum);
         self.streamed_samples += pcm.len();
 
-        let audio_embedding = embed_audio_token(self.weights, &codes);
         Ok(FrameOutcome::Codes {
             audio_embedding,
             pcm,
@@ -271,6 +302,26 @@ impl<'a> AudioOutputDecoder<'a> {
             }
             return self.streamed_samples;
         }
+
+        if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
+            let t1 = Instant::now();
+            for chunk in self.all_codes.chunks_exact(8) {
+                let codes: [i32; 8] = chunk.try_into().unwrap_or([0; 8]);
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum(self.detok_weights, &codes)
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            self.time_detokenizer += t1.elapsed();
+        }
+
         if self.all_spectrum.is_empty() {
             return 0;
         }
@@ -301,6 +352,27 @@ impl<'a> AudioOutputDecoder<'a> {
             }
             return Ok(self.streamed_samples);
         }
+
+        if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
+            let t1 = Instant::now();
+            for chunk in self.all_codes.chunks_exact(8) {
+                let codes: [i32; 8] = chunk.try_into().unwrap_or([0; 8]);
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                        .await?
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            self.time_detokenizer += t1.elapsed();
+        }
+
         if self.all_spectrum.is_empty() {
             return Ok(0);
         }

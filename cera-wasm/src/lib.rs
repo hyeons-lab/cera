@@ -2842,14 +2842,17 @@ mod webgpu {
                         .gpu_audio_decoder
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
-                    Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec,
-                        detok,
-                        gpu_ref,
-                        audio_temp,
-                        audio_top_k,
-                        false,
-                    ))
+                    Some(
+                        cera::audio_engine::AudioOutputDecoder::new(
+                            dec,
+                            detok,
+                            gpu_ref,
+                            audio_temp,
+                            audio_top_k,
+                            false,
+                        )
+                        .with_streaming(false),
+                    )
                 } else {
                     None
                 };
