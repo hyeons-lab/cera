@@ -1492,9 +1492,14 @@ impl IstftStreamer {
     pub fn flush(&mut self) -> Vec<f32> {
         let padding = (self.n_fft - self.hop_length) / 2;
         let mut output = Vec::with_capacity(padding);
+        let mut has_energy = false;
         for k in 0..padding {
             let sample = if self.window_sum[k] > 1e-8 {
-                self.overlap_buf[k] / self.window_sum[k]
+                let s = self.overlap_buf[k] / self.window_sum[k];
+                if s.abs() > 1e-6 {
+                    has_energy = true;
+                }
+                s
             } else {
                 self.overlap_buf[k]
             };
@@ -1506,7 +1511,7 @@ impl IstftStreamer {
         }
         self.overlap_buf.fill(0.0);
         self.window_sum.fill(0.0);
-        output
+        if has_energy { output } else { vec![] }
     }
 }
 
