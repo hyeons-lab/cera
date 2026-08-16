@@ -3796,6 +3796,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens != 27407) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens`: expected 27407, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts != 26137) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts`: expected 26137, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_encode_text');
@@ -4106,6 +4116,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel != 11168) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_clear_cancel`: expected 11168, got $_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_default_generate_opts');
+      _checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts != 61826) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: expected 61826, got $_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_generate');
@@ -4173,8 +4193,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 54184) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 54184, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 17860) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 17860, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens;
     try {
@@ -7389,6 +7409,77 @@ class CeraFfiFfi {
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
       final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineDefaultGenerateOptsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_default_generate_opts');
+
+  GenerateOpts ceraEngineInvokeDefaultGenerateOpts(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ceraEngineDefaultGenerateOptsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeGenerateOpts(retBytes);
       return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -10904,6 +10995,81 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionDefaultGenerateOptsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_default_generate_opts');
+
+  GenerateOpts sessionInvokeDefaultGenerateOpts(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionDefaultGenerateOptsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeGenerateOpts(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionGenerateFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_generate');
 
   GenerateOutput sessionInvokeGenerate(int handle, GenerateOpts opts) {
@@ -12631,6 +12797,13 @@ final class CeraEngine {
     return _ffi.ceraEngineInvokeDecodeTokens(_handle, tokens);
   }
 
+  /// Returns default `GenerateOpts` for this engine, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeDefaultGenerateOpts(_handle);
+  }
+
   /// Encode `text` into token IDs using the model's BPE tokenizer.
   /// Empty input returns an empty vec.
   List<int> encodeText(String text) {
@@ -13635,6 +13808,13 @@ final class Session {
     _ffi.sessionInvokeClearCancel(_handle);
   }
 
+  /// Returns default `GenerateOpts` for this session, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() {
+    _ensureOpen();
+    return _ffi.sessionInvokeDefaultGenerateOpts(_handle);
+  }
+
   /// Run autoregressive decode and return all emitted tokens +
   /// a summary. Synchronous — the call blocks until the decode
   /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -13753,7 +13933,7 @@ final class Session {
   }
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
   Uint8List hiddenStatesForText(String text) {
     _ensureOpen();
     return _ffi.sessionInvokeHiddenStatesForText(_handle, text);

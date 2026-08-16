@@ -447,6 +447,16 @@ struct GpuLayerWeights {
     attn_q_bias: Option<wgpu::Buffer>,
     attn_k_bias: Option<wgpu::Buffer>,
     attn_v_bias: Option<wgpu::Buffer>,
+
+    // Cached bind groups for zero-allocation decode loop
+    attn_norm_bg: Option<wgpu::BindGroup>,
+    ffn_norm_bg: Option<wgpu::BindGroup>,
+    rope_bg: Option<wgpu::BindGroup>,
+    conv_fused_bg: Option<wgpu::BindGroup>,
+    conv_add_bg: Option<wgpu::BindGroup>,
+    attn_out_add_bg: Option<wgpu::BindGroup>,
+    silu_bg: Option<wgpu::BindGroup>,
+    ffn_add_bg: Option<wgpu::BindGroup>,
 }
 
 /// Device-side working set for the routed FFN, allocated once for the model and
@@ -1207,6 +1217,11 @@ enum DecodeTail {
     Logits(TailArgmax),
     /// Output norm only, leaving the normed hidden state in `hidden_buf`.
     Hidden,
+    /// Output norm only, leaving the normed hidden state in `hidden_buf` and returning
+    /// the unsubmitted command encoder for single-pass download staging.
+    HiddenUnsubmitted,
+    /// Output norm and logits/argmax, returning the unsubmitted command encoder.
+    LogitsUnsubmitted(TailArgmax),
 }
 
 impl GpuLfm2Model {
@@ -1245,6 +1260,11 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
         Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+    }
+
+    /// Access the underlying GPU context (device, queue, adapter).
+    pub fn ctx(&self) -> &GpuContext {
+        &self.ctx
     }
 
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
@@ -1792,6 +1812,14 @@ impl GpuLfm2Model {
                 attn_q_bias,
                 attn_k_bias,
                 attn_v_bias,
+                attn_norm_bg: None,
+                ffn_norm_bg: None,
+                rope_bg: None,
+                conv_fused_bg: None,
+                conv_add_bg: None,
+                attn_out_add_bg: None,
+                silu_bg: None,
+                ffn_add_bg: None,
             });
         }
 
@@ -2444,25 +2472,227 @@ impl GpuLfm2Model {
         self.dispatch_into(pass, pipeline, bind_group, self.gemv_workgroups(w));
     }
 
-    /// Pre-create bind groups for all per-layer GEMV dispatches.
-    /// Eliminates ~150 create_bind_group calls per token (~2.4 ms CPU).
+    /// Pre-create bind groups for all per-layer dispatches (GEMVs, norms, RoPE, elementwise ops).
+    /// Eliminates ~250 create_bind_group calls per token.
     fn cache_bind_groups(&mut self) {
         let cfg = &self.config;
         for i in 0..cfg.n_layers {
+            let attn_norm_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.normed_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.layers[i].attn_norm.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rmsnorm_hs_params.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let ffn_norm_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.ffn_input_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.layers[i].ffn_norm.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.rmsnorm_hs_params.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let silu_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.gate_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.up_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.elementwise_is_params.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let ffn_add_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.hidden_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.out_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.residual_add_params.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let (conv_fused_bg, conv_add_bg) = if cfg.block_types[i] == BlockType::GatedConv {
+                let conv_buf = self.active_conv(i);
+                let conv_p = &self.conv1d_params;
+                let bg_fused = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.conv1d_fused.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.conv_proj_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: conv_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.layers[i]
+                                    .conv_weight
+                                    .as_ref()
+                                    .unwrap()
+                                    .as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.conv_gate_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: conv_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let add_p = &self.elementwise_hs_params;
+                let bg_add = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.hidden_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: add_p.as_entire_binding(),
+                            },
+                        ],
+                    });
+                (Some(bg_fused), Some(bg_add))
+            } else {
+                (None, None)
+            };
+
+            let (rope_bg, attn_out_add_bg) = if cfg.block_types[i] != BlockType::GatedConv {
+                let bg_rope = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rope.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.q_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.k_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.rope_params.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: self.rope_freqs_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let bg_add = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.hidden_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.residual_add_params.as_entire_binding(),
+                            },
+                        ],
+                    });
+                (Some(bg_rope), Some(bg_add))
+            } else {
+                (None, None)
+            };
+
+            let layer = &mut self.layers[i];
+            layer.attn_norm_bg = Some(attn_norm_bg);
+            layer.ffn_norm_bg = Some(ffn_norm_bg);
+            layer.silu_bg = Some(silu_bg);
+            layer.ffn_add_bg = Some(ffn_add_bg);
+            layer.conv_fused_bg = conv_fused_bg;
+            layer.conv_add_bg = conv_add_bg;
+            layer.rope_bg = rope_bg;
+            layer.attn_out_add_bg = attn_out_add_bg;
+
             // FFN. Only the dense arm caches: the routed one builds its bind
             // groups per call in `moe_ffn_steps`, so there is nothing here for it
-            // to look up. Its inputs at n = 1 are layer-constant and so are
-            // cacheable in principle, which is worth revisiting with a
-            // measurement (a bind group cost ~16 us when this caching was added,
-            // against a measured 32.7 ms per token on 8B-A1B) rather than on the
-            // strength of that arithmetic.
-            //
-            // The same follow-up covers the seven params buffers `moe_ffn_steps`
-            // uploads per routed layer per call, which are also constant at
-            // n = 1 (~154 fresh buffers per token on 8B-A1B). The dense path
-            // preallocates its equivalents in `GpuWeight::params_buf`, and Metal
-            // passes them with `set_bytes` and allocates nothing; this backend
-            // is the outlier. Measure before moving either.
+            // to look up.
             if let GpuFfn::Dense(d) = &self.layers[i].ffn {
                 let gate_bg = self.make_gemv_bg(&d.gate, &self.ffn_input_buf, &self.gate_buf);
                 let up_bg = self.make_gemv_bg(&d.up, &self.ffn_input_buf, &self.up_buf);
@@ -3558,9 +3788,9 @@ impl GpuLfm2Model {
         pos: usize,
         state: &mut InferenceState,
         tail: DecodeTail,
-    ) {
+    ) -> Option<wgpu::CommandEncoder> {
         assert_eq!(tokens.len(), 1, "GPU forward expects single token");
-        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, tail);
+        self.forward_inner_compute_tail_seeded(HiddenSeed::Token(tokens[0]), pos, state, tail)
     }
 
     /// As [`Self::forward_inner_compute_tail`], but the initial hidden state
@@ -3573,7 +3803,7 @@ impl GpuLfm2Model {
         pos: usize,
         state: &mut InferenceState,
         tail: DecodeTail,
-    ) {
+    ) -> Option<wgpu::CommandEncoder> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
@@ -3669,30 +3899,7 @@ impl GpuLfm2Model {
             if cfg.block_types[i] == BlockType::GatedConv {
                 let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
                 let _d_conv = kernel_size - 1;
-                let conv_buf = self.active_conv(i);
-
-                // Pre-create BGs for conv block (using pre-allocated params).
-                let norm_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.normed_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: lw.attn_norm.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.rmsnorm_hs_params.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
                 let in_w = lw.conv_in_proj.as_ref().unwrap();
                 let in_bg_tmp;
                 let in_bg = match in_w.cached_bg.as_ref() {
@@ -3712,17 +3919,6 @@ impl GpuLfm2Model {
                         self.lora_target_bgs(t, &self.normed_buf, &self.conv_proj_buf),
                     )
                 });
-                // `rmsnorm` normalizes its buffer **in place**, and the residual
-                // add at the end of the block still needs the *pre-norm* hidden
-                // state. So the block normalizes a scratch copy: `hidden` is
-                // copied into `normed`, rmsnorm rewrites `normed`, and `hidden`
-                // is left untouched for the residual. (An out-of-place
-                // `rmsnorm_to(hidden, normed)` would remove this copy entirely.)
-                //
-                // It is also the only *encoder* operation in the whole conv
-                // block, which is what lets the three stages below share one
-                // compute pass — a copy cannot be issued inside a pass, so each
-                // one forces a boundary.
                 Self::encode_copy(
                     &mut enc,
                     &self.hidden_buf,
@@ -3732,46 +3928,7 @@ impl GpuLfm2Model {
                     hs as u64,
                 );
 
-                // Bind groups for the conv and out_proj stages. Built here,
-                // before the pass opens, because a `ComputePass` borrows the
-                // encoder — creating a bind group mid-pass would not compile,
-                // and hoisting them is what lets the whole block be one pass.
-                //
-                // The fused conv shader reads x/c/b directly from
-                // `conv_proj_buf` at offsets 0/hs/2*hs and writes output to
-                // `conv_gate_buf` (where the post-conv out_proj gemv reads
-                // from) — replaces the prior mul1 + conv1d + mul2 sequence and
-                // the three encoder copies that fed it.
-                let conv_p = &self.conv1d_params;
-                let conv_fused_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.conv1d_fused.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.conv_proj_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: conv_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: lw.conv_weight.as_ref().unwrap().as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: self.conv_gate_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: conv_p.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let conv_fused_bg = lw.conv_fused_bg.as_ref().unwrap();
                 let out_w = lw.conv_out_proj.as_ref().unwrap();
                 let out_bg_tmp;
                 let out_bg = match out_w.cached_bg.as_ref() {
@@ -3791,28 +3948,7 @@ impl GpuLfm2Model {
                         self.lora_target_bgs(t, &self.conv_gate_buf, &self.out_buf),
                     )
                 });
-                let add_p = &self.elementwise_hs_params;
-                let add_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.add_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.hidden_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.out_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: add_p.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let add_bg = lw.conv_add_bg.as_ref().unwrap();
 
                 // The whole conv block in ONE compute pass: rmsnorm (on the
                 // `normed` scratch copy made above), in_proj, the fused conv,
@@ -3837,7 +3973,7 @@ impl GpuLfm2Model {
                 // note in the module docs.
                 {
                     let mut pass = self.ctx.begin_pass(&mut enc, "conv");
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                     self.dispatch_gemv_into(&mut pass, in_w, in_bg);
                     if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
                         self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
@@ -3845,7 +3981,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.conv1d_fused,
-                        &conv_fused_bg,
+                        conv_fused_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                     self.dispatch_gemv_into(&mut pass, out_w, out_bg);
@@ -3855,7 +3991,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.add_inplace,
-                        &add_bg,
+                        add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                 }
@@ -3867,28 +4003,7 @@ impl GpuLfm2Model {
                 let n_heads = cfg.n_heads as u32;
                 let q_dim = n_heads * head_dim;
 
-                // Pre-create all BGs before opening passes.
-                let norm_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.normed_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: lw.attn_norm.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.rmsnorm_hs_params.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
                 let q_w = lw.attn_q.as_ref().unwrap();
                 let q_bg_tmp;
                 let q_bg = match q_w.cached_bg.as_ref() {
@@ -3998,31 +4113,7 @@ impl GpuLfm2Model {
                 self.ctx
                     .queue
                     .write_buffer(&self.rope_params, 0, bytemuck::cast_slice(&rope_data));
-                let rope_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.rope.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.q_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.k_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.rope_params.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: self.rope_freqs_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let rope_bg = lw.rope_bg.as_ref().unwrap();
 
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
 
@@ -4052,7 +4143,7 @@ impl GpuLfm2Model {
                 );
                 {
                     let mut pass = self.ctx.begin_pass(&mut enc, "attn_pre");
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                     self.dispatch_gemv_into(&mut pass, q_w, q_bg);
                     self.dispatch_gemv_into(&mut pass, k_w, k_bg);
                     self.dispatch_gemv_into(&mut pass, v_w, v_bg);
@@ -4111,7 +4202,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.rope,
-                        &rope_bg,
+                        rope_bg,
                         (max_pairs.div_ceil(256), 1, 1),
                     );
                 }
@@ -4186,29 +4277,7 @@ impl GpuLfm2Model {
                         &out_bg_tmp
                     }
                 };
-                // Residual add: `scaled_add_inplace` folds Granite's residual
-                // multiplier into the addend (1.0 for every other arch).
-                let add_bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.hidden_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.out_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.residual_add_params.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let add_bg = lw.attn_out_add_bg.as_ref().unwrap();
                 // LoRA attn-output delta: input is the attention output (o_proj
                 // input), added into the post-residual hidden state. The
                 // `residual_mult` fold at upload matches the base o_proj's
@@ -4226,7 +4295,7 @@ impl GpuLfm2Model {
                     self.dispatch_into(
                         &mut pass,
                         &self.pipelines.scaled_add_inplace,
-                        &add_bg,
+                        add_bg,
                         (hs32.div_ceil(256), 1, 1),
                     );
                     if let Some((t, (bg_a, bg_b))) = o_lora_bgs.as_ref() {
@@ -4244,47 +4313,14 @@ impl GpuLfm2Model {
                 0,
                 hs as u64,
             );
-            // FFN: batch 6 dispatches into ONE compute pass.
-            // Pre-create bind groups before opening the pass.
-            let norm_params = &self.rmsnorm_hs_params;
-            let norm_bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.ffn_input_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: lw.ffn_norm.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: norm_params.as_entire_binding(),
-                        },
-                    ],
-                });
-            // A routed layer replaces the entire gate/up/silu/down/residual
-            // sequence with the expert kernels, so it takes the pass on its own
-            // rather than threading the difference through the dense path below.
-            // The rmsnorm is the one shared dispatch: it is the same
-            // normalization either way, and sharing the pass with it keeps the
-            // routed block at one pass per layer like the dense one.
-            //
-            // No LoRA hooks, and none are reachable: `validate_dims` rejects a
-            // dense-FFN delta on a routed layer, and `supports_moe_lora` refuses
-            // an adapter carrying routed-FFN deltas at attach.
+            let norm_bg = lw.ffn_norm_bg.as_ref().unwrap();
             let dense = match &lw.ffn {
                 GpuFfn::Moe(moe) => {
                     let steps =
                         self.moe_ffn_steps(moe, &self.ffn_input_buf, &self.hidden_buf, 1, true);
                     {
                         let mut pass = self.ctx.begin_pass(&mut enc, "ffn_moe");
-                        self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                        self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                         steps.iter().for_each(|s| {
                             self.dispatch_into(&mut pass, s.pipeline, &s.bind_group, s.workgroups);
                         });
@@ -4311,28 +4347,7 @@ impl GpuLfm2Model {
                     &up_bg_tmp
                 }
             };
-            let silu_params = &self.elementwise_is_params;
-            let silu_bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.gate_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: self.up_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: silu_params.as_entire_binding(),
-                        },
-                    ],
-                });
+            let silu_bg = lw.silu_bg.as_ref().unwrap();
             let down_bg_tmp;
             let down_bg = match dense.down.cached_bg.as_ref() {
                 Some(bg) => bg,
@@ -4341,29 +4356,7 @@ impl GpuLfm2Model {
                     &down_bg_tmp
                 }
             };
-            // Residual add: `scaled_add_inplace` folds Granite's residual
-            // multiplier into the addend (1.0 for every other arch).
-            let add_bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.hidden_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: self.out_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: self.residual_add_params.as_entire_binding(),
-                        },
-                    ],
-                });
+            let add_bg = lw.ffn_add_bg.as_ref().unwrap();
 
             // LoRA gate/up deltas on the raw projections (before silu_mul), and
             // the ffn-down delta into the post-residual hidden state (input is
@@ -4391,7 +4384,7 @@ impl GpuLfm2Model {
             {
                 let mut pass = self.ctx.begin_pass(&mut enc, "ffn");
                 // rmsnorm
-                self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, &norm_bg, (1, 1, 1));
+                self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
                 // gate + up GEMVs
                 self.dispatch_gemv_into(&mut pass, &dense.gate, gate_bg);
                 self.dispatch_gemv_into(&mut pass, &dense.up, up_bg);
@@ -4406,7 +4399,7 @@ impl GpuLfm2Model {
                 self.dispatch_into(
                     &mut pass,
                     &self.pipelines.silu_mul_inplace,
-                    &silu_bg,
+                    silu_bg,
                     ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
                 );
                 // down GEMV
@@ -4415,7 +4408,7 @@ impl GpuLfm2Model {
                 self.dispatch_into(
                     &mut pass,
                     &self.pipelines.scaled_add_inplace,
-                    &add_bg,
+                    add_bg,
                     (hs32.div_ceil(256), 1, 1),
                 );
                 // LoRA ffn-down delta into the post-residual hidden state.
@@ -4441,62 +4434,74 @@ impl GpuLfm2Model {
             hs32,
             cfg.rms_norm_eps,
         );
-        let DecodeTail::Logits(argmax) = tail else {
-            self.submit_and_wait(enc);
-            self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-            state.seq_len += 1;
-            self.ctx.finish_profiler();
-            return;
-        };
-        self.encode_lm_head(&mut enc, &self.hidden_buf, &self.logits_buf);
-        // Granite divides the logits by `logits_scaling` (identity elsewhere).
-        if let Some(params) = self.logit_scale_params.as_ref() {
-            let scale_bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("logit_scale_bg"),
-                    layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.logits_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: params.as_entire_binding(),
-                        },
-                    ],
-                });
-            // Was unprofiled; routing it through the choke point gives it a
-            // span too, which is harmless — `begin_profile_span` returns `None`
-            // once the query budget is spent.
-            let mut pass = self.ctx.begin_pass(&mut enc, "logit_scale");
-            self.dispatch_into(
-                &mut pass,
-                &self.pipelines.scale_f32,
-                &scale_bg,
-                ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
-            );
-            drop(pass);
+        match tail {
+            DecodeTail::Hidden => {
+                self.submit_and_wait(enc);
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                None
+            }
+            DecodeTail::HiddenUnsubmitted => {
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                Some(enc)
+            }
+            DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) => {
+                self.encode_lm_head(&mut enc, &self.hidden_buf, &self.logits_buf);
+                // Granite divides the logits by `logits_scaling` (identity elsewhere).
+                if let Some(params) = self.logit_scale_params.as_ref() {
+                    let scale_bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("logit_scale_bg"),
+                            layout: &self.pipelines.scale_f32.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.logits_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: params.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    let mut pass = self.ctx.begin_pass(&mut enc, "logit_scale");
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.scale_f32,
+                        &scale_bg,
+                        ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                    );
+                    drop(pass);
+                }
+                if argmax != TailArgmax::None {
+                    self.encode_argmax_pass(&mut enc);
+                }
+                if argmax == TailArgmax::DispatchAndStage {
+                    // Stage the 4-byte result in this same submission.
+                    enc.copy_buffer_to_buffer(
+                        &self.argmax_out_buf,
+                        0,
+                        &self.argmax_readback_buf,
+                        0,
+                        4,
+                    );
+                }
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
+                    Some(enc)
+                } else {
+                    self.submit_and_wait(enc);
+                    None
+                }
+            }
         }
-        if argmax != TailArgmax::None {
-            self.encode_argmax_pass(&mut enc);
-        }
-        if argmax == TailArgmax::DispatchAndStage {
-            // Stage the 4-byte result in this same submission. On its own it is
-            // another GPU round trip (~1.5 ms) for a 4-byte copy — the handoff
-            // is cheap, waiting for the submission to execute and signal is not.
-            enc.copy_buffer_to_buffer(&self.argmax_out_buf, 0, &self.argmax_readback_buf, 0, 4);
-        }
-        self.submit_and_wait(enc);
-
-        // 4. Update seq_len + profile bookkeeping. Logits are now in
-        // `logits_buf` on the GPU; the caller decides how to consume
-        // them (full readback vs. argmax-then-u32-readback).
-        self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-        state.seq_len += 1;
-        self.ctx.finish_profiler();
     }
 
     /// Encode the argmax compute pass into `enc`. Shared by the sync and async
@@ -4564,18 +4569,20 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            // `Dispatch`, not `DispatchAndStage`: this path reads through
-            // `begin_download`'s per-call buffer, so staging into the shared one
-            // would be a copy nothing reads.
-            self.forward_inner_compute_tail(
-                &[token],
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::Dispatch),
-            );
+            let enc = self
+                .forward_inner_compute_tail(
+                    &[token],
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
+                )
+                .expect("LogitsUnsubmitted returned None");
 
-            self.ctx
-                .begin_download(&self.argmax_out_buf, std::mem::size_of::<u32>() as u64)
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.argmax_out_buf,
+                std::mem::size_of::<u32>() as u64,
+            )
         };
 
         let bytes = pending.recv().await?;
@@ -4611,16 +4618,17 @@ impl GpuLfm2Model {
             let _lora_guard = self.resolve_lora(state);
             // Keep the KV-write slot in lockstep with the RoPE position.
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
-            // `None`: the argmax would be computed and then ignored, and its
-            // staging copy is a second readback nothing reads.
-            self.forward_inner_compute_tail(
-                &[token],
-                pos,
-                state,
-                DecodeTail::Logits(TailArgmax::None),
-            );
+            let enc = self
+                .forward_inner_compute_tail(
+                    &[token],
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::None),
+                )
+                .expect("LogitsUnsubmitted returned None");
 
-            self.ctx.begin_download(
+            self.ctx.begin_download_with_encoder(
+                enc,
                 &self.logits_buf,
                 (vocab * std::mem::size_of::<f32>()) as u64,
             )
@@ -4632,6 +4640,151 @@ impl GpuLfm2Model {
         let mut out = vec![0f32; vocab];
         bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
         Ok(out)
+    }
+
+    /// Async decode step returning the hidden state embedding on GPU, for vocoder conditioning.
+    pub async fn forward_embedding_async(
+        &self,
+        token: u32,
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            let enc = self
+                .forward_inner_compute_tail(&[token], pos, state, DecodeTail::HiddenUnsubmitted)
+                .expect("HiddenUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.hidden_buf,
+                (hidden_size * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let mut out = vec![0f32; hidden_size];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// Async decode step returning the hidden state embedding when seeded by an audio embedding.
+    pub async fn forward_hidden_from_embedding_async(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let hidden_size = self.config.hidden_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::HiddenUnsubmitted,
+                )
+                .expect("HiddenUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.hidden_buf,
+                (hidden_size * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let mut out = vec![0f32; hidden_size];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// Decode step computing hidden state and keeping it in `hidden_buf` on the GPU with no host readback.
+    pub fn forward_hidden_from_embedding_gpu(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<&wgpu::Buffer> {
+        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _lora_guard = self.resolve_lora(state);
+        self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+        self.forward_inner_compute_tail_seeded(
+            HiddenSeed::Embedding(embedding),
+            pos,
+            state,
+            DecodeTail::Hidden,
+        );
+        Ok(&self.hidden_buf)
+    }
+
+    /// Access the GPU hidden state buffer directly for zero-copy downstream pipeline stages.
+    pub fn hidden_buffer(&self) -> &wgpu::Buffer {
+        &self.hidden_buf
+    }
+
+    /// Async decode step returning logits when seeded by an audio embedding.
+    pub async fn forward_logits_from_embedding_async(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>> {
+        let vocab_size = self.config.vocab_size;
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::None),
+                )
+                .expect("LogitsUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.logits_buf,
+                (vocab_size * std::mem::size_of::<f32>()) as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let mut out = vec![0f32; vocab_size];
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// Async decode step returning the argmax token directly when seeded by an audio embedding.
+    pub async fn forward_greedy_from_embedding_async(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<u32> {
+        let pending = {
+            let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+            let _lora_guard = self.resolve_lora(state);
+            self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
+            let enc = self
+                .forward_inner_compute_tail_seeded(
+                    HiddenSeed::Embedding(embedding),
+                    pos,
+                    state,
+                    DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
+                )
+                .expect("LogitsUnsubmitted returned None");
+            self.ctx.begin_download_with_encoder(
+                enc,
+                &self.argmax_out_buf,
+                std::mem::size_of::<u32>() as u64,
+            )
+        };
+        let bytes = pending.recv().await?;
+        let token = bytemuck::pod_read_unaligned::<u32>(&bytes);
+        Ok(token)
     }
 
     /// Adapter name and backend of the underlying [`GpuContext`], for

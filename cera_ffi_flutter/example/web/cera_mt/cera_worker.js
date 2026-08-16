@@ -57,15 +57,6 @@ let gpu = null; // {session, tokenizer}
 /** Human-readable description of the backend that actually loaded. */
 let backendLabel = 'none';
 let pendingAudioSuffixTokens = null;
-let isCancelled = false;
-let cancelSharedBuffer = null;
-let cancelArray = null;
-try {
-  if (typeof SharedArrayBuffer !== 'undefined') {
-    cancelSharedBuffer = new SharedArrayBuffer(4);
-    cancelArray = new Int32Array(cancelSharedBuffer);
-  }
-} catch (_) {}
 
 /**
  * Tokens currently in the live session's KV cache. Zero means BOS.
@@ -126,8 +117,6 @@ function encodePrompt(text, first) {
   return Uint32Array.from(ids);
 }
 
-let currentModuleUrl = null;
-
 /**
  * Load the wasm module once, from a URL the host resolves.
  *
@@ -136,11 +125,7 @@ let currentModuleUrl = null;
  * package and the artifacts are installed into the app's `web/` directory.
  */
 async function ensureModule(moduleUrl) {
-  if (wasm && currentModuleUrl === moduleUrl) return;
-  if (wasm && currentModuleUrl !== moduleUrl) {
-    OPS.close();
-    wasm = null;
-  }
+  if (wasm) return;
   // Absolutize first. A dynamic `import()` treats a specifier with no leading
   // `./`, `../` or scheme as a BARE specifier (a package name), and rejects it
   // outright with "Failed to resolve module specifier", even though the very
@@ -150,14 +135,12 @@ async function ensureModule(moduleUrl) {
   try {
     module = await import(new URL(moduleUrl, self.location.href).href);
     await module.default();
-    currentModuleUrl = moduleUrl;
   } catch (err) {
     const defaultUrl = 'cera/cera_wasm.js';
     if (moduleUrl !== defaultUrl) {
       console.warn(`[cera:worker] failed to load ${moduleUrl} (${err}), falling back to ${defaultUrl}`);
       module = await import(new URL(defaultUrl, self.location.href).href);
       await module.default();
-      currentModuleUrl = defaultUrl;
     } else {
       throw err;
     }
@@ -210,9 +193,6 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
       ? await wasm.WebGpuSession.createWithParts(bytes, mmproj, contextSize, kvCompression)
       : await wasm.WebGpuSession.create(bytes, contextSize, kvCompression);
   } catch (_) {
-    try {
-      kvCompression?.free();
-    } catch (_) {}
     return false;
   }
   gpu = { session, tokenizer: session.tokenizer };
@@ -267,16 +247,9 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress, turb
       onProgress,
     );
   } catch (err) {
-    try {
-      kvCompression?.free();
-    } catch (_) {}
     return String((err && err.message) || err);
   }
-  gpu = {
-    session,
-    tokenizer: session.tokenizer,
-    cancelHandle: typeof session.cancelHandle === 'function' ? session.cancelHandle() : null,
-  };
+  gpu = { session, tokenizer: session.tokenizer };
   backendLabel = `webgpu: ${session.adapter}`;
   return null;
 }
@@ -291,17 +264,14 @@ function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant) {
 
 function initCpuSession(engine, turboQuant) {
   const config = new wasm.SessionConfig();
-  let tq = null;
   if (turboQuant && typeof wasm.TurboQuantConfig === 'function') {
-    tq = new wasm.TurboQuantConfig(BigInt(0));
-    config.kvCompression = tq;
+    config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
   }
   try {
     const session = engine.newSession(config);
     cpu = { engine, session, tokenizer: engine.tokenizer, turboQuant: Boolean(turboQuant) };
   } finally {
     config.free();
-    tq?.free();
   }
   backendLabel = 'wasm cpu';
 }
@@ -373,11 +343,7 @@ const OPS = {
     } else if (!(await tryGpu(view, ctx, proj, turboQuant))) {
       openCpu(view, ctx, proj, type, turboQuant);
     }
-    return {
-      backend: backendLabel,
-      capabilities: capabilitiesOf(),
-      cancelBuffer: cancelSharedBuffer,
-    };
+    return { backend: backendLabel, capabilities: capabilitiesOf() };
   },
 
   /**
@@ -404,7 +370,7 @@ const OPS = {
    * is not bounded by the ~2 GiB limit on a single contiguous JS allocation.
    *
    * `storeDir` names the OPFS directory to cache under; omitting it takes
-   * `BundleRepo's own default. A cached bundle re-opens without any network
+   * `BundleRepo`'s own default. A cached bundle re-opens without any network
    * access and fires no progress events.
    */
   async openBundle(req, post) {
@@ -414,39 +380,26 @@ const OPS = {
     const repo = new wasm.BundleRepo(storeDir ?? undefined);
     const ctx = contextSize ?? undefined;
     // `total` is null when the server sends no Content-Length, and crosses as
-    // null on the post rather than being omitted.
-    const onProgress = (url, done, total) => post({ event: 'progress', url, done, total: total ?? null });
+    // null rather than being dropped so the host can tell "unknown size" from
+    // "no progress yet".
+    const onProgress = (url, done, total) => {
+      post({ event: 'progress', url, done, total: total ?? null });
+    };
     try {
-      if (backend === 'gpu') {
-        const why = await tryGpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
-        if (why != null) {
-          throw new Error(
-            `the WebGPU backend could not open bundle "${bundleId}": ${why}. ` +
-              'Use backend: auto to fall back to the CPU instead.',
-          );
-        }
-        return {
-          backend: backendLabel,
-          capabilities: capabilitiesOf(),
-          cancelBuffer: cancelSharedBuffer,
-        };
-      }
       if (backend === 'cpu') {
         await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
-        return {
-          backend: backendLabel,
-          capabilities: capabilitiesOf(),
-          cancelBuffer: cancelSharedBuffer,
-        };
+        return { backend: backendLabel, capabilities: capabilitiesOf() };
       }
-      // `auto`. The GPU path is tried first.
       const why = await tryGpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
-      if (why == null) {
-        return {
-          backend: backendLabel,
-          capabilities: capabilitiesOf(),
-          cancelBuffer: cancelSharedBuffer,
-        };
+      if (why === null) {
+        return { backend: backendLabel, capabilities: capabilitiesOf() };
+      }
+      if (backend === 'gpu') {
+        throw new Error(
+          `the WebGPU backend could not load bundle ${bundleId}/${quant}: ${why}. ` +
+            'Only LFM2 bundles have a browser GPU path. Use backend: auto to fall ' +
+            'back to the CPU instead.',
+        );
       }
       // `auto`. The CPU load is the fallback, but the GPU reason is the more
       // useful half of a double failure: it is the one that says whether the
@@ -459,11 +412,7 @@ const OPS = {
             `and reported: ${why})`,
         );
       }
-      return {
-        backend: backendLabel,
-        capabilities: capabilitiesOf(),
-        cancelBuffer: cancelSharedBuffer,
-      };
+      return { backend: backendLabel, capabilities: capabilitiesOf() };
     } finally {
       // The repo is a wasm-bindgen handle and nothing else holds it once the
       // load has read what it needs, so it has to be freed explicitly like the
@@ -527,14 +476,11 @@ const OPS = {
     const currentPos = position();
     const userContent =
       prompt && prompt.trim().length > 0
-        ? `${prompt.trim()} ${markerName}`
+        ? `${prompt.trim()}\n${markerName}`
         : markerName;
     const messages = [];
     if (currentPos === 0) {
-      const systemPrompt = capabilitiesOf().audioOut
-        ? 'Respond with interleaved text and audio.'
-        : 'Respond to the user.';
-      messages.push({ role: 'system', content: systemPrompt });
+      messages.push({ role: 'system', content: 'Respond to the user.' });
     }
     messages.push({ role: 'user', content: userContent });
     let formatted;
@@ -544,24 +490,27 @@ const OPS = {
       formatted = userContent;
     }
 
-    const allTokens = Array.from(tk.encodeSpecial(formatted, false));
+    const allTokens = Array.from(tk.encode(formatted, false));
     const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
     let prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
-    const bosId = tk.bosToken ?? tk.bosTokenId;
     if (splitIdx === -1 && prompt && prompt.trim() !== '') {
       const currentPos = position();
       prefix = Array.from(encodePrompt(prompt, currentPos === 0));
-    } else if (position() === 0 && tk.addBosToken && bosId != null) {
-      if (prefix.length === 0 || prefix[0] !== bosId) {
-        prefix.unshift(bosId);
-      }
     }
     const suffix = splitIdx >= 0 ? allTokens.slice(splitIdx + 1) : [];
 
     if (gpu) {
       console.info('[cera:worker] appendAudio: encoding audio frames for WebGPU KV cache...');
       if (prefix.length > 0) {
-        gpu.session.appendTokens(new Uint32Array(prefix));
+        await gpu.session.generateTokens(
+          new Uint32Array(prefix),
+          0,
+          null,
+          null,
+          null,
+          null,
+          () => {},
+        );
       }
       gpu.session.appendAudio(samples, sr);
     } else {
@@ -612,63 +561,39 @@ const OPS = {
       } catch (err) {
         throw new Error(`failed to render ASR chat template: ${err}`);
       }
-      const allTokens = Array.from(tk.encodeSpecial(formatted, false));
-      const bosId = tk.bosToken ?? tk.bosTokenId;
-      if (position() === 0 && tk.addBosToken && bosId != null) {
-        if (allTokens.length === 0 || allTokens[0] !== bosId) {
-          allTokens.unshift(bosId);
-        }
-      }
+      const allTokens = Array.from(tk.encode(formatted, false));
       const splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
 
-      if (splitIdx >= 0) {
+      if (splitIdx > 0) {
         const prefix = allTokens.slice(0, splitIdx);
-        if (prefix.length > 0) {
-          await gpu.session.generateTokens(
-            new Uint32Array(prefix),
-            0,
-            null,
-            null,
-            null,
-            null,
-            () => {},
-          );
-        }
-        gpu.session.appendAudio(samples, sr);
-        const suffix = allTokens.slice(splitIdx + 1);
-        let text = '';
         await gpu.session.generateTokens(
-          new Uint32Array(suffix),
-          256,
+          new Uint32Array(prefix),
+          0,
           null,
           null,
           null,
           null,
-          (piece) => {
-            text += piece;
-          },
+          () => {},
         );
-        const elapsed = (performance.now() - t0).toFixed(1);
-        console.info(`[cera:worker] transcribe: WebGPU ASR completed in ${elapsed}ms -> "${text.trim()}"`);
-        return text.trim();
-      } else {
-        gpu.session.appendAudio(samples, sr);
-        let text = '';
-        await gpu.session.generateTokens(
-          new Uint32Array(allTokens),
-          256,
-          null,
-          null,
-          null,
-          null,
-          (piece) => {
-            text += piece;
-          },
-        );
-        const elapsed = (performance.now() - t0).toFixed(1);
-        console.info(`[cera:worker] transcribe: WebGPU ASR completed in ${elapsed}ms -> "${text.trim()}"`);
-        return text.trim();
       }
+      gpu.session.appendAudio(samples, sr);
+      const suffix = splitIdx >= 0 ? allTokens.slice(splitIdx + 1) : allTokens;
+      let text = '';
+      await gpu.session.generateTokens(
+        new Uint32Array(suffix),
+        256,
+        null,
+        null,
+        null,
+        null,
+        (piece) => {
+          text += piece;
+        },
+      );
+      console.info(
+        `[cera:worker] transcribe: WebGPU ASR completed in ${(performance.now() - t0).toFixed(1)}ms: "${text.trim()}"`,
+      );
+      return text.trim();
     }
     if (cpu) {
       const t0 = performance.now();
@@ -691,10 +616,6 @@ const OPS = {
    * calls continue one conversation; `reset` starts over.
    */
   async generate(req, post) {
-    isCancelled = false;
-    if (cancelArray) {
-      Atomics.store(cancelArray, 0, 0);
-    }
     const { prompt, maxTokens } = req;
     const currentPos = position();
     console.info(
@@ -708,17 +629,14 @@ const OPS = {
     if (req.seed != null && currentPos === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
-      let tq = null;
       if (cpu.turboQuant && typeof wasm.TurboQuantConfig === 'function') {
-        tq = new wasm.TurboQuantConfig(BigInt(0));
-        config.kvCompression = tq;
+        config.kvCompression = new wasm.TurboQuantConfig(BigInt(0));
       }
       try {
         cpu.session.free();
         cpu.session = cpu.engine.newSession(config);
       } finally {
         config.free();
-        tq?.free();
       }
     }
     let ids;
@@ -742,12 +660,6 @@ const OPS = {
     let tokenCount = 0;
     let text = '';
     const onToken = (piece) => {
-      if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
-        isCancelled = true;
-        if (cpu) cpu.session.cancel();
-        if (gpu) gpu.session.cancel();
-        return;
-      }
       tokenCount++;
       if (!firstTokenTime) {
         firstTokenTime = performance.now();
@@ -769,19 +681,6 @@ const OPS = {
       text += piece;
       post({ event: 'token', text: piece });
     };
-    console.info(
-      `[cera:worker] generate op started: backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
-    );
-    const onAudio = (pcm, sampleRate) => {
-      if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
-        isCancelled = true;
-        if (cpu) cpu.session.cancel();
-        if (gpu) gpu.session.cancel();
-        return;
-      }
-      const pcmArray = new Float32Array(pcm);
-      post({ event: 'audio', pcm: pcmArray, sampleRate }, [pcmArray.buffer]);
-    };
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
@@ -798,67 +697,43 @@ const OPS = {
         req.topK ?? null,
         req.seed != null ? BigInt(req.seed) : null,
         onToken,
-        onAudio,
       );
     } else {
       const tk = cpu.tokenizer;
       if (ids.length > 0) {
         cpu.session.appendTokens(ids);
       }
-      const opts =
-        typeof cpu.engine.defaultGenerateOpts === 'function'
-          ? cpu.engine.defaultGenerateOpts()
-          : new wasm.GenerateOpts();
+      const opts = new wasm.GenerateOpts();
       opts.maxTokens = maxTokens;
       if (req.temperature != null) opts.temperature = req.temperature;
       if (req.topP != null) opts.topP = req.topP;
       if (req.topK != null) opts.topK = req.topK;
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
+      opts.flushEveryTokens = 1;
       let uncommittedTokens = [];
       try {
-        console.info('[cera:worker] calling cpu.session.generate...');
-        cpu.session.generate(
-          opts,
-          (toks) => {
-            if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
-              isCancelled = true;
-              if (cpu) cpu.session.cancel();
-              throw new Error('cancelled');
-            }
-            console.info(`[cera:worker] cpu emitted ${toks.length} tokens:`, Array.from(toks));
-            for (let i = 0; i < toks.length; i++) {
-              uncommittedTokens.push(toks[i]);
-            }
-            const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
-            if (decoded.endsWith('\uFFFD') && uncommittedTokens.length < 4) {
-              // Incomplete multibyte UTF-8 character spanning across token chunks;
-              // hold back until the completing token arrives (max 4 bytes).
-              return;
-            }
-            if (decoded.length > 0) {
-              onToken(decoded);
-              uncommittedTokens = [];
-            }
-          },
-          onAudio,
-        );
+        cpu.session.generate(opts, (toks) => {
+          for (let i = 0; i < toks.length; i++) {
+            uncommittedTokens.push(toks[i]);
+          }
+          const decoded = tk.decode(Uint32Array.from(uncommittedTokens));
+          if (decoded.endsWith('\uFFFD') && uncommittedTokens.length < 4) {
+            // Incomplete multibyte UTF-8 character spanning across token chunks;
+            // hold back until the completing token arrives (max 4 bytes).
+            return;
+          }
+          if (decoded.length > 0) {
+            onToken(decoded);
+            uncommittedTokens = [];
+          }
+        });
         if (uncommittedTokens.length > 0) {
           const remaining = tk.decode(Uint32Array.from(uncommittedTokens));
           if (remaining.length > 0) {
             onToken(remaining);
           }
           uncommittedTokens = [];
-        }
-      } catch (err) {
-        if (
-          isCancelled ||
-          (cancelArray && Atomics.load(cancelArray, 0) === 1) ||
-          String(err && err.message).includes('cancelled')
-        ) {
-          console.info('[cera:worker] generate cancelled cleanly');
-        } else {
-          throw err;
         }
       } finally {
         opts.free();
@@ -936,27 +811,9 @@ const OPS = {
    * turn's chunked prefill with `Cancelled`.
    */
   cancel() {
-    isCancelled = true;
-    if (cancelArray) {
-      try {
-        Atomics.store(cancelArray, 0, 1);
-      } catch (_) {}
-    }
     if (cpu) {
-      try {
-        cpu.session.cancel();
-      } catch (_) {}
-    }
-    if (gpu) {
-      if (gpu.cancelHandle) {
-        try {
-          gpu.cancelHandle.cancel();
-        } catch (_) {}
-      } else {
-        try {
-          gpu.session.cancel();
-        } catch (_) {}
-      }
+      cpu.session.cancel();
+      cpu.session.clearCancel();
     }
     return null;
   },
@@ -974,7 +831,6 @@ const OPS = {
       cpu = null;
     }
     if (gpu) {
-      gpu.cancelHandle?.free();
       gpu.tokenizer.free();
       gpu.session.free();
       gpu = null;
@@ -987,10 +843,7 @@ const OPS = {
 self.onmessage = async (e) => {
   const req = e.data;
   const { id, op } = req;
-  const post = (msg, transfer) =>
-    transfer
-      ? self.postMessage({ id, ...msg }, transfer)
-      : self.postMessage({ id, ...msg });
+  const post = (msg) => self.postMessage({ id, ...msg });
   try {
     const handler = OPS[op];
     if (!handler) throw new Error(`unknown op ${op}`);

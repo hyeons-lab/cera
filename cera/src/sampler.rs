@@ -30,7 +30,7 @@ pub fn argmax(logits: &[f32]) -> u32 {
 }
 
 /// Configuration for token sampling.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplerConfig {
     pub temperature: f32,
     pub top_k: usize,

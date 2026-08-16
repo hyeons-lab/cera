@@ -1,0 +1,22 @@
+{
+  "name": "@hyeons-lab/cera-wasm",
+  "description": "wasm-bindgen browser/Node bindings for the cera inference engine",
+  "version": "0.4.0",
+  "license": "Apache-2.0 OR MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hyeons-lab/cera"
+  },
+  "files": [
+    "cera_wasm_bg.wasm",
+    "cera_wasm.js",
+    "cera_wasm.d.ts",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "module": "cera_wasm.js",
+  "types": "cera_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

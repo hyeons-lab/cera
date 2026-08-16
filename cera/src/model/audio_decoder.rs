@@ -15,12 +15,44 @@ use crate::model::weights::MmapWeight;
 
 /// GPU-accelerated audio backend. Implementations provide Metal or WGPU
 /// dispatch for the depthformer (code sampling) and detokenizer (spectrum).
-pub trait AudioGpu {
+pub trait AudioGpu: Send + Sync {
     /// Sample 8 audio codes from an LLM embedding using the depthformer.
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8];
 
+    /// Async version of [`Self::sample_audio_frame`] for WebGPU / browser wasm.
+    fn sample_audio_frame_async<'a>(
+        &'a self,
+        embedding: &'a [f32],
+        temperature: f32,
+        top_k: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.sample_audio_frame(embedding, temperature, top_k)) })
+    }
+
+    /// Async depthformer sampling using a GPU hidden state buffer directly without CPU roundtrip.
+    #[cfg(feature = "gpu")]
+    fn sample_audio_frame_from_gpu_hidden_async<'a>(
+        &'a self,
+        _hidden_buf: &'a wgpu::Buffer,
+        _temperature: f32,
+        _top_k: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::bail!("sample_audio_frame_from_gpu_hidden_async not implemented")
+        })
+    }
+
     /// Convert 8 audio codes to spectrum [n_frames × n_fft_bins × 2].
     fn detokenize_to_spectrum(&self, cpu_weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32>;
+
+    /// Async version of [`Self::detokenize_to_spectrum`].
+    fn detokenize_to_spectrum_async<'a>(
+        &'a self,
+        cpu_weights: &'a DetokenizerWeights,
+        codes: &'a [i32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.detokenize_to_spectrum(cpu_weights, codes)) })
+    }
 
     /// Reset depthformer KV caches (called per audio frame).
     fn reset_depthformer(&self);
@@ -29,12 +61,6 @@ pub trait AudioGpu {
     fn reset_detokenizer(&self);
 
     /// Whether [`AudioGpu::sample_audio_frame`] is actually implemented here.
-    ///
-    /// A backend may ship the detokenizer alone: the WGPU one does, and its
-    /// `sample_audio_frame` panics. Callers that route the depthformer to the
-    /// GPU (the CLI, under `CERA_GPU_DF=1`) must ask this first and fall back
-    /// to the CPU sampler when it is false. Deliberately has no default, so a
-    /// new backend has to answer rather than inherit an answer.
     fn supports_depthformer(&self) -> bool;
 
     /// Convert the accumulated spectrum `[n_frames × n_fft_bins × 2]` (log-mag,
@@ -42,6 +68,16 @@ pub trait AudioGpu {
     /// override to run the iDFT-matmul + windowed overlap-add on-device.
     fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
         istft_to_pcm(spectrum, n_fft, hop_length)
+    }
+
+    /// Async version of [`Self::istft_to_pcm`].
+    fn istft_to_pcm_async<'a>(
+        &'a self,
+        spectrum: &'a [f32],
+        n_fft: usize,
+        hop_length: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.istft_to_pcm(spectrum, n_fft, hop_length)) })
     }
 }
 
@@ -242,6 +278,21 @@ struct LayerKvCache {
 pub struct DepthformerState {
     kv: Vec<LayerKvCache>,
     n_past: usize,
+    cur: Vec<f32>,
+    residual: Vec<f32>,
+    qkv: Vec<f32>,
+    attn_out: Vec<f32>,
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    scores: Vec<f32>,
+    q8_scales: Vec<f32>,
+    q8_quants: Vec<i8>,
+    depthformer_in: Vec<f32>,
+    emb_row: Vec<f32>,
+    normed: Vec<f32>,
+    logits: Vec<f32>,
+    indices: Vec<usize>,
 }
 
 impl DepthformerState {
@@ -253,7 +304,29 @@ impl DepthformerState {
                 v: vec![0.0; cache_size],
             })
             .collect();
-        Self { kv, n_past: 0 }
+        let n_embd = cfg.n_embd;
+        let hd = cfg.n_embd_head;
+        let qkv_dim = cfg.n_head * hd + 2 * (cfg.n_head_kv * hd);
+        let nb = n_embd / 32;
+        Self {
+            kv,
+            n_past: 0,
+            cur: vec![0.0; n_embd],
+            residual: vec![0.0; n_embd],
+            qkv: vec![0.0; qkv_dim],
+            attn_out: vec![0.0; cfg.n_head * hd],
+            proj: vec![0.0; n_embd],
+            gate: vec![0.0; cfg.ffn_dim],
+            up: vec![0.0; cfg.ffn_dim],
+            scores: vec![0.0; cfg.max_seq_len],
+            q8_scales: vec![0.0; nb],
+            q8_quants: vec![0; n_embd],
+            depthformer_in: vec![0.0; n_embd],
+            emb_row: vec![0.0; n_embd],
+            normed: vec![0.0; n_embd],
+            logits: vec![0.0; 2049],
+            indices: Vec::with_capacity(2049),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -301,6 +374,27 @@ pub fn depthformer_forward(
     state: &mut DepthformerState,
     input: &[f32],
 ) -> Vec<f32> {
+    depthformer_forward_into(weights, state, input);
+    state.cur.clone()
+}
+
+/// In-place depthformer forward pass that avoids allocating a returning Vec.
+pub fn depthformer_forward_into(
+    weights: &AudioDecoderWeights,
+    state: &mut DepthformerState,
+    input: &[f32],
+) {
+    state.cur.copy_from_slice(input);
+    depthformer_forward_step(weights, state);
+}
+
+/// In-place depthformer forward pass directly reading `state.depthformer_in`.
+pub fn depthformer_forward_inplace(weights: &AudioDecoderWeights, state: &mut DepthformerState) {
+    state.cur.copy_from_slice(&state.depthformer_in);
+    depthformer_forward_step(weights, state);
+}
+
+fn depthformer_forward_step(weights: &AudioDecoderWeights, state: &mut DepthformerState) {
     let cfg = &weights.depthformer_config;
     let n_embd = cfg.n_embd;
     let n_head = cfg.n_head;
@@ -310,77 +404,62 @@ pub fn depthformer_forward(
     let kv_dim = n_kv * hd;
     let q_dim = n_head * hd;
     let k_dim = n_kv * hd;
-    let qkv_dim = q_dim + k_dim + k_dim; // Q + K + V
     let group_size = n_head / n_kv;
     let scale = 1.0 / (hd as f32).sqrt();
 
-    let mut cur = input.to_vec();
-    assert_eq!(cur.len(), n_embd);
-
-    // Pre-allocate buffers outside the layer loop to avoid per-layer allocation.
-    let mut residual = vec![0.0f32; n_embd];
-    let mut qkv = vec![0.0f32; qkv_dim];
-    let mut attn_out = vec![0.0f32; n_head * hd];
-    let mut proj = vec![0.0f32; n_embd];
-    let mut gate = vec![0.0f32; cfg.ffn_dim];
-    let mut up = vec![0.0f32; cfg.ffn_dim];
-    let mut scores = vec![0.0f32; cfg.max_seq_len];
-    // Q8_0 scratch for pre-quantized GEMV (avoids re-quantizing for each weight matrix).
-    let mut q8_scales = Vec::new();
-    let mut q8_quants = Vec::new();
-
     for (il, lw) in weights.depthformer_layers.iter().enumerate() {
-        residual.copy_from_slice(&cur);
+        state.residual.copy_from_slice(&state.cur);
 
         // 1. RMSnorm.
-        cpu::rmsnorm(&mut cur, &lw.operator_norm, cfg.rms_norm_eps);
+        cpu::rmsnorm(&mut state.cur, &lw.operator_norm, cfg.rms_norm_eps);
 
         // 2. Fused QKV projection → split.
-        // Pre-quantize cur to Q8_0 once, reuse for QKV and later wo.
-        #[cfg(target_arch = "aarch64")]
+        let q8_scratch = if lw.wqkv.dtype != crate::tensor::DType::F32
+            || lw.w1.dtype != crate::tensor::DType::F32
         {
-            let nb = n_embd / 32;
-            q8_scales.resize(nb, 0.0);
-            q8_quants.resize(n_embd, 0);
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &cur,
-                    &mut q8_scales,
-                    &mut q8_quants,
-                );
-            }
-        }
-        qkv.iter_mut().for_each(|v| *v = 0.0);
+            crate::backend::cpu::quantize_f32_to_q8_0_into(
+                &state.cur,
+                &mut state.q8_scales,
+                &mut state.q8_quants,
+            );
+            Some((&mut state.q8_scales, &mut state.q8_quants))
+        } else {
+            None
+        };
+
+        state.qkv.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(
             lw.wqkv.dtype,
             lw.wqkv.data(),
-            &cur,
-            &mut qkv,
+            &state.cur,
+            &mut state.qkv,
             lw.wqkv.rows,
             lw.wqkv.cols,
-            Some((&mut q8_scales, &mut q8_quants)),
+            q8_scratch,
         );
-
-        // Split in-place via index ranges (no copy for V).
-        // Q: qkv[0..q_dim], K: qkv[q_dim..q_dim+k_dim], V: qkv[q_dim+k_dim..]
 
         // 3. Per-head RMSnorm on Q and K (in-place within qkv).
         for h in 0..n_head {
-            let s = &mut qkv[h * hd..(h + 1) * hd];
+            let s = &mut state.qkv[h * hd..(h + 1) * hd];
             cpu::rmsnorm(s, &lw.q_norm, cfg.rms_norm_eps);
         }
         for h in 0..n_kv {
-            let s = &mut qkv[q_dim + h * hd..q_dim + (h + 1) * hd];
+            let s = &mut state.qkv[q_dim + h * hd..q_dim + (h + 1) * hd];
             cpu::rmsnorm(s, &lw.k_norm, cfg.rms_norm_eps);
         }
 
         // 4. RoPE on Q and K (depthformer uses interleaved/NORM style).
         for h in 0..n_head {
-            apply_rope_interleaved(&mut qkv[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+            apply_rope_interleaved(
+                &mut state.qkv[h * hd..(h + 1) * hd],
+                pos,
+                hd,
+                cfg.rope_freq_base,
+            );
         }
         for h in 0..n_kv {
             apply_rope_interleaved(
-                &mut qkv[q_dim + h * hd..q_dim + (h + 1) * hd],
+                &mut state.qkv[q_dim + h * hd..q_dim + (h + 1) * hd],
                 pos,
                 hd,
                 cfg.rope_freq_base,
@@ -392,84 +471,88 @@ pub fn depthformer_forward(
         for h in 0..n_kv {
             let cache_off = pos * kv_dim + h * hd;
             kv.k[cache_off..cache_off + hd]
-                .copy_from_slice(&qkv[q_dim + h * hd..q_dim + (h + 1) * hd]);
+                .copy_from_slice(&state.qkv[q_dim + h * hd..q_dim + (h + 1) * hd]);
             kv.v[cache_off..cache_off + hd]
-                .copy_from_slice(&qkv[q_dim + k_dim + h * hd..q_dim + k_dim + (h + 1) * hd]);
+                .copy_from_slice(&state.qkv[q_dim + k_dim + h * hd..q_dim + k_dim + (h + 1) * hd]);
         }
 
         // 6. Attention: Q×K → softmax → ×V (GQA).
         let seq_len = pos + 1;
-        attn_out.iter_mut().for_each(|v| *v = 0.0);
+        state.attn_out.iter_mut().for_each(|v| *v = 0.0);
 
         for h in 0..n_head {
             let kv_h = h / group_size;
-            let q_head = &qkv[h * hd..(h + 1) * hd];
+            let q_head = &state.qkv[h * hd..(h + 1) * hd];
             let kv_h_offset = kv_h * hd;
 
-            let sc = &mut scores[..seq_len];
+            let sc = &mut state.scores[..seq_len];
             cpu::attn_scores(q_head, &kv.k, sc, kv_dim, kv_h_offset, hd, scale, seq_len);
             cpu::softmax_inplace(sc);
 
-            let out = &mut attn_out[h * hd..(h + 1) * hd];
+            let out = &mut state.attn_out[h * hd..(h + 1) * hd];
             cpu::attn_values(sc, &kv.v, out, kv_dim, kv_h_offset, hd, seq_len);
         }
 
         // 7. Out projection + residual (in-place).
-        proj.iter_mut().for_each(|v| *v = 0.0);
-        lw.wo.gemv(&attn_out, &mut proj);
-        for (c, (r, p)) in cur.iter_mut().zip(residual.iter().zip(&proj)) {
+        state.proj.iter_mut().for_each(|v| *v = 0.0);
+        lw.wo.gemv(&state.attn_out, &mut state.proj);
+        for (c, (r, p)) in state
+            .cur
+            .iter_mut()
+            .zip(state.residual.iter().zip(&state.proj))
+        {
             *c = r + p;
         }
 
         // 8. FFN: RMSnorm → SwiGLU(w1, w3) → w2 → residual.
-        residual.copy_from_slice(&cur);
-        cpu::rmsnorm(&mut cur, &lw.ffn_norm, cfg.rms_norm_eps);
+        state.residual.copy_from_slice(&state.cur);
+        cpu::rmsnorm(&mut state.cur, &lw.ffn_norm, cfg.rms_norm_eps);
 
-        // Pre-quantize cur for FFN gate + up (same input).
-        #[cfg(target_arch = "aarch64")]
-        {
-            let nb = n_embd / 32;
-            q8_scales.resize(nb, 0.0);
-            q8_quants.resize(n_embd, 0);
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &cur,
-                    &mut q8_scales,
-                    &mut q8_quants,
-                );
-            }
-        }
-        gate.iter_mut().for_each(|v| *v = 0.0);
-        up.iter_mut().for_each(|v| *v = 0.0);
+        let ffn_q8 = if lw.w1.dtype != crate::tensor::DType::F32 {
+            crate::backend::cpu::quantize_f32_to_q8_0_into(
+                &state.cur,
+                &mut state.q8_scales,
+                &mut state.q8_quants,
+            );
+            Some((&mut state.q8_scales, &mut state.q8_quants))
+        } else {
+            None
+        };
+
+        state.gate.iter_mut().for_each(|v| *v = 0.0);
+        state.up.iter_mut().for_each(|v| *v = 0.0);
         crate::backend::cpu::gemv_dispatch(
             lw.w1.dtype,
             lw.w1.data(),
-            &cur,
-            &mut gate,
+            &state.cur,
+            &mut state.gate,
             lw.w1.rows,
             lw.w1.cols,
-            Some((&mut q8_scales, &mut q8_quants)),
+            ffn_q8,
         );
         crate::backend::cpu::gemv_dispatch(
             lw.w3.dtype,
             lw.w3.data(),
-            &cur,
-            &mut up,
+            &state.cur,
+            &mut state.up,
             lw.w3.rows,
             lw.w3.cols,
-            Some((&mut q8_scales, &mut q8_quants)),
+            None,
         );
-        cpu::silu_mul_inplace(&mut gate, &up);
+        cpu::silu_mul_inplace(&mut state.gate, &state.up);
 
-        proj.iter_mut().for_each(|v| *v = 0.0);
-        lw.w2.gemv(&gate, &mut proj);
-        for (c, (r, d)) in cur.iter_mut().zip(residual.iter().zip(&proj)) {
+        state.proj.iter_mut().for_each(|v| *v = 0.0);
+        lw.w2.gemv(&state.gate, &mut state.proj);
+        for (c, (r, d)) in state
+            .cur
+            .iter_mut()
+            .zip(state.residual.iter().zip(&state.proj))
+        {
             *c = r + d;
         }
     }
 
     state.n_past += 1;
-    cur
 }
 
 // ── DecoderModel: 8-codebook audio frame sampling ───────────────────────
@@ -488,18 +571,12 @@ pub fn sample_audio_frame(
     top_k: usize,
 ) -> [i32; 8] {
     let cfg = &weights.decoder_config;
-    let _df_cfg = &weights.depthformer_config;
     let mut token = [0i32; 8];
     let mut prev_token: i32 = -1;
 
     state.reset();
 
-    // All codebooks share the same depthformer input dim — hoist
-    // the per-frame scratch outside the codebook loop so we don't
-    // re-allocate `n_codebook` × 2 vectors on every audio frame.
     let n_embd_d = weights.depth_embeddings[0].embedding.cols;
-    let mut depthformer_in = vec![0.0f32; n_embd_d];
-    let mut emb_row = vec![0.0f32; n_embd_d];
 
     for j in 0..cfg.n_codebook {
         let cb = &weights.depth_embeddings[j];
@@ -509,15 +586,13 @@ pub fn sample_audio_frame(
         );
 
         // 1. Project LLM embedding → depthformer input for codebook j.
-        //    depth_linear.weight is [n_embd_llm, n_codebook * n_embd_d],
-        //    slice rows [j*n_embd_d .. (j+1)*n_embd_d].
-        depthformer_in.fill(0.0);
+        state.depthformer_in.fill(0.0);
         let row_start = j * n_embd_d;
         weights
             .depth_linear_w
-            .gemv_rows(embedding, &mut depthformer_in, row_start, n_embd_d);
+            .gemv_rows(embedding, &mut state.depthformer_in, row_start, n_embd_d);
         // Add bias.
-        for (r, out) in depthformer_in.iter_mut().enumerate() {
+        for (r, out) in state.depthformer_in.iter_mut().enumerate() {
             *out += weights.depth_linear_b[row_start + r];
         }
 
@@ -525,41 +600,48 @@ pub fn sample_audio_frame(
         if j > 0 && prev_token >= 0 {
             let prev_cb = &weights.depth_embeddings[j - 1];
             let tok = prev_token as usize;
-            prev_cb.embedding.dequantize_row(tok, &mut emb_row);
-            for (d, e) in depthformer_in.iter_mut().zip(&emb_row) {
+            prev_cb.embedding.dequantize_row(tok, &mut state.emb_row);
+            for (d, e) in state.depthformer_in.iter_mut().zip(&state.emb_row) {
                 *d += e;
             }
         }
 
-        // 3. Run depthformer.
-        let hidden = depthformer_forward(weights, state, &depthformer_in);
+        // 3. Run depthformer in-place.
+        depthformer_forward_inplace(weights, state);
 
         // 4. RMSnorm → to_logits → sample.
-        let mut normed = hidden;
-        cpu::rmsnorm(&mut normed, &cb.norm, cfg.rms_norm_eps);
+        state.normed.copy_from_slice(&state.cur);
+        cpu::rmsnorm(&mut state.normed, &cb.norm, cfg.rms_norm_eps);
 
-        let mut logits = vec![0.0; cfg.n_vocab];
-        cb.to_logits.gemv(&normed, &mut logits);
+        state.logits.resize(cfg.n_vocab, 0.0);
+        state.logits.fill(0.0);
+        cb.to_logits.gemv(&state.normed, &mut state.logits);
 
-        // Sample (greedy if temperature <= 0, otherwise top-k).
-        let sampled = if temperature <= 0.0 {
-            crate::sampler::argmax(&logits) as i32
+        // Sample (greedy if temperature <= 0 or top_k <= 1, otherwise top-k).
+        let sampled = if temperature <= 0.0 || top_k <= 1 {
+            crate::sampler::argmax(&state.logits) as i32
         } else {
             // Temperature scaling + top-k sampling.
             let inv_temp = 1.0 / temperature;
-            for l in &mut logits {
+            for l in &mut state.logits {
                 *l *= inv_temp;
             }
-            cpu::softmax_inplace(&mut logits);
-            // Simple top-k: find top-k, sample from them.
-            let mut indices: Vec<usize> = (0..logits.len()).collect();
-            indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-            indices.truncate(top_k.min(logits.len()));
-            let sum: f32 = indices.iter().map(|&i| logits[i]).sum();
+            cpu::softmax_inplace(&mut state.logits);
+            let n_logits = state.logits.len();
+            let k = top_k.min(n_logits);
+            state.indices.clear();
+            state.indices.extend(0..n_logits);
+            if k < n_logits {
+                state.indices.select_nth_unstable_by(k - 1, |&a, &b| {
+                    state.logits[b].total_cmp(&state.logits[a])
+                });
+            }
+            let top_indices = &state.indices[..k];
+            let sum: f32 = top_indices.iter().map(|&i| state.logits[i]).sum();
             let mut r = rand::random::<f32>() * sum;
-            let mut picked = indices[0];
-            for &i in &indices {
-                r -= logits[i];
+            let mut picked = top_indices[0];
+            for &i in top_indices {
+                r -= state.logits[i];
                 if r <= 0.0 {
                     picked = i;
                     break;
@@ -1340,5 +1422,147 @@ fn ifft_frame(
     let inv_n = 1.0 / n_fft as f32;
     for (o, c) in out.iter_mut().zip(fft_buf.iter()) {
         *o = c.re * inv_n;
+    }
+}
+
+/// Stateful streaming inverse STFT (overlap-add) processor.
+///
+/// Maintains overlap-add state across streaming frame decodes so PCM audio can
+/// be streamed progressively with zero boundary discontinuities or fade artifacts.
+pub struct IstftStreamer {
+    n_fft: usize,
+    hop_length: usize,
+    n_fft_bins: usize,
+    frame_size: usize,
+    hann: Vec<f32>,
+    overlap_buf: Vec<f32>,
+    window_sum: Vec<f32>,
+    padding_remaining: usize,
+    fft_buf: Vec<rustfft::num_complex::Complex32>,
+    time_domain: Vec<f32>,
+    ifft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+}
+
+impl IstftStreamer {
+    pub fn new(n_fft: usize, hop_length: usize) -> Self {
+        let mut planner = rustfft::FftPlanner::new();
+        let ifft = planner.plan_fft_inverse(n_fft);
+        let n_fft_bins = n_fft / 2 + 1;
+        let frame_size = n_fft_bins * 2;
+        let hann = build_hann(n_fft);
+        let padding = (n_fft - hop_length) / 2;
+        Self {
+            n_fft,
+            hop_length,
+            n_fft_bins,
+            frame_size,
+            hann,
+            overlap_buf: vec![0.0f32; n_fft],
+            window_sum: vec![0.0f32; n_fft],
+            padding_remaining: padding,
+            fft_buf: vec![rustfft::num_complex::Complex32::new(0.0, 0.0); n_fft],
+            time_domain: vec![0.0f32; n_fft],
+            ifft,
+        }
+    }
+
+    /// Feed spectrum floats for 1 or more frames and return newly decoded PCM samples.
+    pub fn feed_frames(&mut self, spectrum: &[f32]) -> Vec<f32> {
+        let n_frames = spectrum.len() / self.frame_size;
+        if n_frames == 0 {
+            return vec![];
+        }
+        let mut output = Vec::with_capacity(n_frames * self.hop_length);
+        for i in 0..n_frames {
+            for c in self.fft_buf.iter_mut() {
+                *c = rustfft::num_complex::Complex32::new(0.0, 0.0);
+            }
+            for j in 0..self.n_fft_bins {
+                let log_abs = spectrum[i * self.frame_size + j];
+                let angle = spectrum[i * self.frame_size + self.n_fft_bins + j];
+                let mag = log_abs.exp();
+                self.fft_buf[j] =
+                    rustfft::num_complex::Complex32::new(mag * angle.cos(), mag * angle.sin());
+            }
+            for j in 1..self.n_fft_bins - 1 {
+                self.fft_buf[self.n_fft - j] =
+                    rustfft::num_complex::Complex32::new(self.fft_buf[j].re, -self.fft_buf[j].im);
+            }
+
+            ifft_frame(
+                &mut self.fft_buf,
+                &mut self.time_domain,
+                self.n_fft,
+                self.ifft.as_ref(),
+            );
+
+            for j in 0..self.n_fft {
+                self.overlap_buf[j] += self.time_domain[j] * self.hann[j];
+                self.window_sum[j] += self.hann[j] * self.hann[j];
+            }
+
+            for k in 0..self.hop_length {
+                let sample = if self.window_sum[k] > 1e-8 {
+                    self.overlap_buf[k] / self.window_sum[k]
+                } else {
+                    self.overlap_buf[k]
+                };
+                if self.padding_remaining > 0 {
+                    self.padding_remaining -= 1;
+                } else {
+                    output.push(sample);
+                }
+            }
+
+            self.overlap_buf.copy_within(self.hop_length..self.n_fft, 0);
+            self.overlap_buf[self.n_fft - self.hop_length..].fill(0.0);
+            self.window_sum.copy_within(self.hop_length..self.n_fft, 0);
+            self.window_sum[self.n_fft - self.hop_length..].fill(0.0);
+        }
+        output
+    }
+
+    /// Flush any remaining samples buffered in the overlap-add accumulator.
+    pub fn flush(&mut self) -> Vec<f32> {
+        self.overlap_buf.fill(0.0);
+        self.window_sum.fill(0.0);
+        vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_istft_streamer_exact_parity_with_batch() {
+        let n_fft = 1280;
+        let hop_length = 320;
+        let n_fft_bins = n_fft / 2 + 1;
+        let frame_size = n_fft_bins * 2;
+        let n_frames = 18; // 3 tokens * 6 frames
+
+        let mut spectrum = vec![0.0f32; n_frames * frame_size];
+        for i in 0..spectrum.len() {
+            spectrum[i] = ((i as f32) * 0.01).sin();
+        }
+
+        let batch_pcm = istft_to_pcm(&spectrum, n_fft, hop_length);
+
+        let mut streamer = IstftStreamer::new(n_fft, hop_length);
+        let mut streamed_pcm = Vec::new();
+        // Feed in 6-frame chunks (matching 1 token at a time)
+        for chunk in spectrum.chunks(6 * frame_size) {
+            let pcm_chunk = streamer.feed_frames(chunk);
+            streamed_pcm.extend_from_slice(&pcm_chunk);
+        }
+
+        assert_eq!(batch_pcm.len(), streamed_pcm.len());
+        for (idx, (&b, &s)) in batch_pcm.iter().zip(streamed_pcm.iter()).enumerate() {
+            assert!(
+                (b - s).abs() < 1e-6,
+                "Sample mismatch at {idx}: batch={b}, stream={s}"
+            );
+        }
     }
 }

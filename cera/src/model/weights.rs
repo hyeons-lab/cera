@@ -186,7 +186,7 @@ impl MmapWeight {
     /// fall-through to `dequantize_row` is preferable to a panic.
     pub fn try_as_f32(&self) -> Option<&[f32]> {
         if self.dtype == DType::F32 {
-            Some(bytemuck::cast_slice(self.data()))
+            bytemuck::try_cast_slice(self.data()).ok()
         } else {
             None
         }
@@ -235,6 +235,65 @@ impl MmapWeight {
         );
     }
 
+    pub fn batched_matmul(&self, x: &[f32], y: &mut [f32], n_tokens: usize) {
+        self.batched_matmul_with_scratch(x, y, n_tokens, None);
+    }
+
+    /// Batched linear projection: `y[tokens, rows] = x[tokens, cols] · selfᵀ`
+    /// where `self` is `[rows × cols]`.
+    ///
+    /// By inverting the loop order (iterating over weight rows in the outer loop
+    /// and token rows in the inner loop), each quantized weight row is dequantized
+    /// and loaded into CPU cache **once** rather than `n_tokens` times.
+    ///
+    /// If `scratch` is provided and has `scratch.len() >= self.cols`, it is used
+    /// directly to avoid allocating on the heap.
+    pub fn batched_matmul_with_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        n_tokens: usize,
+        scratch: Option<&mut [f32]>,
+    ) {
+        assert_eq!(x.len(), n_tokens * self.cols);
+        assert_eq!(y.len(), n_tokens * self.rows);
+        if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
+            return;
+        }
+
+        // Fast path if already contiguous and properly aligned F32
+        if self.dtype == DType::F32
+            && let Some(w_f32) = self.try_as_f32()
+        {
+            for r in 0..self.rows {
+                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                for t in 0..n_tokens {
+                    let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                    y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, w_row);
+                }
+            }
+            return;
+        }
+
+        // Quantized path: dequantize each row into scratch ONCE
+        let mut local_buf;
+        let row_buf: &mut [f32] = match scratch {
+            Some(buf) if buf.len() >= self.cols => &mut buf[..self.cols],
+            _ => {
+                local_buf = vec![0.0f32; self.cols];
+                &mut local_buf[..]
+            }
+        };
+
+        for r in 0..self.rows {
+            self.dequantize_row(r, row_buf);
+            for t in 0..n_tokens {
+                let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, row_buf);
+            }
+        }
+    }
+
     /// Dequantise a single row at `row_idx` into `dst`. `dst.len()`
     /// must equal `self.cols`. Works for any dtype the rest of the
     /// crate supports (F32 path is a memcpy, quantised dtypes route
@@ -263,19 +322,34 @@ impl MmapWeight {
         let bytes = &self.data()[offset..offset + row_bytes];
         match self.dtype {
             DType::F32 => {
-                let src: &[f32] = bytemuck::cast_slice(bytes);
-                dst.copy_from_slice(src);
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+                    dst.copy_from_slice(src);
+                } else {
+                    bytemuck::cast_slice_mut::<f32, u8>(dst).copy_from_slice(bytes);
+                }
             }
             DType::F16 => {
-                let src: &[half::f16] = bytemuck::cast_slice(bytes);
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = crate::quant::f16_to_f32(s.to_bits());
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, half::f16>(bytes) {
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = crate::quant::f16_to_f32(s.to_bits());
+                    }
+                } else {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        *d = crate::quant::f16_to_f32(bits);
+                    }
                 }
             }
             DType::BF16 => {
-                let src: &[half::bf16] = bytemuck::cast_slice(bytes);
-                for (d, &s) in dst.iter_mut().zip(src) {
-                    *d = crate::quant::bf16_to_f32(s.to_bits());
+                if let Ok(src) = bytemuck::try_cast_slice::<u8, half::bf16>(bytes) {
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = crate::quant::bf16_to_f32(s.to_bits());
+                    }
+                } else {
+                    for (i, d) in dst.iter_mut().enumerate() {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        *d = crate::quant::bf16_to_f32(bits);
+                    }
                 }
             }
             DType::Q4_0 => crate::quant::dequantize_q4_0_row(bytes, dst),

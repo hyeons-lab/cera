@@ -30,6 +30,17 @@ fn load_a(idx: u32) -> f32 {
 #endif
 }
 
+// Load weight vector (4 consecutive elements) of the row-major A[m, k] as vec4<f32>.
+fn load_a_vec4(idx: u32) -> vec4<f32> {
+#ifdef F16_A
+    let p0 = unpack2x16float(a[idx / 2u]);
+    let p1 = unpack2x16float(a[idx / 2u + 1u]);
+    return vec4<f32>(p0.x, p0.y, p1.x, p1.y);
+#else
+    return vec4<f32>(a[idx], a[idx + 1u], a[idx + 2u], a[idx + 3u]);
+#endif
+}
+
 const NR: u32 = 8u;
 const WG_SIZE: u32 = 32u;
 
@@ -51,8 +62,22 @@ fn gemv_f32(
         sums[r] = 0.0;
     }
 
-    // Each thread strides through k in steps of 32.
-    var col = tid;
+    // 4-wide vectorized loop: 32 threads process 128 elements per step.
+    let k_vec = k & ~3u;
+    var col = tid * 4u;
+    while col < k_vec {
+        let xv = vec4<f32>(x[col], x[col + 1u], x[col + 2u], x[col + 3u]);
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                let av = load_a_vec4((r0 + r) * k + col);
+                sums[r] += dot(av, xv);
+            }
+        }
+        col += 128u;
+    }
+
+    // Scalar tail for any remaining unaligned elements.
+    col = k_vec + tid;
     while col < k {
         let xv = x[col];
         for (var r = 0u; r < NR; r += 1u) {
@@ -108,7 +133,20 @@ fn gemv_f32_accum(
         sums[r] = 0.0;
     }
 
-    var col = tid;
+    let k_vec = k & ~3u;
+    var col = tid * 4u;
+    while col < k_vec {
+        let xv = vec4<f32>(x[col], x[col + 1u], x[col + 2u], x[col + 3u]);
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                let av = load_a_vec4((r0 + r) * k + col);
+                sums[r] += dot(av, xv);
+            }
+        }
+        col += 128u;
+    }
+
+    col = k_vec + tid;
     while col < k {
         let xv = x[col];
         for (var r = 0u; r < NR; r += 1u) {

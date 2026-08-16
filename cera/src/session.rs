@@ -5,11 +5,10 @@
 //! one-shot `engine::generate()` so every downstream consumer — CLI,
 //! FFI bindings, browser workers, the AIDL service — shares one core.
 //!
-//! The API is multimodal from day one even though only text is wired
-//! in v1: `append_image` and `append_audio` return
-//! `CeraError::UnsupportedModality` until the VL / audio loaders land
-//! in follow-ups. Callbacks use a `ModalitySink` trait with default-empty
-//! methods so text-only consumers override just `on_text_tokens` + `on_done`.
+//! The API is multimodal: `append_image` and `append_audio` feed visual and
+//! acoustic features into the LLM via their respective attached encoders.
+//! Callbacks use a `ModalitySink` trait with default-empty methods so text-only
+//! consumers override just `on_text_tokens` + `on_done`.
 
 use std::io;
 use std::sync::Arc;
@@ -36,11 +35,11 @@ pub struct SessionConfig {
     pub max_seq_len: Option<u32>,
     /// KV cache compression mode.
     pub kv_compression: KvCompression,
-    /// Reserved for Phase 1.5 context shift — tokens pinned at the front on overflow. Ignored in 1.1.
+    /// Number of tokens pinned at the front on context shift overflow (e.g. system prompt).
     pub n_keep: u32,
     /// Optional deterministic seed for the sampler.
     pub seed: Option<u64>,
-    /// Reserved for Phase 1.4 chunked prefill — ubatch size. Ignored in 1.1 (prefill is monolithic).
+    /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
 }
 
@@ -143,8 +142,8 @@ impl Default for GenerateOpts {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
+            min_p: 0.05,
+            repetition_penalty: 1.1,
             stop_tokens: Vec::new(),
             ignore_eos: false,
             grammar: None,
@@ -153,6 +152,65 @@ impl Default for GenerateOpts {
             flush_every_ms: 50,
             spec: None,
         }
+    }
+}
+
+impl GenerateOpts {
+    /// Constructs a `GenerateOpts` seeded with the advisory defaults from the
+    /// given manifest (if any), falling back to standard defaults for unmentioned fields.
+    pub fn from_manifest(manifest: &crate::manifest::Manifest) -> Self {
+        let mut opts = Self::default();
+        match &manifest.generation_defaults {
+            crate::manifest::GenerationDefaults::Text {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+            } => {
+                if let Some(t) = temperature {
+                    opts.temperature = *t;
+                }
+                if let Some(mp) = min_p {
+                    opts.min_p = *mp;
+                }
+                if let Some(tp) = top_p {
+                    opts.top_p = *tp;
+                }
+                if let Some(tk) = top_k {
+                    opts.top_k = *tk;
+                }
+                if let Some(rp) = repetition_penalty {
+                    opts.repetition_penalty = *rp;
+                }
+            }
+            crate::manifest::GenerationDefaults::Audio {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+                ..
+            } => {
+                if let Some(t) = temperature {
+                    opts.temperature = *t;
+                }
+                if let Some(mp) = min_p {
+                    opts.min_p = *mp;
+                }
+                if let Some(tp) = top_p {
+                    opts.top_p = *tp;
+                }
+                if let Some(tk) = top_k {
+                    opts.top_k = *tk;
+                }
+                if let Some(rp) = repetition_penalty {
+                    opts.repetition_penalty = *rp;
+                }
+            }
+            _ => {}
+        }
+        opts
     }
 }
 
@@ -176,7 +234,7 @@ pub struct GenerateSummary {
 }
 
 /// Why a decode loop ended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
     /// Hit `max_tokens`.
     MaxTokens,
@@ -479,6 +537,8 @@ pub struct Session {
     /// inference_type at construction. Immutable for the session's
     /// lifetime.
     capabilities: ModalityCapabilities,
+    /// Default generation options for this session.
+    default_opts: GenerateOpts,
     /// Retained for `reset()` (rebuild state + sampler) and
     /// `sync_sampler_from_opts` (read back the seed).
     config: SessionConfig,
@@ -488,6 +548,10 @@ pub struct Session {
     /// encoder can back multiple sessions (one per concurrent
     /// generation) without re-loading the ~hundreds-of-MB weights.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Audio decoder (vocoder depthformer) weights, if attached.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Detokenizer weights, if attached.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
     /// Optional cached GPU audio encoder. When present, [`Self::append_audio`]
     /// runs the Conformer encoder on the GPU instead of the CPU
     /// `audio_encoder`; the CPU encoder above is always kept as the fallback
@@ -643,8 +707,11 @@ impl Session {
             prefill_elapsed: Duration::ZERO,
             max_seq_len,
             capabilities,
+            default_opts: GenerateOpts::default(),
             config,
             audio_encoder: None,
+            audio_decoder: None,
+            detok_weights: None,
             gpu_audio_encoder: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
@@ -654,6 +721,27 @@ impl Session {
             hs_scratch_cap: 0,
             lora: None,
         })
+    }
+
+    /// Borrow the default generation options configured for this session.
+    pub fn default_generate_opts(&self) -> &GenerateOpts {
+        &self.default_opts
+    }
+
+    /// Override the default generation options for this session.
+    pub fn set_default_generate_opts(&mut self, opts: GenerateOpts) {
+        self.default_opts = opts;
+    }
+
+    /// Attach vocoder weights so [`Self::generate`] can synthesize PCM audio
+    /// frames from model hidden states when the model enters audio mode.
+    pub fn attach_vocoder(
+        &mut self,
+        decoder: Arc<crate::model::audio_decoder::AudioDecoderWeights>,
+        detok: Arc<crate::model::audio_decoder::DetokenizerWeights>,
+    ) {
+        self.audio_decoder = Some(decoder);
+        self.detok_weights = Some(detok);
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -965,9 +1053,7 @@ impl Session {
         debug_assert_eq!(t * d, flat.len(), "hidden states not a multiple of D");
         let mut pooled = vec![0.0f32; d];
         for row in flat.chunks_exact(d) {
-            for (p, &x) in pooled.iter_mut().zip(row) {
-                *p += x;
-            }
+            crate::backend::cpu::add_inplace(&mut pooled, row);
         }
         if t > 0 {
             let inv = 1.0 / t as f32;
@@ -997,10 +1083,8 @@ impl Session {
     /// MLP adapter) and prefills the resulting per-frame hidden
     /// states into KV via [`Self::append_embeddings`].
     ///
-    /// `samples` is f32 PCM in `[-1, 1]`, mono. `sample_rate` must
-    /// match [`crate::model::audio_encoder::SAMPLE_RATE`] (16 kHz);
-    /// resampling is out of scope — caller is expected to resample
-    /// externally if their source rate differs.
+    /// `samples` is f32 PCM in `[-1, 1]`, mono. Non-16kHz inputs
+    /// are automatically linearly resampled to 16 kHz.
     ///
     /// Errors are checked in the order listed. The first matching
     /// condition wins — e.g. an empty `samples` buffer paired with
@@ -1016,11 +1100,11 @@ impl Session {
     /// 3. [`CeraError::Backend`] when the attached encoder's
     ///    `llm_hidden_size` doesn't match the LLM's `hidden_size`
     ///    (wrong-bundle encoder).
-    /// 4. [`CeraError::Backend`] on sample-rate mismatch.
-    /// 5. [`CeraError::EmptyInput`] when `samples` is empty *or* the
+    /// 4. [`CeraError::EmptyInput`] when `samples` is empty *or* the
     ///    audio is too short to produce any encoder frames (less than
-    ///    one window after center-padded STFT).
-    /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
+    ///    one window after center-padded STFT). Non-16kHz inputs are
+    ///    automatically resampled to 16kHz.
+    /// 5. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
     ///    propagated from the underlying [`Self::append_embeddings`]
     ///    call.
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {
@@ -1051,34 +1135,49 @@ impl Session {
                  currently-loaded LLM."
             )));
         }
-        if sample_rate != crate::model::audio_encoder::SAMPLE_RATE {
-            return Err(CeraError::Backend(format!(
-                "Session::append_audio: sample_rate {} != {} required by \
-                 encoder (resampling is out of scope; resample externally \
-                 before passing samples in)",
-                sample_rate,
-                crate::model::audio_encoder::SAMPLE_RATE,
-            )));
-        }
         if samples.is_empty() {
             return Err(CeraError::EmptyInput);
         }
+        if !(1000..=192_000).contains(&sample_rate) {
+            return Err(CeraError::Backend(format!(
+                "unsupported audio sample rate: {sample_rate} Hz (expected 1000..=192000 Hz)"
+            )));
+        }
+        let target_sr = crate::model::audio_encoder::SAMPLE_RATE;
+        let resampled: std::borrow::Cow<[f32]> = if sample_rate == target_sr {
+            std::borrow::Cow::Borrowed(samples)
+        } else {
+            std::borrow::Cow::Owned(crate::model::audio_encoder::resample_linear(
+                samples,
+                sample_rate,
+                target_sr,
+            ))
+        };
+        if resampled.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        let effective_samples = resampled.as_ref();
         // Prefer the GPU encoder when one is attached. A GPU refusal (chunk
         // longer than the attention kernel's capacity, unsupported geometry) is
         // a fallback, not a failure: the CPU encoder is always present and
         // produces the same output, just slower.
         let (embeddings, n_frames) = match self.gpu_audio_encoder.as_ref() {
-            Some(gpu) => match gpu.encode_pcm(samples) {
+            Some(gpu) => match gpu.encode_pcm(effective_samples) {
                 Ok(out) => out,
                 Err(e) => {
                     // warn, not debug, and for the same reason
                     // `try_metal_audio_encoder` warns at build time: the only
                     // other symptom of this is "audio encode got slower".
                     tracing::warn!("audio encoder: GPU path declined, using CPU: {e:#}");
-                    crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref())
+                    crate::model::audio_encoder::encode_audio_pcm(
+                        effective_samples,
+                        encoder.as_ref(),
+                    )
                 }
             },
-            None => crate::model::audio_encoder::encode_audio_pcm(samples, encoder.as_ref()),
+            None => {
+                crate::model::audio_encoder::encode_audio_pcm(effective_samples, encoder.as_ref())
+            }
         };
         if n_frames == 0 {
             // Sub-window-length input: log_mel_spectrogram produced
@@ -1691,10 +1790,6 @@ impl Session {
         opts: &GenerateOpts,
         sink: &mut S,
     ) -> Result<GenerateSummary, CeraError> {
-        // Reset cancel at the start of each generate — stale flips from a
-        // prior call shouldn't pre-cancel the next one.
-        self.cancel.store(false, Ordering::Relaxed);
-
         // Prefill happened in `append_*`, which accumulated its token count and
         // wall time on the session. Consume them here — unconditionally, so
         // EVERY `generate()` call (including the no-op early exits below)
@@ -1710,6 +1805,31 @@ impl Session {
         self.prefill_elapsed = Duration::ZERO;
 
         let decode_start = Instant::now();
+
+        // RAII guard ensuring the cancel flag is cleared when this generation exits
+        // (whether on completion, cancellation, or error).
+        struct CancelGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _cancel_guard = CancelGuard(Arc::clone(&self.cancel));
+
+        // If a cancel was already armed before generate() started (e.g. preemption or timeout),
+        // honor it immediately without performing unnecessary work.
+        if self.cancel.load(Ordering::Relaxed) {
+            sink.on_done(FinishReason::Cancelled);
+            let decode_ms = duration_ms_u32(decode_start.elapsed());
+            return Ok(GenerateSummary {
+                tokens_generated: 0,
+                prompt_eval_tokens,
+                prompt_eval_ms,
+                decode_ms,
+                finish_reason: FinishReason::Cancelled,
+            });
+        }
+
         let mut finish = FinishReason::MaxTokens;
         let mut generated: u32 = 0;
         let mut pos = self.current_pos;
@@ -1754,6 +1874,12 @@ impl Session {
         // and returns the argmax token directly — a real win on Metal
         // (~hundreds of μs per token saved at 64 K vocab).
         let mut logits = self.last_logits.take().ok_or(CeraError::EmptyInput)?;
+        tracing::info!(
+            "[cera:session] generate starting: current_pos={}, max_seq_len={}, audio_vocoder_attached={}",
+            self.current_pos,
+            self.max_seq_len,
+            self.audio_decoder.is_some() && self.detok_weights.is_some()
+        );
 
         // Greedy mode is decided once per generate call: deterministic
         // argmax + `forward_greedy`. Stochastic mode samples with RNG +
@@ -1879,6 +2005,20 @@ impl Session {
         // That preserves seeded-split-generation reproducibility: a
         // single `generate(N)` advances RNG the same number of steps as
         // two `generate(N/2)` calls with the same seed.
+        let mut decoder =
+            if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                Some(
+                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.8, 4, false)
+                        .with_streaming(false),
+                )
+            } else {
+                None
+            };
+        let mut modality_budget = 6usize;
+        let mut text_done = false;
+        let mut trailing_audio_segments: usize = 0;
+        const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
+
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 finish = FinishReason::Cancelled;
@@ -1955,9 +2095,11 @@ impl Session {
             // constraint begins on the next token.
             if is_pending_trigger {
                 armed = true;
-            } else if armed && let Some(state) = grammar_state.as_mut() {
+            } else if armed
+                && let (Some(state), Some(mask)) = (grammar_state.as_mut(), grammar_mask.as_ref())
+            {
                 // Advance the grammar by the chosen (grammar-valid, non-EOS) token.
-                state.accept(grammar_mask.as_ref().unwrap().token_bytes(token));
+                state.accept(mask.token_bytes(token));
                 // For a lazy tool-call grammar, deactivate once the interior is
                 // complete so the model can emit its closing marker and continue.
                 // Reset to a fresh grammar state so a later trigger token re-arms
@@ -1971,7 +2113,6 @@ impl Session {
                 }
             }
 
-            pending.push(token);
             // Record here too, not just on the spec path's `emit!`. A session can
             // mix the two — spec engages only for plain greedy on a dense model
             // with uncompressed KV, so grammar, sampling, a compressed cache, or
@@ -1982,8 +2123,94 @@ impl Session {
             // the current position, so the drafts are rejected and the round is
             // wasted. Output stays correct either way (`verify_draft` re-derives
             // every token), which is exactly why the gap would go unnoticed.
-            self.token_history.push(token);
-            generated += 1;
+            let is_audio_transition = token == crate::audio_engine::TOKEN_AUDIO_START
+                || token == crate::audio_engine::TOKEN_TEXT_END;
+            if token == crate::audio_engine::TOKEN_TEXT_END {
+                text_done = true;
+            }
+
+            if !is_audio_transition {
+                pending.push(token);
+                self.token_history.push(token);
+                generated += 1;
+                modality_budget = modality_budget.saturating_sub(1);
+            }
+
+            if let Some(ref mut dec) = decoder
+                && (is_audio_transition || (modality_budget == 0 || text_done))
+                && pos < self.max_seq_len
+            {
+                if text_done {
+                    trailing_audio_segments += 1;
+                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
+                        break;
+                    }
+                }
+
+                if !pending.is_empty() {
+                    sink.on_text_tokens(&pending);
+                    pending.clear();
+                }
+
+                let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
+                pos += 1;
+
+                let mut audio_budget = 12usize;
+                let mut end_reached = false;
+                loop {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        finish = FinishReason::Cancelled;
+                        break;
+                    }
+                    if generated >= opts.max_tokens || pos >= self.max_seq_len {
+                        break;
+                    }
+                    let outcome = dec.decode_frame(&emb);
+                    let audio_emb = match outcome {
+                        crate::audio_engine::FrameOutcome::End => {
+                            text_done = true;
+                            end_reached = true;
+                            break;
+                        }
+                        crate::audio_engine::FrameOutcome::Codes {
+                            audio_embedding,
+                            pcm,
+                        } => {
+                            if !pcm.is_empty() {
+                                sink.on_audio_frames(&pcm, dec.sample_rate());
+                            }
+                            audio_embedding
+                        }
+                    };
+                    audio_budget = audio_budget.saturating_sub(1);
+
+                    if audio_budget == 0 && !text_done {
+                        // Switch back to text from the audio embedding
+                        logits =
+                            self.model
+                                .forward_from_embedding(&audio_emb, pos, &mut self.state);
+                        if greedy {
+                            greedy_next = crate::sampler::argmax(&logits);
+                        }
+                        pos += 1;
+                        modality_budget = 6;
+                        break;
+                    }
+
+                    emb =
+                        self.model
+                            .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
+                    pos += 1;
+                    generated += 1;
+                }
+
+                if end_reached {
+                    break;
+                }
+                if audio_budget == 0 && !text_done {
+                    continue;
+                }
+            }
 
             let should_flush_n = pending.len() >= flush_n;
             let should_flush_t =
@@ -2021,6 +2248,14 @@ impl Session {
 
         if !pending.is_empty() {
             sink.on_text_tokens(&pending);
+        }
+
+        if let Some(mut dec) = decoder
+            && dec.audio_frames() > 0
+        {
+            dec.finish(|pcm, rate| {
+                sink.on_audio_frames(pcm, rate);
+            });
         }
 
         self.current_pos = pos;
@@ -2558,5 +2793,65 @@ mod tests {
     fn splice_image_markers_empty() {
         let segs = splice_image_markers(&[], 99);
         assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn generate_opts_from_manifest_applies_defaults_and_preserves_fallbacks() {
+        let manifest = crate::manifest::Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".into(),
+            files: crate::manifest::ManifestFiles {
+                model: "model.gguf".into(),
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                extras: std::collections::HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: crate::manifest::GenerationDefaults::Text {
+                temperature: Some(0.35),
+                min_p: Some(0.05),
+                top_p: Some(0.85),
+                top_k: Some(25),
+                repetition_penalty: Some(1.15),
+            },
+            raw: serde_json::json!({}),
+        };
+
+        let opts = GenerateOpts::from_manifest(&manifest);
+        assert_eq!(opts.temperature, 0.35);
+        assert_eq!(opts.min_p, 0.05);
+        assert_eq!(opts.top_p, 0.85);
+        assert_eq!(opts.top_k, 25);
+        assert_eq!(opts.repetition_penalty, 1.15);
+        assert_eq!(opts.max_tokens, 256); // untouched fallback
+
+        let empty_manifest = crate::manifest::Manifest {
+            inference_type: InferenceType::LlamaCppTextToText,
+            schema_version: "1.0.0".into(),
+            files: crate::manifest::ManifestFiles {
+                model: "model.gguf".into(),
+                multimodal_projector: None,
+                audio_decoder: None,
+                audio_tokenizer: None,
+                extras: std::collections::HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: crate::manifest::GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+            },
+            raw: serde_json::json!({}),
+        };
+
+        let default_opts = GenerateOpts::from_manifest(&empty_manifest);
+        assert_eq!(default_opts.temperature, 0.7);
+        assert_eq!(default_opts.top_p, 0.9);
+        assert_eq!(default_opts.top_k, 40);
+        assert_eq!(default_opts.min_p, 0.0);
+        assert_eq!(default_opts.repetition_penalty, 1.0);
     }
 }

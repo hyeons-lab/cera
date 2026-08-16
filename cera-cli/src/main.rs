@@ -186,6 +186,70 @@ impl cera::bundle::DownloadProgress for CliDownloadProgress {
     }
 }
 
+/// CLI sampling and generation arguments.
+struct CliSamplingArgs {
+    max_tokens: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+}
+
+impl CliSamplingArgs {
+    /// Validates CLI sampling overrides to catch invalid parameter ranges early.
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(t) = self.temperature {
+            anyhow::ensure!(t >= 0.0, "--temperature must be non-negative");
+        }
+        if let Some(p) = self.top_p {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&p),
+                "--top-p must be in range [0.0, 1.0]"
+            );
+        }
+        if let Some(mp) = self.min_p {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&mp),
+                "--min-p must be in range [0.0, 1.0]"
+            );
+        }
+        if let Some(rp) = self.repetition_penalty {
+            anyhow::ensure!(rp >= 0.0, "--repetition-penalty must be non-negative");
+        }
+        Ok(())
+    }
+
+    /// Construct [`cera::GenerateOpts`] from manifest defaults and CLI overrides.
+    fn build_generate_opts(
+        &self,
+        engine: &cera::CeraEngine,
+        grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
+        grammar_trigger_tokens: Vec<u32>,
+    ) -> cera::GenerateOpts {
+        let mut opts = cera::GenerateOpts::from_manifest(engine.manifest());
+        opts.max_tokens = self.max_tokens as u32;
+        if let Some(t) = self.temperature {
+            opts.temperature = t;
+        }
+        if let Some(p) = self.top_p {
+            opts.top_p = p;
+        }
+        if let Some(k) = self.top_k {
+            opts.top_k = k;
+        }
+        if let Some(mp) = self.min_p {
+            opts.min_p = mp;
+        }
+        if let Some(rp) = self.repetition_penalty {
+            opts.repetition_penalty = rp;
+        }
+        opts.grammar = grammar;
+        opts.grammar_trigger_tokens = grammar_trigger_tokens;
+        opts
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "cera", version, about = "Rust-native LLM inference engine")]
 struct Cli {
@@ -253,9 +317,25 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         max_tokens: usize,
 
-        /// Sampling temperature.
-        #[arg(long, default_value_t = 0.7)]
-        temperature: f32,
+        /// Sampling temperature. Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Nucleus sampling probability (top-p). Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Top-k candidate token cutoff. Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        top_k: Option<u32>,
+
+        /// Relative nucleus cutoff (min-p). Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        min_p: Option<f32>,
+
+        /// Repetition penalty. Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
 
         /// Constrain output to a GBNF grammar. Pass an inline grammar string, or
         /// `@path/to/file.gbnf` to read it from a file.
@@ -550,10 +630,25 @@ enum Command {
         max_tokens: usize,
 
         /// Sampling temperature. `<= 0` selects greedy decoding
-        /// (reproducible). Default 0 so chat output is deterministic
-        /// without a seed.
-        #[arg(long, default_value_t = 0.0)]
-        temperature: f32,
+        /// (reproducible). Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Nucleus sampling probability (top-p). Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Top-k candidate token cutoff. Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        top_k: Option<u32>,
+
+        /// Relative nucleus cutoff (min-p). Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        min_p: Option<f32>,
+
+        /// Repetition penalty. Overrides Leap Bundles manifest defaults.
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
 
         /// RNG seed for sampling. Only meaningful when
         /// `--temperature > 0`; ignored under greedy decoding.
@@ -1879,41 +1974,7 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
 /// degenerate but cheap to handle here so the caller doesn't
 /// have to special-case them.
 fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
-    if samples.is_empty() || sr_in == 0 || sr_out == 0 {
-        return Vec::new();
-    }
-    if sr_in == sr_out {
-        return samples.to_vec();
-    }
-    let n_in = samples.len();
-    // Output length scales by the rate ratio. Use f64 to avoid
-    // precision loss on long inputs (a 60s @ 44.1kHz clip is
-    // 2.6M samples — f32 mantissa starts losing integer fidelity
-    // around 16M, so f32 would be fine here, but f64 is free).
-    let ratio = sr_out as f64 / sr_in as f64;
-    // Clamp to ≥ 1 for non-empty input. Without this a tiny input
-    // (e.g. `n_in=1` with `sr_in=48_000, sr_out=16_000`) would
-    // round `n_in * ratio = 0.333 → 0` and the resampler would
-    // hand back an empty buffer, which `Session::append_audio`
-    // surfaces as `EmptyInput`. The empty-input early return
-    // above handles `n_in == 0`; this handles the round-to-zero
-    // edge case for non-empty input.
-    let n_out = ((n_in as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(n_out);
-    let step = sr_in as f64 / sr_out as f64;
-    for i in 0..n_out {
-        let pos = i as f64 * step;
-        let idx = pos.floor() as usize;
-        let frac = (pos - idx as f64) as f32;
-        // Clamp to [0, n_in - 1]. The last interval (idx == n_in - 1,
-        // frac > 0) interpolates against itself — equivalent to
-        // hold-the-last-sample, which is the standard end-of-buffer
-        // handling for linear resampling.
-        let a = samples[idx.min(n_in - 1)];
-        let b = samples[(idx + 1).min(n_in - 1)];
-        out.push(a + (b - a) * frac);
-    }
-    out
+    cera::model::audio_encoder::resample_linear(samples, sr_in, sr_out)
 }
 
 /// Pick a vocab-resident special token to use as the audio
@@ -2117,6 +2178,10 @@ fn main() -> Result<()> {
             prompt,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
             grammar,
             json,
             tools,
@@ -2243,6 +2308,22 @@ fn main() -> Result<()> {
                 cache_disk_gb,
             );
 
+            let sampling_args = CliSamplingArgs {
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                repetition_penalty,
+            };
+            sampling_args.validate()?;
+            let build_opts = |engine: &cera::CeraEngine,
+                              grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
+                              triggers: Vec<u32>|
+             -> cera::GenerateOpts {
+                sampling_args.build_generate_opts(engine, grammar, triggers)
+            };
+
             // Image-input path (mutually exclusive with --audio-in,
             // --vocoder, --audio-out, --token-ids via clap
             // `conflicts_with`). Renders the chat template with
@@ -2306,12 +2387,7 @@ fn main() -> Result<()> {
                     prefill_elapsed.as_secs_f64() * 1000.0
                 );
 
-                let opts = cera::GenerateOpts {
-                    max_tokens: max_tokens as u32,
-                    temperature,
-                    grammar: grammar_compiled.clone(),
-                    ..Default::default()
-                };
+                let opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
                 let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
 
@@ -2379,8 +2455,14 @@ fn main() -> Result<()> {
                 // `--temperature`, `--kv-cache-keys`, and appends `--prompt` before the marker.
                 // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
+                let effective_opts = build_opts(&engine, None, Vec::new());
+                let has_sampling_overrides = top_p.is_some()
+                    || top_k.is_some()
+                    || min_p.is_some()
+                    || repetition_penalty.is_some();
                 let transcribe_compatible = prompt_is_empty
-                    && temperature <= 0.0
+                    && effective_opts.temperature <= 0.0
+                    && !has_sampling_overrides
                     && max_tokens == 256
                     && kv_cache_keys == "f32"
                     // `engine.transcribe` bypasses the session, so a LoRA adapter
@@ -2460,12 +2542,7 @@ fn main() -> Result<()> {
                 // would overreport the prefill frame count.
                 let kv_after_prefill = session.position();
 
-                let opts = cera::GenerateOpts {
-                    max_tokens: max_tokens as u32,
-                    temperature,
-                    grammar: grammar_compiled.clone(),
-                    ..Default::default()
-                };
+                let opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
 
                 let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
@@ -2609,7 +2686,10 @@ fn main() -> Result<()> {
                 // {metal, wgpu, cpu}. Default: metal on macOS+metal, else cpu.
                 let audio_gpu_choice = std::env::var("CERA_AUDIO_GPU").ok();
                 let audio_gpu_choice = audio_gpu_choice.as_deref().unwrap_or(
-                    if cfg!(all(feature = "metal", target_os = "macos")) {
+                    if cfg!(all(
+                        feature = "metal",
+                        any(target_os = "macos", target_os = "ios")
+                    )) {
                         "metal"
                     } else {
                         "cpu"
@@ -2619,7 +2699,10 @@ fn main() -> Result<()> {
                     match audio_gpu_choice {
                         "cpu" => None,
                         "metal" => {
-                            #[cfg(all(feature = "metal", target_os = "macos"))]
+                            #[cfg(all(
+                                feature = "metal",
+                                any(target_os = "macos", target_os = "ios")
+                            ))]
                             {
                                 match cera::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(
                                     &voc_gguf,
@@ -2636,7 +2719,10 @@ fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            #[cfg(not(all(feature = "metal", target_os = "macos")))]
+                            #[cfg(not(all(
+                                feature = "metal",
+                                any(target_os = "macos", target_os = "ios")
+                            )))]
                             {
                                 eprintln!(
                                     "CERA_AUDIO_GPU=metal but the metal backend is not built; using CPU"
@@ -2701,16 +2787,24 @@ fn main() -> Result<()> {
                 }
 
                 let mut all_pcm = Vec::new();
-                let sys = system.as_deref().unwrap();
-                let mode = if sys == "Respond with interleaved text and audio." {
+                let sys = system.as_deref().unwrap_or("");
+                let mode = if sys.contains("interleaved") {
                     cera::audio_engine::AudioMode::Interleaved
                 } else {
                     cera::audio_engine::AudioMode::Sequential
                 };
+                let default_opts = engine.default_generate_opts();
                 let audio_config = cera::audio_engine::AudioGenerateConfig {
                     max_tokens,
                     sampler: cera::sampler::SamplerConfig {
-                        temperature,
+                        temperature: temperature.unwrap_or(default_opts.temperature),
+                        top_p: top_p.unwrap_or(default_opts.top_p),
+                        top_k: top_k
+                            .map(|k| k as usize)
+                            .unwrap_or(default_opts.top_k as usize),
+                        min_p: min_p.unwrap_or(default_opts.min_p),
+                        repetition_penalty: repetition_penalty
+                            .unwrap_or(default_opts.repetition_penalty),
                         ..Default::default()
                     },
                     audio_temperature,
@@ -2846,13 +2940,7 @@ fn main() -> Result<()> {
                         (grammar_compiled.clone(), Vec::new())
                     };
 
-                let opts = cera::GenerateOpts {
-                    max_tokens: max_tokens as u32,
-                    temperature,
-                    grammar: effective_grammar,
-                    grammar_trigger_tokens: trigger_tokens,
-                    ..Default::default()
-                };
+                let opts = build_opts(&engine, effective_grammar, trigger_tokens);
 
                 // With tools, collect the reply (ChatSink streams + buffers) so
                 // tool calls can be parsed out afterward. Stream it to stderr so
@@ -3374,6 +3462,10 @@ fn main() -> Result<()> {
             context_size,
             max_tokens,
             temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
             seed,
             no_tui,
             lora,
@@ -3465,11 +3557,16 @@ fn main() -> Result<()> {
             // not memcpy).
             let mut pending_images: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
 
-            let opts = cera::GenerateOpts {
-                max_tokens: max_tokens as u32,
+            let sampling_args = CliSamplingArgs {
+                max_tokens,
                 temperature,
-                ..Default::default()
+                top_p,
+                top_k,
+                min_p,
+                repetition_penalty,
             };
+            sampling_args.validate()?;
+            let opts = sampling_args.build_generate_opts(&engine, None, Vec::new());
 
             // Dispatch: inline TUI when both stdin AND stdout are TTYs
             // (so cursor positioning + raw-mode keystroke reads behave
@@ -4173,7 +4270,7 @@ fn main() -> Result<()> {
                 if add_bos && let Some(bos) = tokenizer.bos_token() {
                     tokens.push(bos);
                 }
-                tokens.extend_from_slice(&tokenizer.encode(&prompt));
+                tokens.extend(tokenizer.encode(&prompt));
             }
 
             eprintln!(
