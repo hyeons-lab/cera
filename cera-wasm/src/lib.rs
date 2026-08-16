@@ -2858,6 +2858,8 @@ mod webgpu {
                 };
             let mut modality_budget = 6usize;
             let mut text_done = false;
+            let mut trailing_audio_segments: usize = 0;
+            const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
 
             // Greedy decode loop. Stream raw bytes through a buffer and emit
             // only complete UTF-8: a multi-byte character can span several
@@ -2981,6 +2983,13 @@ mod webgpu {
                     && (modality_budget == 0 || text_done)
                     && pos < max_seq_len
                 {
+                    if text_done {
+                        trailing_audio_segments += 1;
+                        if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
+                            break;
+                        }
+                    }
+
                     if !pending.is_empty() {
                         let valid = match std::str::from_utf8(&pending) {
                             Ok(s) => s.len(),
@@ -3001,14 +3010,17 @@ mod webgpu {
                         .map_err(map_err)?;
                     pos += 1;
 
-                    let mut frames = 0;
-                    let mut reached_end = false;
-                    while frames < 12 && pos < max_seq_len && generated < max_tokens as usize {
+                    let mut audio_budget = 12usize;
+                    let mut end_reached = false;
+                    loop {
+                        if generated >= max_tokens as usize || pos >= max_seq_len {
+                            break;
+                        }
                         let outcome = dec.decode_frame_async(&emb).await.map_err(map_err)?;
                         let audio_emb = match outcome {
                             cera::audio_engine::FrameOutcome::End => {
                                 text_done = true;
-                                reached_end = true;
+                                end_reached = true;
                                 break;
                             }
                             cera::audio_engine::FrameOutcome::Codes {
@@ -3025,8 +3037,9 @@ mod webgpu {
                                 audio_embedding
                             }
                         };
-                        frames += 1;
-                        if frames == 12 && !text_done {
+                        audio_budget = audio_budget.saturating_sub(1);
+
+                        if audio_budget == 0 && !text_done {
                             // Transition back to text from the audio embedding
                             next = match sampler.as_mut() {
                                 Some(s) => {
@@ -3055,6 +3068,7 @@ mod webgpu {
                             modality_budget = 6;
                             break;
                         }
+
                         emb = self
                             .model
                             .forward_hidden_from_embedding_async(&audio_emb, pos, &mut self.state)
@@ -3064,10 +3078,10 @@ mod webgpu {
                         generated += 1;
                     }
 
-                    if reached_end {
+                    if end_reached {
                         break;
                     }
-                    if frames == 12 {
+                    if audio_budget == 0 && !text_done {
                         continue;
                     }
                 }
