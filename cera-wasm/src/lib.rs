@@ -2795,7 +2795,7 @@ mod webgpu {
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, gpu_ref, 0.0, 1, false,
+                        dec, detok, gpu_ref, 0.8, 4, false,
                     ))
                 } else {
                     None
@@ -2883,6 +2883,16 @@ mod webgpu {
                             pos += 1;
                             generated += 1;
                         }
+
+                        dec.finish(|pcm, rate| {
+                            if !pcm.is_empty()
+                                && let Some(cb) = on_audio
+                            {
+                                let array = js_sys::Float32Array::from(pcm);
+                                let rate_val = JsValue::from_f64(rate as f64);
+                                let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                            }
+                        });
                     }
                     break;
                 }

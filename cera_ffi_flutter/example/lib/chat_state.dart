@@ -119,6 +119,7 @@ class ChatSettings {
     this.turboQuant = false,
     this.maxImageLongSize = 256,
     this.audioChatMode = AudioChatMode.interleaved,
+    this.ttsVoice = 'Use the US female voice.',
   });
 
   /// Which compute backend to run on.
@@ -134,6 +135,9 @@ class ChatSettings {
 
   /// Mode for audio generation when an audio-capable model is loaded.
   final AudioChatMode audioChatMode;
+
+  /// Voice persona description for TTS synthesis.
+  final String ttsVoice;
 
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
@@ -152,6 +156,7 @@ class ChatSettings {
     bool? turboQuant,
     int? Function()? maxImageLongSize,
     AudioChatMode? audioChatMode,
+    String? ttsVoice,
   }) {
     return ChatSettings(
       backend: backend ?? this.backend,
@@ -160,6 +165,7 @@ class ChatSettings {
           ? maxImageLongSize()
           : this.maxImageLongSize,
       audioChatMode: audioChatMode ?? this.audioChatMode,
+      ttsVoice: ttsVoice ?? this.ttsVoice,
     );
   }
 }

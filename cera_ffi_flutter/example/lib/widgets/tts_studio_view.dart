@@ -282,7 +282,60 @@ class _TtsStudioViewState extends State<TtsStudioView> {
               ),
             ),
           ),
-          const SizedBox(height: 12),
+          // Voice Persona Selector
+          Text(
+            'VOICE PERSONA',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.8,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _VoiceChip(
+                label: '👩 US Female (Default)',
+                selected: state.settings.ttsVoice == 'Use the US female voice.',
+                onSelected: () => widget.controller.dispatch(
+                  const UpdateSettingsIntent(
+                    ttsVoice: 'Use the US female voice.',
+                  ),
+                ),
+              ),
+              _VoiceChip(
+                label: '👨 US Male',
+                selected: state.settings.ttsVoice == 'Use the US male voice.',
+                onSelected: () => widget.controller.dispatch(
+                  const UpdateSettingsIntent(
+                    ttsVoice: 'Use the US male voice.',
+                  ),
+                ),
+              ),
+              _VoiceChip(
+                label: '👩 UK Female',
+                selected: state.settings.ttsVoice == 'Use the UK female voice.',
+                onSelected: () => widget.controller.dispatch(
+                  const UpdateSettingsIntent(
+                    ttsVoice: 'Use the UK female voice.',
+                  ),
+                ),
+              ),
+              _VoiceChip(
+                label: '👨 UK Male',
+                selected: state.settings.ttsVoice == 'Use the UK male voice.',
+                onSelected: () => widget.controller.dispatch(
+                  const UpdateSettingsIntent(
+                    ttsVoice: 'Use the UK male voice.',
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
 
           // Action Buttons
           Row(
@@ -469,6 +522,42 @@ class _TtsStudioViewState extends State<TtsStudioView> {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+class _VoiceChip extends StatelessWidget {
+  const _VoiceChip({
+    required this.label,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ChoiceChip(
+      label: Text(label, style: const TextStyle(fontSize: 11.5)),
+      selected: selected,
+      onSelected: (_) => onSelected(),
+      selectedColor: theme.colorScheme.primary.withValues(alpha: 0.18),
+      backgroundColor: theme.colorScheme.surface,
+      side: BorderSide(
+        color: selected
+            ? theme.colorScheme.primary
+            : theme.colorScheme.outlineVariant,
+      ),
+      labelStyle: TextStyle(
+        fontSize: 11.5,
+        fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+        color: selected
+            ? theme.colorScheme.primary
+            : theme.colorScheme.onSurface,
       ),
     );
   }

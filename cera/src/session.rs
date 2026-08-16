@@ -2104,7 +2104,7 @@ impl Session {
                 }
 
                 let mut decoder =
-                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.0, 1, false);
+                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.8, 4, false);
 
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
                 pos += 1;

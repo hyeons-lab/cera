@@ -136,11 +136,14 @@ class ChatController extends ValueNotifier<ChatState> {
         'textOnly' => AudioChatMode.textOnly,
         _ => AudioChatMode.interleaved,
       };
+      final ttsVoice =
+          prefs.getString('cera_tts_voice') ?? 'Use the US female voice.';
       final restoredSettings = ChatSettings(
         backend: backend,
         turboQuant: turboQuant,
         maxImageLongSize: maxImageDim == 0 ? null : (maxImageDim ?? 256),
         audioChatMode: audioMode,
+        ttsVoice: ttsVoice,
       );
       value = value.copyWith(settings: restoredSettings);
 
@@ -190,12 +193,14 @@ class ChatController extends ValueNotifier<ChatState> {
         ? null
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
     final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
+    final newTtsVoice = intent.ttsVoice ?? current.ttsVoice;
 
     final updated = current.copyWith(
       backend: newBackend,
       turboQuant: newTurbo,
       maxImageLongSize: () => newMaxImage,
       audioChatMode: newAudioMode,
+      ttsVoice: newTtsVoice,
     );
 
     value = value.copyWith(settings: updated);
@@ -214,6 +219,7 @@ class ChatController extends ValueNotifier<ChatState> {
         AudioChatMode.textOnly => 'textOnly',
         AudioChatMode.interleaved => 'interleaved',
       });
+      await prefs.setString('cera_tts_voice', newTtsVoice);
     } catch (err) {
       debugPrint('cera: error persisting settings: $err');
     }
@@ -499,7 +505,7 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     final String? systemPrompt = isTts
-        ? 'Perform TTS.'
+        ? 'Perform TTS. ${value.settings.ttsVoice}'.trim()
         : (isInterleaved ? 'Respond with interleaved text and audio.' : null);
 
     final messages = <CeraMessage>[
