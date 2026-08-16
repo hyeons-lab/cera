@@ -264,6 +264,11 @@ impl<'a> AudioOutputDecoder<'a> {
     /// accumulated streamed sample count.
     pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
         if self.streamed_samples > 0 {
+            let remaining = self.streamer.flush();
+            if !remaining.is_empty() {
+                sink(&remaining, self.detok_weights.config.sample_rate as u32);
+                self.streamed_samples += remaining.len();
+            }
             return self.streamed_samples;
         }
         if self.all_spectrum.is_empty() {
@@ -289,6 +294,11 @@ impl<'a> AudioOutputDecoder<'a> {
         mut sink: impl FnMut(&[f32], u32),
     ) -> anyhow::Result<usize> {
         if self.streamed_samples > 0 {
+            let remaining = self.streamer.flush();
+            if !remaining.is_empty() {
+                sink(&remaining, self.detok_weights.config.sample_rate as u32);
+                self.streamed_samples += remaining.len();
+            }
             return Ok(self.streamed_samples);
         }
         if self.all_spectrum.is_empty() {

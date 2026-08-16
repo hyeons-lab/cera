@@ -197,6 +197,29 @@ struct CliSamplingArgs {
 }
 
 impl CliSamplingArgs {
+    /// Validates CLI sampling overrides to catch invalid parameter ranges early.
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(t) = self.temperature {
+            anyhow::ensure!(t >= 0.0, "--temperature must be non-negative");
+        }
+        if let Some(p) = self.top_p {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&p),
+                "--top-p must be in range [0.0, 1.0]"
+            );
+        }
+        if let Some(mp) = self.min_p {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&mp),
+                "--min-p must be in range [0.0, 1.0]"
+            );
+        }
+        if let Some(rp) = self.repetition_penalty {
+            anyhow::ensure!(rp >= 0.0, "--repetition-penalty must be non-negative");
+        }
+        Ok(())
+    }
+
     /// Construct [`cera::GenerateOpts`] from manifest defaults and CLI overrides.
     fn build_generate_opts(
         &self,
@@ -2118,6 +2141,7 @@ fn main() -> Result<()> {
                 min_p,
                 repetition_penalty,
             };
+            sampling_args.validate()?;
             let build_opts = |engine: &cera::CeraEngine,
                               grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
                               triggers: Vec<u32>|
@@ -3207,15 +3231,16 @@ fn main() -> Result<()> {
             // not memcpy).
             let mut pending_images: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
 
-            let opts = CliSamplingArgs {
+            let sampling_args = CliSamplingArgs {
                 max_tokens,
                 temperature,
                 top_p,
                 top_k,
                 min_p,
                 repetition_penalty,
-            }
-            .build_generate_opts(&engine, None, Vec::new());
+            };
+            sampling_args.validate()?;
+            let opts = sampling_args.build_generate_opts(&engine, None, Vec::new());
 
             // Dispatch: inline TUI when both stdin AND stdout are TTYs
             // (so cursor positioning + raw-mode keystroke reads behave

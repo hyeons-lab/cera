@@ -1487,6 +1487,27 @@ impl IstftStreamer {
         }
         output
     }
+
+    /// Flush any remaining samples buffered in the overlap-add accumulator.
+    pub fn flush(&mut self) -> Vec<f32> {
+        let padding = (self.n_fft - self.hop_length) / 2;
+        let mut output = Vec::with_capacity(padding);
+        for k in 0..padding {
+            let sample = if self.window_sum[k] > 1e-8 {
+                self.overlap_buf[k] / self.window_sum[k]
+            } else {
+                self.overlap_buf[k]
+            };
+            if self.padding_remaining > 0 {
+                self.padding_remaining -= 1;
+            } else {
+                output.push(sample);
+            }
+        }
+        self.overlap_buf.fill(0.0);
+        self.window_sum.fill(0.0);
+        output
+    }
 }
 
 #[cfg(test)]

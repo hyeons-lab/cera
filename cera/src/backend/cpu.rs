@@ -2001,7 +2001,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         sum
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
         use core::arch::wasm32::*;
         let mut sum_v0 = f32x4_splat(0.0);
@@ -2072,7 +2072,10 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         }
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         // Fallback unrolled loop
         let mut a_chunks = a.chunks_exact(8);
