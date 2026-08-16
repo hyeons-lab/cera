@@ -305,13 +305,10 @@ class _NativeCera implements Cera {
     // A controller rather than an `async*` body: the tokens arrive on a
     // callback driven by Rust, not from anything this function can await.
     final controller = StreamController<String>();
-    // Built by overriding the generated defaults rather than by restating
-    // them. Spelling `temperature ?? 0.7` here would pin a literal that the
-    // web path does not have: there the sampler falls back to
-    // `cera::GenerateOpts::default()` itself. The two agree today, and would
-    // silently stop agreeing the moment that default changed, since
-    // regenerating the bindings would not touch a hand-written literal.
-    var opts = GenerateOpts(
+    // Built from the session's default options (populated from the bundle
+    // manifest when loaded from a bundle) rather than hardcoded constants,
+    // allowing explicit caller overrides to take precedence.
+    var opts = _session.defaultGenerateOpts().copyWith(
       maxTokens: maxTokens,
       // Emit per token. The default buffers 16, which turns a stream into four
       // lumps for a short reply.

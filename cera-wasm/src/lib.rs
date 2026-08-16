@@ -424,6 +424,7 @@ impl CeraEngine {
                 .as_deref()
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
+            generation_defaults: None,
         };
         cera::CeraEngine::from_parts(parts, cfg)
             .map(|inner| CeraEngine { inner })
@@ -1919,6 +1920,8 @@ mod webgpu {
         gpu_audio_decoder: Option<Arc<cera::model::wgpu_audio_decoder::WgpuAudioDecoder>>,
         /// Session-default cap on an appended image's longest side.
         image_max_long_size: Option<u32>,
+        /// Generation defaults from the bundle manifest.
+        generation_defaults: Option<cera::manifest::GenerationDefaults>,
     }
 
     #[wasm_bindgen]
@@ -2068,6 +2071,7 @@ mod webgpu {
                 detok_weights: None,
                 gpu_audio_decoder: None,
                 image_max_long_size: None,
+                generation_defaults: None,
             })
         }
 
@@ -2129,6 +2133,7 @@ mod webgpu {
                 crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
             let mut session =
                 Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
+            session.generation_defaults = parts.generation_defaults;
             // A VL or audio bundle names its tower in the manifest, so unlike
             // `createWithParts` this path never has to be told about it.
             if let Some(mmproj) = parts.multimodal_projector {
@@ -2752,6 +2757,45 @@ mod webgpu {
                 pos += 1;
             }
 
+            let (def_temp, def_top_p, def_top_k, def_min_p, def_rep_pen, audio_temp, audio_top_k) =
+                match &self.generation_defaults {
+                    Some(cera::manifest::GenerationDefaults::Text {
+                        temperature,
+                        top_p,
+                        top_k,
+                        min_p,
+                        repetition_penalty,
+                        ..
+                    }) => (
+                        *temperature,
+                        *top_p,
+                        *top_k,
+                        *min_p,
+                        *repetition_penalty,
+                        0.8,
+                        4,
+                    ),
+                    Some(cera::manifest::GenerationDefaults::Audio {
+                        temperature,
+                        top_p,
+                        top_k,
+                        min_p,
+                        repetition_penalty,
+                        audio_temperature,
+                        audio_top_k,
+                        ..
+                    }) => (
+                        *temperature,
+                        *top_p,
+                        *top_k,
+                        *min_p,
+                        *repetition_penalty,
+                        audio_temperature.unwrap_or(0.8),
+                        audio_top_k.map(|k| k as usize).unwrap_or(4),
+                    ),
+                    _ => (None, None, None, None, None, 0.8, 4),
+                };
+
             // Greedy stays on the GPU-argmax path, which reads back four bytes
             // per token; sampling needs the whole logits row on the host, which
             // is a vocab-sized readback per token. Deciding once, here, keeps a
@@ -2762,9 +2806,11 @@ mod webgpu {
             // rather than inventing a second threshold.
             let defaults = cera::sampler::SamplerConfig::default();
             let cfg = cera::sampler::SamplerConfig {
-                temperature: temperature.unwrap_or(defaults.temperature),
-                top_p: top_p.unwrap_or(defaults.top_p),
-                top_k: top_k.map(|k| k as usize).unwrap_or(defaults.top_k),
+                temperature: temperature.or(def_temp).unwrap_or(defaults.temperature),
+                top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
+                top_k: top_k.or(def_top_k).map(|k| k as usize).unwrap_or(defaults.top_k),
+                min_p: def_min_p.unwrap_or(defaults.min_p),
+                repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
                 ..defaults
             };
@@ -2795,7 +2841,7 @@ mod webgpu {
                         .as_deref()
                         .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
                     Some(cera::audio_engine::AudioOutputDecoder::new(
-                        dec, detok, gpu_ref, 0.8, 4, false,
+                        dec, detok, gpu_ref, audio_temp, audio_top_k, false,
                     ))
                 } else {
                     None

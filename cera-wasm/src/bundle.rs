@@ -1263,6 +1263,7 @@ pub(crate) async fn load_manifest(
         // an mmproj was supplied.
         inference_type: Some(manifest.inference_type),
         chat_template: manifest.chat_template,
+        generation_defaults: Some(manifest.generation_defaults),
     })
 }
 

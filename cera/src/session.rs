@@ -184,9 +184,32 @@ impl GenerateOpts {
                     opts.repetition_penalty = *rp;
                 }
             }
-            crate::manifest::GenerationDefaults::Audio { .. } => {
-                // Audio models (e.g. ASR) default to greedy decoding.
-                opts.temperature = 0.0;
+            crate::manifest::GenerationDefaults::Audio {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+                ..
+            } => {
+                if let Some(t) = temperature {
+                    opts.temperature = *t;
+                } else {
+                    // Audio models (e.g. ASR) default to greedy decoding if unmentioned.
+                    opts.temperature = 0.0;
+                }
+                if let Some(mp) = min_p {
+                    opts.min_p = *mp;
+                }
+                if let Some(tp) = top_p {
+                    opts.top_p = *tp;
+                }
+                if let Some(tk) = top_k {
+                    opts.top_k = *tk;
+                }
+                if let Some(rp) = repetition_penalty {
+                    opts.repetition_penalty = *rp;
+                }
             }
             _ => {}
         }

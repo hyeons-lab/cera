@@ -165,6 +165,8 @@ pub struct ModelBytes {
     pub inference_type: Option<InferenceType>,
     /// Chat-template override. When set, replaces the GGUF's own template.
     pub chat_template: Option<String>,
+    /// Generation defaults from the bundle manifest (if loaded from a bundle).
+    pub generation_defaults: Option<crate::manifest::GenerationDefaults>,
 }
 
 impl ModelBytes {
@@ -176,6 +178,7 @@ impl ModelBytes {
             audio_decoder: None,
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
+            generation_defaults: None,
         }
     }
 }
@@ -500,6 +503,9 @@ impl CeraEngine {
                 .map(|_| "<mmproj-bytes>".to_string()),
         );
         manifest.chat_template = parts.chat_template;
+        if let Some(defaults) = parts.generation_defaults {
+            manifest.generation_defaults = defaults;
+        }
         Self::from_gguf(gguf, manifest, cfg, None, aux)
     }
 
@@ -1302,6 +1308,13 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
             },
             DefaultsShape::Audio => crate::manifest::GenerationDefaults::Audio {
                 number_of_decoding_threads: None,
+                audio_temperature: None,
+                audio_top_k: None,
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
             },
             DefaultsShape::Other => crate::manifest::GenerationDefaults::Other {
                 raw: serde_json::Value::Null,

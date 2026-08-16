@@ -986,6 +986,7 @@ impl CeraEngine {
                 .as_deref()
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
+            generation_defaults: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
         Ok(Arc::new(Self { inner }))
@@ -2498,6 +2499,7 @@ impl CeraEngine {
                     .as_deref()
                     .map(cera::manifest::InferenceType::parse_str),
                 chat_template: None,
+                generation_defaults: None,
             };
             cera::CeraEngine::from_parts(parts, cera_config)
         })
