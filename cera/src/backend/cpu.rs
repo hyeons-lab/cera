@@ -2047,10 +2047,9 @@ fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
 
 /// Unrolled scalar fallback vector dot product.
 #[inline(always)]
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
-    let mut a_chunks = a.chunks_exact(8);
-    let mut b_chunks = b.chunks_exact(8);
+    let (a_chunks, a_rem) = a.as_chunks::<8>();
+    let (b_chunks, b_rem) = b.as_chunks::<8>();
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
     let mut sum2 = 0.0f32;
@@ -2060,7 +2059,7 @@ fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
     let mut sum6 = 0.0f32;
     let mut sum7 = 0.0f32;
 
-    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks.iter()) {
         sum0 += ca[0] * cb[0];
         sum1 += ca[1] * cb[1];
         sum2 += ca[2] * cb[2];
@@ -2071,7 +2070,7 @@ fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
         sum7 += ca[7] * cb[7];
     }
     let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+    for (&x, &y) in a_rem.iter().zip(b_rem.iter()) {
         sum += x * y;
     }
     sum

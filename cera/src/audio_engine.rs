@@ -385,19 +385,10 @@ impl<'a> AudioOutputDecoder<'a> {
                 self.all_spectrum.extend_from_slice(&spectrum);
             }
             if !remainder.is_empty() {
-                let mut padded = [0i32; 8];
-                padded[..remainder.len()].copy_from_slice(remainder);
-                let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum(self.detok_weights, &padded)
-                } else {
-                    detokenize_to_spectrum(
-                        self.detok_weights,
-                        self.weights,
-                        &mut self.detok_state,
-                        &padded,
-                    )
-                };
-                self.all_spectrum.extend_from_slice(&spectrum);
+                tracing::warn!(
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
+                    remainder.len()
+                );
             }
             self.time_detokenizer += t1.elapsed();
         }
@@ -454,20 +445,10 @@ impl<'a> AudioOutputDecoder<'a> {
                 self.all_spectrum.extend_from_slice(&spectrum);
             }
             if !remainder.is_empty() {
-                let mut padded = [0i32; 8];
-                padded[..remainder.len()].copy_from_slice(remainder);
-                let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum_async(self.detok_weights, &padded)
-                        .await?
-                } else {
-                    detokenize_to_spectrum(
-                        self.detok_weights,
-                        self.weights,
-                        &mut self.detok_state,
-                        &padded,
-                    )
-                };
-                self.all_spectrum.extend_from_slice(&spectrum);
+                tracing::warn!(
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
+                    remainder.len()
+                );
             }
             self.time_detokenizer += t1.elapsed();
         }
