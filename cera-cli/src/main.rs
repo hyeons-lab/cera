@@ -216,8 +216,8 @@ impl CliSamplingArgs {
         }
         if let Some(rp) = self.repetition_penalty {
             anyhow::ensure!(
-                rp.is_finite() && rp >= 0.0,
-                "--repetition-penalty must be a non-negative finite number"
+                rp.is_finite() && rp > 0.0,
+                "--repetition-penalty must be a positive finite number (> 0.0)"
             );
         }
         Ok(())
