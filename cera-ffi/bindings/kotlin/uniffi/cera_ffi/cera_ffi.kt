@@ -7069,12 +7069,12 @@ data class GenerateOpts(
      * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
      * disables it. Honored in the stochastic path.
      */
-    var `minP`: kotlin.Float = 0.0f,
+    var `minP`: kotlin.Float = 0.05f,
     /**
      * Repetition penalty over tokens generated this call. `1.0` disables it.
      * Honored in the stochastic path (greedy/argmax decoding is unaffected).
      */
-    var `repetitionPenalty`: kotlin.Float = 1.0f,
+    var `repetitionPenalty`: kotlin.Float = 1.1f,
     /**
      * Early-stop IDs (EOS / instruction markers / end-of-turn).
      */

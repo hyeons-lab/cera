@@ -1363,11 +1363,11 @@ pub struct GenerateOpts {
     pub top_k: u32,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
-    #[uniffi(default = 0.0)]
+    #[uniffi(default = 0.05)]
     pub min_p: f32,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
-    #[uniffi(default = 1.0)]
+    #[uniffi(default = 1.1)]
     pub repetition_penalty: f32,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     #[uniffi(default = [])]

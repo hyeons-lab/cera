@@ -1305,7 +1305,7 @@ impl GenerateOpts {
     }
 
     /// Min-p (relative) nucleus cutoff: drop tokens below `minP * pMax`.
-    /// `0.0` (default) disables it. Honored in the stochastic path.
+    /// `0.0` disables it (default: 0.05). Honored in the stochastic path.
     #[wasm_bindgen(getter, js_name = minP)]
     pub fn min_p(&self) -> f32 {
         self.inner.min_p
@@ -1315,8 +1315,8 @@ impl GenerateOpts {
         self.inner.min_p = v;
     }
 
-    /// Repetition penalty over tokens generated this call. `1.0` (default)
-    /// disables it. Honored in the stochastic path.
+    /// Repetition penalty over tokens generated this call. `1.0` disables it
+    /// (default: 1.1). Honored in the stochastic path.
     #[wasm_bindgen(getter, js_name = repetitionPenalty)]
     pub fn repetition_penalty(&self) -> f32 {
         self.inner.repetition_penalty
@@ -2813,6 +2813,9 @@ mod webgpu {
                 )));
             }
 
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::Release);
+
             // Prefill: feed every prompt token through the GPU to build the KV
             // cache. All but the last token skip the argmax + readback (their
             // predictions are unused), so an N-token prompt does a single
@@ -2820,6 +2823,9 @@ mod webgpu {
             // first generated token.
             let (last, prefix) = ids.split_last().expect("ids is non-empty");
             for &tok in prefix {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(String::new());
+                }
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
                 pos += 1;
             }
@@ -2871,14 +2877,14 @@ mod webgpu {
             // The rule matches `SamplerConfig`'s own definition of greedy, so
             // this backend agrees with the CPU on what `temperature: 0` means
             // rather than inventing a second threshold.
-            let defaults = cera::sampler::SamplerConfig::default();
+            let defaults = cera::GenerateOpts::default();
             let cfg = cera::sampler::SamplerConfig {
                 temperature: temperature.or(def_temp).unwrap_or(defaults.temperature),
                 top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
                 top_k: top_k
                     .or(def_top_k)
                     .map(|k| k as usize)
-                    .unwrap_or(defaults.top_k),
+                    .unwrap_or(defaults.top_k as usize),
                 min_p: def_min_p.unwrap_or(defaults.min_p),
                 repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
@@ -2960,9 +2966,6 @@ mod webgpu {
             let mut time_vocoder_finish_ms = 0.0;
 
             let gen_start_time = js_sys::Date::now();
-
-            self.cancel
-                .store(false, std::sync::atomic::Ordering::Release);
 
             for _ in 0..max_tokens {
                 if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {

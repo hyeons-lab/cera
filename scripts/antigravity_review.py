@@ -13,7 +13,6 @@ import os
 import subprocess
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
 # Files to exclude from LLM diff review to save context and avoid reviewing generated code

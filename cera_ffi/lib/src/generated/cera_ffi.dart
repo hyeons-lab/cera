@@ -372,10 +372,10 @@ class GenerateOpts {
     this.topK = 40,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
-    this.minP = 0.0,
+    this.minP = 0.05,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
-    this.repetitionPenalty = 1.0,
+    this.repetitionPenalty = 1.1,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     this.stopTokens = const [],
     /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
@@ -454,8 +454,8 @@ class GenerateOpts {
       temperature: json.containsKey('temperature') ? (json['temperature'] as num).toDouble() : 0.7,
       topP: json.containsKey('topP') ? (json['topP'] as num).toDouble() : 0.9,
       topK: json.containsKey('topK') ? (json['topK'] as num).toInt() : 40,
-      minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.0,
-      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.0,
+      minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.05,
+      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.1,
       stopTokens: json.containsKey('stopTokens') ? (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
       ignoreEos: json.containsKey('ignoreEos') ? json['ignoreEos'] as bool : false,
       grammar: json.containsKey('grammar') ? json['grammar'] == null ? null : json['grammar'] as String : null,

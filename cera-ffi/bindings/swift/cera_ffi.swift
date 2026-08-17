@@ -4133,11 +4133,11 @@ public struct GenerateOpts: Equatable, Hashable {
         /**
          * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
          * disables it. Honored in the stochastic path.
-         */minP: Float = Float(0.0), 
+         */minP: Float = Float(0.05), 
         /**
          * Repetition penalty over tokens generated this call. `1.0` disables it.
          * Honored in the stochastic path (greedy/argmax decoding is unaffected).
-         */repetitionPenalty: Float = Float(1.0), 
+         */repetitionPenalty: Float = Float(1.1), 
         /**
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
          */stopTokens: [UInt32] = [], 

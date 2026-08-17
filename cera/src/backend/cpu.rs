@@ -1969,7 +1969,6 @@ pub fn gemv_q4_1_f32(
     }
 }
 
-/// Vector dot product of two `f32` slices of equal length.
 /// Vector dot product using ARM NEON SIMD (unrolled across 4 vectors).
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -2141,14 +2140,36 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// F32 GEMV: `y[m] = A_f32[m,k] @ x[k]`.
 pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
-    debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(y.len(), m);
-    let a_f32: &[f32] = bytemuck::cast_slice(a);
-    debug_assert_eq!(a_f32.len(), m * k);
+    assert_eq!(x.len(), k, "gemv_f32: x must have k elements");
+    assert_eq!(y.len(), m, "gemv_f32: y must have m elements");
+    if let Ok(a_f32) = bytemuck::try_cast_slice::<u8, f32>(a) {
+        debug_assert_eq!(a_f32.len(), m * k);
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row = &a_f32[i * k..(i + 1) * k];
+            *yi = dot_f32(row, x);
+        };
 
-    for i in 0..m {
-        let row = &a_f32[i * k..(i + 1) * k];
-        y[i] = dot_f32(row, x);
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
+    } else {
+        let k_bytes = k * std::mem::size_of::<f32>();
+        for (i, yi) in y.iter_mut().enumerate().take(m) {
+            let row_bytes = &a[i * k_bytes..(i + 1) * k_bytes];
+            let mut sum = 0.0f32;
+            for (j, &xj) in x.iter().enumerate() {
+                let bytes = [
+                    row_bytes[j * 4],
+                    row_bytes[j * 4 + 1],
+                    row_bytes[j * 4 + 2],
+                    row_bytes[j * 4 + 3],
+                ];
+                sum += f32::from_ne_bytes(bytes) * xj;
+            }
+            *yi = sum;
+        }
     }
 }
 
