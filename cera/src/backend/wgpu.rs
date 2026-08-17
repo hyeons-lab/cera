@@ -304,7 +304,9 @@ impl PendingReadback {
             .map_err(|e| anyhow::anyhow!("GPU readback failed: {e:?}"))?;
 
         let slice = self.staging.slice(0..self.size);
-        let data = slice.get_mapped_range().expect("get_mapped_range failed");
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| anyhow::anyhow!("GPU staging get_mapped_range failed: {e:?}"))?;
         let bytes = data.to_vec();
         drop(data);
         self.staging.unmap();
