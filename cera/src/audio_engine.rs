@@ -370,16 +370,17 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            for &codes in chunks {
+            let chunks = self.all_codes.chunks_exact(8);
+            let remainder = chunks.remainder();
+            for codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum(self.detok_weights, &codes)
+                    g.detokenize_to_spectrum(self.detok_weights, codes)
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
                         self.weights,
                         &mut self.detok_state,
-                        &codes,
+                        codes,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);
@@ -429,17 +430,18 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            for &codes in chunks {
+            let chunks = self.all_codes.chunks_exact(8);
+            let remainder = chunks.remainder();
+            for codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                    g.detokenize_to_spectrum_async(self.detok_weights, codes)
                         .await?
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
                         self.weights,
                         &mut self.detok_state,
-                        &codes,
+                        codes,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);

@@ -2202,18 +2202,36 @@ pub fn gemv_f16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     // here so it costs one check per GEMV instead of one per row.
     assert_eq!(x.len(), k, "gemv_f16: x must have k elements");
     debug_assert_eq!(y.len(), m);
-    let a16: &[u16] = bytemuck::cast_slice(a);
-    debug_assert_eq!(a16.len(), m * k);
 
-    let compute_row = |(i, yi): (usize, &mut f32)| {
-        let row = &a16[i * k..(i + 1) * k];
-        *yi = dot_f16_f32(row, x);
-    };
+    if let Ok(a16) = bytemuck::try_cast_slice::<u8, u16>(a) {
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row = &a16[i * k..(i + 1) * k];
+            *yi = dot_f16_f32(row, x);
+        };
 
-    if m >= gemv_par_threshold() {
-        par_rows(y, gemv_min_rows(), compute_row);
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     } else {
-        y.iter_mut().enumerate().for_each(compute_row);
+        let k_bytes = k * std::mem::size_of::<u16>();
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_bytes = &a[i * k_bytes..(i + 1) * k_bytes];
+            let u16_ptr = row_bytes.as_ptr() as *const u16;
+            let mut sum = 0.0f32;
+            for (j, &xj) in x.iter().enumerate() {
+                let val = unsafe { std::ptr::read_unaligned(u16_ptr.add(j)) };
+                sum += crate::quant::f16_to_f32(val) * xj;
+            }
+            *yi = sum;
+        };
+
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 
@@ -2300,22 +2318,40 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     // `gemv_f32` panics on a short `x`, so check once here rather than per row.
     assert_eq!(x.len(), k, "gemv_bf16: x must have k elements");
     debug_assert_eq!(y.len(), m);
-    let a16: &[u16] = bytemuck::cast_slice(a);
-    debug_assert_eq!(a16.len(), m * k);
 
-    let compute_row = |(i, yi): (usize, &mut f32)| {
-        let row = &a16[i * k..(i + 1) * k];
-        *yi = row
-            .iter()
-            .zip(x)
-            .map(|(&w, &xv)| crate::quant::bf16_to_f32(w) * xv)
-            .sum();
-    };
+    if let Ok(a16) = bytemuck::try_cast_slice::<u8, u16>(a) {
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row = &a16[i * k..(i + 1) * k];
+            *yi = row
+                .iter()
+                .zip(x)
+                .map(|(&w, &xv)| crate::quant::bf16_to_f32(w) * xv)
+                .sum();
+        };
 
-    if m >= gemv_par_threshold() {
-        par_rows(y, gemv_min_rows(), compute_row);
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     } else {
-        y.iter_mut().enumerate().for_each(compute_row);
+        let k_bytes = k * std::mem::size_of::<u16>();
+        let compute_row = |(i, yi): (usize, &mut f32)| {
+            let row_bytes = &a[i * k_bytes..(i + 1) * k_bytes];
+            let u16_ptr = row_bytes.as_ptr() as *const u16;
+            let mut sum = 0.0f32;
+            for (j, &xj) in x.iter().enumerate() {
+                let val = unsafe { std::ptr::read_unaligned(u16_ptr.add(j)) };
+                sum += crate::quant::bf16_to_f32(val) * xj;
+            }
+            *yi = sum;
+        };
+
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
+        }
     }
 }
 

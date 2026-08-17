@@ -1874,6 +1874,12 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
         let sz = read_u32(o + 4)? as usize;
         let body = o + 8;
         if id == b"fmt " {
+            if sz < 16 {
+                bail!("WAV `{path}`: `fmt ` chunk size {sz} < 16");
+            }
+            if body + sz > buf.len() {
+                bail!("WAV `{path}`: `fmt ` chunk extends past file");
+            }
             fmt_off = Some(body);
         } else if id == b"data" {
             if body + sz > buf.len() {
@@ -1886,7 +1892,12 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
             data = Some((body, sz));
         }
         // Subchunks are word-aligned: pad odd sizes by 1.
-        o = body + sz + (sz & 1);
+        let pad = sz & 1;
+        let next = match body.checked_add(sz).and_then(|n| n.checked_add(pad)) {
+            Some(n) => n,
+            None => break,
+        };
+        o = next;
     }
     let fmt = fmt_off.ok_or_else(|| anyhow!("WAV `{path}`: no `fmt ` chunk"))?;
     let (data_off, data_sz) = data.ok_or_else(|| anyhow!("WAV `{path}`: no `data` chunk"))?;

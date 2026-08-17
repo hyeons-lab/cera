@@ -222,10 +222,9 @@ pub fn n_frames_for(n_samples: usize) -> usize {
 /// `effective_n_len` would diverge from the reference's frame
 /// count — the conv stem expects all `n_frames` rows.
 pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) {
-    if pcm.is_empty() {
+    if pcm.is_empty() || n_mel_bins == 0 {
         return (Vec::new(), 0);
     }
-    assert!(n_mel_bins > 0, "n_mel_bins must be > 0");
 
     let n_samples_in = pcm.len();
     let pad_amount = N_FFT / 2;

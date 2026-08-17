@@ -600,9 +600,11 @@ pub fn sample_audio_frame(
         if j > 0 && prev_token >= 0 {
             let prev_cb = &weights.depth_embeddings[j - 1];
             let tok = prev_token as usize;
-            prev_cb.embedding.dequantize_row(tok, &mut state.emb_row);
-            for (d, e) in state.depthformer_in.iter_mut().zip(&state.emb_row) {
-                *d += e;
+            if tok < prev_cb.embedding.rows {
+                prev_cb.embedding.dequantize_row(tok, &mut state.emb_row);
+                for (d, e) in state.depthformer_in.iter_mut().zip(&state.emb_row) {
+                    *d += e;
+                }
             }
         }
 
@@ -670,10 +672,14 @@ pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec
 
     let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
-        let offset_idx = j * n_vocab + code as usize;
-        emb.dequantize_row(offset_idx, &mut row);
-        for (r, e) in result.iter_mut().zip(&row) {
-            *r += e;
+        if code >= 0 {
+            let offset_idx = j * n_vocab + code as usize;
+            if offset_idx < emb.rows {
+                emb.dequantize_row(offset_idx, &mut row);
+                for (r, e) in result.iter_mut().zip(&row) {
+                    *r += e;
+                }
+            }
         }
     }
 
@@ -939,10 +945,14 @@ pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32
     let mut result = vec![0.0f32; emb_dim];
     let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
-        let idx = j * n_vocab_per_cb + code as usize;
-        emb.dequantize_row(idx, &mut row);
-        for (r, e) in result.iter_mut().zip(&row) {
-            *r += e;
+        if code >= 0 {
+            let idx = j * n_vocab_per_cb + code as usize;
+            if idx < emb.rows {
+                emb.dequantize_row(idx, &mut row);
+                for (r, e) in result.iter_mut().zip(&row) {
+                    *r += e;
+                }
+            }
         }
     }
     // Mean across codebooks.
@@ -1000,7 +1010,6 @@ fn detok_conv_block(
     // Kernel applies: sum over k of weight[k] * input[pos - d_conv + k]
     // GGUF stores conv.weight as [kernel_size, n_embd] with dim0 (kernel) fastest.
     // Element (k, ch) is at index ch * kernel_size + k.
-    let kernel_size = d_conv + 1;
     for ch in 0..chunk_size {
         let mut sum = 0.0;
         for k in 0..d_conv {
@@ -1347,7 +1356,7 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
 
     // Strip startup padding: the first (n_fft - hop_length) / 2 samples are
     // overlap-add artifacts. Matches llama.cpp's `padding_to_remove`.
-    let padding = (n_fft - hop_length) / 2;
+    let padding = n_fft.saturating_sub(hop_length) / 2;
     if output.len() > padding {
         output.drain(..padding);
     }
@@ -1450,7 +1459,7 @@ impl IstftStreamer {
         let n_fft_bins = n_fft / 2 + 1;
         let frame_size = n_fft_bins * 2;
         let hann = build_hann(n_fft);
-        let padding = (n_fft - hop_length) / 2;
+        let padding = n_fft.saturating_sub(hop_length) / 2;
         Self {
             n_fft,
             hop_length,
