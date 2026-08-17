@@ -4480,9 +4480,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BundleQuantPair, Cli, Command, display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono,
-        resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        truncate_oldest_turn_pair, write_transcript, write_wav,
+        BundleQuantPair, Cli, CliSamplingArgs, Command, display_bundle_id, normalize_bundle_id,
+        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
+        split_at_marker, truncate_oldest_turn_pair, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -5732,5 +5732,62 @@ mod tests {
             }
             _ => panic!("expected Vad command"),
         }
+    }
+
+    #[test]
+    fn cli_sampling_args_validate_ranges() {
+        let valid = CliSamplingArgs {
+            max_tokens: 128,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.1),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Negative temperature allowed for greedy decoding
+        let greedy = CliSamplingArgs {
+            max_tokens: 128,
+            temperature: Some(-0.5),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repetition_penalty: None,
+        };
+        assert!(greedy.validate().is_ok());
+
+        // NaN temperature rejected
+        let nan_temp = CliSamplingArgs {
+            max_tokens: 128,
+            temperature: Some(f32::NAN),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repetition_penalty: None,
+        };
+        assert!(nan_temp.validate().is_err());
+
+        // Repetition penalty 0.0 or negative rejected
+        let zero_rep = CliSamplingArgs {
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repetition_penalty: Some(0.0),
+        };
+        assert!(zero_rep.validate().is_err());
+
+        // Out-of-bounds top_p rejected
+        let oob_top_p = CliSamplingArgs {
+            max_tokens: 128,
+            temperature: None,
+            top_p: Some(1.5),
+            top_k: None,
+            min_p: None,
+            repetition_penalty: None,
+        };
+        assert!(oob_top_p.validate().is_err());
     }
 }

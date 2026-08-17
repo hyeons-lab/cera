@@ -1971,7 +1971,7 @@ pub fn gemv_q4_1_f32(
 
 /// Vector dot product using ARM NEON SIMD (unrolled across 4 vectors).
 #[cfg(target_arch = "aarch64")]
-#[inline]
+#[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
@@ -2014,7 +2014,7 @@ fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 
 /// Vector dot product using WASM SIMD128.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-#[inline]
+#[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
     use core::arch::wasm32::*;
@@ -2046,7 +2046,7 @@ fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Unrolled scalar fallback vector dot product.
-#[inline]
+#[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
     let mut a_chunks = a.chunks_exact(8);
@@ -2078,7 +2078,7 @@ fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Vector dot product of two `f32` slices of equal length.
-#[inline]
+#[inline(always)]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot_f32 input lengths must match");
 
@@ -2095,6 +2095,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         #[target_feature(enable = "avx", enable = "fma")]
+        #[inline(always)]
         #[allow(clippy::chunks_exact_to_as_chunks)]
         unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
             use std::arch::x86_64::*;
