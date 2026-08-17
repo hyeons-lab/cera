@@ -160,7 +160,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_space:
-        description: "Also publish this build to the Hugging Face Space"
+        description: "Publish this build to the Hugging Face Space (skips Cloudflare Pages deploy)"
         type: boolean
         default: false
 
@@ -189,8 +189,8 @@ permissions:
 # third publish cancels the queued second. Safe, since a pending run has pushed
 # nothing.
 concurrency:
-  group: ${{ inputs.publish_space && 'web-demo-space-publish' || format('web-demo-{0}', github.ref) }}
-  cancel-in-progress: ${{ !inputs.publish_space }}
+  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_space) && 'web-demo-space-publish' || format('web-demo-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish_space) }}
 
 env:
   PROJECT_NAME: cera-demo
@@ -328,7 +328,7 @@ jobs:
           # copy of the patterns is not checking the tracking, it is agreeing
           # with itself.
           ATTR="${GITHUB_WORKSPACE}/${SPACE_META}/.gitattributes"
-          LFS_EXTS=$(sed -n 's/^\*\.\([A-Za-z0-9_-]\{1,\}\)[[:space:]].*filter=lfs.*/\1/p' "$ATTR")
+          LFS_EXTS=$(sed -n 's/^\*\.\([A-Za-z0-9_-]\{1,\}\)[[:space:]].*filter=lfs.*/\1/p' "$ATTR" | tr '[:upper:]' '[:lower:]')
           # An empty parse would make the loop below wave everything through
           # while still reporting a pass, so it is the one outcome that cannot
           # be treated as "nothing to check". Reachable without anyone touching
@@ -389,12 +389,17 @@ jobs:
                   *.*) ext="${rel##*.}" ;;
                   *) ext="" ;;
                 esac
-                case "$LFS_LIST" in
-                  *" $ext "*) ;;
-                  # Collected rather than reported: this loop's output is the
-                  # job summary table, and an error line belongs in the log.
-                  *) UNTRACKED="${UNTRACKED}  ${rel} ($bytes bytes)"$'\n' ;;
-                esac
+                ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+                if [ -n "$ext" ]; then
+                  case "$LFS_LIST" in
+                    *" $ext "*) ;;
+                    # Collected rather than reported: this loop's output is the
+                    # job summary table, and an error line belongs in the log.
+                    *) UNTRACKED="${UNTRACKED}  ${rel} ($bytes bytes)"$'\n' ;;
+                  esac
+                else
+                  UNTRACKED="${UNTRACKED}  ${rel} ($bytes bytes)"$'\n'
+                fi
               fi
             done <<< "$SIZES"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
@@ -420,7 +425,7 @@ jobs:
             # into `%0A`.
             LIST="${UNTRACKED%$'\n'}"
             echo "::error::these files are over $LFS_LIMIT bytes and would be pushed to the Hugging Face Space outside LFS:%0A${LIST//$'\n'/%0A}"
-            echo "::error::add a pattern for them to ${SPACE_META}/.gitattributes, or find out why the build grew one. It has to be a top-level '*.ext filter=lfs' line: that is the only shape this check can read, so a path-scoped pattern would leave it failing unchanged."
+            echo "::error::add a '*.ext filter=lfs' pattern for them to ${SPACE_META}/.gitattributes, or rename/reduce files over 10 MB that lack an extension. The pattern check requires top-level '*.ext filter=lfs' lines."
             exit 1
           fi
 
@@ -429,7 +434,7 @@ jobs:
         # Skipped when this run is publishing the Space, so the two
         # destinations are never uploaded to by the same run. The header
         # explains why that separation is load-bearing rather than cosmetic.
-        if: ${{ !inputs.publish_space }}
+        if: !inputs.publish_space
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -470,11 +475,10 @@ jobs:
           fi
 
           # Staged in RUNNER_TEMP rather than turning `build/web` itself into a
-          # git repo. The push below authenticates with a remote URL carrying
-          # the token, which git writes into `.git/config`, and `build/web` is
-          # the directory this job hands to an uploader. Keeping the repo out
-          # of it means no later change to what gets uploaded, or in what
-          # order, can ship a credential.
+          # git repo. The push below authenticates via http.extraheader Bearer
+          # auth, and `build/web` is the directory this job hands to an uploader.
+          # Keeping the git metadata completely isolated in RUNNER_TEMP ensures
+          # no uploaded artifacts contain repository or credential state.
           SPACE_DIR="${RUNNER_TEMP}/hf-space"
           rm -rf "$SPACE_DIR"
           mkdir -p "$SPACE_DIR"
@@ -513,12 +517,11 @@ jobs:
           # resolve, so the push fails with `batch request: missing protocol`
           # after the pointer files are already committed.
           #
-          # The token is in the URL because that is the shape HF's git endpoint
-          # takes; the username half is ignored when the password is a token.
-          # Actions masks the secret's value wherever it appears in the log, and
-          # nothing here echoes the remote, so it does not reach the transcript.
-          git remote add space "https://user:${HF_TOKEN}@huggingface.co/spaces/${SPACE_ID}"
-          git push --force --quiet space main
+          # The token is passed via http.extraheader Bearer authorization so the
+          # remote URL contains no credentials, protecting against token leaks in
+          # git-lfs traces or terminal error diagnostics.
+          git remote add space "https://huggingface.co/spaces/${SPACE_ID}"
+          git -c "http.extraheader=Authorization: Bearer ${HF_TOKEN}" push --force --quiet space main
 
           # A static Space is served from `<owner>-<name>.static.hf.space`,
           # lowercased. Derived instead of written out again so that changing
