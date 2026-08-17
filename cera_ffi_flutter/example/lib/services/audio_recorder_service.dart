@@ -53,10 +53,17 @@ class AudioRecorderService {
       );
 
       _isRecording = true;
-      _streamSub = stream.listen((chunk) {
-        final samples = pcm16ToFloat32(chunk);
-        _accumulatedPcm.addAll(samples);
-      });
+      _streamSub = stream.listen(
+        (chunk) {
+          final samples = pcm16ToFloat32(chunk);
+          _accumulatedPcm.addAll(samples);
+        },
+        onError: (err) {
+          debugPrint('[cera:audio_recorder] stream error: $err');
+          _isRecording = false;
+        },
+        cancelOnError: true,
+      );
     }
   }
 

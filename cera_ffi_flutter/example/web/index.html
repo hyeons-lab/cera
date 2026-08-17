@@ -40,6 +40,7 @@
     }
   </style>
 </head>
+<body>
   <script>
     window.ceraDecodeAudioBlob = async function(blobUrl, targetSr) {
       try {
@@ -246,6 +247,7 @@
     globalThis.ceraFinishAudioStream = window.ceraFinishAudioStream;
     globalThis.ceraStopAudioStream = window.ceraStopAudioStream;
     globalThis.ceraDownloadFile = window.ceraDownloadFile;
+    globalThis.ceraProbeBundleFiles = window.ceraProbeBundleFiles;
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

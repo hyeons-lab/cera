@@ -177,7 +177,10 @@ class _TurnBubble extends StatelessWidget {
                           ),
                   ),
                 if (!isUser &&
-                    (turn.modelName != null || turn.stats != null)) ...[
+                    !turn.isGenerating &&
+                    (turn.modelName != null ||
+                        turn.stats != null ||
+                        turn.text.isNotEmpty)) ...[
                   const SizedBox(height: 6),
                   Wrap(
                     crossAxisAlignment: WrapCrossAlignment.center,

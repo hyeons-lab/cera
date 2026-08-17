@@ -107,7 +107,9 @@ class _MessageComposerState extends State<MessageComposer> {
     if (_isStartingRecording) {
       _isStartingRecording = false;
       _pointerOrigin = null;
-      await _audioRecorder.cancelRecording();
+      try {
+        await _audioRecorder.cancelRecording();
+      } catch (_) {}
       return;
     }
     if (!_isRecordingAudio) return;
@@ -121,13 +123,23 @@ class _MessageComposerState extends State<MessageComposer> {
     });
 
     if (cancelled) {
-      await _audioRecorder.cancelRecording();
+      try {
+        await _audioRecorder.cancelRecording();
+      } catch (_) {}
       return;
     }
 
-    final pcm = await _audioRecorder.stopRecording();
-    if (pcm.isNotEmpty && mounted) {
-      widget.onSendAudio(pcm, 16000);
+    try {
+      final pcm = await _audioRecorder.stopRecording();
+      if (pcm.isNotEmpty && mounted) {
+        widget.onSendAudio(pcm, 16000);
+      }
+    } catch (err) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Recording error: $err')));
+      }
     }
   }
 
@@ -279,7 +291,7 @@ class _MessageComposerState extends State<MessageComposer> {
                             ),
                           ),
                         ),
-                        enabled: !widget.isGenerating,
+                        readOnly: widget.isGenerating,
                         onSubmitted: (_) => widget.onSend(),
                       ),
               ),

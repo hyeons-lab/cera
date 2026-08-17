@@ -47,11 +47,12 @@ Uint8List encodeWav(List<double> samples, {int sampleRate = 24000}) {
   // Convert Float32 samples to Int16 PCM
   var offset = 44;
   for (var i = 0; i < numSamples; i++) {
-    final clamped = samples[i].clamp(-1.0, 1.0);
-    final int16Val = (clamped * 32767.0).round().clamp(-32768, 32767);
+    final s = samples[i];
+    final sample = s.isFinite ? s.clamp(-1.0, 1.0) : 0.0;
+    final int16Val = (sample * 32767.0).round().clamp(-32768, 32767);
     buffer.setInt16(offset, int16Val, Endian.little);
     offset += 2;
   }
 
-  return buffer.buffer.asUint8List();
+  return buffer.buffer.asUint8List(buffer.offsetInBytes, buffer.lengthInBytes);
 }

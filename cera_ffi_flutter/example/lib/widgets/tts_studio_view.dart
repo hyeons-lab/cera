@@ -51,7 +51,9 @@ class _TtsStudioViewState extends State<TtsStudioView> {
   void initState() {
     super.initState();
     final modelName = _getModelDisplayName(widget.state);
-    _textController = TextEditingController(text: _defaultSampleText(modelName));
+    _textController = TextEditingController(
+      text: _defaultSampleText(modelName),
+    );
   }
 
   @override
@@ -73,13 +75,13 @@ class _TtsStudioViewState extends State<TtsStudioView> {
     super.dispose();
   }
 
-  void _synthesize() {
+  Future<void> _synthesize() async {
     final text = _textController.text.trim();
     if (text.isEmpty || widget.state.isBusy) return;
 
     // Ensure audio mode is set to textToSpeech
     if (widget.state.settings.audioChatMode != AudioChatMode.textToSpeech) {
-      widget.controller.dispatch(
+      await widget.controller.dispatch(
         const UpdateSettingsIntent(audioChatMode: AudioChatMode.textToSpeech),
       );
     }
@@ -94,7 +96,15 @@ class _TtsStudioViewState extends State<TtsStudioView> {
     final hasAudioOut = state.capabilities?.audioOut ?? false;
 
     // Find turns that contain assistant audio outputs
-    final audioTurns = state.turns.where((t) => t.role == 'assistant').toList();
+    final audioTurns = state.turns
+        .where(
+          (t) =>
+              t.role == 'assistant' &&
+              (t.audioSamples != null ||
+                  t.audioDurationSeconds != null ||
+                  t.isGenerating),
+        )
+        .toList();
 
     return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
@@ -253,7 +263,9 @@ class _TtsStudioViewState extends State<TtsStudioView> {
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
-              children: _getSamplePrompts(_getModelDisplayName(state)).map((prompt) {
+              children: _getSamplePrompts(_getModelDisplayName(state)).map((
+                prompt,
+              ) {
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: ActionChip(
@@ -471,140 +483,155 @@ class _TtsStudioViewState extends State<TtsStudioView> {
               ],
             ),
             const SizedBox(height: 8),
-            ListView.separated(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: audioTurns.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 12),
-              itemBuilder: (context, index) {
-                final turn = audioTurns[audioTurns.length - 1 - index];
-                return Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surface,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: theme.colorScheme.outlineVariant),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (turn.audioDurationSeconds != null ||
-                          turn.audioSamples != null)
-                        AudioWaveformBubble(
-                          durationSeconds: turn.audioDurationSeconds ?? 0,
-                          samples: turn.audioSamples,
-                          audioPlayer: widget.controller.audioPlayer,
-                        )
-                      else if (turn.isGenerating)
-                        Row(
-                          children: [
-                            const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                            const SizedBox(width: 8),
-                            Text(
-                              turn.statusText ?? 'Synthesizing audio...',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                          ],
-                        ),
-                      if (turn.text.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          turn.text,
-                          style: TextStyle(
-                            fontSize: 13,
-                            color: theme.colorScheme.onSurface,
-                            height: 1.4,
+            Column(
+              children: [
+                for (int i = 0; i < audioTurns.length; i++) ...[
+                  if (i > 0) const SizedBox(height: 12),
+                  Builder(
+                    builder: (context) {
+                      final turn = audioTurns[audioTurns.length - 1 - i];
+                      return Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: theme.colorScheme.outlineVariant,
                           ),
                         ),
-                      ],
-                      if (turn.stats != null) ...[
-                        const SizedBox(height: 8),
-                        Wrap(
-                          spacing: 12,
-                          runSpacing: 4,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            if (turn.stats!.tokens > 0)
-                              Text(
-                                'Tokens: ${turn.stats!.tokens}',
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            if (turn.stats!.tps > 0)
-                              Text(
-                                'Speed: ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            if (turn.stats!.audioDurationSeconds != null)
-                              Text(
-                                'Audio: ${turn.stats!.audioDurationSeconds!.toStringAsFixed(1)}s',
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: theme.colorScheme.primary,
-                                ),
-                              ),
-                            if (turn.stats!.audioRtf != null)
-                              Text(
-                                'RTF: ${turn.stats!.audioRtf!.toStringAsFixed(2)}x',
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: theme.colorScheme.primary,
-                                ),
-                              ),
-                            Text(
-                              'Latency: ${turn.stats!.totalMs}ms',
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            if (turn.text.isNotEmpty)
-                              IconButton(
-                                icon: Icon(
-                                  Icons.copy_rounded,
-                                  size: 13,
-                                  color: theme.colorScheme.onSurfaceVariant
-                                      .withValues(alpha: 0.7),
-                                ),
-                                padding: EdgeInsets.zero,
-                                constraints: const BoxConstraints(
-                                  minWidth: 18,
-                                  minHeight: 18,
-                                ),
-                                tooltip: 'Copy text',
-                                onPressed: () {
-                                  Clipboard.setData(
-                                    ClipboardData(text: turn.text),
-                                  );
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(
-                                      content: Text('Copied to clipboard'),
-                                      duration: Duration(seconds: 1),
-                                      behavior: SnackBarBehavior.floating,
+                            if (turn.audioDurationSeconds != null ||
+                                turn.audioSamples != null)
+                              AudioWaveformBubble(
+                                durationSeconds: turn.audioDurationSeconds ?? 0,
+                                samples: turn.audioSamples,
+                                audioPlayer: widget.controller.audioPlayer,
+                              )
+                            else if (turn.isGenerating)
+                              Row(
+                                children: [
+                                  const SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
                                     ),
-                                  );
-                                },
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    turn.statusText ?? 'Synthesizing audio...',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
                               ),
+                            if (turn.text.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                turn.text,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: theme.colorScheme.onSurface,
+                                  height: 1.4,
+                                ),
+                              ),
+                            ],
+                            if (turn.stats != null) ...[
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 12,
+                                runSpacing: 4,
+                                children: [
+                                  if (turn.stats!.tokens > 0)
+                                    Text(
+                                      'Tokens: ${turn.stats!.tokens}',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  if (turn.stats!.tps > 0)
+                                    Text(
+                                      'Speed: ${turn.stats!.tps.toStringAsFixed(1)} tok/s',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  if (turn.stats!.audioDurationSeconds != null)
+                                    Text(
+                                      'Audio: ${turn.stats!.audioDurationSeconds!.toStringAsFixed(1)}s',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: theme.colorScheme.primary,
+                                      ),
+                                    ),
+                                  if (turn.stats!.audioRtf != null)
+                                    Text(
+                                      'RTF: ${turn.stats!.audioRtf!.toStringAsFixed(2)}x',
+                                      style: TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: theme.colorScheme.primary,
+                                      ),
+                                    ),
+                                  Text(
+                                    'Latency: ${turn.stats!.totalMs}ms',
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                  if (turn.text.isNotEmpty)
+                                    IconButton(
+                                      icon: Icon(
+                                        Icons.copy_rounded,
+                                        size: 13,
+                                        color: theme
+                                            .colorScheme
+                                            .onSurfaceVariant
+                                            .withValues(alpha: 0.7),
+                                      ),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 18,
+                                        minHeight: 18,
+                                      ),
+                                      tooltip: 'Copy text',
+                                      onPressed: () {
+                                        Clipboard.setData(
+                                          ClipboardData(text: turn.text),
+                                        );
+                                        ScaffoldMessenger.of(
+                                          context,
+                                        ).showSnackBar(
+                                          const SnackBar(
+                                            content: Text(
+                                              'Copied to clipboard',
+                                            ),
+                                            duration: Duration(seconds: 1),
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                ],
+                              ),
+                            ],
                           ],
                         ),
-                      ],
-                    ],
+                      );
+                    },
                   ),
-                );
-              },
+                ],
+              ],
             ),
           ],
         ],

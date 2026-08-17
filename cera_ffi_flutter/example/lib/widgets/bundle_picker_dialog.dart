@@ -354,13 +354,19 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                 ),
               ],
             ),
-            onTap: () => Navigator.of(context).pop(
-              BundleChoice(
-                bundleName: model.bundleName,
-                quant: model.quant,
-                displayName: model.displayName,
-              ),
-            ),
+            onTap: () {
+              if (isActive) {
+                Navigator.of(context).pop();
+                return;
+              }
+              Navigator.of(context).pop(
+                BundleChoice(
+                  bundleName: model.bundleName,
+                  quant: model.quant,
+                  displayName: model.displayName,
+                ),
+              );
+            },
           ),
         );
       },

@@ -25,6 +25,7 @@ external void _ceraStopAudioStream();
 
 /// Plays a single audio PCM buffer using the browser Web Audio API.
 Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
+  if (samples.isEmpty) return;
   debugPrint(
     '[cera:audio_player_web] playAudioPcm calling ceraPlayAudio with ${samples.length} samples at $sampleRate Hz',
   );

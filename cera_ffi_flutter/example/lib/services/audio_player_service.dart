@@ -16,8 +16,11 @@ class AudioPlayerService extends ChangeNotifier {
 
   /// Whether a specific audio source (e.g. sample buffer) is currently playing.
   bool isSourcePlaying(Object? source) {
-    if (!_isPlaying || _activeAudioSource == null || source == null) return false;
-    return identical(_activeAudioSource, source) || _activeAudioSource == source;
+    if (!_isPlaying || _activeAudioSource == null || source == null) {
+      return false;
+    }
+    return identical(_activeAudioSource, source) ||
+        _activeAudioSource == source;
   }
 
   /// Plays a completed mono Float32 PCM waveform.
@@ -70,7 +73,9 @@ class AudioPlayerService extends ChangeNotifier {
     debugPrint(
       '[cera:audio_player_service] appendChunk called with ${chunk.length} samples (isPlaying=$_isPlaying, kIsWeb=$kIsWeb)',
     );
-    if (chunk.isEmpty || !_isPlaying) return;
+    if (chunk.isEmpty || !_isPlaying || !identical(_activeAudioSource, this)) {
+      return;
+    }
     final floatList = Float32List.fromList(chunk);
     if (kIsWeb) {
       web_player.appendAudioStreamChunk(floatList);
@@ -90,6 +95,7 @@ class AudioPlayerService extends ChangeNotifier {
     debugPrint(
       '[cera:audio_player_service] finishStream called (kIsWeb=$kIsWeb)',
     );
+    if (!identical(_activeAudioSource, this)) return;
     _isPlaying = false;
     _activeAudioSource = null;
     _notifySafely();

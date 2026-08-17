@@ -66,6 +66,6 @@ Future<Map<String, int>> probeBundleFileSizes(
   } catch (_) {
     return {};
   } finally {
-    client.close();
+    client.close(force: true);
   }
 }

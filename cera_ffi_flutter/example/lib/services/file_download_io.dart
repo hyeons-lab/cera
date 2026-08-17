@@ -7,7 +7,23 @@ Future<void> downloadFileBytes(
   required String filename,
   String mimeType = 'application/octet-stream',
 }) async {
-  final dir = Directory.current.path;
-  final file = File('$dir/$filename');
-  await file.writeAsBytes(bytes);
+  Directory targetDir;
+  try {
+    final current = Directory.current;
+    if (current.path != '/' &&
+        (Platform.isMacOS || Platform.isLinux || Platform.isWindows)) {
+      targetDir = current;
+    } else {
+      targetDir = Directory.systemTemp;
+    }
+  } catch (_) {
+    targetDir = Directory.systemTemp;
+  }
+  try {
+    final file = File('${targetDir.path}/$filename');
+    await file.writeAsBytes(bytes);
+  } catch (_) {
+    final fallback = File('${Directory.systemTemp.path}/$filename');
+    await fallback.writeAsBytes(bytes);
+  }
 }

@@ -218,17 +218,21 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
       double sum = 0.0;
       final limit = math.min(end, pcm.length);
       for (var j = start; j < limit; j++) {
-        sum += pcm[j].abs();
+        final val = pcm[j];
+        if (val.isFinite) {
+          sum += val.abs();
+        }
       }
       final count = math.max(1, limit - start);
       final avg = sum / count;
-      bars[i] = avg;
-      if (avg > maxVal) maxVal = avg;
+      bars[i] = avg.isFinite ? avg : 0.0;
+      if (bars[i] > maxVal) maxVal = bars[i];
     }
 
     if (maxVal > 1e-4) {
       for (var i = 0; i < numBars; i++) {
-        bars[i] = (bars[i] / maxVal).clamp(0.15, 1.0);
+        final norm = bars[i] / maxVal;
+        bars[i] = norm.isFinite ? norm.clamp(0.15, 1.0) : 0.15;
       }
     }
     return bars;
@@ -254,8 +258,9 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     if (_isPlaying) {
       player.stop();
     } else {
-      final sr = widget.durationSeconds > 0
-          ? (samples.length / widget.durationSeconds).round()
+      final sr =
+          (widget.durationSeconds.isFinite && widget.durationSeconds > 0.05)
+          ? (samples.length / widget.durationSeconds).round().clamp(8000, 96000)
           : 24000;
       await player.playPcm(samples, sampleRate: sr, source: samples);
     }
@@ -330,23 +335,40 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
               constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
               tooltip: 'Download WAV audio',
               onPressed: () async {
-                final sr = widget.durationSeconds > 0
-                    ? (widget.samples!.length / widget.durationSeconds).round()
-                    : 24000;
-                await downloadAudioWav(
-                  widget.samples!,
-                  filename:
-                      'cera_audio_${DateTime.now().millisecondsSinceEpoch}.wav',
-                  sampleRate: sr,
-                );
-                if (context.mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('WAV audio downloaded'),
-                      duration: Duration(seconds: 1),
-                      behavior: SnackBarBehavior.floating,
-                    ),
+                try {
+                  final sr =
+                      (widget.durationSeconds.isFinite &&
+                          widget.durationSeconds > 0.05)
+                      ? (widget.samples!.length / widget.durationSeconds)
+                            .round()
+                            .clamp(8000, 96000)
+                      : 24000;
+                  await downloadAudioWav(
+                    widget.samples!,
+                    filename:
+                        'cera_audio_${DateTime.now().millisecondsSinceEpoch}.wav',
+                    sampleRate: sr,
                   );
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('WAV audio downloaded'),
+                        duration: Duration(seconds: 1),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('Failed to save audio: $e'),
+                        backgroundColor: theme.colorScheme.error,
+                        duration: const Duration(seconds: 2),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
                 }
               },
             ),

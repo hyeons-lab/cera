@@ -97,15 +97,25 @@ class _ChatPageState extends State<ChatPage> {
   void _onStateChange() {
     if (!mounted) return;
     if (_controller.value.isGenerating) {
-      _scrollToBottom();
+      if (!_scrollController.hasClients) return;
+      final pos = _scrollController.position;
+      final distanceToBottom = pos.maxScrollExtent - pos.pixels;
+      // Only auto-scroll if the user is already near the bottom (within 120px)
+      if (distanceToBottom < 120) {
+        _scrollToBottom(isStreaming: true);
+      }
     }
   }
 
-  void _scrollToBottom() {
+  void _scrollToBottom({bool isStreaming = false}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final target = _scrollController.position.maxScrollExtent;
+      if (isStreaming) {
+        _scrollController.jumpTo(target);
+      } else {
         _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
+          target,
           duration: const Duration(milliseconds: 150),
           curve: Curves.easeOut,
         );
@@ -213,6 +223,7 @@ class _ChatPageState extends State<ChatPage> {
     final prompt = _inputController.text.trim();
     if (prompt.isEmpty && _controller.value.pendingImageBytes == null) return;
     _inputController.clear();
+    _scrollToBottom();
     _controller.dispatch(SendMessageIntent(prompt));
   }
 
@@ -226,9 +237,11 @@ class _ChatPageState extends State<ChatPage> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            final currentSettings = _controller.value.settings;
+        return ListenableBuilder(
+          listenable: _controller,
+          builder: (context, _) {
+            final currentState = _controller.value;
+            final currentSettings = currentState.settings;
             return SafeArea(
               child: Padding(
                 padding: const EdgeInsets.symmetric(
@@ -292,7 +305,7 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                         onTap: () {
                           Navigator.of(context).pop();
-                          _pickBundle(state);
+                          _pickBundle(_controller.value);
                         },
                       ),
                       ListTile(
@@ -310,7 +323,7 @@ class _ChatPageState extends State<ChatPage> {
                           _pickLocalModel();
                         },
                       ),
-                      if (state.hasModel) ...[
+                      if (currentState.hasModel) ...[
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           leading: Icon(
@@ -371,7 +384,6 @@ class _ChatPageState extends State<ChatPage> {
                           ],
                           onChanged: (val) {
                             if (val == null) return;
-                            setModalState(() {});
                             _controller.dispatch(
                               UpdateSettingsIntent(backend: val),
                             );
@@ -391,7 +403,6 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                         value: currentSettings.turboQuant,
                         onChanged: (val) {
-                          setModalState(() {});
                           _controller.dispatch(
                             UpdateSettingsIntent(turboQuant: val),
                           );
@@ -427,7 +438,6 @@ class _ChatPageState extends State<ChatPage> {
                             ),
                           ],
                           onChanged: (val) {
-                            setModalState(() {});
                             _controller.dispatch(
                               UpdateSettingsIntent(
                                 maxImageLongSize: val,
@@ -472,33 +482,39 @@ class _ChatPageState extends State<ChatPage> {
                           ],
                           onChanged: (val) {
                             if (val == null) return;
-                            setModalState(() {});
                             _controller.dispatch(
                               UpdateSettingsIntent(audioChatMode: val),
                             );
                           },
                         ),
                       ),
-                      if (state.capabilities?.audioOut ?? true) ...[
+                      if (currentSettings.audioChatMode ==
+                              AudioChatMode.interleaved ||
+                          currentSettings.audioChatMode ==
+                              AudioChatMode.textToSpeech) ...[
                         const SizedBox(height: 8),
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           title: const Text('Voice Persona'),
                           subtitle: Text(
-                            'Persona for voice chat responses (TTS Studio maintains its own dedicated voice setting).',
+                            'Select speaker timbre and accent for synthesized speech responses.',
                             style: TextStyle(
                               fontSize: 12,
                               color: theme.colorScheme.onSurfaceVariant,
                             ),
                           ),
-                          trailing: DropdownButton<String>(
+                          trailing: DropdownButton<String?>(
                             value: currentSettings.chatVoice,
                             dropdownColor: theme.colorScheme.surface,
                             underline: const SizedBox.shrink(),
                             items: const [
                               DropdownMenuItem(
+                                value: null,
+                                child: Text('Default Voice'),
+                              ),
+                              DropdownMenuItem(
                                 value: 'Use the US female voice.',
-                                child: Text('👩 US Female (Default)'),
+                                child: Text('👩 US Female'),
                               ),
                               DropdownMenuItem(
                                 value: 'Use the US male voice.',
@@ -514,8 +530,6 @@ class _ChatPageState extends State<ChatPage> {
                               ),
                             ],
                             onChanged: (val) {
-                              if (val == null) return;
-                              setModalState(() {});
                               _controller.dispatch(
                                 UpdateSettingsIntent(chatVoice: val),
                               );
@@ -523,7 +537,7 @@ class _ChatPageState extends State<ChatPage> {
                           ),
                         ),
                       ],
-                      if (state.hasModel) ...[
+                      if (currentState.hasModel) ...[
                         Divider(color: theme.dividerColor, height: 24),
                         Text(
                           'BACKEND & DEVICE',
@@ -549,17 +563,17 @@ class _ChatPageState extends State<ChatPage> {
                           child: Row(
                             children: [
                               Icon(
-                                Icons.memory_rounded,
-                                size: 20,
+                                Icons.developer_board_rounded,
+                                size: 24,
                                 color: theme.colorScheme.primary,
                               ),
-                              const SizedBox(width: 10),
+                              const SizedBox(width: 12),
                               Expanded(
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      state.backend ?? 'Unknown Backend',
+                                      currentState.backend ?? 'Unknown Backend',
                                       style: const TextStyle(
                                         fontSize: 13,
                                         fontWeight: FontWeight.w500,
@@ -567,7 +581,7 @@ class _ChatPageState extends State<ChatPage> {
                                     ),
                                     const SizedBox(height: 2),
                                     Text(
-                                      'Active model: ${state.loadedModel?.name ?? ""}',
+                                      'Active model: ${currentState.loadedModel?.name ?? ""}',
                                       style: TextStyle(
                                         fontSize: 11,
                                         color:
@@ -618,7 +632,7 @@ class _ChatPageState extends State<ChatPage> {
               ],
             ),
             bottom: PreferredSize(
-              preferredSize: Size.fromHeight(state.isLoading ? 3 : 1),
+              preferredSize: const Size.fromHeight(3),
               child: state.isLoading
                   ? LinearProgressIndicator(
                       value: state.downloadFraction,

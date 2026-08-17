@@ -82,6 +82,8 @@ class ChatController extends ValueNotifier<ChatState> {
   /// Explicitly and cleanly unloads the currently active Cera model and frees
   /// all underlying memory and native resources.
   Future<void> _unloadCurrentModel() async {
+    _loadSessionId++;
+    _audioPlayer.stop();
     if (_generationSub != null) {
       await _generationSub?.cancel();
       _generationSub = null;
@@ -102,8 +104,9 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _onUnloadModel() async {
+    final unloadId = _loadSessionId;
     await _unloadCurrentModel();
-    if (_disposed) return;
+    if (_disposed || _loadSessionId != unloadId) return;
     value = value.copyWith(
       loadedModel: () => null,
       capabilities: () => null,
@@ -247,7 +250,7 @@ class ChatController extends ValueNotifier<ChatState> {
         !value.isBusy) {
       final model = value.loadedModel;
       if (model is BundleModelSource) {
-        dispatch(
+        await _onLoadBundle(
           LoadBundleIntent(
             bundleName: model.bundleName,
             quant: model.quant,
@@ -256,7 +259,7 @@ class ChatController extends ValueNotifier<ChatState> {
           ),
         );
       } else if (model is ModelSource) {
-        dispatch(LoadLocalModelIntent(model));
+        await _onLoadLocalModel(LoadLocalModelIntent(model));
       }
     }
   }
@@ -297,6 +300,8 @@ class ChatController extends ValueNotifier<ChatState> {
     );
   }
 
+  int _loadSessionId = 0;
+
   Future<void> _load({
     required LoadedModel modelSource,
     required Future<Cera> Function(void Function(CeraDownload) onProgress)
@@ -311,6 +316,7 @@ class ChatController extends ValueNotifier<ChatState> {
     await _unloadCurrentModel();
 
     if (_disposed) return;
+    final loadId = ++_loadSessionId;
 
     value = value.copyWith(
       isLoading: true,
@@ -347,7 +353,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
     try {
       final cera = await openFn((progress) {
-        if (_disposed) return;
+        if (_disposed || _loadSessionId != loadId) return;
         final fileName = progress.url.contains('/')
             ? progress.url.split('/').last
             : progress.url;
@@ -412,7 +418,7 @@ class ChatController extends ValueNotifier<ChatState> {
         );
       });
 
-      if (_disposed) {
+      if (_disposed || _loadSessionId != loadId) {
         await cera.close();
         return;
       }
@@ -447,9 +453,12 @@ class ChatController extends ValueNotifier<ChatState> {
       } catch (_) {}
     } catch (err, stack) {
       debugPrint('cera: model failed to load: $err\n$stack');
-      if (!_disposed) {
+      if (!_disposed && _loadSessionId == loadId) {
         value = value.copyWith(
           isLoading: false,
+          loadedModel: () => null,
+          backend: () => null,
+          capabilities: () => null,
           downloadFraction: () => null,
           status: 'Failed to load: $err',
         );
@@ -586,6 +595,12 @@ class ChatController extends ValueNotifier<ChatState> {
         debugPrint(
           '[cera:chat] Image successfully encoded and seeded into KV cache',
         );
+        if (_disposed || !value.isGenerating) {
+          _updateLastTurn(
+            (t) => t.copyWith(isGenerating: false, statusText: () => null),
+          );
+          return;
+        }
         _updateLastTurn(
           (t) => t.copyWith(statusText: () => 'Generating response...'),
         );
@@ -615,7 +630,9 @@ class ChatController extends ValueNotifier<ChatState> {
       return;
     }
 
-    final durationSec = intent.pcmSamples.length / intent.sampleRate;
+    final durationSec = intent.sampleRate > 0
+        ? intent.pcmSamples.length / intent.sampleRate
+        : 0.0;
     final promptText = intent.prompt.trim();
     final isAsr = value.settings.audioChatMode == AudioChatMode.speechToText;
 
@@ -686,6 +703,12 @@ class ChatController extends ValueNotifier<ChatState> {
       debugPrint(
         '[cera:chat] Audio successfully encoded and seeded into KV cache',
       );
+      if (_disposed || !value.isGenerating) {
+        _updateLastTurn(
+          (t) => t.copyWith(isGenerating: false, statusText: () => null),
+        );
+        return;
+      }
       _updateLastTurn(
         (t) => t.copyWith(statusText: () => 'Generating response...'),
       );
@@ -706,22 +729,34 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   void _updateLastTurn(Turn Function(Turn current) updater) {
-    if (value.turns.isEmpty) return;
+    if (_disposed || value.turns.isEmpty) return;
     final turns = List<Turn>.from(value.turns);
     final last = turns.removeLast();
     turns.add(updater(last));
     value = value.copyWith(turns: turns);
   }
 
+  int _generationId = 0;
+
   Future<void> _runGeneration(String formattedPrompt) async {
     final cera = _ceraEngine;
-    if (cera == null || _disposed) return;
+    if (cera == null || _disposed) {
+      if (!_disposed) {
+        _updateLastTurn(
+          (t) => t.copyWith(isGenerating: false, statusText: () => null),
+        );
+        value = value.copyWith(isGenerating: false);
+      }
+      return;
+    }
 
+    final generationId = ++_generationId;
     final stopwatch = Stopwatch()..start();
     int? firstTokenMs;
     int tokenCount = 0;
     final done = Completer<void>();
     _generationCompleter = done;
+    var hasError = false;
 
     debugPrint(
       '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) and starting generation...',
@@ -729,7 +764,8 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final generatedAudioSamples = <double>[];
     final isTts = value.settings.audioChatMode == AudioChatMode.textToSpeech;
-    final shouldStreamAudio = (value.capabilities?.audioOut ?? false) &&
+    final shouldStreamAudio =
+        (value.capabilities?.audioOut ?? false) &&
         (value.settings.audioChatMode == AudioChatMode.interleaved ||
             value.settings.audioChatMode == AudioChatMode.textToSpeech);
 
@@ -744,6 +780,9 @@ class ChatController extends ValueNotifier<ChatState> {
         temperature: isTts ? 0.0 : null,
         onAudio: shouldStreamAudio
             ? (pcm, rate) {
+                if (rate <= 0 || _disposed || _generationId != generationId) {
+                  return;
+                }
                 debugPrint(
                   '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
                 );
@@ -751,7 +790,7 @@ class ChatController extends ValueNotifier<ChatState> {
                 _audioPlayer.appendChunk(pcm);
                 _updateLastTurn(
                   (t) => t.copyWith(
-                    audioSamples: List.of(generatedAudioSamples),
+                    audioSamples: generatedAudioSamples,
                     audioDurationSeconds: generatedAudioSamples.length / rate,
                   ),
                 );
@@ -761,6 +800,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
       final sub = stream.listen(
         (piece) {
+          if (_disposed || _generationId != generationId) return;
           tokenCount++;
           if (firstTokenMs == null) {
             firstTokenMs = stopwatch.elapsedMilliseconds;
@@ -774,16 +814,19 @@ class ChatController extends ValueNotifier<ChatState> {
             ),
           );
         },
-        onError: (Object err) {
-          _updateLastTurn(
-            (t) => t.copyWith(
-              isGenerating: false,
-              statusText: () => null,
-              text: t.text.isEmpty
-                  ? 'Error: $err'
-                  : '${t.text}\n\n[Error: $err]',
-            ),
-          );
+        onError: (err) {
+          hasError = true;
+          if (!_disposed && _generationId == generationId) {
+            _updateLastTurn(
+              (t) => t.copyWith(
+                isGenerating: false,
+                statusText: () => null,
+                text: t.text.isEmpty
+                    ? 'Error: $err'
+                    : '${t.text}\n\n[Error: $err]',
+              ),
+            );
+          }
           if (!done.isCompleted) done.complete();
         },
         onDone: () {
@@ -796,13 +839,16 @@ class ChatController extends ValueNotifier<ChatState> {
 
       await done.future;
     } catch (err) {
-      _updateLastTurn(
-        (t) => t.copyWith(
-          isGenerating: false,
-          statusText: () => null,
-          text: t.text.isEmpty ? 'Error: $err' : '${t.text}\n\n[Error: $err]',
-        ),
-      );
+      hasError = true;
+      if (!_disposed && _generationId == generationId) {
+        _updateLastTurn(
+          (t) => t.copyWith(
+            isGenerating: false,
+            statusText: () => null,
+            text: t.text.isEmpty ? 'Error: $err' : '${t.text}\n\n[Error: $err]',
+          ),
+        );
+      }
     } finally {
       stopwatch.stop();
       _audioPlayer.finishStream();
@@ -810,58 +856,66 @@ class ChatController extends ValueNotifier<ChatState> {
       _generationCompleter = null;
     }
 
-    final lastText = value.turns.isNotEmpty ? value.turns.last.text : '';
-    int totalTokens = 0;
-    if (lastText.isNotEmpty) {
-      try {
-        final encoded = await cera.encode(lastText, addSpecial: false);
-        totalTokens = encoded.length;
-      } catch (_) {
+    TurnStats? stats;
+    if (!hasError &&
+        tokenCount > 0 &&
+        !_disposed &&
+        _generationId == generationId &&
+        value.isGenerating) {
+      final lastText = value.turns.isNotEmpty ? value.turns.last.text : '';
+      int totalTokens = 0;
+      if (lastText.isNotEmpty) {
+        try {
+          final encoded = await cera.encode(lastText, addSpecial: false);
+          totalTokens = encoded.length;
+        } catch (_) {
+          totalTokens = tokenCount;
+        }
+      } else {
         totalTokens = tokenCount;
       }
-    } else {
-      totalTokens = tokenCount;
+
+      final totalMs = stopwatch.elapsedMilliseconds;
+      final ttft = firstTokenMs;
+      final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
+      final tps = totalTokens > 1 && decodeMs > 0
+          ? ((totalTokens - 1) / (decodeMs / 1000.0))
+          : (totalTokens == 1 && totalMs > 0
+                ? (totalTokens / (totalMs / 1000.0))
+                : 0.0);
+
+      final audioDurationSec = generatedAudioSamples.isNotEmpty
+          ? (generatedAudioSamples.length / 24000.0)
+          : null;
+      final audioRtf = (audioDurationSec != null && totalMs > 0)
+          ? (audioDurationSec / (totalMs / 1000.0))
+          : null;
+
+      stats = TurnStats(
+        tokens: totalTokens,
+        totalMs: totalMs,
+        ttftMs: ttft,
+        tps: tps,
+        audioDurationSeconds: audioDurationSec,
+        audioRtf: audioRtf,
+      );
+
+      debugPrint(
+        '[cera:chat] Generation completed: $totalTokens tokens in ${totalMs}ms '
+        '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms'
+        '${audioDurationSec != null ? ", ${audioDurationSec.toStringAsFixed(1)}s audio, RTF: ${audioRtf?.toStringAsFixed(2)}x" : ""})',
+      );
     }
 
-    final totalMs = stopwatch.elapsedMilliseconds;
-    final ttft = firstTokenMs;
-    final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
-    final tps = totalTokens > 1 && decodeMs > 0
-        ? ((totalTokens - 1) / (decodeMs / 1000.0))
-        : (totalTokens == 1 && totalMs > 0
-              ? (totalTokens / (totalMs / 1000.0))
-              : 0.0);
+    if (!_disposed && _generationId == generationId) {
+      _updateLastTurn(
+        (t) => t.copyWith(
+          isGenerating: false,
+          statusText: () => null,
+          stats: stats ?? t.stats,
+        ),
+      );
 
-    final audioDurationSec = generatedAudioSamples.isNotEmpty
-        ? (generatedAudioSamples.length / 24000.0)
-        : null;
-    final audioRtf = (audioDurationSec != null && totalMs > 0)
-        ? (audioDurationSec / (totalMs / 1000.0))
-        : null;
-
-    final stats = (totalTokens > 0 || audioDurationSec != null)
-        ? TurnStats(
-            tokens: totalTokens,
-            totalMs: totalMs,
-            ttftMs: ttft,
-            tps: tps,
-            audioDurationSeconds: audioDurationSec,
-            audioRtf: audioRtf,
-          )
-        : null;
-
-    _updateLastTurn(
-      (t) =>
-          t.copyWith(isGenerating: false, statusText: () => null, stats: stats),
-    );
-
-    debugPrint(
-      '[cera:chat] Generation completed: $totalTokens tokens in ${totalMs}ms '
-      '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms'
-      '${audioDurationSec != null ? ", ${audioDurationSec.toStringAsFixed(1)}s audio, RTF: ${audioRtf?.toStringAsFixed(2)}x" : ""})',
-    );
-
-    if (!_disposed) {
       value = value.copyWith(isGenerating: false);
     }
   }
@@ -881,6 +935,7 @@ class ChatController extends ValueNotifier<ChatState> {
       _generationCompleter!.complete();
       _generationCompleter = null;
     }
+    if (_disposed) return;
     final updatedTurns = value.turns.map((turn) {
       if (turn.isGenerating) {
         return turn.copyWith(isGenerating: false, statusText: () => null);
@@ -913,20 +968,30 @@ class ChatController extends ValueNotifier<ChatState> {
       // reopen the engine with the current model to clear it cleanly.
       final current = value.loadedModel;
       if (current != null) {
-        await _ceraEngine?.close();
-        _ceraEngine = null;
+        final resetId = ++_loadSessionId;
+        value = value.copyWith(isLoading: true, status: 'Resetting session...');
         try {
+          await _ceraEngine?.close();
+          _ceraEngine = null;
           final reloaded = await current.open(
             options: value.settings.ceraOptions,
           );
-          if (_disposed) {
+          if (_disposed || _loadSessionId != resetId) {
             await reloaded.close();
             return;
           }
           _ceraEngine = reloaded;
-        } catch (err) {
-          if (_disposed) return;
+          final visionTag = reloaded.capabilities.imageIn ? ' · Vision' : '';
           value = value.copyWith(
+            isLoading: false,
+            capabilities: () => reloaded.capabilities,
+            backend: () => reloaded.backend,
+            status: '${current.name} · ${reloaded.backend}$visionTag',
+          );
+        } catch (err) {
+          if (_disposed || _loadSessionId != resetId) return;
+          value = value.copyWith(
+            isLoading: false,
             loadedModel: () => null,
             backend: () => null,
             capabilities: () => null,
@@ -936,6 +1001,9 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     } catch (err) {
       debugPrint('[cera:chat] Engine reset failed: $err');
+      if (!_disposed) {
+        value = value.copyWith(isLoading: false);
+      }
     }
     if (!_disposed) {
       value = value.copyWith(turns: []);
@@ -950,7 +1018,7 @@ class ChatController extends ValueNotifier<ChatState> {
     if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
       _generationCompleter!.complete();
     }
-    _ceraEngine?.close();
+    _ceraEngine?.terminate();
     super.dispose();
   }
 }
