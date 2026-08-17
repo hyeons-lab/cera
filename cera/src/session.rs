@@ -2851,7 +2851,7 @@ mod tests {
         assert_eq!(default_opts.temperature, 0.7);
         assert_eq!(default_opts.top_p, 0.9);
         assert_eq!(default_opts.top_k, 40);
-        assert_eq!(default_opts.min_p, 0.0);
-        assert_eq!(default_opts.repetition_penalty, 1.0);
+        assert_eq!(default_opts.min_p, 0.05);
+        assert_eq!(default_opts.repetition_penalty, 1.1);
     }
 }
