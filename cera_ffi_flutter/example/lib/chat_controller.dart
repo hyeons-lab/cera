@@ -787,6 +787,7 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     final generatedAudioSamples = <double>[];
+    int? audioSampleRate;
     final mode = value.settings.audioChatMode;
     final isTts = mode == AudioChatMode.textToSpeech;
     final isAudioChat = mode == AudioChatMode.interleaved || isTts;
@@ -810,11 +811,12 @@ class ChatController extends ValueNotifier<ChatState> {
                 debugPrint(
                   '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
                 );
+                audioSampleRate = rate;
                 generatedAudioSamples.addAll(pcm);
                 _audioPlayer.appendChunk(pcm);
                 _updateLastTurn(
                   (t) => t.copyWith(
-                    audioSamples: generatedAudioSamples,
+                    audioSamples: List.of(generatedAudioSamples),
                     audioDurationSeconds: generatedAudioSamples.length / rate,
                   ),
                 );
@@ -882,7 +884,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
     TurnStats? stats;
     if (!hasError &&
-        tokenCount > 0 &&
+        (tokenCount > 0 || generatedAudioSamples.isNotEmpty) &&
         !_disposed &&
         _generationId == generationId &&
         value.isGenerating) {
@@ -908,8 +910,9 @@ class ChatController extends ValueNotifier<ChatState> {
                 ? (totalTokens / (totalMs / 1000.0))
                 : 0.0);
 
+      final rate = (audioSampleRate ?? 24000).toDouble();
       final audioDurationSec = generatedAudioSamples.isNotEmpty
-          ? (generatedAudioSamples.length / 24000.0)
+          ? (generatedAudioSamples.length / rate)
           : null;
       final audioRtf = (audioDurationSec != null && totalMs > 0)
           ? (audioDurationSec / (totalMs / 1000.0))
