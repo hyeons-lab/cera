@@ -419,7 +419,7 @@ impl<'a> AudioOutputDecoder<'a> {
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
         self.streamed_samples += n;
-        n
+        self.streamed_samples
     }
 
     /// Async version of [`Self::finish`] for WebGPU / browser wasm.
@@ -489,7 +489,7 @@ impl<'a> AudioOutputDecoder<'a> {
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
         self.streamed_samples += n;
-        Ok(n)
+        Ok(self.streamed_samples)
     }
 }
 
