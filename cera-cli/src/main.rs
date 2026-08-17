@@ -200,22 +200,28 @@ impl CliSamplingArgs {
     /// Validates CLI sampling overrides to catch invalid parameter ranges early.
     fn validate(&self) -> anyhow::Result<()> {
         if let Some(t) = self.temperature {
-            anyhow::ensure!(t >= 0.0, "--temperature must be non-negative");
+            anyhow::ensure!(
+                !t.is_nan() && t >= 0.0,
+                "--temperature must be a non-negative finite number"
+            );
         }
         if let Some(p) = self.top_p {
             anyhow::ensure!(
-                (0.0..=1.0).contains(&p),
+                !p.is_nan() && (0.0..=1.0).contains(&p),
                 "--top-p must be in range [0.0, 1.0]"
             );
         }
         if let Some(mp) = self.min_p {
             anyhow::ensure!(
-                (0.0..=1.0).contains(&mp),
+                !mp.is_nan() && (0.0..=1.0).contains(&mp),
                 "--min-p must be in range [0.0, 1.0]"
             );
         }
         if let Some(rp) = self.repetition_penalty {
-            anyhow::ensure!(rp >= 0.0, "--repetition-penalty must be non-negative");
+            anyhow::ensure!(
+                !rp.is_nan() && rp >= 0.0,
+                "--repetition-penalty must be a non-negative finite number"
+            );
         }
         Ok(())
     }

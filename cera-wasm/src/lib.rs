@@ -2315,6 +2315,9 @@ mod webgpu {
         /// Feed `ids` into the KV cache without running any token generation.
         #[wasm_bindgen(js_name = appendTokens)]
         pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError> {
+            if ids.is_empty() {
+                return Ok(());
+            }
             let max_seq_len = self.model.config().max_seq_len;
             let mut pos = self.state.seq_len;
             if pos.saturating_add(ids.len()) > max_seq_len {

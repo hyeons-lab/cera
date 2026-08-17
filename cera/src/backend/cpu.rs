@@ -7393,4 +7393,21 @@ mod f16_gemv_tests {
             gemv_f16,
         );
     }
+
+    /// `dot_f32` must compute correct dot products across varied vector lengths,
+    /// including empty slices, prime lengths, and lengths exceeding chunk sizes.
+    #[test]
+    fn dot_f32_various_lengths() {
+        for len in 0..=65 {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 + 1.0) * 0.5).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 + 2.0) * 0.25).collect();
+            let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let actual = dot_f32(&a, &b);
+            let diff = (actual - expected).abs();
+            assert!(
+                diff <= 1e-4,
+                "len {len}: expected {expected}, got {actual} (diff {diff})"
+            );
+        }
+    }
 }
