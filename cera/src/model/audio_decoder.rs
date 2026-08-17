@@ -990,10 +990,15 @@ fn detok_conv_block(
     n_embd: usize,
     d_conv: usize,
 ) -> Vec<f32> {
+    let (Some(in_proj), Some(conv_w), Some(out_proj)) =
+        (&lw.conv_in_proj, &lw.conv_weight, &lw.conv_out_proj)
+    else {
+        return cur.to_vec();
+    };
     // in_proj → [b, c, x] chunks.
     let chunk_size = n_embd;
     let mut bcx = vec![0.0; 3 * chunk_size];
-    lw.conv_in_proj.as_ref().unwrap().gemv(cur, &mut bcx);
+    in_proj.gemv(cur, &mut bcx);
 
     let b = &bcx[..chunk_size];
     let c = &bcx[chunk_size..2 * chunk_size];
@@ -1004,7 +1009,6 @@ fn detok_conv_block(
 
     // conv1d with rolling buffer: concat [conv_buf, bx], convolve, update buf.
     let kernel_size = d_conv + 1;
-    let conv_w = lw.conv_weight.as_ref().unwrap();
     let mut conv_out = vec![0.0; chunk_size];
     // The rolling buffer has d_conv previous bx vectors.
     // Kernel applies: sum over k of weight[k] * input[pos - d_conv + k]
@@ -1035,7 +1039,7 @@ fn detok_conv_block(
 
     // out_proj
     let mut out = vec![0.0; n_embd];
-    lw.conv_out_proj.as_ref().unwrap().gemv(&y, &mut out);
+    out_proj.gemv(&y, &mut out);
     out
 }
 
@@ -1048,6 +1052,9 @@ fn detok_attn_block(
     pos: usize,
     cfg: &DetokenizerConfig,
 ) -> Vec<f32> {
+    let (Some(wq), Some(wk), Some(wv), Some(wo)) = (&lw.wq, &lw.wk, &lw.wv, &lw.wo) else {
+        return cur.to_vec();
+    };
     let n_embd = cfg.n_embd;
     let n_head = cfg.n_head;
     let n_kv = cfg.n_head_kv;
@@ -1056,20 +1063,20 @@ fn detok_attn_block(
     let mut q = vec![0.0; n_head * hd];
     let mut k = vec![0.0; n_kv * hd];
     let mut v = vec![0.0; n_kv * hd];
-    lw.wq.as_ref().unwrap().gemv(cur, &mut q);
-    lw.wk.as_ref().unwrap().gemv(cur, &mut k);
-    lw.wv.as_ref().unwrap().gemv(cur, &mut v);
+    wq.gemv(cur, &mut q);
+    wk.gemv(cur, &mut k);
+    wv.gemv(cur, &mut v);
 
     // Per-head norm + RoPE.
-    let q_norm = lw.q_norm.as_ref().unwrap();
-    let k_norm = lw.k_norm.as_ref().unwrap();
-    for h in 0..n_head {
-        cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
-        apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
-    }
-    for h in 0..n_kv {
-        cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
-        apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+    if let (Some(q_norm), Some(k_norm)) = (&lw.q_norm, &lw.k_norm) {
+        for h in 0..n_head {
+            cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
+            apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
+        for h in 0..n_kv {
+            cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
+            apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
     }
 
     // Write to KV cache (ring buffer for SWA).
@@ -1111,7 +1118,7 @@ fn detok_attn_block(
     }
 
     let mut proj = vec![0.0; n_embd];
-    lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+    wo.gemv(&attn_out, &mut proj);
     proj
 }
 
