@@ -1974,6 +1974,7 @@ pub fn gemv_q4_1_f32(
 #[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_f32: input lengths must match");
     use std::arch::aarch64::*;
     let mut sum_v0 = unsafe { vdupq_n_f32(0.0) };
     let mut sum_v1 = unsafe { vdupq_n_f32(0.0) };
@@ -2017,6 +2018,7 @@ fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 #[inline(always)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_f32: input lengths must match");
     use core::arch::wasm32::*;
     let mut sum_v0 = f32x4_splat(0.0);
     let mut sum_v1 = f32x4_splat(0.0);
@@ -2048,6 +2050,7 @@ fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
 /// Unrolled scalar fallback vector dot product.
 #[inline(always)]
 fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_f32: input lengths must match");
     let (a_chunks, a_rem) = a.as_chunks::<8>();
     let (b_chunks, b_rem) = b.as_chunks::<8>();
     let mut sum0 = 0.0f32;
@@ -2081,6 +2084,7 @@ fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx", enable = "fma")]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_f32: input lengths must match");
     use std::arch::x86_64::*;
     unsafe {
         let mut sum_v0 = _mm256_setzero_ps();

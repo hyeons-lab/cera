@@ -601,6 +601,7 @@ pub fn generate_audio(
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
+                            generated += 1;
                             break;
                         }
                         FrameOutcome::Codes {
