@@ -411,6 +411,8 @@ impl<'a> AudioOutputDecoder<'a> {
             Some(g) => g.istft_to_pcm(&self.all_spectrum, n_fft, hop),
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
+        self.all_spectrum.clear();
+        self.all_codes.clear();
         if pcm.is_empty() {
             return 0;
         }
@@ -479,6 +481,8 @@ impl<'a> AudioOutputDecoder<'a> {
             Some(g) => g.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
+        self.all_spectrum.clear();
+        self.all_codes.clear();
         if pcm.is_empty() {
             return Ok(0);
         }
