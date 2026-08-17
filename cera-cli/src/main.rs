@@ -200,10 +200,7 @@ impl CliSamplingArgs {
     /// Validates CLI sampling overrides to catch invalid parameter ranges early.
     fn validate(&self) -> anyhow::Result<()> {
         if let Some(t) = self.temperature {
-            anyhow::ensure!(
-                !t.is_nan() && t >= 0.0,
-                "--temperature must be a non-negative finite number"
-            );
+            anyhow::ensure!(!t.is_nan(), "--temperature must be a finite number");
         }
         if let Some(p) = self.top_p {
             anyhow::ensure!(
@@ -236,7 +233,7 @@ impl CliSamplingArgs {
         let mut opts = cera::GenerateOpts::from_manifest(engine.manifest());
         opts.max_tokens = self.max_tokens as u32;
         if let Some(t) = self.temperature {
-            opts.temperature = t;
+            opts.temperature = t.max(0.0);
         }
         if let Some(p) = self.top_p {
             opts.top_p = p;

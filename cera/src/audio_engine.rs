@@ -371,10 +371,6 @@ impl<'a> AudioOutputDecoder<'a> {
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
             let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            debug_assert!(
-                remainder.is_empty(),
-                "all_codes contains trailing incomplete frames"
-            );
             for &codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum(self.detok_weights, &codes)
@@ -384,6 +380,21 @@ impl<'a> AudioOutputDecoder<'a> {
                         self.weights,
                         &mut self.detok_state,
                         &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            if !remainder.is_empty() {
+                let mut padded = [0i32; 8];
+                padded[..remainder.len()].copy_from_slice(remainder);
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum(self.detok_weights, &padded)
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &padded,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);
@@ -425,10 +436,6 @@ impl<'a> AudioOutputDecoder<'a> {
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
             let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            debug_assert!(
-                remainder.is_empty(),
-                "all_codes contains trailing incomplete frames"
-            );
             for &codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum_async(self.detok_weights, &codes)
@@ -439,6 +446,22 @@ impl<'a> AudioOutputDecoder<'a> {
                         self.weights,
                         &mut self.detok_state,
                         &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            if !remainder.is_empty() {
+                let mut padded = [0i32; 8];
+                padded[..remainder.len()].copy_from_slice(remainder);
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum_async(self.detok_weights, &padded)
+                        .await?
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &padded,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);
