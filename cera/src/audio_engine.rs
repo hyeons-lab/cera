@@ -356,8 +356,9 @@ impl<'a> AudioOutputDecoder<'a> {
     }
 
     /// Drain any remaining audio through the ISTFT pass.
-    /// If streaming was already performed during decoding, returns the
+    /// Flushes any buffered streaming samples to the caller and returns the
     /// accumulated streamed sample count.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
         if self.streaming {
             let remaining = self.streamer.flush();
@@ -415,6 +416,7 @@ impl<'a> AudioOutputDecoder<'a> {
     }
 
     /// Async version of [`Self::finish`] for WebGPU / browser wasm.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub async fn finish_async(
         &mut self,
         mut sink: impl FnMut(&[f32], u32),
