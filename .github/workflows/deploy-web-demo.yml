@@ -189,8 +189,8 @@ permissions:
 # third publish cancels the queued second. Safe, since a pending run has pushed
 # nothing.
 concurrency:
-  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_space) && 'web-demo-space-publish' || format('web-demo-{0}', github.ref) }}
-  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish_space) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_space == 'true' && 'web-demo-space-publish' || format('web-demo-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_space != 'true' }}
 
 env:
   PROJECT_NAME: cera-demo
