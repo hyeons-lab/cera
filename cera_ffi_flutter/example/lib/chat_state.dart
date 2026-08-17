@@ -162,11 +162,9 @@ class ChatSettings {
   CeraOptions get ceraOptions => CeraOptions(
     backend: backend,
     turboQuant: turboQuant,
-    web: CeraWebAssets(
+    web: const CeraWebAssets(
       workerUrl: 'cera/cera_worker.js',
-      moduleUrl: backend == CeraBackend.cpu
-          ? 'cera_mt/cera_wasm.js'
-          : 'cera/cera_wasm.js',
+      moduleUrl: 'cera/cera_wasm.js',
     ),
   );
 

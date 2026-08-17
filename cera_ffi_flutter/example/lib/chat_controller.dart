@@ -787,11 +787,11 @@ class ChatController extends ValueNotifier<ChatState> {
     );
 
     final generatedAudioSamples = <double>[];
-    final isTts = value.settings.audioChatMode == AudioChatMode.textToSpeech;
+    final mode = value.settings.audioChatMode;
+    final isTts = mode == AudioChatMode.textToSpeech;
+    final isAudioChat = mode == AudioChatMode.interleaved || isTts;
     final shouldStreamAudio =
-        (value.capabilities?.audioOut ?? false) &&
-        (value.settings.audioChatMode == AudioChatMode.interleaved ||
-            value.settings.audioChatMode == AudioChatMode.textToSpeech);
+        (value.capabilities?.audioOut ?? false) && isAudioChat;
 
     if (shouldStreamAudio) {
       _audioPlayer.startStream(sampleRate: 24000);
