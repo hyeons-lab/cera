@@ -495,20 +495,13 @@ abstract interface class Cera {
 
   /// Requests that an in-flight [generate] stop early.
   ///
-  /// **Reliable only on native.** On the web it is best-effort and today
-  /// reaches neither backend's running decode, for two unrelated reasons:
-  ///
-  /// - CPU: the decode loop is one synchronous wasm call occupying the worker,
-  ///   so the message is not delivered until it has already finished.
-  /// - GPU: `WebGpuSession` exposes no cancel entry point to call.
+  /// On native, cancellation stops generation immediately. On the web,
+  /// WebGPU cancels between tokens via its cancel handle, while CPU multi-threaded
+  /// wasm stops via shared cancellation buffers.
   ///
   /// Cancelling the [generate] stream's subscription is the more idiomatic
   /// form and the better one for a Stop button: delivery to your code stops at
-  /// once, whether or not the decode behind it does. Note that *awaiting* that
-  /// cancellation is a different matter on the web's CPU backend, where the
-  /// returned future waits on a worker reply that cannot be dequeued until the
-  /// synchronous decode finishes. Drop the subscription rather than awaiting it
-  /// if a Stop button must return promptly.
+  /// once, whether or not the decode behind it does.
   ///
   /// [terminate] does stop the work itself on every platform, but by destroying
   /// the engine, so it answers "I am done with this" rather than "stop this

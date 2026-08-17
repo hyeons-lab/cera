@@ -215,7 +215,11 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
     } catch (_) {}
     return false;
   }
-  gpu = { session, tokenizer: session.tokenizer };
+  gpu = {
+    session,
+    tokenizer: session.tokenizer,
+    cancelHandle: typeof session.cancelHandle === 'function' ? session.cancelHandle() : null,
+  };
   backendLabel = `webgpu: ${session.adapter}`;
   return true;
 }
@@ -695,6 +699,11 @@ const OPS = {
     if (cancelArray) {
       Atomics.store(cancelArray, 0, 0);
     }
+    if (cpu && cpu.session && typeof cpu.session.clearCancel === 'function') {
+      try {
+        cpu.session.clearCancel();
+      } catch (_) {}
+    }
     const { prompt, maxTokens } = req;
     const currentPos = position();
     console.info(
@@ -744,8 +753,14 @@ const OPS = {
     const onToken = (piece) => {
       if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
         isCancelled = true;
-        if (cpu) cpu.session.cancel();
-        if (gpu) gpu.session.cancel();
+        if (cpu?.session?.cancel) {
+          try { cpu.session.cancel(); } catch (_) {}
+        }
+        if (gpu?.cancelHandle?.cancel) {
+          try { gpu.cancelHandle.cancel(); } catch (_) {}
+        } else if (gpu?.session?.cancel) {
+          try { gpu.session.cancel(); } catch (_) {}
+        }
         return;
       }
       tokenCount++;
@@ -775,8 +790,14 @@ const OPS = {
     const onAudio = (pcm, sampleRate) => {
       if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
         isCancelled = true;
-        if (cpu) cpu.session.cancel();
-        if (gpu) gpu.session.cancel();
+        if (cpu?.session?.cancel) {
+          try { cpu.session.cancel(); } catch (_) {}
+        }
+        if (gpu?.cancelHandle?.cancel) {
+          try { gpu.cancelHandle.cancel(); } catch (_) {}
+        } else if (gpu?.session?.cancel) {
+          try { gpu.session.cancel(); } catch (_) {}
+        }
         return;
       }
       const pcmArray = new Float32Array(pcm);
@@ -916,24 +937,11 @@ const OPS = {
   },
 
   /**
-   * Request an early stop. Reaches neither backend's in-flight decode, for two
-   * unrelated reasons, so treat it as best-effort.
+   * Request an early stop for in-flight generation.
    *
-   * On the CPU path the decode loop is one synchronous wasm call. This message
-   * is not dequeued until that call returns, so the flag is only ever set
-   * between generations. Reaching an in-flight decode would need a
-   * SharedArrayBuffer flag, hence cross-origin isolation, which is the
-   * requirement this design otherwise avoids entirely.
-   *
-   * On the GPU path there is nothing to call: `WebGpuSession` exposes no
-   * cancel. Its decode does yield to the event loop between tokens, so a stop
-   * is implementable there, but it needs a Rust-side entry point that does not
-   * exist yet.
-   *
-   * Clearing the CPU flag right after setting it is deliberate. The engine's
-   * cancel flag is sticky, and `Session::generate` clears it only at entry,
-   * after `appendTokens` has already run; leaving it set poisons the next
-   * turn's chunked prefill with `Cancelled`.
+   * On the CPU path, multi-threaded wasm signals cancellation via SharedArrayBuffer
+   * or during token emission; on the WebGPU path, decode yields between tokens and
+   * cancels cleanly via `WebGpuCancelHandle` or `gpu.session.cancel()`.
    */
   cancel() {
     isCancelled = true;

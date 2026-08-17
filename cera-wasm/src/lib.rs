@@ -2480,7 +2480,7 @@ mod webgpu {
             ));
 
             let hidden = cera::model::Model::config(&self.model).hidden_size;
-            if hidden == 0 || !img_tokens.len().is_multiple_of(hidden) {
+            if hidden == 0 || img_tokens.len() % hidden != 0 {
                 return Err(JsError::new(&format!(
                     "vision encoder returned {} f32s, not a multiple of hidden_size \
                      ({hidden}), malformed image-token tensor",
@@ -2817,11 +2817,13 @@ mod webgpu {
             // Prefill: feed every prompt token through the GPU to build the KV
             // cache. All but the last token skip the argmax + readback (their
             // predictions are unused), so an N-token prompt does a single
-            // GPU→CPU round-trip instead of N. The last token's argmax is the
-            // first generated token.
-            let (last, prefix) = ids.split_last().expect("ids is non-empty");
+            let (last, prefix) = match ids.split_last() {
+                Some(pair) => pair,
+                None => return Ok(String::new()),
+            };
             for &tok in prefix {
                 if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.state.seq_len = pos;
                     return Ok(String::new());
                 }
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
@@ -3364,6 +3366,7 @@ mod webgpu {
                 out.push_str(&piece);
                 emit(on_token, &piece);
             }
+            self.state.seq_len = pos;
             Ok(out)
         }
     }

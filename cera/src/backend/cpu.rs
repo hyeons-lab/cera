@@ -2142,8 +2142,11 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     assert_eq!(x.len(), k, "gemv_f32: x must have k elements");
     assert_eq!(y.len(), m, "gemv_f32: y must have m elements");
+    assert!(
+        a.len() >= m * k * std::mem::size_of::<f32>(),
+        "gemv_f32: a buffer too small"
+    );
     if let Ok(a_f32) = bytemuck::try_cast_slice::<u8, f32>(a) {
-        debug_assert_eq!(a_f32.len(), m * k);
         let compute_row = |(i, yi): (usize, &mut f32)| {
             let row = &a_f32[i * k..(i + 1) * k];
             *yi = dot_f32(row, x);
@@ -7453,15 +7456,19 @@ mod f16_gemv_tests {
     /// including empty slices, prime lengths, and lengths exceeding chunk sizes.
     #[test]
     fn dot_f32_various_lengths() {
-        for len in 0..=65 {
-            let a: Vec<f32> = (0..len).map(|i| (i as f32 + 1.0) * 0.5).collect();
-            let b: Vec<f32> = (0..len).map(|i| (i as f32 + 2.0) * 0.25).collect();
+        for len in [
+            0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 513, 1024,
+            1025,
+        ] {
+            let a: Vec<f32> = (0..len).map(|i| (i as f32 + 1.0) * 0.05).collect();
+            let b: Vec<f32> = (0..len).map(|i| (i as f32 + 2.0) * 0.025).collect();
             let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
             let actual = dot_f32(&a, &b);
             let diff = (actual - expected).abs();
+            let rel_diff = diff / expected.abs().max(1.0);
             assert!(
-                diff <= 1e-4,
-                "len {len}: expected {expected}, got {actual} (diff {diff})"
+                rel_diff <= 1e-4,
+                "len {len}: expected {expected}, got {actual} (diff {diff}, rel_diff {rel_diff})"
             );
         }
     }

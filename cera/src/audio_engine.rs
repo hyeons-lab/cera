@@ -403,7 +403,7 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         if self.all_spectrum.is_empty() {
-            return 0;
+            return self.streamed_samples;
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
@@ -414,7 +414,7 @@ impl<'a> AudioOutputDecoder<'a> {
         self.all_spectrum.clear();
         self.all_codes.clear();
         if pcm.is_empty() {
-            return 0;
+            return self.streamed_samples;
         }
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
@@ -473,7 +473,7 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         if self.all_spectrum.is_empty() {
-            return Ok(0);
+            return Ok(self.streamed_samples);
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
@@ -484,7 +484,7 @@ impl<'a> AudioOutputDecoder<'a> {
         self.all_spectrum.clear();
         self.all_codes.clear();
         if pcm.is_empty() {
-            return Ok(0);
+            return Ok(self.streamed_samples);
         }
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
