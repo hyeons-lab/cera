@@ -16,6 +16,8 @@ fn df_embed_add(@builtin(global_invocation_id) gid : vec3<u32>) {
     let i = gid.x;
     if (i < emb_dim) {
         let offset = code * emb_dim + i;
-        hidden[i] = hidden[i] + codebook_emb[offset];
+        if (offset < arrayLength(&codebook_emb)) {
+            hidden[i] = hidden[i] + codebook_emb[offset];
+        }
     }
 }

@@ -370,7 +370,12 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            for &codes in self.all_codes.as_chunks::<8>().0 {
+            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
+            debug_assert!(
+                remainder.is_empty(),
+                "all_codes contains trailing incomplete frames"
+            );
+            for &codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum(self.detok_weights, &codes)
                 } else {
@@ -419,7 +424,12 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            for &codes in self.all_codes.as_chunks::<8>().0 {
+            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
+            debug_assert!(
+                remainder.is_empty(),
+                "all_codes contains trailing incomplete frames"
+            );
+            for &codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
                     g.detokenize_to_spectrum_async(self.detok_weights, &codes)
                         .await?

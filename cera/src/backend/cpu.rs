@@ -1970,65 +1970,127 @@ pub fn gemv_q4_1_f32(
 }
 
 /// Vector dot product of two `f32` slices of equal length.
+/// Vector dot product using ARM NEON SIMD (unrolled across 4 vectors).
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[allow(clippy::chunks_exact_to_as_chunks)]
+fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let mut sum_v0 = unsafe { vdupq_n_f32(0.0) };
+    let mut sum_v1 = unsafe { vdupq_n_f32(0.0) };
+    let mut sum_v2 = unsafe { vdupq_n_f32(0.0) };
+    let mut sum_v3 = unsafe { vdupq_n_f32(0.0) };
+
+    let mut a_chunks = a.chunks_exact(16);
+    let mut b_chunks = b.chunks_exact(16);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        unsafe {
+            sum_v0 = vfmaq_f32(sum_v0, vld1q_f32(ca.as_ptr()), vld1q_f32(cb.as_ptr()));
+            sum_v1 = vfmaq_f32(
+                sum_v1,
+                vld1q_f32(ca.as_ptr().add(4)),
+                vld1q_f32(cb.as_ptr().add(4)),
+            );
+            sum_v2 = vfmaq_f32(
+                sum_v2,
+                vld1q_f32(ca.as_ptr().add(8)),
+                vld1q_f32(cb.as_ptr().add(8)),
+            );
+            sum_v3 = vfmaq_f32(
+                sum_v3,
+                vld1q_f32(ca.as_ptr().add(12)),
+                vld1q_f32(cb.as_ptr().add(12)),
+            );
+        }
+    }
+    let sum_v01 = unsafe { vaddq_f32(sum_v0, sum_v1) };
+    let sum_v23 = unsafe { vaddq_f32(sum_v2, sum_v3) };
+    let mut sum = unsafe { vaddvq_f32(vaddq_f32(sum_v01, sum_v23)) };
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// Vector dot product using WASM SIMD128.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn dot_f32_wasm_simd128(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::wasm32::*;
+    let mut sum_v0 = f32x4_splat(0.0);
+    let mut sum_v1 = f32x4_splat(0.0);
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        unsafe {
+            let va0 = v128_load(ca.as_ptr() as *const v128);
+            let vb0 = v128_load(cb.as_ptr() as *const v128);
+            sum_v0 = f32x4_add(sum_v0, f32x4_mul(va0, vb0));
+
+            let va1 = v128_load(ca.as_ptr().add(4) as *const v128);
+            let vb1 = v128_load(cb.as_ptr().add(4) as *const v128);
+            sum_v1 = f32x4_add(sum_v1, f32x4_mul(va1, vb1));
+        }
+    }
+    let sum_v = f32x4_add(sum_v0, sum_v1);
+    let mut sum = f32x4_extract_lane::<0>(sum_v)
+        + f32x4_extract_lane::<1>(sum_v)
+        + f32x4_extract_lane::<2>(sum_v)
+        + f32x4_extract_lane::<3>(sum_v);
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// Unrolled scalar fallback vector dot product.
+#[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
+    let mut sum4 = 0.0f32;
+    let mut sum5 = 0.0f32;
+    let mut sum6 = 0.0f32;
+    let mut sum7 = 0.0f32;
+
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        sum0 += ca[0] * cb[0];
+        sum1 += ca[1] * cb[1];
+        sum2 += ca[2] * cb[2];
+        sum3 += ca[3] * cb[3];
+        sum4 += ca[4] * cb[4];
+        sum5 += ca[5] * cb[5];
+        sum6 += ca[6] * cb[6];
+        sum7 += ca[7] * cb[7];
+    }
+    let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// Vector dot product of two `f32` slices of equal length.
+#[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dot_f32 input lengths must match");
 
     #[cfg(target_arch = "aarch64")]
     {
-        use std::arch::aarch64::*;
-        let mut sum_v0 = unsafe { vdupq_n_f32(0.0) };
-        let mut sum_v1 = unsafe { vdupq_n_f32(0.0) };
-        let mut a_chunks = a.chunks_exact(8);
-        let mut b_chunks = b.chunks_exact(8);
-
-        for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-            unsafe {
-                let va0 = vld1q_f32(ca.as_ptr());
-                let vb0 = vld1q_f32(cb.as_ptr());
-                sum_v0 = vfmaq_f32(sum_v0, va0, vb0);
-
-                let va1 = vld1q_f32(ca.as_ptr().add(4));
-                let vb1 = vld1q_f32(cb.as_ptr().add(4));
-                sum_v1 = vfmaq_f32(sum_v1, va1, vb1);
-            }
-        }
-        let mut sum = unsafe { vaddvq_f32(vaddq_f32(sum_v0, sum_v1)) };
-        for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
-            sum += x * y;
-        }
-        sum
+        return dot_f32_neon(a, b);
     }
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        use core::arch::wasm32::*;
-        let mut sum_v0 = f32x4_splat(0.0);
-        let mut sum_v1 = f32x4_splat(0.0);
-        let mut a_chunks = a.chunks_exact(8);
-        let mut b_chunks = b.chunks_exact(8);
-
-        for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-            unsafe {
-                let va0 = v128_load(ca.as_ptr() as *const v128);
-                let vb0 = v128_load(cb.as_ptr() as *const v128);
-                sum_v0 = f32x4_add(sum_v0, f32x4_mul(va0, vb0));
-
-                let va1 = v128_load(ca.as_ptr().add(4) as *const v128);
-                let vb1 = v128_load(cb.as_ptr().add(4) as *const v128);
-                sum_v1 = f32x4_add(sum_v1, f32x4_mul(va1, vb1));
-            }
-        }
-        let sum_v = f32x4_add(sum_v0, sum_v1);
-        let mut sum = f32x4_extract_lane::<0>(sum_v)
-            + f32x4_extract_lane::<1>(sum_v)
-            + f32x4_extract_lane::<2>(sum_v)
-            + f32x4_extract_lane::<3>(sum_v);
-        for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
-            sum += x * y;
-        }
-        sum
+        return dot_f32_wasm_simd128(a, b);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2036,35 +2098,33 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         #[target_feature(enable = "avx", enable = "fma")]
         unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
             use std::arch::x86_64::*;
-            unsafe {
-                let mut sum_v0 = _mm256_setzero_ps();
-                let mut sum_v1 = _mm256_setzero_ps();
-                let mut a_chunks = a.chunks_exact(16);
-                let mut b_chunks = b.chunks_exact(16);
+            let mut sum_v0 = _mm256_setzero_ps();
+            let mut sum_v1 = _mm256_setzero_ps();
+            let mut a_chunks = a.chunks_exact(16);
+            let mut b_chunks = b.chunks_exact(16);
 
-                for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-                    let va0 = _mm256_loadu_ps(ca.as_ptr());
-                    let vb0 = _mm256_loadu_ps(cb.as_ptr());
-                    sum_v0 = _mm256_fmadd_ps(va0, vb0, sum_v0);
+            for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+                let va0 = _mm256_loadu_ps(ca.as_ptr());
+                let vb0 = _mm256_loadu_ps(cb.as_ptr());
+                sum_v0 = _mm256_fmadd_ps(va0, vb0, sum_v0);
 
-                    let va1 = _mm256_loadu_ps(ca.as_ptr().add(8));
-                    let vb1 = _mm256_loadu_ps(cb.as_ptr().add(8));
-                    sum_v1 = _mm256_fmadd_ps(va1, vb1, sum_v1);
-                }
-                let sum256 = _mm256_add_ps(sum_v0, sum_v1);
-                let sum128 = _mm_add_ps(
-                    _mm256_castps256_ps128(sum256),
-                    _mm256_extractf128_ps(sum256, 1),
-                );
-                let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-                let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-                let mut sum = _mm_cvtss_f32(sum32);
-
-                for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
-                    sum += x * y;
-                }
-                sum
+                let va1 = _mm256_loadu_ps(ca.as_ptr().add(8));
+                let vb1 = _mm256_loadu_ps(cb.as_ptr().add(8));
+                sum_v1 = _mm256_fmadd_ps(va1, vb1, sum_v1);
             }
+            let sum256 = _mm256_add_ps(sum_v0, sum_v1);
+            let sum128 = _mm_add_ps(
+                _mm256_castps256_ps128(sum256),
+                _mm256_extractf128_ps(sum256, 1),
+            );
+            let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+            let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+            let mut sum = _mm_cvtss_f32(sum32);
+
+            for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+                sum += x * y;
+            }
+            sum
         }
 
         if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx") {
@@ -2072,39 +2132,8 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         }
     }
 
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
-    {
-        // Fallback unrolled loop
-        let mut a_chunks = a.chunks_exact(8);
-        let mut b_chunks = b.chunks_exact(8);
-        let mut sum0 = 0.0f32;
-        let mut sum1 = 0.0f32;
-        let mut sum2 = 0.0f32;
-        let mut sum3 = 0.0f32;
-        let mut sum4 = 0.0f32;
-        let mut sum5 = 0.0f32;
-        let mut sum6 = 0.0f32;
-        let mut sum7 = 0.0f32;
-
-        for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-            sum0 += ca[0] * cb[0];
-            sum1 += ca[1] * cb[1];
-            sum2 += ca[2] * cb[2];
-            sum3 += ca[3] * cb[3];
-            sum4 += ca[4] * cb[4];
-            sum5 += ca[5] * cb[5];
-            sum6 += ca[6] * cb[6];
-            sum7 += ca[7] * cb[7];
-        }
-        let mut sum = ((sum0 + sum1) + (sum2 + sum3)) + ((sum4 + sum5) + (sum6 + sum7));
-        for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
-            sum += x * y;
-        }
-        sum
-    }
+    #[allow(unreachable_code)]
+    dot_f32_scalar_fallback(a, b)
 }
 
 /// F32 GEMV: `y[m] = A_f32[m,k] @ x[k]`.
