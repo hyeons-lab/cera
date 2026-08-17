@@ -141,6 +141,25 @@ def call_gemini_api(api_key: str, prompt: str) -> str:
     return ""
 
 
+def find_existing_comment_id(github_token: str, repo: str, pr_number: str) -> int | None:
+    comments_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100"
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Antigravity-Code-Review",
+    }
+    req = urllib.request.Request(comments_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            comments = json.loads(resp.read().decode("utf-8"))
+            for c in comments:
+                if COMMENT_TAG in c.get("body", ""):
+                    return c["id"]
+    except Exception as e:
+        print(f"Error checking existing comments: {e}", file=sys.stderr)
+    return None
+
+
 def post_comment(
     github_token: str,
     repo: str,
@@ -175,17 +194,25 @@ def post_comment(
         "User-Agent": "Antigravity-Code-Review",
     }
 
-    # Always create a new comment so updates trigger notifications and preserve review history
-    create_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    existing_id = find_existing_comment_id(github_token, repo, pr_number)
+    if existing_id:
+        url = f"https://api.github.com/repos/{repo}/issues/comments/{existing_id}"
+        method = "PATCH"
+        action = f"Updated existing review comment {existing_id}"
+    else:
+        url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+        method = "POST"
+        action = "Created new review comment"
+
     req = urllib.request.Request(
-        create_url,
+        url,
         data=json.dumps({"body": full_body}).encode("utf-8"),
         headers=headers,
-        method="POST",
+        method=method,
     )
     try:
         with urllib.request.urlopen(req):
-            print("Created new review comment on PR")
+            print(f"{action} on PR #{pr_number}")
     except Exception as e:
         print(f"Error posting comment: {e}", file=sys.stderr)
         raise
