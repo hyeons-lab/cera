@@ -240,12 +240,20 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
 
   List<double>? _cachedBars;
   List<double>? _lastSamples;
+  int _lastSampleLength = 0;
+  int _lastNumBars = 0;
 
   List<double> _getBars(int numBars) {
-    if (_cachedBars != null && identical(_lastSamples, widget.samples)) {
+    final currentLength = widget.samples?.length ?? 0;
+    if (_cachedBars != null &&
+        identical(_lastSamples, widget.samples) &&
+        _lastSampleLength == currentLength &&
+        _lastNumBars == numBars) {
       return _cachedBars!;
     }
     _lastSamples = widget.samples;
+    _lastSampleLength = currentLength;
+    _lastNumBars = numBars;
     _cachedBars = _computeNormalizedBars(widget.samples, numBars);
     return _cachedBars!;
   }

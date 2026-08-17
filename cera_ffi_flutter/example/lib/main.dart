@@ -531,7 +531,10 @@ class _ChatPageState extends State<ChatPage> {
                             ],
                             onChanged: (val) {
                               _controller.dispatch(
-                                UpdateSettingsIntent(chatVoice: val),
+                                UpdateSettingsIntent(
+                                  chatVoice: val,
+                                  clearChatVoice: val == null,
+                                ),
                               );
                             },
                           ),

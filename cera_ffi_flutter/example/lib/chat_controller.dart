@@ -83,6 +83,7 @@ class ChatController extends ValueNotifier<ChatState> {
   /// all underlying memory and native resources.
   Future<void> _unloadCurrentModel() async {
     _loadSessionId++;
+    _generationId++;
     _audioPlayer.stop();
     if (_generationSub != null) {
       await _generationSub?.cancel();
@@ -104,9 +105,8 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _onUnloadModel() async {
-    final unloadId = _loadSessionId;
     await _unloadCurrentModel();
-    if (_disposed || _loadSessionId != unloadId) return;
+    if (_disposed) return;
     value = value.copyWith(
       loadedModel: () => null,
       capabilities: () => null,
@@ -204,8 +204,9 @@ class ChatController extends ValueNotifier<ChatState> {
         ? null
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
     final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
-    final newChatVoice =
-        intent.chatVoice ?? intent.ttsVoice ?? current.chatVoice;
+    final newChatVoice = intent.clearChatVoice
+        ? 'Use the US female voice.'
+        : (intent.chatVoice ?? current.chatVoice);
     final newTtsStudioVoice = intent.ttsStudioVoice ?? current.ttsStudioVoice;
 
     final updated = current.copyWith(
@@ -921,6 +922,7 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _onStopGeneration() async {
+    _generationId++;
     _audioPlayer.stop();
     if (_ceraEngine != null) {
       try {

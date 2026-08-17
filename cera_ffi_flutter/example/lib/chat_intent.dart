@@ -90,8 +90,8 @@ class UpdateSettingsIntent extends ChatIntent {
     this.clearMaxImageLongSize = false,
     this.audioChatMode,
     this.chatVoice,
+    this.clearChatVoice = false,
     this.ttsStudioVoice,
-    this.ttsVoice,
   });
 
   final CeraBackend? backend;
@@ -100,8 +100,8 @@ class UpdateSettingsIntent extends ChatIntent {
   final bool clearMaxImageLongSize;
   final AudioChatMode? audioChatMode;
   final String? chatVoice;
+  final bool clearChatVoice;
   final String? ttsStudioVoice;
-  final String? ttsVoice;
 }
 
 /// Intent to switch the main app UI mode (Chat vs TTS Studio).
