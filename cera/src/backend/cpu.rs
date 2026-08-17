@@ -2095,7 +2095,6 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         #[target_feature(enable = "avx", enable = "fma")]
-        #[inline(always)]
         #[allow(clippy::chunks_exact_to_as_chunks)]
         unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
             use std::arch::x86_64::*;
