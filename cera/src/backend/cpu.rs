@@ -2077,6 +2077,44 @@ fn dot_f32_scalar_fallback(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Vector dot product using x86_64 AVX + FMA instructions.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx", enable = "fma")]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mut sum_v0 = _mm256_setzero_ps();
+        let mut sum_v1 = _mm256_setzero_ps();
+        let mut a_chunks = a.chunks_exact(16);
+        let mut b_chunks = b.chunks_exact(16);
+
+        for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+            let va0 = _mm256_loadu_ps(ca.as_ptr());
+            let vb0 = _mm256_loadu_ps(cb.as_ptr());
+            sum_v0 = _mm256_fmadd_ps(va0, vb0, sum_v0);
+
+            let va1 = _mm256_loadu_ps(ca.as_ptr().add(8));
+            let vb1 = _mm256_loadu_ps(cb.as_ptr().add(8));
+            sum_v1 = _mm256_fmadd_ps(va1, vb1, sum_v1);
+        }
+
+        let sum256 = _mm256_add_ps(sum_v0, sum_v1);
+        let sum128 = _mm_add_ps(
+            _mm256_castps256_ps128(sum256),
+            _mm256_extractf128_ps(sum256, 1),
+        );
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
+        let mut sum = _mm_cvtss_f32(sum32);
+
+        for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
+            sum += x * y;
+        }
+        sum
+    }
+}
+
 /// Vector dot product of two `f32` slices of equal length.
 #[inline(always)]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -2094,41 +2132,6 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        #[target_feature(enable = "avx", enable = "fma")]
-        #[allow(clippy::chunks_exact_to_as_chunks)]
-        unsafe fn dot_f32_avx_fma(a: &[f32], b: &[f32]) -> f32 {
-            use std::arch::x86_64::*;
-            unsafe {
-                let mut sum_v0 = _mm256_setzero_ps();
-                let mut sum_v1 = _mm256_setzero_ps();
-                let mut a_chunks = a.chunks_exact(16);
-                let mut b_chunks = b.chunks_exact(16);
-
-                for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-                    let va0 = _mm256_loadu_ps(ca.as_ptr());
-                    let vb0 = _mm256_loadu_ps(cb.as_ptr());
-                    sum_v0 = _mm256_fmadd_ps(va0, vb0, sum_v0);
-
-                    let va1 = _mm256_loadu_ps(ca.as_ptr().add(8));
-                    let vb1 = _mm256_loadu_ps(cb.as_ptr().add(8));
-                    sum_v1 = _mm256_fmadd_ps(va1, vb1, sum_v1);
-                }
-                let sum256 = _mm256_add_ps(sum_v0, sum_v1);
-                let sum128 = _mm_add_ps(
-                    _mm256_castps256_ps128(sum256),
-                    _mm256_extractf128_ps(sum256, 1),
-                );
-                let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-                let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 1));
-                let mut sum = _mm_cvtss_f32(sum32);
-
-                for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder().iter()) {
-                    sum += x * y;
-                }
-                sum
-            }
-        }
-
         if is_x86_feature_detected!("fma") && is_x86_feature_detected!("avx") {
             return unsafe { dot_f32_avx_fma(a, b) };
         }
