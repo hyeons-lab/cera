@@ -98,6 +98,7 @@ fn parses_audio_manifest_with_all_aux() {
     match m.generation_defaults {
         GenerationDefaults::Audio {
             number_of_decoding_threads,
+            ..
         } => {
             assert_eq!(number_of_decoding_threads, Some(4));
         }
