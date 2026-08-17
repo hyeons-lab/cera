@@ -1943,14 +1943,13 @@ mod webgpu {
     impl WebGpuCancelHandle {
         #[wasm_bindgen]
         pub fn cancel(&self) {
-            self.cancel
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         #[wasm_bindgen(js_name = clearCancel)]
         pub fn clear_cancel(&self) {
             self.cancel
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1965,14 +1964,13 @@ mod webgpu {
 
         #[wasm_bindgen]
         pub fn cancel(&self) {
-            self.cancel
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         #[wasm_bindgen(js_name = clearCancel)]
         pub fn clear_cancel(&self) {
             self.cancel
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
@@ -2814,7 +2812,7 @@ mod webgpu {
             }
 
             self.cancel
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(false, std::sync::atomic::Ordering::SeqCst);
 
             // Prefill: feed every prompt token through the GPU to build the KV
             // cache. All but the last token skip the argmax + readback (their
@@ -2823,7 +2821,7 @@ mod webgpu {
             // first generated token.
             let (last, prefix) = ids.split_last().expect("ids is non-empty");
             for &tok in prefix {
-                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     return Ok(String::new());
                 }
                 self.model.forward_prefill_step(tok, pos, &mut self.state);
@@ -2968,7 +2966,7 @@ mod webgpu {
             let gen_start_time = js_sys::Date::now();
 
             for _ in 0..max_tokens {
-                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
                 if Some(next) == self.eos {

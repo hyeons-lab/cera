@@ -2156,19 +2156,25 @@ pub fn gemv_f32(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
         }
     } else {
         let k_bytes = k * std::mem::size_of::<f32>();
-        for (i, yi) in y.iter_mut().enumerate().take(m) {
+        let compute_row = |(i, yi): (usize, &mut f32)| {
             let row_bytes = &a[i * k_bytes..(i + 1) * k_bytes];
-            let mut sum = 0.0f32;
-            for (j, &xj) in x.iter().enumerate() {
+            let mut row_f32 = vec![0.0f32; k];
+            for (j, val) in row_f32.iter_mut().enumerate() {
                 let bytes = [
                     row_bytes[j * 4],
                     row_bytes[j * 4 + 1],
                     row_bytes[j * 4 + 2],
                     row_bytes[j * 4 + 3],
                 ];
-                sum += f32::from_ne_bytes(bytes) * xj;
+                *val = f32::from_ne_bytes(bytes);
             }
-            *yi = sum;
+            *yi = dot_f32(&row_f32, x);
+        };
+
+        if m >= gemv_par_threshold() {
+            par_rows(y, gemv_min_rows(), compute_row);
+        } else {
+            y.iter_mut().enumerate().for_each(compute_row);
         }
     }
 }
