@@ -100,8 +100,12 @@ profile-cpu MODEL *ARGS:
         cargo build --release -p cera-cli
     ./scripts/profile_cpu.sh --model "{{MODEL}}" {{ARGS}}
 
+# Run python unit tests
+python-test:
+    python3 tests/test_format_review_comment.py
+
 # Run all CI checks locally (mirrors GitHub Actions)
-ci: fmt clippy test
+ci: fmt clippy test python-test
 
 # Print the host's resolved SIMD tier, then run the tier-specific kernel tests.
 # Each test self-skips unless the host has the feature it covers, so the useful

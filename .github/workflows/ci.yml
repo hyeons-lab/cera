@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Override .cargo/config.toml target-cpu=native — CI runners vary
@@ -43,6 +47,8 @@ jobs:
         # clippy skips those compile targets, so lints living in test modules
         # (e.g. `needless_update`, `items_after_test_module`) slip through CI.
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Python unit tests
+        run: python3 tests/test_format_review_comment.py
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
