@@ -475,6 +475,11 @@ jobs:
           fi
           echo "::add-mask::${HF_TOKEN}"
 
+          if ! command -v git-lfs >/dev/null 2>&1; then
+            echo "::error::git-lfs is required for Hugging Face Space deployment but was not found in PATH."
+            exit 1
+          fi
+
           # Staged in RUNNER_TEMP rather than turning `build/web` itself into a
           # git repo. The push below authenticates via http.extraheader Bearer
           # auth, and `build/web` is the directory this job hands to an uploader.
@@ -483,6 +488,7 @@ jobs:
           SPACE_DIR="${RUNNER_TEMP}/hf-space"
           rm -rf "$SPACE_DIR"
           mkdir -p "$SPACE_DIR"
+          trap 'rm -rf "$SPACE_DIR"' EXIT
           # `/.` for the source, because `dir/*` leaves dotfiles behind.
           cp -R "${APP_DIR}/build/web/." "$SPACE_DIR/"
           # The card and the LFS patterns live in this repo and are versioned
