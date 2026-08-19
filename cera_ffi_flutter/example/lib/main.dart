@@ -85,6 +85,7 @@ class _ChatPageState extends State<ChatPage> {
   );
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  bool _scrollPending = false;
 
   @override
   void initState() {
@@ -108,7 +109,10 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   void _scrollToBottom({bool isStreaming = false}) {
+    if (_scrollPending) return;
+    _scrollPending = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollPending = false;
       if (!mounted || !_scrollController.hasClients) return;
       final target = _scrollController.position.maxScrollExtent;
       if (isStreaming) {

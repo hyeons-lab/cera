@@ -38,10 +38,9 @@ void main(List<String> args) {
 
   // ── String return ────────────────────────────────────────────────────────
   final messages = [ChatMessage(role: 'user', content: prompt)];
-  final String rendered =
-      engine.hasChatTemplate()
-          ? engine.applyChatTemplate(messages, true)
-          : prompt;
+  final String rendered = engine.hasChatTemplate()
+      ? engine.applyChatTemplate(messages, true)
+      : prompt;
   print(
     'chat template: ${engine.hasChatTemplate() ? "yes" : "none, raw prompt"}',
   );

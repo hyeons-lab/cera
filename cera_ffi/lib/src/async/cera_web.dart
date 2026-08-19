@@ -306,29 +306,28 @@ class _WorkerCera implements Cera {
     worker.onmessage = ((_MessageEvent event) => _receive(event.data)).toJS;
     // Without this, a worker that fails to load never replies and every request
     // hangs forever with nothing logged. The usual cause is a bad `workerUrl`.
-    worker.onerror =
-        ((_ErrorEvent error) {
-          // Shut down rather than only failing the in-flight batch. A worker that
-          // errored answers nothing further, so leaving it "open" means every
-          // later request parks a completer that cannot resolve, which is the hang
-          // this handler exists to prevent.
-          //
-          // The event's own message leads, because `onerror` fires for two
-          // different things: a worker that never loaded, and an uncaught error
-          // inside one that did (a wasm out-of-memory mid-generate being the
-          // likely one). Only the first is a path problem, so the path advice is
-          // an afterthought rather than the headline.
-          final detail = error.message ?? 'no detail from the worker';
-          _shutDown(
-            StateError(
-              'the Cera web worker at "$workerUrl" failed: $detail. '
-              'If it never loaded, check that cera_worker.js, cera_wasm.js and '
-              'cera_wasm_bg.wasm are served from the configured paths (see '
-              'CeraWebAssets), which `dart run cera_ffi:install_web` sets up '
-              '(`dart run cera_ffi_flutter:install_web` from a Flutter app).',
-            ),
-          );
-        }).toJS;
+    worker.onerror = ((_ErrorEvent error) {
+      // Shut down rather than only failing the in-flight batch. A worker that
+      // errored answers nothing further, so leaving it "open" means every
+      // later request parks a completer that cannot resolve, which is the hang
+      // this handler exists to prevent.
+      //
+      // The event's own message leads, because `onerror` fires for two
+      // different things: a worker that never loaded, and an uncaught error
+      // inside one that did (a wasm out-of-memory mid-generate being the
+      // likely one). Only the first is a path problem, so the path advice is
+      // an afterthought rather than the headline.
+      final detail = error.message ?? 'no detail from the worker';
+      _shutDown(
+        StateError(
+          'the Cera web worker at "$workerUrl" failed: $detail. '
+          'If it never loaded, check that cera_worker.js, cera_wasm.js and '
+          'cera_wasm_bg.wasm are served from the configured paths (see '
+          'CeraWebAssets), which `dart run cera_ffi:install_web` sets up '
+          '(`dart run cera_ffi_flutter:install_web` from a Flutter app).',
+        ),
+      );
+    }).toJS;
   }
 
   Future<void> _start(
@@ -441,10 +440,9 @@ class _WorkerCera implements Cera {
         if (pcmJs.isA<JSFloat32Array>()) {
           pcm = (pcmJs as JSFloat32Array).toDart;
         } else {
-          pcm =
-              (pcmJs as JSArray<JSNumber>).toDart
-                  .map((n) => n.toDartDouble)
-                  .toList();
+          pcm = (pcmJs as JSArray<JSNumber>).toDart
+              .map((n) => n.toDartDouble)
+              .toList();
         }
         callback(pcm, sampleRate);
       }
@@ -457,12 +455,13 @@ class _WorkerCera implements Cera {
         sink(
           CeraDownload(
             url: reply.url ?? '',
-            bytesDownloaded:
-                ((reply.done as JSNumber?)?.toDartDouble ?? 0).toInt(),
+            bytesDownloaded: ((reply.done as JSNumber?)?.toDartDouble ?? 0)
+                .toInt(),
             // Distinguishes "the server sent no length" from "zero so far";
             // the worker forwards null rather than omitting the field.
-            totalBytes:
-                total == null ? null : (total as JSNumber).toDartDouble.toInt(),
+            totalBytes: total == null
+                ? null
+                : (total as JSNumber).toDartDouble.toInt(),
           ),
         );
       }

@@ -256,7 +256,7 @@ class ChatController extends ValueNotifier<ChatState> {
             bundleName: model.bundleName,
             quant: model.quant,
             displayName: model.displayName ?? model.bundleName,
-            storeDir: _defaultStoreDir,
+            storeDir: model.getStoreDir ?? _defaultStoreDir,
           ),
         );
       } else if (model is ModelSource) {
@@ -479,7 +479,7 @@ class ChatController extends ValueNotifier<ChatState> {
         try {
           final map = jsonDecode(item) as Map<String, dynamic>;
           return map['bundleName'] == bundleName && map['quant'] == quant;
-        } catch (_) {
+        } on FormatException {
           return false;
         }
       });
