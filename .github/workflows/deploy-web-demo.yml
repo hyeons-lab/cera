@@ -434,7 +434,7 @@ jobs:
         # Skipped when this run is publishing the Space, so the two
         # destinations are never uploaded to by the same run. The header
         # explains why that separation is load-bearing rather than cosmetic.
-        if: !inputs.publish_space
+        if: ${{ !inputs.publish_space }}
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -518,11 +518,11 @@ jobs:
           # resolve, so the push fails with `batch request: missing protocol`
           # after the pointer files are already committed.
           #
-          # The token is passed via http.extraheader Bearer authorization so the
-          # remote URL contains no credentials, protecting against token leaks in
-          # git-lfs traces or terminal error diagnostics.
+          # The token is passed via http.extraheader Bearer authorization in local config
+          # so the remote URL contains no credentials and git-lfs hooks inherit authentication.
           git remote add space "https://huggingface.co/spaces/${SPACE_ID}"
-          git -c "http.extraheader=Authorization: Bearer ${HF_TOKEN}" push --force --quiet space main
+          git config --local "http.https://huggingface.co/.extraheader" "Authorization: Bearer ${HF_TOKEN}"
+          git push --force --quiet space main
 
           # A static Space is served from `<owner>-<name>.static.hf.space`,
           # lowercased. Derived instead of written out again so that changing
