@@ -1169,7 +1169,18 @@ pub fn detokenize_to_spectrum(
             }
         } else {
             // Attention: write ALL tokens' K/V, then each token attends to ALL.
-            let kv = state.attn_kv[il].as_mut().unwrap();
+            let (Some(wq), Some(wk), Some(wv), Some(wo), Some(q_norm), Some(k_norm), Some(kv)) = (
+                &lw.wq,
+                &lw.wk,
+                &lw.wv,
+                &lw.wo,
+                &lw.q_norm,
+                &lw.k_norm,
+                state.attn_kv.get_mut(il).and_then(|opt| opt.as_mut()),
+            ) else {
+                new_hidden.extend_from_slice(&hidden);
+                continue;
+            };
             let n_head = cfg.n_head;
             let n_kv = cfg.n_head_kv;
             let hd = cfg.n_embd_head;
@@ -1185,23 +1196,15 @@ pub fn detokenize_to_spectrum(
                 let mut q = vec![0.0; n_head * hd];
                 let mut k = vec![0.0; n_kv * hd];
                 let mut v = vec![0.0; n_kv * hd];
-                lw.wq.as_ref().unwrap().gemv(&cur, &mut q);
-                lw.wk.as_ref().unwrap().gemv(&cur, &mut k);
-                lw.wv.as_ref().unwrap().gemv(&cur, &mut v);
+                wq.gemv(&cur, &mut q);
+                wk.gemv(&cur, &mut k);
+                wv.gemv(&cur, &mut v);
                 for h in 0..n_head {
-                    cpu::rmsnorm(
-                        &mut q[h * hd..(h + 1) * hd],
-                        lw.q_norm.as_ref().unwrap(),
-                        cfg.rms_norm_eps,
-                    );
+                    cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
                     apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 for h in 0..n_kv {
-                    cpu::rmsnorm(
-                        &mut k[h * hd..(h + 1) * hd],
-                        lw.k_norm.as_ref().unwrap(),
-                        cfg.rms_norm_eps,
-                    );
+                    cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
                     apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 let wp = pos % cfg.swa_window_size;
@@ -1242,7 +1245,7 @@ pub fn detokenize_to_spectrum(
                     }
                 }
                 let mut proj = vec![0.0; n_embd];
-                lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+                wo.gemv(&attn_out, &mut proj);
                 let residual = &hidden[t * n_embd..(t + 1) * n_embd];
                 let mut cur: Vec<f32> = residual.iter().zip(&proj).map(|(r, p)| r + p).collect();
                 let ffn_res = cur.clone();

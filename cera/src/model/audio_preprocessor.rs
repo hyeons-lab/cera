@@ -230,9 +230,10 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     let pad_amount = N_FFT / 2;
 
     // Center-pad: prepend + append `pad_amount` zeros.
-    let n_samples_padded = n_samples_in
-        .checked_add(2 * pad_amount)
-        .expect("log_mel_spectrogram: n_samples + 2 * pad_amount overflowed usize");
+    let n_samples_padded = match n_samples_in.checked_add(2 * pad_amount) {
+        Some(val) => val,
+        None => return (Vec::new(), 0),
+    };
     let mut samples = vec![0.0f32; n_samples_padded];
     samples[pad_amount..pad_amount + n_samples_in].copy_from_slice(pcm);
 
