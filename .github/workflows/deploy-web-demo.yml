@@ -327,7 +327,7 @@ jobs:
           # the handling instead of restated here. A gate that carries its own
           # copy of the patterns is not checking the tracking, it is agreeing
           # with itself.
-          ATTR="${GITHUB_WORKSPACE}/${SPACE_META}/.gitattributes"
+          ATTR="${GITHUB_WORKSPACE:-.}/${SPACE_META}/.gitattributes"
           LFS_EXTS=$(sed -n 's/^\*\.\([A-Za-z0-9_-]\{1,\}\)[[:space:]].*filter=lfs.*/\1/p' "$ATTR" | tr '[:upper:]' '[:lower:]')
           # An empty parse would make the loop below wave everything through
           # while still reporting a pass, so it is the one outcome that cannot
@@ -473,6 +473,7 @@ jobs:
             echo "::error::publish_space was requested but the HF_TOKEN secret is empty. Create the Space and the token first; the header of this file has the steps."
             exit 1
           fi
+          echo "::add-mask::${HF_TOKEN}"
 
           # Staged in RUNNER_TEMP rather than turning `build/web` itself into a
           # git repo. The push below authenticates via http.extraheader Bearer
@@ -531,6 +532,7 @@ jobs:
           # `-`, so the latter two fold to it along with the separating slash.
           HOST=$(printf '%s' "$SPACE_ID" | tr '[:upper:]' '[:lower:]' | tr '/_.' '---')
           echo "url=https://${HOST}.static.hf.space" >> "$GITHUB_OUTPUT"
+          echo "space_url=https://huggingface.co/spaces/${SPACE_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Link the deployment
         # `always()`, with each destination reported only if it ran and a
