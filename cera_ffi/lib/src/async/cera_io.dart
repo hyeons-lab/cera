@@ -99,8 +99,9 @@ Future<List<CeraBundle>> listBundles(CeraOptions options) async {
     for (final entry in entries)
       CeraBundle(
         name: entry.name,
-        quants: entry.quants.toList()
-          ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
+        quants:
+            entry.quants.toList()
+              ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
       ),
   ];
   list.sort(
@@ -122,9 +123,10 @@ Future<Cera> openBundle(
   // Two constructors rather than always attaching a sink: `withProgress`
   // installs a callback vtable that Rust invokes from its download thread, and
   // a caller who did not ask for progress should not pay for that plumbing.
-  final repo = onProgress == null
-      ? BundleRepo.create(dir)
-      : BundleRepo.withProgress(dir, _ProgressSink(onProgress));
+  final repo =
+      onProgress == null
+          ? BundleRepo.create(dir)
+          : BundleRepo.withProgress(dir, _ProgressSink(onProgress));
   try {
     final engine = await CeraEngine.fromBundleIdAsync(
       name,
@@ -199,9 +201,14 @@ class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
     : _session = _engine.newSession(
         SessionConfig(
-          kvCompression: _options.turboQuant
-              ? const KvCompressionTurboQuant(seed: 0, keys: true, values: true)
-              : null,
+          kvCompression:
+              _options.turboQuant
+                  ? const KvCompressionTurboQuant(
+                    seed: 0,
+                    keys: true,
+                    values: true,
+                  )
+                  : null,
         ),
       ),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
@@ -393,13 +400,14 @@ class _NativeCera implements Cera {
           final reseeded = _engine.newSession(
             SessionConfig(
               seed: seed,
-              kvCompression: _options.turboQuant
-                  ? const KvCompressionTurboQuant(
-                      seed: 0,
-                      keys: true,
-                      values: true,
-                    )
-                  : null,
+              kvCompression:
+                  _options.turboQuant
+                      ? const KvCompressionTurboQuant(
+                        seed: 0,
+                        keys: true,
+                        values: true,
+                      )
+                      : null,
             ),
           );
           _session.close();
@@ -514,9 +522,10 @@ class _NativeCera implements Cera {
       }
       markerName ??= '<|reserved_4|>';
 
-      final userContent = (prompt != null && prompt.trim().isNotEmpty)
-          ? '${prompt.trim()}\n$markerName'
-          : markerName;
+      final userContent =
+          (prompt != null && prompt.trim().isNotEmpty)
+              ? '${prompt.trim()}\n$markerName'
+              : markerName;
 
       String formatted;
       try {
@@ -701,9 +710,10 @@ class _StreamingSink implements ModalitySink {
     // Hold back a trailing replacement char: it means the last token is half a
     // character, and the next one completes it. A genuine U+FFFD in the model's
     // output is merely delayed by one token.
-    final stable = full.endsWith(_replacement)
-        ? full.substring(0, full.length - _replacement.length)
-        : full;
+    final stable =
+        full.endsWith(_replacement)
+            ? full.substring(0, full.length - _replacement.length)
+            : full;
     if (stable.length > _emitted) {
       emit(stable.substring(_emitted));
       _emitted = stable.length;

@@ -54,9 +54,10 @@ class _PrintProgress implements DownloadProgressSink {
 Future<void> main(List<String> args) async {
   final bundleId = args.isNotEmpty ? args[0] : 'LFM2-350M-GGUF';
   final quant = args.length > 1 ? args[1] : 'Q4_0';
-  final storeDir = args.length > 2
-      ? args[2]
-      : Directory.systemTemp.createTempSync('cera_prog_').path;
+  final storeDir =
+      args.length > 2
+          ? args[2]
+          : Directory.systemTemp.createTempSync('cera_prog_').path;
 
   print('cera ${ceraFfiVersion()}: verifying BundleRepo.withProgress');
   print('bundle=$bundleId quant=$quant store=$storeDir');

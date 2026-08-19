@@ -162,9 +162,10 @@ class CeraBundle {
   /// list. `cera list-bundles` and the CLI picker trim it the same way, so a
   /// menu built on this names a model exactly as the CLI does. Pass [name],
   /// not this, to [Cera.openBundle].
-  String get displayName => name.endsWith('-GGUF')
-      ? name.substring(0, name.length - '-GGUF'.length)
-      : name;
+  String get displayName =>
+      name.endsWith('-GGUF')
+          ? name.substring(0, name.length - '-GGUF'.length)
+          : name;
 
   @override
   String toString() => 'CeraBundle($name, quants: ${quants.join(", ")})';

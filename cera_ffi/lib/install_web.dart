@@ -77,8 +77,7 @@ Future<void> installWeb(List<String> args) async {
     ..writeln('  )));');
 }
 
-const _usage =
-    '''
+const _usage = '''
 Install the Cera web runtime into an app's web/ directory.
 
 Usage: dart run cera_ffi:install_web [options]
@@ -279,6 +278,7 @@ Future<void> _write(
   stdout.writeln('  write $name (${_size(bytes.length)})');
 }
 
-String _size(int bytes) => bytes < 1024 * 1024
-    ? '${(bytes / 1024).toStringAsFixed(0)} KB'
-    : '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+String _size(int bytes) =>
+    bytes < 1024 * 1024
+        ? '${(bytes / 1024).toStringAsFixed(0)} KB'
+        : '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';

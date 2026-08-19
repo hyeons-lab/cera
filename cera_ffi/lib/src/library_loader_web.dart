@@ -24,9 +24,10 @@ class CeraLibrary {
   static const String pathEnvVar = 'CERA_FFI_LIB';
 
   /// Always throws on web — `cera-ffi` requires `dart:ffi`.
-  static Never open({String? path}) => throw UnsupportedError(
-    'cera_ffi requires dart:ffi and does not support the web; '
-    'use it only from native targets (Android, iOS, macOS, Linux, Windows). '
-    'For browsers, use cera-wasm.',
-  );
+  static Never open({String? path}) =>
+      throw UnsupportedError(
+        'cera_ffi requires dart:ffi and does not support the web; '
+        'use it only from native targets (Android, iOS, macOS, Linux, Windows). '
+        'For browsers, use cera-wasm.',
+      );
 }
