@@ -31,11 +31,12 @@
 // distinct rows (gemv_workgroups folds the row overflow into wid.y).
 #include "common_decls.tmpl"
 
-const NR: u32 = 4u;
+const NR: u32 = 8u;
 const NQ: u32 = 16u;
 const WG_SIZE: u32 = 32u;
 
-var<workgroup> partials: array<f32, 128>;
+var<workgroup> partials: array<f32, 256>;
+var<workgroup> x_stage: array<f32, 1024>;
 
 // Read the f16 block scale at `blk_byte`. Q4_0 blocks are 18 B, so the scale is
 // only 2-byte aligned and straddles a u32 boundary once every two blocks.
@@ -81,37 +82,67 @@ fn gemv_q4_0_fast(
     let ix = tid / 2u;
     let il = (tid & 1u) * 8u;
 
-    var sumf: array<f32, 4>;
+    var sumf: array<f32, 8>;
     sumf[0] = 0.0;
     sumf[1] = 0.0;
     sumf[2] = 0.0;
     sumf[3] = 0.0;
+    sumf[4] = 0.0;
+    sumf[5] = 0.0;
+    sumf[6] = 0.0;
+    sumf[7] = 0.0;
+
+    let use_shmem = (k <= 1024u);
+    if use_shmem {
+        for (var i = tid; i < k; i += WG_SIZE) {
+            x_stage[i] = x[i];
+        }
+        workgroupBarrier();
+    }
 
     var yb_off: u32 = ix * 32u + il;
 
     var ib = ix;
     while ib < nb {
-        // Load each activation from the storage buffer EXACTLY ONCE, then
-        // derive both the pre-scaled `y*` and the `sumy*` bias from registers.
-        // The pointer version (and a first cut of this one) read each element
-        // twice — once to stage it, once to accumulate `sumy` — which is 16
-        // redundant storage loads per block per thread in the hot loop.
-        let a0 = x[yb_off + 0u];
-        let a1 = x[yb_off + 1u];
-        let a2 = x[yb_off + 2u];
-        let a3 = x[yb_off + 3u];
-        let a4 = x[yb_off + 4u];
-        let a5 = x[yb_off + 5u];
-        let a6 = x[yb_off + 6u];
-        let a7 = x[yb_off + 7u];
-        let a8 = x[yb_off + 16u];
-        let a9 = x[yb_off + 17u];
-        let a10 = x[yb_off + 18u];
-        let a11 = x[yb_off + 19u];
-        let a12 = x[yb_off + 20u];
-        let a13 = x[yb_off + 21u];
-        let a14 = x[yb_off + 22u];
-        let a15 = x[yb_off + 23u];
+        var a0: f32; var a1: f32; var a2: f32; var a3: f32;
+        var a4: f32; var a5: f32; var a6: f32; var a7: f32;
+        var a8: f32; var a9: f32; var a10: f32; var a11: f32;
+        var a12: f32; var a13: f32; var a14: f32; var a15: f32;
+        if use_shmem {
+            a0 = x_stage[yb_off + 0u];
+            a1 = x_stage[yb_off + 1u];
+            a2 = x_stage[yb_off + 2u];
+            a3 = x_stage[yb_off + 3u];
+            a4 = x_stage[yb_off + 4u];
+            a5 = x_stage[yb_off + 5u];
+            a6 = x_stage[yb_off + 6u];
+            a7 = x_stage[yb_off + 7u];
+            a8 = x_stage[yb_off + 16u];
+            a9 = x_stage[yb_off + 17u];
+            a10 = x_stage[yb_off + 18u];
+            a11 = x_stage[yb_off + 19u];
+            a12 = x_stage[yb_off + 20u];
+            a13 = x_stage[yb_off + 21u];
+            a14 = x_stage[yb_off + 22u];
+            a15 = x_stage[yb_off + 23u];
+        } else {
+            a0 = x[yb_off + 0u];
+            a1 = x[yb_off + 1u];
+            a2 = x[yb_off + 2u];
+            a3 = x[yb_off + 3u];
+            a4 = x[yb_off + 4u];
+            a5 = x[yb_off + 5u];
+            a6 = x[yb_off + 6u];
+            a7 = x[yb_off + 7u];
+            a8 = x[yb_off + 16u];
+            a9 = x[yb_off + 17u];
+            a10 = x[yb_off + 18u];
+            a11 = x[yb_off + 19u];
+            a12 = x[yb_off + 20u];
+            a13 = x[yb_off + 21u];
+            a14 = x[yb_off + 22u];
+            a15 = x[yb_off + 23u];
+        }
 
         // Pre-scaled activations, staged in named registers (see header).
         let y0 = a0;
@@ -193,9 +224,10 @@ fn gemv_q4_0_fast(
     }
 
     if tid == 0u {
-        if r0 + 0u < m { y[r0 + 0u] = partials[0u * WG_SIZE]; }
-        if r0 + 1u < m { y[r0 + 1u] = partials[1u * WG_SIZE]; }
-        if r0 + 2u < m { y[r0 + 2u] = partials[2u * WG_SIZE]; }
-        if r0 + 3u < m { y[r0 + 3u] = partials[3u * WG_SIZE]; }
+        for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r < m {
+                y[r0 + r] = partials[r * WG_SIZE];
+            }
+        }
     }
 }

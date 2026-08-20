@@ -41,6 +41,7 @@ fn from_bundle_id_loads_lfm2_q4_0() {
         EngineConfig {
             context_size: 128,
             backend: BackendPreference::Cpu,
+            draft_model: None,
             bundle_repo: Some(repo),
         },
     )
@@ -70,6 +71,7 @@ fn from_bundle_id_fails_without_bundle_repo() {
         EngineConfig {
             context_size: 128,
             backend: BackendPreference::Cpu,
+            draft_model: None,
             bundle_repo: None,
         },
     );

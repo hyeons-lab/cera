@@ -7,6 +7,44 @@
 //! prompt-lookup drafting and the greedy accept rule — so they can be unit
 //! tested without a GGUF. The orchestration lives in `session`.
 
+/// A drafter proposes speculative draft tokens given sequence history.
+pub trait Drafter: Send + Sync {
+    /// Create an isolated clone/instance of the drafter for a new session.
+    fn clone_drafter(&self) -> Box<dyn Drafter>;
+    /// Reset internal state (e.g. when session history is cleared or truncated).
+    fn reset(&mut self);
+    /// Propose up to `max_k` draft tokens given the sequence history so far.
+    fn draft(&mut self, tokens: &[u32], max_k: usize) -> Vec<u32>;
+    /// Suggested speculation depth (k) if configured for this drafter.
+    fn suggested_k(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Prompt-lookup (n-gram) drafter implementation.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptLookupDrafter {
+    pub ngram: usize,
+}
+
+impl PromptLookupDrafter {
+    pub fn new(ngram: usize) -> Self {
+        Self { ngram }
+    }
+}
+
+impl Drafter for PromptLookupDrafter {
+    fn clone_drafter(&self) -> Box<dyn Drafter> {
+        Box::new(*self)
+    }
+
+    fn reset(&mut self) {}
+
+    fn draft(&mut self, tokens: &[u32], max_k: usize) -> Vec<u32> {
+        prompt_lookup_draft(tokens, self.ngram, max_k)
+    }
+}
+
 /// Prompt-lookup (n-gram) draft: guess the next tokens by finding the most
 /// recent earlier occurrence of the last `ngram` tokens and returning up to `k`
 /// tokens that followed it. No draft model — the guess comes from the sequence
@@ -154,9 +192,8 @@ pub fn verify_draft(
 /// and `k` configure the drafter. Returns the generated tokens (excluding the
 /// prompt) and acceptance stats.
 ///
-/// Dense (pure-attention) models only for now: verification rewinds the KV, and
-/// [`crate::model::Model::truncate_kv`] panics on an LFM2 conv window. Lifting
-/// this needs a way to rebuild that window, not just an override.
+/// Models with short-conv layers (such as LFM2) preserve convolution state history
+/// via `ConvHistory` ring buffers to rewind cleanly during verification rewinds.
 pub fn greedy_generate_spec(
     model: &dyn crate::model::Model,
     state: &mut crate::kv_cache::InferenceState,

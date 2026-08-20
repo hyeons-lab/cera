@@ -197,6 +197,76 @@ impl KvCompression {
 }
 
 /// Per-layer inference state.
+/// Capacity for the Conv rollback ring buffer (in number of tokens).
+pub const CONV_HISTORY_CAPACITY: usize = 64;
+
+/// Zero-allocation flat ring buffer storing recent convolution state snapshots
+/// for speculative decoding rollback.
+#[derive(Clone, Debug)]
+pub struct ConvHistory {
+    snapshots: Vec<f32>,
+    positions: [usize; CONV_HISTORY_CAPACITY],
+    head: usize,
+    count: usize,
+    buf_len: usize,
+}
+
+impl ConvHistory {
+    /// Create a new pre-allocated history ring buffer for a convolution layer with `buf_len` elements.
+    pub fn new(buf_len: usize) -> Self {
+        Self {
+            snapshots: vec![0.0f32; CONV_HISTORY_CAPACITY * buf_len],
+            positions: [0; CONV_HISTORY_CAPACITY],
+            head: 0,
+            count: 0,
+            buf_len,
+        }
+    }
+
+    /// Record a snapshot of `buffer` at sequence position `pos`.
+    /// Zero heap allocation: copies into the pre-allocated flat storage.
+    pub fn push(&mut self, pos: usize, buffer: &[f32]) {
+        if self.buf_len == 0 {
+            return;
+        }
+        debug_assert_eq!(buffer.len(), self.buf_len);
+        let offset = self.head * self.buf_len;
+        self.snapshots[offset..offset + self.buf_len].copy_from_slice(buffer);
+        self.positions[self.head] = pos;
+        self.head = (self.head + 1) % CONV_HISTORY_CAPACITY;
+        if self.count < CONV_HISTORY_CAPACITY {
+            self.count += 1;
+        }
+    }
+
+    /// Roll back the convolution `buffer` to the state at `target_pos`.
+    /// Returns `true` if the state was successfully found and restored.
+    pub fn rollback_to(&mut self, target_pos: usize, buffer: &mut [f32]) -> bool {
+        if target_pos == 0 {
+            buffer.fill(0.0);
+            self.clear();
+            return true;
+        }
+        for i in 0..self.count {
+            let idx = (self.head + CONV_HISTORY_CAPACITY - 1 - i) % CONV_HISTORY_CAPACITY;
+            if self.positions[idx] == target_pos {
+                let offset = idx * self.buf_len;
+                buffer.copy_from_slice(&self.snapshots[offset..offset + self.buf_len]);
+                self.head = (idx + 1) % CONV_HISTORY_CAPACITY;
+                self.count = self.count.saturating_sub(i);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reset all snapshot tracking without deallocating.
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum LayerState {
     /// KV cache for attention layers.
@@ -217,7 +287,11 @@ pub enum LayerState {
     },
     /// Rolling buffer for convolution layers.
     /// Stores previous `d_conv` pre-conv activations (bx values), time-major.
-    Conv { buffer: Vec<f32> },
+    Conv {
+        buffer: Vec<f32>,
+        /// Pre-allocated ring buffer history snapshots for speculative decoding rollback.
+        history: ConvHistory,
+    },
 }
 
 /// Pre-allocated scratch buffers reused across layers and tokens.
@@ -387,7 +461,10 @@ impl InferenceState {
                     key_cache_f16.clear();
                     value_cache_f16.clear();
                 }
-                LayerState::Conv { buffer } => buffer.iter_mut().for_each(|x| *x = 0.0),
+                LayerState::Conv { buffer, history } => {
+                    buffer.fill(0.0);
+                    history.clear();
+                }
             }
         }
     }
@@ -552,9 +629,13 @@ impl InferenceState {
                             compressed_values,
                         })
                     }
-                    BlockType::GatedConv => Ok(LayerState::Conv {
-                        buffer: zeroed_f32(checked_elems::<f32>(d_conv, config.hidden_size)?)?,
-                    }),
+                    BlockType::GatedConv => {
+                        let buf_len = checked_elems::<f32>(d_conv, config.hidden_size)?;
+                        Ok(LayerState::Conv {
+                            buffer: zeroed_f32(buf_len)?,
+                            history: ConvHistory::new(buf_len),
+                        })
+                    }
                 }
             },
         ) {
@@ -807,7 +888,7 @@ impl InferenceState {
                     };
                     layers.push(snap);
                 }
-                LayerState::Conv { buffer } => layers.push(LayerSnapshot::Conv {
+                LayerState::Conv { buffer, .. } => layers.push(LayerSnapshot::Conv {
                     buffer: bytemuck::cast_slice(buffer).to_vec(),
                 }),
             }
@@ -941,14 +1022,6 @@ impl InferenceState {
                     // isn't TurboQuant-configured; the caller
                     // should have detected the incompatibility
                     // before calling restore (see `LayerSnapshot::is_compressed`
-                    // + the lookup-time gate in `Lfm2Model::forward_prefill`).
-                    assert!(
-                        compressed_keys.is_some() && compressed_values.is_some(),
-                        "AttentionCompressed snapshot restored into a live state \
-                         missing compressed slots — caller must gate on \
-                         `LayerSnapshot::is_compressed()` matching \
-                         `LayerState::is_compressed()`"
-                    );
                     *compressed_keys = Some(
                         crate::turboquant::decode_compressed_keys(keys)
                             .expect("invalid TQK1 blob in snapshot"),
@@ -963,8 +1036,12 @@ impl InferenceState {
                     key_cache.clear();
                     value_cache.clear();
                 }
-                (LayerState::Conv { buffer }, LayerSnapshot::Conv { buffer: snap_buf }) => {
+                (
+                    LayerState::Conv { buffer, history },
+                    LayerSnapshot::Conv { buffer: snap_buf },
+                ) => {
                     decode_f32_into(buffer, snap_buf);
+                    history.clear();
                 }
                 _ => panic!("snapshot layer kind doesn't match state layer kind"),
             }
@@ -980,12 +1057,11 @@ impl InferenceState {
     /// the next forward continues from the accepted boundary. Unlike
     /// [`Self::shift_kv_with_rope`], **no RoPE fixup is needed** — surviving cells
     /// keep their original absolute positions, so this is a plain `Vec::truncate`.
+    /// For convolution layers, rolling buffer state is rewound using recorded history snapshots.
     ///
     /// Preconditions (enforced in all builds):
     /// - `len <= seq_len`
     /// - `!self.is_compressed()` — TurboQuant caches have no tail-truncate.
-    /// - No `Conv` layers — LFM2's gated-conv state is not position-indexed, so a
-    ///   KV tail-truncate cannot roll it back (spec-decode is dense-only in Phase 1).
     pub fn truncate_to(&mut self, len: usize) {
         assert!(
             len <= self.seq_len,
@@ -1036,10 +1112,17 @@ impl InferenceState {
                     trunc(key_cache_f16, seq_len, len);
                     trunc(value_cache_f16, seq_len, len);
                 }
-                LayerState::Conv { .. } => panic!(
-                    "truncate_to called on a state with Conv layers (LFM2); conv state \
-                     is not position-indexed and cannot be tail-truncated"
-                ),
+                LayerState::Conv { buffer, history } => {
+                    if !history.rollback_to(len, buffer) {
+                        tracing::warn!(
+                            target: "cera::kv_cache",
+                            target_len = len,
+                            "truncate_to target pos not in ConvHistory ring buffer window; zeroing Conv buffer"
+                        );
+                        buffer.fill(0.0);
+                        history.clear();
+                    }
+                }
             }
         }
         self.seq_len = len;
@@ -2573,7 +2656,7 @@ mod tests {
         } else {
             panic!("layer 0 should be attention");
         };
-        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &mut state.layers[1] {
             buffer.iter_mut().for_each(|x| *x = 1.0);
         }
 
@@ -2590,7 +2673,7 @@ mod tests {
             assert_eq!(key_cache.capacity(), cap_k, "capacity must be retained");
             assert_eq!(value_cache.capacity(), cap_v);
         }
-        if let LayerState::Conv { buffer } = &state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &state.layers[1] {
             assert!(
                 buffer.iter().all(|&x| x == 0.0),
                 "conv buffer must be zeroed"
@@ -2619,7 +2702,7 @@ mod tests {
                 value_cache.push(-(i as f32) * 0.25);
             }
         }
-        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &mut state.layers[1] {
             for v in buffer.iter_mut() {
                 *v = 0.7;
             }
@@ -2651,7 +2734,7 @@ mod tests {
             _ => panic!("expected attention layer 0"),
         }
         match (&fresh.layers[1], &state.layers[1]) {
-            (LayerState::Conv { buffer: br }, LayerState::Conv { buffer: bo }) => {
+            (LayerState::Conv { buffer: br, .. }, LayerState::Conv { buffer: bo, .. }) => {
                 assert_eq!(br, bo, "conv buffer must round-trip exactly")
             }
             _ => panic!("expected conv layer 1"),
@@ -2752,5 +2835,54 @@ mod tests {
             _ => panic!("expected both states to have populated compressed caches"),
         }
         assert_eq!(fresh.seq_len, state.seq_len);
+    }
+
+    #[test]
+    fn conv_history_ring_buffer_and_rollback() {
+        let buf_len = 16;
+        let mut history = ConvHistory::new(buf_len);
+        let mut buf = vec![0.0f32; buf_len];
+
+        // Push 10 snapshots with recognizable values
+        for pos in 1..=10 {
+            buf.fill(pos as f32);
+            history.push(pos, &buf);
+        }
+
+        // Roll back to pos = 5
+        let mut restored = vec![0.0f32; buf_len];
+        assert!(history.rollback_to(5, &mut restored));
+        assert_eq!(restored, vec![5.0f32; buf_len]);
+
+        // Roll back to pos = 0 (clears buffer)
+        assert!(history.rollback_to(0, &mut restored));
+        assert_eq!(restored, vec![0.0f32; buf_len]);
+
+        // Roll back to non-existent position fails cleanly
+        assert!(!history.rollback_to(99, &mut restored));
+    }
+
+    #[test]
+    fn conv_history_ring_buffer_wraparound() {
+        let buf_len = 8;
+        let mut history = ConvHistory::new(buf_len);
+        let mut buf = vec![0.0f32; buf_len];
+
+        // Push 100 snapshots (exceeding CONV_HISTORY_CAPACITY = 64)
+        for pos in 1..=100 {
+            buf.fill(pos as f32);
+            history.push(pos, &buf);
+        }
+
+        let mut restored = vec![0.0f32; buf_len];
+        // Positions within the latest 64 steps (37..=100) must be retrievable
+        assert!(history.rollback_to(100, &mut restored));
+        assert_eq!(restored, vec![100.0f32; buf_len]);
+
+        assert!(history.rollback_to(50, &mut restored));
+        assert_eq!(restored, vec![50.0f32; buf_len]);
+
+        // Older positions that fell out of the ring buffer (> 64 steps old) return false
+        assert!(!history.rollback_to(10, &mut restored));
     }
 }

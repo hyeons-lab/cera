@@ -417,6 +417,7 @@ impl CeraEngine {
             model: bytes.into(),
             multimodal_projector: mmproj.map(Into::into),
             audio_decoder: None,
+            draft_model: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`, which
             // `from_parts` rejects by name, better than silently falling
             // back to text when a caller fat-fingers the string.

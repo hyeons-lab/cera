@@ -522,6 +522,10 @@ enum Command {
         /// adapters, which carry alpha in their own metadata.
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
+
+        /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
+        #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
+        draft_model: Option<String>,
     },
 
     /// Inspect a GGUF model file.
@@ -676,6 +680,10 @@ enum Command {
         /// adapters, which carry alpha in their own metadata.
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
+
+        /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
+        #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
+        draft_model: Option<String>,
     },
 
     /// Extract hidden-state embeddings for a prompt.
@@ -993,6 +1001,10 @@ enum Command {
         /// Only used with `--spec`.
         #[arg(long, default_value_t = 6)]
         spec_k: usize,
+
+        /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
+        #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
+        draft_model: Option<String>,
     },
 
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
@@ -1380,6 +1392,7 @@ fn resolve_engine(
     hf: Option<&str>,
     quant: Option<&str>,
     quant_strategy: Option<&str>,
+    draft_model: Option<&str>,
     cache_dir: Option<&str>,
     device: &str,
     context_size: usize,
@@ -1390,10 +1403,15 @@ fn resolve_engine(
             .unwrap_or_else(default_cache_dir)
     };
 
+    let draft_path = draft_model.map(Path::new);
+
     match (model, bundle_id, hf, quant) {
-        (Some(p), None, None, None) => {
-            load_engine_from_spec(ModelSpec::Path(Path::new(p)), device, context_size)
-        }
+        (Some(p), None, None, None) => load_engine_from_spec(
+            ModelSpec::Path(Path::new(p)),
+            draft_path,
+            device,
+            context_size,
+        ),
         (None, Some(id), None, Some(q)) => {
             let normalized = normalize_bundle_id(id);
             load_engine_from_spec(
@@ -1402,6 +1420,7 @@ fn resolve_engine(
                     quant: q,
                     cache_dir: cache(),
                 },
+                draft_path,
                 device,
                 context_size,
             )
@@ -1413,6 +1432,7 @@ fn resolve_engine(
                 quant_strategy,
                 cache_dir: cache(),
             },
+            draft_path,
             device,
             context_size,
         ),
@@ -1487,10 +1507,12 @@ fn pick_bundle_interactively(no_tui: bool) -> Result<Option<(String, String)>> {
 
 fn load_engine_from_spec(
     spec: ModelSpec<'_>,
+    draft_model: Option<&Path>,
     device: &str,
     context_size: usize,
 ) -> Result<CeraEngine> {
     let backend = BackendPreference::parse_str(device).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let draft_buf = draft_model.map(PathBuf::from);
     let engine = match spec {
         ModelSpec::Path(path) => {
             // `..Default::default()` picks up optional fields (e.g.
@@ -1502,6 +1524,7 @@ fn load_engine_from_spec(
                 EngineConfig {
                     context_size,
                     backend,
+                    draft_model: draft_buf,
                     ..Default::default()
                 },
             )?
@@ -1529,6 +1552,7 @@ fn load_engine_from_spec(
                 EngineConfig {
                     context_size,
                     backend,
+                    draft_model: draft_buf,
                     bundle_repo: Some(repo),
                 },
             )?;
@@ -1560,6 +1584,7 @@ fn load_engine_from_spec(
                 EngineConfig {
                     context_size,
                     backend,
+                    draft_model: draft_buf,
                     bundle_repo: Some(repo),
                 },
             )?;
@@ -2220,6 +2245,7 @@ fn main() -> Result<()> {
             n_keep,
             lora,
             lora_alpha,
+            draft_model,
         } => {
             // Compile the grammar (if any) up front so a malformed GBNF fails fast,
             // before the engine loads ~1 GB of weights. `--json` uses a bundled grammar;
@@ -2304,6 +2330,7 @@ fn main() -> Result<()> {
                 hf.as_deref(),
                 quant.as_deref(),
                 quant_strategy.as_deref(),
+                draft_model.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3059,6 +3086,7 @@ fn main() -> Result<()> {
                 hf.as_deref(),
                 quant.as_deref(),
                 quant_strategy.as_deref(),
+                None,
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3172,6 +3200,7 @@ fn main() -> Result<()> {
                 hf.as_deref(),
                 quant.as_deref(),
                 quant_strategy.as_deref(),
+                None,
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3484,6 +3513,7 @@ fn main() -> Result<()> {
             no_tui,
             lora,
             lora_alpha,
+            draft_model,
         } => {
             use std::io::BufRead;
 
@@ -3507,6 +3537,7 @@ fn main() -> Result<()> {
                 hf.as_deref(),
                 quant,
                 quant_strategy.as_deref(),
+                draft_model.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -4224,6 +4255,7 @@ fn main() -> Result<()> {
             spec,
             spec_ngram,
             spec_k,
+            draft_model,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
             if spec {
@@ -4242,6 +4274,7 @@ fn main() -> Result<()> {
                 hf.as_deref(),
                 quant.as_deref(),
                 quant_strategy.as_deref(),
+                draft_model.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -4300,7 +4333,7 @@ fn main() -> Result<()> {
                 warmup,
                 runs
             );
-            if spec {
+            if spec || draft_model.is_some() {
                 // Speculative decode only engages on a dense model with an
                 // uncompressed KV cache; flag when it will silently no-op so the
                 // measured number isn't mistaken for a spec result. Test against
@@ -4312,8 +4345,13 @@ fn main() -> Result<()> {
                     cera::kv_cache::KvCompression::TurboQuant { .. }
                 );
                 let engages = engine.model().supports_all_logits() && !compressed;
+                let drafter_desc = if draft_model.is_some() {
+                    format!("neural draft model, k={spec_k}")
+                } else {
+                    format!("ngram={spec_ngram}, k={spec_k}")
+                };
                 eprintln!(
-                    "Speculative decode: ON (ngram={spec_ngram}, k={spec_k}){}",
+                    "Speculative decode: ON ({drafter_desc}){}",
                     if engages {
                         String::new()
                     } else {
@@ -4346,7 +4384,7 @@ fn main() -> Result<()> {
                     // `max_tokens`, not stop early at EOS — otherwise short
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
-                    spec: spec.then_some(cera::SpecDecode {
+                    spec: (spec || draft_model.is_some()).then_some(cera::SpecDecode {
                         ngram: spec_ngram,
                         k: spec_k,
                     }),
@@ -4899,6 +4937,64 @@ mod tests {
         assert_eq!(lora_alpha, Some(16.0));
     }
 
+    /// `run`, `chat`, and `bench` all accept `--draft-model` / `-d <PATH>`;
+    /// the flag must parse and thread into the command's `draft_model` field.
+    #[test]
+    fn draft_model_flag_parses_on_run_chat_bench() {
+        let run = Cli::try_parse_from([
+            "cera",
+            "run",
+            "-m",
+            "/tmp/base.gguf",
+            "-d",
+            "/tmp/draft.gguf",
+            "-p",
+            "hello",
+        ]);
+        let Ok(Cli {
+            command: Command::Run { draft_model, .. },
+        }) = run
+        else {
+            panic!("expected `run -d` to parse, got: {:?}", run.err());
+        };
+        assert_eq!(draft_model.as_deref(), Some("/tmp/draft.gguf"));
+
+        let chat = Cli::try_parse_from([
+            "cera",
+            "chat",
+            "-m",
+            "/tmp/base.gguf",
+            "--draft-model",
+            "/tmp/draft.gguf",
+        ]);
+        let Ok(Cli {
+            command: Command::Chat { draft_model, .. },
+        }) = chat
+        else {
+            panic!(
+                "expected `chat --draft-model` to parse, got: {:?}",
+                chat.err()
+            );
+        };
+        assert_eq!(draft_model.as_deref(), Some("/tmp/draft.gguf"));
+
+        let bench = Cli::try_parse_from([
+            "cera",
+            "bench",
+            "-m",
+            "/tmp/base.gguf",
+            "-d",
+            "/tmp/draft.gguf",
+        ]);
+        let Ok(Cli {
+            command: Command::Bench { draft_model, .. },
+        }) = bench
+        else {
+            panic!("expected `bench -d` to parse, got: {:?}", bench.err());
+        };
+        assert_eq!(draft_model.as_deref(), Some("/tmp/draft.gguf"));
+    }
+
     /// `embed` requires `--prompt`, accepts a model source, and exposes
     /// `--per-token` / `--json` / `--lora`.
     #[test]
@@ -5130,7 +5226,7 @@ mod tests {
     /// being optional means clap accepts the empty case).
     #[test]
     fn resolve_engine_rejects_no_source() {
-        let r = resolve_engine(None, None, None, None, None, None, "cpu", 1024);
+        let r = resolve_engine(None, None, None, None, None, None, None, "cpu", 1024);
         let err = match r {
             Ok(_) => panic!("expected an error when no source flags are set"),
             Err(e) => e,
@@ -5155,6 +5251,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "cpu",
             1024,
         );
@@ -5162,7 +5259,17 @@ mod tests {
             r.is_err(),
             "expected partial bundle args (id only) to error"
         );
-        let r = resolve_engine(None, None, None, Some("Q4_0"), None, None, "cpu", 1024);
+        let r = resolve_engine(
+            None,
+            None,
+            None,
+            Some("Q4_0"),
+            None,
+            None,
+            None,
+            "cpu",
+            1024,
+        );
         assert!(
             r.is_err(),
             "expected partial bundle args (quant only) to error"
@@ -5178,6 +5285,7 @@ mod tests {
             Some("Q4_0"),
             None,
             None,
+            None,
             "cpu",
             1024,
         );
@@ -5190,6 +5298,7 @@ mod tests {
             Some("model.gguf"),
             None,
             Some("LiquidAI/LFM2.5-VL-3B-GGUF"),
+            None,
             None,
             None,
             None,

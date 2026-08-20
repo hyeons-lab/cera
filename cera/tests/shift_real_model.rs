@@ -127,6 +127,7 @@ fn run_shift_through_real_model(backend: BackendPreference) {
         EngineConfig {
             context_size: CTX,
             backend,
+            draft_model: None,
             bundle_repo: Some(repo),
         },
     )

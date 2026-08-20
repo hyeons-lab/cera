@@ -456,6 +456,7 @@ struct GpuLayerWeights {
     conv_add_bg: Option<wgpu::BindGroup>,
     attn_out_add_bg: Option<wgpu::BindGroup>,
     silu_bg: Option<wgpu::BindGroup>,
+    ffn_swiglu_bg: Option<wgpu::BindGroup>,
     ffn_add_bg: Option<wgpu::BindGroup>,
 }
 
@@ -754,6 +755,7 @@ struct GpuPipelines {
     scale_f32: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
+    ffn_swiglu_q4_0: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     per_head_rmsnorm: wgpu::ComputePipeline,
     rope: wgpu::ComputePipeline,
@@ -1388,6 +1390,11 @@ impl GpuLfm2Model {
                 "silu_mul_inplace",
                 "silu_mul",
             ),
+            ffn_swiglu_q4_0: ctx.create_pipeline(
+                shaders::FFN_SWIGLU_Q4_0,
+                "ffn_swiglu_q4_0",
+                "ffn_swiglu_q4_0",
+            ),
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
             per_head_rmsnorm: ctx.create_pipeline(
                 shaders::PER_HEAD_RMSNORM,
@@ -1819,6 +1826,7 @@ impl GpuLfm2Model {
                 conv_add_bg: None,
                 attn_out_add_bg: None,
                 silu_bg: None,
+                ffn_swiglu_bg: None,
                 ffn_add_bg: None,
             });
         }
@@ -2423,7 +2431,7 @@ impl GpuLfm2Model {
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
-        // constant: gemv_q4_0_fast=4, gemv_q8_0=8, gemv_q4_k=2, gemv_q5_k=2,
+        // constant: gemv_q4_0_fast=8, gemv_q8_0=8, gemv_q4_k=2, gemv_q5_k=2,
         // gemv_q6_k=2, gemv_f32=8. Too large and rows are silently dropped, in
         // every kernel here. Too small over-dispatches, and what that costs is
         // per kernel: `gemv_q4_0_fast` is the one that reads past the weight
@@ -2431,7 +2439,7 @@ impl GpuLfm2Model {
         // guard the read path too (`gemv_q5_k` returns early for a whole
         // workgroup, the others skip per row), so they only burn dispatches.
         match w.tensor.dtype {
-            DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 4, "gemv_q4"),
+            DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 8, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
             DType::Q4KM => (&self.pipelines.gemv_q4_k, 2, "gemv_q4k"),
             DType::Q6K => (&self.pipelines.gemv_q6_k, 2, "gemv_q6"),
@@ -2697,13 +2705,48 @@ impl GpuLfm2Model {
                 let gate_bg = self.make_gemv_bg(&d.gate, &self.ffn_input_buf, &self.gate_buf);
                 let up_bg = self.make_gemv_bg(&d.up, &self.ffn_input_buf, &self.up_buf);
                 let down_bg = self.make_gemv_bg(&d.down, &self.gate_buf, &self.out_buf);
-                // Built before the mutable borrow: `make_gemv_bg` takes `&self`,
-                // so it cannot run while `self.layers[i]` is borrowed mutably.
+                let ffn_swiglu_bg = if d.gate.tensor.dtype == DType::Q4_0
+                    && d.up.tensor.dtype == DType::Q4_0
+                {
+                    Some(
+                        self.ctx
+                            .device
+                            .create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("ffn_swiglu_q4_0"),
+                                layout: &self.pipelines.ffn_swiglu_q4_0.get_bind_group_layout(0),
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: d.gate.tensor.buffer.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: d.up.tensor.buffer.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: self.ffn_input_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: self.gate_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 4,
+                                        resource: d.gate.params_buf.as_entire_binding(),
+                                    },
+                                ],
+                            }),
+                    )
+                } else {
+                    None
+                };
                 if let GpuFfn::Dense(d) = &mut self.layers[i].ffn {
                     d.gate.cached_bg = Some(gate_bg);
                     d.up.cached_bg = Some(up_bg);
                     d.down.cached_bg = Some(down_bg);
                 }
+                self.layers[i].ffn_swiglu_bg = ffn_swiglu_bg;
             }
 
             if cfg.block_types[i] == BlockType::GatedConv {
@@ -3892,9 +3935,9 @@ impl GpuLfm2Model {
         // T5b has already profiled it (`CERA_GPU_PROFILE=1`): decode is memory-bound
         // inside the quantized GEMVs, which sustain only ~25 GB/s against the f16
         // GEMV's 106 GB/s on the same GPU. Fix those loads. See `BASELINE.md`.
+        let mut enc = self.new_encoder();
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
-            let mut enc = self.new_encoder();
 
             if cfg.block_types[i] == BlockType::GatedConv {
                 let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
@@ -4325,7 +4368,6 @@ impl GpuLfm2Model {
                             self.dispatch_into(&mut pass, s.pipeline, &s.bind_group, s.workgroups);
                         });
                     }
-                    self.ctx.submit_encoder(enc);
                     continue;
                 }
                 GpuFfn::Dense(d) => d,
@@ -4385,23 +4427,38 @@ impl GpuLfm2Model {
                 let mut pass = self.ctx.begin_pass(&mut enc, "ffn");
                 // rmsnorm
                 self.dispatch_into(&mut pass, &self.pipelines.rmsnorm, norm_bg, (1, 1, 1));
-                // gate + up GEMVs
-                self.dispatch_gemv_into(&mut pass, &dense.gate, gate_bg);
-                self.dispatch_gemv_into(&mut pass, &dense.up, up_bg);
-                // LoRA gate/up deltas on the raw projections, before silu_mul.
-                if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
-                    self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                if let Some(fused_bg) = lw.ffn_swiglu_bg.as_ref()
+                    && gate_lora_bgs.is_none()
+                    && up_lora_bgs.is_none()
+                {
+                    // Fused SwiGLU: gate + up + silu in ONE single dispatch!
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.ffn_swiglu_q4_0,
+                        fused_bg,
+                        crate::backend::wgpu::gemv_row_workgroups(
+                            dense.gate.tensor.shape[0] as u32,
+                        ),
+                    );
+                } else {
+                    // gate + up GEMVs
+                    self.dispatch_gemv_into(&mut pass, &dense.gate, gate_bg);
+                    self.dispatch_gemv_into(&mut pass, &dense.up, up_bg);
+                    // LoRA gate/up deltas on the raw projections, before silu_mul.
+                    if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
+                    if let Some((t, (bg_a, bg_b))) = up_lora_bgs.as_ref() {
+                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
+                    }
+                    // silu_mul
+                    self.dispatch_into(
+                        &mut pass,
+                        &self.pipelines.silu_mul_inplace,
+                        silu_bg,
+                        ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
+                    );
                 }
-                if let Some((t, (bg_a, bg_b))) = up_lora_bgs.as_ref() {
-                    self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
-                }
-                // silu_mul
-                self.dispatch_into(
-                    &mut pass,
-                    &self.pipelines.silu_mul_inplace,
-                    silu_bg,
-                    ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
-                );
                 // down GEMV
                 self.dispatch_gemv_into(&mut pass, &dense.down, down_bg);
                 // residual add
@@ -4416,7 +4473,6 @@ impl GpuLfm2Model {
                     self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
                 }
             }
-            self.ctx.submit_encoder(enc);
         }
 
         // 3. Output norm + projection. Untied models project through
@@ -4426,7 +4482,6 @@ impl GpuLfm2Model {
         // `run_layers`, so it is inside what `forward_embedding` returns, not
         // part of the projection that `DecodeTail::Hidden` is declining. Only
         // the projection and the argmax below are conditional.
-        let mut enc = self.new_encoder();
         self.encode_rmsnorm(
             &mut enc,
             &self.hidden_buf,
@@ -6320,6 +6375,39 @@ impl GpuLfm2Model {
 }
 
 impl Model for GpuLfm2Model {
+    fn supports_all_logits(&self) -> bool {
+        self.config
+            .block_types
+            .iter()
+            .all(|b| *b == BlockType::Attention)
+    }
+
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
+        let vocab = self.config.vocab_size;
+        let mut all_logits = Vec::with_capacity(tokens.len() * vocab);
+
+        self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
+        for (j, &token) in tokens.iter().enumerate() {
+            let pos = start_pos + j;
+            let logits = self.forward_inner(&[token], pos, state);
+            all_logits.extend_from_slice(&logits);
+        }
+        all_logits
+    }
+
+    fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.gpu_state.seq_len.store(len, Ordering::Relaxed);
+        state.seq_len = len;
+    }
+
     fn supports_hidden_states(&self) -> bool {
         true
     }
