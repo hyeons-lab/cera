@@ -397,19 +397,19 @@ fn is_audio_tokenizer_gguf(file: &str) -> bool {
     file.starts_with("tokenizer")
 }
 
-/// Check whether two quantization tags match (case-insensitive and hyphen/underscore agnostic, zero-alloc).
+/// Check whether two quantization tags match (case-insensitive and hyphen/underscore/dot agnostic, zero-alloc).
 #[inline]
-pub fn quant_matches(a: &str, b: &str) -> bool {
+pub(crate) fn quant_matches(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
     a.bytes().zip(b.bytes()).all(|(b1, b2)| {
-        let c1 = if b1 == b'_' {
+        let c1 = if b1 == b'_' || b1 == b'.' {
             b'-'
         } else {
             b1.to_ascii_uppercase()
         };
-        let c2 = if b2 == b'_' {
+        let c2 = if b2 == b'_' || b2 == b'.' {
             b'-'
         } else {
             b2.to_ascii_uppercase()
@@ -432,6 +432,7 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
 
+    // Pass 1: Prioritize explicit QAD variants (e.g. QAD-Q4_0, QAD_Q4_K_M, QAD.Q8_0)
     for &q in BASE_QUANTS {
         for (pos, _) in upper.match_indices(q) {
             let end = pos + q.len();
@@ -454,6 +455,17 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
 
             if has_immediate_qad {
                 return Some(format!("QAD-{q}"));
+            }
+        }
+    }
+
+    // Pass 2: Standard base quantization tags
+    for &q in BASE_QUANTS {
+        for (pos, _) in upper.match_indices(q) {
+            let end = pos + q.len();
+            let after_ok = end == upper.len() || matches!(bytes[end], b'-' | b'_' | b'.' | b'/');
+            if !after_ok {
+                continue;
             }
 
             let before_ok = pos == 0 || matches!(bytes[pos - 1], b'-' | b'_' | b'.' | b'/');
@@ -1086,8 +1098,15 @@ mod tests {
             Some("Q4_0")
         );
 
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-Q4_0-QAD-Q4_0.gguf").as_deref(),
+            Some("QAD-Q4_0")
+        );
+
         assert!(quant_matches("QAD-Q4_0", "qad_q4_0"));
         assert!(quant_matches("QAD_Q4_0", "QAD-Q4-0"));
+        assert!(quant_matches("QAD-Q4_0", "QAD.Q4_0"));
+        assert!(quant_matches("QAD.Q4_0", "qad_q4_0"));
         assert!(quant_matches("Q4_K_M", "q4-k-m"));
         assert!(!quant_matches("QAD-Q4_0", "Q4_0"));
 
