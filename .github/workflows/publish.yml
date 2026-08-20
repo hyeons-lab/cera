@@ -67,9 +67,17 @@ on:
         description: 'Web runtime for the Flutter plugin (cera-wasm --target web --features wgpu, attached to the release)'
         type: boolean
         default: true
+      pub:
+        description: 'pub.dev (cera_ffi & cera_ffi_flutter)'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,7 +102,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -123,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -267,7 +275,7 @@ jobs:
             features: ''
             archive: zip
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -312,7 +320,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -401,7 +409,7 @@ jobs:
           - { os: ubuntu-latest,  label: linux-x86-64,   target: x86_64-unknown-linux-gnu, lib: libcera_ffi.so,    dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/linux-x86-64,  android: true  }
           - { os: windows-latest, label: win32-x86-64,   target: x86_64-pc-windows-msvc,  lib: cera_ffi.dll,      dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/win32-x86-64,  android: false }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -498,7 +506,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Pull every runner's native libs back into the module source trees. The
       # committed `cera_ffi.kt` binding is already in the repo (srcDir'd by both
@@ -580,7 +588,7 @@ jobs:
     outputs:
       checksum: ${{ steps.zip.outputs.checksum }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -649,7 +657,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -714,10 +722,141 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
+  # ── pub.dev (cera_ffi & cera_ffi_flutter) ──────────────────────────────────
+  publish-pub:
+    name: Publish packages to pub.dev
+    needs: [version, build-spm]
+    if: >-
+      ${{ !cancelled()
+          && github.event.inputs.pub == 'true'
+          && needs.version.result == 'success'
+          && needs.build-spm.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      # OIDC token minting for pub.dev automated publishing
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Validate SPM checksum prerequisite for real release
+        if: ${{ github.event.inputs.dry_run == 'false' }}
+        env:
+          CHECKSUM: ${{ needs.build-spm.outputs.checksum }}
+        run: |
+          if [ -z "$CHECKSUM" ] || [ "$CHECKSUM" = "null" ]; then
+            echo "::error::Cannot publish cera_ffi_flutter without a valid SPM checksum from build-spm. Enable SPM ('spm: true') when releasing pub.dev packages." >&2
+            exit 1
+          fi
+
+      - name: Publish cera_ffi (Dart package)
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: cera_ffi package validation (no upload) ==="
+            ( cd cera_ffi && dart pub publish --dry-run )
+            exit 0
+          fi
+
+          echo "=== Publishing cera_ffi@${VERSION} to pub.dev ==="
+          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+          if [ "$pkg_status" = "200" ]; then
+            echo "✓ cera_ffi@${VERSION} already on pub.dev — skipping"
+          else
+            ( cd cera_ffi && dart pub publish --force )
+            propagated=false
+            for i in $(seq 1 30); do
+              status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+              if [ "$status" = "200" ]; then
+                echo "  cera_ffi@${VERSION} visible on pub.dev"
+                propagated=true
+                break
+              fi
+              echo "  waiting for pub.dev index propagation (${i}/30)..."
+              sleep 10
+            done
+            if [ "$propagated" = "false" ]; then
+              echo "::error::cera_ffi@${VERSION} did not propagate to pub.dev index after 300s" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Publish cera_ffi_flutter (Flutter plugin)
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          CHECKSUM="${{ needs.build-spm.outputs.checksum }}"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "false" ] && { [ -z "$CHECKSUM" ] || [ "$CHECKSUM" = "null" ]; }; then
+            echo "::error::Cannot publish cera_ffi_flutter without a valid SPM checksum from build-spm. Enable SPM ('spm: true') when releasing pub.dev packages." >&2
+            exit 1
+          fi
+
+          # If the SPM build produced a checksum, substitute it into the Apple manifests
+          # before publishing to pub.dev (which packages the local workspace directory).
+          if [ -n "$CHECKSUM" ] && [ "$CHECKSUM" != "null" ]; then
+            echo "Pinning Apple manifests with CHECKSUM=${CHECKSUM}..."
+            for f in \
+              cera_ffi_flutter/ios/cera_ffi_flutter.podspec \
+              cera_ffi_flutter/macos/cera_ffi_flutter.podspec \
+              cera_ffi_flutter/ios/cera_ffi_flutter/Package.swift \
+              cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
+            do
+              sed -i.bak \
+                -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
+                -e "s|releases/download/v[0-9][0-9A-Za-z.+-]*/CeraFFI\.xcframework\.zip|releases/download/v${VERSION}/CeraFFI.xcframework.zip|" \
+                -e "s|VERSION=\"RELEASE_VERSION\"|VERSION=\"${VERSION}\"|" \
+                -e "s|VERSION=\"[0-9][0-9A-Za-z.+-]*\"|VERSION=\"${VERSION}\"|" \
+                -e "s|EXPECTED_SHA=\"RELEASE_CHECKSUM\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+                -e "s|EXPECTED_SHA=\"[0-9a-f]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+                -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
+                -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+                "$f"
+              rm -f "$f.bak"
+              if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
+                echo "::error::$f still has placeholders after rewrite" >&2
+                exit 1
+              fi
+            done
+          fi
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN: cera_ffi_flutter package validation (no upload) ==="
+            ( cd cera_ffi_flutter && flutter analyze )
+            # Verify packaging via dry-run; pubspec_overrides/exact-pinning hints are expected during local dry runs
+            out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
+            echo "$out"
+            if grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; then
+              echo "✓ cera_ffi_flutter package structure verified."
+            else
+              echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+
+          echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
+          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+          if [ "$pkg_status" = "200" ]; then
+            echo "✓ cera_ffi_flutter@${VERSION} already on pub.dev — skipping"
+            exit 0
+          fi
+
+          rm -f cera_ffi_flutter/pubspec_overrides.yaml
+          ( cd cera_ffi_flutter && flutter pub publish --force )
+          echo "✓ cera_ffi_flutter@${VERSION} published successfully to pub.dev"
+
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
     name: Tag & GitHub Release
-    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm, build-web-assets]
+    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm, build-web-assets, publish-pub]
     # Real runs only, and only once every enabled leg succeeded. Disabled legs
     # are `skipped` (not `failure`), so they don't block the tag; any actual
     # failure does. `jvm-native-libs` is gated too: if it fails, `publish-jvm`
@@ -736,12 +875,14 @@ jobs:
           && needs.publish-jvm.result != 'failure'
           && needs.build-spm.result != 'failure'
           && needs.build-web-assets.result != 'failure'
+          && needs.publish-pub.result != 'failure'
           && (github.event.inputs.crates == 'true'
               || github.event.inputs.cli == 'true'
               || github.event.inputs.npm == 'true'
               || github.event.inputs.jvm == 'true'
               || github.event.inputs.spm == 'true'
-              || github.event.inputs.web == 'true') }}
+              || github.event.inputs.web == 'true'
+              || github.event.inputs.pub == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Least privilege: only this job creates the tag / release.
@@ -762,7 +903,7 @@ jobs:
       # set on this job) for the tag push only.
       - name: Checkout default branch
         if: ${{ needs.build-spm.result == 'success' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
@@ -859,7 +1000,9 @@ jobs:
               -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
               -e "s|releases/download/v[0-9][0-9A-Za-z.+-]*/CeraFFI\.xcframework\.zip|releases/download/v${VERSION}/CeraFFI.xcframework.zip|" \
               -e "s|VERSION=\"RELEASE_VERSION\"|VERSION=\"${VERSION}\"|" \
+              -e "s|VERSION=\"[0-9][0-9A-Za-z.+-]*\"|VERSION=\"${VERSION}\"|" \
               -e "s|EXPECTED_SHA=\"RELEASE_CHECKSUM\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+              -e "s|EXPECTED_SHA=\"[0-9a-f]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
               -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
               -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
               "$f"
