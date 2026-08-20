@@ -1190,7 +1190,8 @@ impl GpuContext {
 
         let data = slice.get_mapped_range().expect("get_mapped_range failed");
         let mut timestamps = vec![0u64; n_queries as usize];
-        bytemuck::cast_slice_mut(&mut timestamps).copy_from_slice(&data[0..(n_queries as usize * 8)]);
+        bytemuck::cast_slice_mut(&mut timestamps)
+            .copy_from_slice(&data[0..(n_queries as usize * 8)]);
 
         let period_ns = profiler.timestamp_period as f64;
         let spans = profiler.spans.lock().expect("profiler mutex poisoned");
