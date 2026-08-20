@@ -9180,14 +9180,11 @@ pub(crate) mod wasm_simd {
         let d = crate::quant::f16_to_f32(block.d);
         let bias = f32x4_splat(8.0);
 
-        // SAFETY: `qs` is 16 bytes and `v128_load` reads exactly 16; `y` is
+        // SAFETY: `qs` is 16 bytes and `read_unaligned` reads exactly 16; `y` is
         // asserted to be 32 f32 and the largest offset read below is 28..32.
-        let (qs, y_ptr) = unsafe {
-            (
-                v128_load(block.qs.as_ptr().cast::<v128>()),
-                y.as_ptr().cast::<v128>(),
-            )
-        };
+        // Using `read_unaligned` avoids 16-byte alignment assumptions on packed
+        // GGUF structures and slice references.
+        let qs = unsafe { block.qs.as_ptr().cast::<v128>().read_unaligned() };
 
         let lo = v128_and(qs, u8x16_splat(0x0F));
         let hi = u8x16_shr(qs, 4);
@@ -9201,9 +9198,14 @@ pub(crate) mod wasm_simd {
                 .enumerate()
             {
                 let q = u8_lanes_to_f32(src, high, bias);
-                // SAFETY: `base + chunk` is at most 7, and reading v128 lane
-                // `7` of `y` covers f32 indices 28..32, the last of 32.
-                let yv = unsafe { v128_load(y_ptr.add(base + chunk)) };
+                // SAFETY: `(base + chunk) * 4` is at most 28, and reading 16 bytes
+                // covers f32 indices 28..32, the last of 32.
+                let yv = unsafe {
+                    y.as_ptr()
+                        .add((base + chunk) * 4)
+                        .cast::<v128>()
+                        .read_unaligned()
+                };
                 acc = f32x4_add(acc, f32x4_mul(q, yv));
             }
         }
@@ -9223,13 +9225,15 @@ pub(crate) mod wasm_simd {
         let mut acc = f32x4_splat(0.0);
         for half in 0..2usize {
             // SAFETY: `quants` is 32 i8; `half` is 0 or 1 so this reads bytes
-            // 0..16 then 16..32. `y` is 32 f32 and lane `half * 4 + 3` covers
+            // 0..16 then 16..32. `y` is 32 f32 and reading at `(half * 4 + 3) * 4` covers
             // f32 indices 28..32 at most.
-            let (qs, y_ptr) = unsafe {
-                (
-                    v128_load(block.quants.as_ptr().add(half * 16).cast::<v128>()),
-                    y.as_ptr().cast::<v128>(),
-                )
+            let qs = unsafe {
+                block
+                    .quants
+                    .as_ptr()
+                    .add(half * 16)
+                    .cast::<v128>()
+                    .read_unaligned()
             };
             let w = [i16x8_extend_low_i8x16(qs), i16x8_extend_high_i8x16(qs)];
             for (chunk, (src, high)) in [(w[0], false), (w[0], true), (w[1], false), (w[1], true)]
@@ -9243,7 +9247,12 @@ pub(crate) mod wasm_simd {
                 };
                 let q = f32x4_convert_i32x4(i32s);
                 // SAFETY: see the load above.
-                let yv = unsafe { v128_load(y_ptr.add(half * 4 + chunk)) };
+                let yv = unsafe {
+                    y.as_ptr()
+                        .add((half * 4 + chunk) * 4)
+                        .cast::<v128>()
+                        .read_unaligned()
+                };
                 acc = f32x4_add(acc, f32x4_mul(q, yv));
             }
         }
