@@ -37,6 +37,8 @@ cera-wasm/examples/**/pkg/
 
 # Models
 *.gguf
+*.onnx
+models/
 
 # Environment
 .env

@@ -939,6 +939,46 @@ enum Command {
         #[arg(long)]
         cache_dir: Option<String>,
     },
+
+    /// Run Voice Activity Detection (VAD) using Silero VAD.
+    Vad {
+        /// Path to the Silero VAD `.gguf` model file.
+        #[arg(short, long, default_value = "models/silero_vad.gguf")]
+        model: String,
+
+        /// Path to an input WAV file.
+        #[arg(short, long)]
+        audio: String,
+
+        /// Target sample rate in Hz: 16000 or 8000. Inputs with different
+        /// sample rates are automatically resampled with linear interpolation.
+        #[arg(long, default_value_t = 16000)]
+        sample_rate: u32,
+
+        /// Speech probability threshold (default: 0.5).
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f32,
+
+        /// Negative silence probability threshold (default: 0.35).
+        #[arg(long, default_value_t = 0.35)]
+        neg_threshold: f32,
+
+        /// Minimum duration of speech segment to retain in milliseconds (default: 64).
+        #[arg(long, default_value_t = 64)]
+        min_speech_ms: usize,
+
+        /// Minimum duration of silence before splitting speech segments in milliseconds (default: 100).
+        #[arg(long, default_value_t = 100)]
+        min_silence_ms: usize,
+
+        /// Padding prepended/appended to speech segments in milliseconds (default: 30).
+        #[arg(long, default_value_t = 30)]
+        speech_pad_ms: usize,
+
+        /// Output results as a JSON array of speech timestamps.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3258,6 +3298,67 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Vad {
+            model,
+            audio,
+            sample_rate,
+            threshold,
+            neg_threshold,
+            min_speech_ms,
+            min_silence_ms,
+            speech_pad_ms,
+            json,
+        } => {
+            let vad_rate = match sample_rate {
+                16000 => cera::vad::VadSampleRate::Rate16kHz,
+                8000 => cera::vad::VadSampleRate::Rate8kHz,
+                other => anyhow::bail!(
+                    "unsupported sample rate {other} Hz; Silero VAD supports 16000 or 8000 Hz"
+                ),
+            };
+
+            let config = cera::vad::VadConfig {
+                threshold,
+                neg_threshold,
+                min_speech_duration_ms: min_speech_ms,
+                min_silence_duration_ms: min_silence_ms,
+                speech_pad_ms,
+            };
+
+            let mut vad = cera::vad::SileroVad::from_file(&model)
+                .with_context(|| format!("loading Silero VAD model from `{model}`"))?;
+
+            let (mut pcm, sr_in) = read_wav_pcm16_mono(&audio)
+                .with_context(|| format!("reading audio file `{audio}`"))?;
+
+            if sr_in != sample_rate {
+                pcm = resample_linear(&pcm, sr_in, sample_rate);
+            }
+
+            let timestamps = vad.get_speech_timestamps(&pcm, vad_rate, &config)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&timestamps)?);
+            } else {
+                println!(
+                    "Silero VAD: detected {} speech segment(s) in `{}` ({:.2}s @ {} Hz)",
+                    timestamps.len(),
+                    audio,
+                    pcm.len() as f32 / sample_rate as f32,
+                    sample_rate
+                );
+                for (i, ts) in timestamps.iter().enumerate() {
+                    println!(
+                        "  [{:02}] {:8.2}ms - {:8.2}ms  (samples {}..{})",
+                        i + 1,
+                        ts.start_ms,
+                        ts.end_ms,
+                        ts.start_sample,
+                        ts.end_sample
+                    );
+                }
+            }
+        }
         Command::Chat {
             model,
             hf,
@@ -5491,5 +5592,45 @@ mod tests {
         let input48 = vec![0.0; n_in_48];
         let out48 = resample_linear(&input48, 48_000, 16_000);
         assert_eq!(out48.len(), 16_000);
+    }
+
+    #[test]
+    fn vad_command_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "vad",
+            "--model",
+            "models/silero_vad.gguf",
+            "--audio",
+            "models/en.wav",
+            "--sample-rate",
+            "16000",
+            "--threshold",
+            "0.6",
+            "--neg-threshold",
+            "0.4",
+            "--json",
+        ])
+        .expect("vad subcommand should parse");
+
+        match cli.command {
+            Command::Vad {
+                model,
+                audio,
+                sample_rate,
+                threshold,
+                neg_threshold,
+                json,
+                ..
+            } => {
+                assert_eq!(model, "models/silero_vad.gguf");
+                assert_eq!(audio, "models/en.wav");
+                assert_eq!(sample_rate, 16000);
+                assert_eq!(threshold, 0.6);
+                assert_eq!(neg_threshold, 0.4);
+                assert!(json);
+            }
+            _ => panic!("expected Vad command"),
+        }
     }
 }
