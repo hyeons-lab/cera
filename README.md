@@ -250,7 +250,7 @@ Cera includes a **native, pure-Rust implementation of Silero VAD v5** (`cera::va
 - **Zero runtime dependencies**: Pure Rust tensor operations with no ONNX Runtime or Python required.
 - **Streaming audio evaluation**: State-machine-based chunk iterator (`VadIterator`) processing 512-sample frames (32ms at 16kHz) with state persistence.
 - **Speech segment timestamping**: Automatic speech segment extraction, speech padding, and silence trimming.
-- **Cross-Platform Bindings**: Available in Rust (`cera::vad::VadEngine`), CLI (`cera vad`), Swift/Kotlin via UniFFI, and Dart/Flutter via `cera_ffi`.
+- **Cross-Platform Bindings**: Available in Rust (`cera::vad::SileroVad`), CLI (`cera vad`), Swift/Kotlin via UniFFI, and Dart/Flutter via `cera_ffi`.
 
 ```bash
 # Detect speech timestamps from a WAV file

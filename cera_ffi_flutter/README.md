@@ -155,10 +155,13 @@ The Flutter package supports multimodal audio pipelines and 4 interactive voice 
 - **`TextOnly`**: Standard LLM text turn generation.
 
 ```dart
-// Voice Activity Detection with Silero VAD v5
-final vad = VadEngine.fromPath('/path/to/silero_vad.gguf', SileroVadConfig.standard());
-final iterator = vad.newIterator(VadSampleRate.rate16kHz);
-final segment = iterator.processChunk(audioFrame512);
+// Voice Activity Detection with Silero VAD v5 (re-exported from cera_ffi)
+final vad = FfiSileroVad.fromFile('/path/to/silero_vad.gguf');
+final iterator = FfiVadIterator(
+  rate: FfiVadSampleRate.rate16kHz,
+  config: sileroVadDefaultConfig(),
+);
+final event = iterator.processChunk(vad, audioFrame512);
 ```
 
 ## Web

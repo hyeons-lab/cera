@@ -4,7 +4,7 @@
 
 ### Added
 
-- **Silero VAD v5 integration**: Re-exports native Silero VAD v5 classes (`SileroVadConfig`, `VadSampleRate`, `VadIterator`, `VadEngine`) for audio activity detection in Flutter apps.
+- **Silero VAD v5 integration**: Re-exports native Silero VAD v5 classes (`FfiSileroVad`, `FfiVadSampleRate`, `FfiVadIterator`, `FfiVadConfig`, `sileroVadDefaultConfig`) for audio activity detection in Flutter apps.
 - **Modern MVI UI Architecture**: Complete architectural rewrite of the Flutter example application using Model-View-Intent pattern for predictable state transitions and lifecycle management.
 - **Voice Interaction Modes**: 4 dedicated interaction modes (`SpeechToText`, `VoiceChat`, `TextToSpeech`, and `TextOnly`) with capability-based mode switching, dynamic audio waveforms, and exclusive audio streaming playback via `AudioPlayerService`.
 - **Hugging Face Model Repositories**: Support for downloading and loading models directly from arbitrary Hugging Face repositories and URLs in addition to LeapBundles.

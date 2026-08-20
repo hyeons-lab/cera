@@ -687,7 +687,8 @@ impl GpuContext {
             .expect("GPU readback failed");
 
         let data = slice.get_mapped_range().expect("get_mapped_range failed");
-        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        let mut result = vec![0.0f32; count];
+        bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
         drop(data);
         staging.unmap();
         result
@@ -824,7 +825,8 @@ impl GpuContext {
             .expect("GPU readback failed");
 
         let data = slice.get_mapped_range().expect("get_mapped_range failed");
-        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        let mut result = vec![0u32; count];
+        bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
         drop(data);
         staging.unmap();
         result
@@ -877,7 +879,8 @@ impl GpuContext {
 
         let data = slice.get_mapped_range().expect("get_mapped_range failed");
         // Slicing to exact byte count before casting to handle potential 2-byte padding.
-        let f16_data: &[f16] = bytemuck::cast_slice(&data[0..size as usize]);
+        let mut f16_data = vec![f16::ZERO; count];
+        bytemuck::cast_slice_mut(&mut f16_data).copy_from_slice(&data[0..size as usize]);
         let result: Vec<f32> = f16_data.iter().map(|&x| x.to_f32()).collect();
         drop(data);
         staging.unmap();
@@ -1186,7 +1189,8 @@ impl GpuContext {
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range().expect("get_mapped_range failed");
-        let timestamps: &[u64] = bytemuck::cast_slice(&data);
+        let mut timestamps = vec![0u64; n_queries as usize];
+        bytemuck::cast_slice_mut(&mut timestamps).copy_from_slice(&data[0..(n_queries as usize * 8)]);
 
         let period_ns = profiler.timestamp_period as f64;
         let spans = profiler.spans.lock().expect("profiler mutex poisoned");

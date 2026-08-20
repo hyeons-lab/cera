@@ -133,14 +133,27 @@ text. For streaming and the async variants that keep the isolate responsive, see
 import 'package:cera_ffi/cera_ffi.dart';
 
 void main() {
-  final vad = VadEngine.fromPath('/path/to/silero_vad.gguf', SileroVadConfig.standard());
-  final iterator = vad.newIterator(VadSampleRate.rate16kHz);
+  final vad = FfiSileroVad.fromFile('/path/to/silero_vad.gguf');
+  final iterator = FfiVadIterator(
+    rate: FfiVadSampleRate.rate16kHz,
+    config: sileroVadDefaultConfig(),
+  );
 
-  // Process 512-sample (32ms) audio chunks
-  final chunk = Float32List(512); // PCM samples in [-1.0, 1.0]
-  final segment = iterator.processChunk(chunk);
-  if (segment != null) {
-    print('Speech detected from ${segment.start}s to ${segment.end ?? 0.0}s');
+  // Process 512-sample (32ms) audio chunks (PCM samples in [-1.0, 1.0])
+  final chunk = List<double>.filled(512, 0.0);
+  final event = iterator.processChunk(vad, chunk);
+  if (event != null) {
+    print('VAD Event: speech=${event.speech}, start=${event.startSample}, end=${event.endSample}');
+  }
+
+  // Or extract speech timestamps for an entire audio buffer
+  final timestamps = vad.getSpeechTimestamps(
+    audio: chunk,
+    rate: FfiVadSampleRate.rate16kHz,
+    config: sileroVadDefaultConfig(),
+  );
+  for (final ts in timestamps) {
+    print('Speech segment: ${ts.start}s to ${ts.end}s');
   }
 }
 ```

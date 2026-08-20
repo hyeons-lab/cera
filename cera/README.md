@@ -21,7 +21,7 @@ cera = "0.5"
 
 ## Highlights in 0.5.0
 
-- **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`VadEngine`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
+- **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`SileroVad`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
 - **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with on-the-fly zero-disk streaming quantization of remote SafeTensors models directly to GGUF in memory.
 - **WebGPU Depthformer Acceleration & Voice Modes**: High-performance compute shaders for Depthformer audio decoder, unified web runtime, and 4 dedicated voice interaction modes.
 - **Multimodal Vision ViT Optimization**: High-resolution image encoding improvements and async WebGPU readbacks.
