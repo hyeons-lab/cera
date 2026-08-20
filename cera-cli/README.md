@@ -80,6 +80,15 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
+| `vad` | Run Voice Activity Detection (VAD) on audio files using pure-Rust Silero VAD v5 with timestamp segmentation and `--json` export. |
+
+```sh
+# Run Voice Activity Detection on a WAV audio file
+cera vad --model models/silero_vad.gguf --audio test.wav --threshold 0.5 --json
+
+# Run directly from any Hugging Face model repository
+cera run --hf LiquidAI/LFM2.5-1.2B-Instruct-GGUF --quant Q4_0 --prompt "Hello"
+```
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`

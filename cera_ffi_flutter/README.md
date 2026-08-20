@@ -146,6 +146,24 @@ into text. For token-by-token output use `generateStreamingAsync` with a
 `Cera.generate`. Drive it from `Isolate.run`, or use `generateStreamingAsync`,
 or use `Cera` and skip the question.
 
+### Voice Modes & Speech Processing
+
+The Flutter package supports multimodal audio pipelines and 4 interactive voice modes:
+- **`SpeechToText`**: Microphone input streaming with automatic silence trimming and audio transcription.
+- **`VoiceChat`**: Full-duplex interleaved text and audio conversations.
+- **`TextToSpeech`**: Synthesizes speech outputs on device with streaming audio playback via `AudioPlayerService`.
+- **`TextOnly`**: Standard LLM text turn generation.
+
+```dart
+// Voice Activity Detection with Silero VAD v5 (re-exported from cera_ffi)
+final vad = FfiSileroVad.fromFile('/path/to/silero_vad.gguf');
+final iterator = FfiVadIterator(
+  rate: FfiVadSampleRate.rate16kHz,
+  config: sileroVadDefaultConfig(),
+);
+final event = iterator.processChunk(vad, audioFrame512);
+```
+
 ## Web
 
 Inference in a browser runs through WebGPU when the browser has it, and falls

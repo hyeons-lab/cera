@@ -16,7 +16,7 @@
 // release ships.
 
 group = 'com.hyeonslab.cera.ffi.flutter'
-version = '0.4.0'
+version = '0.5.0'
 
 buildscript {
     repositories {
@@ -72,5 +72,5 @@ dependencies {
     // are checksum-verified against a specific FFI surface at construction, so
     // a drifting native library would fail loudly at startup rather than
     // silently misbehave.
-    api 'com.hyeons-lab:cera-ffi-android:0.4.0'
+    api 'com.hyeons-lab:cera-ffi-android:0.5.0'
 }

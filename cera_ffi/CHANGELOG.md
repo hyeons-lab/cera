@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- **Native Silero VAD v5 engine and bindings**: Added `FfiSileroVad`, `FfiVadSampleRate`, `FfiVadIterator`, `FfiVadConfig`, and `sileroVadDefaultConfig` for real-time speech activity detection, streaming audio chunk processing, and speech segment timestamping.
+- **Hugging Face model repository support**: Direct loading from Hugging Face model repository specs and URLs with optional on-the-fly streaming quantization.
+- **Multimodal audio & vision enhancements**: WebGPU Depthformer acceleration, 4 voice modes (SpeechToText, VoiceChat, TextToSpeech, TextOnly), microphone audio input, silence trimming, and vision encoder ViT optimizations.
+
 ## 0.4.0
 
 First release. The Dart bindings previously lived inside the

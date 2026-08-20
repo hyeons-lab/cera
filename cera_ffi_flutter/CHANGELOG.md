@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- **Silero VAD v5 integration**: Re-exports native Silero VAD v5 classes (`FfiSileroVad`, `FfiVadSampleRate`, `FfiVadIterator`, `FfiVadConfig`, `sileroVadDefaultConfig`) for audio activity detection in Flutter apps.
+- **Modern MVI UI Architecture**: Complete architectural rewrite of the Flutter example application using Model-View-Intent pattern for predictable state transitions and lifecycle management.
+- **Voice Interaction Modes**: 4 dedicated interaction modes (`SpeechToText`, `VoiceChat`, `TextToSpeech`, and `TextOnly`) with capability-based mode switching, dynamic audio waveforms, and exclusive audio streaming playback via `AudioPlayerService`.
+- **Hugging Face Model Repositories**: Support for downloading and loading models directly from arbitrary Hugging Face repositories and URLs in addition to LeapBundles.
+- **WebGPU Depthformer Acceleration**: High-performance compute shaders for Depthformer audio decoder running seamlessly on WebGPU in web builds.
+
 ## 0.4.0
 
 First release to pub.dev. The package existed in-tree before this, but was

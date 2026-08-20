@@ -14,6 +14,10 @@ class AudioPlayerService extends ChangeNotifier {
   bool get isPlaying => _isPlaying;
   Object? get activeAudioSource => _activeAudioSource;
 
+  /// Whether real-time audio playback is supported on the active platform.
+  /// Web uses the Web Audio API; native platform players are planned.
+  bool get isSupported => kIsWeb;
+
   /// Whether a specific audio source (e.g. sample buffer) is currently playing.
   bool isSourcePlaying(Object? source) {
     if (!_isPlaying || _activeAudioSource == null || source == null) {
