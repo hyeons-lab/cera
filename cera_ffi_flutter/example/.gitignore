@@ -48,3 +48,4 @@ app.*.map.json
 # of the cera-wasm crate (~3 MB), fetched or copied per checkout like every other
 # platform's native library, never committed.
 /web/cera/
+/web/cera_mt/

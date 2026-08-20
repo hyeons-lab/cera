@@ -1,34 +1,28 @@
-// Example Flutter app for `cera_ffi_flutter`: pick a GGUF, chat with it, watch
-// tokens stream in.
+// Example Flutter app demonstrating `cera_ffi_flutter` across iOS, Android,
+// macOS, Linux, Windows, and the Web.
 //
-// One code path serves every platform, web included, because it is written
-// against `Cera`, the portable async API, rather than against the generated
-// bindings. That is the whole point of the type: the bindings are synchronous
-// and `dart:ffi`-based, and neither of those can exist in a browser, so an app
-// that wants to run everywhere cannot be written against them.
+// Demonstrates MVI (Model-View-Intent) architecture with clean model lifecycle
+// management (guaranteed engine unloading and resource cleanup on model switch).
 //
-// Note what is *absent* compared to a direct-bindings version: no
-// `dart:isolate`, no `dart:io`, no per-turn model reload. The blocking work
-// already happens off the Dart thread on both transports, so there is nothing
-// left for an isolate to fix.
-//
-// Running this on the web needs the wasm runtime installed once:
-//
-//   just wasm-web-wgpu
-//   cd cera_ffi_flutter/example
-//   dart run cera_ffi_flutter:install_web --from ../../cera-wasm/examples/webgpu/pkg
+// Running locally:
+//   flutter run -d macos
 //   flutter run -d chrome
 
-import 'dart:async';
-
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'benchmark.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'chat_controller.dart';
+import 'chat_intent.dart';
+import 'chat_state.dart';
 import 'model_source.dart';
+import 'widgets/bundle_picker_dialog.dart';
+import 'widgets/message_composer.dart';
+import 'widgets/message_list.dart';
+import 'widgets/tts_studio_view.dart';
 
 void main() => runApp(const CeraExampleApp());
 
@@ -37,24 +31,47 @@ class CeraExampleApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const bgDark = Color(0xFF0B0C0E);
+    const surfaceDark = Color(0xFF14161B);
+    const borderDark = Color(0xFF232732);
+    const textPrimary = Color(0xFFF1F5F9);
+    const textSecondary = Color(0xFF8E95A5);
+    const accentBlue = Color(0xFF3B82F6);
+
     return MaterialApp(
-      title: 'Cera Example',
-      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+      title: 'Cera',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: bgDark,
+        canvasColor: bgDark,
+        cardColor: surfaceDark,
+        dividerColor: borderDark,
+        colorScheme: const ColorScheme.dark(
+          primary: accentBlue,
+          surface: surfaceDark,
+          outline: borderDark,
+          outlineVariant: Color(0xFF1E222D),
+          onSurface: textPrimary,
+          onSurfaceVariant: textSecondary,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: surfaceDark,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          titleTextStyle: TextStyle(
+            color: textPrimary,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
       home: const ChatPage(),
     );
   }
 }
 
-/// One message in the transcript.
-class Turn {
-  Turn({required this.role, required this.text});
-
-  final String role;
-  String text;
-
-  bool get isUser => role == 'user';
-}
-
+/// Main chat interface built with MVI architecture.
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key});
 
@@ -63,139 +80,63 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
-  final _input = TextEditingController();
-  final _scroll = ScrollController();
-  final _turns = <Turn>[];
+  late final ChatController _controller = ChatController(
+    defaultStoreDir: _storeDir,
+  );
+  final TextEditingController _inputController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  bool _scrollPending = false;
 
-  /// The loaded model, kept alive across turns so the conversation shares one
-  /// KV cache and the weights are paid for once.
-  Cera? _cera;
-  StreamSubscription<String>? _generation;
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onStateChange);
+    // Restore the previously loaded model if one was saved
+    _controller.dispatch(const RestoreLastModelIntent());
+  }
 
-  /// Releases the `_send` that is waiting on the current turn. See its use.
-  void Function()? _finishTurn;
+  void _onStateChange() {
+    if (!mounted) return;
+    if (_controller.value.isGenerating) {
+      if (!_scrollController.hasClients) return;
+      final pos = _scrollController.position;
+      final distanceToBottom = pos.maxScrollExtent - pos.pixels;
+      // Only auto-scroll if the user is already near the bottom (within 120px)
+      if (distanceToBottom < 120) {
+        _scrollToBottom(isStreaming: true);
+      }
+    }
+  }
 
-  String _status = 'No model loaded';
-  bool _loading = false;
-
-  /// Download completion in `0.0..1.0` while a bundle is being fetched, or null
-  /// for "not downloading, or downloading something of unknown size". Both
-  /// nulls render the same way (no determinate bar), so they need not be
-  /// distinguished here.
-  double? _downloadFraction;
-
-  bool get _busy => _loading || _generation != null;
+  void _scrollToBottom({bool isStreaming = false}) {
+    if (_scrollPending) return;
+    _scrollPending = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollPending = false;
+      if (!mounted || !_scrollController.hasClients) return;
+      final target = _scrollController.position.maxScrollExtent;
+      if (isStreaming) {
+        _scrollController.jumpTo(target);
+      } else {
+        _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
 
   @override
   void dispose() {
-    unawaited(_generation?.cancel());
-    // Cancelling a subscription suppresses `onDone`, so without this the
-    // pending `_send` frame would hold this State, its transcript and the
-    // engine closure for the life of the app. Same reason `_stop` calls it.
-    _finishTurn?.call();
-    unawaited(_cera?.close());
-    _input.dispose();
-    _scroll.dispose();
+    _controller.removeListener(_onStateChange);
+    _controller.dispose();
+    _inputController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
-  /// Runs `open` as the app's one model-loading path, with the bookkeeping that
-  /// every loader needs: closing the previous model, the busy flag, the
-  /// dispose-during-load guard, and error reporting.
-  ///
-  /// Shared by the file picker and the bundle menu. They differ only in how
-  /// they produce a [Cera], and having each carry its own copy of this is how
-  /// the two quietly drift apart on which of these steps they remember.
-  Future<void> _load(String label, Future<Cera> Function() open) async {
-    // Guarded here, not only on the buttons that call it. Both entry points
-    // await a dialog first, and the file picker's is a browser-native dialog
-    // that does not disable the Flutter buttons behind it, so a second load can
-    // legitimately arrive while the first is still running. Two in flight would
-    // each open an engine and the last to finish would overwrite the other's
-    // without closing it, leaking a full set of model weights. That is the
-    // hazard `_pickBundle` reasons about below; keeping the invariant in the
-    // function that depends on it means a future caller cannot forget it.
-    //
-    // Says so rather than dropping the request silently: the user picked a file
-    // or a bundle and would otherwise see the status line still naming the
-    // first load, with no sign the second went nowhere.
-    if (_loading) {
-      setState(() => _status = 'Still loading; ignored $label');
-      return;
-    }
-    setState(() {
-      _loading = true;
-      _downloadFraction = null;
-      _status = 'Loading $label…';
-      _turns.clear();
-    });
-
-    try {
-      // Close any previous model first: two sets of weights will not fit
-      // alongside each other on a phone, and on the web they compete for one
-      // wasm heap. Inside the try, so a failure here cannot leave `_loading`
-      // stuck true and the whole UI disabled with nothing shown.
-      await _cera?.close();
-      _cera = null;
-      final cera = await open();
-      // Every setState here follows an await, so it needs the guard: loading a
-      // multi-hundred-megabyte model takes long enough for the page to be
-      // disposed underneath it.
-      if (!mounted) {
-        await cera.close();
-        return;
-      }
-      setState(() {
-        _cera = cera;
-        _status = '$label · ${cera.backend}';
-      });
-    } catch (err, stack) {
-      // Log as well as display: the status line truncates, and the full message
-      // is the only thing that says which step failed.
-      debugPrint('cera: model failed to load: $err\n$stack');
-      if (mounted) setState(() => _status = 'Failed to load: $err');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loading = false;
-          _downloadFraction = null;
-        });
-      }
-    }
-  }
-
-  Future<void> _pickModel() async {
-    final ModelSource? source;
-    try {
-      source = await pickModelSource(dialogTitle: 'Choose a .gguf model');
-    } catch (err) {
-      // The pick itself failing, whether the picker threw or the file it
-      // returned cannot be read. Nothing awaits this method, so without a catch
-      // the failure would leave the zone as an unhandled error and the user
-      // with no sign that anything happened.
-      if (mounted) setState(() => _status = 'Could not open a model: $err');
-      return;
-    }
-    if (source == null || !mounted) return;
-    // Rebound so the closures below see a non-nullable value: a local declared
-    // without an initializer does not promote inside one.
-    final model = source;
-
-    // Not `reusable`: this page opens the model once and keeps it, so paying
-    // for a second copy of the weights on the web would buy nothing.
-    await _load(model.name, () => model.open());
-  }
-
-  /// Where bundle downloads are cached.
-  ///
-  /// Only Android and iOS need an answer: an app there may write solely inside
-  /// its own container, which no environment variable names, so `openBundle`
-  /// refuses to guess rather than failing partway into a download. Desktop
-  /// falls through to the default, `$HOME/.cache/cera`, which is the CLI's own
-  /// cache, so a model pulled by `cera chat` is already here, and vice versa.
-  /// The web takes a single directory NAME inside the origin's private
-  /// filesystem rather than a path, so a native path would be rejected there;
-  /// null takes its default, which is what you want.
+  /// Supplies bundle cache directory for mobile platforms.
   Future<String?> _storeDir() async {
     if (kIsWeb) return null;
     final mobile =
@@ -205,353 +146,770 @@ class _ChatPageState extends State<ChatPage> {
     return (await getApplicationSupportDirectory()).path;
   }
 
-  /// Offers the published catalog, then downloads and opens what was chosen.
-  Future<void> _pickBundle() async {
-    final choice = await showDialog<_BundleChoice>(
+  /// Opens the bundle selector dialog and dispatches load intent.
+  Future<void> _pickBundle(ChatState state) async {
+    String? currentBundleName;
+    String? currentQuant;
+    final loaded = state.loadedModel;
+    if (loaded is BundleModelSource) {
+      currentBundleName = loaded.bundleName;
+      currentQuant = loaded.quant;
+    }
+
+    final choice = await showDialog<BundleChoice>(
       context: context,
-      builder: (_) => const _BundlePickerDialog(),
+      builder: (_) => BundlePickerDialog(
+        currentBundleName: currentBundleName,
+        currentQuant: currentQuant,
+      ),
     );
+
     if (choice == null || !mounted) return;
 
-    final label = '${choice.bundle.displayName} · ${choice.quant}';
-    await _load(
-      label,
-      // `_storeDir()` is awaited INSIDE the callback, not before `_load`. On
-      // mobile it is a real platform-channel round trip, and awaiting it out
-      // here would leave the buttons enabled (nothing sets `_loading` until
-      // `_load` runs) long enough to start a second load: both would see
-      // `_cera` still null, and whichever finished last would overwrite the
-      // other's engine without closing it, leaking the model weights.
-      () async => Cera.openBundle(
-        choice.bundle.name,
-        choice.quant,
-        storeDir: await _storeDir(),
-        onProgress: (progress) {
-          // Guarded before setState: progress keeps arriving for a moment after
-          // the page is disposed, since disposal does not cancel the download.
-          if (!mounted) return;
-          setState(() {
-            _downloadFraction = progress.fraction;
-            final pct = progress.fraction == null
-                ? '${(progress.bytesDownloaded / 1024 / 1024).toStringAsFixed(0)} MB'
-                : '${(progress.fraction! * 100).toStringAsFixed(0)}%';
-            _status = 'Downloading $label · $pct';
-          });
-        },
+    _controller.dispatch(
+      LoadBundleIntent(
+        bundleName: choice.bundleName,
+        quant: choice.quant,
+        displayName: choice.displayName,
+        storeDir: _storeDir,
       ),
     );
   }
 
-  Future<void> _send() async {
-    final prompt = _input.text.trim();
-    final cera = _cera;
-    if (prompt.isEmpty || cera == null || _busy) return;
-
-    _input.clear();
-    setState(() {
-      _turns.add(Turn(role: 'user', text: prompt));
-      _turns.add(Turn(role: 'assistant', text: ''));
-    });
-    _scrollToBottom();
-
-    // Render the turn through the model's chat template so it answers rather
-    // than continuing the transcript. A GGUF without one throws, and a raw
-    // prompt is the honest fallback there. A closed engine throws here too, so
-    // report that rather than pressing on into a generate that cannot work.
-    String framed;
+  /// Opens a local .gguf file from device storage.
+  Future<void> _pickLocalModel() async {
     try {
-      framed = await cera.applyChatTemplate([CeraMessage.user(prompt)]);
-    } on StateError catch (err) {
-      if (mounted) setState(() => _turns.last.text = 'Error: $err');
-      return;
-    } catch (_) {
-      framed = prompt;
-    }
-    if (!mounted) return;
-
-    // Completed from the stream's terminal callbacks AND from `_stop`.
-    // Cancelling a subscription suppresses `onDone`, so a Stop press would
-    // otherwise leave the `await` below pending for the life of the app.
-    final done = Completer<void>();
-    _finishTurn = () {
-      if (!done.isCompleted) done.complete();
-    };
-    final sub = cera
-        .generate(framed, maxTokens: 256)
-        .listen(
-          (piece) {
-            setState(() => _turns.last.text += piece);
-            _scrollToBottom();
-          },
-          onError: (Object err) {
-            setState(() => _turns.last.text = 'Error: $err');
-            if (!done.isCompleted) done.complete();
-          },
-          onDone: () {
-            if (!done.isCompleted) done.complete();
-          },
-          cancelOnError: true,
+      final source = await pickModelSource(dialogTitle: 'Choose a .gguf model');
+      if (source != null && mounted) {
+        _controller.dispatch(LoadLocalModelIntent(source));
+      }
+    } catch (err) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not open local model: $err')),
         );
-    if (!mounted) {
-      await sub.cancel();
-      return;
+      }
     }
-    setState(() => _generation = sub);
-
-    await done.future;
-    _finishTurn = null;
-    await sub.cancel();
-    if (mounted) setState(() => _generation = null);
   }
 
-  void _stop() {
-    // Cancel the SUBSCRIPTION, not the engine. `Cera.cancel` is best-effort and
-    // reaches neither web backend's running decode, whereas dropping the
-    // subscription stops delivery immediately on every platform, which is what
-    // a Stop button owes the user. The stream's own onCancel still asks the
-    // engine to stop where it can.
-    //
-    // Deliberately not awaited: on the web's CPU backend that future waits on a
-    // worker reply the worker cannot dequeue until its synchronous decode
-    // finishes, so awaiting it would leave the Stop button and the disabled
-    // input up for the rest of a decode the user just stopped.
-    unawaited(_generation?.cancel());
-    _finishTurn?.call();
-    setState(() => _generation = null);
+  /// Attaches an image file for vision chat inference.
+  Future<void> _pickImage() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        withData: true,
+        dialogTitle: 'Select an image to attach',
+      );
+      final file = result?.files.single;
+      if (file == null || !mounted) return;
+
+      final bytes = file.bytes;
+      if (bytes == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not read image file bytes')),
+          );
+        }
+        return;
+      }
+
+      _controller.dispatch(AttachImageIntent(bytes: bytes, name: file.name));
+    } catch (err) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Could not attach image: $err')));
+      }
+    }
   }
 
-  void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _scroll.jumpTo(_scroll.position.maxScrollExtent);
-    });
+  void _sendMessage() {
+    final prompt = _inputController.text.trim();
+    if (prompt.isEmpty && _controller.value.pendingImageBytes == null) return;
+    _inputController.clear();
+    _scrollToBottom();
+    _controller.dispatch(SendMessageIntent(prompt));
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Cera'),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(24),
-          child: Padding(
-            padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                _status,
-                style: Theme.of(context).textTheme.bodySmall,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ),
-        ),
-        actions: [
-          IconButton(
-            // Disabled while this page is busy. Not because the benchmark
-            // shares state with it (it opens its own engines from its own
-            // pick), but because a second set of weights loading alongside a
-            // generation in flight is how a browser tab runs out of memory.
-            // An idle chat model stays resident either way; this rules out the
-            // concurrent case, not coexistence.
-            onPressed: _busy
-                ? null
-                : () => Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => const BenchmarkPage(),
-                    ),
-                  ),
-            icon: const Icon(Icons.speed),
-            tooltip: 'Benchmark CPU vs GPU',
-          ),
-          IconButton(
-            onPressed: _busy ? null : _pickBundle,
-            icon: const Icon(Icons.cloud_download_outlined),
-            tooltip: 'Download a published model',
-          ),
-          IconButton(
-            onPressed: _busy ? null : _pickModel,
-            icon: const Icon(Icons.folder_open),
-            tooltip: 'Open a .gguf model',
-          ),
-        ],
+  void _showSettingsSheet(ChatState state) {
+    final theme = Theme.of(context);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: theme.colorScheme.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
-      body: Column(
-        children: [
-          // Up for any load, not only a download: `_downloadFraction` is null
-          // for a local file open and for a server that sent no length, and
-          // `value: null` is an indeterminate bar, which is the honest
-          // rendering of both.
-          if (_loading) LinearProgressIndicator(value: _downloadFraction),
-          Expanded(
-            child: _turns.isEmpty
-                ? const Center(
-                    child: Text(
-                      'Download a published model, or open a .gguf, to start.',
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _turns.length,
-                    itemBuilder: (context, i) => _Bubble(turn: _turns[i]),
-                  ),
-          ),
-          const Divider(height: 1),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _input,
-                    enabled: _cera != null && !_busy,
-                    onSubmitted: (_) => _send(),
-                    decoration: const InputDecoration(
-                      hintText: 'Ask something…',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
+      builder: (context) {
+        return ListenableBuilder(
+          listenable: _controller,
+          builder: (context, _) {
+            final currentState = _controller.value;
+            final currentSettings = currentState.settings;
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  vertical: 12,
+                  horizontal: 16,
                 ),
-                const SizedBox(width: 8),
-                if (_generation != null)
-                  IconButton.filled(
-                    onPressed: _stop,
-                    icon: const Icon(Icons.stop),
-                    tooltip: 'Stop generating',
-                  )
-                else
-                  IconButton.filled(
-                    onPressed: _cera != null && !_busy ? _send : null,
-                    icon: _loading
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.send),
-                  ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// A bundle and one of its quantizations, chosen from the catalog.
-class _BundleChoice {
-  const _BundleChoice(this.bundle, this.quant);
-
-  /// The catalog entry. Carried whole rather than as a bare id so the display
-  /// name comes from `CeraBundle.displayName` instead of being trimmed again
-  /// here.
-  final CeraBundle bundle;
-
-  final String quant;
-}
-
-/// Lists the published bundles and pops with the chosen `<name>, <quant>`.
-class _BundlePickerDialog extends StatefulWidget {
-  const _BundlePickerDialog();
-
-  @override
-  State<_BundlePickerDialog> createState() => _BundlePickerDialogState();
-}
-
-class _BundlePickerDialogState extends State<_BundlePickerDialog> {
-  // Held as a Future and given to a FutureBuilder rather than resolved into
-  // state, so the request is issued exactly once: initState runs once, whereas
-  // build runs on every expansion tile toggle.
-  late final Future<List<CeraBundle>> _bundles = Cera.listBundles();
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Published models'),
-      content: SizedBox(
-        width: 420,
-        height: 460,
-        child: FutureBuilder<List<CeraBundle>>(
-          future: _bundles,
-          builder: (context, snapshot) {
-            if (snapshot.hasError) {
-              // The catalog is one request with a 30 second deadline and no
-              // retry, so the useful thing to show is the reason plus a way to
-              // give up; a spinner that never ends would be worse.
-              return Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    'Could not reach the catalog:\n${snapshot.error}',
-                  ),
-                ),
-              );
-            }
-            final bundles = snapshot.data;
-            if (bundles == null) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            return ListView.builder(
-              itemCount: bundles.length,
-              itemBuilder: (context, i) {
-                final bundle = bundles[i];
-                final n = bundle.quants.length;
-                return ExpansionTile(
-                  // Without a key the expanded state is not preserved across
-                  // ListView recycling, so expanding a tile and scrolling away
-                  // collapses it: only about six of the ~29 entries fit.
-                  key: PageStorageKey(bundle.name),
-                  title: Text(bundle.displayName),
-                  subtitle: Text('$n quantization${n == 1 ? "" : "s"}'),
-                  children: [
-                    for (final quant in bundle.quants)
-                      ListTile(
-                        dense: true,
-                        title: Text(quant),
-                        onTap: () => Navigator.of(
-                          context,
-                        ).pop(_BundleChoice(bundle, quant)),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 36,
+                          height: 4,
+                          margin: const EdgeInsets.only(bottom: 16),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.outlineVariant,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
                       ),
-                  ],
-                );
-              },
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.settings_outlined,
+                            size: 20,
+                            color: theme.colorScheme.primary,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Settings & Models',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'MODELS',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.cloud_download_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                        title: const Text('Downloaded & Catalog Models'),
+                        subtitle: const Text(
+                          'Switch between cached models or download new ones',
+                        ),
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          _pickBundle(_controller.value);
+                        },
+                      ),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.folder_open_outlined,
+                          color: theme.colorScheme.primary,
+                        ),
+                        title: const Text('Open Local .gguf File...'),
+                        subtitle: const Text(
+                          'Pick a model file from disk storage',
+                        ),
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          _pickLocalModel();
+                        },
+                      ),
+                      if (currentState.hasModel) ...[
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(
+                            Icons.eject_outlined,
+                            color: theme.colorScheme.error,
+                          ),
+                          title: Text(
+                            'Unload Active Model',
+                            style: TextStyle(color: theme.colorScheme.error),
+                          ),
+                          subtitle: const Text(
+                            'Release memory and close model engine',
+                          ),
+                          onTap: () {
+                            Navigator.of(context).pop();
+                            _controller.dispatch(const UnloadModelIntent());
+                          },
+                        ),
+                      ],
+                      Divider(color: theme.dividerColor, height: 24),
+                      Text(
+                        'INFERENCE & OPTIMIZATION',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Compute Backend'),
+                        subtitle: Text(
+                          'Choose between Auto (WebGPU / Metal), GPU only, or CPU backend (WASM / Single-core).',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<CeraBackend>(
+                          value: currentSettings.backend,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: CeraBackend.auto,
+                              child: Text('Auto (GPU / Fallback)'),
+                            ),
+                            DropdownMenuItem(
+                              value: CeraBackend.gpu,
+                              child: Text('GPU (WebGPU / Metal)'),
+                            ),
+                            DropdownMenuItem(
+                              value: CeraBackend.cpu,
+                              child: Text('CPU (WASM / CPU)'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            if (val == null) return;
+                            _controller.dispatch(
+                              UpdateSettingsIntent(backend: val),
+                            );
+                          },
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('TurboQuant KV Compression'),
+                        subtitle: Text(
+                          'Compresses KV cache to 3-bit keys / 2-bit values for lower memory footprint and faster multi-turn attention. (Default: Off)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        value: currentSettings.turboQuant,
+                        onChanged: (val) {
+                          _controller.dispatch(
+                            UpdateSettingsIntent(turboQuant: val),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Vision Max Image Dimension'),
+                        subtitle: Text(
+                          'Caps the long side of input images before ViT patch encoding to minimize prompt latency.',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<int?>(
+                          value: currentSettings.maxImageLongSize,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 256,
+                              child: Text('256 px (Fast)'),
+                            ),
+                            DropdownMenuItem(
+                              value: 512,
+                              child: Text('512 px (HD)'),
+                            ),
+                            DropdownMenuItem(
+                              value: null,
+                              child: Text('Native / Off'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            _controller.dispatch(
+                              UpdateSettingsIntent(
+                                maxImageLongSize: val,
+                                clearMaxImageLongSize: val == null,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Voice Mode'),
+                        subtitle: Text(
+                          'Select how audio-capable models interact with speech (Speech to Text ASR, Interleaved Voice Chat, Text to Speech TTS, or Text Only).',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<AudioChatMode>(
+                          value: currentSettings.audioChatMode,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: const [
+                            DropdownMenuItem(
+                              value: AudioChatMode.speechToText,
+                              child: Text('Speech to Text (ASR)'),
+                            ),
+                            DropdownMenuItem(
+                              value: AudioChatMode.interleaved,
+                              child: Text('Voice Chat (Interleaved)'),
+                            ),
+                            DropdownMenuItem(
+                              value: AudioChatMode.textToSpeech,
+                              child: Text('Text to Speech (TTS)'),
+                            ),
+                            DropdownMenuItem(
+                              value: AudioChatMode.textOnly,
+                              child: Text('Text Only (No Audio)'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            if (val == null) return;
+                            _controller.dispatch(
+                              UpdateSettingsIntent(audioChatMode: val),
+                            );
+                          },
+                        ),
+                      ),
+                      if (currentSettings.audioChatMode ==
+                              AudioChatMode.interleaved ||
+                          currentSettings.audioChatMode ==
+                              AudioChatMode.textToSpeech) ...[
+                        const SizedBox(height: 8),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Voice Persona'),
+                          subtitle: Text(
+                            'Select speaker timbre and accent for synthesized speech responses.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          trailing: DropdownButton<String?>(
+                            value: currentSettings.chatVoice,
+                            dropdownColor: theme.colorScheme.surface,
+                            underline: const SizedBox.shrink(),
+                            items: const [
+                              DropdownMenuItem(
+                                value: null,
+                                child: Text('Default Voice'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the US female voice.',
+                                child: Text('👩 US Female'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the US male voice.',
+                                child: Text('👨 US Male'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the UK female voice.',
+                                child: Text('👩 UK Female'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'Use the UK male voice.',
+                                child: Text('👨 UK Male'),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              _controller.dispatch(
+                                UpdateSettingsIntent(
+                                  chatVoice: val,
+                                  clearChatVoice: val == null,
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                      if (currentState.hasModel) ...[
+                        Divider(color: theme.dividerColor, height: 24),
+                        Text(
+                          'BACKEND & DEVICE',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.8,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.outlineVariant.withValues(
+                              alpha: 0.25,
+                            ),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.developer_board_rounded,
+                                size: 24,
+                                color: theme.colorScheme.primary,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      currentState.backend ?? 'Unknown Backend',
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'Active model: ${currentState.loadedModel?.name ?? ""}',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                    ],
+                  ),
+                ),
+              ),
             );
           },
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-      ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ValueListenableBuilder<ChatState>(
+      valueListenable: _controller,
+      builder: (context, state, _) {
+        return Scaffold(
+          appBar: AppBar(
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Cera'),
+                const SizedBox(height: 2),
+                Text(
+                  state.status,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.normal,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+            bottom: PreferredSize(
+              preferredSize: const Size.fromHeight(3),
+              child: state.isLoading
+                  ? LinearProgressIndicator(
+                      value: state.downloadFraction,
+                      minHeight: 3,
+                      backgroundColor: theme.colorScheme.outlineVariant,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        theme.colorScheme.primary,
+                      ),
+                    )
+                  : Container(
+                      color: theme.colorScheme.outlineVariant,
+                      height: 1,
+                    ),
+            ),
+            actions: [
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: SegmentedButton<AppUIMode>(
+                  style: SegmentedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    side: BorderSide(color: theme.colorScheme.outlineVariant),
+                    selectedBackgroundColor: theme.colorScheme.primary
+                        .withValues(alpha: 0.16),
+                    selectedForegroundColor: theme.colorScheme.primary,
+                  ),
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment<AppUIMode>(
+                      value: AppUIMode.chat,
+                      label: Text('Chat', style: TextStyle(fontSize: 11.5)),
+                      icon: Icon(Icons.chat_outlined, size: 14),
+                    ),
+                    ButtonSegment<AppUIMode>(
+                      value: AppUIMode.ttsStudio,
+                      label: Text(
+                        'TTS Studio',
+                        style: TextStyle(fontSize: 11.5),
+                      ),
+                      icon: Icon(Icons.record_voice_over_outlined, size: 14),
+                    ),
+                  ],
+                  selected: {state.uiMode},
+                  onSelectionChanged: (selection) {
+                    _controller.dispatch(SetUIModeIntent(selection.first));
+                  },
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.delete_sweep_rounded),
+                tooltip: 'Clear transcript',
+                onPressed: state.turns.isEmpty
+                    ? null
+                    : () => _controller.dispatch(const ClearTranscriptIntent()),
+              ),
+              IconButton(
+                icon: const Icon(Icons.settings_outlined),
+                tooltip: 'Settings & Models',
+                onPressed: () => _showSettingsSheet(state),
+              ),
+            ],
+          ),
+          body: state.uiMode == AppUIMode.ttsStudio
+              ? TtsStudioView(
+                  state: state,
+                  controller: _controller,
+                  onOpenCatalog: () => _pickBundle(state),
+                )
+              : Column(
+                  children: [
+                    Expanded(
+                      child: MessageList(
+                        turns: state.turns,
+                        scrollController: _scrollController,
+                        audioPlayer: _controller.audioPlayer,
+                      ),
+                    ),
+                    if (state.hasModel &&
+                        ((state.capabilities?.audioIn ?? false) ||
+                            (state.capabilities?.audioOut ?? false)))
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.surface,
+                          border: Border(
+                            top: BorderSide(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                            bottom: BorderSide(
+                              color: theme.colorScheme.outlineVariant,
+                            ),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              Icons.graphic_eq_rounded,
+                              size: 15,
+                              color: theme.colorScheme.primary,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Voice Mode:',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                child: Row(
+                                  children: [
+                                    _AudioModeChip(
+                                      label: 'Speech to Text (ASR)',
+                                      icon: Icons.transcribe_rounded,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.speechToText,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.speechToText,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _AudioModeChip(
+                                      label: 'Voice Chat',
+                                      icon: Icons.record_voice_over_outlined,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.interleaved,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.interleaved,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _AudioModeChip(
+                                      label: 'Text to Speech (TTS)',
+                                      icon: Icons.volume_up_outlined,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.textToSpeech,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode:
+                                              AudioChatMode.textToSpeech,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _AudioModeChip(
+                                      label: 'Text Only',
+                                      icon: Icons.chat_bubble_outline_rounded,
+                                      isSelected:
+                                          state.settings.audioChatMode ==
+                                          AudioChatMode.textOnly,
+                                      onTap: () => _controller.dispatch(
+                                        const UpdateSettingsIntent(
+                                          audioChatMode: AudioChatMode.textOnly,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    MessageComposer(
+                      controller: _inputController,
+                      isBusy: state.isBusy,
+                      isGenerating: state.isGenerating,
+                      canAttachImage: state.canAttachImage,
+                      canAttachAudio: state.canAttachAudio,
+                      pendingImageBytes: state.pendingImageBytes,
+                      pendingImageName: state.pendingImageName,
+                      onSend: _sendMessage,
+                      onStop: () =>
+                          _controller.dispatch(const StopGenerationIntent()),
+                      onPickImage: _pickImage,
+                      onClearImage: () => _controller.dispatch(
+                        const ClearAttachedImageIntent(),
+                      ),
+                      onSendAudio: (pcm, sampleRate) {
+                        final text = _inputController.text.trim();
+                        _inputController.clear();
+                        _controller.dispatch(
+                          SendAudioPromptIntent(
+                            pcmSamples: pcm,
+                            sampleRate: sampleRate,
+                            prompt: text,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+        );
+      },
     );
   }
 }
 
-class _Bubble extends StatelessWidget {
-  const _Bubble({required this.turn});
+class _AudioModeChip extends StatelessWidget {
+  const _AudioModeChip({
+    required this.label,
+    required this.icon,
+    required this.isSelected,
+    required this.onTap,
+  });
 
-  final Turn turn;
+  final String label;
+  final IconData icon;
+  final bool isSelected;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: turn.isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: const BoxConstraints(maxWidth: 520),
+    final theme = Theme.of(context);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         decoration: BoxDecoration(
-          color: turn.isUser
-              ? scheme.primaryContainer
-              : scheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(14),
+          color: isSelected
+              ? theme.colorScheme.primary.withValues(alpha: 0.16)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isSelected
+                ? theme.colorScheme.primary.withValues(alpha: 0.4)
+                : theme.colorScheme.outlineVariant,
+          ),
         ),
-        child: Text(turn.text.isEmpty ? '…' : turn.text),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 13,
+              color: isSelected
+                  ? theme.colorScheme.primary
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                color: isSelected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

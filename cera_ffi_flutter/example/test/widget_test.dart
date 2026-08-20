@@ -4,11 +4,19 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
+import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
+import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
+import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
   testWidgets('renders the empty state before a model is picked', (
     WidgetTester tester,
   ) async {
@@ -21,24 +29,93 @@ void main() {
     );
   });
 
-  // The benchmark page is reachable only through the app-bar icon, so a broken
-  // route or a rename of that icon would strand it with nothing failing. Like
-  // the test above this loads no model: it asserts the page builds and reaches
-  // its own empty state, which is where a widget-tree regression would show.
-  testWidgets('the speed icon opens the benchmark page', (
+  testWidgets('vision and audio buttons are hidden before a model is loaded', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const CeraExampleApp());
 
-    await tester.tap(find.byIcon(Icons.speed));
-    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.add_photo_alternate_outlined), findsNothing);
+    expect(find.byIcon(Icons.mic_none_rounded), findsNothing);
+  });
 
-    expect(find.text('CPU vs GPU'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, 'Run'), findsOneWidget);
-    // Nothing is loaded, so Run must be inert.
-    final run = tester.widget<FilledButton>(
-      find.widgetWithText(FilledButton, 'Run'),
+  testWidgets(
+    'message list displays the specific model name badge for each assistant response',
+    (WidgetTester tester) async {
+      final turns = [
+        Turn(role: 'user', text: 'Hello model 1'),
+        Turn(
+          role: 'assistant',
+          text: 'Response from model 1',
+          modelName: 'LFM2-700M · Q4_0',
+          stats: const TurnStats(
+            tokens: 15,
+            totalMs: 300,
+            ttftMs: 50,
+            tps: 50.0,
+          ),
+        ),
+        Turn(role: 'user', text: 'Hello model 2'),
+        Turn(
+          role: 'assistant',
+          text: 'Response from model 2',
+          modelName: 'Gemma-2-2B · Q4_K_M',
+          stats: const TurnStats(
+            tokens: 20,
+            totalMs: 400,
+            ttftMs: 40,
+            tps: 55.0,
+          ),
+        ),
+      ];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageList(
+              turns: turns,
+              scrollController: ScrollController(),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Response from model 1'), findsOneWidget);
+      expect(find.text('LFM2-700M · Q4_0'), findsOneWidget);
+
+      expect(find.text('Response from model 2'), findsOneWidget);
+      expect(find.text('Gemma-2-2B · Q4_K_M'), findsOneWidget);
+    },
+  );
+
+  testWidgets('message list displays voice note badge for audio prompt turns', (
+    WidgetTester tester,
+  ) async {
+    final turns = [
+      Turn(
+        role: 'user',
+        text: 'What is the weather?',
+        audioDurationSeconds: 3.5,
+      ),
+      Turn(
+        role: 'assistant',
+        text: 'It is sunny today.',
+        modelName: 'LFM2.5-Audio-1.5B · Q4_0',
+        stats: const TurnStats(tokens: 10, totalMs: 200, ttftMs: 30, tps: 50.0),
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MessageList(turns: turns, scrollController: ScrollController()),
+        ),
+      ),
     );
-    expect(run.onPressed, isNull);
+
+    expect(find.byType(AudioWaveformBubble), findsOneWidget);
+    expect(find.text('3.5s'), findsOneWidget);
+    expect(find.text('What is the weather?'), findsOneWidget);
+    expect(find.text('It is sunny today.'), findsOneWidget);
+    expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);
   });
 }

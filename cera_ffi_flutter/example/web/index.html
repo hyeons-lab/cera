@@ -29,18 +29,226 @@
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>cera_ffi_flutter_example</title>
+  <title>Cera</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    body {
+      background-color: #0b0c0e;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
+  <script>
+    window.ceraDecodeAudioBlob = async function(blobUrl, targetSr) {
+      try {
+        const res = await fetch(blobUrl);
+        const buf = await res.arrayBuffer();
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioCtx({ sampleRate: targetSr || 16000 });
+        try {
+          if (ctx.state === 'suspended') {
+            await ctx.resume();
+          }
+          const decoded = await ctx.decodeAudioData(buf);
+          const chan = decoded.getChannelData(0);
+          return new Float32Array(chan);
+        } finally {
+          if (ctx.state !== 'closed') ctx.close();
+        }
+      } catch (err) {
+        console.error('[cera:audio] decodeAudioData failed:', err);
+        throw err;
+      }
+    };
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
+    let activeAudioSource = null;
+    let activeAudioCtx = null;
+    let activeStreamer = null;
+
+    class CeraAudioStreamer {
+      constructor(sampleRate = 24000) {
+        this.sampleRate = sampleRate;
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AudioCtx({ sampleRate: this.sampleRate });
+        this.nextStartTime = this.ctx.currentTime;
+        this.isPlaying = true;
+        console.info(`[cera:audio] live streamer session started at ${sampleRate}Hz`);
+      }
+
+      appendChunk(raw) {
+        if (!this.isPlaying || !raw) return;
+        const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+        if (data.length === 0) return;
+        if (this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+        const buf = this.ctx.createBuffer(1, data.length, this.sampleRate);
+        buf.copyToChannel(data, 0);
+        const src = this.ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(this.ctx.destination);
+        const cur = this.ctx.currentTime;
+        const startTime = Math.max(cur + 0.005, this.nextStartTime);
+        src.start(startTime);
+        this.nextStartTime = startTime + buf.duration;
+      }
+
+      finish() {
+        console.info('[cera:html] streamer finish called');
+      }
+
+      stop() {
+        console.info('[cera:html] streamer stop called');
+        this.isPlaying = false;
+        if (this.ctx && this.ctx.state !== 'closed') {
+          try { this.ctx.close(); } catch (_) {}
+        }
+      }
+    }
+
+    window.ceraStartAudioStream = function(sampleRate) {
+      window.ceraStopAudioStream();
+      activeStreamer = new CeraAudioStreamer(sampleRate || 24000);
+    };
+
+    window.ceraAppendAudioStreamChunk = function(chunk) {
+      if (activeStreamer) {
+        activeStreamer.appendChunk(chunk);
+      }
+    };
+
+    window.ceraFinishAudioStream = function() {
+      if (activeStreamer) {
+        activeStreamer.finish();
+      }
+    };
+
+    window.ceraStopAudioStream = function() {
+      if (activeStreamer) {
+        activeStreamer.stop();
+        activeStreamer = null;
+      }
+    };
+
+    window.ceraProbeBundleFiles = async function(bundleName, quant) {
+      try {
+        const manifestUrl = `https://huggingface.co/LiquidAI/LeapBundles/raw/main/${bundleName}/${quant}.json`;
+        const manifestRes = await fetch(manifestUrl);
+        if (!manifestRes.ok) return '{}';
+        const manifest = await manifestRes.json();
+        const loadTime = manifest.load_time_parameters || {};
+        const urls = [];
+        for (const key of ['model', 'multimodal_projector', 'audio_decoder', 'audio_tokenizer']) {
+          const val = loadTime[key];
+          if (val && typeof val === 'string' && val.trim().length > 0) {
+            const trimmed = val.trim();
+            const resolved = trimmed.startsWith('http') ? trimmed : new URL(trimmed, manifestUrl).href;
+            urls.push(resolved);
+          }
+        }
+        const sizes = {};
+        await Promise.all(
+          urls.map(async (url) => {
+            try {
+              const res = await fetch(url, { method: 'HEAD' });
+              const cl = res.headers.get('content-length');
+              if (cl) {
+                const len = parseInt(cl, 10);
+                if (len > 0) {
+                  sizes[url] = len;
+                  const parts = url.split('/');
+                  const fileName = parts[parts.length - 1];
+                  sizes[fileName] = len;
+                }
+              }
+            } catch (_) {}
+          })
+        );
+        return JSON.stringify(sizes);
+      } catch (err) {
+        return '{}';
+      }
+    };
+
+    window.ceraPlayAudio = async function(raw, sampleRate) {
+      window.ceraStopAudio();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const sr = sampleRate || 24000;
+      const ctx = new AudioCtx({ sampleRate: sr });
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+      activeAudioCtx = ctx;
+      const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+      console.info(
+        `[cera:html] ceraPlayAudio called with ${data.length} samples at ${sr}Hz, ctx.state=${ctx.state}`,
+      );
+      const buffer = ctx.createBuffer(1, data.length, sr);
+      buffer.copyToChannel(data, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      activeAudioSource = source;
+      return new Promise((resolve) => {
+        source.onended = () => {
+          console.info('[cera:html] ceraPlayAudio onended fired');
+          if (activeAudioSource === source) {
+            activeAudioSource = null;
+          }
+          if (ctx.state !== 'closed') {
+            ctx.close().catch(() => {});
+          }
+          resolve();
+        };
+        source.start(0);
+      });
+    };
+
+    window.ceraStopAudio = function() {
+      if (activeAudioSource) {
+        try { activeAudioSource.stop(); } catch (_) {}
+        activeAudioSource = null;
+      }
+      if (activeAudioCtx) {
+        try { if (activeAudioCtx.state !== 'closed') activeAudioCtx.close(); } catch (_) {}
+        activeAudioCtx = null;
+      }
+      if (activeStreamer) {
+        activeStreamer.stop();
+        activeStreamer = null;
+      }
+    };
+
+    window.ceraDownloadFile = function(bytes, filename, mimeType) {
+      try {
+        const data = (typeof Uint8Array !== 'undefined' && bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
+        const blob = new Blob([data], { type: mimeType || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || 'cera_download';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      } catch (err) {
+        console.error('[cera:html] ceraDownloadFile failed:', err);
+      }
+    };
+
+    globalThis.ceraDecodeAudioBlob = window.ceraDecodeAudioBlob;
+    globalThis.ceraPlayAudio = window.ceraPlayAudio;
+    globalThis.ceraStopAudio = window.ceraStopAudio;
+    globalThis.ceraStartAudioStream = window.ceraStartAudioStream;
+    globalThis.ceraAppendAudioStreamChunk = window.ceraAppendAudioStreamChunk;
+    globalThis.ceraFinishAudioStream = window.ceraFinishAudioStream;
+    globalThis.ceraStopAudioStream = window.ceraStopAudioStream;
+    globalThis.ceraDownloadFile = window.ceraDownloadFile;
+    globalThis.ceraProbeBundleFiles = window.ceraProbeBundleFiles;
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
