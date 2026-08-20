@@ -116,7 +116,7 @@ impl BundleRepo {
         let head_client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("build no-redirect reqwest client");
+            .unwrap_or_else(|_| Client::new());
         Self {
             store_dir: store_dir.into(),
             http_client: Client::new(),
@@ -142,6 +142,11 @@ impl BundleRepo {
     /// Root directory backing this repo.
     pub fn store_dir(&self) -> &Path {
         &self.store_dir
+    }
+
+    /// Progress callback attached to this repo, if any.
+    pub fn progress(&self) -> Option<Arc<dyn DownloadProgress>> {
+        self.progress.clone()
     }
 
     /// Total bytes currently held in the cache. Recursively sums file

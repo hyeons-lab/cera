@@ -29,6 +29,7 @@ pub fn build_info() -> String {
 pub mod audio_engine;
 pub mod backend;
 pub mod bundle;
+pub mod convert;
 pub mod engine;
 /// Auto-generated FlatBuffers code for KV cache serialization.
 /// Regenerate with: `flatc --rust -o src/generated schema/kv_cache.fbs`

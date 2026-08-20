@@ -15,14 +15,24 @@
 //! that shares the addressing above. See `cera-wasm`'s bundle module.
 
 pub mod cache_key;
+pub mod hf;
 
 pub use cache_key::{LeapBundleEntry, leap_bundles_manifest_url};
+pub use hf::{
+    GgufFileEntry, HfModelInfo, HfRepoContents, HfSibling, HfSpec, classify_repo_siblings,
+    default_cache_dir, extract_quant_from_filename, resolve_hf_manifest,
+};
 
 #[cfg(feature = "remote")]
 pub(crate) mod download;
 
 #[cfg(feature = "remote")]
 mod repo;
+
+#[cfg(feature = "remote")]
+pub use hf::{
+    fetch_generation_defaults, fetch_model_info, get_hf_auth_token, inspect_and_resolve_manifest,
+};
 
 #[cfg(feature = "remote")]
 pub use repo::{BundleRepo, DownloadProgress, list_leap_bundles};
