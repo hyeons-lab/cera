@@ -204,14 +204,19 @@ enum Command {
     Run {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
-        /// manifest. Mutually exclusive with `--bundle-id` /
-        /// `--quant`; one of the two source forms must be set.
+        /// manifest. Mutually exclusive with `--bundle-id` / `--hf`.
         #[arg(
             short,
             long,
-            conflicts_with_all = ["bundle_id", "quant"],
+            conflicts_with_all = ["bundle_id", "hf"],
         )]
         model: Option<String>,
+
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        /// Pairs optionally with `--quant`.
+        #[arg(long, group = "remote_source", conflicts_with_all = ["model", "bundle_id"])]
+        hf: Option<String>,
 
         /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
         /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
@@ -220,14 +225,23 @@ enum Command {
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
         /// `--cache-dir` (default `$HOME/.cache/cera`). Use
         /// `cera list-bundles` to discover available IDs.
-        #[arg(long, requires = "quant")]
+        #[arg(
+            long,
+            group = "remote_source",
+            requires = "quant",
+            conflicts_with = "hf"
+        )]
         bundle_id: Option<String>,
 
-        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
-        /// `Q8_0`). Pairs with `--bundle-id`: clap rejects
-        /// either flag without the other.
-        #[arg(long, requires = "bundle_id")]
+        /// Quantization label (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        /// Required when `--bundle-id` is set; optional for `--hf`.
+        #[arg(long, requires = "remote_source")]
         quant: Option<String>,
+
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        /// Used when quantizing remote SafeTensors models on the fly.
+        #[arg(long, requires = "remote_source")]
+        quant_strategy: Option<String>,
 
         /// The prompt to generate from. Required for text mode; optional
         /// when `--audio-in` is set (in which case it becomes a leading
@@ -454,14 +468,19 @@ enum Command {
     Chat {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
-        /// manifest. Mutually exclusive with `--bundle-id` /
-        /// `--quant`; one of the two source forms must be set.
+        /// manifest. Mutually exclusive with `--bundle-id` / `--hf`.
         #[arg(
             short,
             long,
-            conflicts_with_all = ["bundle_id", "quant"],
+            conflicts_with_all = ["bundle_id", "hf"],
         )]
         model: Option<String>,
+
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        /// Pairs optionally with `--quant`.
+        #[arg(long, group = "remote_source", conflicts_with_all = ["model", "bundle_id"])]
+        hf: Option<String>,
 
         /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
         /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
@@ -470,13 +489,23 @@ enum Command {
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
         /// `--cache-dir` (default `$HOME/.cache/cera`). Use
         /// `cera list-bundles` to discover available IDs.
-        #[arg(long, requires = "quant")]
+        #[arg(
+            long,
+            group = "remote_source",
+            requires = "quant",
+            conflicts_with = "hf"
+        )]
         bundle_id: Option<String>,
 
-        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
-        /// `Q8_0`). Required when `--bundle-id` is set.
-        #[arg(long, requires = "bundle_id")]
+        /// Quantization label (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        /// Required when `--bundle-id` is set; optional for `--hf`.
+        #[arg(long, requires = "remote_source")]
         quant: Option<String>,
+
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        /// Used when quantizing remote SafeTensors models on the fly.
+        #[arg(long, requires = "remote_source")]
+        quant_strategy: Option<String>,
 
         /// Cache root: shared between `--bundle-id` downloads
         /// (under `<dir>/huggingface.co/...`) and the KV prefix
@@ -568,27 +597,43 @@ enum Command {
     Embed {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
-        /// manifest. Mutually exclusive with `--bundle-id` /
-        /// `--quant`; one of the two source forms must be set.
+        /// manifest. Mutually exclusive with `--bundle-id` / `--hf`.
         #[arg(
             short,
             long,
-            conflicts_with_all = ["bundle_id", "quant"],
+            conflicts_with_all = ["bundle_id", "hf"],
         )]
         model: Option<String>,
+
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        /// Pairs optionally with `--quant`.
+        #[arg(long, group = "remote_source", conflicts_with_all = ["model", "bundle_id"])]
+        hf: Option<String>,
 
         /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
         /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
         /// automatically if missing). Pairs with `--quant` for
         /// auto-download from `huggingface.co/LiquidAI/LeapBundles`.
-        #[arg(long, requires = "quant")]
+        #[arg(
+            long,
+            group = "remote_source",
+            requires = "quant",
+            conflicts_with = "hf"
+        )]
         bundle_id: Option<String>,
 
-        /// Quantization label for `--bundle-id` (e.g. `Q4_0`, `Q8_0`).
-        #[arg(long, requires = "bundle_id")]
+        /// Quantization label (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        /// Required when `--bundle-id` is set; optional for `--hf`.
+        #[arg(long, requires = "remote_source")]
         quant: Option<String>,
 
-        /// Cache root for `--bundle-id` downloads. Default: `$HOME/.cache/cera`.
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        /// Used when quantizing remote SafeTensors models on the fly.
+        #[arg(long, requires = "remote_source")]
+        quant_strategy: Option<String>,
+
+        /// Cache root for `--bundle-id` and `--hf` downloads. Default: `$HOME/.cache/cera`.
         #[arg(long)]
         cache_dir: Option<String>,
 
@@ -642,19 +687,36 @@ enum Command {
     Logits {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles manifest, or
         /// a directory containing exactly one `.json` manifest. Mutually
-        /// exclusive with `--bundle-id` / `--quant`.
-        #[arg(short, long, conflicts_with_all = ["bundle_id", "quant"])]
+        /// exclusive with `--bundle-id` / `--hf`.
+        #[arg(short, long, conflicts_with_all = ["bundle_id", "hf"])]
         model: Option<String>,
 
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        /// Pairs optionally with `--quant`.
+        #[arg(long, group = "remote_source", conflicts_with_all = ["model", "bundle_id"])]
+        hf: Option<String>,
+
         /// LeapBundles bundle id (pairs with `--quant`). See `cera list-bundles`.
-        #[arg(long, requires = "quant")]
+        #[arg(
+            long,
+            group = "remote_source",
+            requires = "quant",
+            conflicts_with = "hf"
+        )]
         bundle_id: Option<String>,
 
-        /// Quantization label for `--bundle-id` (e.g. `Q4_0`, `Q8_0`).
-        #[arg(long, requires = "bundle_id")]
+        /// Quantization label (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        /// Required when `--bundle-id` is set; optional for `--hf`.
+        #[arg(long, requires = "remote_source")]
         quant: Option<String>,
 
-        /// Cache root for `--bundle-id` downloads. Default: `$HOME/.cache/cera`.
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        /// Used when quantizing remote SafeTensors models on the fly.
+        #[arg(long, requires = "remote_source")]
+        quant_strategy: Option<String>,
+
+        /// Cache root for `--bundle-id` and `--hf` downloads. Default: `$HOME/.cache/cera`.
         #[arg(long)]
         cache_dir: Option<String>,
 
@@ -712,14 +774,19 @@ enum Command {
     Bench {
         /// Path to the model: a `.gguf` file, a `.json` LeapBundles
         /// manifest, or a directory containing exactly one `.json`
-        /// manifest. Mutually exclusive with `--bundle-id` /
-        /// `--quant`; one of the two source forms must be set.
+        /// manifest. Mutually exclusive with `--bundle-id` / `--hf`.
         #[arg(
             short,
             long,
-            conflicts_with_all = ["bundle_id", "quant"],
+            conflicts_with_all = ["bundle_id", "hf"],
         )]
         model: Option<String>,
+
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        /// Pairs optionally with `--quant`.
+        #[arg(long, group = "remote_source", conflicts_with_all = ["model", "bundle_id"])]
+        hf: Option<String>,
 
         /// LeapBundles bundle id (e.g. `LFM2.5-1.2B-Instruct` or
         /// `LFM2.5-1.2B-Instruct-GGUF` — `-GGUF` is appended
@@ -728,17 +795,26 @@ enum Command {
         /// `huggingface.co/LiquidAI/LeapBundles`. Cached under
         /// `--cache-dir` (default `$HOME/.cache/cera`). Use
         /// `cera list-bundles` to discover available IDs.
-        #[arg(long, requires = "quant")]
+        #[arg(
+            long,
+            group = "remote_source",
+            requires = "quant",
+            conflicts_with = "hf"
+        )]
         bundle_id: Option<String>,
 
-        /// Quantization label for `--bundle-id` (e.g. `Q4_0`,
-        /// `Q8_0`). Pairs with `--bundle-id`: clap rejects
-        /// either flag without the other.
-        #[arg(long, requires = "bundle_id")]
+        /// Quantization label (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        /// Required when `--bundle-id` is set; optional for `--hf`.
+        #[arg(long, requires = "remote_source")]
         quant: Option<String>,
 
-        /// Cache root for `--bundle-id` downloads. Default:
-        /// `$HOME/.cache/cera`. Used only for bundle download
+        /// Quantization optimization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        /// Used when quantizing remote SafeTensors models on the fly.
+        #[arg(long, requires = "remote_source")]
+        quant_strategy: Option<String>,
+
+        /// Cache root for `--bundle-id` and `--hf` downloads. Default:
+        /// `$HOME/.cache/cera`. Used only for model/bundle download
         /// caching; bench's KV prefix cache is the engine default
         /// (warm-only, in-memory) regardless of this flag —
         /// `cera run --cache-dir <d>` is the right entrypoint
@@ -835,6 +911,18 @@ enum Command {
         quants: bool,
     },
 
+    /// Inspect a Hugging Face model repository, listing available GGUF quantizations
+    /// and detected modality auxiliary files (vision mmproj, audio decoders, tokenizers).
+    ListHf {
+        /// Hugging Face repository spec or URL (e.g. `LiquidAI/LFM2.5-VL-3B-GGUF`
+        /// or `https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF`).
+        hf: String,
+
+        /// Output findings as a structured JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Download LeapBundles manifests and model files without loading them.
     ///
     /// Accepts one or more `ID:QUANT` pairs. Bare bundle IDs are normalized
@@ -902,6 +990,12 @@ enum ModelSpec<'a> {
     Bundle {
         id: &'a str,
         quant: &'a str,
+        cache_dir: PathBuf,
+    },
+    Hf {
+        spec: &'a str,
+        quant: Option<&'a str>,
+        quant_strategy: Option<&'a str>,
         cache_dir: PathBuf,
     },
 }
@@ -1133,68 +1227,74 @@ pub(crate) fn simulate_truncate_oldest_turn_pairs(
 /// KV prefix cache (under `<root>/kv`), so a single `--cache-dir` flag covers
 /// both, unifying the user's cache footprint instead of fragmenting it.
 fn default_cache_dir() -> PathBuf {
-    // `USERPROFILE` before falling back to a temp dir: Windows sets no `HOME`,
-    // so without it every Windows run cached into a directory the OS is free to
-    // clean, and re-downloaded multi-gigabyte models. It also makes this agree
-    // with `Cera.openBundle`'s default in `cera_ffi`, which is what lets a
-    // desktop app and this CLI share one set of downloads.
-    let base = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(".cache/cera")
+    cera::bundle::default_cache_dir()
 }
 
-/// Take the four CLI flags `(--model, --bundle-id, --quant, --cache-dir)` and
+/// Take the CLI flags `(--model, --bundle-id, --hf, --quant, --cache-dir)` and
 /// validate "exactly one source set". Then build a `ModelSpec` and load
 /// through [`load_engine_from_spec`]. Errors before any I/O so a flag-misuse
 /// surfaces fast with a clear message rather than a downstream HTTP/file
 /// error.
+#[allow(clippy::too_many_arguments)]
 fn resolve_engine(
     model: Option<&str>,
     bundle_id: Option<&str>,
+    hf: Option<&str>,
     quant: Option<&str>,
+    quant_strategy: Option<&str>,
     cache_dir: Option<&str>,
     device: &str,
     context_size: usize,
 ) -> Result<CeraEngine> {
-    match (model, bundle_id, quant) {
-        (Some(p), None, None) => {
+    let cache = || {
+        cache_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_cache_dir)
+    };
+
+    match (model, bundle_id, hf, quant) {
+        (Some(p), None, None, None) => {
             load_engine_from_spec(ModelSpec::Path(Path::new(p)), device, context_size)
         }
-        (None, Some(id), Some(q)) => {
-            let cache = cache_dir
-                .map(PathBuf::from)
-                .unwrap_or_else(default_cache_dir);
-            // Append `-GGUF` if the user didn't include it. Keeps
-            // `--bundle-id LFM2.5-1.2B-Instruct` and the explicit
-            // `--bundle-id LFM2.5-1.2B-Instruct-GGUF` both valid;
-            // the URL Liquid actually publishes always has the
-            // suffix.
+        (None, Some(id), None, Some(q)) => {
             let normalized = normalize_bundle_id(id);
             load_engine_from_spec(
                 ModelSpec::Bundle {
                     id: &normalized,
                     quant: q,
-                    cache_dir: cache,
+                    cache_dir: cache(),
                 },
                 device,
                 context_size,
             )
         }
-        (None, Some(_), None) | (None, None, Some(_)) => {
+        (None, None, Some(spec), q) => load_engine_from_spec(
+            ModelSpec::Hf {
+                spec,
+                quant: q,
+                quant_strategy,
+                cache_dir: cache(),
+            },
+            device,
+            context_size,
+        ),
+        (None, Some(_), None, None) => {
             anyhow::bail!(
                 "`--bundle-id` and `--quant` must be passed together \
                  (e.g. `--bundle-id LFM2-1.2B-GGUF --quant Q4_0`)"
             )
         }
-        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => anyhow::bail!(
-            "`--model` and `--bundle-id`/`--quant` are mutually exclusive — \
-             pick one source"
-        ),
-        (None, None, None) => anyhow::bail!(
-            "no model source: pass either `--model <path>` or \
+        (None, None, None, Some(_)) => {
+            anyhow::bail!(
+                "`--quant` was passed without a remote model source — pass either `--bundle-id <id>` or `--hf <repo_or_url>`"
+            )
+        }
+        (None, None, None, None) => anyhow::bail!(
+            "no model source: pass either `--model <path>`, `--hf <repo_or_url>`, or \
              `--bundle-id <id> --quant <quant>`"
+        ),
+        _ => anyhow::bail!(
+            "`--model`, `--hf`, and `--bundle-id` are mutually exclusive — pick one model source"
         ),
     }
 }
@@ -1288,6 +1388,37 @@ fn load_engine_from_spec(
             let engine = CeraEngine::from_bundle_id(
                 id,
                 quant,
+                EngineConfig {
+                    context_size,
+                    backend,
+                    bundle_repo: Some(repo),
+                },
+            )?;
+            progress.finish_line();
+            engine
+        }
+        ModelSpec::Hf {
+            spec,
+            quant,
+            quant_strategy,
+            cache_dir,
+        } => {
+            let quant_msg = quant
+                .map(|q| format!(" (quant `{q}`) "))
+                .unwrap_or_default();
+            eprintln!(
+                "Resolving Hugging Face model `{spec}`{quant_msg}into cache `{}`…",
+                cache_dir.display()
+            );
+            let progress = Arc::new(CliDownloadProgress::default());
+            let repo = cera::bundle::BundleRepo::with_progress(
+                cache_dir,
+                progress.clone() as Arc<dyn cera::bundle::DownloadProgress>,
+            );
+            let engine = CeraEngine::from_hf_with_strategy(
+                spec,
+                quant,
+                quant_strategy,
                 EngineConfig {
                     context_size,
                     backend,
@@ -1939,8 +2070,10 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             model,
+            hf,
             bundle_id,
             quant,
+            quant_strategy,
             prompt,
             max_tokens,
             temperature,
@@ -2049,7 +2182,9 @@ fn main() -> Result<()> {
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id.as_deref(),
+                hf.as_deref(),
                 quant.as_deref(),
+                quant_strategy.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -2762,8 +2897,10 @@ fn main() -> Result<()> {
         }
         Command::Embed {
             model,
+            hf,
             bundle_id,
             quant,
+            quant_strategy,
             cache_dir,
             prompt,
             device,
@@ -2777,7 +2914,9 @@ fn main() -> Result<()> {
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id.as_deref(),
+                hf.as_deref(),
                 quant.as_deref(),
+                quant_strategy.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -2872,8 +3011,10 @@ fn main() -> Result<()> {
         }
         Command::Logits {
             model,
+            hf,
             bundle_id,
             quant,
+            quant_strategy,
             cache_dir,
             prompt,
             token_ids,
@@ -2886,7 +3027,9 @@ fn main() -> Result<()> {
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id.as_deref(),
+                hf.as_deref(),
                 quant.as_deref(),
+                quant_strategy.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3047,10 +3190,80 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::ListHf { hf, json } => {
+            let spec = cera::bundle::HfSpec::parse(&hf)?;
+            let info = cera::bundle::fetch_model_info(&spec)?;
+            let contents = cera::bundle::classify_repo_siblings(&info.siblings);
+
+            if json {
+                let out = serde_json::json!({
+                    "id": info.id,
+                    "pipeline_tag": info.pipeline_tag,
+                    "primary_ggufs": contents.primary_ggufs.iter().map(|e| {
+                        serde_json::json!({
+                            "filename": e.rfilename,
+                            "quant": e.quant,
+                            "size_bytes": e.size_bytes,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "mmproj_ggufs": contents.mmproj_ggufs.iter().map(|e| {
+                        serde_json::json!({
+                            "filename": e.rfilename,
+                            "quant": e.quant,
+                            "size_bytes": e.size_bytes,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "audio_decoders": contents.audio_decoders.iter().map(|e| {
+                        serde_json::json!({
+                            "filename": e.rfilename,
+                            "quant": e.quant,
+                            "size_bytes": e.size_bytes,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "has_safetensors": contents.has_safetensors,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("Hugging Face Repository: {}/{}", spec.owner, spec.repo);
+                if let Some(tag) = &info.pipeline_tag {
+                    println!("Pipeline: {tag}");
+                }
+                if !contents.primary_ggufs.is_empty() {
+                    println!("\nPrimary GGUF Models:");
+                    for g in &contents.primary_ggufs {
+                        let size_str = g
+                            .size_bytes
+                            .map(|s| format!(" ({:.2} MB)", s as f64 / 1_000_000.0))
+                            .unwrap_or_default();
+                        println!("  • {:<10} -> {}{}", g.quant, g.rfilename, size_str);
+                    }
+                }
+                if !contents.mmproj_ggufs.is_empty() {
+                    println!("\nVision Multimodal Projectors (mmproj):");
+                    for g in &contents.mmproj_ggufs {
+                        println!("  • {:<10} -> {}", g.quant, g.rfilename);
+                    }
+                }
+                if !contents.audio_decoders.is_empty() {
+                    println!("\nAudio Decoders:");
+                    for g in &contents.audio_decoders {
+                        println!("  • {:<10} -> {}", g.quant, g.rfilename);
+                    }
+                }
+                if contents.has_safetensors {
+                    println!(
+                        "\nSafeTensors: present ({} files)",
+                        contents.safetensors_files.len()
+                    );
+                }
+            }
+        }
         Command::Chat {
             model,
+            hf,
             bundle_id,
             quant,
+            quant_strategy,
             cache_dir,
             cache_warm_mb,
             cache_disk_gb,
@@ -3071,11 +3284,12 @@ fn main() -> Result<()> {
             // refusing outright: the alternative is an error telling the user
             // to go run `cera list-bundles`, read it, and come back with two
             // strings, for something that is one request away.
-            let picked = if model.is_none() && bundle_id.is_none() && quant.is_none() {
-                pick_bundle_interactively(no_tui)?
-            } else {
-                None
-            };
+            let picked =
+                if model.is_none() && hf.is_none() && bundle_id.is_none() && quant.is_none() {
+                    pick_bundle_interactively(no_tui)?
+                } else {
+                    None
+                };
             let (bundle_id, quant) = match &picked {
                 Some((id, q)) => (Some(id.as_str()), Some(q.as_str())),
                 None => (bundle_id.as_deref(), quant.as_deref()),
@@ -3083,7 +3297,9 @@ fn main() -> Result<()> {
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id,
+                hf.as_deref(),
                 quant,
+                quant_strategy.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -3777,8 +3993,10 @@ fn main() -> Result<()> {
         }
         Command::Bench {
             model,
+            hf,
             bundle_id,
             quant,
+            quant_strategy,
             cache_dir,
             prompt,
             prompt_tokens,
@@ -3809,7 +4027,9 @@ fn main() -> Result<()> {
             let engine = resolve_engine(
                 model.as_deref(),
                 bundle_id.as_deref(),
+                hf.as_deref(),
                 quant.as_deref(),
+                quant_strategy.as_deref(),
                 cache_dir.as_deref(),
                 &device,
                 context_size,
@@ -4698,7 +4918,7 @@ mod tests {
     /// being optional means clap accepts the empty case).
     #[test]
     fn resolve_engine_rejects_no_source() {
-        let r = resolve_engine(None, None, None, None, "cpu", 1024);
+        let r = resolve_engine(None, None, None, None, None, None, "cpu", 1024);
         let err = match r {
             Ok(_) => panic!("expected an error when no source flags are set"),
             Err(e) => e,
@@ -4716,16 +4936,55 @@ mod tests {
     /// programmatic callers (and as a defense-in-depth check).
     #[test]
     fn resolve_engine_rejects_partial_bundle_args() {
-        let r = resolve_engine(None, Some("LFM2-1.2B-GGUF"), None, None, "cpu", 1024);
+        let r = resolve_engine(
+            None,
+            Some("LFM2-1.2B-GGUF"),
+            None,
+            None,
+            None,
+            None,
+            "cpu",
+            1024,
+        );
         assert!(
             r.is_err(),
             "expected partial bundle args (id only) to error"
         );
-        let r = resolve_engine(None, None, Some("Q4_0"), None, "cpu", 1024);
+        let r = resolve_engine(None, None, None, Some("Q4_0"), None, None, "cpu", 1024);
         assert!(
             r.is_err(),
             "expected partial bundle args (quant only) to error"
         );
+    }
+
+    #[test]
+    fn resolve_engine_rejects_conflicting_sources() {
+        let r = resolve_engine(
+            Some("model.gguf"),
+            Some("LFM2-1.2B-GGUF"),
+            None,
+            Some("Q4_0"),
+            None,
+            None,
+            "cpu",
+            1024,
+        );
+        assert!(
+            r.is_err(),
+            "expected conflict error between model and bundle_id"
+        );
+
+        let r = resolve_engine(
+            Some("model.gguf"),
+            None,
+            Some("LiquidAI/LFM2.5-VL-3B-GGUF"),
+            None,
+            None,
+            None,
+            "cpu",
+            1024,
+        );
+        assert!(r.is_err(), "expected conflict error between model and hf");
     }
 
     /// `normalize_bundle_id` appends `-GGUF` when missing and is

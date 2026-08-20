@@ -117,16 +117,12 @@ pub(crate) fn head_info(client: &Client, url: &str) -> HeadInfo {
         content_length: None,
         linked_sha256: None,
     };
-    // Chain `.error_for_status()` so 4xx/5xx responses are rejected
-    // (we don't trust headers on an error page). 3xx passes through —
-    // which is the whole point, since HF's `X-Linked-Etag` lives on
-    // the 302.
-    let Ok(resp) = client
-        .head(url)
-        .timeout(HEAD_TIMEOUT)
-        .send()
-        .and_then(|r| r.error_for_status())
-    else {
+    let token = get_hf_auth_token_for_url(url);
+    let mut req = client.head(url).timeout(HEAD_TIMEOUT);
+    if let Some(t) = &token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    let Ok(resp) = req.send().and_then(|r| r.error_for_status()) else {
         return none;
     };
     // HF sets `x-linked-size` on the first hop; prefer that over
@@ -192,6 +188,23 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
 /// a HEAD probe's `x-linked-size`) to the progress callback even
 /// when the GET response omits `Content-Length` (some chunked-transfer
 /// CDNs do). Falls back to `resp.content_length()` when `None`.
+fn get_hf_auth_token_for_url(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let host = after_scheme
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("");
+
+    if crate::bundle::hf::is_hf_or_endpoint_host(host) {
+        crate::bundle::hf::get_hf_auth_token()
+    } else {
+        None
+    }
+}
+
 pub(crate) fn download_to(
     client: &Client,
     url: &str,
@@ -200,13 +213,51 @@ pub(crate) fn download_to(
     total_bytes_hint: Option<u64>,
     progress: Option<&dyn crate::bundle::DownloadProgress>,
 ) -> Result<(), CeraError> {
-    let mut resp = client
-        .get(url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .send()
-        .map_err(|e| CeraError::Backend(format!("GET {url}: {e}")))?
-        .error_for_status()
-        .map_err(|e| CeraError::Backend(format!("GET {url}: {e}")))?;
+    const MAX_DOWNLOAD_RETRIES: u32 = 5;
+    const BASE_RETRY_DELAY_MS: u64 = 1000;
+
+    let token = get_hf_auth_token_for_url(url);
+    let mut resp = {
+        let mut last_err = String::new();
+        let mut response = None;
+        for attempt in 0..MAX_DOWNLOAD_RETRIES {
+            if attempt > 0 {
+                let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1));
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            let mut req = client.get(url).timeout(DOWNLOAD_TIMEOUT);
+            if let Some(t) = &token {
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+            }
+            match req.send() {
+                Ok(r) => {
+                    let status = r.status();
+                    if status.is_success() {
+                        response = Some(r);
+                        break;
+                    } else if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                    {
+                        last_err = format!("HTTP {status}");
+                    } else {
+                        return Err(CeraError::Backend(format!("GET {url}: HTTP {status}")));
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("{e}");
+                }
+            }
+        }
+        match response {
+            Some(r) => r,
+            None => {
+                return Err(CeraError::Backend(format!(
+                    "GET {url} failed after {MAX_DOWNLOAD_RETRIES} attempts: {last_err}"
+                )));
+            }
+        }
+    };
 
     // Prefer the caller's hint (typically from a HEAD probe), then
     // fall back to the GET response's Content-Length. Either may be

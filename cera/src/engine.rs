@@ -533,6 +533,65 @@ impl CeraEngine {
         Self::from_manifest_file(&manifest_path, cfg)
     }
 
+    /// Load from a Hugging Face repository spec or URL, e.g.
+    /// `from_hf("LiquidAI/LFM2.5-VL-3B-GGUF", Some("Q4_K_M"), cfg)` or
+    /// `from_hf("https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF", None, cfg)`.
+    ///
+    /// Inspects the Hugging Face repository via its metadata API, selects
+    /// the requested (or best default) quantization, automatically pairs
+    /// any modality auxiliary files (e.g. `mmproj-*.gguf` for vision-language
+    /// models, `audiodecoder-*.gguf` for audio models), downloads and caches
+    /// them via `cfg.bundle_repo`, and loads the engine.
+    ///
+    /// `cfg.bundle_repo` **must** be set; otherwise this returns an
+    /// error telling the caller to set it. Requires both `remote` and
+    /// `mmap` features.
+    #[cfg(all(feature = "remote", feature = "mmap"))]
+    pub fn from_hf(
+        spec_or_url: &str,
+        quant: Option<&str>,
+        cfg: EngineConfig,
+    ) -> Result<Self, CeraError> {
+        Self::from_hf_with_strategy(spec_or_url, quant, None, cfg)
+    }
+
+    /// Load from a Hugging Face repository spec or URL with an explicit quantization strategy
+    /// (e.g. `auto`, `fast-mse`, `hqq`, `quarot`).
+    #[cfg(all(feature = "remote", feature = "mmap"))]
+    pub fn from_hf_with_strategy(
+        spec_or_url: &str,
+        quant: Option<&str>,
+        quant_strategy: Option<&str>,
+        cfg: EngineConfig,
+    ) -> Result<Self, CeraError> {
+        let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
+            CeraError::Backend(
+                "`CeraEngine::from_hf` requires `EngineConfig::bundle_repo` to be set — \
+                 construct a `BundleRepo` rooted at your desired store directory and assign it \
+                 before calling this constructor."
+                    .to_string(),
+            )
+        })?;
+        let manifest = crate::bundle::hf::inspect_and_resolve_manifest(
+            spec_or_url,
+            quant,
+            quant_strategy,
+            Some(repo.store_dir()),
+            repo.progress(),
+        )?;
+        Self::from_manifest(manifest, cfg)
+    }
+
+    /// Alias for [`Self::from_hf`] when loading from a full Hugging Face URL.
+    #[cfg(all(feature = "remote", feature = "mmap"))]
+    pub fn from_hf_url(
+        url: &str,
+        quant: Option<&str>,
+        cfg: EngineConfig,
+    ) -> Result<Self, CeraError> {
+        Self::from_hf(url, quant, cfg)
+    }
+
     // --- internal constructors ---
 
     /// Core assembly: take a pre-constructed `GgufFile` + parsed
@@ -996,7 +1055,12 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, CeraError> {
             "no .json manifest in directory `{}`",
             dir.display()
         ))),
-        1 => Ok(jsons.into_iter().next().unwrap()),
+        1 => jsons.pop().ok_or_else(|| {
+            CeraError::Backend(format!(
+                "no .json manifest in directory `{}`",
+                dir.display()
+            ))
+        }),
         n => {
             jsons.sort();
             let names: Vec<String> = jsons
@@ -1561,25 +1625,28 @@ fn load_text_model_auto(
     // which doesn't need the re-open helper.
     #[cfg(all(feature = "gpu", feature = "mmap"))]
     {
-        // Path guaranteed present (short-circuited above otherwise).
-        let p = path.expect("path guaranteed by early return");
-        let gguf_for_gpu = clone_gguf_like(&gguf, p)?;
-        match model::load_model_gpu(gguf_for_gpu, Some(p), context_size) {
-            Ok(m) => {
-                tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
-                return Ok(m);
+        if let Some(p) = path {
+            let gguf_for_gpu = clone_gguf_like(&gguf, p)?;
+            match model::load_model_gpu(gguf_for_gpu, Some(p), context_size) {
+                Ok(m) => {
+                    tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
+                    return Ok(m);
+                }
+                Err(e) => {
+                    tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
+                }
             }
-            Err(e) => {
-                tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
-            }
+            // Re-open the file for CPU — original `gguf` may have been
+            // consumed by the Metal attempt above.
+            let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
+                CeraError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
+            })?;
+            model::load_model(gguf_for_cpu, Some(p), context_size)
+                .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
+        } else {
+            model::load_model(gguf, path, context_size)
+                .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
         }
-        // Re-open the file for CPU — original `gguf` may have been
-        // consumed by the Metal attempt above.
-        let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
-            CeraError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
-        })?;
-        model::load_model(gguf_for_cpu, Some(p), context_size)
-            .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
     }
 
     #[cfg(not(all(feature = "gpu", feature = "mmap")))]

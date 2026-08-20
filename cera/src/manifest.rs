@@ -127,6 +127,51 @@ pub enum GenerationDefaults {
     Other { raw: serde_json::Value },
 }
 
+impl GenerationDefaults {
+    /// Convert `GenerationDefaults` back to its JSON Value representation.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+            } => {
+                let mut params = serde_json::Map::new();
+                if let Some(t) = temperature {
+                    params.insert("temperature".into(), serde_json::json!(t));
+                }
+                if let Some(mp) = min_p {
+                    params.insert("min_p".into(), serde_json::json!(mp));
+                }
+                if let Some(tp) = top_p {
+                    params.insert("top_p".into(), serde_json::json!(tp));
+                }
+                if let Some(tk) = top_k {
+                    params.insert("top_k".into(), serde_json::json!(tk));
+                }
+                if let Some(rp) = repetition_penalty {
+                    params.insert("repetition_penalty".into(), serde_json::json!(rp));
+                }
+                serde_json::json!({
+                    "sampling_parameters": params
+                })
+            }
+            Self::Audio {
+                number_of_decoding_threads,
+            } => {
+                let mut params = serde_json::Map::new();
+                if let Some(t) = number_of_decoding_threads {
+                    params.insert("number_of_decoding_threads".into(), serde_json::json!(t));
+                }
+                serde_json::Value::Object(params)
+            }
+            Self::Other { raw } => raw.clone(),
+        }
+    }
+}
+
 impl Manifest {
     /// Parse a manifest from a file on disk. Thin convenience over
     /// `from_str` that also captures a nicer error context.
