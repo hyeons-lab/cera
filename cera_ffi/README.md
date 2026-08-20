@@ -125,6 +125,26 @@ void main() {
 text. For streaming and the async variants that keep the isolate responsive, see
 `example/`.
 
+### Voice Activity Detection (Silero VAD v5)
+
+`cera_ffi` provides native bindings for the Silero VAD v5 speech activity detection engine:
+
+```dart
+import 'package:cera_ffi/cera_ffi.dart';
+
+void main() {
+  final vad = VadEngine.fromPath('/path/to/silero_vad.gguf', SileroVadConfig.standard());
+  final iterator = vad.newIterator(VadSampleRate.rate16kHz);
+
+  // Process 512-sample (32ms) audio chunks
+  final chunk = Float32List(512); // PCM samples in [-1.0, 1.0]
+  final segment = iterator.processChunk(chunk);
+  if (segment != null) {
+    print('Speech detected from ${segment.start}s to ${segment.end ?? 0.0}s');
+  }
+}
+```
+
 ## Platform support
 
 `Cera` runs everywhere: Android, iOS, macOS, Linux, Windows, and the web.

@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "cera"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "cera-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "cera",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "cera-ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "cera",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "cera-parity"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "cera",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "cera-wasm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "cera",

@@ -243,6 +243,39 @@ context shift is not supported with any TurboQuant mode on any backend.
 
 See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
 
+## Voice Activity Detection (Silero VAD v5)
+
+Cera includes a **native, pure-Rust implementation of Silero VAD v5** (`cera::vad`), enabling zero-dependency, real-time voice activity detection across desktop, mobile, and web:
+
+- **Zero runtime dependencies**: Pure Rust tensor operations with no ONNX Runtime or Python required.
+- **Streaming audio evaluation**: State-machine-based chunk iterator (`VadIterator`) processing 512-sample frames (32ms at 16kHz) with state persistence.
+- **Speech segment timestamping**: Automatic speech segment extraction, speech padding, and silence trimming.
+- **Cross-Platform Bindings**: Available in Rust (`cera::vad::VadEngine`), CLI (`cera vad`), Swift/Kotlin via UniFFI, and Dart/Flutter via `cera_ffi`.
+
+```bash
+# Detect speech timestamps from a WAV file
+cera vad --model models/silero_vad.gguf --audio speech.wav --json
+
+# Convert official Silero VAD v5 ONNX model to GGUF
+python scripts/convert_silero_vad.py silero_vad.onnx models/silero_vad.gguf
+```
+
+## Hugging Face Models & Streaming Quantization
+
+Cera supports direct loading and streaming execution from **Hugging Face model repositories**:
+
+- **Direct Repo Loading**: Point Cera directly at Hugging Face model IDs or URLs (`--hf org/repo`).
+- **Zero-Disk Streaming Quantization**: Quantize remote SafeTensors models on-the-fly into GGUF format directly in memory without writing intermediate full-precision weights to disk (`--quant-strategy fast-mse`, `hqq`, `quarot`).
+- **LeapBundles Integration**: Seamless automatic download, manifest parsing, and local caching under `$HOME/.cache/cera`.
+
+```bash
+# Run directly from a Hugging Face GGUF repository
+cera run --hf LiquidAI/LFM2.5-1.2B-Instruct-GGUF --quant Q4_0 --prompt "Explain quantum computing."
+
+# Quantize and run on-the-fly from a remote SafeTensors repository
+cera run --hf LiquidAI/LFM2.5-350M --quant Q4_0 --quant-strategy fast-mse --prompt "Hello"
+```
+
 ## Quick start
 
 ```bash
