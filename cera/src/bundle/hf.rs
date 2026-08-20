@@ -650,18 +650,74 @@ pub fn resolve_hf_manifest(
         extras,
     };
 
-    let defaults = generation_defaults.unwrap_or(match inference_type {
-        InferenceType::LlamaCppLfm2AudioV1 => GenerationDefaults::Audio {
+    let defaults = match (inference_type.clone(), generation_defaults) {
+        (
+            InferenceType::LlamaCppLfm2AudioV1,
+            Some(GenerationDefaults::Text {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+            }),
+        ) => GenerationDefaults::Audio {
             number_of_decoding_threads: None,
+            audio_temperature: None,
+            audio_top_k: None,
+            temperature,
+            min_p,
+            top_p,
+            top_k,
+            repetition_penalty,
         },
-        _ => GenerationDefaults::Text {
+        (InferenceType::LlamaCppLfm2AudioV1, Some(audio @ GenerationDefaults::Audio { .. })) => {
+            audio
+        }
+        (InferenceType::LlamaCppLfm2AudioV1, _) => GenerationDefaults::Audio {
+            number_of_decoding_threads: None,
+            audio_temperature: None,
+            audio_top_k: None,
             temperature: None,
             min_p: None,
             top_p: None,
             top_k: None,
             repetition_penalty: None,
         },
-    });
+        (
+            InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText,
+            Some(GenerationDefaults::Audio {
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+                ..
+            }),
+        ) => GenerationDefaults::Text {
+            temperature,
+            min_p,
+            top_p,
+            top_k,
+            repetition_penalty,
+        },
+        (
+            InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText,
+            Some(text @ GenerationDefaults::Text { .. }),
+        ) => text,
+        (InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText, _) => {
+            GenerationDefaults::Text {
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+            }
+        }
+        (_, Some(defaults)) => defaults,
+        (_, None) => GenerationDefaults::Other {
+            raw: serde_json::Value::Null,
+        },
+    };
 
     let mut raw_map = serde_json::Map::new();
     raw_map.insert(
@@ -1165,5 +1221,62 @@ mod tests {
                 .model
                 .contains("LFM2.5-2.6B-QAD-Q4_0.gguf")
         );
+    }
+
+    #[test]
+    fn test_audio_hf_manifest_normalizes_text_generation_config_to_audio() {
+        let siblings = vec![
+            HfSibling {
+                rfilename: "LFM2.5-Audio-Q4_0.gguf".into(),
+                size: Some(1500000000),
+            },
+            HfSibling {
+                rfilename: "audio_decoder.gguf".into(),
+                size: Some(300000000),
+            },
+        ];
+
+        let spec = HfSpec::parse("LiquidAI/LFM2.5-Audio-GGUF").unwrap();
+        let info = HfModelInfo {
+            id: "LiquidAI/LFM2.5-Audio-GGUF".into(),
+            siblings,
+            tags: vec!["audio".into(), "text-to-speech".into()],
+            pipeline_tag: Some("text-to-speech".into()),
+            config: None,
+        };
+
+        // GenerationDefaults parsed from generation_config.json is GenerationDefaults::Text
+        let gen_config_text = GenerationDefaults::Text {
+            temperature: Some(0.3),
+            min_p: Some(0.05),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            repetition_penalty: Some(1.1),
+        };
+
+        let manifest = resolve_hf_manifest(&spec, &info, None, Some(gen_config_text)).unwrap();
+        assert_eq!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1);
+        match manifest.generation_defaults {
+            GenerationDefaults::Audio {
+                number_of_decoding_threads,
+                audio_temperature,
+                audio_top_k,
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+            } => {
+                assert_eq!(number_of_decoding_threads, None);
+                assert_eq!(audio_temperature, None);
+                assert_eq!(audio_top_k, None);
+                assert_eq!(temperature, Some(0.3));
+                assert_eq!(min_p, Some(0.05));
+                assert_eq!(top_p, Some(0.95));
+                assert_eq!(top_k, Some(40));
+                assert_eq!(repetition_penalty, Some(1.1));
+            }
+            other => panic!("expected GenerationDefaults::Audio, got {other:?}"),
+        }
     }
 }
