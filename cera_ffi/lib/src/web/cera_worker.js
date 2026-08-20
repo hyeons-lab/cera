@@ -644,9 +644,9 @@ const OPS = {
         await gpu.session.generateTokens(
           new Uint32Array(suffix),
           256,
-          null,
-          null,
-          null,
+          0.0,
+          1.0,
+          1,
           null,
           (piece) => {
             text += piece;
@@ -661,9 +661,9 @@ const OPS = {
         await gpu.session.generateTokens(
           new Uint32Array(allTokens),
           256,
-          null,
-          null,
-          null,
+          0.0,
+          1.0,
+          1,
           null,
           (piece) => {
             text += piece;

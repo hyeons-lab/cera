@@ -12,6 +12,7 @@ class AudioRecorderService {
   final AudioRecorder _recorder = AudioRecorder();
   final List<double> _accumulatedPcm = [];
   StreamSubscription<Uint8List>? _streamSub;
+  int? _leftoverByte;
   bool _isRecording = false;
   int _currentSampleRate = 16000;
 
@@ -53,9 +54,24 @@ class AudioRecorderService {
       );
 
       _isRecording = true;
+      _leftoverByte = null;
       _streamSub = stream.listen(
         (chunk) {
-          final samples = pcm16ToFloat32(chunk);
+          Uint8List bytes;
+          if (_leftoverByte != null) {
+            final combined = Uint8List(chunk.length + 1);
+            combined[0] = _leftoverByte!;
+            combined.setRange(1, combined.length, chunk);
+            _leftoverByte = null;
+            bytes = combined;
+          } else {
+            bytes = chunk;
+          }
+          if (bytes.length % 2 != 0) {
+            _leftoverByte = bytes.last;
+            bytes = Uint8List.sublistView(bytes, 0, bytes.length - 1);
+          }
+          final samples = pcm16ToFloat32(bytes);
           _accumulatedPcm.addAll(samples);
         },
         onError: (err) {
@@ -76,6 +92,7 @@ class AudioRecorderService {
     _isRecording = false;
     await _streamSub?.cancel();
     _streamSub = null;
+    _leftoverByte = null;
 
     List<double> pcm;
     if (kIsWeb) {
@@ -94,6 +111,7 @@ class AudioRecorderService {
         await _recorder.stop();
       } catch (_) {}
       pcm = List<double>.from(_accumulatedPcm);
+      _accumulatedPcm.clear();
     }
 
     if (pcm.isEmpty) return [];
@@ -112,6 +130,7 @@ class AudioRecorderService {
     _isRecording = false;
     await _streamSub?.cancel();
     _streamSub = null;
+    _leftoverByte = null;
     _accumulatedPcm.clear();
     try {
       await _recorder.stop();
@@ -130,7 +149,10 @@ class AudioRecorderService {
     final floats = Float32List(count);
     for (var i = 0; i < count; i++) {
       final sample = byteData.getInt16(i * 2, Endian.little);
-      floats[i] = (sample / 32768.0).clamp(-1.0, 1.0);
+      floats[i] = (sample < 0 ? sample / 32768.0 : sample / 32767.0).clamp(
+        -1.0,
+        1.0,
+      );
     }
     return floats;
   }
@@ -159,16 +181,18 @@ class AudioRecorderService {
       final start = f * frameSize;
       for (var i = 0; i < frameSize; i++) {
         final val = samples[start + i];
-        sumSquares += val * val;
+        if (val.isFinite) {
+          sumSquares += val * val;
+        }
       }
       final rms = math.sqrt(sumSquares / frameSize);
       frameRms[f] = rms;
-      if (rms > maxRms) {
+      if (rms.isFinite && rms > maxRms) {
         maxRms = rms;
       }
     }
 
-    if (maxRms < minThreshold) {
+    if (!maxRms.isFinite || maxRms < minThreshold) {
       // Entire signal is very quiet: keep original to avoid false empty
       return samples;
     }
@@ -205,16 +229,26 @@ class AudioRecorderService {
 
     double maxAmp = 0.0;
     for (final s in samples) {
-      final absVal = s.abs();
-      if (absVal > maxAmp) maxAmp = absVal;
+      if (s.isFinite) {
+        final absVal = s.abs();
+        if (absVal > maxAmp) maxAmp = absVal;
+      }
     }
 
-    if (maxAmp < 1e-4) return samples; // Silent or nearly silent
+    if (!maxAmp.isFinite || maxAmp < 1e-4) {
+      final sanitized = Float32List(samples.length);
+      for (var i = 0; i < samples.length; i++) {
+        final s = samples[i];
+        sanitized[i] = s.isFinite ? s : 0.0;
+      }
+      return sanitized;
+    }
 
     final scale = targetPeak / maxAmp;
     final normalized = Float32List(samples.length);
     for (var i = 0; i < samples.length; i++) {
-      normalized[i] = (samples[i] * scale).clamp(-1.0, 1.0);
+      final s = samples[i];
+      normalized[i] = s.isFinite ? (s * scale).clamp(-1.0, 1.0) : 0.0;
     }
     return normalized;
   }

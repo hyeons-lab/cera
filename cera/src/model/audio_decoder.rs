@@ -600,9 +600,11 @@ pub fn sample_audio_frame(
         if j > 0 && prev_token >= 0 {
             let prev_cb = &weights.depth_embeddings[j - 1];
             let tok = prev_token as usize;
-            prev_cb.embedding.dequantize_row(tok, &mut state.emb_row);
-            for (d, e) in state.depthformer_in.iter_mut().zip(&state.emb_row) {
-                *d += e;
+            if tok < prev_cb.embedding.rows {
+                prev_cb.embedding.dequantize_row(tok, &mut state.emb_row);
+                for (d, e) in state.depthformer_in.iter_mut().zip(&state.emb_row) {
+                    *d += e;
+                }
             }
         }
 
@@ -670,10 +672,14 @@ pub fn embed_audio_token(weights: &AudioDecoderWeights, codes: &[i32; 8]) -> Vec
 
     let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
-        let offset_idx = j * n_vocab + code as usize;
-        emb.dequantize_row(offset_idx, &mut row);
-        for (r, e) in result.iter_mut().zip(&row) {
-            *r += e;
+        if code >= 0 {
+            let offset_idx = j * n_vocab + code as usize;
+            if offset_idx < emb.rows {
+                emb.dequantize_row(offset_idx, &mut row);
+                for (r, e) in result.iter_mut().zip(&row) {
+                    *r += e;
+                }
+            }
         }
     }
 
@@ -939,10 +945,14 @@ pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32
     let mut result = vec![0.0f32; emb_dim];
     let mut row = vec![0f32; emb_dim];
     for (j, &code) in codes.iter().enumerate() {
-        let idx = j * n_vocab_per_cb + code as usize;
-        emb.dequantize_row(idx, &mut row);
-        for (r, e) in result.iter_mut().zip(&row) {
-            *r += e;
+        if code >= 0 {
+            let idx = j * n_vocab_per_cb + code as usize;
+            if idx < emb.rows {
+                emb.dequantize_row(idx, &mut row);
+                for (r, e) in result.iter_mut().zip(&row) {
+                    *r += e;
+                }
+            }
         }
     }
     // Mean across codebooks.
@@ -980,10 +990,15 @@ fn detok_conv_block(
     n_embd: usize,
     d_conv: usize,
 ) -> Vec<f32> {
+    let (Some(in_proj), Some(conv_w), Some(out_proj)) =
+        (&lw.conv_in_proj, &lw.conv_weight, &lw.conv_out_proj)
+    else {
+        return cur.to_vec();
+    };
     // in_proj → [b, c, x] chunks.
     let chunk_size = n_embd;
     let mut bcx = vec![0.0; 3 * chunk_size];
-    lw.conv_in_proj.as_ref().unwrap().gemv(cur, &mut bcx);
+    in_proj.gemv(cur, &mut bcx);
 
     let b = &bcx[..chunk_size];
     let c = &bcx[chunk_size..2 * chunk_size];
@@ -994,13 +1009,11 @@ fn detok_conv_block(
 
     // conv1d with rolling buffer: concat [conv_buf, bx], convolve, update buf.
     let kernel_size = d_conv + 1;
-    let conv_w = lw.conv_weight.as_ref().unwrap();
     let mut conv_out = vec![0.0; chunk_size];
     // The rolling buffer has d_conv previous bx vectors.
     // Kernel applies: sum over k of weight[k] * input[pos - d_conv + k]
     // GGUF stores conv.weight as [kernel_size, n_embd] with dim0 (kernel) fastest.
     // Element (k, ch) is at index ch * kernel_size + k.
-    let kernel_size = d_conv + 1;
     for ch in 0..chunk_size {
         let mut sum = 0.0;
         for k in 0..d_conv {
@@ -1026,7 +1039,7 @@ fn detok_conv_block(
 
     // out_proj
     let mut out = vec![0.0; n_embd];
-    lw.conv_out_proj.as_ref().unwrap().gemv(&y, &mut out);
+    out_proj.gemv(&y, &mut out);
     out
 }
 
@@ -1039,6 +1052,9 @@ fn detok_attn_block(
     pos: usize,
     cfg: &DetokenizerConfig,
 ) -> Vec<f32> {
+    let (Some(wq), Some(wk), Some(wv), Some(wo)) = (&lw.wq, &lw.wk, &lw.wv, &lw.wo) else {
+        return cur.to_vec();
+    };
     let n_embd = cfg.n_embd;
     let n_head = cfg.n_head;
     let n_kv = cfg.n_head_kv;
@@ -1047,20 +1063,20 @@ fn detok_attn_block(
     let mut q = vec![0.0; n_head * hd];
     let mut k = vec![0.0; n_kv * hd];
     let mut v = vec![0.0; n_kv * hd];
-    lw.wq.as_ref().unwrap().gemv(cur, &mut q);
-    lw.wk.as_ref().unwrap().gemv(cur, &mut k);
-    lw.wv.as_ref().unwrap().gemv(cur, &mut v);
+    wq.gemv(cur, &mut q);
+    wk.gemv(cur, &mut k);
+    wv.gemv(cur, &mut v);
 
     // Per-head norm + RoPE.
-    let q_norm = lw.q_norm.as_ref().unwrap();
-    let k_norm = lw.k_norm.as_ref().unwrap();
-    for h in 0..n_head {
-        cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
-        apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
-    }
-    for h in 0..n_kv {
-        cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
-        apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+    if let (Some(q_norm), Some(k_norm)) = (&lw.q_norm, &lw.k_norm) {
+        for h in 0..n_head {
+            cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
+            apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
+        for h in 0..n_kv {
+            cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
+            apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
+        }
     }
 
     // Write to KV cache (ring buffer for SWA).
@@ -1102,7 +1118,7 @@ fn detok_attn_block(
     }
 
     let mut proj = vec![0.0; n_embd];
-    lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+    wo.gemv(&attn_out, &mut proj);
     proj
 }
 
@@ -1153,7 +1169,18 @@ pub fn detokenize_to_spectrum(
             }
         } else {
             // Attention: write ALL tokens' K/V, then each token attends to ALL.
-            let kv = state.attn_kv[il].as_mut().unwrap();
+            let (Some(wq), Some(wk), Some(wv), Some(wo), Some(q_norm), Some(k_norm), Some(kv)) = (
+                &lw.wq,
+                &lw.wk,
+                &lw.wv,
+                &lw.wo,
+                &lw.q_norm,
+                &lw.k_norm,
+                state.attn_kv.get_mut(il).and_then(|opt| opt.as_mut()),
+            ) else {
+                new_hidden.extend_from_slice(&hidden);
+                continue;
+            };
             let n_head = cfg.n_head;
             let n_kv = cfg.n_head_kv;
             let hd = cfg.n_embd_head;
@@ -1169,23 +1196,15 @@ pub fn detokenize_to_spectrum(
                 let mut q = vec![0.0; n_head * hd];
                 let mut k = vec![0.0; n_kv * hd];
                 let mut v = vec![0.0; n_kv * hd];
-                lw.wq.as_ref().unwrap().gemv(&cur, &mut q);
-                lw.wk.as_ref().unwrap().gemv(&cur, &mut k);
-                lw.wv.as_ref().unwrap().gemv(&cur, &mut v);
+                wq.gemv(&cur, &mut q);
+                wk.gemv(&cur, &mut k);
+                wv.gemv(&cur, &mut v);
                 for h in 0..n_head {
-                    cpu::rmsnorm(
-                        &mut q[h * hd..(h + 1) * hd],
-                        lw.q_norm.as_ref().unwrap(),
-                        cfg.rms_norm_eps,
-                    );
+                    cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
                     apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 for h in 0..n_kv {
-                    cpu::rmsnorm(
-                        &mut k[h * hd..(h + 1) * hd],
-                        lw.k_norm.as_ref().unwrap(),
-                        cfg.rms_norm_eps,
-                    );
+                    cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
                     apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
                 }
                 let wp = pos % cfg.swa_window_size;
@@ -1226,7 +1245,7 @@ pub fn detokenize_to_spectrum(
                     }
                 }
                 let mut proj = vec![0.0; n_embd];
-                lw.wo.as_ref().unwrap().gemv(&attn_out, &mut proj);
+                wo.gemv(&attn_out, &mut proj);
                 let residual = &hidden[t * n_embd..(t + 1) * n_embd];
                 let mut cur: Vec<f32> = residual.iter().zip(&proj).map(|(r, p)| r + p).collect();
                 let ffn_res = cur.clone();
@@ -1347,7 +1366,7 @@ pub fn istft_to_pcm(spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f3
 
     // Strip startup padding: the first (n_fft - hop_length) / 2 samples are
     // overlap-add artifacts. Matches llama.cpp's `padding_to_remove`.
-    let padding = (n_fft - hop_length) / 2;
+    let padding = n_fft.saturating_sub(hop_length) / 2;
     if output.len() > padding {
         output.drain(..padding);
     }
@@ -1450,7 +1469,7 @@ impl IstftStreamer {
         let n_fft_bins = n_fft / 2 + 1;
         let frame_size = n_fft_bins * 2;
         let hann = build_hann(n_fft);
-        let padding = (n_fft - hop_length) / 2;
+        let padding = n_fft.saturating_sub(hop_length) / 2;
         Self {
             n_fft,
             hop_length,

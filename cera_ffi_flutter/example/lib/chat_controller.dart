@@ -508,6 +508,7 @@ class ChatController extends ValueNotifier<ChatState> {
       return;
     }
 
+    final generationId = ++_generationId;
     final userTurn = Turn(
       role: 'user',
       text: prompt.trim(),
@@ -541,23 +542,20 @@ class ChatController extends ValueNotifier<ChatState> {
       statusText: initialStatus,
     );
 
-    final newTurns = List<Turn>.from(value.turns)
-      ..addAll([userTurn, assistantTurn]);
-
     value = value.copyWith(
-      turns: newTurns,
+      turns: [...value.turns, userTurn, assistantTurn],
       isGenerating: true,
       pendingImageBytes: () => null,
       pendingImageName: () => null,
     );
 
     final promptText = prompt.trim();
-    final framedPrompt = promptText.isNotEmpty
+    final framedPromptText = promptText.isNotEmpty
         ? promptText
         : (imageBytes != null ? 'Describe this image.' : '');
 
     debugPrint(
-      '[cera:chat] Submitting user message: "$framedPrompt" '
+      '[cera:chat] Submitting user message: "$framedPromptText" '
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
@@ -573,15 +571,16 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final messages = <CeraMessage>[
       if (systemPrompt != null) CeraMessage.system(systemPrompt),
-      CeraMessage.user(framedPrompt),
+      CeraMessage.user(framedPromptText),
     ];
 
     String formattedPrompt;
     try {
       formattedPrompt = await cera.applyChatTemplate(messages);
     } catch (_) {
-      formattedPrompt = framedPrompt;
+      formattedPrompt = framedPromptText;
     }
+    if (_disposed || generationId != _generationId) return;
 
     if (imageBytes != null) {
       try {
@@ -596,7 +595,8 @@ class ChatController extends ValueNotifier<ChatState> {
         debugPrint(
           '[cera:chat] Image successfully encoded and seeded into KV cache',
         );
-        if (_disposed || !value.isGenerating) {
+        if (_disposed || generationId != _generationId) return;
+        if (!value.isGenerating) {
           _updateLastTurn(
             (t) => t.copyWith(isGenerating: false, statusText: () => null),
           );
@@ -606,6 +606,7 @@ class ChatController extends ValueNotifier<ChatState> {
           (t) => t.copyWith(statusText: () => 'Generating response...'),
         );
       } catch (err) {
+        if (_disposed || generationId != _generationId) return;
         _updateLastTurn(
           (t) => t.copyWith(
             isGenerating: false,
@@ -618,7 +619,9 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     }
 
-    if (_disposed || !value.isGenerating) return;
+    if (_disposed || generationId != _generationId || !value.isGenerating) {
+      return;
+    }
     await _runGeneration(formattedPrompt);
   }
 
@@ -637,6 +640,7 @@ class ChatController extends ValueNotifier<ChatState> {
     final promptText = intent.prompt.trim();
     final isAsr = value.settings.audioChatMode == AudioChatMode.speechToText;
 
+    final generationId = ++_generationId;
     final userTurn = Turn(
       role: 'user',
       text: promptText,
@@ -658,6 +662,7 @@ class ChatController extends ValueNotifier<ChatState> {
     value = value.copyWith(turns: newTurns, isGenerating: true);
 
     if (isAsr) {
+      final sw = Stopwatch()..start();
       try {
         debugPrint(
           '[cera:chat] Running Speech to Text (ASR) on ${intent.pcmSamples.length} samples at ${intent.sampleRate} Hz...',
@@ -666,6 +671,9 @@ class ChatController extends ValueNotifier<ChatState> {
           intent.pcmSamples,
           sampleRate: intent.sampleRate,
         );
+        sw.stop();
+        if (_disposed || generationId != _generationId) return;
+
         debugPrint('[cera:chat] ASR result: "$transcribed"');
         final recognizedText = transcribed.trim().isNotEmpty
             ? transcribed.trim()
@@ -675,11 +683,22 @@ class ChatController extends ValueNotifier<ChatState> {
             text: recognizedText,
             isGenerating: false,
             statusText: () => null,
+            stats: TurnStats(
+              tokens: 0,
+              ttftMs: null,
+              totalMs: sw.elapsedMilliseconds,
+              tps: 0.0,
+              audioDurationSeconds: durationSec,
+              audioRtf: sw.elapsedMilliseconds > 0 && durationSec > 0
+                  ? durationSec / (sw.elapsedMilliseconds / 1000.0)
+                  : null,
+            ),
           ),
         );
         value = value.copyWith(isGenerating: false);
         return;
       } catch (err) {
+        if (_disposed || generationId != _generationId) return;
         _updateLastTurn(
           (t) => t.copyWith(
             isGenerating: false,
@@ -704,7 +723,8 @@ class ChatController extends ValueNotifier<ChatState> {
       debugPrint(
         '[cera:chat] Audio successfully encoded and seeded into KV cache',
       );
-      if (_disposed || !value.isGenerating) {
+      if (_disposed || generationId != _generationId) return;
+      if (!value.isGenerating) {
         _updateLastTurn(
           (t) => t.copyWith(isGenerating: false, statusText: () => null),
         );
@@ -714,6 +734,7 @@ class ChatController extends ValueNotifier<ChatState> {
         (t) => t.copyWith(statusText: () => 'Generating response...'),
       );
     } catch (err) {
+      if (_disposed || generationId != _generationId) return;
       _updateLastTurn(
         (t) => t.copyWith(
           isGenerating: false,
@@ -725,7 +746,9 @@ class ChatController extends ValueNotifier<ChatState> {
       return;
     }
 
-    if (_disposed || !value.isGenerating) return;
+    if (_disposed || generationId != _generationId || !value.isGenerating) {
+      return;
+    }
     await _runGeneration('');
   }
 

@@ -356,8 +356,9 @@ impl<'a> AudioOutputDecoder<'a> {
     }
 
     /// Drain any remaining audio through the ISTFT pass.
-    /// If streaming was already performed during decoding, returns the
+    /// Flushes any buffered streaming samples to the caller and returns the
     /// accumulated streamed sample count.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
         if self.streaming {
             let remaining = self.streamer.flush();
@@ -370,16 +371,17 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            for &codes in chunks {
+            let chunks = self.all_codes.chunks_exact(8);
+            let remainder = chunks.remainder();
+            for codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum(self.detok_weights, &codes)
+                    g.detokenize_to_spectrum(self.detok_weights, codes)
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
                         self.weights,
                         &mut self.detok_state,
-                        &codes,
+                        codes,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);
@@ -414,6 +416,7 @@ impl<'a> AudioOutputDecoder<'a> {
     }
 
     /// Async version of [`Self::finish`] for WebGPU / browser wasm.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub async fn finish_async(
         &mut self,
         mut sink: impl FnMut(&[f32], u32),
@@ -429,17 +432,18 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
-            for &codes in chunks {
+            let chunks = self.all_codes.chunks_exact(8);
+            let remainder = chunks.remainder();
+            for codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                    g.detokenize_to_spectrum_async(self.detok_weights, codes)
                         .await?
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
                         self.weights,
                         &mut self.detok_state,
-                        &codes,
+                        codes,
                     )
                 };
                 self.all_spectrum.extend_from_slice(&spectrum);

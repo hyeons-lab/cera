@@ -2204,7 +2204,11 @@ impl Session {
                     generated += 1;
                 }
 
-                if end_reached {
+                if end_reached
+                    || finish == FinishReason::Cancelled
+                    || generated >= opts.max_tokens
+                    || pos >= self.max_seq_len
+                {
                     break;
                 }
                 if audio_budget == 0 && !text_done {
