@@ -375,10 +375,12 @@ pub fn classify_repo_siblings(siblings: &[HfSibling]) -> HfRepoContents {
 }
 
 fn is_vision_mmproj(file: &str) -> bool {
-    file.starts_with("mmproj")
-        || file.contains("-mmproj")
-        || file.contains("_mmproj")
-        || file.contains("projector")
+    !is_audio_decoder(file)
+        && !file.contains("audio")
+        && (file.starts_with("mmproj")
+            || file.contains("-mmproj")
+            || file.contains("_mmproj")
+            || file.contains("projector"))
 }
 
 fn is_audio_decoder(file: &str) -> bool {
@@ -395,27 +397,67 @@ fn is_audio_tokenizer_gguf(file: &str) -> bool {
     file.starts_with("tokenizer")
 }
 
-/// Extract quantization string (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`, `BF16`) from a filename.
+/// Check whether two quantization tags match (case-insensitive and hyphen/underscore agnostic, zero-alloc).
+#[inline]
+pub fn quant_matches(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).all(|(b1, b2)| {
+        let c1 = if b1 == b'_' {
+            b'-'
+        } else {
+            b1.to_ascii_uppercase()
+        };
+        let c2 = if b2 == b'_' {
+            b'-'
+        } else {
+            b2.to_ascii_uppercase()
+        };
+        c1 == c2
+    })
+}
+
+/// Extract quantization string (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`, `BF16`, `QAD-Q4_0`, `QAD-Q4_K_M`) from a filename.
 pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
     let base = filename.strip_suffix(".gguf").unwrap_or(filename);
     let name = base.rsplit(['/', '\\']).next().unwrap_or(base);
 
-    // Standard known quants in priority order
-    const QUANTS: &[&str] = &[
+    const BASE_QUANTS: &[&str] = &[
         "Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0", "Q4_1", "Q5_K_M", "Q5_K_S", "Q5_K", "Q5_0", "Q5_1",
         "Q6_K", "Q8_0", "Q8_1", "Q8_K", "Q2_K", "Q3_K_M", "Q3_K_S", "Q3_K_L", "Q3_K", "F16",
         "BF16", "F32",
     ];
 
     let upper = name.to_ascii_uppercase();
-    for &q in QUANTS {
+    let bytes = upper.as_bytes();
+
+    for &q in BASE_QUANTS {
         for (pos, _) in upper.match_indices(q) {
-            let before_ok =
-                pos == 0 || matches!(upper.as_bytes()[pos - 1], b'-' | b'_' | b'.' | b'/');
             let end = pos + q.len();
-            let after_ok =
-                end == upper.len() || matches!(upper.as_bytes()[end], b'-' | b'_' | b'.' | b'/');
-            if before_ok && after_ok {
+            let after_ok = end == upper.len() || matches!(bytes[end], b'-' | b'_' | b'.' | b'/');
+            if !after_ok {
+                continue;
+            }
+
+            // Check for immediate anchored QAD prefix: [-_./]QAD[-_.] or ^QAD[-_.]
+            let has_immediate_qad = if pos >= 4
+                && (&bytes[pos - 4..pos] == b"QAD-"
+                    || &bytes[pos - 4..pos] == b"QAD_"
+                    || &bytes[pos - 4..pos] == b"QAD.")
+            {
+                let qad_start = pos - 4;
+                qad_start == 0 || matches!(bytes[qad_start - 1], b'-' | b'_' | b'.' | b'/')
+            } else {
+                false
+            };
+
+            if has_immediate_qad {
+                return Some(format!("QAD-{q}"));
+            }
+
+            let before_ok = pos == 0 || matches!(bytes[pos - 1], b'-' | b'_' | b'.' | b'/');
+            if before_ok {
                 return Some(q.to_string());
             }
         }
@@ -426,7 +468,20 @@ pub fn extract_quant_from_filename(filename: &str) -> Option<String> {
 
 /// Preference ranking for automatic quantization selection when none is requested.
 const QUANT_PREFERENCE_ORDER: &[&str] = &[
-    "Q4_K_M", "Q4_0", "Q5_K_M", "Q8_0", "Q6_K", "Q5_0", "Q4_1", "F16", "BF16",
+    "QAD-Q4_K_M",
+    "QAD-Q4_0",
+    "Q4_K_M",
+    "Q4_0",
+    "QAD-Q5_K_M",
+    "Q5_K_M",
+    "QAD-Q8_0",
+    "Q8_0",
+    "QAD-Q6_K",
+    "Q6_K",
+    "Q5_0",
+    "Q4_1",
+    "F16",
+    "BF16",
 ];
 
 /// Resolve a [`HfModelInfo`] payload to a fully populated [`Manifest`] with download URLs.
@@ -456,7 +511,12 @@ pub fn resolve_hf_manifest(
         contents
             .primary_ggufs
             .iter()
-            .find(|e| e.rfilename == *sub || e.rfilename.ends_with(sub))
+            .find(|e| {
+                e.rfilename == *sub
+                    || e.rfilename.strip_suffix(sub).is_some_and(|prefix| {
+                        prefix.is_empty() || prefix.ends_with('/') || prefix.ends_with('\\')
+                    })
+            })
             .ok_or_else(|| {
                 CeraError::Backend(format!(
                     "requested file `{sub}` not found in `{}/{}`",
@@ -470,7 +530,7 @@ pub fn resolve_hf_manifest(
                 contents
                     .primary_ggufs
                     .iter()
-                    .find(|e| e.quant.eq_ignore_ascii_case(norm_q))
+                    .find(|e| quant_matches(&e.quant, norm_q))
                     .ok_or_else(|| {
                         let available: Vec<_> = contents
                             .primary_ggufs
@@ -489,7 +549,7 @@ pub fn resolve_hf_manifest(
                     contents
                         .primary_ggufs
                         .iter()
-                        .find(|e| e.quant.eq_ignore_ascii_case(pref))
+                        .find(|e| quant_matches(&e.quant, pref))
                 })
                 .unwrap_or(&contents.primary_ggufs[0]),
         }
@@ -515,17 +575,18 @@ pub fn resolve_hf_manifest(
         let mmproj_chosen = contents
             .mmproj_ggufs
             .iter()
-            .find(|e| e.quant.eq_ignore_ascii_case(&primary_entry.quant))
+            .find(|e| quant_matches(&e.quant, &primary_entry.quant))
             .or_else(|| {
                 contents
                     .mmproj_ggufs
                     .iter()
-                    .find(|e| e.quant.eq_ignore_ascii_case("Q8_0"))
+                    .find(|e| quant_matches(&e.quant, "Q8_0"))
             })
             .or_else(|| {
-                contents.mmproj_ggufs.iter().find(|e| {
-                    e.quant.eq_ignore_ascii_case("F16") || e.quant.eq_ignore_ascii_case("BF16")
-                })
+                contents
+                    .mmproj_ggufs
+                    .iter()
+                    .find(|e| quant_matches(&e.quant, "F16") || quant_matches(&e.quant, "BF16"))
             })
             .unwrap_or(&contents.mmproj_ggufs[0]);
 
@@ -561,10 +622,10 @@ pub fn resolve_hf_manifest(
     }
 
     // Determine InferenceType
-    let inference_type = if multimodal_projector.is_some() || is_vl_pipeline {
-        InferenceType::LlamaCppImageToText
-    } else if audio_decoder.is_some() || is_audio_pipeline {
+    let inference_type = if is_audio_pipeline || audio_decoder.is_some() {
         InferenceType::LlamaCppLfm2AudioV1
+    } else if multimodal_projector.is_some() || is_vl_pipeline {
+        InferenceType::LlamaCppImageToText
     } else {
         InferenceType::LlamaCppTextToText
     };
@@ -577,12 +638,17 @@ pub fn resolve_hf_manifest(
         extras,
     };
 
-    let defaults = generation_defaults.unwrap_or(GenerationDefaults::Text {
-        temperature: None,
-        min_p: None,
-        top_p: None,
-        top_k: None,
-        repetition_penalty: None,
+    let defaults = generation_defaults.unwrap_or(match inference_type {
+        InferenceType::LlamaCppLfm2AudioV1 => GenerationDefaults::Audio {
+            number_of_decoding_threads: None,
+        },
+        _ => GenerationDefaults::Text {
+            temperature: None,
+            min_p: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+        },
     });
 
     let mut raw_map = serde_json::Map::new();
@@ -990,6 +1056,95 @@ mod tests {
         assert_eq!(
             spec_rev.api_url(),
             "https://huggingface.co/api/models/LiquidAI/LFM2.5-VL-3B-GGUF?revision=v1.0"
+        );
+    }
+
+    #[test]
+    fn test_qad_quant_extraction_and_resolution() {
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-2.6B-QAD-Q4_0.gguf").as_deref(),
+            Some("QAD-Q4_0")
+        );
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-2.6B-QAD_Q4_0.gguf").as_deref(),
+            Some("QAD-Q4_0")
+        );
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-2.6B.QAD.Q4_0.gguf").as_deref(),
+            Some("QAD-Q4_0")
+        );
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-2.6B-QAD-Q4_K_M.gguf").as_deref(),
+            Some("QAD-Q4_K_M")
+        );
+        assert_eq!(
+            extract_quant_from_filename("LFM2.5-2.6B-Q4_0.gguf").as_deref(),
+            Some("Q4_0")
+        );
+        assert_eq!(
+            extract_quant_from_filename("QADNet-model-Q4_0.gguf").as_deref(),
+            Some("Q4_0")
+        );
+
+        assert!(quant_matches("QAD-Q4_0", "qad_q4_0"));
+        assert!(quant_matches("QAD_Q4_0", "QAD-Q4-0"));
+        assert!(quant_matches("Q4_K_M", "q4-k-m"));
+        assert!(!quant_matches("QAD-Q4_0", "Q4_0"));
+
+        let siblings = vec![
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-Q4_0.gguf".into(),
+                size: Some(1500000000),
+            },
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-QAD-Q4_0.gguf".into(),
+                size: Some(1500000000),
+            },
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-Q8_0.gguf".into(),
+                size: Some(2800000000),
+            },
+        ];
+
+        let spec = HfSpec::parse("LiquidAI/LFM2.5-2.6B-GGUF").unwrap();
+        let info = HfModelInfo {
+            id: "LiquidAI/LFM2.5-2.6B-GGUF".into(),
+            siblings,
+            tags: vec!["text-generation".into()],
+            pipeline_tag: Some("text-generation".into()),
+            config: None,
+        };
+
+        // 1. Explicit QAD-Q4_0 request
+        let manifest_qad = resolve_hf_manifest(&spec, &info, Some("QAD-Q4_0"), None).unwrap();
+        assert!(
+            manifest_qad
+                .files
+                .model
+                .contains("LFM2.5-2.6B-QAD-Q4_0.gguf")
+        );
+
+        // 2. Explicit QAD_Q4_0 underscore request
+        let manifest_qad_underscore =
+            resolve_hf_manifest(&spec, &info, Some("qad_q4_0"), None).unwrap();
+        assert!(
+            manifest_qad_underscore
+                .files
+                .model
+                .contains("LFM2.5-2.6B-QAD-Q4_0.gguf")
+        );
+
+        // 3. Explicit standard Q4_0 request
+        let manifest_ptq = resolve_hf_manifest(&spec, &info, Some("Q4_0"), None).unwrap();
+        assert!(manifest_ptq.files.model.contains("LFM2.5-2.6B-Q4_0.gguf"));
+
+        // 4. Default preference should prefer QAD-Q4_0 over standard Q4_0
+        let manifest_default = resolve_hf_manifest(&spec, &info, None, None).unwrap();
+        assert!(
+            manifest_default
+                .files
+                .model
+                .contains("LFM2.5-2.6B-QAD-Q4_0.gguf")
         );
     }
 }
