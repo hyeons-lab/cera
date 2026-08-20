@@ -202,6 +202,73 @@ void main(List<String> args) {
     stdout.writeln('  implemented _uniffiEncodeEngineConfig');
   }
 
+  // Fix 7: clone object parameter in ffiVadIteratorInvokeProcessChunk.
+  // When passing `vad: &FfiSileroVad` to `FfiVadIterator.processChunk`, Rust lifts
+  // the parameter with `into_arc` (ownership transfer). Passing the raw handle
+  // causes Rust to drop the caller's only reference on return, invalidating the
+  // handle on subsequent chunk calls. Cloning the handle preserves ownership.
+  const vadUncloned = '(argBuf + 1).ref.u64 = FfiSileroVadFfiCodec.lower(vad);';
+  const vadCloned =
+      "final int clonedVadHandle;\n"
+      "      {\n"
+      "        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
+      "        try {\n"
+      "          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
+      "          cloneStatusPtr.ref.errorBuf\n"
+      "            ..capacity = 0\n"
+      "            ..len = 0\n"
+      "            ..data = ffi.nullptr;\n"
+      "          clonedVadHandle = _ffiSileroVadClone(FfiSileroVadFfiCodec.lower(vad), cloneStatusPtr);\n"
+      "          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
+      "            throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
+      "          }\n"
+      "        } finally {\n"
+      "          calloc.free(cloneStatusPtr);\n"
+      "        }\n"
+      "      }\n"
+      "      (argBuf + 1).ref.u64 = clonedVadHandle;";
+  if (src.contains(vadUncloned)) {
+    src = src.replaceAll(vadUncloned, vadCloned);
+    applied += 1;
+    stdout.writeln(
+      '  cloned vad handle in ffiVadIteratorInvokeProcessChunk (1 site)',
+    );
+  }
+
+  // Fix 8: clone object parameter in sessionInvokeAttachLora.
+  // When passing `adapters: Arc<LoraAdapters>` to `Session.attachLora`, Rust lifts
+  // the parameter with `into_arc` (ownership transfer). Passing the raw handle
+  // causes Rust to drop the caller's only reference on return, invalidating the
+  // handle on subsequent calls. Cloning the handle preserves ownership.
+  const adaptersUncloned =
+      '(argBuf + 1).ref.u64 = LoraAdaptersFfiCodec.lower(adapters);';
+  const adaptersCloned =
+      "final int clonedLoraHandle;\n"
+      "      {\n"
+      "        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
+      "        try {\n"
+      "          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
+      "          cloneStatusPtr.ref.errorBuf\n"
+      "            ..capacity = 0\n"
+      "            ..len = 0\n"
+      "            ..data = ffi.nullptr;\n"
+      "          clonedLoraHandle = _loraAdaptersClone(LoraAdaptersFfiCodec.lower(adapters), cloneStatusPtr);\n"
+      "          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
+      "            throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
+      "          }\n"
+      "        } finally {\n"
+      "          calloc.free(cloneStatusPtr);\n"
+      "        }\n"
+      "      }\n"
+      "      (argBuf + 1).ref.u64 = clonedLoraHandle;";
+  if (src.contains(adaptersUncloned)) {
+    src = src.replaceAll(adaptersUncloned, adaptersCloned);
+    applied += 1;
+    stdout.writeln(
+      '  cloned adapters handle in sessionInvokeAttachLora (1 site)',
+    );
+  }
+
   if (applied == 0) {
     stdout.writeln('  no patches needed (already patched or upstream fixed).');
   }

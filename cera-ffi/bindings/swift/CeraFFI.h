@@ -486,6 +486,71 @@ void uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink(const UniffiVT
 void uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress(uint64_t ptr, RustBuffer url, uint64_t bytes_downloaded, RustBuffer total_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFISILEROVAD
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFISILEROVAD
+uint64_t uniffi_cera_ffi_fn_clone_ffisilerovad(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFISILEROVAD
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFISILEROVAD
+void uniffi_cera_ffi_fn_free_ffisilerovad(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFISILEROVAD_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFISILEROVAD_FROM_BYTES
+uint64_t uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes(RustBuffer bytes, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFISILEROVAD_FROM_FILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFISILEROVAD_FROM_FILE
+uint64_t uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_GET_SPEECH_TIMESTAMPS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_GET_SPEECH_TIMESTAMPS
+RustBuffer uniffi_cera_ffi_fn_method_ffisilerovad_get_speech_timestamps(uint64_t ptr, RustBuffer audio, RustBuffer rate, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_PROCESS_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_PROCESS_CHUNK
+float uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk(uint64_t ptr, RustBuffer chunk, RustBuffer rate, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_RESET
+void uniffi_cera_ffi_fn_method_ffisilerovad_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFIVADITERATOR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_FFIVADITERATOR
+uint64_t uniffi_cera_ffi_fn_clone_ffivaditerator(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFIVADITERATOR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_FFIVADITERATOR
+void uniffi_cera_ffi_fn_free_ffivaditerator(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIVADITERATOR_NEW
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIVADITERATOR_NEW
+uint64_t uniffi_cera_ffi_fn_constructor_ffivaditerator_new(RustBuffer rate, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FLUSH
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FLUSH
+RustBuffer uniffi_cera_ffi_fn_method_ffivaditerator_flush(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_PROCESS_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_PROCESS_CHUNK
+RustBuffer uniffi_cera_ffi_fn_method_ffivaditerator_process_chunk(uint64_t ptr, uint64_t vad, RustBuffer chunk, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_RESET
+void uniffi_cera_ffi_fn_method_ffivaditerator_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_LORAADAPTERS
 uint64_t uniffi_cera_ffi_fn_clone_loraadapters(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -688,6 +753,12 @@ uint64_t uniffi_cera_ffi_fn_func_list_leap_bundles_async(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_PARSE_TOOL_CALLS
 RustBuffer uniffi_cera_ffi_fn_func_parse_tool_calls(RustBuffer text, RustBuffer format, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_SILERO_VAD_DEFAULT_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_SILERO_VAD_DEFAULT_CONFIG
+RustBuffer uniffi_cera_ffi_fn_func_silero_vad_default_config(RustCallStatus *_Nonnull out_status
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_TOOL_GRAMMAR
@@ -991,6 +1062,12 @@ uint16_t uniffi_cera_ffi_checksum_func_parse_tool_calls(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_SILERO_VAD_DEFAULT_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_SILERO_VAD_DEFAULT_CONFIG
+uint16_t uniffi_cera_ffi_checksum_func_silero_vad_default_config(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_TOOL_GRAMMAR
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_TOOL_GRAMMAR
 uint16_t uniffi_cera_ffi_checksum_func_tool_grammar(void
@@ -1126,6 +1203,42 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_vocab_size(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DOWNLOADPROGRESSSINK_ON_PROGRESS
 uint16_t uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_GET_SPEECH_TIMESTAMPS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_GET_SPEECH_TIMESTAMPS
+uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_PROCESS_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_PROCESS_CHUNK
+uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_RESET
+uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FLUSH
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FLUSH
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_flush(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_PROCESS_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_PROCESS_CHUNK
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_RESET
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_reset(void
     
 );
 #endif
@@ -1336,6 +1449,24 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_path(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CERAENGINE_FROM_PATH_ASYNC
 uint16_t uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFISILEROVAD_FROM_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFISILEROVAD_FROM_BYTES
+uint16_t uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFISILEROVAD_FROM_FILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFISILEROVAD_FROM_FILE
+uint16_t uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIVADITERATOR_NEW
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIVADITERATOR_NEW
+uint16_t uniffi_cera_ffi_checksum_constructor_ffivaditerator_new(void
     
 );
 #endif

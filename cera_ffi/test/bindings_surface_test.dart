@@ -92,7 +92,38 @@ void main() {
       isA<Future<CeraEngine> Function(String, String, EngineConfig)>(),
     );
   });
+
+  test('FfiSileroVad and VAD types are exposed on the Dart surface', () {
+    expect(_vadSurfaceGuard, isA<Function>());
+    expect(_vadIteratorSurfaceGuard, isA<Function>());
+    const cfg = FfiVadConfig(
+      threshold: 0.5,
+      negThreshold: 0.35,
+      minSpeechDurationMs: 64,
+      minSilenceDurationMs: 100,
+      speechPadMs: 30,
+    );
+    expect(cfg.threshold, 0.5);
+    expect(cfg.minSpeechDurationMs, 64);
+    expect(FfiVadSampleRate.values, contains(FfiVadSampleRate.rate16kHz));
+    expect(FfiVadSampleRate.values, contains(FfiVadSampleRate.rate8kHz));
+  });
 }
+
+void Function(FfiSileroVad) get _vadSurfaceGuard => (FfiSileroVad vad) {
+  vad.processChunk(const <double>[], FfiVadSampleRate.rate16kHz);
+  vad.getSpeechTimestamps(const <double>[], FfiVadSampleRate.rate16kHz, null);
+  vad.reset();
+};
+
+void Function(FfiVadIterator, FfiSileroVad) get _vadIteratorSurfaceGuard => (
+  FfiVadIterator it,
+  FfiSileroVad vad,
+) {
+  it.processChunk(vad, const <double>[]);
+  it.flush();
+  it.reset();
+};
 
 /// Compile-time reference to every method that used to be a runtime stub.
 ///

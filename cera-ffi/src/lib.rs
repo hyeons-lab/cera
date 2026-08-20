@@ -47,6 +47,11 @@
 //! - [`ModalitySink`] — UniFFI foreign-trait callback for streaming
 //!   decode output to Kotlin / Swift / Python implementations.
 //!
+//! Voice Activity Detection (VAD):
+//! - [`FfiSileroVad`] — native Silero VAD v5 speech detector for 16 kHz and 8 kHz audio.
+//! - [`FfiVadIterator`] — stateful speech boundary detector emitting start/end events for live audio streams.
+//! - [`FfiVadConfig`], [`FfiVadSampleRate`], [`FfiSpeechTimestamp`], [`FfiVadEvent`].
+//!
 //! Error:
 //! - [`FfiError`] — typed error surface mirroring [`cera::CeraError`]
 //!   one-to-one (`ContextOverflow { max_seq_len, by }`,
@@ -2523,6 +2528,270 @@ pub fn cpu_backend_report() -> String {
     cera::cpu_features().report()
 }
 
+// ---------------------------------------------------------------------------
+// Voice Activity Detection (VAD)
+// ---------------------------------------------------------------------------
+
+/// Audio sample rate supported by Silero VAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum FfiVadSampleRate {
+    Rate16kHz,
+    Rate8kHz,
+}
+
+impl From<FfiVadSampleRate> for cera::vad::VadSampleRate {
+    fn from(r: FfiVadSampleRate) -> Self {
+        match r {
+            FfiVadSampleRate::Rate16kHz => cera::vad::VadSampleRate::Rate16kHz,
+            FfiVadSampleRate::Rate8kHz => cera::vad::VadSampleRate::Rate8kHz,
+        }
+    }
+}
+
+impl From<cera::vad::VadSampleRate> for FfiVadSampleRate {
+    fn from(r: cera::vad::VadSampleRate) -> Self {
+        match r {
+            cera::vad::VadSampleRate::Rate16kHz => FfiVadSampleRate::Rate16kHz,
+            cera::vad::VadSampleRate::Rate8kHz => FfiVadSampleRate::Rate8kHz,
+        }
+    }
+}
+
+/// A detected speech segment with sample and millisecond boundaries.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiSpeechTimestamp {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_ms: f32,
+    pub end_ms: f32,
+}
+
+impl From<cera::vad::SpeechTimestamp> for FfiSpeechTimestamp {
+    fn from(ts: cera::vad::SpeechTimestamp) -> Self {
+        Self {
+            start_sample: ts.start_sample,
+            end_sample: ts.end_sample,
+            start_ms: ts.start_ms,
+            end_ms: ts.end_ms,
+        }
+    }
+}
+
+/// Configuration options for batch speech detection and segmentation.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiVadConfig {
+    #[uniffi(default = 0.5)]
+    pub threshold: f32,
+    #[uniffi(default = 0.35)]
+    pub neg_threshold: f32,
+    #[uniffi(default = 64)]
+    pub min_speech_duration_ms: u32,
+    #[uniffi(default = 100)]
+    pub min_silence_duration_ms: u32,
+    #[uniffi(default = 30)]
+    pub speech_pad_ms: u32,
+}
+
+impl From<cera::vad::VadConfig> for FfiVadConfig {
+    fn from(cfg: cera::vad::VadConfig) -> Self {
+        Self {
+            threshold: cfg.threshold,
+            neg_threshold: cfg.neg_threshold,
+            min_speech_duration_ms: cfg.min_speech_duration_ms as u32,
+            min_silence_duration_ms: cfg.min_silence_duration_ms as u32,
+            speech_pad_ms: cfg.speech_pad_ms as u32,
+        }
+    }
+}
+
+impl Default for FfiVadConfig {
+    fn default() -> Self {
+        cera::vad::VadConfig::default().into()
+    }
+}
+
+impl From<FfiVadConfig> for cera::vad::VadConfig {
+    fn from(cfg: FfiVadConfig) -> Self {
+        Self {
+            threshold: cfg.threshold,
+            neg_threshold: cfg.neg_threshold,
+            min_speech_duration_ms: cfg.min_speech_duration_ms as usize,
+            min_silence_duration_ms: cfg.min_silence_duration_ms as usize,
+            speech_pad_ms: cfg.speech_pad_ms as usize,
+        }
+    }
+}
+
+/// Default VAD configuration parameters.
+#[uniffi::export]
+pub fn silero_vad_default_config() -> FfiVadConfig {
+    FfiVadConfig::default()
+}
+
+/// Stateful Silero Voice Activity Detector (VAD) session.
+#[derive(uniffi::Object)]
+pub struct FfiSileroVad {
+    inner: std::sync::Mutex<cera::vad::SileroVad>,
+}
+
+impl FfiSileroVad {
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::vad::SileroVad>, FfiError> {
+        self.inner.lock().map_err(|e| FfiError::Backend {
+            detail: format!("VAD mutex poisoned: {e}"),
+        })
+    }
+}
+
+#[uniffi::export]
+impl FfiSileroVad {
+    /// Load a Silero VAD model from a `.gguf` file path.
+    #[uniffi::constructor]
+    pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
+        let vad = cera::vad::SileroVad::from_file(&path).map_err(|e| FfiError::Backend {
+            detail: e.to_string(),
+        })?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(vad),
+        }))
+    }
+
+    /// Load a Silero VAD model from in-memory GGUF bytes.
+    #[uniffi::constructor]
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError> {
+        let vad = cera::vad::SileroVad::from_bytes(bytes).map_err(|e| FfiError::Backend {
+            detail: e.to_string(),
+        })?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(vad),
+        }))
+    }
+
+    /// Reset recurrent state tensors and streaming context to zeros.
+    pub fn reset(&self) -> Result<(), FfiError> {
+        let mut vad = self.lock_inner()?;
+        vad.reset();
+        Ok(())
+    }
+
+    /// Process a single chunk of audio and return the speech probability in `[0.0, 1.0]`.
+    ///
+    /// - 16 kHz: chunk must have exactly 512 samples.
+    /// - 8 kHz: chunk must have exactly 256 samples.
+    pub fn process_chunk(&self, chunk: Vec<f32>, rate: FfiVadSampleRate) -> Result<f32, FfiError> {
+        let mut vad = self.lock_inner()?;
+        vad.process_chunk(&chunk, rate.into())
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })
+    }
+
+    /// Process an entire audio buffer and return speech timestamps.
+    pub fn get_speech_timestamps(
+        &self,
+        audio: Vec<f32>,
+        rate: FfiVadSampleRate,
+        config: Option<FfiVadConfig>,
+    ) -> Result<Vec<FfiSpeechTimestamp>, FfiError> {
+        let mut vad = self.lock_inner()?;
+        let cfg = config.unwrap_or_default().into();
+        let timestamps = vad
+            .get_speech_timestamps(&audio, rate.into(), &cfg)
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(timestamps.into_iter().map(Into::into).collect())
+    }
+}
+
+/// A speech boundary event emitted during streaming audio processing.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiVadEvent {
+    SpeechStart {
+        sample: u64,
+        ms: f32,
+    },
+    SpeechEnd {
+        start_sample: u64,
+        end_sample: u64,
+        start_ms: f32,
+        end_ms: f32,
+    },
+}
+
+impl From<cera::vad::VadEvent> for FfiVadEvent {
+    fn from(ev: cera::vad::VadEvent) -> Self {
+        match ev {
+            cera::vad::VadEvent::SpeechStart { sample, ms } => Self::SpeechStart { sample, ms },
+            cera::vad::VadEvent::SpeechEnd {
+                start_sample,
+                end_sample,
+                start_ms,
+                end_ms,
+            } => Self::SpeechEnd {
+                start_sample,
+                end_sample,
+                start_ms,
+                end_ms,
+            },
+        }
+    }
+}
+
+/// Stateful speech boundary detector for live audio streams.
+#[derive(uniffi::Object)]
+pub struct FfiVadIterator {
+    inner: std::sync::Mutex<cera::vad::VadIterator>,
+}
+
+impl FfiVadIterator {
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::vad::VadIterator>, FfiError> {
+        self.inner.lock().map_err(|e| FfiError::Backend {
+            detail: format!("VAD iterator mutex poisoned: {e}"),
+        })
+    }
+}
+
+#[uniffi::export]
+impl FfiVadIterator {
+    /// Create a new streaming speech boundary iterator.
+    #[uniffi::constructor]
+    pub fn new(rate: FfiVadSampleRate, config: Option<FfiVadConfig>) -> Arc<Self> {
+        let cfg = config.unwrap_or_default().into();
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(cera::vad::VadIterator::new(rate.into(), cfg)),
+        })
+    }
+
+    /// Reset iterator state.
+    pub fn reset(&self) -> Result<(), FfiError> {
+        let mut it = self.lock_inner()?;
+        it.reset();
+        Ok(())
+    }
+
+    /// Flush any pending in-flight speech segment at the end of an audio stream.
+    pub fn flush(&self) -> Result<Option<FfiVadEvent>, FfiError> {
+        let mut it = self.lock_inner()?;
+        Ok(it.flush().map(Into::into))
+    }
+
+    /// Process a single chunk of audio and return any speech start or end event.
+    pub fn process_chunk(
+        &self,
+        vad: &FfiSileroVad,
+        chunk: Vec<f32>,
+    ) -> Result<Option<FfiVadEvent>, FfiError> {
+        let mut it = self.lock_inner()?;
+        let mut v = vad.lock_inner()?;
+        let ev = it
+            .process_chunk(&mut v, &chunk)
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(ev.map(Into::into))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3307,5 +3576,30 @@ mod tests {
         );
         assert_eq!(detect_tool_format("qwen3".into()), Some(ToolFormat::Hermes));
         assert_eq!(detect_tool_format("gpt2".into()), None);
+    }
+
+    #[test]
+    fn vad_config_and_sample_rate_roundtrip() {
+        let def = silero_vad_default_config();
+        assert_eq!(def.threshold, 0.5);
+        assert_eq!(def.neg_threshold, 0.35);
+        assert_eq!(def.min_speech_duration_ms, 64);
+        assert_eq!(def.min_silence_duration_ms, 100);
+        assert_eq!(def.speech_pad_ms, 30);
+
+        let core_cfg: cera::vad::VadConfig = def.clone().into();
+        assert_eq!(core_cfg.threshold, def.threshold);
+
+        let r16 = FfiVadSampleRate::Rate16kHz;
+        let core_r16: cera::vad::VadSampleRate = r16.into();
+        assert_eq!(core_r16, cera::vad::VadSampleRate::Rate16kHz);
+        let back_r16: FfiVadSampleRate = core_r16.into();
+        assert_eq!(back_r16, r16);
+
+        let r8 = FfiVadSampleRate::Rate8kHz;
+        let core_r8: cera::vad::VadSampleRate = r8.into();
+        assert_eq!(core_r8, cera::vad::VadSampleRate::Rate8kHz);
+        let back_r8: FfiVadSampleRate = core_r8.into();
+        assert_eq!(back_r8, r8);
     }
 }

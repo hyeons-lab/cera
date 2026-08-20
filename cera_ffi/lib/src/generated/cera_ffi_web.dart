@@ -163,6 +163,132 @@ class EngineConfig {
   int get hashCode => Object.hash(contextSize, backend, bundleRepo);
 }
 
+/// A detected speech segment with sample and millisecond boundaries.
+class FfiSpeechTimestamp {
+  const FfiSpeechTimestamp({
+    required this.startSample,
+    required this.endSample,
+    required this.startMs,
+    required this.endMs,
+  });
+
+  final int startSample;
+  final int endSample;
+  final double startMs;
+  final double endMs;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'startSample': this.startSample,
+      'endSample': this.endSample,
+      'startMs': this.startMs,
+      'endMs': this.endMs,
+    };
+  }
+
+  factory FfiSpeechTimestamp.fromJson(Map<String, dynamic> json) {
+    return FfiSpeechTimestamp(
+      startSample: (json['startSample'] as num).toInt(),
+      endSample: (json['endSample'] as num).toInt(),
+      startMs: (json['startMs'] as num).toDouble(),
+      endMs: (json['endMs'] as num).toDouble(),
+    );
+  }
+
+  FfiSpeechTimestamp copyWith({
+    int? startSample,
+    int? endSample,
+    double? startMs,
+    double? endMs,
+  }) {
+    return FfiSpeechTimestamp(
+      startSample: startSample ?? this.startSample,
+      endSample: endSample ?? this.endSample,
+      startMs: startMs ?? this.startMs,
+      endMs: endMs ?? this.endMs,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiSpeechTimestamp(startSample: $startSample, endSample: $endSample, startMs: $startMs, endMs: $endMs)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiSpeechTimestamp && startSample == other.startSample && endSample == other.endSample && startMs == other.startMs && endMs == other.endMs;
+
+  @override
+  int get hashCode => Object.hash(startSample, endSample, startMs, endMs);
+}
+
+/// Configuration options for batch speech detection and segmentation.
+class FfiVadConfig {
+  const FfiVadConfig({
+    this.threshold = 0.5,
+    this.negThreshold = 0.35,
+    this.minSpeechDurationMs = 64,
+    this.minSilenceDurationMs = 100,
+    this.speechPadMs = 30,
+  });
+
+  final double threshold;
+  final double negThreshold;
+  final int minSpeechDurationMs;
+  final int minSilenceDurationMs;
+  final int speechPadMs;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'threshold': this.threshold,
+      'negThreshold': this.negThreshold,
+      'minSpeechDurationMs': this.minSpeechDurationMs,
+      'minSilenceDurationMs': this.minSilenceDurationMs,
+      'speechPadMs': this.speechPadMs,
+    };
+  }
+
+  factory FfiVadConfig.fromJson(Map<String, dynamic> json) {
+    return FfiVadConfig(
+      threshold: json.containsKey('threshold') ? (json['threshold'] as num).toDouble() : 0.5,
+      negThreshold: json.containsKey('negThreshold') ? (json['negThreshold'] as num).toDouble() : 0.35,
+      minSpeechDurationMs: json.containsKey('minSpeechDurationMs') ? (json['minSpeechDurationMs'] as num).toInt() : 64,
+      minSilenceDurationMs: json.containsKey('minSilenceDurationMs') ? (json['minSilenceDurationMs'] as num).toInt() : 100,
+      speechPadMs: json.containsKey('speechPadMs') ? (json['speechPadMs'] as num).toInt() : 30,
+    );
+  }
+
+  FfiVadConfig copyWith({
+    double? threshold,
+    double? negThreshold,
+    int? minSpeechDurationMs,
+    int? minSilenceDurationMs,
+    int? speechPadMs,
+  }) {
+    return FfiVadConfig(
+      threshold: threshold ?? this.threshold,
+      negThreshold: negThreshold ?? this.negThreshold,
+      minSpeechDurationMs: minSpeechDurationMs ?? this.minSpeechDurationMs,
+      minSilenceDurationMs: minSilenceDurationMs ?? this.minSilenceDurationMs,
+      speechPadMs: speechPadMs ?? this.speechPadMs,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiVadConfig(threshold: $threshold, negThreshold: $negThreshold, minSpeechDurationMs: $minSpeechDurationMs, minSilenceDurationMs: $minSilenceDurationMs, speechPadMs: $speechPadMs)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiVadConfig && threshold == other.threshold && negThreshold == other.negThreshold && minSpeechDurationMs == other.minSpeechDurationMs && minSilenceDurationMs == other.minSilenceDurationMs && speechPadMs == other.speechPadMs;
+
+  @override
+  int get hashCode => Object.hash(threshold, negThreshold, minSpeechDurationMs, minSilenceDurationMs, speechPadMs);
+}
+
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
@@ -1267,6 +1393,65 @@ final class FfiErrorLoraUnsupportedByBackend extends FfiError {
   int get hashCode => detail.hashCode;
 }
 
+/// A speech boundary event emitted during streaming audio processing.
+sealed class FfiVadEvent {
+  const FfiVadEvent();
+}
+
+final class FfiVadEventSpeechStart extends FfiVadEvent {
+  const FfiVadEventSpeechStart({
+    required this.sample,
+    required this.ms,
+  });
+  final int sample;
+  final double ms;
+
+  @override
+  String toString() {
+    return 'FfiVadEventSpeechStart(sample: $sample, ms: $ms)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiVadEventSpeechStart && sample == other.sample && ms == other.ms;
+
+  @override
+  int get hashCode => Object.hash(sample, ms);
+}
+
+final class FfiVadEventSpeechEnd extends FfiVadEvent {
+  const FfiVadEventSpeechEnd({
+    required this.startSample,
+    required this.endSample,
+    required this.startMs,
+    required this.endMs,
+  });
+  final int startSample;
+  final int endSample;
+  final double startMs;
+  final double endMs;
+
+  @override
+  String toString() {
+    return 'FfiVadEventSpeechEnd(startSample: $startSample, endSample: $endSample, startMs: $startMs, endMs: $endMs)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiVadEventSpeechEnd && startSample == other.startSample && endSample == other.endSample && startMs == other.startMs && endMs == other.endMs;
+
+  @override
+  int get hashCode => Object.hash(startSample, endSample, startMs, endMs);
+}
+
+/// Audio sample rate supported by Silero VAD.
+enum FfiVadSampleRate {
+  rate16kHz,
+  rate8kHz,
+}
+
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
 sealed class FinishReason {
   const FinishReason();
@@ -1921,6 +2106,62 @@ FfiError _decodeFfiError(String raw) {
   }
 }
 
+String _encodeFfiVadEvent(FfiVadEvent value) {
+  if (value is FfiVadEventSpeechStart) {
+    return jsonEncode({
+      'tag': 'speechStart',
+      'sample': value.sample,
+      'ms': value.ms,
+    });
+  }
+  if (value is FfiVadEventSpeechEnd) {
+    return jsonEncode({
+      'tag': 'speechEnd',
+      'startSample': value.startSample,
+      'endSample': value.endSample,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+    });
+  }
+  throw StateError('Unknown FfiVadEvent variant instance: $value');
+}
+
+FfiVadEvent _decodeFfiVadEvent(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'speechStart':
+      return FfiVadEventSpeechStart(
+        sample: (map['sample'] as num).toInt(),
+        ms: (map['ms'] as num).toDouble(),
+      );
+    case 'speechEnd':
+      return FfiVadEventSpeechEnd(
+        startSample: (map['startSample'] as num).toInt(),
+        endSample: (map['endSample'] as num).toInt(),
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+      );
+    default:
+      throw StateError('Unknown FfiVadEvent variant tag: $tag');
+  }
+}
+
+String _encodeFfiVadSampleRate(FfiVadSampleRate value) {
+  return switch (value) {
+    FfiVadSampleRate.rate16kHz => 'rate16kHz',
+    FfiVadSampleRate.rate8kHz => 'rate8kHz',
+  };
+}
+
+FfiVadSampleRate _decodeFfiVadSampleRate(String raw) {
+  return switch (raw) {
+    'rate16kHz' => FfiVadSampleRate.rate16kHz,
+    'rate8kHz' => FfiVadSampleRate.rate8kHz,
+    _ => throw StateError('Unknown FfiVadSampleRate variant: $raw'),
+  };
+}
+
 String _encodeFinishReason(FinishReason value) {
   if (value is FinishReasonMaxTokens) {
     return jsonEncode({
@@ -2203,6 +2444,22 @@ final class FfiErrorFfiCodec {
   static String encode(FfiError value) => _encodeFfiError(value);
 
   static FfiError decode(String raw) => _decodeFfiError(raw);
+}
+
+final class FfiVadEventFfiCodec {
+  const FfiVadEventFfiCodec._();
+
+  static String encode(FfiVadEvent value) => _encodeFfiVadEvent(value);
+
+  static FfiVadEvent decode(String raw) => _decodeFfiVadEvent(raw);
+}
+
+final class FfiVadSampleRateFfiCodec {
+  const FfiVadSampleRateFfiCodec._();
+
+  static String encode(FfiVadSampleRate value) => _encodeFfiVadSampleRate(value);
+
+  static FfiVadSampleRate decode(String raw) => _decodeFfiVadSampleRate(raw);
 }
 
 final class FinishReasonFfiCodec {
@@ -2652,6 +2909,64 @@ abstract interface class DownloadProgressSink {
 final class DownloadProgressSinkFfiCodec {
   static int lower(DownloadProgressSink value) => _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lower');
   static DownloadProgressSink lift(int handle) => _unsupportedOnWeb('DownloadProgressSinkFfiCodec.lift');
+}
+
+/// Stateful Silero Voice Activity Detector (VAD) session.
+final class FfiSileroVad {
+  FfiSileroVad._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiSileroVad.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiSileroVad.close');
+
+  /// Load a Silero VAD model from in-memory GGUF bytes.
+  static FfiSileroVad fromBytes(Uint8List bytes) => _unsupportedOnWeb('FfiSileroVad.fromBytes');
+
+  /// Load a Silero VAD model from a `.gguf` file path.
+  static FfiSileroVad fromFile(String path) => _unsupportedOnWeb('FfiSileroVad.fromFile');
+
+  /// Process an entire audio buffer and return speech timestamps.
+  List<FfiSpeechTimestamp> getSpeechTimestamps(List<double> audio, FfiVadSampleRate rate, FfiVadConfig? config) => _unsupportedOnWeb('FfiSileroVad.getSpeechTimestamps');
+
+  /// Process a single chunk of audio and return the speech probability in `[0.0, 1.0]`.
+  ///
+  /// - 16 kHz: chunk must have exactly 512 samples.
+  /// - 8 kHz: chunk must have exactly 256 samples.
+  double processChunk(List<double> chunk, FfiVadSampleRate rate) => _unsupportedOnWeb('FfiSileroVad.processChunk');
+
+  /// Reset recurrent state tensors and streaming context to zeros.
+  void reset() => _unsupportedOnWeb('FfiSileroVad.reset');
+}
+
+final class FfiSileroVadFfiCodec {
+  static int lower(FfiSileroVad value) => _unsupportedOnWeb('FfiSileroVadFfiCodec.lower');
+  static FfiSileroVad lift(int handle) => _unsupportedOnWeb('FfiSileroVadFfiCodec.lift');
+}
+
+/// Stateful speech boundary detector for live audio streams.
+final class FfiVadIterator {
+  FfiVadIterator._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiVadIterator.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiVadIterator.close');
+
+  /// Create a new streaming speech boundary iterator.
+  static FfiVadIterator create(FfiVadSampleRate rate, FfiVadConfig? config) => _unsupportedOnWeb('FfiVadIterator.create');
+
+  /// Flush any pending in-flight speech segment at the end of an audio stream.
+  FfiVadEvent? flush() => _unsupportedOnWeb('FfiVadIterator.flush');
+
+  /// Process a single chunk of audio and return any speech start or end event.
+  FfiVadEvent? processChunk(FfiSileroVad vad, List<double> chunk) => _unsupportedOnWeb('FfiVadIterator.processChunk');
+
+  /// Reset iterator state.
+  void reset() => _unsupportedOnWeb('FfiVadIterator.reset');
+}
+
+final class FfiVadIteratorFfiCodec {
+  static int lower(FfiVadIterator value) => _unsupportedOnWeb('FfiVadIteratorFfiCodec.lower');
+  static FfiVadIterator lift(int handle) => _unsupportedOnWeb('FfiVadIteratorFfiCodec.lift');
 }
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
@@ -3112,6 +3427,9 @@ Future<List<LeapBundleEntry>> listLeapBundlesAsync() => _unsupportedOnWeb('listL
 /// answered in prose). Errors only when a call section is present but
 /// unrecoverably malformed.
 List<ToolCall> parseToolCalls(String text, ToolFormat format) => _unsupportedOnWeb('parseToolCalls');
+
+/// Default VAD configuration parameters.
+FfiVadConfig sileroVadDefaultConfig() => _unsupportedOnWeb('sileroVadDefaultConfig');
 
 /// Build a GBNF grammar string constraining output to a valid call for one
 /// of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set

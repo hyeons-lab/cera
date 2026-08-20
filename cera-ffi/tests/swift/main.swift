@@ -148,4 +148,24 @@ do {
     fail("unexpected non-FfiError thrown: \(error)")
 }
 
+// 5. Silero VAD surface coverage.
+let vadCfg = sileroVadDefaultConfig()
+guard vadCfg.threshold == 0.5 else { fail("sileroVadDefaultConfig.threshold round-trip") }
+guard vadCfg.negThreshold == 0.35 else { fail("sileroVadDefaultConfig.negThreshold round-trip") }
+guard vadCfg.minSpeechDurationMs == 64 else { fail("sileroVadDefaultConfig.minSpeechDurationMs round-trip") }
+guard vadCfg.minSilenceDurationMs == 100 else { fail("sileroVadDefaultConfig.minSilenceDurationMs round-trip") }
+guard vadCfg.speechPadMs == 30 else { fail("sileroVadDefaultConfig.speechPadMs round-trip") }
+let customVadCfg = FfiVadConfig(
+    threshold: 0.6,
+    negThreshold: 0.4,
+    minSpeechDurationMs: 80,
+    minSilenceDurationMs: 120,
+    speechPadMs: 40
+)
+let vadIter = FfiVadIterator(rate: .rate16kHz, config: customVadCfg)
+try vadIter.reset()
+let flushed = try vadIter.flush()
+guard flushed == nil else { fail("empty FfiVadIterator flush returned event") }
+print("OK: FfiVadConfig + FfiVadIterator Swift wiring")
+
 print("OK: all swift smoke tests passed")

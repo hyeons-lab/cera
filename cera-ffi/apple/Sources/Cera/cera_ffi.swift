@@ -1912,6 +1912,371 @@ public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgress
 
 
 /**
+ * Stateful Silero Voice Activity Detector (VAD) session.
+ */
+public protocol FfiSileroVadProtocol: AnyObject, Sendable {
+    
+    /**
+     * Process an entire audio buffer and return speech timestamps.
+     */
+    func getSpeechTimestamps(audio: [Float], rate: FfiVadSampleRate, config: FfiVadConfig?) throws  -> [FfiSpeechTimestamp]
+    
+    /**
+     * Process a single chunk of audio and return the speech probability in `[0.0, 1.0]`.
+     *
+     * - 16 kHz: chunk must have exactly 512 samples.
+     * - 8 kHz: chunk must have exactly 256 samples.
+     */
+    func processChunk(chunk: [Float], rate: FfiVadSampleRate) throws  -> Float
+    
+    /**
+     * Reset recurrent state tensors and streaming context to zeros.
+     */
+    func reset() throws 
+    
+}
+/**
+ * Stateful Silero Voice Activity Detector (VAD) session.
+ */
+open class FfiSileroVad: FfiSileroVadProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffisilerovad(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffisilerovad(handle, $0) }
+    }
+
+    
+    /**
+     * Load a Silero VAD model from in-memory GGUF bytes.
+     */
+public static func fromBytes(bytes: Data)throws  -> FfiSileroVad  {
+    return try  FfiConverterTypeFfiSileroVad_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+    /**
+     * Load a Silero VAD model from a `.gguf` file path.
+     */
+public static func fromFile(path: String)throws  -> FfiSileroVad  {
+    return try  FfiConverterTypeFfiSileroVad_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Process an entire audio buffer and return speech timestamps.
+     */
+open func getSpeechTimestamps(audio: [Float], rate: FfiVadSampleRate, config: FfiVadConfig?)throws  -> [FfiSpeechTimestamp]  {
+    return try  FfiConverterSequenceTypeFfiSpeechTimestamp.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffisilerovad_get_speech_timestamps(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(audio),
+        FfiConverterTypeFfiVadSampleRate_lower(rate),
+        FfiConverterOptionTypeFfiVadConfig.lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Process a single chunk of audio and return the speech probability in `[0.0, 1.0]`.
+     *
+     * - 16 kHz: chunk must have exactly 512 samples.
+     * - 8 kHz: chunk must have exactly 256 samples.
+     */
+open func processChunk(chunk: [Float], rate: FfiVadSampleRate)throws  -> Float  {
+    return try  FfiConverterFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(chunk),
+        FfiConverterTypeFfiVadSampleRate_lower(rate),$0
+    )
+})
+}
+    
+    /**
+     * Reset recurrent state tensors and streaming context to zeros.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffisilerovad_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSileroVad: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiSileroVad
+
+    public static func lift(_ handle: UInt64) throws -> FfiSileroVad {
+        return FfiSileroVad(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiSileroVad) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSileroVad {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiSileroVad, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSileroVad_lift(_ handle: UInt64) throws -> FfiSileroVad {
+    return try FfiConverterTypeFfiSileroVad.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSileroVad_lower(_ value: FfiSileroVad) -> UInt64 {
+    return FfiConverterTypeFfiSileroVad.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Stateful speech boundary detector for live audio streams.
+ */
+public protocol FfiVadIteratorProtocol: AnyObject, Sendable {
+    
+    /**
+     * Flush any pending in-flight speech segment at the end of an audio stream.
+     */
+    func flush() throws  -> FfiVadEvent?
+    
+    /**
+     * Process a single chunk of audio and return any speech start or end event.
+     */
+    func processChunk(vad: FfiSileroVad, chunk: [Float]) throws  -> FfiVadEvent?
+    
+    /**
+     * Reset iterator state.
+     */
+    func reset() throws 
+    
+}
+/**
+ * Stateful speech boundary detector for live audio streams.
+ */
+open class FfiVadIterator: FfiVadIteratorProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffivaditerator(self.handle, $0) }
+    }
+    /**
+     * Create a new streaming speech boundary iterator.
+     */
+public convenience init(rate: FfiVadSampleRate, config: FfiVadConfig?) {
+    let handle =
+        try! rustCall() {
+    uniffi_cera_ffi_fn_constructor_ffivaditerator_new(
+        FfiConverterTypeFfiVadSampleRate_lower(rate),
+        FfiConverterOptionTypeFfiVadConfig.lower(config),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffivaditerator(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Flush any pending in-flight speech segment at the end of an audio stream.
+     */
+open func flush()throws  -> FfiVadEvent?  {
+    return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_flush(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Process a single chunk of audio and return any speech start or end event.
+     */
+open func processChunk(vad: FfiSileroVad, chunk: [Float])throws  -> FfiVadEvent?  {
+    return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_process_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiSileroVad_lower(vad),
+        FfiConverterSequenceFloat.lower(chunk),$0
+    )
+})
+}
+    
+    /**
+     * Reset iterator state.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVadIterator: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiVadIterator
+
+    public static func lift(_ handle: UInt64) throws -> FfiVadIterator {
+        return FfiVadIterator(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiVadIterator) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVadIterator {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiVadIterator, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadIterator_lift(_ handle: UInt64) throws -> FfiVadIterator {
+    return try FfiConverterTypeFfiVadIterator.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadIterator_lower(_ value: FfiVadIterator) -> UInt64 {
+    return FfiConverterTypeFfiVadIterator.lower(value)
+}
+
+
+
+
+
+
+/**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
  * [`Session::attach_lora`]. Load it once and share the handle across sessions —
  * it's reference-counted internally, so attaching to multiple sessions doesn't
@@ -3535,6 +3900,140 @@ public func FfiConverterTypeEngineConfig_lower(_ value: EngineConfig) -> RustBuf
 
 
 /**
+ * A detected speech segment with sample and millisecond boundaries.
+ */
+public struct FfiSpeechTimestamp: Equatable, Hashable {
+    public var startSample: UInt64
+    public var endSample: UInt64
+    public var startMs: Float
+    public var endMs: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(startSample: UInt64, endSample: UInt64, startMs: Float, endMs: Float) {
+        self.startSample = startSample
+        self.endSample = endSample
+        self.startMs = startMs
+        self.endMs = endMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiSpeechTimestamp: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSpeechTimestamp: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSpeechTimestamp {
+        return
+            try FfiSpeechTimestamp(
+                startSample: FfiConverterUInt64.read(from: &buf), 
+                endSample: FfiConverterUInt64.read(from: &buf), 
+                startMs: FfiConverterFloat.read(from: &buf), 
+                endMs: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiSpeechTimestamp, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.startSample, into: &buf)
+        FfiConverterUInt64.write(value.endSample, into: &buf)
+        FfiConverterFloat.write(value.startMs, into: &buf)
+        FfiConverterFloat.write(value.endMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSpeechTimestamp_lift(_ buf: RustBuffer) throws -> FfiSpeechTimestamp {
+    return try FfiConverterTypeFfiSpeechTimestamp.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSpeechTimestamp_lower(_ value: FfiSpeechTimestamp) -> RustBuffer {
+    return FfiConverterTypeFfiSpeechTimestamp.lower(value)
+}
+
+
+/**
+ * Configuration options for batch speech detection and segmentation.
+ */
+public struct FfiVadConfig: Equatable, Hashable {
+    public var threshold: Float
+    public var negThreshold: Float
+    public var minSpeechDurationMs: UInt32
+    public var minSilenceDurationMs: UInt32
+    public var speechPadMs: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(threshold: Float = Float(0.5), negThreshold: Float = Float(0.35), minSpeechDurationMs: UInt32 = UInt32(64), minSilenceDurationMs: UInt32 = UInt32(100), speechPadMs: UInt32 = UInt32(30)) {
+        self.threshold = threshold
+        self.negThreshold = negThreshold
+        self.minSpeechDurationMs = minSpeechDurationMs
+        self.minSilenceDurationMs = minSilenceDurationMs
+        self.speechPadMs = speechPadMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiVadConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVadConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVadConfig {
+        return
+            try FfiVadConfig(
+                threshold: FfiConverterFloat.read(from: &buf), 
+                negThreshold: FfiConverterFloat.read(from: &buf), 
+                minSpeechDurationMs: FfiConverterUInt32.read(from: &buf), 
+                minSilenceDurationMs: FfiConverterUInt32.read(from: &buf), 
+                speechPadMs: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiVadConfig, into buf: inout [UInt8]) {
+        FfiConverterFloat.write(value.threshold, into: &buf)
+        FfiConverterFloat.write(value.negThreshold, into: &buf)
+        FfiConverterUInt32.write(value.minSpeechDurationMs, into: &buf)
+        FfiConverterUInt32.write(value.minSilenceDurationMs, into: &buf)
+        FfiConverterUInt32.write(value.speechPadMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadConfig_lift(_ buf: RustBuffer) throws -> FfiVadConfig {
+    return try FfiConverterTypeFfiVadConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadConfig_lower(_ value: FfiVadConfig) -> RustBuffer {
+    return FfiConverterTypeFfiVadConfig.lower(value)
+}
+
+
+/**
  * Per-call decode options. Mirrors [`cera::GenerateOpts`].
  *
  * `flush_every_tokens` / `flush_every_ms` are accepted but have no
@@ -4773,6 +5272,156 @@ public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * A speech boundary event emitted during streaming audio processing.
+ */
+
+public enum FfiVadEvent: Equatable, Hashable {
+    
+    case speechStart(sample: UInt64, ms: Float
+    )
+    case speechEnd(startSample: UInt64, endSample: UInt64, startMs: Float, endMs: Float
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiVadEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVadEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVadEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVadEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .speechStart(sample: try FfiConverterUInt64.read(from: &buf), ms: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        case 2: return .speechEnd(startSample: try FfiConverterUInt64.read(from: &buf), endSample: try FfiConverterUInt64.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVadEvent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .speechStart(sample,ms):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt64.write(sample, into: &buf)
+            FfiConverterFloat.write(ms, into: &buf)
+            
+        
+        case let .speechEnd(startSample,endSample,startMs,endMs):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(startSample, into: &buf)
+            FfiConverterUInt64.write(endSample, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadEvent_lift(_ buf: RustBuffer) throws -> FfiVadEvent {
+    return try FfiConverterTypeFfiVadEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadEvent_lower(_ value: FfiVadEvent) -> RustBuffer {
+    return FfiConverterTypeFfiVadEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Audio sample rate supported by Silero VAD.
+ */
+
+public enum FfiVadSampleRate: Equatable, Hashable {
+    
+    case rate16kHz
+    case rate8kHz
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiVadSampleRate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVadSampleRate: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVadSampleRate
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVadSampleRate {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .rate16kHz
+        
+        case 2: return .rate8kHz
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVadSampleRate, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .rate16kHz:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .rate8kHz:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadSampleRate_lift(_ buf: RustBuffer) throws -> FfiVadSampleRate {
+    return try FfiConverterTypeFfiVadSampleRate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVadSampleRate_lower(_ value: FfiVadSampleRate) -> RustBuffer {
+    return FfiConverterTypeFfiVadSampleRate.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Why a decode loop exited. Mirrors [`cera::FinishReason`].
  */
 
@@ -5206,6 +5855,54 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVadConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiVadConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiVadConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiVadEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVadEvent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiVadEvent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiVadEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
     typealias SwiftType = KvCompression?
 
@@ -5346,6 +6043,31 @@ fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiSpeechTimestamp: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiSpeechTimestamp]
+
+    public static func write(_ value: [FfiSpeechTimestamp], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiSpeechTimestamp.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiSpeechTimestamp] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiSpeechTimestamp]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiSpeechTimestamp.read(from: &buf))
         }
         return seq
     }
@@ -5576,6 +6298,15 @@ public func parseToolCalls(text: String, format: ToolFormat)throws  -> [ToolCall
 })
 }
 /**
+ * Default VAD configuration parameters.
+ */
+public func sileroVadDefaultConfig() -> FfiVadConfig  {
+    return try!  FfiConverterTypeFfiVadConfig_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_silero_vad_default_config($0
+    )
+})
+}
+/**
  * Build a GBNF grammar string constraining output to a valid call for one
  * of `tools`, in `format`. Put the result in `GenerateOpts.grammar` and set
  * `GenerateOpts.grammar_trigger_tokens` (see
@@ -5621,6 +6352,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 25300) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
@@ -5690,6 +6424,24 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 58406) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -5795,6 +6547,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 47359) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
