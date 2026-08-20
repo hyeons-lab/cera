@@ -653,6 +653,13 @@ pub fn resolve_hf_manifest(
     let defaults = generation_defaults.unwrap_or(match inference_type {
         InferenceType::LlamaCppLfm2AudioV1 => GenerationDefaults::Audio {
             number_of_decoding_threads: None,
+            audio_temperature: None,
+            audio_top_k: None,
+            temperature: None,
+            min_p: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
         },
         _ => GenerationDefaults::Text {
             temperature: None,
