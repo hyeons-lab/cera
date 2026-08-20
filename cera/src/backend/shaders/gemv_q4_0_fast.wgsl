@@ -137,6 +137,7 @@ fn gemv_q4_0_fast(
         let sumy_total = sumy0 + sumy1;
 
         for (var r = 0u; r < NR; r += 1u) {
+            if r0 + r >= m { continue; }
             let blk_byte = (r0 + r) * row_bytes + ib * 18u;
             let d = block_scale(blk_byte);
             let qs_byte = blk_byte + 2u + il;

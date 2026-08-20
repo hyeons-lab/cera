@@ -983,6 +983,7 @@ impl CeraEngine {
         let parts = cera::ModelBytes {
             model: bytes.into(),
             multimodal_projector: multimodal_projector.map(Into::into),
+            audio_decoder: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`,
             // which `from_parts` rejects by name, better than silently
             // falling back to text when a caller fat-fingers the string.
@@ -990,6 +991,7 @@ impl CeraEngine {
                 .as_deref()
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
+            generation_defaults: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
         Ok(Arc::new(Self { inner }))
@@ -1070,6 +1072,12 @@ impl CeraEngine {
         } else {
             cs as u64
         }
+    }
+
+    /// Returns default `GenerateOpts` for this engine, pre-populated with
+    /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+    pub fn default_generate_opts(&self) -> GenerateOpts {
+        GenerateOpts::from(&self.inner.default_generate_opts())
     }
 
     // ----- Tokenizer surface (PR 13) ---------------------------------
@@ -1355,11 +1363,11 @@ pub struct GenerateOpts {
     pub top_k: u32,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
-    #[uniffi(default = 0.0)]
+    #[uniffi(default = 0.05)]
     pub min_p: f32,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
-    #[uniffi(default = 1.0)]
+    #[uniffi(default = 1.1)]
     pub repetition_penalty: f32,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     #[uniffi(default = [])]
@@ -1390,9 +1398,8 @@ pub struct GenerateOpts {
     pub flush_every_ms: u32,
 }
 
-impl Default for GenerateOpts {
-    fn default() -> Self {
-        let core = cera::GenerateOpts::default();
+impl From<&cera::GenerateOpts> for GenerateOpts {
+    fn from(core: &cera::GenerateOpts) -> Self {
         Self {
             max_tokens: core.max_tokens,
             temperature: core.temperature,
@@ -1400,15 +1407,27 @@ impl Default for GenerateOpts {
             top_k: core.top_k,
             min_p: core.min_p,
             repetition_penalty: core.repetition_penalty,
-            stop_tokens: core.stop_tokens,
+            stop_tokens: core.stop_tokens.clone(),
             ignore_eos: core.ignore_eos,
             // Core default is no grammar; the compiled `Arc` has no FFI form, so
             // the mirrored field is the (absent) source string.
             grammar: None,
-            grammar_trigger_tokens: core.grammar_trigger_tokens,
+            grammar_trigger_tokens: core.grammar_trigger_tokens.clone(),
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
         }
+    }
+}
+
+impl From<cera::GenerateOpts> for GenerateOpts {
+    fn from(core: cera::GenerateOpts) -> Self {
+        GenerateOpts::from(&core)
+    }
+}
+
+impl Default for GenerateOpts {
+    fn default() -> Self {
+        GenerateOpts::from(&cera::GenerateOpts::default())
     }
 }
 
@@ -1808,7 +1827,7 @@ impl Session {
     }
 
     /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-    /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+    /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
     pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError> {
         let hs = self.lock_inner()?.hidden_states_for_text(&text)?;
         Ok(f32_vec_to_le_bytes(&hs))
@@ -1930,6 +1949,13 @@ impl Session {
     pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
         self.lock_inner()?.set_image_max_long_size(max_long_size);
         Ok(())
+    }
+
+    /// Returns default `GenerateOpts` for this session, pre-populated with
+    /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+    pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError> {
+        let guard = self.lock_inner()?;
+        Ok(GenerateOpts::from(guard.default_generate_opts()))
     }
 
     /// Run autoregressive decode and return all emitted tokens +
@@ -2473,10 +2499,12 @@ impl CeraEngine {
             let parts = cera::ModelBytes {
                 model: bytes.into(),
                 multimodal_projector: multimodal_projector.map(Into::into),
+                audio_decoder: None,
                 inference_type: inference_type
                     .as_deref()
                     .map(cera::manifest::InferenceType::parse_str),
                 chat_template: None,
+                generation_defaults: None,
             };
             cera::CeraEngine::from_parts(parts, cera_config)
         })
@@ -3601,5 +3629,16 @@ mod tests {
         assert_eq!(core_r8, cera::vad::VadSampleRate::Rate8kHz);
         let back_r8: FfiVadSampleRate = core_r8.into();
         assert_eq!(back_r8, r8);
+    }
+
+    #[test]
+    fn generate_opts_defaults_match_core() {
+        let opts = GenerateOpts::default();
+        let core = cera::GenerateOpts::default();
+        assert_eq!(opts.temperature, core.temperature);
+        assert_eq!(opts.top_p, core.top_p);
+        assert_eq!(opts.top_k, core.top_k);
+        assert_eq!(opts.min_p, core.min_p);
+        assert_eq!(opts.repetition_penalty, core.repetition_penalty);
     }
 }

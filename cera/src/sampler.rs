@@ -30,7 +30,7 @@ pub fn argmax(logits: &[f32]) -> u32 {
 }
 
 /// Configuration for token sampling.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplerConfig {
     pub temperature: f32,
     pub top_k: usize,
@@ -109,10 +109,13 @@ impl Sampler {
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
         assert!(!logits.is_empty(), "cannot sample from empty logits");
 
-        // Greedy: argmax (NaN-safe). Triggered by temperature<=0 OR top_k=1
-        // (single candidate makes temp/top_p/penalties irrelevant). Greedy
-        // skips history bookkeeping too — it's deterministic by contract.
-        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+        // Greedy: argmax (NaN-safe). Triggered by temperature<=0, NaN/non-finite,
+        // OR top_k=1 (single candidate makes temp/top_p/penalties irrelevant).
+        // Greedy skips history bookkeeping too — it's deterministic by contract.
+        if !self.config.temperature.is_finite()
+            || self.config.temperature <= 0.0
+            || self.config.top_k == 1
+        {
             return argmax(logits);
         }
 
@@ -401,5 +404,24 @@ mod tests {
         assert_eq!(argmax(&[f32::NAN, 2.0, f32::NAN]), 1);
         assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
         assert_eq!(argmax(&[]), 0);
+    }
+
+    #[test]
+    fn nan_and_negative_temperature_use_greedy_argmax() {
+        let mut s_nan = sampler(0.0, 1.0);
+        s_nan.set_config(SamplerConfig {
+            temperature: f32::NAN,
+            ..s_nan.config.clone()
+        });
+        let mut logits = vec![1.0f32, 10.0, 2.0];
+        assert_eq!(s_nan.sample(&mut logits), 1);
+
+        let mut s_neg = sampler(0.0, 1.0);
+        s_neg.set_config(SamplerConfig {
+            temperature: -0.5,
+            ..s_neg.config.clone()
+        });
+        let mut logits2 = vec![15.0f32, 10.0, 2.0];
+        assert_eq!(s_neg.sample(&mut logits2), 0);
     }
 }

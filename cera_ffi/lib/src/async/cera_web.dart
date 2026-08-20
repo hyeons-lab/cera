@@ -45,7 +45,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? backend,
     String? inferenceType,
     int? maxLongSize,
-    JSArray<JSNumber>? pcm,
+    JSAny? pcm,
     int? sampleRate,
     String? prompt,
     int? maxTokens,
@@ -61,6 +61,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? bundleId,
     String? quant,
     String? storeDir,
+    bool? turboQuant,
   });
 }
 
@@ -87,11 +88,23 @@ extension type _Reply._(JSObject _) implements JSObject {
   external String? get url;
   external JSAny? get done;
   external JSAny? get total;
+  // Audio streaming fields, present on `event: 'audio'`.
+  external JSAny? get pcm;
+  external JSAny? get sampleRate;
 }
 
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
   external _Capabilities get capabilities;
+  external JSAny? get cancelBuffer;
+}
+
+@JS('Atomics')
+external _Atomics get _atomics;
+
+extension type _Atomics._(JSObject _) implements JSObject {
+  external int store(JSInt32Array typedArray, int index, int value);
+  external int load(JSInt32Array typedArray, int index);
 }
 
 /// One entry of the `listBundles` reply.
@@ -165,13 +178,19 @@ Future<List<CeraBundle>> listBundles(CeraOptions options) async {
       worker._newId(),
       (id) => _Request(id: id, op: 'listBundles', moduleUrl: worker._moduleUrl),
     );
-    return [
+    final list = [
       for (final entry in (result as JSArray<_BundleEntry>).toDart)
         CeraBundle(
           name: entry.name,
-          quants: [for (final q in entry.quants.toDart) q.toDart],
+          quants: [for (final q in entry.quants.toDart) q.toDart]
+            ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase())),
         ),
     ];
+    list.sort(
+      (a, b) =>
+          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+    );
+    return list;
   } finally {
     // Always, including on failure: a worker left running holds the wasm module
     // it imported, and a picker that is opened and closed repeatedly would
@@ -230,6 +249,12 @@ class _WorkerCera implements Cera {
 
   /// Progress callbacks for in-flight bundle downloads, by id.
   final _progress = <int, void Function(CeraDownload progress)>{};
+
+  /// Callbacks for streaming audio frames, by id.
+  final _audioCallbacks =
+      <int, void Function(List<double> pcm, int sampleRate)>{};
+
+  JSInt32Array? _cancelArray;
 
   int _nextId = 0;
   String _backend = 'unknown';
@@ -325,6 +350,7 @@ class _WorkerCera implements Cera {
         contextSize: _options.contextSize,
         backend: _options.backend.name,
         inferenceType: inferenceType,
+        turboQuant: _options.turboQuant,
       ),
       // Hand the model's memory to the worker rather than copying it. A
       // multi-hundred-megabyte structured clone is both a pause and a moment
@@ -363,6 +389,7 @@ class _WorkerCera implements Cera {
           storeDir: storeDir,
           contextSize: _options.contextSize,
           backend: _options.backend.name,
+          turboQuant: _options.turboQuant,
         ),
       );
       _adoptOpenResult(result);
@@ -375,6 +402,12 @@ class _WorkerCera implements Cera {
     final opened = result as _OpenResult;
     _backend = opened.backend;
     _capabilities = _capabilitiesOf(opened.capabilities);
+    final buf = opened.cancelBuffer;
+    if (buf != null) {
+      try {
+        _cancelArray = JSInt32Array(buf as JSArrayBuffer);
+      } catch (_) {}
+    }
   }
 
   /// Produces an `ArrayBuffer` that is safe to transfer.
@@ -384,11 +417,11 @@ class _WorkerCera implements Cera {
   /// views onto it. Copy in that case; the common case is a whole-buffer list
   /// and costs nothing.
   JSArrayBuffer _detach(Uint8List bytes) {
-    if (bytes.offsetInBytes == 0 &&
-        bytes.lengthInBytes == bytes.buffer.lengthInBytes) {
-      return bytes.buffer.toJS;
-    }
     return Uint8List.fromList(bytes).buffer.toJS;
+  }
+
+  JSArrayBuffer _detachF32(Float32List floats) {
+    return Float32List.fromList(floats).buffer.toJS;
   }
 
   void _receive(JSObject? data) {
@@ -396,6 +429,25 @@ class _WorkerCera implements Cera {
     final reply = data as _Reply;
     if (reply.event == 'token') {
       _streams[reply.id]?.add(reply.text ?? '');
+      return;
+    }
+    if (reply.event == 'audio') {
+      final callback = _audioCallbacks[reply.id];
+      final pcmJs = reply.pcm;
+      final sampleRate =
+          ((reply.sampleRate as JSNumber?)?.toDartDouble ?? 24000).toInt();
+      if (callback != null && pcmJs != null) {
+        final List<double> pcm;
+        if (pcmJs.isA<JSFloat32Array>()) {
+          pcm = (pcmJs as JSFloat32Array).toDart;
+        } else {
+          pcm =
+              (pcmJs as JSArray<JSNumber>).toDart
+                  .map((n) => n.toDartDouble)
+                  .toList();
+        }
+        callback(pcm, sampleRate);
+      }
       return;
     }
     if (reply.event == 'progress') {
@@ -449,6 +501,7 @@ class _WorkerCera implements Cera {
     }
     final pending = _pending.values.toList();
     _pending.clear();
+    _audioCallbacks.clear();
     for (final completer in pending) {
       if (!completer.isCompleted) completer.completeError(error);
     }
@@ -487,6 +540,7 @@ class _WorkerCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     if (_closed) {
       throw StateError('this Cera engine is closed');
@@ -512,7 +566,9 @@ class _WorkerCera implements Cera {
       final ahead = _queue;
       final mine = Completer<void>();
       _queue = mine.future;
-      await ahead;
+      try {
+        await ahead;
+      } catch (_) {}
       // Release the queue BEFORE closing the controller on every early exit;
       // `close()`'s future does not complete while a subscription is paused, so
       // the other order can leave `_queue` uncompleted forever.
@@ -527,9 +583,13 @@ class _WorkerCera implements Cera {
       started = true;
       final id = _newId();
       _streams[id] = controller;
+      if (onAudio != null) {
+        _audioCallbacks[id] = onAudio;
+      }
       void terminate(Object? error, StackTrace? stack) {
         finished = true;
         _streams.remove(id);
+        _audioCallbacks.remove(id);
         if (!mine.isCompleted) mine.complete();
         if (controller.isClosed) return;
         if (error != null) controller.addError(error, stack);
@@ -619,37 +679,85 @@ class _WorkerCera implements Cera {
   Future<void> appendImage(Uint8List bytes, {int? maxLongSize}) async {
     // Queued behind any running generation, as on native: this appends patch
     // embeddings to the very KV cache a decode is writing to.
-    await _queue;
-    final buffer = _detach(bytes);
-    await _send(
-      _newId(),
-      (id) => _Request(
-        id: id,
-        op: 'appendImage',
-        bytes: buffer,
-        maxLongSize: maxLongSize,
-      ),
-      transfer: <JSAny>[buffer],
-    );
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      final buffer = _detach(bytes);
+      await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'appendImage',
+          bytes: buffer,
+          maxLongSize: maxLongSize,
+        ),
+        transfer: <JSAny>[buffer],
+      );
+    } finally {
+      mine.complete();
+    }
+  }
+
+  @override
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  }) async {
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      final buffer = _detachF32(floatList);
+      await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'appendAudio',
+          pcm: Float32List.view(buffer.toDart).toJS,
+          sampleRate: sampleRate,
+          prompt: prompt,
+        ),
+        transfer: <JSAny>[buffer],
+      );
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
-    await _queue;
-    final result = await _send(
-      _newId(),
-      (id) => _Request(
-        id: id,
-        op: 'transcribe',
-        // Crosses as a plain number array and is narrowed to Float32Array in
-        // the worker. A `Float64List` would transfer, but the samples are f32
-        // on the Rust side, so the wider buffer would be twice the traffic to
-        // then be halved.
-        pcm: pcm.map((s) => s.toJS).toList().toJS,
-        sampleRate: sampleRate,
-      ),
-    );
-    return (result as JSString).toDart;
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
+      final buffer = _detachF32(floatList);
+      final result = await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'transcribe',
+          pcm: Float32List.view(buffer.toDart).toJS,
+          sampleRate: sampleRate,
+        ),
+        transfer: <JSAny>[buffer],
+      );
+      return (result as JSString).toDart;
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -660,12 +768,21 @@ class _WorkerCera implements Cera {
     // natively, and B would then run against a conversation the caller cleared
     // before starting it.
     await cancel();
-    await _queue;
-    // `_send` throws synchronously on a closed engine; `async` here turns that
-    // into a failed future, which is what the native twin returns. The two
-    // transports would otherwise differ on the one call an app is most likely
-    // to leave unawaited.
-    await _send(_newId(), (id) => _Request(id: id, op: 'reset'));
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      // `_send` throws synchronously on a closed engine; `async` here turns that
+      // into a failed future, which is what the native twin returns. The two
+      // transports would otherwise differ on the one call an app is most likely
+      // to leave unawaited.
+      await _send(_newId(), (id) => _Request(id: id, op: 'reset'));
+    } finally {
+      mine.complete();
+    }
   }
 
   @override
@@ -674,6 +791,11 @@ class _WorkerCera implements Cera {
     // there is nothing left to stop, and cancel is the call most often fired
     // from a dispose path that has already closed.
     if (_closed) return;
+    if (_cancelArray != null) {
+      try {
+        _atomics.store(_cancelArray!, 0, 1);
+      } catch (_) {}
+    }
     await _send(_newId(), (id) => _Request(id: id, op: 'cancel'));
   }
 

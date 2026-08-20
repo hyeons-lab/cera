@@ -899,6 +899,12 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func decodeTokens(tokens: [UInt32])  -> String
     
     /**
+     * Returns default `GenerateOpts` for this engine, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    func defaultGenerateOpts()  -> GenerateOpts
+    
+    /**
      * Encode `text` into token IDs using the model's BPE tokenizer.
      * Empty input returns an empty vec.
      */
@@ -1417,6 +1423,18 @@ open func decodeTokens(tokens: [UInt32]) -> String  {
     uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
+}
+    
+    /**
+     * Returns default `GenerateOpts` for this engine, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+open func defaultGenerateOpts() -> GenerateOpts  {
+    return try!  FfiConverterTypeGenerateOpts_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -2955,6 +2973,12 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func clearCancel() 
     
     /**
+     * Returns default `GenerateOpts` for this session, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+    func defaultGenerateOpts() throws  -> GenerateOpts
+    
+    /**
      * Run autoregressive decode and return all emitted tokens +
      * a summary. Synchronous — the call blocks until the decode
      * loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -3067,7 +3091,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
     func hiddenStatesForText(text: String) throws  -> Data
     
@@ -3412,6 +3436,18 @@ open func clearCancel()  {try! rustCall() {
 }
     
     /**
+     * Returns default `GenerateOpts` for this session, pre-populated with
+     * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+     */
+open func defaultGenerateOpts()throws  -> GenerateOpts  {
+    return try  FfiConverterTypeGenerateOpts_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_default_generate_opts(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Run autoregressive decode and return all emitted tokens +
      * a summary. Synchronous — the call blocks until the decode
      * loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -3581,7 +3617,7 @@ open func hiddenSize() -> UInt32  {
     
     /**
      * Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-     * (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+     * (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
      */
 open func hiddenStatesForText(text: String)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -4097,11 +4133,11 @@ public struct GenerateOpts: Equatable, Hashable {
         /**
          * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
          * disables it. Honored in the stochastic path.
-         */minP: Float = Float(0.0), 
+         */minP: Float = Float(0.05), 
         /**
          * Repetition penalty over tokens generated this call. `1.0` disables it.
          * Honored in the stochastic path (greedy/argmax decoding is unaffected).
-         */repetitionPenalty: Float = Float(1.0), 
+         */repetitionPenalty: Float = Float(1.1), 
         /**
          * Early-stop IDs (EOS / instruction markers / end-of-turn).
          */stopTokens: [UInt32] = [], 
@@ -6387,6 +6423,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6480,6 +6519,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6498,7 +6540,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54184) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {

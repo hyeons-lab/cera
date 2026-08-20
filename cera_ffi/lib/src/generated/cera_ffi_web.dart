@@ -304,10 +304,10 @@ class GenerateOpts {
     this.topK = 40,
     /// Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
     /// disables it. Honored in the stochastic path.
-    this.minP = 0.0,
+    this.minP = 0.05,
     /// Repetition penalty over tokens generated this call. `1.0` disables it.
     /// Honored in the stochastic path (greedy/argmax decoding is unaffected).
-    this.repetitionPenalty = 1.0,
+    this.repetitionPenalty = 1.1,
     /// Early-stop IDs (EOS / instruction markers / end-of-turn).
     this.stopTokens = const [],
     /// Ignore end-of-generation: EOS and `stop_tokens` are not honored, so
@@ -386,8 +386,8 @@ class GenerateOpts {
       temperature: json.containsKey('temperature') ? (json['temperature'] as num).toDouble() : 0.7,
       topP: json.containsKey('topP') ? (json['topP'] as num).toDouble() : 0.9,
       topK: json.containsKey('topK') ? (json['topK'] as num).toInt() : 40,
-      minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.0,
-      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.0,
+      minP: json.containsKey('minP') ? (json['minP'] as num).toDouble() : 0.05,
+      repetitionPenalty: json.containsKey('repetitionPenalty') ? (json['repetitionPenalty'] as num).toDouble() : 1.1,
       stopTokens: json.containsKey('stopTokens') ? (json['stopTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
       ignoreEos: json.containsKey('ignoreEos') ? json['ignoreEos'] as bool : false,
       grammar: json.containsKey('grammar') ? json['grammar'] == null ? null : json['grammar'] as String : null,
@@ -2796,6 +2796,10 @@ final class CeraEngine {
   /// invalid IDs should validate against `vocab_size()` first.
   String decodeTokens(List<int> tokens) => _unsupportedOnWeb('CeraEngine.decodeTokens');
 
+  /// Returns default `GenerateOpts` for this engine, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('CeraEngine.defaultGenerateOpts');
+
   /// Encode `text` into token IDs using the model's BPE tokenizer.
   /// Empty input returns an empty vec.
   List<int> encodeText(String text) => _unsupportedOnWeb('CeraEngine.encodeText');
@@ -3202,6 +3206,10 @@ final class Session {
   /// any thread (mirrors the shape of [`Self::cancel`]).
   void clearCancel() => _unsupportedOnWeb('Session.clearCancel');
 
+  /// Returns default `GenerateOpts` for this session, pre-populated with
+  /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+  GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
+
   /// Run autoregressive decode and return all emitted tokens +
   /// a summary. Synchronous — the call blocks until the decode
   /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
@@ -3302,7 +3310,7 @@ final class Session {
   int hiddenSize() => _unsupportedOnWeb('Session.hiddenSize');
 
   /// Like [`Self::hidden_states_for_tokens`] but tokenizes `text` first
-  /// (Swift `hiddenStates(for:)`). Returns the same LE-f32 byte layout.
+  /// (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
   Uint8List hiddenStatesForText(String text) => _unsupportedOnWeb('Session.hiddenStatesForText');
 
   /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp

@@ -157,12 +157,16 @@ pub struct ModelBytes {
     /// The multimodal projector GGUF (the "mmproj"): the vision tower for a
     /// VL bundle, the audio encoder for an audio one. `None` is text-only.
     pub multimodal_projector: Option<Arc<[u8]>>,
+    /// Optional vocoder GGUF for audio output decoding.
+    pub audio_decoder: Option<Arc<[u8]>>,
     /// Explicit inference type. `None` auto-detects from the primary GGUF's
     /// `general.architecture`, then upgrades text → VL when an mmproj is
     /// present (see [`CeraEngine::from_parts`] for why).
     pub inference_type: Option<InferenceType>,
     /// Chat-template override. When set, replaces the GGUF's own template.
     pub chat_template: Option<String>,
+    /// Generation defaults from the bundle manifest (if loaded from a bundle).
+    pub generation_defaults: Option<crate::manifest::GenerationDefaults>,
 }
 
 impl ModelBytes {
@@ -171,8 +175,10 @@ impl ModelBytes {
         Self {
             model: model.into(),
             multimodal_projector: None,
+            audio_decoder: None,
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
+            generation_defaults: None,
         }
     }
 }
@@ -203,6 +209,10 @@ struct AuxWeights {
     vision_mmproj: Option<Arc<GgufFile>>,
     /// Parsed audio encoder, for `LlamaCppLfm2AudioV1` bundles.
     audio_encoder: Option<Arc<AudioEncoderWeights>>,
+    /// Parsed audio decoder (vocoder depthformer), for audio-out bundles.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Parsed detokenizer, for audio-out bundles.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
 }
 
 /// Short summary of the loaded model. Matches the shape planned for the
@@ -273,6 +283,10 @@ pub struct CeraEngine {
     /// available). Shared into every session via `new_session`; sessions fall
     /// back to the CPU `audio_encoder` when this is `None`.
     gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
+    /// Audio decoder (depthformer) weights for audio output generation.
+    audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    /// Detokenizer weights for audio output generation.
+    detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
 }
 
 impl CeraEngine {
@@ -432,17 +446,61 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let aux = match (&inference_type, mmproj) {
+        let (audio_decoder, detok_weights) = if let Some(voc_bytes) = parts.audio_decoder {
+            match GgufFile::from_bytes(voc_bytes) {
+                Ok(voc_gguf) => {
+                    let voc_arc = Arc::new(voc_gguf);
+                    let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_arc)
+                        .map_err(|e| {
+                            tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                            e
+                        })
+                        .ok()
+                        .map(Arc::new);
+                    let detok =
+                        crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
+                            .map_err(|e| {
+                                tracing::warn!("failed to parse detokenizer weights: {e:#}");
+                                e
+                            })
+                            .ok()
+                            .map(Arc::new);
+                    (dec, detok)
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read vocoder GGUF file: {e:#}");
+                    (None, None)
+                }
+            }
+        } else if let Some(ref g) = mmproj {
+            let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
+                .ok()
+                .map(Arc::new);
+            let detok = crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
+                .ok()
+                .map(Arc::new);
+            (dec, detok)
+        } else {
+            (None, None)
+        };
+
+        let mut aux = match (&inference_type, mmproj) {
             (InferenceType::LlamaCppImageToText, Some(g)) => AuxWeights {
                 vision_mmproj: Some(g),
                 audio_encoder: None,
+                audio_decoder: None,
+                detok_weights: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
                 vision_mmproj: None,
                 audio_encoder: try_parse_audio_encoder(&g, None),
+                audio_decoder: None,
+                detok_weights: None,
             },
             _ => AuxWeights::default(),
         };
+        aux.audio_decoder = audio_decoder;
+        aux.detok_weights = detok_weights;
 
         let mut manifest = Manifest::synthetic(
             Path::new("<bytes>"),
@@ -453,6 +511,9 @@ impl CeraEngine {
                 .map(|_| "<mmproj-bytes>".to_string()),
         );
         manifest.chat_template = parts.chat_template;
+        if let Some(defaults) = parts.generation_defaults {
+            manifest.generation_defaults = defaults;
+        }
         Self::from_gguf(gguf, manifest, cfg, None, aux)
     }
 
@@ -693,13 +754,26 @@ impl CeraEngine {
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
         });
-        // Same deal for audio: uploading the Conformer weights once here keeps
-        // them off the per-utterance path. `None` (CPU encode) for `Cpu`,
-        // disabled features, device-init failure, or a model geometry the
-        // kernels cannot take.
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
+        let audio_decoder = aux.audio_decoder.filter(|dec| {
+            let model_dim = model.config().hidden_size;
+            let vocoder_dim = dec.decoder_config.n_embd;
+            if vocoder_dim != model_dim {
+                tracing::warn!(
+                    "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        let detok_weights = if audio_decoder.is_some() {
+            aux.detok_weights
+        } else {
+            None
+        };
         Ok(Self {
             manifest,
             model,
@@ -707,6 +781,8 @@ impl CeraEngine {
             metadata,
             config: cfg,
             audio_encoder,
+            audio_decoder,
+            detok_weights,
             vision_encoder_gguf,
             vision_encoder,
             gpu_vision_encoder,
@@ -791,6 +867,11 @@ impl CeraEngine {
         if let Some(gpu) = &self.gpu_audio_encoder {
             session.attach_gpu_audio_encoder(Arc::clone(gpu));
         }
+        // Auto-attach vocoder for audio output generation when present.
+        if let (Some(decoder), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+            session.attach_vocoder(Arc::clone(decoder), Arc::clone(detok));
+        }
+        session.set_default_generate_opts(self.default_generate_opts());
         Ok(session)
     }
 
@@ -1015,6 +1096,13 @@ impl CeraEngine {
     /// Borrow the engine config.
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Returns default generation options for this engine, populated from the
+    /// manifest's advisory sampling defaults (if loaded from a bundle manifest)
+    /// or standard defaults.
+    pub fn default_generate_opts(&self) -> crate::session::GenerateOpts {
+        crate::session::GenerateOpts::from_manifest(&self.manifest)
     }
 
     /// Configure the model's KV prefix cache. Passthrough to
@@ -1292,6 +1380,13 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
             },
             DefaultsShape::Audio => crate::manifest::GenerationDefaults::Audio {
                 number_of_decoding_threads: None,
+                audio_temperature: None,
+                audio_top_k: None,
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
             },
             DefaultsShape::Other => crate::manifest::GenerationDefaults::Other {
                 raw: serde_json::Value::Null,

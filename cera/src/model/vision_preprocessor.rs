@@ -33,7 +33,7 @@ use crate::session::CeraError;
 /// Bytes the preprocessor produces — the f32 NCHW tensor plus the
 /// dynamic patch grid that the encoder needs to interpret it.
 /// `pixels.len() == 3 · target_h · target_w`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreprocessedImage {
     /// `[3 · target_h · target_w]` f32 NCHW (R/G/B, `c·H·W + y·W +
     /// x` indexing).

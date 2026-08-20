@@ -424,7 +424,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         ($label:literal, $e:expr) => {{
             match &prof {
                 Some(p) => {
-                    let __t = std::time::Instant::now();
+                    let __t = crate::time::Instant::now();
                     let __r = $e;
                     ops.sync();
                     p.record($label, __t.elapsed());
@@ -439,7 +439,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         ($label:literal, $e:expr) => {{
             match &prof {
                 Some(p) => {
-                    let __t = std::time::Instant::now();
+                    let __t = crate::time::Instant::now();
                     let __r = $e;
                     p.record($label, __t.elapsed());
                     __r
@@ -599,6 +599,149 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     if let Some(p) = &prof {
         p.report(n_patches, gpu_w.blocks.len());
     }
+    Ok(result)
+}
+
+/// Async variant of [`encode_image_gpu`] for wgpu, using non-blocking readbacks
+/// (`PendingReadback` / `download_f32_async`). Essential for wasm32 / WebGPU where
+/// synchronous `poll_wait` + `mpsc::recv` deadlocks against the JS event loop.
+#[cfg(feature = "gpu")]
+pub async fn encode_image_gpu_wgpu_async(
+    ops: &WgpuVitOps,
+    gpu_w: &GpuVitWeights<WgpuVitOps>,
+    pixels: &[f32],
+    grid_w: usize,
+    grid_h: usize,
+) -> Result<Vec<f32>> {
+    let cfg = &gpu_w.cfg;
+    anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
+    anyhow::ensure!(
+        cfg.scale_factor > 0,
+        "vision encoder config has scale_factor=0"
+    );
+    anyhow::ensure!(
+        grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
+        "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
+        cfg.scale_factor,
+    );
+
+    let p = cfg.patch_size;
+    let in_dim = 3 * p * p;
+    let n_embd = cfg.n_embd;
+    let n_ff = cfg.n_ff;
+    let n_head = cfg.n_head;
+    let head_dim = n_embd / n_head;
+    let n_patches = grid_w * grid_h;
+    let eps = cfg.eps;
+
+    anyhow::ensure!(
+        pixels.len() == 3 * grid_w * p * grid_h * p,
+        "encode_image_gpu: pixels.len() {} != 3·target_w·target_h",
+        pixels.len()
+    );
+    anyhow::ensure!(
+        n_patches <= MAX_VIT_TOKENS,
+        "encode_image_gpu: {n_patches} patches exceeds GPU MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); \
+         caller should fall back to CPU",
+    );
+
+    // 1. Patch embed: im2col on CPU, batched matmul + bias on GPU.
+    let patches = im2col_patches(pixels, cfg, grid_w, grid_h);
+    let patches_buf = ops.upload(&patches);
+    let tokens = ops.linear(
+        &patches_buf,
+        &gpu_w.patch_conv_wt,
+        n_patches,
+        n_embd,
+        in_dim,
+    );
+    ops.bias_add(&tokens, &gpu_w.patch_conv_b, n_patches, n_embd);
+
+    // 2. Add (interpolated) position embeddings.
+    anyhow::ensure!(
+        cfg.n_trained_patches > 0,
+        "n_trained_patches must be greater than 0"
+    );
+    let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
+    anyhow::ensure!(
+        trained_side * trained_side == cfg.n_trained_patches,
+        "non-square trained pos-embed grid ({} patches) is not supported",
+        cfg.n_trained_patches,
+    );
+    let pos: std::borrow::Cow<[f32]> = if grid_w == trained_side && grid_h == trained_side {
+        std::borrow::Cow::Borrowed(&gpu_w.position_embed)
+    } else {
+        std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+            &gpu_w.position_embed,
+            trained_side,
+            trained_side,
+            grid_h,
+            grid_w,
+            n_embd,
+        ))
+    };
+    anyhow::ensure!(
+        !pos.is_empty(),
+        "failed to interpolate 2D position embeddings (dimension mismatch)"
+    );
+    let pos_buf = ops.upload(&pos);
+    ops.add(&tokens, &pos_buf, n_patches * n_embd);
+
+    // 3. ViT blocks.
+    for blk in &gpu_w.blocks {
+        let normed = ops.layernorm(&tokens, &blk.ln1_w, &blk.ln1_b, eps, n_patches, n_embd);
+        let q = ops.linear(&normed, &blk.q_w, n_patches, n_embd, n_embd);
+        ops.bias_add(&q, &blk.q_b, n_patches, n_embd);
+        let k = ops.linear(&normed, &blk.k_w, n_patches, n_embd, n_embd);
+        ops.bias_add(&k, &blk.k_b, n_patches, n_embd);
+        let v = ops.linear(&normed, &blk.v_w, n_patches, n_embd, n_embd);
+        ops.bias_add(&v, &blk.v_b, n_patches, n_embd);
+
+        let attn_out = ops.attention(&q, &k, &v, n_patches, n_head, head_dim);
+        let o = ops.linear(&attn_out, &blk.o_w, n_patches, n_embd, n_embd);
+        ops.bias_add(&o, &blk.o_b, n_patches, n_embd);
+        ops.add(&tokens, &o, n_patches * n_embd);
+
+        // Pre-FFN LN → FFN up (+bias) → GELU → FFN down (+bias) → residual.
+        let normed = ops.layernorm(&tokens, &blk.ln2_w, &blk.ln2_b, eps, n_patches, n_embd);
+        let mid = ops.linear(&normed, &blk.ffn_up_w, n_patches, n_ff, n_embd);
+        ops.bias_add(&mid, &blk.ffn_up_b, n_patches, n_ff);
+        ops.gelu(&mid, n_patches * n_ff);
+        let down = ops.linear(&mid, &blk.ffn_down_w, n_patches, n_embd, n_ff);
+        ops.bias_add(&down, &blk.ffn_down_b, n_patches, n_embd);
+        ops.add(&tokens, &down, n_patches * n_embd);
+    }
+
+    // 4. Post-LN.
+    let tokens = ops.layernorm(
+        &tokens,
+        &gpu_w.post_ln_w,
+        &gpu_w.post_ln_b,
+        eps,
+        n_patches,
+        n_embd,
+    );
+
+    // 5. Pixel-shuffle on CPU (async readback).
+    let tok_cpu = ops
+        .ctx
+        .download_f32_async(&tokens, n_patches * n_embd)
+        .await?;
+    let pooled = pixel_shuffle(&tok_cpu, cfg, grid_w, grid_h);
+    let pooled_in_dim = n_embd * cfg.scale_factor * cfg.scale_factor;
+    let n_out = pooled.len() / pooled_in_dim;
+
+    // 6. Projector: mm.1 (+bias) + GELU → mm.2 (+bias).
+    let mid_dim = gpu_w.proj_intermediate;
+    let pooled_buf = ops.upload(&pooled);
+    let proj_dim = cfg.projection_dim;
+    let mid = ops.linear(&pooled_buf, &gpu_w.mm1_w, n_out, mid_dim, pooled_in_dim);
+    ops.bias_add(&mid, &gpu_w.mm1_b, n_out, mid_dim);
+    ops.gelu(&mid, n_out * mid_dim);
+    let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
+    ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim);
+
+    let result = ops.ctx.download_f32_async(&out, n_out * proj_dim).await?;
     Ok(result)
 }
 
@@ -1294,6 +1437,17 @@ pub trait VisionGpuEncode: Send + Sync {
     /// Encode preprocessed pixels (`[3·H·W]` NCHW, normalized) at the given
     /// patch grid. Output matches [`VisionEncoderWeights::encode_image`].
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>>;
+
+    /// Async variant for environments (like browser WebGPU on wasm32) where
+    /// GPU readbacks cannot block the main/worker thread.
+    fn encode_image_async<'a>(
+        &'a self,
+        pixels: &'a [f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(async move { self.encode_image(pixels, grid_w, grid_h) })
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -1306,6 +1460,21 @@ struct WgpuVisionEncoder {
 impl VisionGpuEncode for WgpuVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+    }
+
+    fn encode_image_async<'a>(
+        &'a self,
+        pixels: &'a [f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
+        Box::pin(encode_image_gpu_wgpu_async(
+            &self.ops,
+            &self.weights,
+            pixels,
+            grid_w,
+            grid_h,
+        ))
     }
 }
 
@@ -1340,10 +1509,10 @@ pub fn build_gpu_vision_encoder(
 }
 
 #[cfg(feature = "gpu")]
-fn try_wgpu_vision_encoder(
+pub fn build_wgpu_vision_encoder_with_context(
+    ctx: crate::backend::wgpu::GpuContext,
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
-    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
     let ops = WgpuVitOps::new(ctx).ok()?;
     let gpu_w = GpuVitWeights::build(&ops, weights);
     tracing::info!("vision encoder: using wgpu GPU backend");
@@ -1351,6 +1520,14 @@ fn try_wgpu_vision_encoder(
         ops,
         weights: gpu_w,
     }))
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    build_wgpu_vision_encoder_with_context(ctx, weights)
 }
 
 #[cfg(not(feature = "gpu"))]

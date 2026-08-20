@@ -13,6 +13,7 @@ use crate::time::{Duration, Instant};
 use crate::tokenizer::BpeTokenizer;
 
 /// Audio generation configuration.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioGenerateConfig {
     pub max_tokens: usize,
     pub sampler: SamplerConfig,
@@ -27,7 +28,7 @@ pub struct AudioGenerateConfig {
     pub gpu_depthformer: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
     /// All text first, then audio when <|audio_start|> (128) is emitted.
     Sequential,
@@ -36,6 +37,7 @@ pub enum AudioMode {
 }
 
 /// Result of audio generation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioGenerateResult {
     pub text_tokens: usize,
     pub audio_frames: usize,
@@ -46,9 +48,9 @@ pub struct AudioGenerateResult {
 }
 
 /// Special token IDs for modality control.
-const TOKEN_AUDIO_START: u32 = 128;
-const TOKEN_TEXT_END: u32 = 130;
-const AUDIO_END_CODE: i32 = 2048;
+pub const TOKEN_AUDIO_START: u32 = 128;
+pub const TOKEN_TEXT_END: u32 = 130;
+pub const AUDIO_END_CODE: i32 = 2048;
 
 #[derive(PartialEq)]
 enum Modality {
@@ -61,10 +63,15 @@ enum Modality {
 // ---------------------------------------------------------------------------
 
 /// Per-frame outcome from [`AudioOutputDecoder::decode_frame`].
-enum FrameOutcome {
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrameOutcome {
     /// Codes sampled + detokenized; `audio_embedding` is the feedback
     /// embedding the caller should pass back through the main LLM.
-    Codes { audio_embedding: Vec<f32> },
+    /// `pcm` contains the progressive real-time audio chunk for this frame.
+    Codes {
+        audio_embedding: Vec<f32>,
+        pcm: Vec<f32>,
+    },
     /// Audio stream terminated (`codes[0] == AUDIO_END_CODE`). No
     /// spectrum produced for this frame; caller should return control
     /// to the text modality per its mode's exit convention.
@@ -73,32 +80,64 @@ enum FrameOutcome {
 
 /// Owns the audio output-decoder state and exposes per-frame operations.
 /// Extracted from `generate_audio` so the same per-frame logic is shared
-/// between the Sequential and Interleaved paths and so future decoder
-/// variants can slot in behind a common interface.
-///
-/// External `generate_audio` signature is unchanged; this is a purely
-/// internal refactor.
-struct AudioOutputDecoder<'a> {
+/// between the Sequential and Interleaved paths and across CPU/WebGPU sessions.
+pub struct AudioOutputDecoder<'a> {
     weights: &'a AudioDecoderWeights,
     detok_weights: &'a DetokenizerWeights,
     gpu: Option<&'a dyn AudioGpu>,
     df_state: DepthformerState,
     detok_state: DetokenizerState,
+    streamer: crate::model::audio_decoder::IstftStreamer,
     /// Accumulated spectrum across the entire generate_audio call.
-    /// Flushed by `finish()` via a single ISTFT pass — per-frame ISTFT
-    /// would produce discontinuities from fresh overlap buffers.
     all_spectrum: Vec<f32>,
     audio_frames: usize,
+    streamed_samples: usize,
     time_depthformer: Duration,
     time_detokenizer: Duration,
     audio_temperature: f32,
     audio_top_k: usize,
     /// Precomputed: `gpu.is_some() && config.gpu_depthformer`.
     use_gpu_df: bool,
+    /// Whether to detokenize and stream audio incrementally per frame,
+    /// or buffer sampled codes and perform a single fused detokenization + iSTFT pass at finish.
+    streaming: bool,
+    /// Buffered sampled codes across frames (used when `streaming == false`).
+    all_codes: Vec<i32>,
 }
 
 impl<'a> AudioOutputDecoder<'a> {
-    fn new(
+    /// Total audio frames decoded so far in this session.
+    pub fn audio_frames(&self) -> usize {
+        self.audio_frames
+    }
+
+    /// Total audio samples streamed so far in this session.
+    pub fn streamed_samples(&self) -> usize {
+        self.streamed_samples
+    }
+
+    /// Sample rate of the vocoder in Hz (typically 24000).
+    pub fn sample_rate(&self) -> u32 {
+        self.detok_weights.config.sample_rate as u32
+    }
+
+    /// Total duration spent in depthformer frame sampling.
+    pub fn time_depthformer(&self) -> Duration {
+        self.time_depthformer
+    }
+
+    /// Total duration spent in detokenizer spectral processing.
+    pub fn time_detokenizer(&self) -> Duration {
+        self.time_detokenizer
+    }
+
+    /// Configure whether audio is detokenized per-frame or batched at finish.
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    pub fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,
         gpu: Option<&'a dyn AudioGpu>,
@@ -114,20 +153,33 @@ impl<'a> AudioOutputDecoder<'a> {
         }
         let df_state = DepthformerState::new(&weights.depthformer_config);
         let detok_state = DetokenizerState::new(&detok_weights.config);
+        let streamer = crate::model::audio_decoder::IstftStreamer::new(
+            detok_weights.config.n_fft,
+            detok_weights.config.hop_length,
+        );
         Self {
             weights,
             detok_weights,
             gpu,
             df_state,
             detok_state,
+            streamer,
             all_spectrum: Vec::new(),
             audio_frames: 0,
+            streamed_samples: 0,
             time_depthformer: Duration::ZERO,
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_gpu_df: gpu_depthformer && gpu.is_some(),
+            use_gpu_df: gpu_depthformer && gpu.is_some_and(|g| g.supports_depthformer()),
+            streaming: true,
+            all_codes: Vec::new(),
         }
+    }
+
+    /// Whether this decoder is using the GPU depthformer.
+    pub fn supports_gpu_depthformer(&self) -> bool {
+        self.use_gpu_df
     }
 
     /// Sample one audio frame via depthformer, detect end-of-stream,
@@ -137,26 +189,35 @@ impl<'a> AudioOutputDecoder<'a> {
     /// `embed` is the main LLM's hidden state / embedding to condition
     /// this frame on (the audio_start token embedding on the first
     /// frame, or the prior frame's feedback embedding afterward).
-    fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
+    pub fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
         let t0 = Instant::now();
-        let codes = if self.use_gpu_df {
-            let g = self
-                .gpu
-                .expect("use_gpu_df implies gpu is Some (set at construction)");
-            g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
-        } else {
-            sample_audio_frame(
+        let codes = match (self.use_gpu_df, self.gpu) {
+            (true, Some(g)) => {
+                g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
+            }
+            _ => sample_audio_frame(
                 self.weights,
                 &mut self.df_state,
                 embed,
                 self.audio_temperature,
                 self.audio_top_k,
-            )
+            ),
         };
         self.time_depthformer += t0.elapsed();
 
         if codes[0] == AUDIO_END_CODE {
             return FrameOutcome::End;
+        }
+
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            };
         }
 
         let t1 = Instant::now();
@@ -171,20 +232,169 @@ impl<'a> AudioOutputDecoder<'a> {
             )
         };
         self.time_detokenizer += t1.elapsed();
-        self.all_spectrum.extend_from_slice(&spectrum);
-        self.audio_frames += 1;
 
-        let audio_embedding = embed_audio_token(self.weights, &codes);
-        FrameOutcome::Codes { audio_embedding }
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
+        FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        }
     }
 
-    /// Drain the accumulated spectrum through a single ISTFT pass and
-    /// emit the resulting PCM via `sink`. Returns the PCM sample count.
-    /// A single end-of-generation ISTFT (rather than per-frame) avoids
-    /// discontinuities from fresh overlap buffers.
-    fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+    /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
+    pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
+        let t0 = Instant::now();
+        let codes = match (self.use_gpu_df, self.gpu) {
+            (true, Some(g)) => {
+                g.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
+                    .await?
+            }
+            _ => sample_audio_frame(
+                self.weights,
+                &mut self.df_state,
+                embed,
+                self.audio_temperature,
+                self.audio_top_k,
+            ),
+        };
+        self.time_depthformer += t0.elapsed();
+
+        if codes[0] == AUDIO_END_CODE {
+            return Ok(FrameOutcome::End);
+        }
+
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return Ok(FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            });
+        }
+
+        let t1 = Instant::now();
+        let spectrum = if let Some(g) = self.gpu {
+            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
+        } else {
+            detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                &codes,
+            )
+        };
+        self.time_detokenizer += t1.elapsed();
+
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
+        Ok(FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        })
+    }
+
+    /// Async version of [`Self::decode_frame_async`] taking a GPU hidden buffer directly.
+    #[cfg(feature = "gpu")]
+    pub async fn decode_frame_from_gpu_hidden_async(
+        &mut self,
+        hidden_buf: &wgpu::Buffer,
+    ) -> anyhow::Result<FrameOutcome> {
+        let t0 = Instant::now();
+        let codes = if let (true, Some(g)) = (self.use_gpu_df, self.gpu) {
+            g.sample_audio_frame_from_gpu_hidden_async(
+                hidden_buf,
+                self.audio_temperature,
+                self.audio_top_k,
+            )
+            .await?
+        } else {
+            anyhow::bail!("GPU hidden buffer handoff requires GPU depthformer");
+        };
+        self.time_depthformer += t0.elapsed();
+
+        if codes[0] == AUDIO_END_CODE {
+            return Ok(FrameOutcome::End);
+        }
+
+        self.audio_frames += 1;
+        let audio_embedding = embed_audio_token(self.weights, &codes);
+
+        if !self.streaming {
+            self.all_codes.extend_from_slice(&codes);
+            return Ok(FrameOutcome::Codes {
+                audio_embedding,
+                pcm: vec![],
+            });
+        }
+
+        let t1 = Instant::now();
+        let spectrum = if let Some(g) = self.gpu {
+            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await?
+        } else {
+            detokenize_to_spectrum(
+                self.detok_weights,
+                self.weights,
+                &mut self.detok_state,
+                &codes,
+            )
+        };
+        self.time_detokenizer += t1.elapsed();
+
+        let pcm = self.streamer.feed_frames(&spectrum);
+        self.streamed_samples += pcm.len();
+
+        Ok(FrameOutcome::Codes {
+            audio_embedding,
+            pcm,
+        })
+    }
+
+    /// Drain any remaining audio through the ISTFT pass.
+    /// If streaming was already performed during decoding, returns the
+    /// accumulated streamed sample count.
+    pub fn finish(&mut self, mut sink: impl FnMut(&[f32], u32)) -> usize {
+        if self.streaming {
+            let remaining = self.streamer.flush();
+            if !remaining.is_empty() {
+                sink(&remaining, self.detok_weights.config.sample_rate as u32);
+                self.streamed_samples += remaining.len();
+            }
+            return self.streamed_samples;
+        }
+
+        if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
+            let t1 = Instant::now();
+            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
+            for &codes in chunks {
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum(self.detok_weights, &codes)
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            if !remainder.is_empty() {
+                tracing::warn!(
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
+                    remainder.len()
+                );
+            }
+            self.time_detokenizer += t1.elapsed();
+        }
+
         if self.all_spectrum.is_empty() {
-            return 0;
+            return self.streamed_samples;
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
@@ -192,12 +402,75 @@ impl<'a> AudioOutputDecoder<'a> {
             Some(g) => g.istft_to_pcm(&self.all_spectrum, n_fft, hop),
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
+        self.all_spectrum.clear();
+        self.all_codes.clear();
         if pcm.is_empty() {
-            return 0;
+            return self.streamed_samples;
         }
         let n = pcm.len();
         sink(&pcm, self.detok_weights.config.sample_rate as u32);
-        n
+        self.streamed_samples += n;
+        self.streamed_samples
+    }
+
+    /// Async version of [`Self::finish`] for WebGPU / browser wasm.
+    pub async fn finish_async(
+        &mut self,
+        mut sink: impl FnMut(&[f32], u32),
+    ) -> anyhow::Result<usize> {
+        if self.streaming {
+            let remaining = self.streamer.flush();
+            if !remaining.is_empty() {
+                sink(&remaining, self.detok_weights.config.sample_rate as u32);
+                self.streamed_samples += remaining.len();
+            }
+            return Ok(self.streamed_samples);
+        }
+
+        if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
+            let t1 = Instant::now();
+            let (chunks, remainder) = self.all_codes.as_chunks::<8>();
+            for &codes in chunks {
+                let spectrum = if let Some(g) = self.gpu {
+                    g.detokenize_to_spectrum_async(self.detok_weights, &codes)
+                        .await?
+                } else {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &codes,
+                    )
+                };
+                self.all_spectrum.extend_from_slice(&spectrum);
+            }
+            if !remainder.is_empty() {
+                tracing::warn!(
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
+                    remainder.len()
+                );
+            }
+            self.time_detokenizer += t1.elapsed();
+        }
+
+        if self.all_spectrum.is_empty() {
+            return Ok(self.streamed_samples);
+        }
+        let n_fft = self.detok_weights.config.n_fft;
+        let hop = self.detok_weights.config.hop_length;
+        let pcm = match self.gpu {
+            Some(g) => g.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
+            None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
+        };
+        self.all_spectrum.clear();
+        self.all_codes.clear();
+        if pcm.is_empty() {
+            return Ok(self.streamed_samples);
+        }
+        let n = pcm.len();
+        sink(&pcm, self.detok_weights.config.sample_rate as u32);
+        self.streamed_samples += n;
+        Ok(self.streamed_samples)
     }
 }
 
@@ -322,10 +595,24 @@ pub fn generate_audio(
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
                         FrameOutcome::End => {
-                            text_done = true;
+                            if text_done {
+                                break;
+                            }
+                            logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            next_token = sampler.sample(&mut logits);
+                            pos += 1;
+                            generated += 1;
                             break;
                         }
-                        FrameOutcome::Codes { audio_embedding } => audio_embedding,
+                        FrameOutcome::Codes {
+                            audio_embedding,
+                            pcm,
+                        } => {
+                            if !pcm.is_empty() {
+                                audio_callback(&pcm, decoder.sample_rate());
+                            }
+                            audio_embedding
+                        }
                     };
                     modality_budget = modality_budget.saturating_sub(1);
 
@@ -345,6 +632,10 @@ pub fn generate_audio(
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                     pos += 1;
                     generated += 1;
+                }
+
+                if text_done {
+                    break;
                 }
 
                 // Switch back to text.
@@ -395,14 +686,17 @@ pub fn generate_audio(
                             break;
                         }
                     },
-                    FrameOutcome::Codes { audio_embedding } => audio_embedding,
+                    FrameOutcome::Codes {
+                        audio_embedding,
+                        pcm,
+                    } => {
+                        if !pcm.is_empty() {
+                            audio_callback(&pcm, decoder.sample_rate());
+                        }
+                        audio_embedding
+                    }
                 };
                 modality_budget = modality_budget.saturating_sub(1);
-
-                // Feed codes back as embedding → next hidden state.
-                emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
-                pos += 1;
-                generated += 1;
 
                 if generated >= config.max_tokens || pos >= model_config.max_seq_len {
                     break;
@@ -418,6 +712,11 @@ pub fn generate_audio(
                     pos += 1;
                     break;
                 }
+
+                // Feed codes back as embedding → next hidden state.
+                emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                pos += 1;
+                generated += 1;
             }
         }
     }

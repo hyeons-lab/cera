@@ -4,6 +4,8 @@
 // compute shaders. Full forward pass in a single CommandEncoder — only logits
 // are read back to CPU.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
@@ -204,12 +206,30 @@ pub struct GpuContext {
     pub min_storage_buffer_offset_alignment: u64,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
-    pub profiler: Option<GpuProfiler>,
+    pub profiler: Option<Arc<GpuProfiler>>,
     /// Pre-allocated staging buffer for download_f32. Resized on demand.
     /// `Mutex` (not `RefCell`) so `GpuContext` is `Sync`, which is the
     /// prerequisite for `Arc<dyn Model>: Send + Sync` through the FFI.
-    staging: std::sync::Mutex<Option<wgpu::Buffer>>,
-    staging_size: std::sync::atomic::AtomicU64,
+    staging: Arc<std::sync::Mutex<Option<wgpu::Buffer>>>,
+    staging_size: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Clone for GpuContext {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            adapter_name: self.adapter_name.clone(),
+            backend: self.backend.clone(),
+            max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
+            max_buffer_size: self.max_buffer_size,
+            min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
+            preprocessor: self.preprocessor.clone(),
+            profiler: self.profiler.clone(),
+            staging: Arc::clone(&self.staging),
+            staging_size: Arc::clone(&self.staging_size),
+        }
+    }
 }
 
 /// A tensor stored on the GPU.
@@ -284,7 +304,9 @@ impl PendingReadback {
             .map_err(|e| anyhow::anyhow!("GPU readback failed: {e:?}"))?;
 
         let slice = self.staging.slice(0..self.size);
-        let data = slice.get_mapped_range().expect("get_mapped_range failed");
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| anyhow::anyhow!("GPU staging get_mapped_range failed: {e:?}"))?;
         let bytes = data.to_vec();
         drop(data);
         self.staging.unmap();
@@ -358,6 +380,15 @@ impl GpuContext {
         if adapter.features().contains(wgpu::Features::SHADER_F16) {
             features |= wgpu::Features::SHADER_F16;
         }
+        if adapter.features().contains(wgpu::Features::SUBGROUP) {
+            features |= wgpu::Features::SUBGROUP;
+        }
+        if adapter
+            .features()
+            .contains(wgpu::Features::SUBGROUP_BARRIER)
+        {
+            features |= wgpu::Features::SUBGROUP_BARRIER;
+        }
         // SPIR-V passthrough lets us feed slangc-compiled SPIR-V straight to the
         // Vulkan driver, bypassing naga-30's codegen (which regresses ~28% on
         // PowerVR prefill). wgpu-core only accepts a SPIR-V passthrough module on
@@ -411,7 +442,7 @@ impl GpuContext {
                 mapped_at_creation: false,
             });
             tracing::info!("GPU timestamp profiling enabled (period={timestamp_period}ns/tick)");
-            Some(GpuProfiler {
+            Some(Arc::new(GpuProfiler {
                 query_set,
                 resolve_buf,
                 read_buf,
@@ -419,7 +450,7 @@ impl GpuContext {
                 spans: std::sync::Mutex::new(Vec::new()),
                 next_query: std::sync::atomic::AtomicU32::new(0),
                 max_queries,
-            })
+            }))
         } else {
             tracing::info!("GPU timestamp profiling not available");
             None
@@ -448,8 +479,8 @@ impl GpuContext {
                 as u64,
             preprocessor,
             profiler,
-            staging: std::sync::Mutex::new(None),
-            staging_size: std::sync::atomic::AtomicU64::new(0),
+            staging: Arc::new(std::sync::Mutex::new(None)),
+            staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -674,6 +705,22 @@ impl GpuContext {
     /// sync path reuses) — per-token readback alloc is fine for the current
     /// prototype (a staging-reuse perf pass is a follow-up).
     pub(crate) fn begin_download(&self, buffer: &wgpu::Buffer, size: u64) -> PendingReadback {
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download-async"),
+            });
+        self.begin_download_with_encoder(encoder, buffer, size)
+    }
+
+    /// Submit a GPU→CPU readback using an existing command encoder, fusing the
+    /// preceding GPU work and the staging copy into a single submission.
+    pub(crate) fn begin_download_with_encoder(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        buffer: &wgpu::Buffer,
+        size: u64,
+    ) -> PendingReadback {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging-download-async"),
             size,
@@ -681,11 +728,6 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("download-async"),
-            });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
         self.submit_encoder(encoder);
 

@@ -17,10 +17,8 @@
 //!   → embeddings [llm_hidden_size × T_subsampled]
 //! ```
 //!
-//! This module is the **loader only** — config + weight structs +
-//! `from_gguf`. The Conformer forward pass and mel-spec preprocessor
-//! land in follow-up PRs (the "audio input pipeline" plan in
-//! `devlog/`).
+//! This module implements the audio weights loader, Conformer forward pass,
+//! mel-spec preprocessing, and automatic linear resampling.
 //!
 //! Tensor name conventions are taken from llama.cpp's
 //! `tools/mtmd/clip-impl.h` (`TN_*` macros), substituted with
@@ -43,6 +41,16 @@ const KEY_N_FF: &str = "clip.audio.feed_forward_length";
 const KEY_N_HEAD: &str = "clip.audio.attention.head_count";
 const KEY_LN_EPS: &str = "clip.audio.attention.layer_norm_epsilon";
 const KEY_N_MEL_BINS: &str = "clip.audio.num_mel_bins";
+
+/// Returns whether a GGUF mmproj file contains an audio encoder rather than a vision encoder.
+pub fn is_audio_encoder_gguf(gguf: &GgufFile) -> bool {
+    gguf.metadata.contains_key("clip.audio.block_count")
+        || gguf.metadata.contains_key("clip.has_audio_encoder")
+        || gguf.metadata.contains_key("audio.block_count")
+        || gguf
+            .get_tensor("audio_model.encoder.layers.0.attn.q.weight")
+            .is_ok()
+}
 
 // ── Audio preprocessing constants (hardcoded by llama.cpp's LFM2A
 //    preprocessor — not stored in the GGUF; surfaced here so the
@@ -73,10 +81,47 @@ pub const LOG_MEL_EPS: f32 = 5.960_464_5e-8;
 /// would round the CPU's floor through f32 and change the shipping path.
 pub const NORM_VAR_EPS: f64 = 1e-5;
 
+/// Linearly resample `samples` from `sr_in` to `sr_out` Hz.
+/// Returns `samples` unchanged when `sr_in == sr_out`.
+///
+/// Linear interpolation is the simplest viable resampler:
+/// - Upsample (e.g. 8 kHz → 16 kHz): introduces a smoothed
+///   high-frequency rolloff but no aliasing — adequate for ASR.
+/// - Downsample (e.g. 44.1 kHz → 16 kHz): does NOT apply an
+///   anti-aliasing low-pass filter, so frequencies above the
+///   output Nyquist (8 kHz here) fold back as aliasing artifacts.
+///   Speech energy is mostly under 8 kHz so this is tolerable for
+///   ASR but not studio-quality.
+pub fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
+    if samples.is_empty()
+        || !(1000..=192_000).contains(&sr_in)
+        || !(1000..=192_000).contains(&sr_out)
+    {
+        return Vec::new();
+    }
+    if sr_in == sr_out {
+        return samples.to_vec();
+    }
+    let n_in = samples.len();
+    let ratio = sr_out as f64 / sr_in as f64;
+    let n_out = ((n_in as f64) * ratio).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(n_out);
+    let step = sr_in as f64 / sr_out as f64;
+    for i in 0..n_out {
+        let pos = i as f64 * step;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let a = samples[idx.min(n_in - 1)];
+        let b = samples[(idx + 1).min(n_in - 1)];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
 /// Configuration for the LFM2A Conformer audio encoder. Read from
 /// the `clip.audio.*` metadata block of the multimodal_projector
 /// GGUF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioEncoderConfig {
     /// Number of Conformer blocks.
     pub n_layer: usize,
@@ -539,6 +584,7 @@ pub const POS_EMB_DIM: usize = 512;
 /// Caller passes `n_frames` = the encoder's effective sequence
 /// length **after** the conv subsampling stem. The output then
 /// feeds every per-block `linear_pos` projection.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
     assert!(n_frames > 0, "n_frames must be > 0");
     // Use checked arithmetic for the size math: on 32-bit targets a
@@ -560,18 +606,13 @@ pub fn relative_pos_emb(n_frames: usize) -> Vec<f32> {
     let inv_freq = inv_freq_cached();
     let n_frames_f = n_frames as f64;
 
-    for (pos, row) in pos_emb
-        .as_chunks_mut::<POS_EMB_DIM>()
-        .0
-        .iter_mut()
-        .enumerate()
-    {
+    for (pos, row) in pos_emb.chunks_exact_mut(POS_EMB_DIM).enumerate() {
         // Signed relative shift: pos=0 → max-positive,
         // pos=seq_len-1 → max-negative. Computed in f64 directly
         // rather than via i64 cast so the math doesn't wrap on
         // unusual `pos` values.
         let rel_pos = n_frames_f - pos as f64 - 1.0;
-        for (i, pair) in row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        for (i, pair) in row.chunks_exact_mut(2).enumerate() {
             let (sin, cos) = ((rel_pos * inv_freq[i]) as f32).sin_cos();
             pair[0] = sin;
             pair[1] = cos;
@@ -853,7 +894,10 @@ pub fn conformer_conv_module_forward(
         0,      // explicit pad already applied above
         n_embd, // groups = in_channels → true depthwise
     );
-    debug_assert_eq!(t_out, t, "causal pad math drifted: t_out={t_out} != t={t}");
+    debug_assert_eq!(
+        t_out, t,
+        "symmetric pad math drifted: t_out={t_out} != t={t}"
+    );
 
     // ── Step 5: conv_norm affine (per-channel mul+add, broadcast
     //    across time), SiLU. Walk channel-by-channel for the

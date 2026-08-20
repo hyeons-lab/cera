@@ -116,6 +116,13 @@ pub enum GenerationDefaults {
     /// `number_of_decoding_threads` style — audio models.
     Audio {
         number_of_decoding_threads: Option<u32>,
+        audio_temperature: Option<f32>,
+        audio_top_k: Option<u32>,
+        temperature: Option<f32>,
+        min_p: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        repetition_penalty: Option<f32>,
     },
     /// Fallback variant — used when the manifest's `inference_type` is
     /// `Unknown(...)`, whether the `generation_time_parameters` block
@@ -160,10 +167,38 @@ impl GenerationDefaults {
             }
             Self::Audio {
                 number_of_decoding_threads,
+                audio_temperature,
+                audio_top_k,
+                temperature,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
             } => {
                 let mut params = serde_json::Map::new();
                 if let Some(t) = number_of_decoding_threads {
                     params.insert("number_of_decoding_threads".into(), serde_json::json!(t));
+                }
+                if let Some(at) = audio_temperature {
+                    params.insert("audio_temperature".into(), serde_json::json!(at));
+                }
+                if let Some(atk) = audio_top_k {
+                    params.insert("audio_top_k".into(), serde_json::json!(atk));
+                }
+                if let Some(t) = temperature {
+                    params.insert("temperature".into(), serde_json::json!(t));
+                }
+                if let Some(mp) = min_p {
+                    params.insert("min_p".into(), serde_json::json!(mp));
+                }
+                if let Some(tp) = top_p {
+                    params.insert("top_p".into(), serde_json::json!(tp));
+                }
+                if let Some(tk) = top_k {
+                    params.insert("top_k".into(), serde_json::json!(tk));
+                }
+                if let Some(rp) = repetition_penalty {
+                    params.insert("repetition_penalty".into(), serde_json::json!(rp));
                 }
                 serde_json::Value::Object(params)
             }
@@ -428,6 +463,13 @@ impl GenerationDefaults {
             return match inference_type {
                 InferenceType::LlamaCppLfm2AudioV1 => Self::Audio {
                     number_of_decoding_threads: None,
+                    audio_temperature: None,
+                    audio_top_k: None,
+                    temperature: None,
+                    min_p: None,
+                    top_p: None,
+                    top_k: None,
+                    repetition_penalty: None,
                 },
                 InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText => {
                     Self::Text {
@@ -452,8 +494,28 @@ impl GenerationDefaults {
                     .get("number_of_decoding_threads")
                     .and_then(|v| v.as_u64())
                     .and_then(|n| u32::try_from(n).ok());
+                let sp = raw.get("sampling_parameters");
+                let f32_at = |key: &str| -> Option<f32> {
+                    raw.get(key)
+                        .or_else(|| sp.and_then(|o| o.get(key)))
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                };
+                let u32_at = |key: &str| -> Option<u32> {
+                    raw.get(key)
+                        .or_else(|| sp.and_then(|o| o.get(key)))
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                };
                 Self::Audio {
                     number_of_decoding_threads: ndt,
+                    audio_temperature: f32_at("audio_temperature"),
+                    audio_top_k: u32_at("audio_top_k"),
+                    temperature: f32_at("temperature"),
+                    min_p: f32_at("min_p"),
+                    top_p: f32_at("top_p"),
+                    top_k: u32_at("top_k"),
+                    repetition_penalty: f32_at("repetition_penalty"),
                 }
             }
             InferenceType::LlamaCppTextToText | InferenceType::LlamaCppImageToText => {
@@ -557,6 +619,13 @@ mod tests {
             chat_template: None,
             generation_defaults: GenerationDefaults::Audio {
                 number_of_decoding_threads: Some(4),
+                audio_temperature: None,
+                audio_top_k: None,
+                temperature: None,
+                min_p: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: None,
             },
             raw: serde_json::Value::Null,
         };

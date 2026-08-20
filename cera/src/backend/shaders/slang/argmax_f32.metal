@@ -331,12 +331,11 @@ uint block_argmax_0(uint tid_0, float val_0, uint idx_0, KernelContext_0 thread*
 #line 141
     if(tid_1 == 0U)
     {
-
-#line 142
-        *((&kernelContext_1)->out_buf_0+int(0)) = _S5;
+        *((&kernelContext_1)->out_buf_0+(uint2(*((&kernelContext_1)->par_buf_0+int(0))) ).y) = _S5;
 
 #line 141
     }
+
 
 
     return;

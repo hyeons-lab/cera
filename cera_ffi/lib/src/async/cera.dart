@@ -81,6 +81,7 @@ class CeraOptions {
   const CeraOptions({
     this.contextSize = 4096,
     this.backend = CeraBackend.auto,
+    this.turboQuant = false,
     this.web = const CeraWebAssets(),
   });
 
@@ -89,6 +90,9 @@ class CeraOptions {
 
   /// Which compute backend to run on.
   final CeraBackend backend;
+
+  /// Whether to enable TurboQuant KV-cache compression. Defaults to false (cera default).
+  final bool turboQuant;
 
   /// Web asset locations. Ignored on native targets.
   final CeraWebAssets web;
@@ -405,6 +409,7 @@ abstract interface class Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
   });
 
   /// Renders `messages` through the model's chat template.
@@ -450,10 +455,26 @@ abstract interface class Cera {
   /// to one cache.
   Future<void> appendImage(Uint8List bytes, {int? maxLongSize});
 
-  /// Transcribes mono PCM audio to text.
+  /// Feeds mono PCM audio into the conversation, to be processed by the next
+  /// [generate].
   ///
-  /// `pcm` is normalized to roughly [-1.0, 1.0] and `sampleRate` must already
-  /// match what the model's audio encoder expects; nothing here resamples.
+  /// Feeds raw audio frames directly through the model's audio encoder into the
+  /// LLM's KV cache. An optional `prompt` text can accompany the audio.
+  ///
+  /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16 kHz inputs are
+  /// automatically resampled by the engine to the model's required rate.
+  ///
+  /// Throws if this model has no audio encoder, i.e. whenever [capabilities]
+  /// reports `audioIn: false`. Serialized against [generate] the same way
+  /// generations are serialized against each other.
+  Future<void> appendAudio(
+    List<double> pcm, {
+    int sampleRate = 16000,
+    String? prompt,
+  });
+
+  /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16kHz inputs are
+  /// automatically resampled to 16 kHz by the engine.
   ///
   /// Independent of the conversation: this runs the model's own "Perform ASR."
   /// mode start to finish and returns the whole transcript, rather than
@@ -474,20 +495,13 @@ abstract interface class Cera {
 
   /// Requests that an in-flight [generate] stop early.
   ///
-  /// **Reliable only on native.** On the web it is best-effort and today
-  /// reaches neither backend's running decode, for two unrelated reasons:
-  ///
-  /// - CPU: the decode loop is one synchronous wasm call occupying the worker,
-  ///   so the message is not delivered until it has already finished.
-  /// - GPU: `WebGpuSession` exposes no cancel entry point to call.
+  /// On native, cancellation stops generation immediately. On the web,
+  /// WebGPU cancels between tokens via its cancel handle, while CPU multi-threaded
+  /// wasm stops via shared cancellation buffers.
   ///
   /// Cancelling the [generate] stream's subscription is the more idiomatic
   /// form and the better one for a Stop button: delivery to your code stops at
-  /// once, whether or not the decode behind it does. Note that *awaiting* that
-  /// cancellation is a different matter on the web's CPU backend, where the
-  /// returned future waits on a worker reply that cannot be dequeued until the
-  /// synchronous decode finishes. Drop the subscription rather than awaiting it
-  /// if a Stop button must return promptly.
+  /// once, whether or not the decode behind it does.
   ///
   /// [terminate] does stop the work itself on every platform, but by destroying
   /// the engine, so it answers "I am done with this" rather than "stop this

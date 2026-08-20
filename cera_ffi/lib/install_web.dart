@@ -46,6 +46,9 @@ Future<void> installWeb(List<String> args) async {
   final out = Directory(_valueOf(args, '--out') ?? _defaultOut);
   final force = args.contains('--force');
 
+  final mtFrom = _valueOf(args, '--mt-from');
+  final mtOut = Directory(_valueOf(args, '--mt-out') ?? 'web/cera_mt');
+
   final pubspec = await _readPubspec();
   await out.create(recursive: true);
 
@@ -54,6 +57,11 @@ Future<void> installWeb(List<String> args) async {
     await _copyModule(Directory(from), out, force: force);
   } else {
     await _downloadModule(pubspec, out, force: force);
+  }
+
+  if (mtFrom != null) {
+    await mtOut.create(recursive: true);
+    await _copyModule(Directory(mtFrom), mtOut, force: force);
   }
 
   stdout
@@ -75,12 +83,15 @@ Install the Cera web runtime into an app's web/ directory.
 Usage: dart run cera_ffi:install_web [options]
        dart run cera_ffi_flutter:install_web [options]   (from a Flutter app)
 
-  --from DIR   Copy cera_wasm.js and cera_wasm_bg.wasm from a local wasm-pack
-               build instead of downloading them. Use the output of
-               `just wasm-web-wgpu` (cera-wasm/examples/webgpu/pkg).
-  --out DIR    Where to install. Default: $_defaultOut
-  --force      Overwrite files that are already there.
-  -h, --help   Show this message.
+  --from DIR      Copy cera_wasm.js and cera_wasm_bg.wasm from a local wasm-pack
+                  build instead of downloading them. Use the output of
+                  `just wasm-web-wgpu` (cera-wasm/examples/webgpu/pkg).
+  --out DIR       Where to install. Default: $_defaultOut
+  --mt-from DIR   Copy multi-threaded wasm artifacts from a local build
+                  (e.g. cera-wasm/pkg-web-mt).
+  --mt-out DIR    Where to install multi-threaded artifacts. Default: web/cera_mt
+  --force         Overwrite files that are already there.
+  -h, --help      Show this message.
 ''';
 
 String? _valueOf(List<String> args, String flag) {
@@ -161,6 +172,26 @@ Future<void> _installWorker(Directory out, {required bool force}) async {
   );
 }
 
+Future<void> _copyDirectory(
+  Directory src,
+  Directory dst, {
+  required bool force,
+}) async {
+  await dst.create(recursive: true);
+  for (final entity in src.listSync()) {
+    final name = entity.uri.pathSegments.where((s) => s.isNotEmpty).last;
+    if (entity is File) {
+      await _write(dst, name, await entity.readAsBytes(), force: force);
+    } else if (entity is Directory) {
+      await _copyDirectory(
+        entity,
+        Directory('${dst.path}/$name'),
+        force: force,
+      );
+    }
+  }
+}
+
 Future<void> _copyModule(
   Directory from,
   Directory out, {
@@ -171,10 +202,19 @@ Future<void> _copyModule(
     if (!source.existsSync()) {
       throw StateError(
         'no $name in ${from.path}. Build it first:\n'
-        '  just wasm-web-wgpu   (writes cera-wasm/examples/webgpu/pkg)',
+        '  just wasm-web-wgpu   (writes cera-wasm/examples/webgpu/pkg)\n'
+        '  just wasm-web-mt     (writes cera-wasm/pkg-web-mt)',
       );
     }
     await _write(out, name, await source.readAsBytes(), force: force);
+  }
+  final snippets = Directory('${from.path}/snippets');
+  if (snippets.existsSync()) {
+    await _copyDirectory(
+      snippets,
+      Directory('${out.path}/snippets'),
+      force: force,
+    );
   }
 }
 
