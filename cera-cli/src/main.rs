@@ -4356,7 +4356,8 @@ fn main() -> Result<()> {
                 warmup,
                 runs
             );
-            if spec || draft_model.is_some() {
+            let has_draft = draft_model.is_some() || engine.manifest().files.draft_model.is_some();
+            if spec || has_draft {
                 // Speculative decode only engages on a dense model with an
                 // uncompressed KV cache; flag when it will silently no-op so the
                 // measured number isn't mistaken for a spec result. Test against
@@ -4368,7 +4369,7 @@ fn main() -> Result<()> {
                     cera::kv_cache::KvCompression::TurboQuant { .. }
                 );
                 let engages = engine.model().supports_all_logits() && !compressed;
-                let drafter_desc = if draft_model.is_some() {
+                let drafter_desc = if has_draft {
                     format!("neural draft model, k={spec_k}")
                 } else {
                     format!("ngram={spec_ngram}, k={spec_k}")
@@ -4407,7 +4408,7 @@ fn main() -> Result<()> {
                     // `max_tokens`, not stop early at EOS — otherwise short
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
-                    spec: (spec || draft_model.is_some()).then_some(cera::SpecDecode {
+                    spec: (spec || has_draft).then_some(cera::SpecDecode {
                         ngram: spec_ngram,
                         k: spec_k,
                     }),

@@ -403,12 +403,13 @@ fn is_audio_tokenizer_gguf(file: &str) -> bool {
 }
 
 fn is_draft_model(file: &str) -> bool {
-    file.contains("dspark")
-        || file.contains("dflash")
-        || file.contains("-draft")
-        || file.contains("_draft")
-        || file.contains(".draft")
-        || file.starts_with("draft")
+    let lower = file.to_ascii_lowercase();
+    lower.contains("dspark")
+        || lower.contains("dflash")
+        || lower.contains("-draft")
+        || lower.contains("_draft")
+        || lower.contains(".draft")
+        || lower.starts_with("draft")
 }
 
 /// Check whether two quantization tags match (case-insensitive and hyphen/underscore/dot agnostic, zero-alloc).

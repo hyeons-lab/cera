@@ -108,6 +108,12 @@ impl DSparkConfig {
             .map(|v| v as usize)
             .unwrap_or(base_vocab);
 
+        if vocab_size != base_vocab {
+            anyhow::bail!(
+                "draft model vocab_size ({vocab_size}) does not match base model vocab_size ({base_vocab})"
+            );
+        }
+
         let block_size = gguf
             .get_u32(&pfx("block_size"))
             .or_else(|| gguf.get_u32("dspark.block_size"))

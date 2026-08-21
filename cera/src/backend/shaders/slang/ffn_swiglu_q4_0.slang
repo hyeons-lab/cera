@@ -130,7 +130,8 @@ void ffn_swiglu_q4_0(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
         float gate_sum = scratch[0];
         float up_sum   = scratch[16];
         // silu(gate) = gate / (1.0 + exp(-gate))
-        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        float clamped_gate = clamp(gate_sum, -80.0f, 80.0f);
+        float silu_gate = gate_sum / (1.0f + exp(-clamped_gate));
         y[row] = silu_gate * up_sum;
     }
 }
