@@ -3599,6 +3599,81 @@ impl MetalLfm2Model {
         let n_tgs = n.div_ceil(qpt) * n_heads;
         enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
     }
+
+    pub(crate) fn forward_inner(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+
+        assert!(
+            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
+            "Metal seq_len {} exceeds max_seq_len {}",
+            self.state.seq_len.load(Ordering::Relaxed),
+            self.state.max_seq_len,
+        );
+
+        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
+        }
+
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
+
+        let lora_active = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .is_some();
+
+        if !lora_active && let Some(timer) = &self.profile_timer {
+            self.encode_layers_profiled(pos, timer);
+            self.profile_segment(timer, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else if !lora_active && let Some(timer) = &self.gpu_timer {
+            timer.next_idx.store(0, Ordering::Relaxed);
+            timer.labels.lock().expect("timer mutex poisoned").clear();
+            let cb = self.ctx.queue.new_command_buffer();
+            self.encode_layers_gpu_timed(cb, pos, timer);
+            self.gpu_sampled_pass(timer, cb, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            cb.commit();
+            cb.wait_until_completed();
+            self.gpu_timer_resolve(timer);
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else {
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_layers(enc, pos);
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // Update state + read back logits (unified memory zero-copy)
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+    }
 }
 
 impl Model for MetalLfm2Model {
@@ -3721,88 +3796,6 @@ impl Model for MetalLfm2Model {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
         self.forward_inner(tokens, _pos, state)
-    }
-
-    fn forward_inner(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
-        let token_id = tokens[0] as usize;
-        let cfg = &self.config;
-        let hs = cfg.hidden_size;
-
-        assert!(
-            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
-            "Metal seq_len {} exceeds max_seq_len {}",
-            self.state.seq_len.load(Ordering::Relaxed),
-            self.state.max_seq_len,
-        );
-
-        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
-            self.dequant_embedding_row(token_id, dst);
-        }
-
-        let pos = self.state.seq_len.load(Ordering::Relaxed);
-
-        // The per-category profiling paths re-implement the layer loop and don't
-        // run the LoRA hooks, so an active adapter forces the normal (hooked)
-        // `encode_layers` path — profiling + LoRA yields correct (adapted) output
-        // at the cost of no per-category breakdown (a diagnostic-only combo).
-        let lora_active = self
-            .active_lora
-            .lock()
-            .expect("active_lora poisoned")
-            .is_some();
-
-        if !lora_active && let Some(timer) = &self.profile_timer {
-            // Profiling path: each category is its own command buffer so we can
-            // measure wall time separately. Slower than normal — diagnostic only.
-            self.encode_layers_profiled(pos, timer);
-            self.profile_segment(timer, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            timer.bump_token();
-            // Print cumulative breakdown every 32 tokens to avoid noise.
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else if !lora_active && let Some(timer) = &self.gpu_timer {
-            // GPU-timestamp profiling: one command buffer, many compute
-            // encoders (one per category) — each with start/end timestamp
-            // samples attached. Single commit+wait, then resolve samples.
-            timer.next_idx.store(0, Ordering::Relaxed);
-            timer.labels.lock().expect("timer mutex poisoned").clear();
-            let cb = self.ctx.queue.new_command_buffer();
-            self.encode_layers_gpu_timed(cb, pos, timer);
-            self.gpu_sampled_pass(timer, cb, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            cb.commit();
-            cb.wait_until_completed();
-            self.gpu_timer_resolve(timer);
-            timer.bump_token();
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else {
-            // Single command buffer + single compute encoder for the entire forward pass.
-            let cb = self.ctx.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            self.encode_layers(enc, pos);
-            // Output norm + projection (normed_buf is free here).
-            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-        }
-
-        // Update state + read back logits (unified memory zero-copy)
-        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
-        state.seq_len += 1;
-        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
     }
 
     fn forward_greedy(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> u32 {

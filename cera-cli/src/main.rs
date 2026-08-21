@@ -526,6 +526,10 @@ enum Command {
         /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
         #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
         draft_model: Option<String>,
+
+        /// Speculative decoding proposal length (default: 8).
+        #[arg(long = "spec-k", default_value_t = 8, value_name = "K")]
+        spec_k: usize,
     },
 
     /// Inspect a GGUF model file.
@@ -684,6 +688,10 @@ enum Command {
         /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
         #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
         draft_model: Option<String>,
+
+        /// Speculative decoding proposal length (default: 8).
+        #[arg(long = "spec-k", default_value_t = 8, value_name = "K")]
+        spec_k: usize,
     },
 
     /// Extract hidden-state embeddings for a prompt.
@@ -2246,6 +2254,7 @@ fn main() -> Result<()> {
             lora,
             lora_alpha,
             draft_model,
+            spec_k,
         } => {
             // Compile the grammar (if any) up front so a malformed GBNF fails fast,
             // before the engine loads ~1 GB of weights. `--json` uses a bundled grammar;
@@ -2362,7 +2371,14 @@ fn main() -> Result<()> {
                               grammar: Option<std::sync::Arc<cera::grammar::Grammar>>,
                               triggers: Vec<u32>|
              -> cera::GenerateOpts {
-                sampling_args.build_generate_opts(engine, grammar, triggers)
+                let mut opts = sampling_args.build_generate_opts(engine, grammar, triggers);
+                if draft_model.is_some() || engine.manifest().files.draft_model.is_some() {
+                    opts.spec = Some(cera::SpecDecode {
+                        ngram: 2,
+                        k: spec_k,
+                    });
+                }
+                opts
             };
 
             // Image-input path (mutually exclusive with --audio-in,
@@ -3514,6 +3530,7 @@ fn main() -> Result<()> {
             lora,
             lora_alpha,
             draft_model,
+            spec_k,
         } => {
             use std::io::BufRead;
 
@@ -3611,7 +3628,13 @@ fn main() -> Result<()> {
                 repetition_penalty,
             };
             sampling_args.validate()?;
-            let opts = sampling_args.build_generate_opts(&engine, None, Vec::new());
+            let mut opts = sampling_args.build_generate_opts(&engine, None, Vec::new());
+            if draft_model.is_some() || engine.manifest().files.draft_model.is_some() {
+                opts.spec = Some(cera::SpecDecode {
+                    ngram: 2,
+                    k: spec_k,
+                });
+            }
 
             // Dispatch: inline TUI when both stdin AND stdout are TTYs
             // (so cursor positioning + raw-mode keystroke reads behave
