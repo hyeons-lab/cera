@@ -21,12 +21,6 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR
     "cera_ffi_flutter: only 64-bit Windows is supported.")
 endif()
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
-  message(FATAL_ERROR
-    "cera_ffi_flutter: no prebuilt cera-ffi library for Windows on ARM. "
-    "Build cera-ffi from source and place ${CERA_LIB_FILE} in this directory, "
-    "or set CERA_FFI_LIB at runtime.")
-endif()
 
 set(CERA_ARCHIVE "cera-ffi-${CERA_LIB_LABEL}-v${CERA_VERSION}.tar.gz")
 set(CERA_URL
@@ -57,6 +51,13 @@ if(EXISTS "${CERA_LOCAL_LIB}")
   message(STATUS "cera_ffi_flutter: using locally-supplied ${CERA_LOCAL_LIB} (not verified)")
   set(CERA_LIB_PATH "${CERA_LOCAL_LIB}")
 elseif(NOT EXISTS "${CERA_LIB_PATH}")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+    message(FATAL_ERROR
+      "cera_ffi_flutter: no prebuilt cera-ffi library for Windows on ARM. "
+      "Build cera-ffi from source and place ${CERA_LIB_FILE} in ${CMAKE_CURRENT_SOURCE_DIR}, "
+      "or set CERA_FFI_LIB at runtime.")
+  endif()
+
   file(MAKE_DIRECTORY "${CERA_DOWNLOAD_DIR}")
 
   message(STATUS "cera_ffi_flutter: fetching ${CERA_ARCHIVE}")

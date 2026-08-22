@@ -64,6 +64,8 @@ Future<void> installWeb(List<String> args) async {
     await _copyModule(Directory(mtFrom), mtOut, force: force);
   }
 
+  final url = _urlOf(out);
+  final prefix = url.isEmpty ? '' : (url.endsWith('/') ? url : '$url/');
   stdout
     ..writeln()
     ..writeln('Installed into ${out.path}/')
@@ -72,8 +74,8 @@ Future<void> installWeb(List<String> args) async {
     ..writeln(
       '  Cera.openBytes(bytes, options: CeraOptions(web: CeraWebAssets(',
     )
-    ..writeln("    workerUrl: '${_urlOf(out)}/cera_worker.js',")
-    ..writeln("    moduleUrl: '${_urlOf(out)}/cera_wasm.js',")
+    ..writeln("    workerUrl: '${prefix}cera_worker.js',")
+    ..writeln("    moduleUrl: '${prefix}cera_wasm.js',")
     ..writeln('  )));');
 }
 
@@ -114,6 +116,7 @@ String _urlOf(Directory dir) {
   if (raw.startsWith('/')) return raw;
   // Normalized so `./web/cera` and `web/./cera` reduce to `web/cera`.
   final path = _normalizePath(raw);
+  if (path == 'web') return '';
   return path.startsWith('web/') ? path.substring(4) : path;
 }
 
