@@ -63,13 +63,12 @@ def export_quantized_gguf(
     print(f"Target 2D Matrix Quantization: {quant_type.upper()} ({gguf_type}) for architecture '{arch_name}'")
 
     gguf_writer = gguf.GGUFWriter(output_gguf_path, arch_name)
-
-    if is_markov_model:
-        copy_tokenizer_metadata(gguf_writer)
+    copy_tokenizer_metadata(gguf_writer)
 
     # Architecture metadata
     gguf_writer.add_architecture()
     gguf_writer.add_string("general.architecture", arch_name)
+    gguf_writer.add_uint32(f"{arch_name}.context_length", 2048)
     gguf_writer.add_uint32(f"{arch_name}.block_size", block_size)
     gguf_writer.add_uint32(f"{arch_name}.markov_rank", markov_rank)
     gguf_writer.add_uint32(f"{arch_name}.block_count", num_layers)
