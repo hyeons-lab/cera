@@ -207,10 +207,9 @@ class DSparkMarkovModel(nn.Module):
         queries = self.block_queries.unsqueeze(0).expand(B, -1, -1)
         x = fused_h.unsqueeze(1).expand(-1, K, -1) + queries
 
-        causal_mask = torch.triu(torch.full((K, K), float("-inf"), device=x.device), diagonal=1)
-
+        # Bidirectional (non-causal) attention matching llama.cpp dflash.cpp
         for layer in self.layers:
-            x = layer(x, mask=causal_mask)
+            x = layer(x, mask=None)
 
         draft_features = self.output_norm(x) # [B, K, hidden_size]
         base_logits = F.linear(draft_features, base_lm_head_weight)

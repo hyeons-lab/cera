@@ -95,6 +95,8 @@ def export_quantized_gguf(
         gguf_writer.add_uint32("dflash.context_length", 2048)
         gguf_writer.add_uint32("dflash.block_size", block_size)
         gguf_writer.add_bool("dflash.sample_from_anchor", True)
+        gguf_writer.add_uint32("tokenizer.ggml.mask_token_id", 64402)
+        gguf_writer.add_uint32("tokenizer.ggml.padding_token_id", 64402)
         if "target_layers" in state_dict:
             target_layers = state_dict["target_layers"]
         gguf_writer.add_array("target_layers", [int(l) for l in target_layers])

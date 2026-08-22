@@ -45,8 +45,9 @@ def compute_acceptance_length(drafter, base_model, lm_head_weight, eval_loader, 
 
                 if is_markov:
                     target_hiddens = [outputs.hidden_states[l][:, -1, :].float() for l in target_layers]
-                    prev_tokens = prefix_ids[:, -1:].expand(-1, block_size)
-                    draft_out = drafter(target_hiddens, lm_head_weight, input_token_ids=prev_tokens)
+                    dflash_tokens = torch.full((B, block_size), 64402, dtype=torch.long, device=device)
+                    dflash_tokens[:, 0] = prefix_ids[:, -1]
+                    draft_out = drafter(target_hiddens, lm_head_weight, input_token_ids=dflash_tokens)
                 else:
                     teacher_hidden = outputs.hidden_states[-1][:, -1, :].float()
                     draft_out = drafter(teacher_hidden, lm_head_weight)
@@ -190,10 +191,13 @@ def train(args):
                 loss_s.backward()
                 loss_accum["standalone"] += loss_s.detach() * grad_accum_steps
 
-            # 2. Train Markov Drafter (if enabled)
+            # 2. Train Markov / DFlash Drafter (if enabled)
             if train_markov:
                 target_hiddens = [base_out.hidden_states[l][:, t, :].float() for l in target_layers]
-                out_m = models["markov"](target_hiddens, lm_head_weight, input_token_ids=prev_tokens)
+                # In DFlash / llama.cpp, slot 0 is the anchor token, and slots 1..k-1 are mask tokens (64402)
+                dflash_tokens = torch.full((B, block_size), 64402, dtype=torch.long, device=device)
+                dflash_tokens[:, 0] = input_ids[:, t]
+                out_m = models["markov"](target_hiddens, lm_head_weight, input_token_ids=dflash_tokens)
                 loss_ce_m = F.cross_entropy(out_m["logits"].view(-1, vocab_size), target_tokens.reshape(-1))
                 pred_m = out_m["logits"].argmax(dim=-1)
                 is_accepted_m = (pred_m == target_tokens).float()
