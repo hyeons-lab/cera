@@ -14,10 +14,11 @@ import gguf
 
 def copy_tokenizer_metadata(writer: gguf.GGUFWriter):
     candidates = [
-        "/Users/dberrios/.leap/models/LFM2.5-VL-450M-Q4_0/LFM2.5-VL-450M-Q4_0.gguf",
+        os.environ.get("BASE_GGUF", ""),
+        os.path.expanduser("~/.leap/models/LFM2.5-VL-450M-Q4_0/LFM2.5-VL-450M-Q4_0.gguf"),
         os.path.expanduser("~/.cache/cera/LFM2.5-VL-450M-Q4_0.gguf"),
     ]
-    base_gguf_path = next((p for p in candidates if os.path.exists(p)), None)
+    base_gguf_path = next((p for p in candidates if p and os.path.exists(p)), None)
     if not base_gguf_path:
         return
     base_reader = gguf.GGUFReader(base_gguf_path)
@@ -96,34 +97,28 @@ def export_to_gguf(
         if "enc_norm.weight" in state_dict:
             enc_norm = state_dict["enc_norm.weight"].float().numpy()
             gguf_writer.add_tensor("enc.output_norm.weight", enc_norm)
-
-        # Write Markov matrices
-        if "markov_w1" in state_dict and "markov_w2" in state_dict:
-            w1 = state_dict["markov_w1"].float().numpy()
-            w2 = state_dict["markov_w2"].float().numpy()
-            gguf_writer.add_tensor("markov_w1.weight", w1)
-            gguf_writer.add_tensor("markov_w2.weight", w2)
-
-        # Confidence projection
-        if "confidence_head.2.weight" in state_dict and "confidence_head.0.weight" in state_dict:
-            w0 = state_dict["confidence_head.0.weight"].float()
-            b0 = state_dict["confidence_head.0.bias"].float()
-            w2 = state_dict["confidence_head.2.weight"].float()
-            b2 = state_dict["confidence_head.2.bias"].float()
-            w_eff = (w2 @ w0).numpy()
-            b_eff = (w2 @ b0 + b2).numpy()
-            gguf_writer.add_tensor("conf_proj.weight", w_eff)
-            gguf_writer.add_tensor("conf_proj.bias", b_eff)
-        elif "confidence_head.0.weight" in state_dict:
-            conf_w = state_dict["confidence_head.0.weight"].float().numpy()
-            gguf_writer.add_tensor("conf_proj.weight", conf_w)
-            if "confidence_head.0.bias" in state_dict:
-                conf_b = state_dict["confidence_head.0.bias"].float().numpy()
-                gguf_writer.add_tensor("conf_proj.bias", conf_b)
     else:
         # Standalone drafter metadata
         gguf_writer.add_uint32("dspark.num_layers", num_layers)
         gguf_writer.add_uint32("dspark.hidden_size", hidden_size)
+
+    # Write Markov matrices (supported in both models)
+    if "markov_w1" in state_dict and "markov_w2" in state_dict:
+        w1 = state_dict["markov_w1"].float().numpy()
+        w2 = state_dict["markov_w2"].float().numpy()
+        gguf_writer.add_tensor("markov_w1.weight", w1)
+        gguf_writer.add_tensor("markov_w2.weight", w2)
+
+    # Confidence projection (supported in both models)
+    if "confidence_head.weight" in state_dict:
+        conf_w = state_dict["confidence_head.weight"].float().numpy().reshape(-1)
+        gguf_writer.add_tensor("conf_proj.weight", conf_w)
+    elif "confidence_head.0.weight" in state_dict:
+        conf_w = state_dict["confidence_head.0.weight"].float().numpy().reshape(-1)
+        gguf_writer.add_tensor("conf_proj.weight", conf_w)
+        if "confidence_head.0.bias" in state_dict:
+            conf_b = state_dict["confidence_head.0.bias"].float().numpy().reshape(-1)
+            gguf_writer.add_tensor("conf_proj.bias", conf_b)
 
     # Write layer weights
     for l in range(num_layers):

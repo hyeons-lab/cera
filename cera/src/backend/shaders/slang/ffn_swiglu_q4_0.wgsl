@@ -182,7 +182,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     workgroupBarrier();
     if(_S2 == u32(0))
     {
-        y_0[row_0] = scratch_0[i32(0)] / (1.0f + exp(- scratch_0[i32(0)])) * scratch_0[i32(16)];
+        y_0[row_0] = scratch_0[i32(0)] / (1.0f + exp(- clamp(scratch_0[i32(0)], -80.0f, 80.0f))) * scratch_0[i32(16)];
     }
     return;
 }

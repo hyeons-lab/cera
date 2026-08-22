@@ -399,14 +399,13 @@ float load_up_f16_0(uint byte_off_3, KernelContext_0 thread* kernelContext_3)
     if(_S2 == 0U)
     {
 
-
-
-        *((&kernelContext_4)->y_0+row_0) = (*(&kernelContext_4)->scratch_0)[int(0)] / (1.0f + exp(- (*(&kernelContext_4)->scratch_0)[int(0)])) * (*(&kernelContext_4)->scratch_0)[int(16)];
+#line 135
+        *((&kernelContext_4)->y_0+row_0) = (*(&kernelContext_4)->scratch_0)[int(0)] / (1.0f + exp(- clamp((*(&kernelContext_4)->scratch_0)[int(0)], -80.0f, 80.0f))) * (*(&kernelContext_4)->scratch_0)[int(16)];
 
 #line 129
     }
 
-#line 136
+#line 137
     return;
 }
 

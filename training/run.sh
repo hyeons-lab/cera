@@ -18,18 +18,19 @@ python src/train.py --mode both --epochs 15 --batch-size 8 --grad-accum-steps 4
 echo ""
 echo "=== Converting Checkpoints to GGUF Sidecars ==="
 # Option B Standalone (for Cera)
-python src/convert_gguf.py checkpoints/best_dspark_standalone.pt checkpoints/lfm2.5-vl-450m-dspark-standalone.gguf
-python src/convert_gguf_quant.py checkpoints/best_dspark_standalone.pt checkpoints/lfm2.5-vl-450m-dspark-standalone-Q4_0.gguf Q4_0
+python src/convert_gguf.py checkpoints/best_dspark_standalone.pt checkpoints/lfm2.5-vl-450m-dspark.gguf
+python src/convert_gguf_quant.py checkpoints/best_dspark_standalone.pt checkpoints/LFM2.5-VL-450M-DSpark-Q4_0.gguf Q4_0
+cp checkpoints/LFM2.5-VL-450M-DSpark-Q4_0.gguf checkpoints/lfm2.5-vl-450m-dspark-Q4_0.gguf
 
 # Option B Markov (for llama.cpp)
-python src/convert_gguf.py checkpoints/best_dspark_markov.pt checkpoints/lfm2.5-vl-450m-dspark-markov.gguf
-python src/convert_gguf_quant.py checkpoints/best_dspark_markov.pt checkpoints/lfm2.5-vl-450m-dspark-markov-Q4_0.gguf Q4_0
+python src/convert_gguf.py checkpoints/best_dspark_markov.pt checkpoints/lfm2.5-vl-450m-dflash.gguf
+python src/convert_gguf_quant.py checkpoints/best_dspark_markov.pt checkpoints/LFM2.5-VL-450M-DFlash-Q4_0.gguf Q4_0
 
 echo ""
 echo "=========================================================="
 echo " Pipeline Complete!"
-echo " Sidecar Artifacts (Option B):"
-echo "   🚀 Cera:      $DIR/checkpoints/lfm2.5-vl-450m-dspark-standalone-Q4_0.gguf"
-echo "   🦙 llama.cpp: $DIR/checkpoints/lfm2.5-vl-450m-dspark-markov-Q4_0.gguf"
+echo " Sidecar Artifacts:"
+echo "   🚀 Cera:      $DIR/checkpoints/LFM2.5-VL-450M-DSpark-Q4_0.gguf"
+echo "   🦙 llama.cpp: $DIR/checkpoints/LFM2.5-VL-450M-DFlash-Q4_0.gguf"
 echo "=========================================================="
 

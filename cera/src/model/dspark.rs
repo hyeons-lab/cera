@@ -144,14 +144,14 @@ impl DSparkConfig {
 
         ensure!(hidden_size > 0, "DSpark hidden_size must be positive");
         ensure!(
-            hidden_size.is_multiple_of(32),
+            hidden_size % 32 == 0,
             "DSpark hidden_size ({hidden_size}) must be divisible by 32 for SIMD alignment",
         );
         ensure!(num_layers > 0, "DSpark num_layers must be positive");
         ensure!(num_heads > 0, "DSpark num_heads must be positive");
         ensure!(num_kv_heads > 0, "DSpark num_kv_heads must be positive");
         ensure!(
-            num_heads.is_multiple_of(num_kv_heads),
+            num_heads % num_kv_heads == 0,
             "DSpark num_heads ({num_heads}) must be a positive multiple of num_kv_heads ({num_kv_heads})"
         );
         ensure!(head_dim > 0, "DSpark head_dim must be positive");
@@ -583,6 +583,8 @@ impl DSparkDraftModel {
         let confidence_weight: Option<Arc<[f32]>> = draft_gguf
             .get_tensor("confidence.weight")
             .or_else(|_| draft_gguf.get_tensor("confidence_head.proj.weight"))
+            .or_else(|_| draft_gguf.get_tensor("conf_proj.weight"))
+            .or_else(|_| draft_gguf.get_tensor("conf_proj"))
             .or_else(|_| draft_gguf.get_tensor("model.confidence_head.proj.weight"))
             .or_else(|_| draft_gguf.get_tensor("dflash.confidence.weight"))
             .or_else(|_| draft_gguf.get_tensor("dspark.confidence.weight"))
@@ -822,7 +824,8 @@ impl Drafter for DSparkSessionDrafter {
                 if !conf_dot.is_finite() {
                     break;
                 }
-                let prob = 1.0 / (1.0 + (-conf_dot).exp());
+                let clamped_neg_dot = (-conf_dot).clamp(-80.0, 80.0);
+                let prob = 1.0 / (1.0 + clamped_neg_dot.exp());
                 if !prob.is_finite() || prob < 0.35 {
                     break;
                 }

@@ -3678,10 +3678,7 @@ impl MetalLfm2Model {
 
 impl Model for MetalLfm2Model {
     fn supports_all_logits(&self) -> bool {
-        self.config
-            .block_types
-            .iter()
-            .all(|b| *b == BlockType::Attention)
+        true
     }
 
     fn forward_prefill_logits_all(

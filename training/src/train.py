@@ -21,7 +21,7 @@ from transformers import AutoModel, AutoTokenizer
 from model import DSparkStandaloneModel, DSparkMarkovModel
 from data import prepare_dataset, collate_fn
 
-def compute_acceptance_length(drafter, base_model, lm_head_weight, eval_loader, device, block_size=9, num_batches=15, is_markov=False, target_layers=[3, 7, 11]):
+def compute_acceptance_length(drafter, base_model, lm_head_weight, tok_embd_weight, eval_loader, device, block_size=9, num_batches=15, is_markov=False, target_layers=[3, 7, 11]):
     """
     Evaluates empirical speculative acceptance length (tau out of block_size) against the target base model.
     """
@@ -44,15 +44,21 @@ def compute_acceptance_length(drafter, base_model, lm_head_weight, eval_loader, 
                 outputs = base_model(input_ids=prefix_ids, output_hidden_states=True)
 
                 if is_markov:
-                    target_hiddens = [outputs.hidden_states[l][:, -1, :].float() for l in target_layers]
+                    target_hiddens = [outputs.hidden_states[l].float() for l in target_layers]
                     dflash_tokens = torch.full((B, block_size), 64402, dtype=torch.long, device=device)
                     dflash_tokens[:, 0] = prefix_ids[:, -1]
-                    draft_out = drafter(target_hiddens, lm_head_weight, input_token_ids=dflash_tokens)
+                    draft_out = drafter(target_hiddens, dflash_tokens, tok_embd_weight, lm_head_weight)
+                    draft_preds = draft_out["logits"].argmax(dim=-1)
                 else:
-                    teacher_hidden = outputs.hidden_states[-1][:, -1, :].float()
-                    draft_out = drafter(teacher_hidden, lm_head_weight)
-
-                draft_preds = draft_out["logits"].argmax(dim=-1)
+                    # Standalone drafter forwards prefix tokens autoregressively
+                    draft_tokens = []
+                    curr_tokens = prefix_ids
+                    for _ in range(block_size):
+                        draft_out = drafter(curr_tokens, tok_embd_weight, lm_head_weight)
+                        next_tok = draft_out["logits"][:, -1, :].argmax(dim=-1, keepdim=True)
+                        draft_tokens.append(next_tok)
+                        curr_tokens = torch.cat([curr_tokens, next_tok], dim=1)
+                    draft_preds = torch.cat(draft_tokens, dim=1)
 
                 for b in range(B):
                     accepted_in_round = 0
@@ -88,7 +94,7 @@ def train(args):
     learning_rate = args.lr
     epochs = args.epochs
     max_seq_len = 256
-    checkpoint_dir = "/Users/dberrios/development/cera/worktrees/dspark-sidecar/training/checkpoints"
+    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     print("Loading base model & tokenizer...")
@@ -100,7 +106,8 @@ def train(args):
     for param in base_model.parameters():
         param.requires_grad = False
 
-    lm_head_weight = base_model.language_model.embed_tokens.weight.float()
+    tok_embd_weight = base_model.language_model.embed_tokens.weight.float()
+    lm_head_weight = tok_embd_weight
 
     train_standalone = args.mode in ["standalone", "both"]
     train_markov = args.mode in ["markov", "both"]
@@ -181,11 +188,12 @@ def train(args):
 
             # 1. Train Standalone Drafter (if enabled)
             if train_standalone:
-                anchor_hidden = base_out.hidden_states[-1][:, t, :].float()
-                out_s = models["standalone"](anchor_hidden, lm_head_weight)
-                loss_ce_s = F.cross_entropy(out_s["logits"].view(-1, vocab_size), target_tokens.reshape(-1))
+                # Standalone causal draft LM trains on input sequence predicting next tokens
+                out_s = models["standalone"](input_ids[:, :-1], tok_embd_weight, lm_head_weight)
+                target_s = input_ids[:, 1:]
+                loss_ce_s = F.cross_entropy(out_s["logits"].reshape(-1, vocab_size), target_s.reshape(-1))
                 pred_s = out_s["logits"].argmax(dim=-1)
-                is_accepted_s = (pred_s == target_tokens).float()
+                is_accepted_s = (pred_s == target_s).float()
                 loss_conf_s = F.binary_cross_entropy_with_logits(out_s["confidence_logits"], is_accepted_s)
                 loss_s = (loss_ce_s + 0.1 * loss_conf_s) / grad_accum_steps
                 loss_s.backward()
@@ -193,12 +201,12 @@ def train(args):
 
             # 2. Train Markov / DFlash Drafter (if enabled)
             if train_markov:
-                target_hiddens = [base_out.hidden_states[l][:, t, :].float() for l in target_layers]
+                target_hiddens = [base_out.hidden_states[l][:, :t+1, :].float() for l in target_layers]
                 # In DFlash / llama.cpp, slot 0 is the anchor token, and slots 1..k-1 are mask tokens (64402)
                 dflash_tokens = torch.full((B, block_size), 64402, dtype=torch.long, device=device)
                 dflash_tokens[:, 0] = input_ids[:, t]
-                out_m = models["markov"](target_hiddens, lm_head_weight, input_token_ids=dflash_tokens)
-                loss_ce_m = F.cross_entropy(out_m["logits"].view(-1, vocab_size), target_tokens.reshape(-1))
+                out_m = models["markov"](target_hiddens, dflash_tokens, tok_embd_weight, lm_head_weight)
+                loss_ce_m = F.cross_entropy(out_m["logits"].reshape(-1, vocab_size), target_tokens.reshape(-1))
                 pred_m = out_m["logits"].argmax(dim=-1)
                 is_accepted_m = (pred_m == target_tokens).float()
                 loss_conf_m = F.binary_cross_entropy_with_logits(out_m["confidence_logits"], is_accepted_m)
@@ -213,7 +221,7 @@ def train(args):
                     schedulers[k].step()
                     optimizers[k].zero_grad()
 
-            if (step + 1) % 400 == 0:
+            if (step + 1) % 50 == 0:
                 print(f"  [Epoch {epoch:02d}] Step {step+1}/{len(train_loader)}...", flush=True)
 
         elapsed = time.time() - start_time
@@ -222,14 +230,14 @@ def train(args):
 
         # Evaluate acceptance length
         if train_standalone:
-            acc_s = compute_acceptance_length(models["standalone"], base_model, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=False)
+            acc_s = compute_acceptance_length(models["standalone"], base_model, lm_head_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=False)
             print(f"  [Standalone / Cera] Mean Acceptance: {acc_s:.2f}/{block_size} tokens", flush=True)
             if acc_s > best_acceptance["standalone"]:
                 best_acceptance["standalone"] = acc_s
                 torch.save(models["standalone"].state_dict(), os.path.join(checkpoint_dir, "best_dspark_standalone.pt"))
 
         if train_markov:
-            acc_m = compute_acceptance_length(models["markov"], base_model, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=True, target_layers=target_layers)
+            acc_m = compute_acceptance_length(models["markov"], base_model, lm_head_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=True, target_layers=target_layers)
             print(f"  [Markov / llama.cpp] Mean Acceptance: {acc_m:.2f}/{block_size} tokens", flush=True)
             if acc_m > best_acceptance["markov"]:
                 best_acceptance["markov"] = acc_m
