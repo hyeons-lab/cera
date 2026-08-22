@@ -1,0 +1,286 @@
+From 340d4ab8a53c1e20945e623235a0dc1b41ebafaf Mon Sep 17 00:00:00 2001
+From: David Berrios <iamstuffed@gmail.com>
+Date: Fri, 21 Aug 2026 20:08:10 -0700
+Subject: [PATCH] feat(models): add native causal dspark draft model
+ architecture support
+
+- Register LLM_ARCH_DSPARK in llama-arch
+- Implement llama_model_dspark with zero-copy shared weights from target model
+- Auto-detect dspark sidecars in common/speculative for causal speculative unrolling
+---
+ common/speculative.cpp |   4 ++
+ src/llama-arch.cpp     |   1 +
+ src/llama-arch.h       |   1 +
+ src/llama-context.cpp  |   2 +-
+ src/llama-model.cpp    |   5 ++
+ src/models/dspark.cpp  | 157 +++++++++++++++++++++++++++++++++++++++++
+ src/models/models.h    |  14 ++++
+ 7 files changed, 183 insertions(+), 1 deletion(-)
+ create mode 100644 src/models/dspark.cpp
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 89e9b2782..35a1d737e 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2252,6 +2252,10 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
+     }
+ 
+     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
++    if (arch == "dspark") {
++        SPC_INF("%s", "auto-detected speculative type 'draft-simple' from dspark metadata\n");
++        return { COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE };
++    }
+     if (arch != "dflash") {
+         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
+ 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 60b8e461c..3e82592ad 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -140,6 +140,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_MISTRAL3,         "mistral3"         },
+     { LLM_ARCH_EAGLE3,           "eagle3"           },
+     { LLM_ARCH_DFLASH,           "dflash"           },
++    { LLM_ARCH_DSPARK,           "dspark"           },
+     { LLM_ARCH_MISTRAL4,         "mistral4"         },
+     { LLM_ARCH_PADDLEOCR,        "paddleocr"        },
+     { LLM_ARCH_MIMO2,            "mimo2"            },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 7159e23bf..aa2f3d18c 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -154,6 +154,7 @@ enum llm_arch {
+     LLM_ARCH_EAGLE3,
+     LLM_ARCH_MINIMAX_M3,
+     LLM_ARCH_DFLASH,
++    LLM_ARCH_DSPARK,
+     LLM_ARCH_NANBEIGE,
+     LLM_ARCH_QWEN3TTS,
+     LLM_ARCH_POCKETTTS,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 52f8d5367..d2b5e34ae 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -151,7 +151,7 @@ llama_context::llama_context(
+         cparams.ctx_other = params.ctx_other;
+     }
+ 
+-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
++    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) {
+         if (model.tok_embd == nullptr || model.output == nullptr) {
+             if (params.ctx_other == nullptr) {
+                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index de0d3c1a6..ac3db4847 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -325,6 +325,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_eagle3(params);
+         case LLM_ARCH_DFLASH:
+             return new llama_model_dflash(params);
++        case LLM_ARCH_DSPARK:
++            return new llama_model_dspark(params);
+         case LLM_ARCH_MIMO2:
+             return new llama_model_mimo2(params);
+         case LLM_ARCH_KIMI_LINEAR:
+@@ -2800,6 +2802,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
+             return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
+ 
++        case LLM_ARCH_DSPARK:
++            return LLAMA_ROPE_TYPE_NORM;
++
+         case LLM_ARCH_QWEN2VL:
+         case LLM_ARCH_PADDLEOCR:
+             return LLAMA_ROPE_TYPE_MROPE;
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+new file mode 100644
+index 000000000..0819392ca
+--- /dev/null
++++ b/src/models/dspark.cpp
+@@ -0,0 +1,157 @@
++#include "models.h"
++
++void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
++    type = LLM_TYPE_UNKNOWN;
++}
++
++void llama_model_dspark::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
++
++        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
++
++        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
++        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_head_k * n_head_kv}, 0);
++        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_head_v * n_head_kv}, 0);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
++
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
++    }
++}
++
++template <bool embed>
++llama_model_dspark::graph<embed>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++    GGML_ASSERT(n_embd_head == n_rot);
++
++    auto * tok_embd = model.tok_embd;
++    if (tok_embd == nullptr) {
++        GGML_ASSERT(cparams.ctx_other != nullptr);
++        const auto * model_other = llama_get_model(cparams.ctx_other);
++        GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires target token embeddings");
++        tok_embd = model_other->tok_embd;
++    }
++
++    ggml_tensor * cur;
++    ggml_tensor * inpL = build_inp_embd(tok_embd);
++
++    ggml_tensor * inp_pos = build_inp_pos();
++
++    using inp_attn_type = std::conditional_t<embed, llm_graph_input_attn_no_cache, llm_graph_input_attn_kv>;
++
++    inp_attn_type * inp_attn = nullptr;
++    if constexpr (embed) {
++        inp_attn = build_attn_inp_no_cache();
++    } else {
++        inp_attn = build_attn_inp_kv();
++    }
++
++    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
++
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    for (int il = 0; il < n_layer; ++il) {
++        res->t_layer_inp[il] = inpL;
++
++        ggml_tensor * inpSA = inpL;
++
++        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "attn_norm", il);
++
++        {
++            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
++
++            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head, n_head, n_head_kv, il);
++
++            Qcur = ggml_rope_ext(
++                    ctx0, Qcur, inp_pos, rope_factors,
++                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow
++                    );
++
++            Kcur = ggml_rope_ext(
++                    ctx0, Kcur, inp_pos, rope_factors,
++                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow
++                    );
++
++            cb(Qcur, "Qcur", il);
++            cb(Kcur, "Kcur", il);
++            cb(Vcur, "Vcur", il);
++
++            cur = build_attn(inp_attn,
++                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
++                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++            cb(cur, "attn_out", il);
++        }
++
++        if (il == n_layer - 1 && inp_out_ids) {
++            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
++            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
++        }
++        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++        cb(ffn_inp, "ffn_inp", il);
++
++        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        cur = build_ffn(cur,
++                model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
++                model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
++                model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
++                NULL,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(cur, "ffn_out", il);
++
++        cur = ggml_add(ctx0, cur, ffn_inp);
++        cb(cur, "ffn_out", il);
++
++        cur = build_cvec(cur, il);
++        cb(cur, "l_out", il);
++
++        inpL = cur;
++    }
++    cur = inpL;
++
++    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
++    cb(cur, "result_norm", -1);
++    res->t_embd = cur;
++
++    if constexpr (!embed) {
++        auto * output   = model.output;
++        auto * output_s = model.output_s;
++        if (output == nullptr) {
++            GGML_ASSERT(cparams.ctx_other != nullptr);
++            const auto * model_other = llama_get_model(cparams.ctx_other);
++            GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires target output projection");
++            output   = model_other->output;
++            output_s = model_other->output_s;
++        }
++
++        cur = build_lora_mm(output, cur, output_s);
++        cb(cur, "result_output", -1);
++        res->t_logits = cur;
++    }
++
++    ggml_build_forward_expand(gf, cur);
++}
++
++template struct llama_model_dspark::graph<false>;
++template struct llama_model_dspark::graph<true>;
++
++std::unique_ptr<llm_graph_context> llama_model_dspark::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph<false>>(*this, params);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index 157b05dc0..c72b528fa 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1367,6 +1367,20 @@ struct llama_model_dflash : public llama_model_base {
+ };
+ 
+ 
++struct llama_model_dspark : public llama_model_base {
++    llama_model_dspark(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    template <bool embed>
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_mistral4 : public llama_model_deepseek2 {
+     llama_model_mistral4(const struct llama_model_params & params) : llama_model_deepseek2(params) {}
+     // reuse load_arch_hparams and load_arch_tensors from llama_model_deepseek2
+-- 
+2.50.1 (Apple Git-155)
+

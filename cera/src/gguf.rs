@@ -87,9 +87,10 @@ pub struct TensorInfo {
 /// default for `open(path)`; `Owned` backs `from_bytes` / `from_reader`
 /// (WASM builds, in-memory buffers, tests). Kept private — callers
 /// go through `GgufFile::mmap_data()` / `get_tensor()` / `tensor_data()`.
+#[derive(Clone)]
 enum Backing {
     #[cfg(feature = "mmap")]
-    Mmap(Mmap),
+    Mmap(Arc<Mmap>),
     Owned(Arc<[u8]>),
 }
 
@@ -139,6 +140,21 @@ pub struct GgufFile {
     /// Offset in the buffer where tensor data begins (after header +
     /// metadata + tensor infos).
     data_offset: usize,
+}
+
+impl Clone for GgufFile {
+    fn clone(&self) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            tensors: self.tensors.clone(),
+            data: SafeDataPtr {
+                ptr: self.data.ptr,
+                len: self.data.len,
+            },
+            _backing: self._backing.clone(),
+            data_offset: self.data_offset,
+        }
+    }
 }
 
 // ── Reader helper ───────────────────────────────────────────────────────────
@@ -338,7 +354,7 @@ impl GgufFile {
         // as an acceptable risk for the duration of the `GgufFile` —
         // callers are expected not to mutate model files in-flight.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_backing(Backing::Mmap(mmap))
+        Self::from_backing(Backing::Mmap(Arc::new(mmap)))
     }
 
     /// Convenience: [`Self::open`] + wrap in `Arc`. The mmap-backed
@@ -416,7 +432,7 @@ impl GgufFile {
         #[allow(clippy::infallible_destructuring_match)]
         let data_slice: &[u8] = match &backing {
             #[cfg(feature = "mmap")]
-            Backing::Mmap(m) => m,
+            Backing::Mmap(m) => m.as_ref(),
             Backing::Owned(a) => a,
         };
         ensure!(

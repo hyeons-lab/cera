@@ -290,6 +290,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_q4_0_gate_up: ComputePipelineState,
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
+    ffn_swiglu_q4_0: ComputePipelineState,
     gemv_q4_0_fast_slim_qkv: ComputePipelineState,
     #[allow(dead_code)]
     gemv_q4_0_fast_slim2_gate_up: ComputePipelineState,
@@ -717,6 +718,7 @@ impl MetalLfm2Model {
             gemv_q4_0_gate_up: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_gate_up")?,
             gemv_q4_0_fast_slim_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
+            ffn_swiglu_q4_0: ctx.create_pipeline(shaders::FFN_SWIGLU_Q4_0, "ffn_swiglu_q4_0")?,
             gemv_q4_0_fast_slim_qkv: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_qkv")?,
             gemv_q4_0_fast_slim2_gate_up: ctx
@@ -2163,6 +2165,28 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
+    /// Fused Q4_0 SwiGLU FFN: y_gate = silu(W_gate × x) * (W_up × x) in ONE single pass!
+    fn encode_gemv_swiglu(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        y: &Buffer,
+    ) {
+        debug_assert_eq!(w_gate.dtype, DType::Q4_0);
+        debug_assert_eq!(w_up.dtype, DType::Q4_0);
+        let m = w_gate.m;
+        let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.ffn_swiglu_q4_0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_buffer(4, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(32));
+    }
+
     /// Fused Q/K/V GEMV: y_q = W_q × x, y_k = W_k × x, y_v = W_v × x in
     /// one dispatch. Unlike gate_up, Q has m_q rows while K/V each have
     /// m_kv (≤ m_q under GQA). Replaces three `encode_gemv_weight` calls
@@ -3575,9 +3599,114 @@ impl MetalLfm2Model {
         let n_tgs = n.div_ceil(qpt) * n_heads;
         enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
     }
+
+    pub(crate) fn forward_inner(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+
+        assert!(
+            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
+            "Metal seq_len {} exceeds max_seq_len {}",
+            self.state.seq_len.load(Ordering::Relaxed),
+            self.state.max_seq_len,
+        );
+
+        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
+        }
+
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
+
+        let lora_active = self
+            .active_lora
+            .lock()
+            .expect("active_lora poisoned")
+            .is_some();
+
+        if !lora_active && let Some(timer) = &self.profile_timer {
+            self.encode_layers_profiled(pos, timer);
+            self.profile_segment(timer, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else if !lora_active && let Some(timer) = &self.gpu_timer {
+            timer.next_idx.store(0, Ordering::Relaxed);
+            timer.labels.lock().expect("timer mutex poisoned").clear();
+            let cb = self.ctx.queue.new_command_buffer();
+            self.encode_layers_gpu_timed(cb, pos, timer);
+            self.gpu_sampled_pass(timer, cb, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            cb.commit();
+            cb.wait_until_completed();
+            self.gpu_timer_resolve(timer);
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else {
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_layers(enc, pos);
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // Update state + read back logits (unified memory zero-copy)
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+    }
 }
 
 impl Model for MetalLfm2Model {
+    fn supports_all_logits(&self) -> bool {
+        true
+    }
+
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
+        let vocab = self.config.vocab_size;
+        let mut all_logits = Vec::with_capacity(tokens.len() * vocab);
+
+        self.state.seq_len.store(start_pos, Ordering::Relaxed);
+        for (j, &token) in tokens.iter().enumerate() {
+            let pos = start_pos + j;
+            let logits = self.forward_inner(&[token], pos, state);
+            all_logits.extend_from_slice(&logits);
+        }
+        all_logits
+    }
+
+    fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.state.seq_len.store(len, Ordering::Relaxed);
+        state.seq_len = len;
+    }
+
     fn supports_hidden_states(&self) -> bool {
         true
     }
@@ -3661,87 +3790,9 @@ impl Model for MetalLfm2Model {
     }
 
     fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
-        let token_id = tokens[0] as usize;
-        let cfg = &self.config;
-        let hs = cfg.hidden_size;
-
-        assert!(
-            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
-            "Metal seq_len {} exceeds max_seq_len {}",
-            self.state.seq_len.load(Ordering::Relaxed),
-            self.state.max_seq_len,
-        );
-
-        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
-            self.dequant_embedding_row(token_id, dst);
-        }
-
-        let pos = self.state.seq_len.load(Ordering::Relaxed);
-
-        // The per-category profiling paths re-implement the layer loop and don't
-        // run the LoRA hooks, so an active adapter forces the normal (hooked)
-        // `encode_layers` path — profiling + LoRA yields correct (adapted) output
-        // at the cost of no per-category breakdown (a diagnostic-only combo).
-        let lora_active = self
-            .active_lora
-            .lock()
-            .expect("active_lora poisoned")
-            .is_some();
-
-        if !lora_active && let Some(timer) = &self.profile_timer {
-            // Profiling path: each category is its own command buffer so we can
-            // measure wall time separately. Slower than normal — diagnostic only.
-            self.encode_layers_profiled(pos, timer);
-            self.profile_segment(timer, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            timer.bump_token();
-            // Print cumulative breakdown every 32 tokens to avoid noise.
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else if !lora_active && let Some(timer) = &self.gpu_timer {
-            // GPU-timestamp profiling: one command buffer, many compute
-            // encoders (one per category) — each with start/end timestamp
-            // samples attached. Single commit+wait, then resolve samples.
-            timer.next_idx.store(0, Ordering::Relaxed);
-            timer.labels.lock().expect("timer mutex poisoned").clear();
-            let cb = self.ctx.queue.new_command_buffer();
-            self.encode_layers_gpu_timed(cb, pos, timer);
-            self.gpu_sampled_pass(timer, cb, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            cb.commit();
-            cb.wait_until_completed();
-            self.gpu_timer_resolve(timer);
-            timer.bump_token();
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else {
-            // Single command buffer + single compute encoder for the entire forward pass.
-            let cb = self.ctx.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            self.encode_layers(enc, pos);
-            // Output norm + projection (normed_buf is free here).
-            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-        }
-
-        // Update state + read back logits (unified memory zero-copy)
-        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
-        state.seq_len += 1;
-        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+        self.forward_inner(tokens, _pos, state)
     }
 
     fn forward_greedy(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> u32 {
@@ -6555,49 +6606,72 @@ impl MetalLfm2Model {
                     self.encode_moe_ffn(enc, moe, &self.ffn_input_buf, &self.hidden_buf, 1, true)
                 }
                 MetalFfn::Dense(dense) => {
-                    if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
-                        self.encode_gemv_gate_up(
+                    let has_lora = lora.as_ref().is_some_and(|l| {
+                        l.layers.get(i).is_some_and(|a| {
+                            a[LoraTarget::FfnGate.index()].is_some()
+                                || a[LoraTarget::FfnUp.index()].is_some()
+                        })
+                    });
+                    if !has_lora && dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0
+                    {
+                        // Fused SwiGLU: Gate GEMV + Up GEMV + SiLU in ONE single dispatch!
+                        self.encode_gemv_swiglu(
                             enc,
                             &dense.gate,
                             &dense.up,
                             &self.ffn_input_buf,
                             &self.gate_buf,
-                            &self.up_buf,
                         );
                     } else {
-                        self.encode_gemv_weight(
+                        if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
+                            self.encode_gemv_gate_up(
+                                enc,
+                                &dense.gate,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                                &self.up_buf,
+                            );
+                        } else {
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.gate,
+                                &self.ffn_input_buf,
+                                &self.gate_buf,
+                            );
+                            self.encode_gemv_weight(
+                                enc,
+                                &dense.up,
+                                &self.ffn_input_buf,
+                                &self.up_buf,
+                            );
+                        }
+                        // LoRA gate/up deltas on the raw projections, before silu_mul.
+                        self.encode_lora_hook(
                             enc,
-                            &dense.gate,
+                            lora.as_ref(),
+                            i,
+                            LoraTarget::FfnGate,
                             &self.ffn_input_buf,
                             &self.gate_buf,
                         );
-                        self.encode_gemv_weight(enc, &dense.up, &self.ffn_input_buf, &self.up_buf);
+                        self.encode_lora_hook(
+                            enc,
+                            lora.as_ref(),
+                            i,
+                            LoraTarget::FfnUp,
+                            &self.ffn_input_buf,
+                            &self.up_buf,
+                        );
+                        self.encode_elementwise(
+                            enc,
+                            &self.pipelines.silu_mul_inplace,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.params.elementwise_is,
+                            dense.gate.m,
+                        );
                     }
-                    // LoRA gate/up deltas on the raw projections, before silu_mul.
-                    self.encode_lora_hook(
-                        enc,
-                        lora.as_ref(),
-                        i,
-                        LoraTarget::FfnGate,
-                        &self.ffn_input_buf,
-                        &self.gate_buf,
-                    );
-                    self.encode_lora_hook(
-                        enc,
-                        lora.as_ref(),
-                        i,
-                        LoraTarget::FfnUp,
-                        &self.ffn_input_buf,
-                        &self.up_buf,
-                    );
-                    self.encode_elementwise(
-                        enc,
-                        &self.pipelines.silu_mul_inplace,
-                        &self.gate_buf,
-                        &self.up_buf,
-                        &self.params.elementwise_is,
-                        dense.gate.m,
-                    );
                     // FFN-down + residual. `ffn_input_buf` is free here (consumed by the
                     // gate/up projection), so it doubles as the Granite scaled-add temp.
                     self.encode_residual_proj(

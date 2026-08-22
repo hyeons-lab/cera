@@ -297,6 +297,7 @@ pub struct HfRepoContents {
     pub audio_decoders: Vec<GgufFileEntry>,
     pub vocoder_ggufs: Vec<GgufFileEntry>,
     pub tokenizer_ggufs: Vec<GgufFileEntry>,
+    pub draft_ggufs: Vec<GgufFileEntry>,
     pub audio_tokenizers: Vec<String>,
     pub safetensors_files: Vec<String>,
     pub has_safetensors: bool,
@@ -312,6 +313,7 @@ pub fn classify_repo_siblings(siblings: &[HfSibling]) -> HfRepoContents {
     let mut audio_decoders = Vec::new();
     let mut vocoder_ggufs = Vec::new();
     let mut tokenizer_ggufs = Vec::new();
+    let mut draft_ggufs = Vec::new();
     let mut audio_tokenizers = Vec::new();
     let mut safetensors_files = Vec::new();
     let mut generation_config = None;
@@ -340,6 +342,8 @@ pub fn classify_repo_siblings(siblings: &[HfSibling]) -> HfRepoContents {
                 vocoder_ggufs.push(entry);
             } else if is_audio_tokenizer_gguf(base_file) {
                 tokenizer_ggufs.push(entry);
+            } else if is_draft_model(base_file) {
+                draft_ggufs.push(entry);
             } else {
                 primary_ggufs.push(entry);
             }
@@ -365,6 +369,7 @@ pub fn classify_repo_siblings(siblings: &[HfSibling]) -> HfRepoContents {
         audio_decoders,
         vocoder_ggufs,
         tokenizer_ggufs,
+        draft_ggufs,
         audio_tokenizers,
         safetensors_files,
         has_safetensors,
@@ -395,6 +400,16 @@ fn is_vocoder(file: &str) -> bool {
 
 fn is_audio_tokenizer_gguf(file: &str) -> bool {
     file.starts_with("tokenizer")
+}
+
+fn is_draft_model(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    lower.contains("dspark")
+        || lower.contains("dflash")
+        || lower.contains("-draft")
+        || lower.contains("_draft")
+        || lower.contains(".draft")
+        || lower.starts_with("draft")
 }
 
 /// Check whether two quantization tags match (case-insensitive and hyphen/underscore/dot agnostic, zero-alloc).
@@ -503,7 +518,14 @@ pub fn resolve_hf_manifest(
     requested_quant: Option<&str>,
     generation_defaults: Option<GenerationDefaults>,
 ) -> Result<Manifest, CeraError> {
-    let contents = classify_repo_siblings(&info.siblings);
+    let mut contents = classify_repo_siblings(&info.siblings);
+
+    // If the repo contains only draft model GGUFs (e.g. standalone DSpark sidecar repo),
+    // treat them as primary files so inspect_and_resolve_manifest resolves cleanly.
+    let is_standalone_draft = contents.primary_ggufs.is_empty() && !contents.draft_ggufs.is_empty();
+    if is_standalone_draft {
+        contents.primary_ggufs = std::mem::take(&mut contents.draft_ggufs);
+    }
 
     if contents.primary_ggufs.is_empty() {
         if contents.has_safetensors {
@@ -523,6 +545,9 @@ pub fn resolve_hf_manifest(
         contents
             .primary_ggufs
             .iter()
+            .chain(&contents.draft_ggufs)
+            .chain(&contents.mmproj_ggufs)
+            .chain(&contents.audio_decoders)
             .find(|e| {
                 e.rfilename == *sub
                     || e.rfilename.strip_suffix(sub).is_some_and(|prefix| {
@@ -573,6 +598,7 @@ pub fn resolve_hf_manifest(
     let mut multimodal_projector = None;
     let mut audio_decoder = None;
     let mut audio_tokenizer = None;
+    let mut draft_model = None;
 
     // Vision matching
     let is_vl_pipeline = info.pipeline_tag.as_deref() == Some("image-text-to-text")
@@ -633,6 +659,22 @@ pub fn resolve_hf_manifest(
         }
     }
 
+    // Draft sidecar matching (when bundled alongside a distinct base model in the same repo)
+    if !is_standalone_draft && !contents.draft_ggufs.is_empty() {
+        let fallbacks = [&primary_entry.quant, "Q4_K_M", "Q8_0", "F16", "BF16"];
+        let draft_chosen = fallbacks
+            .iter()
+            .find_map(|&target| {
+                contents
+                    .draft_ggufs
+                    .iter()
+                    .find(|e| quant_matches(&e.quant, target))
+            })
+            .unwrap_or(&contents.draft_ggufs[0]);
+
+        draft_model = Some(spec.file_download_url(&draft_chosen.rfilename));
+    }
+
     // Determine InferenceType
     let inference_type = if is_audio_pipeline || audio_decoder.is_some() {
         InferenceType::LlamaCppLfm2AudioV1
@@ -647,6 +689,7 @@ pub fn resolve_hf_manifest(
         multimodal_projector,
         audio_decoder,
         audio_tokenizer,
+        draft_model,
         extras,
     };
 
@@ -1278,5 +1321,73 @@ mod tests {
             }
             other => panic!("expected GenerationDefaults::Audio, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_repo_siblings_detects_mixed_case_draft_models() {
+        let siblings = vec![
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-Q4_K_M.gguf".to_string(),
+                size: None,
+            },
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-DSpark-Q4_K_M.gguf".to_string(),
+                size: None,
+            },
+            HfSibling {
+                rfilename: "LFM2.5-1.2B-Instruct-Draft-Q8_0.gguf".to_string(),
+                size: None,
+            },
+            HfSibling {
+                rfilename: "model.safetensors".to_string(),
+                size: None,
+            },
+        ];
+
+        let classified = classify_repo_siblings(&siblings);
+        assert_eq!(classified.primary_ggufs.len(), 1);
+        assert_eq!(
+            classified.primary_ggufs[0].rfilename,
+            "LFM2.5-2.6B-Q4_K_M.gguf"
+        );
+        assert_eq!(classified.draft_ggufs.len(), 2);
+        assert_eq!(
+            classified.draft_ggufs[0].rfilename,
+            "LFM2.5-2.6B-DSpark-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            classified.draft_ggufs[1].rfilename,
+            "LFM2.5-1.2B-Instruct-Draft-Q8_0.gguf"
+        );
+    }
+
+    #[test]
+    fn resolve_hf_manifest_resolves_direct_subpath_draft_in_mixed_repo() {
+        let siblings = vec![
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-Q4_K_M.gguf".to_string(),
+                size: None,
+            },
+            HfSibling {
+                rfilename: "LFM2.5-2.6B-DSpark-Q4_K_M.gguf".to_string(),
+                size: None,
+            },
+        ];
+
+        let spec =
+            HfSpec::parse("https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q4_K_M.gguf").unwrap();
+        let info = HfModelInfo {
+            id: "LiquidAI/LFM2.5-2.6B-GGUF".into(),
+            siblings,
+            tags: vec!["text-generation".into()],
+            pipeline_tag: Some("text-generation".into()),
+            config: None,
+        };
+
+        let manifest = resolve_hf_manifest(&spec, &info, None, None).unwrap();
+        assert_eq!(
+            manifest.files.model,
+            "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q4_K_M.gguf"
+        );
     }
 }

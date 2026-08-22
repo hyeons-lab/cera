@@ -400,6 +400,7 @@ impl TryFrom<EngineConfig> for cera::EngineConfig {
         Ok(cera::EngineConfig {
             context_size,
             backend: c.backend.into(),
+            draft_model: None,
             bundle_repo: c.bundle_repo.map(|r| r.inner.clone()),
         })
     }
@@ -984,6 +985,7 @@ impl CeraEngine {
             model: bytes.into(),
             multimodal_projector: multimodal_projector.map(Into::into),
             audio_decoder: None,
+            draft_model: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`,
             // which `from_parts` rejects by name, better than silently
             // falling back to text when a caller fat-fingers the string.
@@ -2500,6 +2502,7 @@ impl CeraEngine {
                 model: bytes.into(),
                 multimodal_projector: multimodal_projector.map(Into::into),
                 audio_decoder: None,
+                draft_model: None,
                 inference_type: inference_type
                     .as_deref()
                     .map(cera::manifest::InferenceType::parse_str),

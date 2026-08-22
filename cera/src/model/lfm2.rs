@@ -1071,7 +1071,13 @@ impl Lfm2Model {
     }
 
     /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
-    fn forward_conv_block(&self, layer: usize, hidden: &[f32], state: &mut InferenceState) {
+    fn forward_conv_block(
+        &self,
+        layer: usize,
+        hidden: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) {
         let refs = &self.layer_refs[layer];
         let hidden_size = self.config.hidden_size;
         let kernel_size = self.config.conv_kernel_size.unwrap_or(3);
@@ -1138,7 +1144,7 @@ impl Lfm2Model {
         // conv_scratch now holds bx
 
         // Depthwise conv1d with valid convolution using rolling buffer
-        let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+        let LayerState::Conv { buffer, history } = &mut state.layers[layer] else {
             panic!("expected Conv state for layer {layer}");
         };
 
@@ -1159,6 +1165,7 @@ impl Lfm2Model {
             }
             let last_slot = (d_conv - 1) * hidden_size;
             buffer[last_slot..last_slot + hidden_size].copy_from_slice(conv_scratch);
+            history.push(pos + 1, buffer);
         }
 
         // o = c ⊙ conv_out (second gate), reuse conv_scratch
@@ -1534,7 +1541,7 @@ impl Lfm2Model {
             Self::quantize_to_scratch(&normed, state);
 
             if cfg.block_types[i] == BlockType::GatedConv {
-                self.forward_conv_block(i, &normed, state);
+                self.forward_conv_block(i, &normed, pos, state);
             } else {
                 self.forward_attn_block(i, &normed, pos, state);
             }
@@ -1594,13 +1601,14 @@ impl Lfm2Model {
     /// `hidden` layout). The two entry points differ only in how they
     /// fill `hidden`; everything from the first RMSnorm onward is
     /// identical and lives here.
-    fn prefill_layers_and_logits(
+    /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.
+    fn prefill_layers_loop(
         &self,
-        mut hidden: Vec<f32>,
+        hidden: &mut [f32],
         n: usize,
         start_pos: usize,
         state: &mut InferenceState,
-    ) -> Vec<f32> {
+    ) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
@@ -1640,7 +1648,7 @@ impl Lfm2Model {
             let rms = (sum_sq / hs as f64).sqrt();
             eprintln!("[cera.hidden] {label}: rms={rms:.6e} max_abs={max_abs:.6e}");
         };
-        log_rms("input (pre-layer-0)", &hidden);
+        log_rms("input (pre-layer-0)", hidden);
 
         // Per-layer loop — pre-allocate all large buffers outside the loop
         let mut normed = vec![0.0f32; hs * n];
@@ -1857,7 +1865,8 @@ impl Lfm2Model {
                                 conv_scratch[i] = b[i] * x_slice[i];
                             }
 
-                            let LayerState::Conv { buffer } = &mut state.layers[layer] else {
+                            let LayerState::Conv { buffer, history } = &mut state.layers[layer]
+                            else {
                                 panic!("expected Conv state for layer {layer}");
                             };
                             let out_buf = &mut state.scratch.out[..hs];
@@ -1875,6 +1884,7 @@ impl Lfm2Model {
                                 }
                                 let last_slot = (d_conv - 1) * hs;
                                 buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                                history.push(start_pos + j + 1, buffer);
                             }
 
                             for i in 0..hs {
@@ -2671,7 +2681,7 @@ impl Lfm2Model {
                     Self::quantize_to_scratch(&col, state);
 
                     if is_conv {
-                        self.forward_conv_block(layer, &col, state);
+                        self.forward_conv_block(layer, &col, start_pos + j, state);
                     } else {
                         self.forward_attn_block(layer, &col, start_pos + j, state);
                     }
@@ -2712,7 +2722,7 @@ impl Lfm2Model {
                 } else {
                     "attn"
                 };
-                log_rms(&format!("layer {layer} ({block_kind}) post-block"), &hidden);
+                log_rms(&format!("layer {layer} ({block_kind}) post-block"), hidden);
             }
 
             // FFN pre-norm each column
@@ -3022,7 +3032,7 @@ impl Lfm2Model {
                 hidden[i] += ffn_out[i];
             }
             if debug_hidden {
-                log_rms(&format!("layer {layer} post-ffn"), &hidden);
+                log_rms(&format!("layer {layer} post-ffn"), hidden);
             }
         }
 
@@ -3032,6 +3042,19 @@ impl Lfm2Model {
         // Note: seq_len was NOT incremented inside the block functions — only
         // the single-token forward() does that. So set it here:
         state.seq_len = start_pos + n;
+    }
+
+    /// Run the prefill layer loop and project logits for the final (n - 1) token.
+    fn prefill_layers_and_logits(
+        &self,
+        mut hidden: Vec<f32>,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        self.prefill_layers_loop(&mut hidden, n, start_pos, state);
 
         // Extract last token, apply output norm + projection
         let mut last_hidden = vec![0.0f32; hs];
@@ -3056,6 +3079,95 @@ impl Lfm2Model {
         self.gemv(&self.embd_ref, &last_hidden, &mut logits);
 
         logits
+    }
+
+    /// Batched projection of post-RMSnorm row-major activations `[n × hs]`
+    /// against `token_embd.weight`, yielding row-major `[n × vocab_size]` logits.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(feature = "blas")
+    ))]
+    fn project_logits_batched(&self, hidden: &[f32], n: usize) -> Option<Vec<f32>> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let out_ref = &self.embd_ref;
+        if !transformer::batched_gemm_supports(out_ref.dtype, hs) {
+            return None;
+        }
+        let rows = out_ref.m;
+        let nb = hs / 32;
+        let mut bq_scales = vec![0.0f32; n * nb];
+        let mut bq_quants = vec![0i8; n * hs];
+        for j in 0..n {
+            cpu::quantize_f32_to_q8_0_into(
+                &hidden[j * hs..(j + 1) * hs],
+                &mut bq_scales[j * nb..(j + 1) * nb],
+                &mut bq_quants[j * hs..(j + 1) * hs],
+            );
+        }
+        let mut out = vec![0.0f32; rows * n];
+        if !transformer::gemm_preq(
+            &self.gguf, out_ref, &bq_scales, &bq_quants, &mut out, rows, n, hs,
+        ) {
+            return None;
+        }
+        let mut logits = vec![0.0f32; n * vocab];
+        transformer::gemm_out_to_rows(&out, rows, n, vocab, &mut logits);
+        Some(logits)
+    }
+
+    /// Run the prefill layer loop and project logits for ALL n tokens.
+    fn prefill_layers_and_all_logits(
+        &self,
+        mut hidden: Vec<f32>,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        self.prefill_layers_loop(&mut hidden, n, start_pos, state);
+
+        let mut all_hidden = vec![0.0f32; n * hs];
+        for j in 0..n {
+            for i in 0..hs {
+                all_hidden[j * hs + i] = hidden[i * n + j];
+            }
+            cpu::rmsnorm(
+                &mut all_hidden[j * hs..(j + 1) * hs],
+                &self.output_norm_weight,
+                cfg.rms_norm_eps,
+            );
+        }
+
+        #[cfg(all(
+            any(target_arch = "aarch64", target_arch = "x86_64"),
+            not(feature = "blas")
+        ))]
+        if let Some(logits) = self.project_logits_batched(&all_hidden, n) {
+            return logits;
+        }
+
+        let mut all_logits = vec![0.0f32; n * cfg.vocab_size];
+        for j in 0..n {
+            let tok_h = &all_hidden[j * hs..(j + 1) * hs];
+            let tok_l = &mut all_logits[j * cfg.vocab_size..(j + 1) * cfg.vocab_size];
+            #[cfg(target_arch = "aarch64")]
+            {
+                Self::quantize_to_scratch(tok_h, state);
+                self.gemv_preq(
+                    &self.embd_ref,
+                    tok_h,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    tok_l,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            self.gemv(&self.embd_ref, tok_h, tok_l);
+        }
+        all_logits
     }
 
     /// Lock-free body of `Model::forward_prefill` — does the actual
@@ -3098,9 +3210,60 @@ impl Lfm2Model {
 
         self.prefill_layers_and_logits(hidden, n, start_pos, state)
     }
+
+    /// Multi-token prefill producing all `[n × vocab_size]` logits (used for speculative verification).
+    pub(crate) fn forward_prefill_logits_all_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        assert!(
+            !tokens.is_empty(),
+            "forward_prefill_logits_all_inner requires at least one token"
+        );
+        assert_eq!(
+            start_pos, state.seq_len,
+            "forward_prefill_logits_all: start_pos ({start_pos}) must equal state.seq_len ({})",
+            state.seq_len
+        );
+
+        let mut hidden = vec![0.0f32; hs * n];
+        let mut emb_buf = vec![0.0f32; hs];
+        for (j, &token_id) in tokens.iter().enumerate() {
+            let token_id = token_id as usize;
+            assert!(
+                token_id < self.embd_ref.m,
+                "token_id {token_id} out of range for vocab size {}",
+                self.embd_ref.m
+            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut emb_buf);
+            for i in 0..hs {
+                hidden[i * n + j] = emb_buf[i];
+            }
+        }
+
+        self.prefill_layers_and_all_logits(hidden, n, start_pos, state)
+    }
 }
 
 impl Model for Lfm2Model {
+    fn supports_all_logits(&self) -> bool {
+        true
+    }
+
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.forward_prefill_logits_all_inner(tokens, start_pos, state)
+    }
+
     fn supports_hidden_states(&self) -> bool {
         true
     }

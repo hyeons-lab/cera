@@ -36,10 +36,49 @@ class BundlePickerDialog extends StatefulWidget {
 }
 
 class _BundlePickerDialogState extends State<BundlePickerDialog> {
-  late final Future<List<CeraBundle>> _bundles = Cera.listBundles();
+  late final Future<List<CeraBundle>> _bundles = _fetchBundles();
   List<DownloadedModelRecord> _downloaded = [];
   bool _loadingDownloaded = true;
   _PickerTab _tab = _PickerTab.downloaded;
+
+  Future<List<CeraBundle>> _fetchBundles() async {
+    List<CeraBundle> live = [];
+    try {
+      live = await Cera.listBundles();
+    } catch (_) {}
+
+    final map = {for (final b in live) b.name: b};
+
+    const dspark = [
+      CeraBundle(
+        name: 'LFM2.5-2.6B-DSpark-GGUF',
+        quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+      ),
+      CeraBundle(
+        name: 'LFM2.5-1.2B-Instruct-DSpark-GGUF',
+        quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+      ),
+      CeraBundle(
+        name: 'LFM2.5-700M-DSpark-GGUF',
+        quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+      ),
+      CeraBundle(
+        name: 'LFM2.5-350M-DSpark-GGUF',
+        quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+      ),
+    ];
+
+    for (final b in dspark) {
+      map.putIfAbsent(b.name, () => b);
+    }
+
+    final list = map.values.toList();
+    list.sort(
+      (a, b) =>
+          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+    );
+    return list;
+  }
 
   @override
   void initState() {
@@ -418,6 +457,30 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                   ),
+                  if (bundle.name.toLowerCase().contains('dspark')) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1.5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+                        ),
+                      ),
+                      child: const Text(
+                        'DSpark',
+                        style: TextStyle(
+                          color: Color(0xFFF59E0B),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
                   if (isCurrentBundle)
                     Container(
                       padding: const EdgeInsets.symmetric(

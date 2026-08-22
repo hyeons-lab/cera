@@ -218,6 +218,7 @@ fn engine_config_with_repo(cache_dir: &Path) -> cera::EngineConfig {
         // constant value is well below `u32::MAX`.
         context_size: settings::CONTEXT_SIZE as usize,
         backend: cera::BackendPreference::Cpu,
+        draft_model: None,
         bundle_repo: Some(cera::bundle::BundleRepo::new(cache_dir)),
     }
 }

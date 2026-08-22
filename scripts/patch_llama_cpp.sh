@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# patch_llama_cpp.sh: Applies native Causal DSpark sidecar support to llama.cpp
+# ==============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PATCH_FILE="${REPO_ROOT}/training/patches/llama-cpp-dspark.patch"
+
+TARGET_DIR="${1:-${REPO_ROOT}/scratch/llama.cpp}"
+DO_BUILD=false
+
+for arg in "$@"; do
+    if [[ "$arg" == "--build" ]]; then
+        DO_BUILD=true
+    fi
+done
+
+if [[ ! -f "${PATCH_FILE}" ]]; then
+    echo "❌ Error: Patch file not found at: ${PATCH_FILE}"
+    exit 1
+fi
+
+if [[ ! -d "${TARGET_DIR}" ]]; then
+    if [[ -d "${HOME}/development/llama.cpp" ]]; then
+        TARGET_DIR="${HOME}/development/llama.cpp"
+    else
+        echo "❌ Error: Target llama.cpp directory not found: ${TARGET_DIR}"
+        echo "Usage: $0 [path/to/llama.cpp] [--build]"
+        exit 1
+    fi
+fi
+
+echo "🔍 Target llama.cpp repo: ${TARGET_DIR}"
+
+# Check if already patched
+if grep -q "LLM_ARCH_DSPARK" "${TARGET_DIR}/src/llama-arch.h" 2>/dev/null; then
+    echo "✅ llama.cpp at '${TARGET_DIR}' is already patched with DSpark support."
+else
+    echo "📦 Applying DSpark patch (${PATCH_FILE})..."
+    cd "${TARGET_DIR}"
+    
+    if git apply --check "${PATCH_FILE}" 2>/dev/null; then
+        git apply "${PATCH_FILE}"
+        echo "✅ Successfully applied DSpark patch to ${TARGET_DIR}."
+    else
+        echo "⚠️ Standard git apply check failed, attempting 3-way merge / fallback..."
+        git apply --3way "${PATCH_FILE}" || patch -p1 < "${PATCH_FILE}"
+        echo "✅ Applied patch with 3-way merge fallback."
+    fi
+fi
+
+if [ "$DO_BUILD" = true ]; then
+    echo "🔨 Building llama.cpp with Metal..."
+    cd "${TARGET_DIR}"
+    cmake -B build -DGGML_METAL=ON
+    cmake --build build -j 8
+    echo "🚀 Build complete! Binaries available in ${TARGET_DIR}/build/bin"
+fi
+
+echo ""
+echo "🎉 DSpark patch ready! You can run:"
+echo "   llama-cli -m <base-model.gguf> -md <LFM2.5-VL-450M-DSpark-Q4_0.gguf> -ngl 99 -ngld 99 -p '...'"

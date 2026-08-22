@@ -84,6 +84,7 @@ fn blas_prefill_matches_aarch64_reference() {
         EngineConfig {
             context_size: CTX,
             backend: BackendPreference::Cpu,
+            draft_model: None,
             bundle_repo: Some(repo),
         },
     )

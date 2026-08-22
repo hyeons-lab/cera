@@ -94,6 +94,8 @@ pub struct ManifestFiles {
     pub audio_decoder: Option<String>,
     /// Optional: audio tokenizer (usually a `.safetensors` checkpoint).
     pub audio_tokenizer: Option<String>,
+    /// Optional: speculative decoding draft model GGUF (e.g. DSpark / DFlash).
+    pub draft_model: Option<String>,
     /// Any other `load_time_parameters` key whose value is a string,
     /// preserved verbatim. Forward-compat: new aux roles land here
     /// without a parser change.
@@ -312,6 +314,7 @@ impl Manifest {
                 multimodal_projector,
                 audio_decoder: None,
                 audio_tokenizer: None,
+                draft_model: None,
                 extras: HashMap::new(),
             },
             chat_template: None,
@@ -342,13 +345,13 @@ impl Manifest {
 
     /// Resolve every file URL / path the manifest references to a
     /// (role_name, value) pair, in a stable order (primary first, then
-    /// typed aux in mmproj/decoder/tokenizer order, then extras
+    /// typed aux in mmproj/decoder/tokenizer/draft order, then extras
     /// alphabetically). Used by the downloader (Phase 1.6) and by
     /// `from_files` callers that want to round-trip through manifest
     /// form.
     pub fn files_in_order(&self) -> Vec<(&str, &str)> {
-        // Capacity: 1 (model) + up to 3 typed aux slots + extras.
-        let mut out: Vec<(&str, &str)> = Vec::with_capacity(1 + 3 + self.files.extras.len());
+        // Capacity: 1 (model) + up to 4 typed aux slots + extras.
+        let mut out: Vec<(&str, &str)> = Vec::with_capacity(1 + 4 + self.files.extras.len());
         out.push(("model", self.files.model.as_str()));
         if let Some(v) = &self.files.multimodal_projector {
             out.push(("multimodal_projector", v.as_str()));
@@ -358,6 +361,9 @@ impl Manifest {
         }
         if let Some(v) = &self.files.audio_tokenizer {
             out.push(("audio_tokenizer", v.as_str()));
+        }
+        if let Some(v) = &self.files.draft_model {
+            out.push(("draft_model", v.as_str()));
         }
         let mut extras: Vec<(&String, &String)> = self.files.extras.iter().collect();
         extras.sort_by(|a, b| a.0.cmp(b.0));
@@ -389,12 +395,14 @@ impl ManifestFiles {
         let multimodal_projector = take_str("multimodal_projector");
         let audio_decoder = take_str("audio_decoder");
         let audio_tokenizer = take_str("audio_tokenizer");
+        let draft_model = take_str("draft_model");
 
         const KNOWN_KEYS: &[&str] = &[
             "model",
             "multimodal_projector",
             "audio_decoder",
             "audio_tokenizer",
+            "draft_model",
         ];
         // `chat_template` is an explicit field on `RawLoadTimeParameters`,
         // so serde places it there directly; `#[serde(flatten)]` only
@@ -420,6 +428,7 @@ impl ManifestFiles {
             multimodal_projector,
             audio_decoder,
             audio_tokenizer,
+            draft_model,
             extras,
         })
     }
@@ -434,8 +443,8 @@ impl ManifestFiles {
     where
         F: FnMut(&str) -> PathBuf,
     {
-        // Capacity: 1 (model) + up to 3 typed aux slots + extras.
-        let mut out: Vec<(String, PathBuf)> = Vec::with_capacity(1 + 3 + self.extras.len());
+        // Capacity: 1 (model) + up to 4 typed aux slots + extras.
+        let mut out: Vec<(String, PathBuf)> = Vec::with_capacity(1 + 4 + self.extras.len());
         out.push(("model".into(), local_root_for_url(&self.model)));
         if let Some(v) = &self.multimodal_projector {
             out.push(("multimodal_projector".into(), local_root_for_url(v)));
@@ -445,6 +454,9 @@ impl ManifestFiles {
         }
         if let Some(v) = &self.audio_tokenizer {
             out.push(("audio_tokenizer".into(), local_root_for_url(v)));
+        }
+        if let Some(v) = &self.draft_model {
+            out.push(("draft_model".into(), local_root_for_url(v)));
         }
         let mut extras: Vec<(&String, &String)> = self.extras.iter().collect();
         extras.sort_by(|a, b| a.0.cmp(b.0));
@@ -605,6 +617,7 @@ mod tests {
             multimodal_projector: Some("mm.gguf".into()),
             audio_decoder: Some("ad.gguf".into()),
             audio_tokenizer: Some("at.safetensors".into()),
+            draft_model: None,
             extras: {
                 let mut e = HashMap::new();
                 e.insert("zzz_future".into(), "z.bin".into());

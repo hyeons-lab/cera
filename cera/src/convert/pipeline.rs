@@ -538,6 +538,7 @@ pub fn stream_quantize_hf_repo(
         multimodal_projector: None,
         audio_decoder: None,
         audio_tokenizer: None,
+        draft_model: None,
         extras: std::collections::HashMap::new(),
     };
 

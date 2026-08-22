@@ -1232,7 +1232,9 @@ pub mod shaders {
     pub const GEMV_F32: &str = include_str!("shaders/gemv_f32.wgsl");
     pub const GEMM_F32: &str = include_str!("shaders/gemm_f32.wgsl");
     pub const GEMV_Q4_0: &str = include_str!("shaders/gemv_q4_0.wgsl");
-    pub const GEMV_Q4_0_FAST: &str = include_str!("shaders/gemv_q4_0_fast.wgsl");
+    /// Fast Q4_0 GEMV, generated from `shaders/slang/gemv_q4_0_fast.slang` by
+    /// build.rs and shared with the Metal backend.
+    pub const GEMV_Q4_0_FAST: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv_q4_0_fast.wgsl"));
     pub const GEMV_Q4_K: &str = include_str!("shaders/gemv_q4_k.wgsl");
     pub const GEMV_Q5_K: &str = include_str!("shaders/gemv_q5_k.wgsl");
     pub const GEMV_Q6_K: &str = include_str!("shaders/gemv_q6_k.wgsl");
@@ -1274,6 +1276,9 @@ pub mod shaders {
     /// `shaders/slang/moe_gemv_q4_0.slang`. See [`MOE_ROUTE`] on where these are
     /// dispatched and what pins them.
     pub const MOE_GEMV_Q4_0: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_gemv_q4_0.wgsl"));
+    /// Fused Q4_0 SwiGLU FFN: silu(gate) * up in a single pass.
+    pub const FFN_SWIGLU_Q4_0: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/ffn_swiglu_q4_0.wgsl"));
     /// Weighted sum of a token's expert outputs, generated from
     /// `shaders/slang/moe_combine.slang`. See [`MOE_ROUTE`].
     pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.wgsl"));
@@ -4495,7 +4500,7 @@ mod tests {
                 dtype: DType::Q4_0,
                 shader: shaders::GEMV_Q4_0_FAST,
                 entry: "gemv_q4_0_fast",
-                rows_per_wg: 4,
+                rows_per_wg: 8,
                 weight_bytes: &q4_bytes,
                 expected: &q4_expected,
                 tolerance: 5e-2,

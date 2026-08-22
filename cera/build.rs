@@ -154,6 +154,8 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "moe_route",
     "moe_gemv_q4_0",
     "moe_combine",
+    "ffn_swiglu_q4_0",
+    "gemv_q4_0_fast",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled
