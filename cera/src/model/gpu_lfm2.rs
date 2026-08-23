@@ -6840,6 +6840,13 @@ impl Model for GpuLfm2Model {
             .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
+    fn clear_cache(&self) {
+        self.prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned")
+            .clear();
+    }
+
     /// Public Model trait surface for `_locked` snapshot/restore so
     /// external state-management callers (FFI / parity harness)
     /// can drive the prefix cache directly without going through

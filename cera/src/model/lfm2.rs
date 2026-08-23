@@ -4128,6 +4128,13 @@ impl Model for Lfm2Model {
             .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
+    fn clear_cache(&self) {
+        self.prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned")
+            .clear();
+    }
+
     /// The CPU backend allocates its KV from `InferenceState`, so there is nothing
     /// to build here — but the prefix cache's namespace still has to reflect the
     /// mode, or snapshots from different KV modes collide on disk. See

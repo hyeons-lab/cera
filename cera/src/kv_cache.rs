@@ -1501,7 +1501,7 @@ impl From<u8> for SemanticBoundaryKind {
 
 /// Snapshot of model KV + conv state after prefilling a token sequence.
 /// Backend-agnostic: stores raw bytes that the backend knows how to restore.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StateSnapshot {
     pub layers: Vec<LayerSnapshot>,
     pub seq_len: usize,
@@ -1541,7 +1541,7 @@ impl StateSnapshot {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum LayerSnapshot {
     /// Raw f32 KV bytes (CPU / wgpu) or raw f16 (Metal). Backend
     /// chooses the element width; the byte length implicitly carries
@@ -1893,6 +1893,32 @@ impl KvPrefixCache {
     /// Number of warm entries.
     pub fn warm_count(&self) -> usize {
         self.warm.len()
+    }
+
+    /// Clear all warm entries from the in-memory tier (e.g. during OS memory pressure).
+    pub fn clear_warm(&mut self) {
+        self.warm.clear();
+        self.warm_bytes = 0;
+    }
+
+    /// Clear all cache entries for this model (both warm memory tier and cold disk tier).
+    pub fn clear(&mut self) {
+        self.clear_warm();
+        #[cfg(feature = "disk-cache")]
+        if let Some(dir) = &self.config.cache_dir {
+            let fp_prefix = format!("{:016x}_", self.model_fingerprint);
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&fp_prefix)
+                        && (name_str.ends_with(".kvcache") || name_str.contains(".kvcache.tmp."))
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
 
     fn evict_warm_if_needed(&mut self, new_bytes: u64) {

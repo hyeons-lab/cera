@@ -3992,6 +3992,13 @@ impl Model for MetalLfm2Model {
             .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
+    fn clear_cache(&self) {
+        self.prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned")
+            .clear();
+    }
+
     fn supports_moe_lora(&self) -> bool {
         // No routed-FFN LoRA hooks on this backend: `encode_moe_ffn` applies
         // the base experts only, and there is no per-expert factor upload.

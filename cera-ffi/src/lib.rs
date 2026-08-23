@@ -1238,6 +1238,13 @@ impl CeraEngine {
             .tokenizer()
             .special_token_id(fmt.call_start_marker())
     }
+
+    /// Clear the engine's KV prefix cache (both in-memory warm cache and cold disk cache).
+    /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+    /// or Android `onTrimMemory`) to immediately free memory.
+    pub fn clear_prefix_cache(&self) {
+        self.inner.clear_cache();
+    }
 }
 
 // ---------------------------------------------------------------------------

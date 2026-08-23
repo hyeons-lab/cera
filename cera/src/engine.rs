@@ -1142,6 +1142,11 @@ impl CeraEngine {
     pub fn configure_cache(&self, cfg: KvCacheConfig) {
         self.model.configure_cache(cfg);
     }
+
+    /// Clear the model's KV prefix cache (warm memory and cold disk tiers).
+    pub fn clear_cache(&self) {
+        self.model.clear_cache();
+    }
 }
 
 // ---------------------------------------------------------------------------
