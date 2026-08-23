@@ -94,4 +94,6 @@ wasm-bindgen-rayon = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+strip = false
+debug = 1
+

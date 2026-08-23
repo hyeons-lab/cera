@@ -2520,6 +2520,17 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
+        self.encode_gemv_output_offset(enc, input, 0, output, 0);
+    }
+
+    fn encode_gemv_output_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        input: &Buffer,
+        input_offset: u64,
+        output: &Buffer,
+        output_offset: u64,
+    ) {
         let m = self.config.vocab_size as u32;
         // Untied models project through `output.weight` (its own mmap offset +
         // dtype); tied models reuse the embedding table. Both have shape
@@ -2535,8 +2546,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(64));
             }
@@ -2546,8 +2557,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
@@ -2558,8 +2569,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
@@ -2572,8 +2583,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_k);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(64));
             }
@@ -2587,8 +2598,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_q5_k);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(64));
             }
@@ -2596,8 +2607,8 @@ impl MetalLfm2Model {
                 let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
                 enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
                 enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
+                enc.set_buffer(1, Some(input), input_offset);
+                enc.set_buffer(2, Some(output), output_offset);
                 enc.set_buffer(3, Some(&self.params.gemv_output), 0);
                 enc.dispatch_thread_groups(grid, sz1d(32));
             }
@@ -2617,20 +2628,21 @@ impl MetalLfm2Model {
         // positive scale never changes argmax, so the greedy path is unaffected;
         // this keeps the returned logit *values* correct.
         if let Some(recip) = self.logit_scale_recip {
-            self.encode_scale_f32(enc, output, m, recip);
+            self.encode_scale_f32_offset(enc, output, output_offset, m, recip);
         }
     }
 
-    /// In-place logit scale: `a[i] *= scale` over `n` elements (Granite).
-    fn encode_scale_f32(
+    /// In-place logit scale: `a[i] *= scale` over `n` elements (Granite) with buffer offset.
+    fn encode_scale_f32_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         a: &Buffer,
+        offset: u64,
         n: u32,
         scale: f32,
     ) {
         enc.set_compute_pipeline_state(&self.pipelines.scale_f32);
-        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(0, Some(a), offset);
         let params = ScaleParams {
             n,
             scale_bits: scale.to_bits(),
@@ -3689,16 +3701,7 @@ impl Model for MetalLfm2Model {
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        let vocab = self.config.vocab_size;
-        let mut all_logits = Vec::with_capacity(tokens.len() * vocab);
-
-        self.state.seq_len.store(start_pos, Ordering::Relaxed);
-        for (j, &token) in tokens.iter().enumerate() {
-            let pos = start_pos + j;
-            let logits = self.forward_inner(&[token], pos, state);
-            all_logits.extend_from_slice(&logits);
-        }
-        all_logits
+        self.forward_prefill_logits_all_inner(tokens, start_pos, state)
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
@@ -4729,6 +4732,36 @@ impl MetalLfm2Model {
         self.prefill_layers_and_logits(n, start_pos, state)
     }
 
+    pub(crate) fn forward_prefill_logits_all_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert!(!tokens.is_empty());
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+
+        assert!(
+            start_pos + n <= self.state.max_seq_len,
+            "prefill seq_len {} + {} exceeds max {}",
+            start_pos,
+            n,
+            self.state.max_seq_len
+        );
+
+        let batch_buf = &self.prefill_batch_buf;
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
+            }
+        }
+
+        self.prefill_layers_and_all_logits(n, start_pos, state)
+    }
+
     /// Per-layer dispatch + final-frame logits projection for a
     /// pre-staged prefill batch. Shared by both
     /// [`Self::forward_prefill_inner`] (token-id input, dequantizes
@@ -4742,6 +4775,25 @@ impl MetalLfm2Model {
         n: usize,
         start_pos: usize,
         state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.prefill_layers_and_logits_mode(n, start_pos, state, false)
+    }
+
+    fn prefill_layers_and_all_logits(
+        &self,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.prefill_layers_and_logits_mode(n, start_pos, state, true)
+    }
+
+    fn prefill_layers_and_logits_mode(
+        &self,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+        all_logits: bool,
     ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
@@ -5350,8 +5402,39 @@ impl MetalLfm2Model {
             self.scalars.residual,
         );
 
-        // Final: output norm + logits for last token only.
-        {
+        // Final: output norm + logits.
+        let vocab = cfg.vocab_size;
+        let all_logits_buf = if all_logits {
+            Some(self.ctx.device.new_buffer(
+                (n * vocab * std::mem::size_of::<f32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(buf) = &all_logits_buf {
+            for i in 0..n {
+                let off_floats = (i * hs) as u64;
+                self.copy_compute(
+                    enc,
+                    batch_buf,
+                    off_floats,
+                    &self.hidden_buf,
+                    0,
+                    &self.params.elementwise_hs,
+                    hs as u64,
+                );
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output_offset(
+                    enc,
+                    &self.normed_buf,
+                    0,
+                    buf,
+                    (i * vocab * 4) as u64,
+                );
+            }
+        } else {
             let last_off_floats = ((n - 1) * hs) as u64;
             self.copy_compute(
                 enc,
@@ -5372,7 +5455,11 @@ impl MetalLfm2Model {
 
         self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
-        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+        if let Some(buf) = &all_logits_buf {
+            self.ctx.read_f32(buf, n * vocab)
+        } else {
+            self.ctx.read_f32(&self.logits_buf, vocab)
+        }
     }
 }
 

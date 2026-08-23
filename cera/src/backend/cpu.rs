@@ -147,6 +147,9 @@ pub fn ensure_rayon_global_pool() {
                 // described above; accepted rather than papered over with a
                 // `panic_handler`, which would change how panics propagate for
                 // every rayon job in the process, not just this one.
+                #[cfg(target_os = "macos")]
+                super::threadpool::set_macos_thread_qos_interactive();
+
                 if !cores.is_empty() && !super::threadpool::set_current_thread_affinity(cores) {
                     tracing::debug!(
                         "cera: rayon worker {worker_index} kept its inherited CPU mask; \
@@ -390,6 +393,51 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
     });
 }
 
+/// Row-parallel slice dispatch: hands the full claimed slice `(start_row, &mut [f32])`
+/// to `f`. This lets vector kernels process multiple output rows simultaneously (e.g. 4 rows in registers).
+pub fn par_rows_slice(
+    y: &mut [f32],
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    let pool = super::threadpool::RowPool::decode();
+    let nth = pool.num_threads().max(1);
+    let chunk = ((y.len() + nth - 1) / nth).max(1);
+    pool.dispatch_rows_chunked(y, 1, min_rows, chunk, |row, slice| {
+        f((row, slice));
+    });
+}
+
+/// Row-parallel range dispatch: executes `f(start_row, num_rows)` across the worker pool
+/// without requiring a pre-allocated destination slice.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + Sync + Send) {
+    let pool = super::threadpool::RowPool::decode();
+    let nth = pool.num_threads().max(1);
+    let chunk = ((total_rows + nth - 1) / nth).max(1);
+    let mut dummy = [0.0f32; 4096];
+    if total_rows <= 4096 {
+        pool.dispatch_rows_chunked(&mut dummy[..total_rows], 1, min_rows, chunk, |start, slice| {
+            f(start, slice.len());
+        });
+    } else {
+        let mut heap_dummy = vec![0.0f32; total_rows];
+        pool.dispatch_rows_chunked(&mut heap_dummy, 1, min_rows, chunk, |start, slice| {
+            f(start, slice.len());
+        });
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) + Sync + Send) {
+    f(0, total_rows);
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) + Sync + Send) {
+    f(0, total_rows);
+}
+
 /// On `wasm32` std threads can't spawn, so a `RowPool` would silently degrade
 /// to a single worker. Route through rayon instead — the threaded wasm builds
 /// back it with web workers via `wasm-bindgen-rayon`'s `initThreadPool`.
@@ -414,6 +462,24 @@ pub fn par_rows(y: &mut [f32], min_rows: usize, f: impl Fn((usize, &mut f32)) + 
         });
 }
 
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_slice(
+    y: &mut [f32],
+    min_rows: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+    const WASM_MIN_CHUNK_ROWS: usize = 512;
+    let chunk_size = (y.len() / crate::par::current_num_threads())
+        .max(min_rows)
+        .max(WASM_MIN_CHUNK_ROWS);
+    y.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            f((ci * chunk_size, chunk));
+        });
+}
+
 /// Serial fallback for builds without `parallel`: applies `f` to every element
 /// of `y` in order, on the calling thread.
 ///
@@ -425,6 +491,11 @@ pub fn par_rows(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut f32))) 
     for (i, yi) in y.iter_mut().enumerate() {
         f((i, yi));
     }
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_slice(y: &mut [f32], _min_rows: usize, f: impl Fn((usize, &mut [f32]))) {
+    f((0, y));
 }
 
 /// Like [`par_rows`] but each "row" is `n` contiguous f32 elements (GEMM
@@ -883,21 +954,15 @@ pub fn gemv_par_threshold() -> usize {
 ///
 /// Consumed by the no-`blas` prefill `quantize_columns` on both int8-GEMM
 /// targets: aarch64 NEON and x86_64 int8 (VNNI or AVX2).
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
-pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 32;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 256;
 
 /// Minimum columns per worker for the prefill pre-quant fan-out, resolved once.
 /// `CERA_PREQUANT_MIN_COLS` overrides [`PREQUANT_PAR_MIN_COLS_DEFAULT`] for
 /// per-device tuning — the fan-out is a measured win/loss knob on big.LITTLE, so
 /// it gets a runtime override like its siblings `gemv_par_threshold` /
 /// `gemv_min_rows`, rather than needing a recompile to sweep.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub fn prequant_par_min_cols() -> usize {
     use std::sync::OnceLock;
     static MIN_COLS: OnceLock<usize> = OnceLock::new();
@@ -1132,14 +1197,64 @@ pub fn int8_gemm_available() -> bool {
 /// exactly what the kernel's low/high nibble unpack reassembles into a
 /// lane-per-row weight vector. `scales[(sr*nb + b)*8 + r]` is row `8*sr + r`'s
 /// f32 scale for block `b`. The *nibble* footprint is unchanged — 128 bytes per
-/// super-row block (8× a `BlockQ4_0`'s 16 `qs` bytes) — but the scales are
-/// re-stored as f32 (32 bytes) where the source held f16 (16 bytes), so the
-/// repacked copy is a little larger than the source, and it is kept alongside
-/// it (decode reads the mmap).
-///
-/// x86-only: the only consumer, `gemm_q4_0_8x8_q8_0`, is an x86 int8 kernel.
-/// `allow(dead_code)` under `blas`: `with_repack` (its non-test caller) is
-/// `cfg(not(blas))`, so a non-test `--features blas` build has no caller.
+/// super-row block (8× a `BlockQ4_0`'s 16 `qs` bytes) — #[cfg(target_arch = "aarch64")]
+#[cfg_attr(feature = "blas", allow(dead_code))]
+pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q4_0_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(32),
+        "repack_q4_0_8x8: k must be a multiple of 32"
+    );
+    let nb = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ4_0>();
+    assert_eq!(
+        src.len(),
+        m * nb * bsz,
+        "repack_q4_0_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * nb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb * 256];
+    let mut scales = vec![0.0f32; sr_count * nb * 8];
+
+    let nibble = |row: usize, b: usize, e: usize| -> i8 {
+        let qs = (row * nb + b) * bsz + 2;
+        let raw = if e < 16 {
+            src[qs + e] & 0x0F
+        } else {
+            src[qs + e - 16] >> 4
+        };
+        (raw as i8) - 8
+    };
+
+    for sr in 0..sr_count {
+        for b in 0..nb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * nb + b) * bsz;
+                scales[(sr * nb + b) * 8 + r] =
+                    f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
+            }
+            let base = (sr * nb + b) * 256;
+            for g in 0..8usize {
+                for chunk in 0..2usize {
+                    for r in 0..4usize {
+                        for c in 0..4usize {
+                            let e = 4 * g + c;
+                            let s = nibble(8 * sr + chunk * 4 + r, b, e);
+                            packed[base + g * 32 + chunk * 16 + r * 4 + c] = s as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (packed, scales)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(feature = "blas", allow(dead_code))]
 pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
@@ -1163,10 +1278,8 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
     let sr_count = m / 8;
     let mut packed = vec![0u8; sr_count * nb * 128];
     let mut scales = vec![0.0f32; sr_count * nb * 8];
-    // Nibble of `row`, block `b`, element `e` (0..32) in the standard layout:
-    // e<16 is the low nibble of qs[e], e>=16 the high nibble of qs[e-16].
     let nibble = |row: usize, b: usize, e: usize| -> u8 {
-        let qs = (row * nb + b) * bsz + 2; // skip the 2-byte f16 scale
+        let qs = (row * nb + b) * bsz + 2;
         if e < 16 {
             src[qs + e] & 0x0F
         } else {
@@ -1194,21 +1307,21 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
 }
 
 /// Whether a Q4_0 weight of shape `m x k` should be repacked for prefill on this
-/// host: needs the x86 int8 kernels, a whole number of 8-row super-rows, and
+/// host: needs the int8 kernels, a whole number of 8-row super-rows, and
 /// Q8_0-block-aligned `k`. A weight that fails this keeps the standard layout and
 /// the standard kernel — correctness is identical, only prefill is slower.
-#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
 pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
-    m.is_multiple_of(8) && k.is_multiple_of(32) && int8_gemm_available()
+    #[cfg(target_arch = "aarch64")]
+    return m.is_multiple_of(16) && k.is_multiple_of(32);
+    #[cfg(target_arch = "x86_64")]
+    return int8_gemm_available() && m.is_multiple_of(8) && k.is_multiple_of(32);
 }
 
-/// Run the repacked-Q4_0 prefill GEMM on whichever x86 int8 tier this host has
-/// (VNNI, or the AVX2 emulation). Returns `true` when a kernel ran. A `false`
-/// return means nothing was computed — `q4_0_repack_supported` gates the repack
-/// at load, so it cannot happen for a weight that was actually repacked, but the
-/// caller must still treat it as the invariant break it is (the output buffer is
-/// reused across layers).
-#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+/// Run the repacked-Q4_0 prefill GEMM for `m x n` output floats from `m x k`
+/// repacked weights against pre-quantized `k x n` activation columns. Returns
+/// `false` if no kernel is available for this host architecture.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
     packed: &[u8],
@@ -1221,39 +1334,190 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
     k: usize,
 ) -> bool {
     let nb = k / 32;
-    assert!(
-        k.is_multiple_of(32) && m.is_multiple_of(8),
-        "gemm_preq_repacked_q4_0_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
-    );
-    assert!(
-        packed.len() >= (m / 8) * nb * 128 && scales.len() >= (m / 8) * nb * 8,
-        "gemm_preq_repacked_q4_0_dispatch: repacked weights too small for {m}x{k}"
-    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(32) && m.is_multiple_of(16),
+            "gemm_preq_repacked_q4_0_dispatch: need k%32==0 and m%16==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 512;
+        assert!(
+            packed.len() >= (m / 16) * nb * expected_bytes_per_block && scales.len() >= (m / 16) * nb * 16,
+            "gemm_preq_repacked_q4_0_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 128;
+        assert!(
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            "gemm_preq_repacked_q4_0_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
     assert!(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
 
-    #[cfg(feature = "avx512")]
-    if vnni_int8_available() {
-        // SAFETY: `vnni_int8_available()` proved the VNNI tier; the kernel
-        // re-asserts its own length invariants in debug.
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
         unsafe {
-            crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0(
+            crate::backend::simd::neon::gemm_q4_0_8x8_q8_0(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             );
         }
         return true;
     }
-    if avx2_int8_available() {
-        // SAFETY: `avx2_int8_available()` proved avx2+fma; same as above.
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(feature = "avx512")]
+        if vnni_int8_available() {
+            unsafe {
+                crate::backend::simd::avx512_vnni::gemm_q4_0_8x8_q8_0(
+                    packed, scales, b_scales, b_quants, out, m, n, k,
+                );
+            }
+            return true;
+        }
+        if avx2_int8_available() {
+            unsafe {
+                crate::backend::simd::avx2_int8::gemm_q4_0_8x8_q8_0(
+                    packed, scales, b_scales, b_quants, out, m, n, k,
+                );
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the repacked-Q4_0 prefill GEMM writing directly in row-major `out[n, m]` layout.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let nb = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_rowmajor_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 256;
+        assert!(
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            "gemm_preq_repacked_q4_0_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_rowmajor_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 128;
+        assert!(
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            "gemm_preq_repacked_q4_0_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
+        "gemm_preq_repacked_q4_0_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
         unsafe {
-            crate::backend::simd::avx2_int8::gemm_q4_0_8x8_q8_0(
-                packed, scales, b_scales, b_quants, out, m, n, k,
+            crate::backend::simd::neon::gemm_q4_0_8x8_q8_0_rowmajor(
+                packed, scales, b_scales, b_quants, out, n, m, k,
             );
         }
         return true;
     }
+
+    false
+}
+
+/// Dispatch a fused Gate + Up + SiLU GEMM.
+pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+    gate_packed: &[u8],
+    gate_scales: &[f32],
+    up_packed: &[u8],
+    up_scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let nb = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            m % 8 == 0 && k % 32 == 0,
+            "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: m={m} must be %8 and k={k} must be %32"
+        );
+        let sr_count = m / 8;
+        assert_eq!(
+            gate_packed.len(),
+            sr_count * nb * 256,
+            "gate packed bytes mismatch"
+        );
+        assert_eq!(
+            up_packed.len(),
+            sr_count * nb * 256,
+            "up packed bytes mismatch"
+        );
+        assert_eq!(
+            gate_scales.len(),
+            sr_count * nb * 8,
+            "gate scales mismatch"
+        );
+        assert_eq!(
+            up_scales.len(),
+            sr_count * nb * 8,
+            "up scales mismatch"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
+        "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
+        unsafe {
+            crate::backend::simd::neon::gemm_q4_0_gate_up_silu_rowmajor(
+                gate_packed,
+                gate_scales,
+                up_packed,
+                up_scales,
+                b_scales,
+                b_quants,
+                out,
+                n,
+                m,
+                k,
+            );
+        }
+        return true;
+    }
+
     false
 }
 
@@ -1634,6 +1898,30 @@ pub fn gemv_with_preq(
     }
 }
 
+/// Greedy argmax GEMV: directly computes the argmax over output logits without writing logits to memory.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+pub fn gemv_with_preq_argmax(
+    dtype: DType,
+    a_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    x_f32: &[f32],
+    m: usize,
+    k: usize,
+) -> usize {
+    match dtype {
+        DType::Q6K => unsafe {
+            crate::backend::simd::neon::gemv_q6k_q8_0_argmax_neon(a_quant, x_scales, x_quants, m, k)
+        },
+        _ => {
+            let mut logits = vec![0.0f32; m];
+            gemv_with_preq(dtype, a_quant, x_scales, x_quants, x_f32, &mut logits, m, k);
+            crate::sampler::argmax(&logits) as usize
+        }
+    }
+}
+
 /// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
 /// the same input is used for multiple weight matrices (e.g., ffn_gate + ffn_up).
 #[cfg(target_arch = "aarch64")]
@@ -1647,6 +1935,72 @@ pub fn gemv_q4_0_with_q8(
 ) {
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k);
+    }
+}
+
+/// Fused dual Q4_0 GEMV with pre-quantized Q8_0 input.
+/// Computes y1 = A1 @ x and y2 = A2 @ x in a single threadpool dispatch with a single barrier,
+/// reusing loaded input activations across both matrices.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_0_fused2_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_q8_0_fused2_neon(
+            a1_quant, a2_quant, x_scales, x_quants, y1, y2, m, k,
+        );
+    }
+}
+
+/// Fused Gate + Up Q4_0 GEMV with in-register SwiGLU:
+/// `out[r] = silu(gate[r] · x) * (up[r] · x)`.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q4_0_gate_up_swiglu_with_q8(
+    gate_quant: &[u8],
+    up_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_gate_up_swiglu_neon(
+            gate_quant, up_quant, x_scales, x_quants, out, m, k,
+        );
+    }
+}
+
+/// Unified 3-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
+/// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_0_concat3_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    a3_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_q8_0_concat3_neon(
+            a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
+        );
     }
 }
 
@@ -2475,23 +2829,169 @@ pub fn gemv_dispatch(
 
 // ── Normalization ───────────────────────────────────────────────────────────
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+/// NEON-accelerated RMSNorm kernel.
+unsafe fn rmsnorm_neon(src: &[f32], dst: &mut [f32], weight: &[f32], eps: f32) {
+    use core::arch::aarch64::*;
+    let n = src.len();
+    let src_ptr = src.as_ptr();
+    let weight_ptr = weight.as_ptr();
+    let dst_ptr = dst.as_mut_ptr();
+
+    unsafe {
+        let mut sum_sq0 = vdupq_n_f64(0.0);
+        let mut sum_sq1 = vdupq_n_f64(0.0);
+        let n_chunks = n / 4;
+
+        for i in 0..n_chunks {
+            let v = vld1q_f32(src_ptr.add(i * 4));
+            let v_lo = vcvt_f64_f32(vget_low_f32(v));
+            let v_hi = vcvt_f64_f32(vget_high_f32(v));
+            sum_sq0 = vfmaq_f64(sum_sq0, v_lo, v_lo);
+            sum_sq1 = vfmaq_f64(sum_sq1, v_hi, v_hi);
+        }
+
+        let mut total_sum_sq = vaddvq_f64(vaddq_f64(sum_sq0, sum_sq1));
+        for i in (n_chunks * 4)..n {
+            let v = *src_ptr.add(i) as f64;
+            total_sum_sq += v * v;
+        }
+
+        let mean = total_sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+        let v_inv_rms = vdupq_n_f32(inv_rms);
+
+        for i in 0..n_chunks {
+            let s = vld1q_f32(src_ptr.add(i * 4));
+            let w = vld1q_f32(weight_ptr.add(i * 4));
+            let scaled = vmulq_f32(vmulq_f32(s, v_inv_rms), w);
+            vst1q_f32(dst_ptr.add(i * 4), scaled);
+        }
+        for i in (n_chunks * 4)..n {
+            *dst_ptr.add(i) = *src_ptr.add(i) * inv_rms * (*weight_ptr.add(i));
+        }
+    }
+}
+
 /// RMS normalization in-place: x = x / rms(x) * weight.
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
-    let n = x.len();
-
-    // Accumulate sum of squares in f64 to match ggml's ggml_float (double) precision.
-    // This avoids f32 rounding that compounds across layers.
-    let mut sum_sq = 0.0f64;
-    for &v in x.iter() {
-        sum_sq += (v as f64) * (v as f64);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let ptr = x.as_mut_ptr();
+        let len = x.len();
+        let src = core::slice::from_raw_parts(ptr, len);
+        let dst = core::slice::from_raw_parts_mut(ptr, len);
+        rmsnorm_neon(src, dst, weight, eps);
     }
-    let mean = sum_sq / n as f64;
-    let rms = (mean + eps as f64).sqrt();
-    let inv_rms = (1.0 / rms) as f32;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let n = x.len();
+        let mut sum_sq = 0.0f64;
+        for &v in x.iter() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let mean = sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
 
-    for i in 0..n {
-        x[i] = x[i] * inv_rms * weight[i];
+        for i in 0..n {
+            x[i] = x[i] * inv_rms * weight[i];
+        }
+    }
+}
+
+/// RMS normalization out-of-place: dst = src / rms(src) * weight.
+pub fn rmsnorm_into(src: &[f32], dst: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert_eq!(src.len(), weight.len());
+    debug_assert_eq!(dst.len(), weight.len());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        rmsnorm_neon(src, dst, weight, eps);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let n = src.len();
+        let mut sum_sq = 0.0f64;
+        for &v in src.iter() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let mean = sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+
+        for i in 0..n {
+            dst[i] = src[i] * inv_rms * weight[i];
+        }
+    }
+}
+
+/// Fused RMS normalization and Q8_0 pre-quantization: normalizes `x` with `weight` and `eps`,
+/// immediately quantizes into `scales` and `quants`, and optionally writes the normalized
+/// f32 values to `out_normed`.
+pub fn rmsnorm_and_quantize_q8_0(
+    x: &[f32],
+    weight: &[f32],
+    eps: f32,
+    scales: &mut [f32],
+    quants: &mut [i8],
+    out_normed: Option<&mut [f32]>,
+) {
+    debug_assert_eq!(x.len(), weight.len());
+    let n = x.len();
+    let n_blocks = n / 32;
+    debug_assert!(scales.len() >= n_blocks);
+    debug_assert!(quants.len() >= n);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        crate::backend::simd::neon::rmsnorm_and_quantize_q8_0_neon(
+            x,
+            weight,
+            eps,
+            scales,
+            quants,
+            out_normed,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum_sq = 0.0f64;
+        for &v in x.iter() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let mean = sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+
+        for b in 0..n_blocks {
+            let b_offset = b * 32;
+            let mut amax = 0.0f32;
+            for i in 0..32 {
+                let v = x[b_offset + i] * inv_rms * weight[b_offset + i];
+                if let Some(ref mut out) = out_normed {
+                    out[b_offset + i] = v;
+                }
+                let av = v.abs();
+                if av > amax {
+                    amax = av;
+                }
+            }
+            let (d, id) = if amax == 0.0 {
+                (0.0, 0.0)
+            } else {
+                (amax / 127.0, 127.0 / amax)
+            };
+            scales[b] = d;
+            for i in 0..32 {
+                let v = x[b_offset + i] * inv_rms * weight[b_offset + i];
+                let q = (v * id).round().clamp(-128.0, 127.0) as i8;
+                quants[b_offset + i] = q;
+            }
+        }
     }
 }
 
@@ -2501,7 +3001,7 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
 /// Maximum error: 1.45358 + 0.5 ULPs.
 /// Inputs above 88.38 flush to infinity, below -103.97 flush to zero.
 #[inline(always)]
-fn ggml_expf(x: f32) -> f32 {
+pub(crate) fn ggml_expf(x: f32) -> f32 {
     // Bit-exact constants from ggml's hex float literals.
     const R: f32 = f32::from_bits(0x4B400000); // 0x1.8p23       = 12582912.0
     const LOG2E: f32 = f32::from_bits(0x3FB8AA3B); // 0x1.715476p+0  = log2(e)
@@ -2569,8 +3069,22 @@ pub fn relu_inplace(x: &mut [f32]) {
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
-    for (g, &u) in gate.iter_mut().zip(up.iter()) {
-        *g = *g / (1.0 + ggml_expf(-*g)) * u;
+    let len = gate.len();
+    if len >= 1024 {
+        let chunk_size = 512;
+        let up_ptr = up.as_ptr() as usize;
+        par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
+            let u_chunk = unsafe {
+                core::slice::from_raw_parts((up_ptr as *const f32).add(idx * chunk_size), g_chunk.len())
+            };
+            for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
+                *g = *g / (1.0 + ggml_expf(-*g)) * u;
+            }
+        });
+    } else {
+        for (g, &u) in gate.iter_mut().zip(up.iter()) {
+            *g = *g / (1.0 + ggml_expf(-*g)) * u;
+        }
     }
 }
 
@@ -4588,7 +5102,11 @@ unsafe fn flash_attention_gqa_neon(
     use std::arch::aarch64::*;
     unsafe {
         debug_assert!(
-            q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries,
+            (n_queries == 0)
+                || (q_stride == n_queries
+                    && q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries)
+                || (q_stride >= head_dim
+                    && q_mat.len() >= (n_queries - 1) * q_stride + (n_heads_start + group_size) * head_dim),
             "q_mat too small for the given head range and q_stride"
         );
         debug_assert!(
@@ -4629,16 +5147,21 @@ unsafe fn flash_attention_gqa_neon(
             for j in 0..n_queries {
                 let max_kv = start_pos + j + 1;
 
-                // Gather Q[h, j] from stride-n layout into NEON registers
-                for i in 0..n_vecs {
-                    let d = i * 4;
-                    let q = [
-                        *q_ptr.add((h_off + d) * q_stride + j),
-                        *q_ptr.add((h_off + d + 1) * q_stride + j),
-                        *q_ptr.add((h_off + d + 2) * q_stride + j),
-                        *q_ptr.add((h_off + d + 3) * q_stride + j),
-                    ];
-                    q_vecs[i] = vld1q_f32(q.as_ptr());
+                if q_stride == n_queries {
+                    for i in 0..n_vecs {
+                        let d = i * 4;
+                        let q = [
+                            *q_ptr.add((h_off + d) * q_stride + j),
+                            *q_ptr.add((h_off + d + 1) * q_stride + j),
+                            *q_ptr.add((h_off + d + 2) * q_stride + j),
+                            *q_ptr.add((h_off + d + 3) * q_stride + j),
+                        ];
+                        q_vecs[i] = vld1q_f32(q.as_ptr());
+                    }
+                } else {
+                    for i in 0..n_vecs {
+                        q_vecs[i] = vld1q_f32(q_ptr.add(j * q_stride + h_off + i * 4));
+                    }
                 }
 
                 let mut running_max = f32::NEG_INFINITY;
@@ -5795,11 +6318,16 @@ mod tests {
     /// `n = 13` exercises the column tile plus a remainder on both tiers; `m =
     /// 16` is two super-rows. Skips on a host without the x86 int8 kernels
     /// (where `q4_0_repack_supported` would decline the repack in production).
-    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
     #[test]
     fn repacked_q4_0_dispatch_matches_standard_dispatch() {
         use crate::tensor::DType;
+        #[cfg(target_arch = "x86_64")]
         if !int8_gemm_available() {
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !crate::backend::simd::neon::k_quant_gemm_available() {
             return;
         }
         let (m, n, k) = (16usize, 13usize, 128usize);

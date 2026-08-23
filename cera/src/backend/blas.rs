@@ -62,6 +62,8 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
         n
     );
 
+
+
     // CBLAS integer widths are c_int on Linux, c_int on macOS too — just i32
     // on both supported hosts. cast_int is guarded because rustc complains
     // about potential truncation on 16-bit targets which we don't care about.
@@ -94,6 +96,503 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
             n_i, // ldc
         );
     }
+}
+
+/// Compute `C[n, m] = B[n, k] * A^T[k, m]` in row-major layout where B has shape [n, k] (ld_b = k)
+/// and A has shape [m, k] (ld_a = k). Both inputs are 100% contiguous along the inner contraction dimension k.
+pub fn sgemm_rowmajor_nt(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: &mut [f32]) {
+    assert!(
+        b.len() >= n * k,
+        "sgemm_rowmajor_nt: B buffer too small: {} < {} * {}",
+        b.len(),
+        n,
+        k
+    );
+    assert!(
+        a.len() >= m * k,
+        "sgemm_rowmajor_nt: A buffer too small: {} < {} * {}",
+        a.len(),
+        m,
+        k
+    );
+    assert!(
+        c.len() >= n * m,
+        "sgemm_rowmajor_nt: C buffer too small: {} < {} * {}",
+        c.len(),
+        n,
+        m
+    );
+
+    let n_i = i32::try_from(n).expect("n overflow");
+    let m_i = i32::try_from(m).expect("m overflow");
+    let k_i = i32::try_from(k).expect("k overflow");
+
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasTrans,
+            n_i,
+            m_i,
+            k_i,
+            1.0,
+            b.as_ptr(),
+            k_i,
+            a.as_ptr(),
+            k_i,
+            0.0,
+            c.as_mut_ptr(),
+            m_i,
+        );
+    }
+}
+
+/// Compute `C[n, m] = B[n, k] * A[k, m]` in row-major layout with custom leading dimensions `ldb`, `lda`, `ldc`.
+pub fn sgemm_rowmajor_nn_ld(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: *const f32,
+    ldb: usize,
+    a: *const f32,
+    lda: usize,
+    c: *mut f32,
+    ldc: usize,
+) {
+    let n_i = i32::try_from(n).expect("n overflow");
+    let m_i = i32::try_from(m).expect("m overflow");
+    let k_i = i32::try_from(k).expect("k overflow");
+    let ldb_i = i32::try_from(ldb).expect("ldb overflow");
+    let lda_i = i32::try_from(lda).expect("lda overflow");
+    let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            n_i,
+            m_i,
+            k_i,
+            1.0,
+            b,
+            ldb_i,
+            a,
+            lda_i,
+            0.0,
+            c,
+            ldc_i,
+        );
+    }
+}
+
+/// Compute `C[n, m] = B[n, k] * A[k, m]` in row-major layout partitioned across all CPU threads/AMX units.
+pub fn sgemm_rowmajor_nn_parallel(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: &[f32],
+    a: &[f32],
+    c: &mut [f32],
+) {
+    let num_threads = crate::backend::cpu::configure_thread_pool();
+    if num_threads <= 1 || m < 512 {
+        sgemm_rowmajor_nn(n, m, k, b, a, c);
+        return;
+    }
+
+    let b_ptr = b.as_ptr() as usize;
+    let a_ptr = a.as_ptr() as usize;
+    let c_ptr = c.as_mut_ptr() as usize;
+
+    let chunk_m = (m + num_threads - 1) / num_threads;
+    let n_chunks = (m + chunk_m - 1) / chunk_m;
+
+    let mut dummy_chunks = vec![0.0f32; n_chunks];
+    crate::backend::cpu::par_rows_n(&mut dummy_chunks, 1, 1, move |(t, _)| unsafe {
+        let m_start = t * chunk_m;
+        let m_t = (m - m_start).min(chunk_m);
+        if m_t == 0 {
+            return;
+        }
+
+        let b = b_ptr as *const f32;
+        let a_t = (a_ptr as *const f32).add(m_start);
+        let c_t = (c_ptr as *mut f32).add(m_start);
+
+        let n_i = i32::try_from(n).expect("n overflow");
+        let mt_i = i32::try_from(m_t).expect("m_t overflow");
+        let k_i = i32::try_from(k).expect("k overflow");
+        let lda_i = i32::try_from(m).expect("lda overflow");
+        let ldb_i = i32::try_from(k).expect("ldb overflow");
+        let ldc_i = i32::try_from(m).expect("ldc overflow");
+
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            n_i,
+            mt_i,
+            k_i,
+            1.0,
+            b,
+            ldb_i,
+            a_t,
+            lda_i,
+            0.0,
+            c_t,
+            ldc_i,
+        );
+    });
+}
+
+/// Compute `C[n, m] = B[n, k] * A[k, m]` with custom leading strides partitioned across all CPU threads/AMX units.
+pub fn sgemm_rowmajor_nn_ld_parallel(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: *const f32,
+    ldb: usize,
+    a: *const f32,
+    lda: usize,
+    c: *mut f32,
+    ldc: usize,
+) {
+    let num_threads = crate::backend::cpu::configure_thread_pool();
+    if num_threads <= 1 || m < 512 {
+        sgemm_rowmajor_nn_ld(n, m, k, b, ldb, a, lda, c, ldc);
+        return;
+    }
+
+    let b_ptr = b as usize;
+    let a_ptr = a as usize;
+    let c_ptr = c as usize;
+
+    let chunk_m = (m + num_threads - 1) / num_threads;
+    let n_chunks = (m + chunk_m - 1) / chunk_m;
+
+    let mut dummy_chunks = vec![0.0f32; n_chunks];
+    crate::backend::cpu::par_rows_n(&mut dummy_chunks, 1, 1, move |(t, _)| unsafe {
+        let m_start = t * chunk_m;
+        let m_t = (m - m_start).min(chunk_m);
+        if m_t == 0 {
+            return;
+        }
+
+        let b_p = b_ptr as *const f32;
+        let a_t = (a_ptr as *const f32).add(m_start);
+        let c_t = (c_ptr as *mut f32).add(m_start);
+
+        let n_i = i32::try_from(n).expect("n overflow");
+        let mt_i = i32::try_from(m_t).expect("m_t overflow");
+        let k_i = i32::try_from(k).expect("k overflow");
+        let ldb_i = i32::try_from(ldb).expect("ldb overflow");
+        let lda_i = i32::try_from(lda).expect("lda overflow");
+        let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            n_i,
+            mt_i,
+            k_i,
+            1.0,
+            b_p,
+            ldb_i,
+            a_t,
+            lda_i,
+            0.0,
+            c_t,
+            ldc_i,
+        );
+    });
+}
+
+/// Compute `C[n, m] = B[n, k] * A^T[k, m]` in row-major layout with custom leading dimensions `ldb`, `lda`, `ldc`.
+pub fn sgemm_rowmajor_nt_ld(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: *const f32,
+    ldb: usize,
+    a: *const f32,
+    lda: usize,
+    c: *mut f32,
+    ldc: usize,
+) {
+    let n_i = i32::try_from(n).expect("n overflow");
+    let m_i = i32::try_from(m).expect("m overflow");
+    let k_i = i32::try_from(k).expect("k overflow");
+    let ldb_i = i32::try_from(ldb).expect("ldb overflow");
+    let lda_i = i32::try_from(lda).expect("lda overflow");
+    let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasTrans,
+            n_i,
+            m_i,
+            k_i,
+            1.0,
+            b,
+            ldb_i,
+            a,
+            lda_i,
+            0.0,
+            c,
+            ldc_i,
+        );
+    }
+}
+
+/// Task descriptor for background AMX worker
+#[derive(Default, Copy, Clone)]
+struct AmxTask {
+    n: i32,
+    m: i32,
+    k: i32,
+    b_ptr: usize,
+    ldb: i32,
+    a_ptr: usize,
+    lda: i32,
+    c_ptr: usize,
+    ldc: i32,
+}
+
+const STATE_IDLE: u32 = 0;
+const STATE_RUNNING: u32 = 1;
+const STATE_DONE: u32 = 2;
+
+struct DualAmxWorker {
+    state: std::sync::atomic::AtomicU32,
+    task: std::sync::atomic::AtomicPtr<AmxTask>,
+}
+
+static WORKER_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(STATE_IDLE);
+static mut WORKER_TASK: AmxTask = AmxTask {
+    n: 0,
+    m: 0,
+    k: 0,
+    b_ptr: 0,
+    ldb: 0,
+    a_ptr: 0,
+    lda: 0,
+    c_ptr: 0,
+    ldc: 0,
+};
+static WORKER_INIT: std::sync::Once = std::sync::Once::new();
+
+#[inline(always)]
+fn set_thread_affinity(cluster_tag: i32) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn mach_thread_self() -> u32;
+            fn thread_policy_set(
+                thread: u32,
+                flavor: u32,
+                policy_info: *const i32,
+                count: u32,
+            ) -> i32;
+        }
+        const THREAD_AFFINITY_POLICY: u32 = 4;
+        let policy: [i32; 1] = [cluster_tag];
+        thread_policy_set(
+            mach_thread_self(),
+            THREAD_AFFINITY_POLICY,
+            policy.as_ptr(),
+            1,
+        );
+    }
+}
+
+fn init_dual_amx_pool() {
+    WORKER_INIT.call_once(|| {
+        std::thread::Builder::new()
+            .name("cera-amx-worker-1".into())
+            .spawn(|| {
+                set_thread_affinity(2); // Cluster 1
+                loop {
+                    // Spin-wait for work
+                    while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_RUNNING {
+                        core::hint::spin_loop();
+                    }
+
+                    // Execute task on AMX 1
+                    let task = unsafe { WORKER_TASK };
+                    unsafe {
+                        cblas_sgemm(
+                            CBLAS_ORDER::CblasRowMajor,
+                            CBLAS_TRANSPOSE::CblasNoTrans,
+                            CBLAS_TRANSPOSE::CblasTrans,
+                            task.n,
+                            task.m,
+                            task.k,
+                            1.0,
+                            task.b_ptr as *const f32,
+                            task.ldb,
+                            task.a_ptr as *const f32,
+                            task.lda,
+                            0.0,
+                            task.c_ptr as *mut f32,
+                            task.ldc,
+                        );
+                    }
+
+                    // Mark done
+                    WORKER_STATE.store(STATE_DONE, std::sync::atomic::Ordering::Release);
+                }
+            })
+            .expect("failed to spawn AMX worker 1");
+    });
+}
+
+/// Concurrently compute two independent GEMMs across Cluster 0 (AMX 0) and Cluster 1 (AMX 1):
+/// - Matrix 1: `C1[n1, m1] = B1[n1, k1] * A1^T[m1, k1]` (computed on AMX 0 by caller)
+/// - Matrix 2: `C2[n2, m2] = B2[n2, k2] * A2^T[m2, k2]` (computed on AMX 1 by background worker)
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_dual_parallel(
+    n1: usize,
+    m1: usize,
+    k1: usize,
+    b1: &[f32],
+    a1: &[f32],
+    c1: &mut [f32],
+    n2: usize,
+    m2: usize,
+    k2: usize,
+    b2: &[f32],
+    a2: &[f32],
+    c2: &mut [f32],
+) {
+    init_dual_amx_pool();
+    set_thread_affinity(1); // Ensure caller is on Cluster 0
+
+    // Set up task for Worker 1 (AMX 1)
+    unsafe {
+        WORKER_TASK = AmxTask {
+            n: n2 as i32,
+            m: m2 as i32,
+            k: k2 as i32,
+            b_ptr: b2.as_ptr() as usize,
+            ldb: k2 as i32,
+            a_ptr: a2.as_ptr() as usize,
+            lda: k2 as i32,
+            c_ptr: c2.as_mut_ptr() as usize,
+            ldc: m2 as i32,
+        };
+    }
+    WORKER_STATE.store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+
+    // Concurrently compute Task 1 on AMX 0 (Caller thread)
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasTrans,
+            n1 as i32,
+            m1 as i32,
+            k1 as i32,
+            1.0,
+            b1.as_ptr(),
+            k1 as i32,
+            a1.as_ptr(),
+            k1 as i32,
+            0.0,
+            c1.as_mut_ptr(),
+            m1 as i32,
+        );
+    }
+
+    // Wait for Worker 1 to finish
+    while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
+        core::hint::spin_loop();
+    }
+    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned equally across AMX 0 (top half) and AMX 1 (bottom half).
+pub fn sgemm_split2_parallel(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: &[f32],
+    a: &[f32],
+    c: &mut [f32],
+) {
+    if m < 512 {
+        sgemm_rowmajor_nt(n, m, k, b, a, c);
+        return;
+    }
+
+    init_dual_amx_pool();
+    set_thread_affinity(1);
+
+    let m_top = m / 2;
+    let m_bot = m - m_top;
+
+    let b_ptr = b.as_ptr() as usize;
+    let a_top_ptr = a.as_ptr() as usize;
+    let a_bot_ptr = unsafe { a.as_ptr().add(m_top * k) } as usize;
+    let c_top_ptr = c.as_mut_ptr() as usize;
+    let c_bot_ptr = unsafe { c.as_mut_ptr().add(m_top) } as usize;
+
+    // Set up bottom half for Worker 1 (AMX 1)
+    unsafe {
+        WORKER_TASK = AmxTask {
+            n: n as i32,
+            m: m_bot as i32,
+            k: k as i32,
+            b_ptr,
+            ldb: k as i32,
+            a_ptr: a_bot_ptr,
+            lda: k as i32,
+            c_ptr: c_bot_ptr,
+            ldc: m as i32,
+        };
+    }
+    WORKER_STATE.store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+
+    // Compute top half on AMX 0 (Caller thread)
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ORDER::CblasRowMajor,
+            CBLAS_TRANSPOSE::CblasNoTrans,
+            CBLAS_TRANSPOSE::CblasTrans,
+            n as i32,
+            m_top as i32,
+            k as i32,
+            1.0,
+            b_ptr as *const f32,
+            k as i32,
+            a_top_ptr as *const f32,
+            k as i32,
+            0.0,
+            c_top_ptr as *mut f32,
+            m as i32,
+        );
+    }
+
+    // Wait for Worker 1
+    while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
+        core::hint::spin_loop();
+    }
+    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned across parallel worker threads.
+pub fn sgemm_rowmajor_nt_parallel(
+    n: usize,
+    m: usize,
+    k: usize,
+    b: &[f32],
+    a: &[f32],
+    c: &mut [f32],
+) {
+    sgemm_rowmajor_nt(n, m, k, b, a, c);
 }
 
 #[cfg(test)]

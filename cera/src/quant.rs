@@ -46,30 +46,36 @@ use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSlice, Paral
 /// the `half` crate.
 #[inline(always)]
 pub(crate) fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (u32::from(bits) & 0x8000) << 16;
-    let exp = (u32::from(bits) >> 10) & 0x1F;
-    let mant = u32::from(bits) & 0x03FF;
-    let rest = match exp {
-        // Zero, or a subnormal that has to be renormalized into a normal f32.
-        0 if mant == 0 => 0,
-        0 => {
-            // `mant` is 1..=0x3FF, so `leading_zeros` is 22..=31 and `shift`
-            // lands in 1..=10; neither the subtraction nor the shifts below can
-            // go out of range.
-            let shift = mant.leading_zeros() - 21;
-            ((113 - shift) << 23) | ((mant << (shift + 13)) & 0x007F_FFFF)
-        }
-        0x1F if mant == 0 => 0x7F80_0000,
-        // NaN. The payload is carried across, and the quiet bit is *set*, not
-        // copied: IEEE 754 says widening a signaling NaN quiets it, which is
-        // what both `half` and the hardware `fcvtl` in the NEON path do. An
-        // earlier draft of this shifted the payload verbatim and disagreed with
-        // both on every sNaN (0x7c01 widened to 0x7f802000, not 0x7fc02000).
-        0x1F => 0x7FC0_0000 | (mant << 13),
-        // Normal: rebias 15 -> 127 and left-align the 10-bit significand.
-        _ => ((exp + 112) << 23) | (mant << 13),
-    };
-    f32::from_bits(sign | rest)
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let out: f32;
+        std::arch::asm!(
+            "fcvt {0:s}, {1:h}",
+            out(vreg) out,
+            in(vreg) bits,
+            options(pure, nomem, nostack)
+        );
+        out
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let sign = (u32::from(bits) & 0x8000) << 16;
+        let exp = (u32::from(bits) >> 10) & 0x1F;
+        let mant = u32::from(bits) & 0x03FF;
+        let rest = match exp {
+            // Zero, or a subnormal that has to be renormalized into a normal f32.
+            0 if mant == 0 => 0,
+            0 => {
+                let shift = mant.leading_zeros() - 21;
+                ((113 - shift) << 23) | ((mant << (shift + 13)) & 0x007F_FFFF)
+            }
+            0x1F if mant == 0 => 0x7F80_0000,
+            0x1F => 0x7FC0_0000 | (mant << 13),
+            _ => ((exp + 112) << 23) | (mant << 13),
+        };
+        f32::from_bits(sign | rest)
+    }
 }
 
 /// Convert one bfloat16 (raw bits) to f32.
@@ -348,9 +354,18 @@ macro_rules! dequantize_matrix {
                 concat!(stringify!($name), ": out length mismatch")
             );
 
-            out.par_chunks_mut(k)
-                .zip(src.par_chunks(row_bytes))
-                .for_each(|(dst_row, src_row)| $row(src_row, dst_row));
+            let num_threads = crate::par::current_num_threads().max(1);
+            let rows_per_chunk = (m / num_threads).max(1);
+            let dst_chunk_len = rows_per_chunk * k;
+            let src_chunk_len = rows_per_chunk * row_bytes;
+
+            out.par_chunks_mut(dst_chunk_len)
+                .zip(src.par_chunks(src_chunk_len))
+                .for_each(|(dst_chunk, src_chunk)| {
+                    for (dst_row, src_row) in dst_chunk.chunks_mut(k).zip(src_chunk.chunks(row_bytes)) {
+                        $row(src_row, dst_row);
+                    }
+                });
         }
     };
 }
@@ -376,12 +391,57 @@ pub fn dequantize_q4_0_block(block: &BlockQ4_0) -> [f32; 32] {
 }
 
 /// Dequantize a row of Q4_0 blocks. `src` is raw bytes, `dst` is f32 output.
+#[inline]
 pub fn dequantize_q4_0_row(src: &[u8], dst: &mut [f32]) {
     let block_size = size_of::<BlockQ4_0>();
     let n_blocks = src.len() / block_size;
     debug_assert_eq!(src.len() % block_size, 0);
     debug_assert_eq!(dst.len(), n_blocks * 32);
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let mask_lo = vdupq_n_u8(0x0F);
+        let offset_8 = vdupq_n_s8(0x8);
+
+        for i in 0..n_blocks {
+            let block_ptr = src.as_ptr().add(i * block_size) as *const BlockQ4_0;
+            let block = &*block_ptr;
+            let d_val = f16_to_f32(block.d);
+            let d_vec = vdupq_n_f32(d_val);
+
+            let v = vld1q_u8(block.qs.as_ptr());
+            let v_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, mask_lo)), offset_8);
+            let v_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), offset_8);
+
+            let v_lo_s16_lo = vmovl_s8(vget_low_s8(v_lo));
+            let v_lo_s16_hi = vmovl_high_s8(v_lo);
+            let v_lo_0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v_lo_s16_lo))), d_vec);
+            let v_lo_1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v_lo_s16_lo)), d_vec);
+            let v_lo_2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v_lo_s16_hi))), d_vec);
+            let v_lo_3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v_lo_s16_hi)), d_vec);
+
+            let v_hi_s16_lo = vmovl_s8(vget_low_s8(v_hi));
+            let v_hi_s16_hi = vmovl_high_s8(v_hi);
+            let v_hi_0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v_hi_s16_lo))), d_vec);
+            let v_hi_1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v_hi_s16_lo)), d_vec);
+            let v_hi_2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(v_hi_s16_hi))), d_vec);
+            let v_hi_3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(v_hi_s16_hi)), d_vec);
+
+            let out_ptr = dst.as_mut_ptr().add(i * 32);
+            vst1q_f32(out_ptr, v_lo_0);
+            vst1q_f32(out_ptr.add(4), v_lo_1);
+            vst1q_f32(out_ptr.add(8), v_lo_2);
+            vst1q_f32(out_ptr.add(12), v_lo_3);
+
+            vst1q_f32(out_ptr.add(16), v_hi_0);
+            vst1q_f32(out_ptr.add(20), v_hi_1);
+            vst1q_f32(out_ptr.add(24), v_hi_2);
+            vst1q_f32(out_ptr.add(28), v_hi_3);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..n_blocks {
         let block_bytes = &src[i * block_size..(i + 1) * block_size];
         let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ4_0) };
@@ -501,15 +561,54 @@ pub fn dequantize_q8_0_block(block: &BlockQ8_0) -> [f32; 32] {
 }
 
 /// Dequantize a row of Q8_0 blocks. `src` is raw bytes, `dst` is f32 output.
+#[inline]
 pub fn dequantize_q8_0_row(src: &[u8], dst: &mut [f32]) {
     let block_size = size_of::<BlockQ8_0>();
     let n_blocks = src.len() / block_size;
     debug_assert_eq!(src.len() % block_size, 0);
     debug_assert_eq!(dst.len(), n_blocks * 32);
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        for i in 0..n_blocks {
+            let block = &*(src.as_ptr().add(i * block_size) as *const BlockQ8_0);
+            let d_val = f16_to_f32(block.delta);
+            let d_vec = vdupq_n_f32(d_val);
+
+            let q0 = vld1q_s8(block.quants.as_ptr());
+            let q1 = vld1q_s8(block.quants.as_ptr().add(16));
+
+            let q0_s16_lo = vmovl_s8(vget_low_s8(q0));
+            let q0_s16_hi = vmovl_high_s8(q0);
+            let q1_s16_lo = vmovl_s8(vget_low_s8(q1));
+            let q1_s16_hi = vmovl_high_s8(q1);
+
+            let f0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q0_s16_lo))), d_vec);
+            let f1 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(q0_s16_lo)), d_vec);
+            let f2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q0_s16_hi))), d_vec);
+            let f3 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(q0_s16_hi)), d_vec);
+
+            let f4 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_s16_lo))), d_vec);
+            let f5 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(q1_s16_lo)), d_vec);
+            let f6 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_s16_hi))), d_vec);
+            let f7 = vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(q1_s16_hi)), d_vec);
+
+            let out_ptr = dst.as_mut_ptr().add(i * 32);
+            vst1q_f32(out_ptr, f0);
+            vst1q_f32(out_ptr.add(4), f1);
+            vst1q_f32(out_ptr.add(8), f2);
+            vst1q_f32(out_ptr.add(12), f3);
+            vst1q_f32(out_ptr.add(16), f4);
+            vst1q_f32(out_ptr.add(20), f5);
+            vst1q_f32(out_ptr.add(24), f6);
+            vst1q_f32(out_ptr.add(28), f7);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..n_blocks {
         let block_bytes = &src[i * block_size..(i + 1) * block_size];
-        // SAFETY: BlockQ8_0 is repr(C, packed) and we've verified the slice length
         let block = unsafe { &*(block_bytes.as_ptr() as *const BlockQ8_0) };
         let values = dequantize_q8_0_block(block);
         dst[i * 32..(i + 1) * 32].copy_from_slice(&values);

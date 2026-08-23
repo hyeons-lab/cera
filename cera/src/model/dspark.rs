@@ -241,6 +241,10 @@ pub struct DSparkSessionDrafter {
     scratch_logits: Vec<f32>,
     scratch_markov: Vec<f32>,
     scratch_markov_logits: Vec<f32>,
+    q8_scales: Vec<f32>,
+    q8_quants: Vec<i8>,
+    q8_markov_scales: Vec<f32>,
+    q8_markov_quants: Vec<i8>,
 }
 
 impl DSparkSessionDrafter {
@@ -265,6 +269,10 @@ impl DSparkSessionDrafter {
             scratch_logits: vec![0.0f32; vocab],
             scratch_markov: vec![0.0f32; markov_rank],
             scratch_markov_logits: vec![0.0f32; markov_vocab],
+            q8_scales: vec![0.0f32; hs / 32],
+            q8_quants: vec![0i8; hs],
+            q8_markov_scales: vec![0.0f32; markov_rank.div_ceil(32)],
+            q8_markov_quants: vec![0i8; markov_rank.div_ceil(32) * 32],
         }
     }
 
@@ -832,12 +840,36 @@ impl Drafter for DSparkSessionDrafter {
             }
 
             // Project logits via base model LM head
-            gemv(
-                &self.model.base_gguf,
-                head_ref,
-                &self.scratch_hidden,
-                &mut self.scratch_logits,
-            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                let nb = self.scratch_hidden.len() / 32;
+                self.q8_scales.resize(nb, 0.0);
+                self.q8_quants.resize(self.scratch_hidden.len(), 0);
+                unsafe {
+                    crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                        &self.scratch_hidden,
+                        &mut self.q8_scales,
+                        &mut self.q8_quants,
+                    );
+                }
+                transformer::gemv_preq(
+                    &self.model.base_gguf,
+                    head_ref,
+                    &self.scratch_hidden,
+                    &self.q8_scales,
+                    &self.q8_quants,
+                    &mut self.scratch_logits,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                gemv(
+                    &self.model.base_gguf,
+                    head_ref,
+                    &self.scratch_hidden,
+                    &mut self.scratch_logits,
+                );
+            }
 
             // Add Markov transition boost if markov weights are present
             let prev_tok_idx = last_tok as usize;
@@ -850,6 +882,37 @@ impl Drafter for DSparkSessionDrafter {
                     prev_tok_idx,
                     &mut self.scratch_markov,
                 );
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if self.scratch_markov.len() % 32 == 0 {
+                        let nb_m = self.scratch_markov.len() / 32;
+                        self.q8_markov_scales.resize(nb_m, 0.0);
+                        self.q8_markov_quants.resize(self.scratch_markov.len(), 0);
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &self.scratch_markov,
+                                &mut self.q8_markov_scales,
+                                &mut self.q8_markov_quants,
+                            );
+                        }
+                        transformer::gemv_preq(
+                            &self.model.gguf,
+                            mb,
+                            &self.scratch_markov,
+                            &self.q8_markov_scales,
+                            &self.q8_markov_quants,
+                            &mut self.scratch_markov_logits,
+                        );
+                    } else {
+                        gemv(
+                            &self.model.gguf,
+                            mb,
+                            &self.scratch_markov,
+                            &mut self.scratch_markov_logits,
+                        );
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 gemv(
                     &self.model.gguf,
                     mb,
@@ -970,15 +1033,7 @@ mod tests {
                 config: cfg.clone(),
                 layers: Arc::from([]),
                 output_norm_weight: Arc::from([]),
-                base_embd_ref: transformer::WeightRef {
-                    start: 0,
-                    size: 100 * 64 * 4,
-                    dtype: DType::F32,
-                    m: 100,
-                    k: 64,
-                    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                    repacked: None,
-                },
+                base_embd_ref: transformer::WeightRef::new(0, 100 * 64 * 4, DType::F32, 100, 64),
                 base_output_ref: None,
                 markov_a: None,
                 markov_b: None,
@@ -993,6 +1048,10 @@ mod tests {
             scratch_logits: vec![0.0f32; 100],
             scratch_markov: vec![0.0f32; 16],
             scratch_markov_logits: vec![0.0f32; 100],
+            q8_scales: Vec::new(),
+            q8_quants: Vec::new(),
+            q8_markov_scales: Vec::new(),
+            q8_markov_quants: Vec::new(),
         };
 
         assert!(drafter.state.is_some());
@@ -1025,15 +1084,7 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 10 * 32 * 4,
-                dtype: DType::F32,
-                m: 10,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 10 * 32 * 4, DType::F32, 10, 32),
             base_output_ref: None,
             markov_a: None,
             markov_b: None,
@@ -1080,15 +1131,7 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 10 * 32 * 4,
-                dtype: DType::F32,
-                m: 10,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 10 * 32 * 4, DType::F32, 10, 32),
             base_output_ref: None,
             markov_a: None,
             markov_b: None,
@@ -1096,13 +1139,13 @@ mod tests {
         });
 
         let mut drafter = DSparkSessionDrafter::new(model);
-        let drafted = drafter.draft(&[1, 2, 3], 4);
-        // Step 0 produces 1 token; step 1 aborts due to low confidence.
+        // Step 0 produces token 0 without checking confidence; step 1 encounters negative confidence and terminates early
+        let drafted = drafter.draft(&[1], 2);
         assert_eq!(drafted.len(), 1);
     }
 
     #[test]
-    fn dspark_divergent_prefix_resets_and_resyncs() {
+    fn dspark_draft_detects_divergent_prefix() {
         let cfg = DSparkConfig {
             hidden_size: 32,
             num_layers: 0,
@@ -1122,15 +1165,7 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 10 * 32 * 4,
-                dtype: DType::F32,
-                m: 10,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 10 * 32 * 4, DType::F32, 10, 32),
             base_output_ref: None,
             markov_a: None,
             markov_b: None,
@@ -1194,34 +1229,10 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 4 * 32 * 4,
-                dtype: DType::F32,
-                m: 4,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 4 * 32 * 4, DType::F32, 4, 32),
             base_output_ref: None,
-            markov_a: Some(transformer::WeightRef {
-                start: offset,
-                size: 4 * 2 * 4,
-                dtype: DType::F32,
-                m: 4,
-                k: 2,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            }),
-            markov_b: Some(transformer::WeightRef {
-                start: offset + 4 * 2 * 4,
-                size: 4 * 2 * 4,
-                dtype: DType::F32,
-                m: 4,
-                k: 2,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            }),
+            markov_a: Some(transformer::WeightRef::new(offset, 4 * 2 * 4, DType::F32, 4, 2)),
+            markov_b: Some(transformer::WeightRef::new(offset + 4 * 2 * 4, 4 * 2 * 4, DType::F32, 4, 2)),
             confidence_weight: None,
         });
 
@@ -1255,15 +1266,7 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 4 * 32 * 4,
-                dtype: DType::F32,
-                m: 4,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 4 * 32 * 4, DType::F32, 4, 32),
             base_output_ref: None,
             markov_a: None,
             markov_b: None,
@@ -1298,15 +1301,7 @@ mod tests {
             config: cfg,
             layers: Arc::from([]),
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
-            base_embd_ref: transformer::WeightRef {
-                start: 0,
-                size: 4 * 32 * 4,
-                dtype: DType::F32,
-                m: 4,
-                k: 32,
-                #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-                repacked: None,
-            },
+            base_embd_ref: transformer::WeightRef::new(0, 4 * 32 * 4, DType::F32, 4, 32),
             base_output_ref: None,
             markov_a: None,
             markov_b: None,

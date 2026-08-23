@@ -111,20 +111,21 @@ def export_quantized_gguf(
         gguf_writer.add_uint32("dspark.num_layers", num_layers)
         gguf_writer.add_uint32("dspark.hidden_size", hidden_size)
 
-    if "markov_w1" in state_dict and "markov_w2" in state_dict:
-        add_maybe_quantized("markov_w1.weight", state_dict["markov_w1"])
-        add_maybe_quantized("markov_w2.weight", state_dict["markov_w2"])
+    if is_markov_model:
+        if "markov_w1" in state_dict and "markov_w2" in state_dict:
+            add_maybe_quantized("markov_w1.weight", state_dict["markov_w1"])
+            add_maybe_quantized("markov_w2.weight", state_dict["markov_w2"])
 
-    # Confidence projection
-    if "confidence_head.weight" in state_dict:
-        conf_w = state_dict["confidence_head.weight"].float().numpy().reshape(-1)
-        gguf_writer.add_tensor("conf_proj.weight", conf_w)
-    elif "confidence_head.0.weight" in state_dict:
-        conf_w = state_dict["confidence_head.0.weight"].float().numpy().reshape(-1)
-        gguf_writer.add_tensor("conf_proj.weight", conf_w)
-        if "confidence_head.0.bias" in state_dict:
-            conf_b = state_dict["confidence_head.0.bias"].float().numpy().reshape(-1)
-            gguf_writer.add_tensor("conf_proj.bias", conf_b)
+        # Confidence projection
+        if "confidence_head.weight" in state_dict:
+            conf_w = state_dict["confidence_head.weight"].float().numpy().reshape(-1)
+            gguf_writer.add_tensor("conf_proj.weight", conf_w)
+        elif "confidence_head.0.weight" in state_dict:
+            conf_w = state_dict["confidence_head.0.weight"].float().numpy().reshape(-1)
+            gguf_writer.add_tensor("conf_proj.weight", conf_w)
+            if "confidence_head.0.bias" in state_dict:
+                conf_b = state_dict["confidence_head.0.bias"].float().numpy().reshape(-1)
+                gguf_writer.add_tensor("conf_proj.bias", conf_b)
 
     print("Quantizing and packing layers...")
     for l in range(num_layers):

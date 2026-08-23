@@ -827,6 +827,20 @@ impl RowPool {
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_thread_qos_interactive() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+impl RowPool {
 
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
@@ -866,7 +880,16 @@ impl RowPool {
                     retry_cooldown: 0,
                 })
             };
+            #[cfg(target_os = "macos")]
+            static QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
+        #[cfg(target_os = "macos")]
+        QOS_SET.with(|q| {
+            if !q.get() {
+                set_macos_thread_qos_interactive();
+                q.set(true);
+            }
+        });
         let Some(core) = self.caller_pin else {
             return;
         };
@@ -1271,6 +1294,9 @@ fn worker_loop(
     spread_mask: &'static [usize],
     spin_limit: u32,
 ) {
+    #[cfg(target_os = "macos")]
+    set_macos_thread_qos_interactive();
+
     if let Some(core) = pin_core {
         let _ = pin_current_thread_to_core(core);
     } else if !spread_mask.is_empty() {

@@ -327,6 +327,10 @@ pub struct ScratchBuffers {
     pub q8_scales: Vec<f32>,
     /// Q8_0 quantization scratch: quants for the input vector (max_k entries).
     pub q8_quants: Vec<i8>,
+    /// Q8_0 quantization scratch for MoE down-projections.
+    pub q8_scales_down: Vec<f32>,
+    /// Q8_0 quantization scratch for MoE down-projections.
+    pub q8_quants_down: Vec<i8>,
     /// Dequantized weight scratch for BLAS prefill. Grown lazily on first use
     /// to the largest weight matrix the BLAS path encounters; reused across
     /// every subsequent GEMM call within and between forward passes. Stays
@@ -347,6 +351,10 @@ pub struct ScratchBuffers {
     /// combining weights, for one MoE layer. Held in scratch so routing
     /// allocates nothing per layer per token. Empty on dense models.
     pub moe_selected: Vec<(usize, f32)>,
+    /// Scratch for LM Head output logits (vocab_size). Reused across tokens to eliminate per-token heap allocation.
+    pub logits: Vec<f32>,
+    /// Scratch for token embedding lookup / hidden state input (hidden_size).
+    pub hidden_in: Vec<f32>,
 }
 
 /// Inference state across all layers.
@@ -407,11 +415,15 @@ impl InferenceState {
                 scores: Vec::new(),
                 q8_scales: Vec::new(),
                 q8_quants: Vec::new(),
+                q8_scales_down: Vec::new(),
+                q8_quants_down: Vec::new(),
                 dequant_weight_scratch: Vec::new(),
                 lora_tmp: Vec::new(),
                 moe_probs: Vec::new(),
                 moe_expert_out: Vec::new(),
                 moe_selected: Vec::new(),
+                logits: Vec::new(),
+                hidden_in: Vec::new(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
@@ -660,6 +672,8 @@ impl InferenceState {
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
+                q8_scales_down: Vec::new(),
+                q8_quants_down: Vec::new(),
                 // Grown lazily to max(3*hs*hs, is*hs) on the first BLAS GEMM
                 // call. Stays empty if the `blas` feature is off.
                 dequant_weight_scratch: Vec::new(),
@@ -681,6 +695,8 @@ impl InferenceState {
                     .as_ref()
                     .map(|m| Vec::with_capacity(m.n_expert_used))
                     .unwrap_or_default(),
+                logits: zeroed_f32(config.vocab_size)?,
+                hidden_in: zeroed_f32(config.hidden_size)?,
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
