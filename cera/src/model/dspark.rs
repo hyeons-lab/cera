@@ -1231,8 +1231,20 @@ mod tests {
             output_norm_weight: Arc::from(vec![1.0f32; 32]),
             base_embd_ref: transformer::WeightRef::new(0, 4 * 32 * 4, DType::F32, 4, 32),
             base_output_ref: None,
-            markov_a: Some(transformer::WeightRef::new(offset, 4 * 2 * 4, DType::F32, 4, 2)),
-            markov_b: Some(transformer::WeightRef::new(offset + 4 * 2 * 4, 4 * 2 * 4, DType::F32, 4, 2)),
+            markov_a: Some(transformer::WeightRef::new(
+                offset,
+                4 * 2 * 4,
+                DType::F32,
+                4,
+                2,
+            )),
+            markov_b: Some(transformer::WeightRef::new(
+                offset + 4 * 2 * 4,
+                4 * 2 * 4,
+                DType::F32,
+                4,
+                2,
+            )),
             confidence_weight: None,
         });
 

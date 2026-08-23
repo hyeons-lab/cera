@@ -939,7 +939,7 @@ impl Lfm2Model {
 
         let n_expert = moe.n_expert;
         let n_used = moe.n_expert_used;
-        let _ff = moe.expert_ff_len;
+        let ff = moe.expert_ff_len;
 
         let mut all_router_logits = vec![0.0f32; n * n_expert];
         #[cfg(feature = "blas")]
@@ -968,14 +968,11 @@ impl Lfm2Model {
 
         for j in 0..n {
             let router_probs = &mut all_router_logits[j * n_expert..(j + 1) * n_expert];
-            router_probs.iter_mut().for_each(|p| *p = 1.0 / (1.0 + (-*p).exp()));
+            router_probs
+                .iter_mut()
+                .for_each(|p| *p = 1.0 / (1.0 + (-*p).exp()));
 
-            select_experts(
-                router_probs,
-                &moe.exp_probs_b,
-                n_used,
-                &mut selected,
-            );
+            select_experts(router_probs, &moe.exp_probs_b, n_used, &mut selected);
 
             for &(e, weight) in &selected {
                 if weight > 0.0 {
@@ -1083,6 +1080,94 @@ impl Lfm2Model {
                     #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..hs {
                         out_tok[i] += weight * ed[i];
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(feature = "blas"))]
+        {
+            let mut exp_gate = vec![0.0f32; ff];
+            let mut exp_up = vec![0.0f32; ff];
+            let mut exp_down = vec![0.0f32; hs];
+
+            #[cfg(target_arch = "aarch64")]
+            let mut q8_scales_down = vec![0.0f32; ff / 32];
+            #[cfg(target_arch = "aarch64")]
+            let mut q8_quants_down = vec![0i8; ff];
+
+            for (e, assigned) in expert_assignments.iter().enumerate().take(n_expert) {
+                if assigned.is_empty() {
+                    continue;
+                }
+
+                for &(token_j, weight) in assigned {
+                    let tok_in = &ffn_input[token_j * hs..(token_j + 1) * hs];
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        Self::quantize_to_scratch(tok_in, state);
+                        let gate_data = self.weight_data(&moe.gate[e]);
+                        let up_data = self.weight_data(&moe.up[e]);
+                        cpu::gemv_q4_0_fused2_with_q8(
+                            gate_data,
+                            up_data,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut exp_gate[..ff],
+                            &mut exp_up[..ff],
+                            ff,
+                            hs,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        self.gemv(&moe.gate[e], tok_in, &mut exp_gate[..ff]);
+                        self.gemv(&moe.up[e], tok_in, &mut exp_up[..ff]);
+                    }
+
+                    cpu::silu_mul_inplace(&mut exp_gate[..ff], &exp_up[..ff]);
+
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        unsafe {
+                            crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
+                                &exp_gate[..ff],
+                                &mut q8_scales_down,
+                                &mut q8_quants_down,
+                            );
+                        }
+                        let down_data = self.weight_data(&moe.down[e]);
+                        cpu::gemv_q4_0_with_q8(
+                            down_data,
+                            &q8_scales_down,
+                            &q8_quants_down,
+                            &mut exp_down[..hs],
+                            hs,
+                            ff,
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    self.gemv(&moe.down[e], &exp_gate[..ff], &mut exp_down[..hs]);
+
+                    let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        use core::arch::aarch64::*;
+                        let n_chunks = hs / 4;
+                        let ed_ptr = exp_down.as_ptr();
+                        let out_ptr = out_tok.as_mut_ptr();
+                        let w_vec = vdupq_n_f32(weight);
+                        for i in 0..n_chunks {
+                            let ed_v = vld1q_f32(ed_ptr.add(i * 4));
+                            let out_v = vld1q_f32(out_ptr.add(i * 4));
+                            let res_v = vfmaq_f32(out_v, ed_v, w_vec);
+                            vst1q_f32(out_ptr.add(i * 4), res_v);
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    for i in 0..hs {
+                        out_tok[i] += weight * exp_down[i];
                     }
                 }
             }
@@ -1327,18 +1412,42 @@ impl Lfm2Model {
                     let mut vsum = vdupq_n_f32(0.0);
                     for k in 0..d_conv {
                         let mut vw = vdupq_n_f32(0.0);
-                        vw = vsetq_lane_f32::<0>(*conv_weight.get_unchecked(ch * kernel_size + k), vw);
-                        vw = vsetq_lane_f32::<1>(*conv_weight.get_unchecked((ch + 1) * kernel_size + k), vw);
-                        vw = vsetq_lane_f32::<2>(*conv_weight.get_unchecked((ch + 2) * kernel_size + k), vw);
-                        vw = vsetq_lane_f32::<3>(*conv_weight.get_unchecked((ch + 3) * kernel_size + k), vw);
+                        vw = vsetq_lane_f32::<0>(
+                            *conv_weight.get_unchecked(ch * kernel_size + k),
+                            vw,
+                        );
+                        vw = vsetq_lane_f32::<1>(
+                            *conv_weight.get_unchecked((ch + 1) * kernel_size + k),
+                            vw,
+                        );
+                        vw = vsetq_lane_f32::<2>(
+                            *conv_weight.get_unchecked((ch + 2) * kernel_size + k),
+                            vw,
+                        );
+                        vw = vsetq_lane_f32::<3>(
+                            *conv_weight.get_unchecked((ch + 3) * kernel_size + k),
+                            vw,
+                        );
                         let vbuf = vld1q_f32(buffer.as_ptr().add(k * hidden_size + ch));
                         vsum = vmlaq_f32(vsum, vbuf, vw);
                     }
                     let mut vw_last = vdupq_n_f32(0.0);
-                    vw_last = vsetq_lane_f32::<0>(*conv_weight.get_unchecked(ch * kernel_size + d_conv), vw_last);
-                    vw_last = vsetq_lane_f32::<1>(*conv_weight.get_unchecked((ch + 1) * kernel_size + d_conv), vw_last);
-                    vw_last = vsetq_lane_f32::<2>(*conv_weight.get_unchecked((ch + 2) * kernel_size + d_conv), vw_last);
-                    vw_last = vsetq_lane_f32::<3>(*conv_weight.get_unchecked((ch + 3) * kernel_size + d_conv), vw_last);
+                    vw_last = vsetq_lane_f32::<0>(
+                        *conv_weight.get_unchecked(ch * kernel_size + d_conv),
+                        vw_last,
+                    );
+                    vw_last = vsetq_lane_f32::<1>(
+                        *conv_weight.get_unchecked((ch + 1) * kernel_size + d_conv),
+                        vw_last,
+                    );
+                    vw_last = vsetq_lane_f32::<2>(
+                        *conv_weight.get_unchecked((ch + 2) * kernel_size + d_conv),
+                        vw_last,
+                    );
+                    vw_last = vsetq_lane_f32::<3>(
+                        *conv_weight.get_unchecked((ch + 3) * kernel_size + d_conv),
+                        vw_last,
+                    );
                     let vcur = vld1q_f32(conv_scratch.as_ptr().add(ch));
                     vsum = vmlaq_f32(vsum, vcur, vw_last);
                     vst1q_f32(out_buf.as_mut_ptr().add(ch), vsum);
@@ -1413,7 +1522,11 @@ impl Lfm2Model {
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(out_proj, conv_scratch, &mut state.scratch.out[..hidden_size]);
+        self.gemv(
+            out_proj,
+            conv_scratch,
+            &mut state.scratch.out[..hidden_size],
+        );
         // LoRA on the conv out_proj (input = the gated conv output, before residual).
         if let Some(lora) = &lora
             && let Some(t) = lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj)
@@ -1453,7 +1566,10 @@ impl Lfm2Model {
             let q_ref = refs.attn_q.as_ref().unwrap();
             let k_ref = refs.attn_k.as_ref().unwrap();
             let v_ref = refs.attn_v.as_ref().unwrap();
-            if q_ref.dtype == DType::Q4_0 && k_ref.dtype == DType::Q4_0 && v_ref.dtype == DType::Q4_0 {
+            if q_ref.dtype == DType::Q4_0
+                && k_ref.dtype == DType::Q4_0
+                && v_ref.dtype == DType::Q4_0
+            {
                 let q_data = self.weight_data(q_ref);
                 let k_data = self.weight_data(k_ref);
                 let v_data = self.weight_data(v_ref);
@@ -2057,7 +2173,8 @@ impl Lfm2Model {
             if n >= 512 {
                 let hidden_ptr = hidden.as_ptr() as usize;
                 cpu::par_rows_n(&mut normed[..n * hs], hs, 64, move |(j, row)| unsafe {
-                    let tok_h = core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
+                    let tok_h =
+                        core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
                     cpu::rmsnorm_into(tok_h, row, w_attn, eps);
                 });
             } else {
@@ -2329,16 +2446,21 @@ impl Lfm2Model {
                         {
                             let t_qkv = std::time::Instant::now();
                             let qkv_f32 = refs.qkv_f32.get_or_init(|| {
-                                let q_f32 = transformer::get_dequantized_f32(&self.gguf, attn_q_ref);
-                                let k_f32 = transformer::get_dequantized_f32(&self.gguf, attn_k_ref);
-                                let v_f32 = transformer::get_dequantized_f32(&self.gguf, attn_v_ref);
+                                let q_f32 =
+                                    transformer::get_dequantized_f32(&self.gguf, attn_q_ref);
+                                let k_f32 =
+                                    transformer::get_dequantized_f32(&self.gguf, attn_k_ref);
+                                let v_f32 =
+                                    transformer::get_dequantized_f32(&self.gguf, attn_v_ref);
                                 let qkv_dim = hs + 2 * kv_dim;
                                 let mut fused = vec![0.0f32; hs * qkv_dim];
                                 for c in 0..hs {
                                     let dst_row = &mut fused[c * qkv_dim..(c + 1) * qkv_dim];
                                     dst_row[..hs].copy_from_slice(&q_f32[c * hs..(c + 1) * hs]);
-                                    dst_row[hs..hs + kv_dim].copy_from_slice(&k_f32[c * kv_dim..(c + 1) * kv_dim]);
-                                    dst_row[hs + kv_dim..].copy_from_slice(&v_f32[c * kv_dim..(c + 1) * kv_dim]);
+                                    dst_row[hs..hs + kv_dim]
+                                        .copy_from_slice(&k_f32[c * kv_dim..(c + 1) * kv_dim]);
+                                    dst_row[hs + kv_dim..]
+                                        .copy_from_slice(&v_f32[c * kv_dim..(c + 1) * kv_dim]);
                                 }
                                 fused
                             });
@@ -2356,8 +2478,10 @@ impl Lfm2Model {
                             for j in 0..n {
                                 let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
                                 q_mat[j * hs..(j + 1) * hs].copy_from_slice(&row[..hs]);
-                                k_mat[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&row[hs..hs + kv_dim]);
-                                v_mat[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                    .copy_from_slice(&row[hs..hs + kv_dim]);
+                                v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                    .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
                             }
                             if profile_prefill {
                                 t_attn_qkv += t_qkv.elapsed();
@@ -2378,16 +2502,34 @@ impl Lfm2Model {
                             let qkv_dim = hs + 2 * kv_dim;
                             let qkv_repacked = refs.qkv_repacked.get_or_init(|| {
                                 #[allow(clippy::collapsible_if)]
-                                if let (Some(q_rp), Some(k_rp), Some(v_rp)) = (&attn_q_ref.repacked, &attn_k_ref.repacked, &attn_v_ref.repacked) {
-                                    if let (transformer::Repacked::Q40 { packed: q_p, scales: q_s },
-                                            transformer::Repacked::Q40 { packed: k_p, scales: k_s },
-                                            transformer::Repacked::Q40 { packed: v_p, scales: v_s }) = (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
-                                        let mut p = Vec::with_capacity(q_p.len() + k_p.len() + v_p.len());
+                                if let (Some(q_rp), Some(k_rp), Some(v_rp)) = (
+                                    &attn_q_ref.repacked,
+                                    &attn_k_ref.repacked,
+                                    &attn_v_ref.repacked,
+                                ) {
+                                    if let (
+                                        transformer::Repacked::Q40 {
+                                            packed: q_p,
+                                            scales: q_s,
+                                        },
+                                        transformer::Repacked::Q40 {
+                                            packed: k_p,
+                                            scales: k_s,
+                                        },
+                                        transformer::Repacked::Q40 {
+                                            packed: v_p,
+                                            scales: v_s,
+                                        },
+                                    ) = (&q_rp.kind, &k_rp.kind, &v_rp.kind)
+                                    {
+                                        let mut p =
+                                            Vec::with_capacity(q_p.len() + k_p.len() + v_p.len());
                                         p.extend_from_slice(q_p);
                                         p.extend_from_slice(k_p);
                                         p.extend_from_slice(v_p);
 
-                                        let mut s = Vec::with_capacity(q_s.len() + k_s.len() + v_s.len());
+                                        let mut s =
+                                            Vec::with_capacity(q_s.len() + k_s.len() + v_s.len());
                                         s.extend_from_slice(q_s);
                                         s.extend_from_slice(k_s);
                                         s.extend_from_slice(v_s);
@@ -2399,22 +2541,25 @@ impl Lfm2Model {
 
                             let mut ran_fused = false;
                             if let Some((p, s)) = qkv_repacked.as_ref() {
-                                ran_fused = crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
-                                    p,
-                                    s,
-                                    &bq_scales,
-                                    &bq_quants,
-                                    &mut proj_mat[..qkv_dim * n],
-                                    n,
-                                    qkv_dim,
-                                    hs,
-                                );
+                                ran_fused =
+                                    crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                                        p,
+                                        s,
+                                        &bq_scales,
+                                        &bq_quants,
+                                        &mut proj_mat[..qkv_dim * n],
+                                        n,
+                                        qkv_dim,
+                                        hs,
+                                    );
                                 if ran_fused {
                                     for j in 0..n {
                                         let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
                                         q_mat[j * hs..(j + 1) * hs].copy_from_slice(&row[..hs]);
-                                        k_mat[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&row[hs..hs + kv_dim]);
-                                        v_mat[j * kv_dim..(j + 1) * kv_dim].copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                        k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                            .copy_from_slice(&row[hs..hs + kv_dim]);
+                                        v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                            .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
                                     }
                                 }
                             }
@@ -2567,13 +2712,27 @@ impl Lfm2Model {
                             let eps = cfg.rms_norm_eps;
                             cpu::par_rows_n(&mut q_mat[..n * hs], hs, 4, move |(j, _)| unsafe {
                                 let pos = start_pos + j;
-                                let q = core::slice::from_raw_parts_mut((q_ptr as *mut f32).add(j * hs), hs);
-                                let k = core::slice::from_raw_parts_mut((k_ptr as *mut f32).add(j * kv_dim), kv_dim);
+                                let q = core::slice::from_raw_parts_mut(
+                                    (q_ptr as *mut f32).add(j * hs),
+                                    hs,
+                                );
+                                let k = core::slice::from_raw_parts_mut(
+                                    (k_ptr as *mut f32).add(j * kv_dim),
+                                    kv_dim,
+                                );
                                 for h in 0..n_heads {
-                                    cpu::rmsnorm(&mut q[h * head_dim..(h + 1) * head_dim], q_norm, eps);
+                                    cpu::rmsnorm(
+                                        &mut q[h * head_dim..(h + 1) * head_dim],
+                                        q_norm,
+                                        eps,
+                                    );
                                 }
                                 for h in 0..n_kv_heads {
-                                    cpu::rmsnorm(&mut k[h * head_dim..(h + 1) * head_dim], k_norm, eps);
+                                    cpu::rmsnorm(
+                                        &mut k[h * head_dim..(h + 1) * head_dim],
+                                        k_norm,
+                                        eps,
+                                    );
                                 }
                                 cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta);
                             });
@@ -2596,7 +2755,15 @@ impl Lfm2Model {
                                         cfg.rms_norm_eps,
                                     );
                                 }
-                                cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+                                cpu::rope(
+                                    q,
+                                    k,
+                                    pos,
+                                    cfg.n_heads,
+                                    n_kv_heads,
+                                    head_dim,
+                                    cfg.rope_theta,
+                                );
                             }
                         }
 
@@ -2627,9 +2794,8 @@ impl Lfm2Model {
                                         );
                                     }
                                     _ if use_f16 => {
-                                        key_cache_f16.extend(
-                                            k.iter().map(|&x| crate::quant::f32_to_f16(x)),
-                                        );
+                                        key_cache_f16
+                                            .extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
                                     }
                                     _ => {
                                         key_cache.extend_from_slice(k);
@@ -2648,9 +2814,8 @@ impl Lfm2Model {
                                         );
                                     }
                                     _ if use_f16 => {
-                                        value_cache_f16.extend(
-                                            v.iter().map(|&x| crate::quant::f32_to_f16(x)),
-                                        );
+                                        value_cache_f16
+                                            .extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
                                     }
                                     _ => {
                                         value_cache.extend_from_slice(v);
@@ -2730,8 +2895,10 @@ impl Lfm2Model {
                                 let src_base = h * n * head_dim;
                                 for j in 0..n {
                                     let dst_base = j * hs + h * head_dim;
-                                    let src = &flash_buf[src_base + j * head_dim..src_base + (j + 1) * head_dim];
-                                    out_proj_input[dst_base..dst_base + head_dim].copy_from_slice(src);
+                                    let src = &flash_buf
+                                        [src_base + j * head_dim..src_base + (j + 1) * head_dim];
+                                    out_proj_input[dst_base..dst_base + head_dim]
+                                        .copy_from_slice(src);
                                 }
                             }
                         } else if use_tq {
@@ -3053,7 +3220,8 @@ impl Lfm2Model {
             if n >= 512 {
                 let hidden_ptr = hidden.as_ptr() as usize;
                 cpu::par_rows_n(&mut ffn_input[..n * hs], hs, 64, move |(j, row)| unsafe {
-                    let tok_h = core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
+                    let tok_h =
+                        core::slice::from_raw_parts((hidden_ptr as *const f32).add(j * hs), hs);
                     cpu::rmsnorm_into(tok_h, row, w_ffn, eps);
                 });
             } else {
@@ -3149,7 +3317,8 @@ impl Lfm2Model {
                         );
 
                         for j in 0..n {
-                            let (g_slice, u_slice) = gate_up_mat[j * 2 * is..(j + 1) * 2 * is].split_at_mut(is);
+                            let (g_slice, u_slice) =
+                                gate_up_mat[j * 2 * is..(j + 1) * 2 * is].split_at_mut(is);
                             cpu::silu_mul_inplace(g_slice, u_slice);
                         }
 
@@ -3160,16 +3329,17 @@ impl Lfm2Model {
                     #[cfg(not(feature = "blas"))]
                     {
                         let t_gu = std::time::Instant::now();
-                        let fused_ok = lora.is_none() && transformer::try_repacked_gate_up_silu_rowmajor(
-                            &dense.gate,
-                            &dense.up,
-                            &bq_scales,
-                            &bq_quants,
-                            &mut gate_mat[..is * n],
-                            n,
-                            is,
-                            hs,
-                        );
+                        let fused_ok = lora.is_none()
+                            && transformer::try_repacked_gate_up_silu_rowmajor(
+                                &dense.gate,
+                                &dense.up,
+                                &bq_scales,
+                                &bq_quants,
+                                &mut gate_mat[..is * n],
+                                n,
+                                is,
+                                hs,
+                            );
                         if !fused_ok {
                             transformer::try_repacked_gemm_rowmajor(
                                 &dense.gate,
@@ -3594,11 +3764,7 @@ impl Lfm2Model {
                 "token_id {token_id} out of range for vocab size {}",
                 self.embd_ref.m
             );
-            self.dequantize_row_into(
-                &self.embd_ref,
-                token_id,
-                &mut hidden[j * hs..(j + 1) * hs],
-            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut hidden[j * hs..(j + 1) * hs]);
         }
 
         self.prefill_layers_and_logits(hidden, n, start_pos, state)
@@ -3632,11 +3798,7 @@ impl Lfm2Model {
                 "token_id {token_id} out of range for vocab size {}",
                 self.embd_ref.m
             );
-            self.dequantize_row_into(
-                &self.embd_ref,
-                token_id,
-                &mut hidden[j * hs..(j + 1) * hs],
-            );
+            self.dequantize_row_into(&self.embd_ref, token_id, &mut hidden[j * hs..(j + 1) * hs]);
         }
 
         self.prefill_layers_and_all_logits(hidden, n, start_pos, state)
@@ -3741,7 +3903,11 @@ impl Model for Lfm2Model {
             &mut state.scratch.logits[..cfg.vocab_size],
         );
         #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, hidden, &mut state.scratch.logits[..cfg.vocab_size]);
+        self.gemv(
+            &self.embd_ref,
+            hidden,
+            &mut state.scratch.logits[..cfg.vocab_size],
+        );
 
         state.scratch.logits[..cfg.vocab_size].to_vec()
     }
@@ -3779,7 +3945,11 @@ impl Model for Lfm2Model {
             &mut state.scratch.logits[..cfg.vocab_size],
         );
         #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, hidden, &mut state.scratch.logits[..cfg.vocab_size]);
+        self.gemv(
+            &self.embd_ref,
+            hidden,
+            &mut state.scratch.logits[..cfg.vocab_size],
+        );
 
         crate::sampler::argmax(&state.scratch.logits[..cfg.vocab_size])
     }

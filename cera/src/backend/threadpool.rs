@@ -846,7 +846,6 @@ pub fn set_macos_thread_qos_interactive() {
 }
 
 impl RowPool {
-
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
     /// every host thread that ever dispatches would be permanently pinned to
@@ -1374,7 +1373,9 @@ fn worker_loop(
             } else {
                 shared.parked_count.fetch_add(1, Ordering::SeqCst);
                 // Check state one last time after declaring intent to park
-                if shared.state.load(Ordering::SeqCst) != last_state || shared.shutdown.load(Ordering::SeqCst) {
+                if shared.state.load(Ordering::SeqCst) != last_state
+                    || shared.shutdown.load(Ordering::SeqCst)
+                {
                     shared.parked_count.fetch_sub(1, Ordering::SeqCst);
                     continue;
                 }

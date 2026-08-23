@@ -172,7 +172,12 @@ fn visual_token_anchor_pinning() {
     // Insert visual anchor at index 261 (after image tokens)
     let mut state = InferenceState::from_config(&cfg).unwrap();
     state.seq_len = 261;
-    if let LayerState::Attention { key_cache, value_cache, .. } = &mut state.layers[1] {
+    if let LayerState::Attention {
+        key_cache,
+        value_cache,
+        ..
+    } = &mut state.layers[1]
+    {
         key_cache.resize(261 * 8, 4.0);
         value_cache.resize(261 * 8, 5.0);
     }
@@ -203,7 +208,10 @@ fn visual_token_anchor_pinning() {
         .expect("must find visual token anchor");
 
     assert_eq!(len, 261);
-    assert_eq!(anchor_snap.boundary_kind, SemanticBoundaryKind::ImageTokens as u8);
+    assert_eq!(
+        anchor_snap.boundary_kind,
+        SemanticBoundaryKind::ImageTokens as u8
+    );
     assert_eq!(anchor_snap.semantic_hash, 0xcafe);
 }
 
@@ -253,11 +261,18 @@ fn cold_tier_flatbuffers_v2_and_graceful_fallback() {
     // 3. Corrupted / legacy file test: write raw garbage to an unexpected .kvcache file
     let _corrupt_tokens = [90u32, 91, 92];
     let corrupt_path = dir.join("corrupted_test_file.kvcache");
-    std::fs::write(&corrupt_path, b"LEGACY_CORRUPTED_V1_CACHE_PAYLOAD_NOT_FLATBUFFERS").unwrap();
+    std::fs::write(
+        &corrupt_path,
+        b"LEGACY_CORRUPTED_V1_CACHE_PAYLOAD_NOT_FLATBUFFERS",
+    )
+    .unwrap();
 
     // Verify loading non-matching/corrupted token sequence returns None (graceful cache miss) without panicking
     let corrupt_hit = cache.find_deepest_semantic_anchor(&[90, 91, 92, 93]);
-    assert!(corrupt_hit.is_none(), "corrupted/legacy file must return None cache miss");
+    assert!(
+        corrupt_hit.is_none(),
+        "corrupted/legacy file must return None cache miss"
+    );
 
     // Clean up
     let _ = std::fs::remove_dir_all(&dir);

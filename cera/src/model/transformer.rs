@@ -76,7 +76,10 @@ pub mod oracle_dump {
 /// layout differs from GGUF's, and kept *alongside* the mmap weights — prefill
 /// only, decode keeps the standard mmap layout — so it costs roughly one extra
 /// weight-sized copy for each repacked weight.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[derive(Clone)]
 #[allow(dead_code)]
 pub(crate) enum Repacked {
@@ -100,7 +103,10 @@ pub(crate) enum Repacked {
 ///
 /// Gated to the one config that reads it — the x86 no-BLAS prefill path — so it
 /// does not read as dead code where `gemm_preq`'s repacked branch is compiled out.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[derive(Clone)]
 pub(crate) struct RepackedWeight {
     pub kind: Repacked,
@@ -108,7 +114,10 @@ pub(crate) struct RepackedWeight {
     pub k: usize,
 }
 
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 impl std::fmt::Debug for RepackedWeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the buffers — they can be hundreds of MiB.
@@ -140,7 +149,10 @@ pub(crate) struct WeightRef {
     /// hosts with the int8 kernels. `None` when unset (other dtypes, ragged
     /// row counts, or weights that never hit the batched GEMM). The field exists
     /// only on the target/feature combo whose `gemm_preq` reads it.
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "blas")
+    ))]
     pub repacked: Option<std::sync::Arc<RepackedWeight>>,
     #[cfg(feature = "blas")]
     pub cached_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
@@ -154,7 +166,10 @@ impl WeightRef {
             dtype,
             m,
             k,
-            #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+            #[cfg(all(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                not(feature = "blas")
+            ))]
             repacked: None,
             #[cfg(feature = "blas")]
             cached_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -179,7 +194,10 @@ impl WeightRef {
     /// resident memory are still real, and speculative decoding is off by
     /// default.
     pub(crate) fn with_repack(mut self, gguf: &GgufFile) -> Self {
-        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+        #[cfg(all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            not(feature = "blas")
+        ))]
         {
             let mut kind = None;
             if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
@@ -189,17 +207,29 @@ impl WeightRef {
             }
             #[cfg(target_arch = "x86_64")]
             {
-                if kind.is_none() && self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k) {
+                if kind.is_none()
+                    && self.dtype == DType::Q4KM
+                    && cpu::q4_k_repack_supported(self.m, self.k)
+                {
                     let (packed, dsc, dmn) =
                         cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
-                } else if kind.is_none() && self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k) {
+                } else if kind.is_none()
+                    && self.dtype == DType::Q6K
+                    && cpu::q6_k_repack_supported(self.m, self.k)
+                {
                     let (packed, scales) =
                         cpu::repack_q6_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q6K { packed, scales });
                 }
             }
-            self.repacked = kind.map(|k| std::sync::Arc::new(RepackedWeight { kind: k, m: self.m, k: self.k }));
+            self.repacked = kind.map(|k| {
+                std::sync::Arc::new(RepackedWeight {
+                    kind: k,
+                    m: self.m,
+                    k: self.k,
+                })
+            });
         }
         self
     }
@@ -495,18 +525,18 @@ pub(crate) fn quantize_to_scratch_bufs(
     q8_scales.resize(nb, 0.0);
     q8_quants.resize(x.len(), 0);
     unsafe {
-        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-            x,
-            q8_scales,
-            q8_quants,
-        );
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
     }
 }
 
 /// Quantize `x` to Q8_0 into the state's reusable scratch buffers.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
-    quantize_to_scratch_bufs(x, &mut state.scratch.q8_scales, &mut state.scratch.q8_quants);
+    quantize_to_scratch_bufs(
+        x,
+        &mut state.scratch.q8_scales,
+        &mut state.scratch.q8_quants,
+    );
 }
 
 // ── Batched-GEMM prefill helpers ────────────────────────────────────────────
@@ -746,8 +776,14 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
     m: usize,
     k: usize,
 ) -> bool {
-    debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm_rowmajor: weight m mismatch");
-    debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm_rowmajor: weight k mismatch");
+    debug_assert_eq!(
+        wref.m, m,
+        "try_blas_prefill_gemm_rowmajor: weight m mismatch"
+    );
+    debug_assert_eq!(
+        wref.k, k,
+        "try_blas_prefill_gemm_rowmajor: weight k mismatch"
+    );
     let dequant = get_dequantized_f32(gguf, wref);
     if dequant.is_empty() {
         report_uncomputed_gemm("try_blas_prefill_gemm_rowmajor", wref.dtype, k);
@@ -757,7 +793,10 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
     true
 }
 
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_repacked_gemm_rowmajor(
     wref: &WeightRef,
@@ -784,7 +823,10 @@ pub(crate) fn try_repacked_gemm_rowmajor(
     false
 }
 
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_repacked_gate_up_silu_rowmajor(
@@ -797,8 +839,14 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
     m: usize,
     k: usize,
 ) -> bool {
-    debug_assert_eq!(gate.m, m, "try_repacked_gate_up_silu_rowmajor: gate m mismatch");
-    debug_assert_eq!(gate.k, k, "try_repacked_gate_up_silu_rowmajor: gate k mismatch");
+    debug_assert_eq!(
+        gate.m, m,
+        "try_repacked_gate_up_silu_rowmajor: gate m mismatch"
+    );
+    debug_assert_eq!(
+        gate.k, k,
+        "try_repacked_gate_up_silu_rowmajor: gate k mismatch"
+    );
     debug_assert_eq!(up.m, m, "try_repacked_gate_up_silu_rowmajor: up m mismatch");
     debug_assert_eq!(up.k, k, "try_repacked_gate_up_silu_rowmajor: up k mismatch");
     #[allow(clippy::collapsible_if)]
@@ -812,7 +860,8 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
                 packed: up,
                 scales: us,
             },
-        ) = (&g_rp.kind, &u_rp.kind) {
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
             return cpu::gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
                 gp, gs, up, us, b_scales, b_quants, out, m, n, k,
             );
@@ -877,7 +926,10 @@ pub(crate) fn gemm_preq(
     // dedicated prefill kernel — no per-column hsum. Only present on x86 hosts
     // with the int8 kernels, and only for weights that pass the dtype's
     // `*_repack_supported`, so this is a no-op fall-through everywhere else.
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "blas")
+    ))]
     if let Some(rp) = &wref.repacked {
         debug_assert_eq!(rp.m, m, "gemm_preq: repacked m mismatch");
         debug_assert_eq!(rp.k, k, "gemm_preq: repacked k mismatch");
@@ -1717,7 +1769,9 @@ pub(crate) fn forward_ffn_block(
     let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
     {
-        let can_fuse_swiglu = lora.is_none() && weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0;
+        let can_fuse_swiglu = lora.is_none()
+            && weights.ffn_gate.dtype == DType::Q4_0
+            && weights.ffn_up.dtype == DType::Q4_0;
         if can_fuse_swiglu {
             let g_data = weight_data(gguf, weights.ffn_gate);
             let u_data = weight_data(gguf, weights.ffn_up);
@@ -1779,7 +1833,9 @@ pub(crate) fn forward_ffn_block(
     }
 
     #[cfg(target_arch = "aarch64")]
-    let fused_swiglu_done = lora.is_none() && weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0;
+    let fused_swiglu_done = lora.is_none()
+        && weights.ffn_gate.dtype == DType::Q4_0
+        && weights.ffn_up.dtype == DType::Q4_0;
     #[cfg(not(target_arch = "aarch64"))]
     let fused_swiglu_done = false;
 

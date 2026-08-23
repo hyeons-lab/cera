@@ -493,7 +493,10 @@ impl BpeTokenizer {
     /// Detect token offsets in `tokens` that correspond to semantic boundaries
     /// (e.g. turn delimiters `<|im_end|>`, `<|eot_id|>`, `</s>`, `<end_of_turn>`,
     /// tool markers `</tool_call>`, `</tool_response>`, or thinking closures `</thought>`, `</think>`).
-    pub fn find_semantic_anchor_indices(&self, tokens: &[u32]) -> Vec<(usize, crate::kv_cache::SemanticBoundaryKind)> {
+    pub fn find_semantic_anchor_indices(
+        &self,
+        tokens: &[u32],
+    ) -> Vec<(usize, crate::kv_cache::SemanticBoundaryKind)> {
         let mut anchors = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             if let Some(kind) = self.classify_boundary_token(tok) {
@@ -505,7 +508,10 @@ impl BpeTokenizer {
     }
 
     /// Classify whether a token ID represents a semantic boundary.
-    pub fn classify_boundary_token(&self, token_id: u32) -> Option<crate::kv_cache::SemanticBoundaryKind> {
+    pub fn classify_boundary_token(
+        &self,
+        token_id: u32,
+    ) -> Option<crate::kv_cache::SemanticBoundaryKind> {
         use crate::kv_cache::SemanticBoundaryKind;
         let text = self.decode(&[token_id]);
         let s = text.trim();
@@ -1506,7 +1512,8 @@ mod tests {
 
         let tool_call_id = tok.vocab.len() as u32;
         tok.vocab.push(b"</tool_call>".to_vec());
-        tok.token_to_id.insert(b"</tool_call>".to_vec(), tool_call_id);
+        tok.token_to_id
+            .insert(b"</tool_call>".to_vec(), tool_call_id);
 
         let think_id = tok.vocab.len() as u32;
         tok.vocab.push(b"</thought>".to_vec());
@@ -1516,7 +1523,18 @@ mod tests {
         tok.vocab.push(b"<|image_pad|>".to_vec());
         tok.token_to_id.insert(b"<|image_pad|>".to_vec(), image_id);
 
-        let prompt = vec![0, 1, 2, im_end_id, 3, 4, tool_call_id, 5, think_id, image_id];
+        let prompt = vec![
+            0,
+            1,
+            2,
+            im_end_id,
+            3,
+            4,
+            tool_call_id,
+            5,
+            think_id,
+            image_id,
+        ];
         let anchors = tok.find_semantic_anchor_indices(&prompt);
 
         assert_eq!(anchors.len(), 4);

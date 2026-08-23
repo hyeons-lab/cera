@@ -1523,7 +1523,12 @@ impl StateSnapshot {
         }
     }
 
-    pub fn with_anchor(mut self, depth: u32, kind: SemanticBoundaryKind, semantic_hash: u64) -> Self {
+    pub fn with_anchor(
+        mut self,
+        depth: u32,
+        kind: SemanticBoundaryKind,
+        semantic_hash: u64,
+    ) -> Self {
         self.anchor_depth = depth;
         self.boundary_kind = kind as u8;
         self.semantic_hash = semantic_hash;
@@ -1772,8 +1777,11 @@ impl KvPrefixCache {
 
     /// Find the deepest cached semantic anchor that is a strict prefix of `tokens`.
     /// Semantic anchors are snapshots saved at turn, tool, or thinking boundaries.
-    /// If no anchor is tagged, falls back to [`find_longest_prefix`].
-    pub fn find_deepest_semantic_anchor(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
+    /// If no anchor is tagged, falls back to [`Self::find_longest_prefix`].
+    pub fn find_deepest_semantic_anchor(
+        &mut self,
+        tokens: &[u32],
+    ) -> Option<(StateSnapshot, usize)> {
         let warm_anchor = self
             .warm
             .values()

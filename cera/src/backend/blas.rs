@@ -62,8 +62,6 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
         n
     );
 
-
-
     // CBLAS integer widths are c_int on Linux, c_int on macOS too — just i32
     // on both supported hosts. cast_int is guarded because rustc complains
     // about potential truncation on 16-bit targets which we don't care about.
@@ -515,14 +513,7 @@ pub fn sgemm_dual_parallel(
 }
 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned equally across AMX 0 (top half) and AMX 1 (bottom half).
-pub fn sgemm_split2_parallel(
-    n: usize,
-    m: usize,
-    k: usize,
-    b: &[f32],
-    a: &[f32],
-    c: &mut [f32],
-) {
+pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: &mut [f32]) {
     if m < 512 {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;

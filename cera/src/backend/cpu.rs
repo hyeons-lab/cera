@@ -417,9 +417,15 @@ pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + 
     let chunk = total_rows.div_ceil(nth).max(1);
     let mut dummy = [0.0f32; 4096];
     if total_rows <= 4096 {
-        pool.dispatch_rows_chunked(&mut dummy[..total_rows], 1, min_rows, chunk, |start, slice| {
-            f(start, slice.len());
-        });
+        pool.dispatch_rows_chunked(
+            &mut dummy[..total_rows],
+            1,
+            min_rows,
+            chunk,
+            |start, slice| {
+                f(start, slice.len());
+            },
+        );
     } else {
         let mut heap_dummy = vec![0.0f32; total_rows];
         pool.dispatch_rows_chunked(&mut heap_dummy, 1, min_rows, chunk, |start, slice| {
@@ -1310,7 +1316,10 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
 /// host: needs the int8 kernels, a whole number of 8-row super-rows, and
 /// Q8_0-block-aligned `k`. A weight that fails this keeps the standard layout and
 /// the standard kernel — correctness is identical, only prefill is slower.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(16) && k.is_multiple_of(32);
@@ -1321,7 +1330,10 @@ pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
 /// Run the repacked-Q4_0 prefill GEMM for `m x n` output floats from `m x k`
 /// repacked weights against pre-quantized `k x n` activation columns. Returns
 /// `false` if no kernel is available for this host architecture.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
     packed: &[u8],
@@ -1342,7 +1354,8 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
         );
         let expected_bytes_per_block = 512;
         assert!(
-            packed.len() >= (m / 16) * nb * expected_bytes_per_block && scales.len() >= (m / 16) * nb * 16,
+            packed.len() >= (m / 16) * nb * expected_bytes_per_block
+                && scales.len() >= (m / 16) * nb * 16,
             "gemm_preq_repacked_q4_0_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -1354,7 +1367,8 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
         );
         let expected_bytes_per_block = 128;
         assert!(
-            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block
+                && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -1397,7 +1411,10 @@ pub(crate) fn gemm_preq_repacked_q4_0_dispatch(
 }
 
 /// Run the repacked-Q4_0 prefill GEMM writing directly in row-major `out[n, m]` layout.
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(feature = "blas")
+))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
     packed: &[u8],
@@ -1418,7 +1435,8 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
         );
         let expected_bytes_per_block = 256;
         assert!(
-            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block
+                && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_rowmajor_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -1430,7 +1448,8 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
         );
         let expected_bytes_per_block = 128;
         assert!(
-            packed.len() >= (m / 8) * nb * expected_bytes_per_block && scales.len() >= (m / 8) * nb * 8,
+            packed.len() >= (m / 8) * nb * expected_bytes_per_block
+                && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_rowmajor_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -1484,16 +1503,8 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
             sr_count * nb * 256,
             "up packed bytes mismatch"
         );
-        assert_eq!(
-            gate_scales.len(),
-            sr_count * nb * 8,
-            "gate scales mismatch"
-        );
-        assert_eq!(
-            up_scales.len(),
-            sr_count * nb * 8,
-            "up scales mismatch"
-        );
+        assert_eq!(gate_scales.len(), sr_count * nb * 8, "gate scales mismatch");
+        assert_eq!(up_scales.len(), sr_count * nb * 8, "up scales mismatch");
     }
     assert!(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
@@ -2949,12 +2960,7 @@ pub fn rmsnorm_and_quantize_q8_0(
     #[cfg(target_arch = "aarch64")]
     unsafe {
         crate::backend::simd::neon::rmsnorm_and_quantize_q8_0_neon(
-            x,
-            weight,
-            eps,
-            scales,
-            quants,
-            out_normed,
+            x, weight, eps, scales, quants, out_normed,
         );
     }
 
@@ -3076,7 +3082,10 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
             let u_chunk = unsafe {
-                core::slice::from_raw_parts((up_ptr as *const f32).add(idx * chunk_size), g_chunk.len())
+                core::slice::from_raw_parts(
+                    (up_ptr as *const f32).add(idx * chunk_size),
+                    g_chunk.len(),
+                )
             };
             for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
                 *g = *g / (1.0 + ggml_expf(-*g)) * u;
@@ -5105,9 +5114,11 @@ unsafe fn flash_attention_gqa_neon(
         debug_assert!(
             (n_queries == 0)
                 || (q_stride == n_queries
-                    && q_mat.len() >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries)
+                    && q_mat.len()
+                        >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries)
                 || (q_stride >= head_dim
-                    && q_mat.len() >= (n_queries - 1) * q_stride + (n_heads_start + group_size) * head_dim),
+                    && q_mat.len()
+                        >= (n_queries - 1) * q_stride + (n_heads_start + group_size) * head_dim),
             "q_mat too small for the given head range and q_stride"
         );
         debug_assert!(
@@ -6319,7 +6330,10 @@ mod tests {
     /// `n = 13` exercises the column tile plus a remainder on both tiers; `m =
     /// 16` is two super-rows. Skips on a host without the x86 int8 kernels
     /// (where `q4_0_repack_supported` would decline the repack in production).
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(feature = "blas")))]
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "blas")
+    ))]
     #[test]
     fn repacked_q4_0_dispatch_matches_standard_dispatch() {
         use crate::tensor::DType;
