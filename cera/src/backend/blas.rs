@@ -363,11 +363,7 @@ struct AmxTask {
 const STATE_IDLE: u32 = 0;
 const STATE_RUNNING: u32 = 1;
 const STATE_DONE: u32 = 2;
-
-struct DualAmxWorker {
-    state: std::sync::atomic::AtomicU32,
-    task: std::sync::atomic::AtomicPtr<AmxTask>,
-}
+const STATE_LOCKED: u32 = 3;
 
 static WORKER_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(STATE_IDLE);
 static mut WORKER_TASK: AmxTask = AmxTask {
@@ -467,6 +463,22 @@ pub fn sgemm_dual_parallel(
     c2: &mut [f32],
 ) {
     init_dual_amx_pool();
+
+    // If worker is busy or contended, fall back to sequential CBLAS to avoid clobbering state
+    if WORKER_STATE
+        .compare_exchange(
+            STATE_IDLE,
+            STATE_LOCKED,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        sgemm_rowmajor_nt(n1, m1, k1, b1, a1, c1);
+        sgemm_rowmajor_nt(n2, m2, k2, b2, a2, c2);
+        return;
+    }
+
     set_thread_affinity(1); // Ensure caller is on Cluster 0
 
     // Set up task for Worker 1 (AMX 1)
@@ -509,7 +521,7 @@ pub fn sgemm_dual_parallel(
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
     }
-    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Relaxed);
+    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
 }
 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned equally across AMX 0 (top half) and AMX 1 (bottom half).
@@ -520,6 +532,21 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
     }
 
     init_dual_amx_pool();
+
+    // If worker is busy or contended, fall back to single-threaded CBLAS
+    if WORKER_STATE
+        .compare_exchange(
+            STATE_IDLE,
+            STATE_LOCKED,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        sgemm_rowmajor_nt(n, m, k, b, a, c);
+        return;
+    }
+
     set_thread_affinity(1);
 
     let m_top = m / 2;
@@ -571,7 +598,7 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
     }
-    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Relaxed);
+    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
 }
 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned across parallel worker threads.

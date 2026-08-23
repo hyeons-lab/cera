@@ -1750,6 +1750,8 @@ impl KvPrefixCache {
         // something at least as good" would block promotion forever and re-read the
         // multi-MB cold file on every call.
         if let Some((snapshot, len)) = &best
+            && self.config.max_warm_entries > 0
+            && self.config.max_warm_bytes > 0
             && !self.warm.values().any(|e| {
                 e.tokens.len() >= *len
                     && e.tokens.len() < tokens.len()
@@ -1816,6 +1818,8 @@ impl KvPrefixCache {
         };
 
         if let Some((snapshot, len)) = &best
+            && self.config.max_warm_entries > 0
+            && self.config.max_warm_bytes > 0
             && !self.warm.values().any(|e| {
                 e.tokens.len() >= *len
                     && e.tokens.len() < tokens.len()

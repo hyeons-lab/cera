@@ -559,7 +559,10 @@ pub(crate) mod neon {
                 let (d, id) = if amax == 0.0 {
                     (0.0f32, 0.0f32)
                 } else {
-                    (amax / 127.0, 127.0 / amax)
+                    let d_raw = amax / 127.0;
+                    let d_f16 = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d_raw));
+                    let id_val = if d_f16 != 0.0 { 1.0 / d_f16 } else { 0.0 };
+                    (d_f16, id_val)
                 };
                 *scales.as_mut_ptr().add(b) = d;
                 let id_vec = vdupq_n_f32(id);
