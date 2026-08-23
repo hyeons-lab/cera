@@ -239,6 +239,10 @@ struct Shared {
     /// Set by a worker whose closure panicked; the dispatcher re-raises the
     /// panic on the calling thread after the barrier drains.
     panicked: AtomicBool,
+    /// Number of background workers currently in `thread::park()`. Avoids
+    /// issuing `unpark()` syscalls on every GEMV dispatch when workers are
+    /// actively spin-waiting in user space.
+    parked_count: AtomicUsize,
     /// The panicking worker's original payload, resumed on the calling thread
     /// so the panic message/type survive the thread hop (rayon's contract).
     /// Only touched on the panic path — never on a normal dispatch.
@@ -786,6 +790,7 @@ impl RowPool {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         });
@@ -1182,17 +1187,21 @@ impl RowPool {
             let next_epoch = state_epoch(self.shared.state.load(Ordering::Relaxed)) + 1;
             self.shared
                 .state
-                .store(pack_state(next_epoch, active), Ordering::Release);
-            for h in self.workers.iter().take(active - 1) {
-                h.thread().unpark();
+                .store(pack_state(next_epoch, active), Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in self.workers.iter().take(active - 1) {
+                    h.thread().unpark();
+                }
             }
         } else {
             self.shared
                 .pending
                 .store(self.num_threads - 1, Ordering::Release);
-            self.shared.state.fetch_add(1, Ordering::Release);
-            for h in &self.workers {
-                h.thread().unpark();
+            self.shared.state.fetch_add(1, Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in &self.workers {
+                    h.thread().unpark();
+                }
             }
         }
 
@@ -1363,9 +1372,14 @@ fn worker_loop(
             if spins < spin_limit {
                 std::hint::spin_loop();
             } else {
-                // park() returns immediately if an unpark token is pending, so
-                // there's no lost-wakeup between the epoch check and the park.
+                shared.parked_count.fetch_add(1, Ordering::SeqCst);
+                // Check state one last time after declaring intent to park
+                if shared.state.load(Ordering::SeqCst) != last_state || shared.shutdown.load(Ordering::SeqCst) {
+                    shared.parked_count.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
                 thread::park();
+                shared.parked_count.fetch_sub(1, Ordering::SeqCst);
                 parked = true;
             }
         }
@@ -1629,6 +1643,7 @@ mod tests {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         };
@@ -1671,6 +1686,7 @@ mod tests {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         };

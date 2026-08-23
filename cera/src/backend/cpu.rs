@@ -402,7 +402,7 @@ pub fn par_rows_slice(
 ) {
     let pool = super::threadpool::RowPool::decode();
     let nth = pool.num_threads().max(1);
-    let chunk = ((y.len() + nth - 1) / nth).max(1);
+    let chunk = y.len().div_ceil(nth).max(1);
     pool.dispatch_rows_chunked(y, 1, min_rows, chunk, |row, slice| {
         f((row, slice));
     });
@@ -414,7 +414,7 @@ pub fn par_rows_slice(
 pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + Sync + Send) {
     let pool = super::threadpool::RowPool::decode();
     let nth = pool.num_threads().max(1);
-    let chunk = ((total_rows + nth - 1) / nth).max(1);
+    let chunk = total_rows.div_ceil(nth).max(1);
     let mut dummy = [0.0f32; 4096];
     if total_rows <= 4096 {
         pool.dispatch_rows_chunked(&mut dummy[..total_rows], 1, min_rows, chunk, |start, slice| {
@@ -1453,6 +1453,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_rowmajor_dispatch(
 }
 
 /// Dispatch a fused Gate + Up + SiLU GEMM.
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
     gate_packed: &[u8],
     gate_scales: &[f32],
@@ -1469,7 +1470,7 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
-            m % 8 == 0 && k % 32 == 0,
+            m.is_multiple_of(8) && k.is_multiple_of(32),
             "gemm_preq_repacked_q4_0_gate_up_silu_dispatch: m={m} must be %8 and k={k} must be %32"
         );
         let sr_count = m / 8;

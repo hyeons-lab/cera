@@ -144,14 +144,14 @@ impl DSparkConfig {
 
         ensure!(hidden_size > 0, "DSpark hidden_size must be positive");
         ensure!(
-            hidden_size % 32 == 0,
+            hidden_size.is_multiple_of(32),
             "DSpark hidden_size ({hidden_size}) must be divisible by 32 for SIMD alignment",
         );
         ensure!(num_layers > 0, "DSpark num_layers must be positive");
         ensure!(num_heads > 0, "DSpark num_heads must be positive");
         ensure!(num_kv_heads > 0, "DSpark num_kv_heads must be positive");
         ensure!(
-            num_heads % num_kv_heads == 0,
+            num_heads.is_multiple_of(num_kv_heads),
             "DSpark num_heads ({num_heads}) must be a positive multiple of num_kv_heads ({num_kv_heads})"
         );
         ensure!(head_dim > 0, "DSpark head_dim must be positive");
@@ -884,7 +884,7 @@ impl Drafter for DSparkSessionDrafter {
                 );
                 #[cfg(target_arch = "aarch64")]
                 {
-                    if self.scratch_markov.len() % 32 == 0 {
+                    if self.scratch_markov.len().is_multiple_of(32) {
                         let nb_m = self.scratch_markov.len() / 32;
                         self.q8_markov_scales.resize(nb_m, 0.0);
                         self.q8_markov_quants.resize(self.scratch_markov.len(), 0);

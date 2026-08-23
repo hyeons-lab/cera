@@ -127,7 +127,7 @@ pub(crate) struct LayerWeightRefs {
     pub attn_output: Option<WeightRef>,
     #[allow(dead_code)]
     pub qkv_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::type_complexity)]
     pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<(Vec<u8>, Vec<f32>)>>>,
 }
 
@@ -2341,6 +2341,7 @@ impl Lfm2Model {
 
                             let qkv_dim = hs + 2 * kv_dim;
                             let qkv_repacked = refs.qkv_repacked.get_or_init(|| {
+                                #[allow(clippy::collapsible_if)]
                                 if let (Some(q_rp), Some(k_rp), Some(v_rp)) = (&attn_q_ref.repacked, &attn_k_ref.repacked, &attn_v_ref.repacked) {
                                     if let (transformer::Repacked::Q40 { packed: q_p, scales: q_s },
                                             transformer::Repacked::Q40 { packed: k_p, scales: k_s },

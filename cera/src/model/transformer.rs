@@ -801,23 +801,21 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
     debug_assert_eq!(gate.k, k, "try_repacked_gate_up_silu_rowmajor: gate k mismatch");
     debug_assert_eq!(up.m, m, "try_repacked_gate_up_silu_rowmajor: up m mismatch");
     debug_assert_eq!(up.k, k, "try_repacked_gate_up_silu_rowmajor: up k mismatch");
+    #[allow(clippy::collapsible_if)]
     if let (Some(g_rp), Some(u_rp)) = (&gate.repacked, &up.repacked) {
-        match (&g_rp.kind, &u_rp.kind) {
-            (
-                Repacked::Q40 {
-                    packed: gp,
-                    scales: gs,
-                },
-                Repacked::Q40 {
-                    packed: up,
-                    scales: us,
-                },
-            ) => {
-                return cpu::gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
-                    gp, gs, up, us, b_scales, b_quants, out, m, n, k,
-                );
-            }
-            _ => {}
+        if let (
+            Repacked::Q40 {
+                packed: gp,
+                scales: gs,
+            },
+            Repacked::Q40 {
+                packed: up,
+                scales: us,
+            },
+        ) = (&g_rp.kind, &u_rp.kind) {
+            return cpu::gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                gp, gs, up, us, b_scales, b_quants, out, m, n, k,
+            );
         }
     }
     false
