@@ -403,6 +403,32 @@ fn set_thread_affinity(cluster_tag: i32) {
     }
 }
 
+/// RAII Guard that temporarily binds the current thread to a cluster,
+/// and restores unconstrained affinity (tag 0) on drop to prevent thread pool pollution.
+struct AffinityGuard;
+
+impl AffinityGuard {
+    fn set(cluster_tag: i32) -> Self {
+        set_thread_affinity(cluster_tag);
+        Self
+    }
+}
+
+impl Drop for AffinityGuard {
+    fn drop(&mut self) {
+        set_thread_affinity(0);
+    }
+}
+
+/// RAII Guard that resets `WORKER_STATE` to `STATE_IDLE` on drop to avoid poisoning workers on panic.
+struct AmxWorkerGuard;
+
+impl Drop for AmxWorkerGuard {
+    fn drop(&mut self) {
+        WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn init_dual_amx_pool() {
     WORKER_INIT.call_once(|| {
         std::thread::Builder::new()
@@ -479,7 +505,8 @@ pub fn sgemm_dual_parallel(
         return;
     }
 
-    set_thread_affinity(1); // Ensure caller is on Cluster 0
+    let _amx_guard = AmxWorkerGuard;
+    let _affinity_guard = AffinityGuard::set(1); // Ensure caller is on Cluster 0 during compute
 
     // Set up task for Worker 1 (AMX 1)
     unsafe {
@@ -517,11 +544,15 @@ pub fn sgemm_dual_parallel(
         );
     }
 
-    // Wait for Worker 1 to finish
+    // Wait for Worker 1 to finish with spin timeout guard
+    let mut spins = 0u64;
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
+        spins += 1;
+        if spins > 50_000_000 {
+            break;
+        }
     }
-    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
 }
 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned equally across AMX 0 (top half) and AMX 1 (bottom half).
@@ -547,7 +578,8 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         return;
     }
 
-    set_thread_affinity(1);
+    let _amx_guard = AmxWorkerGuard;
+    let _affinity_guard = AffinityGuard::set(1);
 
     let m_top = m / 2;
     let m_bot = m - m_top;
@@ -594,11 +626,15 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         );
     }
 
-    // Wait for Worker 1
+    // Wait for Worker 1 with spin timeout guard
+    let mut spins = 0u64;
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
+        spins += 1;
+        if spins > 50_000_000 {
+            break;
+        }
     }
-    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
 }
 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` partitioned across parallel worker threads.

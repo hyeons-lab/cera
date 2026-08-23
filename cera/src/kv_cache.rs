@@ -1738,25 +1738,18 @@ impl KvPrefixCache {
         #[cfg(not(feature = "disk-cache"))]
         let cold_hit: Option<(StateSnapshot, usize)> = None;
 
-        let best = match (warm_hit, cold_hit) {
-            (Some(w), Some(c)) if c.1 > w.1 => Some(c),
-            (Some(w), _) => Some(w),
-            (None, c) => c,
+        let (best, is_cold) = match (warm_hit, cold_hit) {
+            (Some(w), Some(c)) if c.1 > w.1 => (Some(c), true),
+            (Some(w), _) => (Some(w), false),
+            (None, Some(c)) => (Some(c), true),
+            (None, None) => (None, false),
         };
 
-        // If the best hit came from the cold tier, promote it to warm.
-        // The `< tokens.len()` bound matches the lookup filter above: a full-length
-        // warm entry can never be returned, so treating it as "we already have
-        // something at least as good" would block promotion forever and re-read the
-        // multi-MB cold file on every call.
-        if let Some((snapshot, len)) = &best
+        // If the best hit came from the cold tier, promote it to warm without redundant O(N) scan.
+        if is_cold
+            && let Some((snapshot, len)) = &best
             && self.config.max_warm_entries > 0
             && self.config.max_warm_bytes > 0
-            && !self.warm.values().any(|e| {
-                e.tokens.len() >= *len
-                    && e.tokens.len() < tokens.len()
-                    && tokens.starts_with(&e.tokens)
-            })
         {
             let hash = hash_tokens(&tokens[..*len]);
             let snap_bytes = snapshot.byte_size() as u64;
@@ -1811,20 +1804,17 @@ impl KvPrefixCache {
         #[cfg(not(feature = "disk-cache"))]
         let cold_anchor: Option<(StateSnapshot, usize)> = None;
 
-        let best = match (warm_anchor, cold_anchor) {
-            (Some(w), Some(c)) if c.1 > w.1 => Some(c),
-            (Some(w), _) => Some(w),
-            (None, c) => c,
+        let (best, is_cold) = match (warm_anchor, cold_anchor) {
+            (Some(w), Some(c)) if c.1 > w.1 => (Some(c), true),
+            (Some(w), _) => (Some(w), false),
+            (None, Some(c)) => (Some(c), true),
+            (None, None) => (None, false),
         };
 
-        if let Some((snapshot, len)) = &best
+        if is_cold
+            && let Some((snapshot, len)) = &best
             && self.config.max_warm_entries > 0
             && self.config.max_warm_bytes > 0
-            && !self.warm.values().any(|e| {
-                e.tokens.len() >= *len
-                    && e.tokens.len() < tokens.len()
-                    && tokens.starts_with(&e.tokens)
-            })
         {
             let hash = hash_tokens(&tokens[..*len]);
             let snap_bytes = snapshot.byte_size() as u64;
@@ -1858,6 +1848,24 @@ impl KvPrefixCache {
         self.insert(tokens, snapshot);
     }
 
+    /// Get total warm cache memory in bytes.
+    pub fn warm_bytes(&self) -> u64 {
+        self.warm_bytes
+    }
+
+    /// Number of warm entries.
+    pub fn warm_count(&self) -> usize {
+        self.warm.len()
+    }
+
+    /// Number of tagged warm semantic anchors.
+    pub fn warm_anchor_count(&self) -> usize {
+        self.warm
+            .values()
+            .filter(|e| e.snapshot.anchor_depth > 0 || e.snapshot.boundary_kind > 0)
+            .count()
+    }
+
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
     pub fn insert(&mut self, tokens: &[u32], snapshot: StateSnapshot) {
         // Skip if cache is disabled (max_warm_entries == 0 and no disk).
@@ -1889,16 +1897,6 @@ impl KvPrefixCache {
         self.warm_bytes += snap_bytes;
     }
 
-    /// Total bytes in warm tier.
-    pub fn warm_bytes(&self) -> u64 {
-        self.warm_bytes
-    }
-
-    /// Number of warm entries.
-    pub fn warm_count(&self) -> usize {
-        self.warm.len()
-    }
-
     /// Clear all warm entries from the in-memory tier (e.g. during OS memory pressure).
     pub fn clear_warm(&mut self) {
         self.warm.clear();
@@ -1927,7 +1925,9 @@ impl KvPrefixCache {
 
     fn evict_warm_if_needed(&mut self, new_bytes: u64) {
         while (self.warm.len() >= self.config.max_warm_entries
-            || self.warm_bytes + new_bytes > self.config.max_warm_bytes)
+            || self.warm_bytes + new_bytes > self.config.max_warm_bytes
+            || (self.config.max_warm_anchors > 0
+                && self.warm_anchor_count() >= self.config.max_warm_anchors))
             && !self.warm.is_empty()
         {
             let oldest = self

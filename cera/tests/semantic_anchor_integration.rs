@@ -277,3 +277,49 @@ fn cold_tier_flatbuffers_v2_and_graceful_fallback() {
     // Clean up
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_max_warm_anchors_eviction() {
+    let cfg = make_test_config(2, 64);
+    let mut cache = KvPrefixCache::new(
+        KvCacheConfig {
+            max_warm_entries: 10,
+            max_warm_anchors: 2,
+            ..KvCacheConfig::default()
+        },
+        &cfg,
+        "cpu:test_anchor_limit",
+    );
+
+    let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
+
+    // Insert 3 tagged semantic anchors
+    cache.insert_anchor(
+        &[1, 2, 3],
+        snapshot(3),
+        1,
+        SemanticBoundaryKind::Turn,
+        0x111,
+    );
+    cache.insert_anchor(
+        &[1, 2, 3, 4],
+        snapshot(4),
+        2,
+        SemanticBoundaryKind::ToolCall,
+        0x222,
+    );
+    assert_eq!(cache.warm_anchor_count(), 2);
+
+    // 3rd anchor should evict the oldest anchor to respect max_warm_anchors: 2
+    cache.insert_anchor(
+        &[1, 2, 3, 4, 5],
+        snapshot(5),
+        3,
+        SemanticBoundaryKind::Turn,
+        0x333,
+    );
+    assert!(
+        cache.warm_anchor_count() <= 2,
+        "warm_anchor_count must not exceed max_warm_anchors limit"
+    );
+}

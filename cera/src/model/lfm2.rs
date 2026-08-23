@@ -4128,6 +4128,13 @@ impl Model for Lfm2Model {
             .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
     }
 
+    fn clear_warm_cache(&self) {
+        self.prefix_cache
+            .lock()
+            .expect("prefix_cache mutex poisoned")
+            .clear_warm();
+    }
+
     fn clear_cache(&self) {
         self.prefix_cache
             .lock()

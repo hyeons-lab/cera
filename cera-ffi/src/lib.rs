@@ -1239,10 +1239,15 @@ impl CeraEngine {
             .special_token_id(fmt.call_start_marker())
     }
 
-    /// Clear the engine's KV prefix cache (both in-memory warm cache and cold disk cache).
+    /// Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
     /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
-    /// or Android `onTrimMemory`) to immediately free memory.
+    /// or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
     pub fn clear_prefix_cache(&self) {
+        self.inner.clear_warm_cache();
+    }
+
+    /// Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+    pub fn wipe_all_prefix_caches(&self) {
         self.inner.clear_cache();
     }
 }

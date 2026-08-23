@@ -504,7 +504,10 @@ pub trait Model: Send + Sync {
     /// Configure the KV prefix cache. No-op for backends without caching.
     fn configure_cache(&self, _config: crate::kv_cache::KvCacheConfig) {}
 
-    /// Clear the KV prefix cache (warm and cold tiers). No-op for backends without caching.
+    /// Clear the in-memory warm KV prefix cache (preserves cold disk tier).
+    fn clear_warm_cache(&self) {}
+
+    /// Clear the KV prefix cache (both warm and cold tiers). No-op for backends without caching.
     fn clear_cache(&self) {}
 
     /// Snapshot the current KV and conv state for prefix caching.
