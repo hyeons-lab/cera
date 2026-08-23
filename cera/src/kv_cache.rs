@@ -909,10 +909,7 @@ impl InferenceState {
                 }),
             }
         }
-        Some(StateSnapshot {
-            layers,
-            seq_len: self.seq_len,
-        })
+        Some(StateSnapshot::new(layers, self.seq_len))
     }
 
     /// Restore a previously captured `StateSnapshot` into this state's
@@ -1475,12 +1472,68 @@ mod cache_tag_tests {
 
 // ── KV Prefix Cache ─────────────────────────────────────────────────────
 
+/// Classification of semantic boundaries in agentic and multimodal workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum SemanticBoundaryKind {
+    Unspecified = 0,
+    Turn = 1,
+    ToolCall = 2,
+    ToolOutput = 3,
+    Thinking = 4,
+    ImageTokens = 5,
+    SystemPrompt = 6,
+}
+
+impl From<u8> for SemanticBoundaryKind {
+    fn from(val: u8) -> Self {
+        match val {
+            1 => Self::Turn,
+            2 => Self::ToolCall,
+            3 => Self::ToolOutput,
+            4 => Self::Thinking,
+            5 => Self::ImageTokens,
+            6 => Self::SystemPrompt,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
 /// Snapshot of model KV + conv state after prefilling a token sequence.
 /// Backend-agnostic: stores raw bytes that the backend knows how to restore.
 #[derive(Clone)]
 pub struct StateSnapshot {
     pub layers: Vec<LayerSnapshot>,
     pub seq_len: usize,
+    pub anchor_depth: u32,
+    pub boundary_kind: u8,
+    pub semantic_hash: u64,
+    pub shift_offset: u32,
+}
+
+impl StateSnapshot {
+    pub fn new(layers: Vec<LayerSnapshot>, seq_len: usize) -> Self {
+        Self {
+            layers,
+            seq_len,
+            anchor_depth: 0,
+            boundary_kind: 0,
+            semantic_hash: 0,
+            shift_offset: 0,
+        }
+    }
+
+    pub fn with_anchor(mut self, depth: u32, kind: SemanticBoundaryKind, semantic_hash: u64) -> Self {
+        self.anchor_depth = depth;
+        self.boundary_kind = kind as u8;
+        self.semantic_hash = semantic_hash;
+        self
+    }
+
+    pub fn with_shift_offset(mut self, shift: u32) -> Self {
+        self.shift_offset = shift;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -1591,6 +1644,8 @@ pub struct KvCacheConfig {
     pub max_warm_bytes: u64,
     /// Max cold-tier (disk) total size in bytes.
     pub max_cold_bytes: u64,
+    /// Max warm-tier semantic anchor snapshots retained.
+    pub max_warm_anchors: usize,
 }
 
 impl Default for KvCacheConfig {
@@ -1600,6 +1655,7 @@ impl Default for KvCacheConfig {
             max_warm_entries: 32,
             max_warm_bytes: 256 * 1024 * 1024,
             max_cold_bytes: 10 * 1024 * 1024 * 1024,
+            max_warm_anchors: 16,
         }
     }
 }
@@ -1712,6 +1768,82 @@ impl KvPrefixCache {
         }
 
         best
+    }
+
+    /// Find the deepest cached semantic anchor that is a strict prefix of `tokens`.
+    /// Semantic anchors are snapshots saved at turn, tool, or thinking boundaries.
+    /// If no anchor is tagged, falls back to [`find_longest_prefix`].
+    pub fn find_deepest_semantic_anchor(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
+        let warm_anchor = self
+            .warm
+            .values()
+            .filter(|e| {
+                e.tokens.len() < tokens.len()
+                    && tokens.starts_with(&e.tokens)
+                    && (e.snapshot.anchor_depth > 0 || e.snapshot.boundary_kind > 0)
+            })
+            .max_by_key(|e| e.tokens.len())
+            .map(|e| {
+                e.last_used.set(Instant::now());
+                (e.snapshot.clone(), e.tokens.len())
+            });
+
+        #[cfg(feature = "disk-cache")]
+        let cold_anchor = self
+            .config
+            .cache_dir
+            .clone()
+            .and_then(|dir| self.find_cold_anchor(&dir, tokens))
+            .map(|snapshot| {
+                let len = snapshot.seq_len;
+                (snapshot, len)
+            });
+        #[cfg(not(feature = "disk-cache"))]
+        let cold_anchor: Option<(StateSnapshot, usize)> = None;
+
+        let best = match (warm_anchor, cold_anchor) {
+            (Some(w), Some(c)) if c.1 > w.1 => Some(c),
+            (Some(w), _) => Some(w),
+            (None, c) => c,
+        };
+
+        if let Some((snapshot, len)) = &best
+            && !self.warm.values().any(|e| {
+                e.tokens.len() >= *len
+                    && e.tokens.len() < tokens.len()
+                    && tokens.starts_with(&e.tokens)
+            })
+        {
+            let hash = hash_tokens(&tokens[..*len]);
+            let snap_bytes = snapshot.byte_size() as u64;
+            self.evict_warm_if_needed(snap_bytes);
+            if let Some(old) = self.warm.insert(
+                hash,
+                CacheEntry {
+                    tokens: tokens[..*len].to_vec(),
+                    snapshot: snapshot.clone(),
+                    last_used: Cell::new(Instant::now()),
+                },
+            ) {
+                self.warm_bytes -= old.snapshot.byte_size() as u64;
+            }
+            self.warm_bytes += snap_bytes;
+        }
+
+        best.or_else(|| self.find_longest_prefix(tokens))
+    }
+
+    /// Cache a semantic anchor prefix's state with boundary metadata.
+    pub fn insert_anchor(
+        &mut self,
+        tokens: &[u32],
+        snapshot: StateSnapshot,
+        anchor_depth: u32,
+        boundary_kind: SemanticBoundaryKind,
+        semantic_hash: u64,
+    ) {
+        let snapshot = snapshot.with_anchor(anchor_depth, boundary_kind, semantic_hash);
+        self.insert(tokens, snapshot);
     }
 
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
@@ -1852,14 +1984,27 @@ impl KvPrefixCache {
                 seq_len: snapshot.seq_len as u32,
                 tokens: Some(tokens_vec),
                 layers: Some(layers_vec),
+                format_version: 2,
+                anchor_depth: snapshot.anchor_depth,
+                boundary_kind: snapshot.boundary_kind,
+                semantic_hash: snapshot.semantic_hash,
+                shift_offset: snapshot.shift_offset,
             },
         );
         builder.finish(entry, None);
 
         let data = builder.finished_data();
         let hash = hash_tokens(tokens);
-        let path = dir.join(self.cold_filename(hash));
-        let _ = std::fs::write(&path, data);
+        let target_path = dir.join(self.cold_filename(hash));
+        let tmp_path = dir.join(format!(
+            "{:016x}_{:016x}.kvcache.tmp.{}",
+            self.model_fingerprint,
+            hash,
+            std::process::id()
+        ));
+        if std::fs::write(&tmp_path, data).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &target_path);
+        }
 
         self.evict_cold_if_needed(dir);
     }
@@ -1893,9 +2038,32 @@ impl KvPrefixCache {
     }
 
     #[cfg(feature = "disk-cache")]
+    fn find_cold_anchor(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
+        let mut best: Option<StateSnapshot> = None;
+        for prefix_len in (1..tokens.len()).rev() {
+            let prefix = &tokens[..prefix_len];
+            let hash = hash_tokens(prefix);
+            let path = dir.join(self.cold_filename(hash));
+            if path.exists()
+                && let Some(snapshot) = self.load_cold_file(&path, tokens)
+                && (snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0)
+            {
+                best = Some(snapshot);
+                break;
+            }
+        }
+        best
+    }
+
+    #[cfg(feature = "disk-cache")]
     fn load_cold_file(&self, path: &Path, expected_prefix: &[u32]) -> Option<StateSnapshot> {
         let data = std::fs::read(path).ok()?;
         let entry = flatbuffers::root::<crate::generated::cera::cache::KvCacheEntry>(&data).ok()?;
+
+        // Validate format version: must be v2 (2). Legacy/invalid format triggers graceful cache miss.
+        if entry.format_version() != 2 {
+            return None;
+        }
 
         // Validate model fingerprint.
         if entry.model_fingerprint() != self.model_fingerprint {
@@ -1970,7 +2138,14 @@ impl KvPrefixCache {
             }
         }
 
-        Some(StateSnapshot { layers, seq_len })
+        Some(StateSnapshot {
+            layers,
+            seq_len,
+            anchor_depth: entry.anchor_depth(),
+            boundary_kind: entry.boundary_kind(),
+            semantic_hash: entry.semantic_hash(),
+            shift_offset: entry.shift_offset(),
+        })
     }
 
     #[cfg(feature = "disk-cache")]
@@ -1979,18 +2154,23 @@ impl KvPrefixCache {
             return;
         };
         let fp_prefix = format!("{:016x}_", self.model_fingerprint);
-        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
-                let name_str = name.to_string_lossy();
-                name_str.starts_with(&fp_prefix) && name_str.ends_with(".kvcache")
-            })
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                Some((e.path(), meta.len(), meta.modified().ok()?))
-            })
-            .collect();
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.contains(".kvcache.tmp.") {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+            if name_str.starts_with(&fp_prefix)
+                && name_str.ends_with(".kvcache")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+            {
+                files.push((entry.path(), meta.len(), modified));
+            }
+        }
 
         let total: u64 = files.iter().map(|(_, sz, _)| sz).sum();
         if total <= self.config.max_cold_bytes {
@@ -2106,10 +2286,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cera_cold_strict_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test");
-        let snapshot = |seq_len: usize| StateSnapshot {
-            layers: Vec::new(),
-            seq_len,
-        };
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
         let tokens = [7u32, 8, 9];
 
         // Saved at exactly the query length → unusable, must not be returned.
@@ -2154,10 +2331,7 @@ mod tests {
             &cfg,
             "test",
         );
-        let snapshot = |seq_len: usize| StateSnapshot {
-            layers: Vec::new(),
-            seq_len,
-        };
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
         let tokens = [1u32, 2, 3, 4];
 
         // Only a full-length entry exists → no usable hit.
@@ -2900,5 +3074,99 @@ mod tests {
 
         // Older positions that fell out of the ring buffer (> 64 steps old) return false
         assert!(!history.rollback_to(10, &mut restored));
+    }
+
+    #[test]
+    fn semantic_anchor_lookup_and_boundary_tags() {
+        let cfg = tiny_config(2, 8);
+        let mut cache = KvPrefixCache::new(
+            KvCacheConfig {
+                cache_dir: None,
+                ..KvCacheConfig::default()
+            },
+            &cfg,
+            "test_anchor",
+        );
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
+        let tokens = [10u32, 20, 30, 40, 50, 60, 70];
+
+        // Insert non-anchor prefix at len 5
+        cache.insert(&tokens[..5], snapshot(5));
+
+        // Insert semantic anchor at len 3 (e.g. Turn boundary)
+        cache.insert_anchor(
+            &tokens[..3],
+            snapshot(3),
+            1,
+            SemanticBoundaryKind::Turn,
+            0x12345678,
+        );
+
+        // find_deepest_semantic_anchor finds the anchor at len 3
+        let (snap, len) = cache
+            .find_deepest_semantic_anchor(&tokens)
+            .expect("must find anchor");
+        assert_eq!(len, 3);
+        assert_eq!(snap.anchor_depth, 1);
+        assert_eq!(snap.boundary_kind, SemanticBoundaryKind::Turn as u8);
+        assert_eq!(snap.semantic_hash, 0x12345678);
+
+        // Standard find_longest_prefix still prefers the longest prefix (len 5)
+        let (_, longest_len) = cache
+            .find_longest_prefix(&tokens)
+            .expect("must find longest prefix");
+        assert_eq!(longest_len, 5);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn flatbuffers_v2_disk_roundtrip_with_anchors_and_atomic_tmp() {
+        let cfg = tiny_config(2, 16);
+        let dir = std::env::temp_dir().join(format!("cera_cold_v2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test_v2");
+
+        let snap = StateSnapshot::new(
+            vec![
+                LayerSnapshot::Attention {
+                    k_data: vec![1, 2, 3, 4],
+                    v_data: vec![5, 6, 7, 8],
+                },
+                LayerSnapshot::Conv {
+                    buffer: vec![9, 10, 11, 12],
+                },
+            ],
+            4,
+        )
+        .with_anchor(2, SemanticBoundaryKind::ToolCall, 0xdeadbeef)
+        .with_shift_offset(0);
+
+        let tokens = [100u32, 101, 102, 103];
+        cache.save_cold(&dir, &tokens, &snap);
+
+        // Verify the file was written atomically and no orphan .tmp remains
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".kvcache")
+        );
+
+        // Load from disk and verify v2 schema fields
+        let loaded = cache
+            .find_cold_prefix(&dir, &[100, 101, 102, 103, 104])
+            .expect("must load v2 snapshot from disk");
+        assert_eq!(loaded.seq_len, 4);
+        assert_eq!(loaded.anchor_depth, 2);
+        assert_eq!(loaded.boundary_kind, SemanticBoundaryKind::ToolCall as u8);
+        assert_eq!(loaded.semantic_hash, 0xdeadbeef);
+        assert_eq!(loaded.shift_offset, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

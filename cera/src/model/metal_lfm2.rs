@@ -4380,7 +4380,7 @@ impl MetalLfm2Model {
             }
         }
 
-        StateSnapshot { layers, seq_len }
+        StateSnapshot::new(layers, seq_len)
     }
 
     /// Lock-free body of `Model::restore_state`. See

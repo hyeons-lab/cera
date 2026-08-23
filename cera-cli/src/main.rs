@@ -1702,6 +1702,7 @@ fn configure_prefix_cache(
             max_warm_entries: 0,
             max_warm_bytes: 0,
             max_cold_bytes: 0,
+            ..Default::default()
         });
         return;
     }
@@ -1717,6 +1718,7 @@ fn configure_prefix_cache(
         max_warm_entries: 32,
         max_warm_bytes: cache_warm_mb * 1024 * 1024,
         max_cold_bytes: cache_disk_gb * 1024 * 1024 * 1024,
+        ..Default::default()
     });
 }
 
@@ -4312,6 +4314,7 @@ fn main() -> Result<()> {
                     max_warm_entries: 0,
                     max_warm_bytes: 0,
                     max_cold_bytes: 0,
+                    ..Default::default()
                 });
             }
 
