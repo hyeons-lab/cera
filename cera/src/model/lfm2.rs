@@ -1319,6 +1319,42 @@ impl Lfm2Model {
 
         {
             let out_buf = &mut state.scratch.out[..hidden_size];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use core::arch::aarch64::*;
+                let mut ch = 0usize;
+                while ch + 3 < hidden_size {
+                    let mut vsum = vdupq_n_f32(0.0);
+                    for k in 0..d_conv {
+                        let mut vw = vdupq_n_f32(0.0);
+                        vw = vsetq_lane_f32::<0>(*conv_weight.get_unchecked(ch * kernel_size + k), vw);
+                        vw = vsetq_lane_f32::<1>(*conv_weight.get_unchecked((ch + 1) * kernel_size + k), vw);
+                        vw = vsetq_lane_f32::<2>(*conv_weight.get_unchecked((ch + 2) * kernel_size + k), vw);
+                        vw = vsetq_lane_f32::<3>(*conv_weight.get_unchecked((ch + 3) * kernel_size + k), vw);
+                        let vbuf = vld1q_f32(buffer.as_ptr().add(k * hidden_size + ch));
+                        vsum = vmlaq_f32(vsum, vbuf, vw);
+                    }
+                    let mut vw_last = vdupq_n_f32(0.0);
+                    vw_last = vsetq_lane_f32::<0>(*conv_weight.get_unchecked(ch * kernel_size + d_conv), vw_last);
+                    vw_last = vsetq_lane_f32::<1>(*conv_weight.get_unchecked((ch + 1) * kernel_size + d_conv), vw_last);
+                    vw_last = vsetq_lane_f32::<2>(*conv_weight.get_unchecked((ch + 2) * kernel_size + d_conv), vw_last);
+                    vw_last = vsetq_lane_f32::<3>(*conv_weight.get_unchecked((ch + 3) * kernel_size + d_conv), vw_last);
+                    let vcur = vld1q_f32(conv_scratch.as_ptr().add(ch));
+                    vsum = vmlaq_f32(vsum, vcur, vw_last);
+                    vst1q_f32(out_buf.as_mut_ptr().add(ch), vsum);
+                    ch += 4;
+                }
+                while ch < hidden_size {
+                    let mut sum = 0.0f32;
+                    for k in 0..d_conv {
+                        sum += buffer[k * hidden_size + ch] * conv_weight[ch * kernel_size + k];
+                    }
+                    sum += conv_scratch[ch] * conv_weight[ch * kernel_size + d_conv];
+                    out_buf[ch] = sum;
+                    ch += 1;
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             for ch in 0..hidden_size {
                 let mut sum = 0.0f32;
                 for k in 0..d_conv {
