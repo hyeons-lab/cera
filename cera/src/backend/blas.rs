@@ -544,11 +544,14 @@ pub fn sgemm_dual_parallel(
         );
     }
 
-    // Wait for Worker 1 to finish with spin timeout guard
+    // Wait for Worker 1 to finish with spin timeout and yield backoff
     let mut spins = 0u64;
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
         spins += 1;
+        if spins > 50_000 {
+            std::thread::yield_now();
+        }
         if spins > 50_000_000 {
             break;
         }
@@ -626,11 +629,14 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         );
     }
 
-    // Wait for Worker 1 with spin timeout guard
+    // Wait for Worker 1 with spin timeout and yield backoff
     let mut spins = 0u64;
     while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) != STATE_DONE {
         core::hint::spin_loop();
         spins += 1;
+        if spins > 50_000 {
+            std::thread::yield_now();
+        }
         if spins > 50_000_000 {
             break;
         }
