@@ -69,7 +69,8 @@ void moe_route(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
     }
 
     for (uint e = lid.x; e < n_expert; e += WG) {
-        float p = 1.0f / (1.0f + exp(-logits[tok * n_expert + e]));
+        float logit = clamp(logits[tok * n_expert + e], -80.0f, 80.0f);
+        float p = 1.0f / (1.0f + exp(-logit));
         sh_prob[e] = p;
         sh_score[e] = p + bias[e];
     }

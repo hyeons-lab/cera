@@ -44,5 +44,6 @@ fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = params.x;
     if i >= n { return; }
     let g = a[i];
-    a[i] = (g / (1.0 + exp(-g))) * b[i];
+    let clamped_g = clamp(g, -80.0, 80.0);
+    a[i] = (clamped_g / (1.0 + exp(-clamped_g))) * b[i];
 }

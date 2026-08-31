@@ -76,10 +76,33 @@ mod seq {
             self.chunks_mut(chunk_size)
         }
     }
+
+    /// Sequential drop-in for `rayon::iter::IntoParallelRefIterator`.
+    pub trait IntoParallelRefIterator<'data> {
+        type Item;
+        type Iter: Iterator<Item = Self::Item>;
+        fn par_iter(&'data self) -> Self::Iter;
+    }
+
+    impl<'data, T: 'data> IntoParallelRefIterator<'data> for [T] {
+        type Item = &'data T;
+        type Iter = core::slice::Iter<'data, T>;
+        fn par_iter(&'data self) -> Self::Iter {
+            self.iter()
+        }
+    }
+
+    impl<'data, T: 'data> IntoParallelRefIterator<'data> for Vec<T> {
+        type Item = &'data T;
+        type Iter = core::slice::Iter<'data, T>;
+        fn par_iter(&'data self) -> Self::Iter {
+            self.as_slice().iter()
+        }
+    }
 }
 
 #[cfg(not(feature = "parallel"))]
-pub use seq::{ParallelSlice, ParallelSliceMut};
+pub use seq::{IntoParallelRefIterator, ParallelSlice, ParallelSliceMut};
 
 // Alias rayon's iterator traits to std's `Iterator` when `parallel` is
 // off, so call-site `use crate::par::{IndexedParallelIterator, ParallelIterator}`

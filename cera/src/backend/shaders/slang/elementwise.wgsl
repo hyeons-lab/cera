@@ -52,7 +52,8 @@ fn silu_mul_inplace(@builtin(global_invocation_id) gid_3 : vec3<u32>)
     {
         return;
     }
-    a_buf_0[i_3] = a_buf_0[i_3] / (1.0f + exp(- a_buf_0[i_3])) * b_buf_0[i_3];
+    var g_0 : f32 = clamp(a_buf_0[i_3], -80.0f, 80.0f);
+    a_buf_0[i_3] = g_0 / (1.0f + exp(- g_0)) * b_buf_0[i_3];
     return;
 }
 

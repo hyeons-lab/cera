@@ -53,8 +53,8 @@ struct KernelContext_0
 #line 48
         return;
     }
-    float device* _S1 = (&kernelContext_1)->x_buf_0+i_1;
-    *((&kernelContext_1)->x_buf_0+i_1) = *_S1 / (1.0f + exp(- *_S1));
+    float v_0 = clamp(*((&kernelContext_1)->x_buf_0+i_1), -80.0f, 80.0f);
+    *((&kernelContext_1)->x_buf_0+i_1) = v_0 / (1.0f + exp(- v_0));
     return;
 }
 
@@ -77,17 +77,17 @@ struct KernelContext_0
 #line 59
         return;
     }
-    float device* _S2 = (&kernelContext_2)->x_buf_0+i_2;
+    float device* _S1 = (&kernelContext_2)->x_buf_0+i_2;
 
 #line 61
-    float v_0 = *_S2;
+    float v_1 = *_S1;
 
 
-    float a_0 = abs(*_S2 * 0.70710676908493042f);
+    float a_0 = abs(*_S1 * 0.70710676908493042f);
 
 #line 64
     float sign_0;
-    if((*_S2) < 0.0f)
+    if((*_S1) < 0.0f)
     {
 
 #line 65
@@ -106,7 +106,7 @@ struct KernelContext_0
     float t_0 = 1.0f / (1.0f + 0.32759109139442444f * a_0);
 
 #line 71
-    *((&kernelContext_2)->x_buf_0+i_2) = 0.5f * v_0 * (1.0f + sign_0 * (1.0f - ((((1.06140542030334473f * t_0 - 1.45315194129943848f) * t_0 + 1.42141366004943848f) * t_0 - 0.28449669480323792f) * t_0 + 0.25482958555221558f) * t_0 * exp(- a_0 * a_0)));
+    *((&kernelContext_2)->x_buf_0+i_2) = 0.5f * v_1 * (1.0f + sign_0 * (1.0f - ((((1.06140542030334473f * t_0 - 1.45315194129943848f) * t_0 + 1.42141366004943848f) * t_0 - 0.28449669480323792f) * t_0 + 0.25482958555221558f) * t_0 * exp(- a_0 * a_0)));
     return;
 }
 

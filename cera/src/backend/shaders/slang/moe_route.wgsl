@@ -34,7 +34,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
         {
             break;
         }
-        var p_0 : f32 = 1.0f / (1.0f + exp(- logits_0[tok_0 * n_expert_0 + e_0]));
+        var p_0 : f32 = 1.0f / (1.0f + exp(- clamp(logits_0[tok_0 * n_expert_0 + e_0], -80.0f, 80.0f)));
         sh_prob_0[e_0] = p_0;
         sh_score_0[e_0] = p_0 + bias_0[e_0];
         e_0 = e_0 + u32(32);

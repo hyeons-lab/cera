@@ -10,7 +10,7 @@ pub mod threadpool;
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(crate) mod calibrate;
 
-#[cfg(feature = "blas")]
+#[cfg(has_blas)]
 pub mod blas;
 
 #[cfg(feature = "gpu")]

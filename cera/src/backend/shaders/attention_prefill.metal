@@ -60,7 +60,7 @@ struct PrefillAttnParams {
 
 // Templated helper. HD_CONST>0 folds `hd` to a literal (Iter 5). QPT is the
 // query-block height (multiple of 8); QT=QPT/8 query-row-tiles per chunk.
-template<uint HD_CONST, uint QPT>
+template<uint HD_CONST, uint QPT, uint C_CHUNK = 64>
 inline void attention_prefill_impl(
     const device float* q_batch,
     const device half*  k_cache,
@@ -90,20 +90,20 @@ inline void attention_prefill_impl(
     const uint n_q = min(QPT, n_queries - q_base);
     const uint max_seq = start_pos + q_base + n_q;
 
+    const uint n_threads = (C_CHUNK == 32) ? 128u : 256u;
+    const uint n_sg = n_threads / 32u;
+
     // TG memory layout:
     //   q_tg    : half  [QPT × hd]
-    //   kv_tile : half  [C × hd]            (K first, overwritten by V)
-    //   scores  : float [QPT × C]
+    //   kv_tile : half  [C_CHUNK × hd]            (K first, overwritten by V)
+    //   scores  : float [QPT × C_CHUNK]
     //   out_tg  : float [QPT × hd]          (running softmax-weighted V sum)
     //   state   : float [QPT × 2]           (per-query max, sum)
     //   rescales: float [QPT]
-    // The `half*` → `float*` cast is safe because (QPT + C) * hd * 2 bytes is a
-    // multiple of 4: (QPT + C) is even (both multiples of 8) and hd is divisible
-    // by 8, so the product is a multiple of 4.
     threadgroup half*  q_tg     = (threadgroup half*)(shmem);
     threadgroup half*  kv_tile  = q_tg + QPT * hd;
-    threadgroup float* scores   = (threadgroup float*)(kv_tile + C * hd);
-    threadgroup float* out_tg   = scores + QPT * C;
+    threadgroup float* scores   = (threadgroup float*)(kv_tile + C_CHUNK * hd);
+    threadgroup float* out_tg   = scores + QPT * C_CHUNK;
     threadgroup float* state    = out_tg + QPT * hd;
     threadgroup float* rescales = state + QPT * 2;
 
@@ -111,19 +111,12 @@ inline void attention_prefill_impl(
     const uint simd_id = tid >> 5u;
 
     // --- Load Q + init output accumulators (cooperative) ---
-    //
-    // out_tg is zeroed for the full QPT × hd (not just n_q × hd): Step B's
-    // pre-rescale reads all QPT rows, threadgroup memory isn't zero on entry,
-    // and NaN × 0 = NaN would leave unused rows as NaN. q_tg for q >= n_q stays
-    // uninitialized; any garbage the scoring MMA produces on those rows is
-    // scrubbed by the softmax else-branch (writes 0 to every cell of rows
-    // q >= n_q) before the V MMA reads `scores`.
-    for (uint idx = tid; idx < n_q * hd; idx += N_THREADS) {
+    for (uint idx = tid; idx < n_q * hd; idx += n_threads) {
         uint q = idx / hd;
         uint d = idx % hd;
         q_tg[q * hd + d] = half(q_batch[(q_base + q) * params.q_stride + head * hd + d]);
     }
-    for (uint idx = tid; idx < QPT * hd; idx += N_THREADS) {
+    for (uint idx = tid; idx < QPT * hd; idx += n_threads) {
         out_tg[idx] = 0.0f;
     }
     if (tid < QPT) {
@@ -133,31 +126,22 @@ inline void attention_prefill_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Outer chunk loop (online softmax) ---
-    for (uint c0 = 0; c0 < max_seq; c0 += C) {
-        const uint c_end = min(c0 + C, max_seq);
+    for (uint c0 = 0; c0 < max_seq; c0 += C_CHUNK) {
+        const uint c_end = min(c0 + C_CHUNK, max_seq);
         const uint c_len = c_end - c0;
 
         // --- Load K tile into TG memory (cooperative, half-precision) ---
-        //
-        // MMA reads the full C×hd tile regardless of c_len, so tail rows
-        // (t >= c_len on the last chunk) must be zeroed to avoid
-        // 0 × uninitialized = NaN propagation.
-        for (uint idx = tid; idx < c_len * hd; idx += N_THREADS) {
+        for (uint idx = tid; idx < c_len * hd; idx += n_threads) {
             uint t = idx / hd;
             uint d = idx % hd;
             kv_tile[t * hd + d] = k_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
-        for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
+        for (uint idx = tid + c_len * hd; idx < C_CHUNK * hd; idx += n_threads) {
             kv_tile[idx] = 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- MMA QK scoring (all 8 SGs, QT row-tiles each) ---
-        //
-        // Score matrix [QPT × C] decomposes into QT row-tiles × 8 col-tiles.
-        // SG `simd_id` owns col-tile `simd_id` and sweeps all QT row-tiles, so
-        // one K tile load in shmem feeds every query row (that's the point of a
-        // larger QPT — the device K read is shared across QPT queries).
+        // --- MMA QK scoring (all n_sg SGs, QT row-tiles each) ---
         {
             const uint hd_tiles = hd / 8u;
             const uint t_tile = simd_id;
@@ -167,12 +151,7 @@ inline void attention_prefill_impl(
                 simdgroup_half8x8  k_mat;
 
                 for (uint d_tile = 0u; d_tile < hd_tiles; d_tile++) {
-                    // Q[q_tile*8 .. +8, d_tile*8 .. +8], stride = hd, no transpose.
                     simdgroup_load(q_mat, q_tg + q_tile * 8u * hd + d_tile * 8u, hd);
-
-                    // K with transpose=true loads K^T[d_tile*8..+8, t_tile*8..+8].
-                    // `origin` is `ulong2` per MSL's simdgroup_load signature on
-                    // this toolchain (uint2 fails compilation).
                     simdgroup_load(k_mat,
                                    kv_tile + t_tile * 8u * hd + d_tile * 8u,
                                    hd,
@@ -182,87 +161,95 @@ inline void attention_prefill_impl(
                     simdgroup_multiply_accumulate(acc, q_mat, k_mat, acc);
                 }
 
-                simdgroup_store(acc, scores + q_tile * 8u * C + t_tile * 8u, C);
+                simdgroup_store(acc, scores + q_tile * 8u * C_CHUNK + t_tile * 8u, C_CHUNK);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Scale + causal mask (per-lane fix-up of the score matrix) ---
-        //
-        // The MMA produced raw QK. Apply `* scale` and the triangular mask
-        // in one cooperative pass over n_q × c_len entries.
-        for (uint idx = tid; idx < n_q * c_len; idx += N_THREADS) {
+        // --- Scale + causal mask ---
+        for (uint idx = tid; idx < n_q * c_len; idx += n_threads) {
             uint q = idx / c_len;
             uint t = idx % c_len;
             uint seq_len_q = start_pos + q_base + q + 1;
-            float s = scores[q * C + t];
+            float s = scores[q * C_CHUNK + t];
             if (c0 + t >= seq_len_q) {
                 s = -INFINITY;
             } else {
                 s = s * scale;
             }
-            scores[q * C + t] = s;
+            scores[q * C_CHUNK + t] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- Overwrite kv_tile with V values (half-precision) ---
-        for (uint idx = tid; idx < c_len * hd; idx += N_THREADS) {
+        for (uint idx = tid; idx < c_len * hd; idx += n_threads) {
             uint t = idx / hd;
             uint d = idx % hd;
             kv_tile[t * hd + d] = v_cache[(c0 + t) * kv_dim + kv_h_off + d];
         }
-        for (uint idx = tid + c_len * hd; idx < C * hd; idx += N_THREADS) {
+        for (uint idx = tid + c_len * hd; idx < C_CHUNK * hd; idx += n_threads) {
             kv_tile[idx] = 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Per-query softmax (one SG per query, strided over QPT) ---
-        //
-        // NSG=8 simdgroups, QPT queries: SG `simd_id` handles queries
-        // {simd_id, simd_id+8, ...}. Simdgroup has 32 lanes but C=64 cells per
-        // query, so lane `l` owns cells `l` and `l + 32`; lane-local max/sum
-        // folds both cells before the cross-lane simd_max / simd_sum.
-        for (uint q = simd_id; q < QPT; q += NSG) {
+        // --- Per-query softmax ---
+        for (uint q = simd_id; q < QPT; q += n_sg) {
             if (q < n_q) {
-                const uint idx0 = simd_lane;
-                const uint idx1 = simd_lane + NW;
-
-                float s0 = (idx0 < c_len) ? scores[q * C + idx0] : -INFINITY;
-                float s1 = (idx1 < c_len) ? scores[q * C + idx1] : -INFINITY;
-
-                float chunk_max = simd_max(max(s0, s1));
-
-                float prev_max = state[q * 2 + 0];
-                float new_max = max(prev_max, chunk_max);
-                float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
-
-                float e0 = 0.0f;
-                float e1 = 0.0f;
-                if (idx0 < c_len) {
-                    e0 = exp(s0 - new_max);
-                    scores[q * C + idx0] = e0;
+                if (C_CHUNK == 32) {
+                    const uint idx0 = simd_lane;
+                    float s0 = (idx0 < c_len) ? scores[q * 32 + idx0] : -INFINITY;
+                    float chunk_max = simd_max(s0);
+                    float prev_max = state[q * 2 + 0];
+                    float new_max = max(prev_max, chunk_max);
+                    float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
+                    float e0 = (idx0 < c_len) ? exp(s0 - new_max) : 0.0f;
+                    scores[q * 32 + idx0] = e0;
+                    float chunk_sum = simd_sum(e0);
+                    if (simd_lane == 0u) {
+                        state[q * 2 + 0] = new_max;
+                        state[q * 2 + 1] = state[q * 2 + 1] * rescale + chunk_sum;
+                        rescales[q] = rescale;
+                    }
                 } else {
-                    scores[q * C + idx0] = 0.0f;
-                }
-                if (idx1 < c_len) {
-                    e1 = exp(s1 - new_max);
-                    scores[q * C + idx1] = e1;
-                } else {
-                    scores[q * C + idx1] = 0.0f;
-                }
-                float chunk_sum = simd_sum(e0 + e1);
+                    const uint idx0 = simd_lane;
+                    const uint idx1 = simd_lane + NW;
 
-                if (simd_lane == 0u) {
-                    state[q * 2 + 0] = new_max;
-                    state[q * 2 + 1] = state[q * 2 + 1] * rescale + chunk_sum;
-                    rescales[q] = rescale;
+                    float s0 = (idx0 < c_len) ? scores[q * C_CHUNK + idx0] : -INFINITY;
+                    float s1 = (idx1 < c_len) ? scores[q * C_CHUNK + idx1] : -INFINITY;
+
+                    float chunk_max = simd_max(max(s0, s1));
+
+                    float prev_max = state[q * 2 + 0];
+                    float new_max = max(prev_max, chunk_max);
+                    float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
+
+                    float e0 = 0.0f;
+                    float e1 = 0.0f;
+                    if (idx0 < c_len) {
+                        e0 = exp(s0 - new_max);
+                        scores[q * C_CHUNK + idx0] = e0;
+                    } else {
+                        scores[q * C_CHUNK + idx0] = 0.0f;
+                    }
+                    if (idx1 < c_len) {
+                        e1 = exp(s1 - new_max);
+                        scores[q * C_CHUNK + idx1] = e1;
+                    } else {
+                        scores[q * C_CHUNK + idx1] = 0.0f;
+                    }
+                    float chunk_sum = simd_sum(e0 + e1);
+
+                    if (simd_lane == 0u) {
+                        state[q * 2 + 0] = new_max;
+                        state[q * 2 + 1] = state[q * 2 + 1] * rescale + chunk_sum;
+                        rescales[q] = rescale;
+                    }
                 }
             } else {
-                // Unused query row (q >= n_q): zero both cells per lane so the
-                // scores row is fully zero (MMA then produces 0 × V = 0), and
-                // zero rescales[q] so the pre-MMA rescale of out_tg is also 0.
-                scores[q * C + simd_lane]        = 0.0f;
-                scores[q * C + simd_lane + NW]   = 0.0f;
+                scores[q * C_CHUNK + simd_lane] = 0.0f;
+                if (C_CHUNK > 32) {
+                    scores[q * C_CHUNK + simd_lane + NW] = 0.0f;
+                }
                 if (simd_lane == 0u) {
                     rescales[q] = 0.0f;
                 }
@@ -271,29 +258,23 @@ inline void attention_prefill_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- MMA V accumulation ---
-        //
-        // Pre-rescale out_tg by per-query rescales[q] (cooperative over all QPT
-        // rows), then fuse V MMA with the add via po pre-loaded with rescaled
-        // out_tg:  po_new = scores × V + po  where po = rescales[q] · out_tg
-        for (uint idx = tid; idx < QPT * hd; idx += N_THREADS) {
+        for (uint idx = tid; idx < QPT * hd; idx += n_threads) {
             uint q = idx / hd;
             out_tg[idx] = out_tg[idx] * rescales[q];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Each SG owns a dim-tile (8 output cols); round-robin across the hd/8
-        // tiles, for each of the QT query-row-tiles.
         const uint dim_tiles = hd / 8u;
-        const uint inner_tiles = C / 8u;  // C=64 → 8 MMA inner iterations
+        const uint inner_tiles = C_CHUNK / 8u;
         for (uint q_tile = 0u; q_tile < QT; q_tile++) {
-            for (uint d_off = simd_id; d_off < dim_tiles; d_off += NSG) {
+            for (uint d_off = simd_id; d_off < dim_tiles; d_off += n_sg) {
                 simdgroup_float8x8 po;
                 simdgroup_load(po, out_tg + q_tile * 8u * hd + d_off * 8u, hd);
 
                 simdgroup_float8x8 s_mat;
                 simdgroup_half8x8  v_mat;
                 for (uint t_in = 0u; t_in < inner_tiles; t_in++) {
-                    simdgroup_load(s_mat, scores + q_tile * 8u * C + t_in * 8u, C);
+                    simdgroup_load(s_mat, scores + q_tile * 8u * C_CHUNK + t_in * 8u, C_CHUNK);
                     simdgroup_load(v_mat,
                                    kv_tile + t_in * 8u * hd + d_off * 8u,
                                    hd);
@@ -308,7 +289,7 @@ inline void attention_prefill_impl(
     // --- Final normalization + write-out ---
     for (uint q = 0; q < n_q; q++) {
         float inv_sum = 1.0f / state[q * 2 + 1];
-        for (uint d = tid; d < hd; d += N_THREADS) {
+        for (uint d = tid; d < hd; d += n_threads) {
             uint out_idx = (q_base + q) * params.out_stride + head * hd + d;
             out_batch[out_idx] = out_tg[q * hd + d] * inv_sum;
         }
@@ -316,9 +297,6 @@ inline void attention_prefill_impl(
 }
 
 // === Entry points =========================================================
-//
-// Shared body; the runtime kernel (`attention_prefill`) handles any head_dim,
-// the specialized kernels constant-propagate (head_dim, QPT).
 
 kernel void attention_prefill(
     const device float* q_batch [[buffer(0)]],
@@ -330,8 +308,8 @@ kernel void attention_prefill(
     uint tid [[thread_position_in_threadgroup]],
     uint tg_idx [[threadgroup_position_in_grid]]
 ) {
-    attention_prefill_impl<0, 8>(q_batch, k_cache, v_cache, out_batch, params,
-                                 shmem, tid, tg_idx);
+    attention_prefill_impl<0, 8, 64>(q_batch, k_cache, v_cache, out_batch, params,
+                                     shmem, tid, tg_idx);
 }
 
 kernel void attention_prefill_hd64(
@@ -344,8 +322,8 @@ kernel void attention_prefill_hd64(
     uint tid [[thread_position_in_threadgroup]],
     uint tg_idx [[threadgroup_position_in_grid]]
 ) {
-    attention_prefill_impl<64, 8>(q_batch, k_cache, v_cache, out_batch, params,
-                                  shmem, tid, tg_idx);
+    attention_prefill_impl<64, 8, 64>(q_batch, k_cache, v_cache, out_batch, params,
+                                      shmem, tid, tg_idx);
 }
 
 kernel void attention_prefill_hd128(
@@ -358,8 +336,8 @@ kernel void attention_prefill_hd128(
     uint tid [[thread_position_in_threadgroup]],
     uint tg_idx [[threadgroup_position_in_grid]]
 ) {
-    attention_prefill_impl<128, 8>(q_batch, k_cache, v_cache, out_batch, params,
-                                   shmem, tid, tg_idx);
+    attention_prefill_impl<128, 8, 64>(q_batch, k_cache, v_cache, out_batch, params,
+                                       shmem, tid, tg_idx);
 }
 
 kernel void attention_prefill_hd64_q16(
@@ -372,8 +350,8 @@ kernel void attention_prefill_hd64_q16(
     uint tid [[thread_position_in_threadgroup]],
     uint tg_idx [[threadgroup_position_in_grid]]
 ) {
-    attention_prefill_impl<64, 16>(q_batch, k_cache, v_cache, out_batch, params,
-                                   shmem, tid, tg_idx);
+    attention_prefill_impl<64, 16, 64>(q_batch, k_cache, v_cache, out_batch, params,
+                                       shmem, tid, tg_idx);
 }
 
 kernel void attention_prefill_hd64_q32(
@@ -386,6 +364,20 @@ kernel void attention_prefill_hd64_q32(
     uint tid [[thread_position_in_threadgroup]],
     uint tg_idx [[threadgroup_position_in_grid]]
 ) {
-    attention_prefill_impl<64, 32>(q_batch, k_cache, v_cache, out_batch, params,
-                                   shmem, tid, tg_idx);
+    attention_prefill_impl<64, 32, 64>(q_batch, k_cache, v_cache, out_batch, params,
+                                       shmem, tid, tg_idx);
+}
+
+kernel void attention_prefill_hd128_q16(
+    const device float* q_batch [[buffer(0)]],
+    const device half*  k_cache [[buffer(1)]],
+    const device half*  v_cache [[buffer(2)]],
+    device float* out_batch [[buffer(3)]],
+    constant PrefillAttnParams& params [[buffer(4)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tg_idx [[threadgroup_position_in_grid]]
+) {
+    attention_prefill_impl<128, 16, 32>(q_batch, k_cache, v_cache, out_batch, params,
+                                        shmem, tid, tg_idx);
 }

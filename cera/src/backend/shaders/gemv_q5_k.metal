@@ -222,3 +222,188 @@ kernel void gemv_q5_k_accum(
         }
     }
 }
+
+static inline void gemv_q5_k_compute_dual(
+    const device uchar* a_gate,
+    const device uchar* a_up,
+    const device float* x,
+    constant Params& params,
+    uint tiisg, uint sgitg, uint tg_id,
+    thread uint& first_row,
+    thread float* totals_g,
+    thread float* totals_u
+) {
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    const uint nb = params.k / QK_K;
+    const uint row_bytes = nb * Q5K_BYTES;
+    first_row = (tg_id * NSG + sgitg) * NR;
+
+    if (params.m == 0u) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < NR; r++) {
+            totals_g[r] = 0.0f;
+            totals_u[r] = 0.0f;
+        }
+        return;
+    }
+
+    device const uchar* row_base_g[NR];
+    device const uchar* row_base_u[NR];
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < NR; r++) {
+        uint safe_row = min(first_row + r, params.m - 1u);
+        row_base_g[r] = a_gate + safe_row * row_bytes;
+        row_base_u[r] = a_up   + safe_row * row_bytes;
+    }
+
+    const uint tid = tiisg / 4u;
+    const uint ix  = tiisg % 4u;
+    const uint iq  = tid / 4u;
+    const uint ir  = tid % 4u;
+
+    const uint l0 = 8u * ir;
+    const uint q_offset = 32u * iq + l0;
+    const uint y_offset = 64u * iq + l0;
+
+    const uchar hm1 = uchar(1u << (2u * iq));
+    const uchar hm2 = uchar(hm1 << 1);
+    const uchar hm3 = uchar(hm1 << 4);
+    const uchar hm4 = uchar(hm2 << 4);
+
+    float yl[16];
+    float yh[16];
+    float sumf_g[NR] = {0.0f, 0.0f};
+    float sumf_u[NR] = {0.0f, 0.0f};
+
+    uint16_t sc16[4];
+    thread const uint8_t* sc8 = (thread const uint8_t*)sc16;
+
+    const device float* y1 = x + ix * QK_K + y_offset;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        const device float* y2 = y1 + 128;
+        float4 sumy = float4(0.0f);
+        #pragma clang loop unroll(full)
+        for (uint l = 0; l < 8u; l++) {
+            yl[l + 0u] = y1[l +  0]; sumy[0] += yl[l + 0u];
+            yl[l + 8u] = y1[l + 32]; sumy[1] += yl[l + 8u];
+            yh[l + 0u] = y2[l +  0]; sumy[2] += yh[l + 0u];
+            yh[l + 8u] = y2[l + 32]; sumy[3] += yh[l + 8u];
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint row = 0; row < NR; row++) {
+            // Gate
+            {
+                device const uchar* blk = row_base_g[row] + ib * Q5K_BYTES;
+                device const half* dh = (device const half*)(blk);
+                device const uint16_t* sc = (device const uint16_t*)(blk + 4u) + iq;
+                device const uchar* qh = blk + 16u + l0;
+                device const uchar* q1 = blk + 48u + q_offset;
+                device const uchar* q2 = q1 + 64u;
+
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+                float4 acc1 = float4(0.0f);
+                float4 acc2 = float4(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint l = 0; l < 8u; l++) {
+                    uchar h = qh[l];
+                    acc1[0] += yl[l + 0u] * float(q1[l] & 0x0Fu);
+                    acc1[1] += yl[l + 8u] * float(q1[l] & 0xF0u);
+                    acc1[2] += yh[l + 0u] * float(q2[l] & 0x0Fu);
+                    acc1[3] += yh[l + 8u] * float(q2[l] & 0xF0u);
+                    acc2[0] += (h & hm1) ? yl[l + 0u] : 0.0f;
+                    acc2[1] += (h & hm2) ? yl[l + 8u] : 0.0f;
+                    acc2[2] += (h & hm3) ? yh[l + 0u] : 0.0f;
+                    acc2[3] += (h & hm4) ? yh[l + 8u] : 0.0f;
+                }
+
+                sumf_g[row] +=
+                    float(dh[0]) * (sc8[0] * (acc1[0]          + 16.0f * acc2[0])
+                                  + sc8[1] * (acc1[1] / 16.0f  + 16.0f * acc2[1])
+                                  + sc8[4] * (acc1[2]          + 16.0f * acc2[2])
+                                  + sc8[5] * (acc1[3] / 16.0f  + 16.0f * acc2[3]))
+                  - float(dh[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
+                                  + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+
+            // Up
+            {
+                device const uchar* blk = row_base_u[row] + ib * Q5K_BYTES;
+                device const half* dh = (device const half*)(blk);
+                device const uint16_t* sc = (device const uint16_t*)(blk + 4u) + iq;
+                device const uchar* qh = blk + 16u + l0;
+                device const uchar* q1 = blk + 48u + q_offset;
+                device const uchar* q2 = q1 + 64u;
+
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+                float4 acc1 = float4(0.0f);
+                float4 acc2 = float4(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint l = 0; l < 8u; l++) {
+                    uchar h = qh[l];
+                    acc1[0] += yl[l + 0u] * float(q1[l] & 0x0Fu);
+                    acc1[1] += yl[l + 8u] * float(q1[l] & 0xF0u);
+                    acc1[2] += yh[l + 0u] * float(q2[l] & 0x0Fu);
+                    acc1[3] += yh[l + 8u] * float(q2[l] & 0xF0u);
+                    acc2[0] += (h & hm1) ? yl[l + 0u] : 0.0f;
+                    acc2[1] += (h & hm2) ? yl[l + 8u] : 0.0f;
+                    acc2[2] += (h & hm3) ? yh[l + 0u] : 0.0f;
+                    acc2[3] += (h & hm4) ? yh[l + 8u] : 0.0f;
+                }
+
+                sumf_u[row] +=
+                    float(dh[0]) * (sc8[0] * (acc1[0]          + 16.0f * acc2[0])
+                                  + sc8[1] * (acc1[1] / 16.0f  + 16.0f * acc2[1])
+                                  + sc8[4] * (acc1[2]          + 16.0f * acc2[2])
+                                  + sc8[5] * (acc1[3] / 16.0f  + 16.0f * acc2[3]))
+                  - float(dh[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
+                                  + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+        }
+
+        y1 += 4u * QK_K;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < NR; row++) {
+        totals_g[row] = simd_sum(sumf_g[row]);
+        totals_u[row] = simd_sum(sumf_u[row]);
+    }
+}
+
+kernel void gemv_q5_k_gate_up(
+    const device uchar* a_gate [[buffer(0)]],
+    const device uchar* a_up [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* y_gate [[buffer(3)]],
+    device float* y_up [[buffer(4)]],
+    constant Params& params [[buffer(5)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals_g[NR];
+    float totals_u[NR];
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q5_k_compute_dual(a_gate, a_up, x, params, tiisg, sgitg, tgi, first_row, totals_g, totals_u);
+    #pragma clang loop unroll(full)
+    for (uint row = 0; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y_gate[first_row + row] = totals_g[row];
+            y_up[first_row + row]   = totals_u[row];
+        }
+    }
+}

@@ -38,9 +38,14 @@ use crate::turboquant::describe_kv_mode;
 /// tile utilization drops below 50% and batch GEMV wins.
 const GEMM_MIN_N: u32 = 16;
 
-/// Maximum tokens for batched prefill. Larger prompts fall back to sequential.
-/// Determines batch buffer allocation: 5 buffers × O(hs × cap) floats.
-const MAX_PREFILL_TOKENS: usize = 512;
+/// Maximum tokens for batched prefill in a single command buffer pass (2048 tokens).
+/// Determines batch activation buffer allocation: 5 buffers × O(hs × cap) floats (~200MB worst-case).
+const MAX_PREFILL_TOKENS: usize = 2048;
+
+/// Maximum token batch size for full-vocabulary all-logits speculative verification.
+/// Decoupled from MAX_PREFILL_TOKENS so prefill activation chunking can grow to 2048
+/// without multiplying the 151k-entry vocabulary table into gigabytes of memory.
+const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
 /// A weight matrix on GPU — references the shared mmap buffer via byte offset.
 struct MetalWeight {
@@ -272,12 +277,14 @@ struct MetalPipelines {
     gemv_q4_0_fast: ComputePipelineState,
     #[allow(dead_code)]
     gemv_f16: ComputePipelineState,
-    gemv_q6_k: ComputePipelineState,
-    gemv_q6_k_accum: ComputePipelineState,
     gemv_q4_k: ComputePipelineState,
     gemv_q4_k_accum: ComputePipelineState,
     gemv_q5_k: ComputePipelineState,
     gemv_q5_k_accum: ComputePipelineState,
+    gemv_q5_k_gate_up: ComputePipelineState,
+    gemv_q6_k: ComputePipelineState,
+    gemv_q6_k_accum: ComputePipelineState,
+    gemv_q6_k_gate_up: ComputePipelineState,
     gemv_q8_0: ComputePipelineState,
     gemv_q8_0_accum: ComputePipelineState,
     gemv_q8_0_batch: ComputePipelineState,
@@ -290,6 +297,7 @@ struct MetalPipelines {
     #[allow(dead_code)]
     gemv_q4_0_gate_up: ComputePipelineState,
     gemv_q4_0_fast_slim_gate_up: ComputePipelineState,
+    ffn_swiglu_q4_0: ComputePipelineState,
     gemv_q4_0_fast_slim_qkv: ComputePipelineState,
     #[allow(dead_code)]
     gemv_q4_0_fast_slim2_gate_up: ComputePipelineState,
@@ -369,6 +377,7 @@ struct MetalPipelines {
     /// `prefill_qpt` (env `CERA_ATTN_QPT`) in `encode_attention_prefill_batch`.
     attention_prefill_hd64_q16: ComputePipelineState,
     attention_prefill_hd64_q32: ComputePipelineState,
+    attention_prefill_hd128_q16: ComputePipelineState,
     qk_norm_rope_batch: ComputePipelineState,
     conv1d_fused_batch: ComputePipelineState,
     kv_shift_k_to_scratch: ComputePipelineState,
@@ -503,10 +512,11 @@ pub struct MetalLfm2Model {
     conv_gate_buf: Buffer,
     /// Pre-allocated batch buffers for prefill. Sized for max_seq_len tokens.
     prefill_batch_buf: Buffer, // [hs × max_seq_len] hidden states
-    prefill_normed_buf: Buffer, // [hs × max_seq_len] normed states
-    prefill_proj_buf: Buffer,   // [max(3*hs, hs+2*kv) × max_seq_len] projections
-    prefill_gate_buf: Buffer,   // [is × max_seq_len] FFN gate
-    prefill_up_buf: Buffer,     // [is × max_seq_len] FFN up
+    prefill_normed_buf: Buffer,     // [hs × max_seq_len] normed states
+    prefill_proj_buf: Buffer,       // [max(3*hs, hs+2*kv) × max_seq_len] projections
+    prefill_gate_buf: Buffer,       // [is × max_seq_len] FFN gate
+    prefill_up_buf: Buffer,         // [is × max_seq_len] FFN up
+    prefill_all_logits_buf: Buffer, // [vocab × max_seq_len] logits for speculative verification
     /// Scratch buffer for the n_keep KV shift. Sized for the
     /// largest single-layer K (or V) cache in f16 — same shape as
     /// any one entry in `MetalState::kv_caches`. The shift kernel
@@ -693,12 +703,14 @@ impl MetalLfm2Model {
             gemv_q4_1_accum: ctx.create_pipeline(shaders::GEMV_Q4_1, "gemv_q4_1_accum")?,
             gemv_q4_0_fast: ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast")?,
             gemv_f16: ctx.create_pipeline(shaders::GEMV_F16, "gemv_f16")?,
-            gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
-            gemv_q6_k_accum: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k_accum")?,
             gemv_q4_k: ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k")?,
             gemv_q4_k_accum: ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k_accum")?,
             gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k")?,
             gemv_q5_k_accum: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k_accum")?,
+            gemv_q5_k_gate_up: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k_gate_up")?,
+            gemv_q6_k: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k")?,
+            gemv_q6_k_accum: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k_accum")?,
+            gemv_q6_k_gate_up: ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k_gate_up")?,
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0")?,
             gemv_q8_0_accum: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0_accum")?,
             gemv_q8_0_batch: ctx.create_pipeline(shaders::GEMV_Q8_0_BATCH, "gemv_q8_0_batch")?,
@@ -717,6 +729,7 @@ impl MetalLfm2Model {
             gemv_q4_0_gate_up: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0_gate_up")?,
             gemv_q4_0_fast_slim_gate_up: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_gate_up")?,
+            ffn_swiglu_q4_0: ctx.create_pipeline(shaders::FFN_SWIGLU_Q4_0, "ffn_swiglu_q4_0")?,
             gemv_q4_0_fast_slim_qkv: ctx
                 .create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast_slim_qkv")?,
             gemv_q4_0_fast_slim2_gate_up: ctx
@@ -772,6 +785,8 @@ impl MetalLfm2Model {
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64_q16")?,
             attention_prefill_hd64_q32: ctx
                 .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd64_q32")?,
+            attention_prefill_hd128_q16: ctx
+                .create_pipeline(shaders::ATTENTION_PREFILL, "attention_prefill_hd128_q16")?,
             qk_norm_rope_batch: ctx
                 .create_pipeline(shaders::QK_NORM_ROPE_BATCH, "qk_norm_rope_batch")?,
             conv1d_fused_batch: ctx
@@ -850,7 +865,7 @@ impl MetalLfm2Model {
         // file offset (data_offset + raw), so it maps directly onto `mmap_buf`
         // (which wraps the whole file). `None` ⇒ tied embeddings.
         let (output_offset, output_dtype) = match src.output_ref() {
-            Some(wref) => (Some(wref.start as u64), wref.dtype),
+            Some(wref) => (Some(wref.start), wref.dtype),
             None => (None, embedding_dtype),
         };
         // `encode_gemv_output` has F32 / Q4_0 / Q8_0 / Q6_K / Q4_K / Q5_K
@@ -923,7 +938,7 @@ impl MetalLfm2Model {
                 wref.dtype.block_size(),
             );
             // Use byte offset into the shared mmap buffer instead of copying.
-            let mmap_offset = wref.start as u64;
+            let mmap_offset = wref.start;
             let params_buf =
                 ctx.upload_bytes(bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]));
             Ok(MetalWeight {
@@ -946,6 +961,7 @@ impl MetalLfm2Model {
         // `forward_prefill` recomputes the same expression against
         // `self.state.max_seq_len`, which is initialized from this same local.
         let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+        let max_all_logits = max_seq_len.min(MAX_ALL_LOGITS_TOKENS);
 
         // Routed-FFN scratch: one allocation for the whole model, shared by
         // every routed layer, so decode reuses it as the n = 1 case rather than
@@ -1220,6 +1236,7 @@ impl MetalLfm2Model {
             prefill_proj_buf: make_buf(prefill_proj_cols * max_pref),
             prefill_gate_buf: make_buf(prefill_gate_cols * max_pref),
             prefill_up_buf: make_buf(prefill_gate_cols * max_pref),
+            prefill_all_logits_buf: make_buf(config.vocab_size * max_all_logits),
             // Sized for the largest f16 K (or V) cache slice we'd
             // ever shift — one full attention layer's worth at the
             // model's clamped max_seq_len. f16 = 2 bytes/elt.
@@ -1494,7 +1511,7 @@ struct LoraGuard<'a>(&'a Mutex<Option<Arc<MetalLoraAdapter>>>);
 
 impl Drop for LoraGuard<'_> {
     fn drop(&mut self) {
-        *self.0.lock().expect("active_lora poisoned") = None;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -1585,7 +1602,7 @@ impl MetalLfm2Model {
             ok
         });
         let resolved = usable.map(|adapter| {
-            let mut lru = self.lora_lru.lock().expect("lora_lru poisoned");
+            let mut lru = self.lora_lru.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pos) = lru.iter().position(|(cpu, _)| Arc::ptr_eq(cpu, adapter)) {
                 // Hit: mark most-recently-used by moving the entry to the end
                 // (the vec is ordered least- → most-recently-used).
@@ -1606,7 +1623,7 @@ impl MetalLfm2Model {
                 gpu
             }
         });
-        *self.active_lora.lock().expect("active_lora poisoned") = resolved;
+        *self.active_lora.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
         LoraGuard(&self.active_lora)
     }
 
@@ -2163,6 +2180,102 @@ impl MetalLfm2Model {
         enc.dispatch_thread_groups(grid, sz1d(32));
     }
 
+    fn encode_gemv_q5_k_gate_up(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        y_gate: &Buffer,
+        y_up: &Buffer,
+    ) {
+        debug_assert_eq!(w_gate.dtype, DType::Q5KM);
+        debug_assert_eq!(w_up.dtype, DType::Q5KM);
+        debug_assert_eq!(w_gate.m, w_up.m);
+        debug_assert_eq!(w_gate.k, w_up.k);
+        let m = w_gate.m;
+        let tg_count = m.div_ceil(4);
+        let grid = sz2d(tg_count.min(65535) as u64, tg_count.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q5_k_gate_up);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y_gate), 0);
+        enc.set_buffer(4, Some(y_up), 0);
+        enc.set_buffer(5, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(64));
+    }
+
+    fn encode_gemv_q6_k_gate_up(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        y_gate: &Buffer,
+        y_up: &Buffer,
+    ) {
+        debug_assert_eq!(w_gate.dtype, DType::Q6K);
+        debug_assert_eq!(w_up.dtype, DType::Q6K);
+        debug_assert_eq!(w_gate.m, w_up.m);
+        debug_assert_eq!(w_gate.k, w_up.k);
+        let m = w_gate.m;
+        let tg_count = m.div_ceil(4);
+        let grid = sz2d(tg_count.min(65535) as u64, tg_count.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k_gate_up);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y_gate), 0);
+        enc.set_buffer(4, Some(y_up), 0);
+        enc.set_buffer(5, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(64));
+    }
+
+    fn encode_gate_up_dispatch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        y_gate: &Buffer,
+        y_up: &Buffer,
+    ) {
+        if w_gate.dtype == DType::Q4_0 && w_up.dtype == DType::Q4_0 {
+            self.encode_gemv_gate_up(enc, w_gate, w_up, x, y_gate, y_up);
+        } else if w_gate.dtype == DType::Q5KM && w_up.dtype == DType::Q5KM {
+            self.encode_gemv_q5_k_gate_up(enc, w_gate, w_up, x, y_gate, y_up);
+        } else if w_gate.dtype == DType::Q6K && w_up.dtype == DType::Q6K {
+            self.encode_gemv_q6_k_gate_up(enc, w_gate, w_up, x, y_gate, y_up);
+        } else {
+            self.encode_gemv_weight(enc, w_gate, x, y_gate);
+            self.encode_gemv_weight(enc, w_up, x, y_up);
+        }
+    }
+
+    /// Fused Q4_0 SwiGLU FFN: y_gate = silu(W_gate × x) * (W_up × x) in ONE single pass!
+    fn encode_gemv_swiglu(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        w_gate: &MetalWeight,
+        w_up: &MetalWeight,
+        x: &Buffer,
+        y: &Buffer,
+    ) {
+        debug_assert_eq!(w_gate.dtype, DType::Q4_0);
+        debug_assert_eq!(w_up.dtype, DType::Q4_0);
+        let m = w_gate.m;
+        let wg_count = m.div_ceil(4);
+        let grid = sz2d(wg_count.min(65535) as u64, wg_count.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(&self.pipelines.ffn_swiglu_q4_0);
+        enc.set_buffer(0, Some(&self.mmap_buf), w_gate.mmap_offset);
+        enc.set_buffer(1, Some(&self.mmap_buf), w_up.mmap_offset);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_buffer(4, Some(&w_gate.params_buf), 0);
+        enc.dispatch_thread_groups(grid, sz1d(32));
+    }
+
     /// Fused Q/K/V GEMV: y_q = W_q × x, y_k = W_k × x, y_v = W_v × x in
     /// one dispatch. Unlike gate_up, Q has m_q rows while K/V each have
     /// m_kv (≤ m_q under GQA). Replaces three `encode_gemv_weight` calls
@@ -2496,6 +2609,17 @@ impl MetalLfm2Model {
         input: &Buffer,
         output: &Buffer,
     ) {
+        self.encode_gemv_output_offset(enc, input, 0, output, 0);
+    }
+
+    fn encode_gemv_output_offset(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        input: &Buffer,
+        input_offset: u64,
+        output: &Buffer,
+        output_offset: u64,
+    ) {
         let m = self.config.vocab_size as u32;
         // Untied models project through `output.weight` (its own mmap offset +
         // dtype); tied models reuse the embedding table. Both have shape
@@ -2504,109 +2628,49 @@ impl MetalLfm2Model {
             Some(off) => (off, self.output_dtype),
             None => (self.embedding_offset, self.embedding_dtype),
         };
-        match weight_dtype {
-            DType::Q6K => {
-                // Q6_K: 4 rows/TG, 64 threads (2 simdgroups × 2 rows).
-                let groups = m.div_ceil(4);
-                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_q6_k);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(64));
-            }
-            DType::Q8_0 => {
-                // Q8_0: 2 rows/TG, 32 threads.
-                let groups = m.div_ceil(2);
-                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_q8_0);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(32));
-            }
-            DType::Q4_0 => {
-                // Q4_0: 2 rows/TG, 32 threads — same dispatch geometry as the base
-                // `gemv_q4_0` layer-weight path and the Q8_0 arm above.
-                let groups = m.div_ceil(2);
-                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_0);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(32));
-            }
-            DType::Q4KM => {
-                // Q4_K: 4 rows/TG, 64 threads (NR=2 × NSG=2) — same geometry as the
-                // layer-weight `gemv_q4_k` path. Both dispatch sites must match the
-                // kernel's simdgroup layout; a 32-thread launch here would leave
-                // `sgitg`/half the rows uncomputed and corrupt the logits.
-                let groups = m.div_ceil(4);
-                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_q4_k);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(64));
-            }
-            DType::Q5KM => {
-                // Q5_K: 4 rows/TG, 64 threads, matching the layer-weight
-                // `gemv_q5_k` path. This is the second dispatch site, and the
-                // one the Q4_K port nearly shipped without updating: a geometry
-                // change has to land on both or the logit head silently reads
-                // the wrong rows.
-                let groups = m.div_ceil(4);
-                let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_q5_k);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(64));
-            }
-            DType::F32 => {
-                let grid = sz2d(m.min(65535) as u64, m.div_ceil(65535) as u64);
-                enc.set_compute_pipeline_state(&self.pipelines.gemv_f32);
-                enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
-                enc.set_buffer(1, Some(input), 0);
-                enc.set_buffer(2, Some(output), 0);
-                enc.set_buffer(3, Some(&self.params.gemv_output), 0);
-                enc.dispatch_thread_groups(grid, sz1d(32));
-            }
+        let (pipeline, rows_per_tg, tg_threads) = match weight_dtype {
+            DType::Q6K => (&self.pipelines.gemv_q6_k, 4, 64),
+            DType::Q8_0 => (&self.pipelines.gemv_q8_0, 2, 32),
+            DType::Q4_0 => (&self.pipelines.gemv_q4_0, 2, 32),
+            DType::Q4KM => (&self.pipelines.gemv_q4_k, 4, 64),
+            DType::Q5KM => (&self.pipelines.gemv_q5_k, 4, 64),
+            DType::F32 => (&self.pipelines.gemv_f32, 1, 32),
             // Unreachable: `from_weight_source` rejects any other output dtype at
             // load (only F32/Q4_0/Q8_0/Q6_K/Q4_K/Q5_K have a logit-GEMV kernel).
-            // Panic loudly
-            // rather than silently misreading quantized bytes as f32 if that guard
-            // ever regresses.
             other => unreachable!(
                 "encode_gemv_output reached with unsupported dtype {other:?} — \
                  should have been rejected at load by from_weight_source"
             ),
-        }
+        };
+        let groups = m.div_ceil(rows_per_tg);
+        let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(&self.mmap_buf), weight_offset);
+        enc.set_buffer(1, Some(input), input_offset);
+        enc.set_buffer(2, Some(output), output_offset);
+        enc.set_buffer(3, Some(&self.params.gemv_output), 0);
+        enc.dispatch_thread_groups(grid, sz1d(tg_threads));
 
         // Granite logit-scale divide: multiply logits by 1/logit_scale. Identity
         // (None) for every other arch, so the logits are left untouched. A
         // positive scale never changes argmax, so the greedy path is unaffected;
         // this keeps the returned logit *values* correct.
         if let Some(recip) = self.logit_scale_recip {
-            self.encode_scale_f32(enc, output, m, recip);
+            self.encode_scale_f32_offset(enc, output, output_offset, m, recip);
         }
     }
 
-    /// In-place logit scale: `a[i] *= scale` over `n` elements (Granite).
-    fn encode_scale_f32(
+    /// In-place logit scale: `a[i] *= scale` over `n` elements (Granite) with buffer offset.
+    fn encode_scale_f32_offset(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         a: &Buffer,
+        offset: u64,
         n: u32,
         scale: f32,
     ) {
         enc.set_compute_pipeline_state(&self.pipelines.scale_f32);
-        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(0, Some(a), offset);
         let params = ScaleParams {
             n,
             scale_bits: scale.to_bits(),
@@ -3533,15 +3597,20 @@ impl MetalLfm2Model {
         // hd=128's QPT=16 needs 32.2 KB shmem, over M1's 32 KB cap. (hd=128 at
         // the forced QPT=8 already needs 24.1 KB, so hd=128 prefill requires
         // Apple GPU family 4+ regardless — unchanged, pre-existing; only the
-        // hd=64 block size is device-clamped, since 8/16/32 straddle the 16 KB
-        // family-≤3 limit.)
-        let qpt: u32 = if head_dim == 64 { self.prefill_qpt } else { 8 };
-        let pipeline = match (head_dim, qpt) {
-            (64, 16) => &self.pipelines.attention_prefill_hd64_q16,
-            (64, 32) => &self.pipelines.attention_prefill_hd64_q32,
-            (64, _) => &self.pipelines.attention_prefill_hd64,
-            (128, _) => &self.pipelines.attention_prefill_hd128,
-            _ => &self.pipelines.attention_prefill,
+        let qpt: u32 = if head_dim == 64 {
+            self.prefill_qpt
+        } else if head_dim == 128 && self.prefill_qpt >= 16 {
+            16
+        } else {
+            8
+        };
+        let (pipeline, c_chunk, num_threads) = match (head_dim, qpt) {
+            (64, 16) => (&self.pipelines.attention_prefill_hd64_q16, 64usize, 256u64),
+            (64, 32) => (&self.pipelines.attention_prefill_hd64_q32, 64usize, 256u64),
+            (64, _) => (&self.pipelines.attention_prefill_hd64, 64usize, 256u64),
+            (128, 16) => (&self.pipelines.attention_prefill_hd128_q16, 32usize, 128u64),
+            (128, _) => (&self.pipelines.attention_prefill_hd128, 64usize, 256u64),
+            _ => (&self.pipelines.attention_prefill, 64usize, 256u64),
         };
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(q_buf), 0);
@@ -3549,35 +3618,116 @@ impl MetalLfm2Model {
         enc.set_buffer(2, Some(v_cache), 0);
         enc.set_buffer(3, Some(out_buf), 0);
         params.set(enc, 4);
-        // Dynamic threadgroup memory — must match attention_prefill.metal's
-        // layout exactly (query block = QPT, C=64).
-        //
-        // Mixed precision: q_tg and kv_tile are `half` (2 bytes/elem),
-        // everything else is `float` (4 bytes/elem).
-        //   q_tg    : half  [QPT × hd]
-        //   kv_tile : half  [C × hd]
-        //   scores  : float [QPT × C]
-        //   out_tg  : float [QPT × hd]
-        //   state   : float [QPT × 2]
-        //   rescales: float [QPT]
-        // Totals (hd=64): 13.1 KB @ QPT=8 (2 TGs/SM), 18.2 KB @ QPT=16,
-        // 28.4 KB @ QPT=32 (1 TG/SM); hd=128 @ QPT=8 = 24.1 KB. All ≤ 32 KB.
+
         let hd_val = head_dim as usize;
         let qpt_val = qpt as usize;
-        let half_bytes = 2 * qpt_val * hd_val   // q_tg (fp16)
-            + 2 * 64 * hd_val; // kv_tile (fp16, C=64)
-        let float_bytes = 4 * qpt_val * 64      // scores
-            + 4 * qpt_val * hd_val              // out_tg
-            + 4 * qpt_val * 2                   // state
-            + 4 * qpt_val; // rescales
+        let half_bytes = 2 * qpt_val * hd_val + 2 * c_chunk * hd_val;
+        let float_bytes =
+            4 * qpt_val * c_chunk + 4 * qpt_val * hd_val + 4 * qpt_val * 2 + 4 * qpt_val;
         let smem_bytes = half_bytes + float_bytes;
         enc.set_threadgroup_memory_length(0, smem_bytes as u64);
         let n_tgs = n.div_ceil(qpt) * n_heads;
-        enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(256));
+        enc.dispatch_thread_groups(sz1d(n_tgs as u64), sz1d(num_threads));
+    }
+
+    pub(crate) fn forward_inner(
+        &self,
+        tokens: &[u32],
+        _pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+
+        assert!(
+            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
+            "Metal seq_len {} exceeds max_seq_len {}",
+            self.state.seq_len.load(Ordering::Relaxed),
+            self.state.max_seq_len,
+        );
+
+        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
+            self.dequant_embedding_row(token_id, dst);
+        }
+
+        let pos = self.state.seq_len.load(Ordering::Relaxed);
+
+        let lora_active = self
+            .active_lora
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+
+        if !lora_active && let Some(timer) = &self.profile_timer {
+            self.encode_layers_profiled(pos, timer);
+            self.profile_segment(timer, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else if !lora_active && let Some(timer) = &self.gpu_timer {
+            timer.next_idx.store(0, Ordering::Relaxed);
+            timer.labels.lock().expect("timer mutex poisoned").clear();
+            let cb = self.ctx.queue.new_command_buffer();
+            self.encode_layers_gpu_timed(cb, pos, timer);
+            self.gpu_sampled_pass(timer, cb, "out", |enc| {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            });
+            cb.commit();
+            cb.wait_until_completed();
+            self.gpu_timer_resolve(timer);
+            timer.bump_token();
+            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
+                timer.print();
+            }
+        } else {
+            let cb = self.ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_layers(enc, pos);
+            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // Update state + read back logits (unified memory zero-copy)
+        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
+        state.seq_len += 1;
+        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
     }
 }
 
 impl Model for MetalLfm2Model {
+    fn supports_all_logits(&self) -> bool {
+        true
+    }
+
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
+        self.forward_prefill_logits_all_inner(tokens, start_pos, state)
+    }
+
+    fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.state.seq_len.store(len, Ordering::Relaxed);
+        state.seq_len = len;
+    }
+
     fn supports_hidden_states(&self) -> bool {
         true
     }
@@ -3590,7 +3740,7 @@ impl Model for MetalLfm2Model {
     /// model, not the caller's `InferenceState`. Positions run `0..n`, so the
     /// attention window and RoPE come purely from the loop index.
     fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Stage the caller's adapter for the per-token layer encoders; the guard
         // clears it on the way out.
         let _lora_guard = self.resolve_lora(state);
@@ -3661,87 +3811,9 @@ impl Model for MetalLfm2Model {
     }
 
     fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        assert_eq!(tokens.len(), 1, "Metal forward expects single token");
-        let token_id = tokens[0] as usize;
-        let cfg = &self.config;
-        let hs = cfg.hidden_size;
-
-        assert!(
-            self.state.seq_len.load(Ordering::Relaxed) < self.state.max_seq_len,
-            "Metal seq_len {} exceeds max_seq_len {}",
-            self.state.seq_len.load(Ordering::Relaxed),
-            self.state.max_seq_len,
-        );
-
-        // 1. Dequantize embedding row from Q6_K into hidden_buf (unified memory).
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(self.hidden_buf.contents() as *mut f32, hs);
-            self.dequant_embedding_row(token_id, dst);
-        }
-
-        let pos = self.state.seq_len.load(Ordering::Relaxed);
-
-        // The per-category profiling paths re-implement the layer loop and don't
-        // run the LoRA hooks, so an active adapter forces the normal (hooked)
-        // `encode_layers` path — profiling + LoRA yields correct (adapted) output
-        // at the cost of no per-category breakdown (a diagnostic-only combo).
-        let lora_active = self
-            .active_lora
-            .lock()
-            .expect("active_lora poisoned")
-            .is_some();
-
-        if !lora_active && let Some(timer) = &self.profile_timer {
-            // Profiling path: each category is its own command buffer so we can
-            // measure wall time separately. Slower than normal — diagnostic only.
-            self.encode_layers_profiled(pos, timer);
-            self.profile_segment(timer, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            timer.bump_token();
-            // Print cumulative breakdown every 32 tokens to avoid noise.
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else if !lora_active && let Some(timer) = &self.gpu_timer {
-            // GPU-timestamp profiling: one command buffer, many compute
-            // encoders (one per category) — each with start/end timestamp
-            // samples attached. Single commit+wait, then resolve samples.
-            timer.next_idx.store(0, Ordering::Relaxed);
-            timer.labels.lock().expect("timer mutex poisoned").clear();
-            let cb = self.ctx.queue.new_command_buffer();
-            self.encode_layers_gpu_timed(cb, pos, timer);
-            self.gpu_sampled_pass(timer, cb, "out", |enc| {
-                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-                self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            });
-            cb.commit();
-            cb.wait_until_completed();
-            self.gpu_timer_resolve(timer);
-            timer.bump_token();
-            if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
-                timer.print();
-            }
-        } else {
-            // Single command buffer + single compute encoder for the entire forward pass.
-            let cb = self.ctx.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            self.encode_layers(enc, pos);
-            // Output norm + projection (normed_buf is free here).
-            self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
-            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-        }
-
-        // Update state + read back logits (unified memory zero-copy)
-        self.state.seq_len.fetch_add(1, Ordering::Relaxed);
-        state.seq_len += 1;
-        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+        self.forward_inner(tokens, _pos, state)
     }
 
     fn forward_greedy(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> u32 {
@@ -3755,7 +3827,7 @@ impl Model for MetalLfm2Model {
             return crate::sampler::argmax(&logits);
         }
 
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
         assert_eq!(tokens.len(), 1, "Metal forward expects single token");
         let token_id = tokens[0] as usize;
@@ -3804,7 +3876,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(tokens.len(), 1);
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -3856,7 +3928,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
@@ -3893,7 +3965,7 @@ impl Model for MetalLfm2Model {
         _pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
@@ -3932,10 +4004,22 @@ impl Model for MetalLfm2Model {
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
         let id = self.cache_namespace();
-        *self
-            .prefix_cache
+        *self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            KvPrefixCache::new(config, &self.config, &id);
+    }
+
+    fn clear_warm_cache(&self) {
+        self.prefix_cache
             .lock()
-            .expect("prefix_cache mutex poisoned") = KvPrefixCache::new(config, &self.config, &id);
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_warm();
+    }
+
+    fn clear_cache(&self) {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     fn supports_moe_lora(&self) -> bool {
@@ -3954,7 +4038,7 @@ impl Model for MetalLfm2Model {
     }
 
     fn configure_kv_compression(&self, compression: &KvCompression) -> Result<(), CeraError> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let want = TqMode::from_compression(compression, self.config.head_dim);
 
         // The per-phase profiling paths (`CERA_PROFILE=timing` / `=gpu`) have no
@@ -4045,10 +4129,7 @@ impl Model for MetalLfm2Model {
         let tag_changed = self.kv_cache_tag.get().is_some_and(|t| !t.is_empty());
         if tag_changed {
             let id = self.cache_namespace();
-            let mut cache = self
-                .prefix_cache
-                .lock()
-                .expect("prefix_cache mutex poisoned");
+            let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
             let cache_config = cache.config.clone();
             *cache = KvPrefixCache::new(cache_config, &self.config, &id);
         }
@@ -4056,12 +4137,12 @@ impl Model for MetalLfm2Model {
     }
 
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.snapshot_state_locked()
     }
 
     fn restore_state(&self, snapshot: &crate::kv_cache::StateSnapshot) {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.restore_state_locked(snapshot);
     }
 
@@ -4071,7 +4152,7 @@ impl Model for MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Stage the caller's adapter for the batched per-layer LoRA hooks in
         // `prefill_layers_and_logits`; the guard clears it on the way out. The
         // adapter is applied in-batch (two f32 GEMMs per target), so prefill keeps
@@ -4086,7 +4167,7 @@ impl Model for MetalLfm2Model {
         let lora_active = self
             .active_lora
             .lock()
-            .expect("active_lora poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_some();
         // Fresh prefill (start_pos == 0) → reset GPU-resident state so the model
         // doesn't carry KV history from a previous generation. The CPU-side
@@ -4100,7 +4181,7 @@ impl Model for MetalLfm2Model {
                 .then(|| {
                     self.prefix_cache
                         .lock()
-                        .expect("prefix_cache mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .find_longest_prefix(tokens)
                 })
                 .flatten()
@@ -4127,7 +4208,7 @@ impl Model for MetalLfm2Model {
                     let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
                     self.prefix_cache
                         .lock()
-                        .expect("prefix_cache mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(tokens, self.snapshot_state_locked());
                     return logits;
                 }
@@ -4145,7 +4226,7 @@ impl Model for MetalLfm2Model {
         if start_pos == 0 && !lora_active {
             self.prefix_cache
                 .lock()
-                .expect("prefix_cache mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(tokens, self.snapshot_state_locked());
         }
         logits
@@ -4174,7 +4255,7 @@ impl Model for MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Stage the adapter so the batched LoRA hooks in the shared
         // `prefill_layers_and_logits` apply on the embeddings-fed (LFM2-VL /
         // Audio) path too — the token path resolves it, so without this the
@@ -4225,7 +4306,7 @@ impl Model for MetalLfm2Model {
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         assert!(shift > 0, "shift must be > 0");
         let cur_len = self.state.seq_len.load(Ordering::Relaxed);
         assert!(
@@ -4326,7 +4407,7 @@ impl MetalLfm2Model {
             }
         }
 
-        StateSnapshot { layers, seq_len }
+        StateSnapshot::new(layers, seq_len)
     }
 
     /// Lock-free body of `Model::restore_state`. See
@@ -4678,6 +4759,43 @@ impl MetalLfm2Model {
         self.prefill_layers_and_logits(n, start_pos, state)
     }
 
+    pub(crate) fn forward_prefill_logits_all_inner(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        assert!(!tokens.is_empty());
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        let max_all_logits = self.state.max_seq_len.min(MAX_ALL_LOGITS_TOKENS);
+        assert!(
+            n <= max_all_logits,
+            "forward_prefill_logits_all_inner batch size {} exceeds max_all_logits {}",
+            n,
+            max_all_logits
+        );
+
+        assert!(
+            start_pos + n <= self.state.max_seq_len,
+            "prefill seq_len {} + {} exceeds max {}",
+            start_pos,
+            n,
+            self.state.max_seq_len
+        );
+
+        let batch_buf = &self.prefill_batch_buf;
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(batch_buf.contents() as *mut f32, hs * n);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.dequant_embedding_row(t as usize, &mut dst[i * hs..(i + 1) * hs]);
+            }
+        }
+
+        self.prefill_layers_and_all_logits(n, start_pos, state)
+    }
+
     /// Per-layer dispatch + final-frame logits projection for a
     /// pre-staged prefill batch. Shared by both
     /// [`Self::forward_prefill_inner`] (token-id input, dequantizes
@@ -4692,6 +4810,25 @@ impl MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        self.prefill_layers_and_logits_mode(n, start_pos, state, false)
+    }
+
+    fn prefill_layers_and_all_logits(
+        &self,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.prefill_layers_and_logits_mode(n, start_pos, state, true)
+    }
+
+    fn prefill_layers_and_logits_mode(
+        &self,
+        n: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+        all_logits: bool,
+    ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let batch_buf = &self.prefill_batch_buf;
@@ -4705,7 +4842,7 @@ impl MetalLfm2Model {
         let lora = self
             .active_lora
             .lock()
-            .expect("active_lora poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
 
         for layer in 0..cfg.n_layers {
@@ -5299,8 +5436,36 @@ impl MetalLfm2Model {
             self.scalars.residual,
         );
 
-        // Final: output norm + logits for last token only.
-        {
+        // Final: output norm + logits.
+        let vocab = cfg.vocab_size;
+        let all_logits_buf = if all_logits {
+            Some(&self.prefill_all_logits_buf)
+        } else {
+            None
+        };
+
+        if let Some(buf) = &all_logits_buf {
+            for i in 0..n {
+                let off_floats = (i * hs) as u64;
+                self.copy_compute(
+                    enc,
+                    batch_buf,
+                    off_floats,
+                    &self.hidden_buf,
+                    0,
+                    &self.params.elementwise_hs,
+                    hs as u64,
+                );
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.encode_gemv_output_offset(
+                    enc,
+                    &self.normed_buf,
+                    0,
+                    buf,
+                    (i * vocab * 4) as u64,
+                );
+            }
+        } else {
             let last_off_floats = ((n - 1) * hs) as u64;
             self.copy_compute(
                 enc,
@@ -5321,7 +5486,11 @@ impl MetalLfm2Model {
 
         self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
-        self.ctx.read_f32(&self.logits_buf, cfg.vocab_size)
+        if let Some(buf) = &all_logits_buf {
+            self.ctx.read_f32(buf, n * vocab)
+        } else {
+            self.ctx.read_f32(&self.logits_buf, vocab)
+        }
     }
 }
 
@@ -5349,7 +5518,7 @@ impl MetalLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<(String, f64)> {
-        let _guard = self.infer_lock.lock().expect("infer_lock poisoned");
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Upfront bounds check so failures are atomic — otherwise a call
         // exceeding the context window could partially advance seq_len /
         // KV / conv buffers across successful chunks and then panic on a
@@ -6337,7 +6506,7 @@ impl MetalLfm2Model {
         let lora = self
             .active_lora
             .lock()
-            .expect("active_lora poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         {
             let lw = &self.layers[i];
@@ -6555,8 +6724,24 @@ impl MetalLfm2Model {
                     self.encode_moe_ffn(enc, moe, &self.ffn_input_buf, &self.hidden_buf, 1, true)
                 }
                 MetalFfn::Dense(dense) => {
-                    if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
-                        self.encode_gemv_gate_up(
+                    let has_lora = lora.as_ref().is_some_and(|l| {
+                        l.layers.get(i).is_some_and(|a| {
+                            a[LoraTarget::FfnGate.index()].is_some()
+                                || a[LoraTarget::FfnUp.index()].is_some()
+                        })
+                    });
+                    if !has_lora && dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0
+                    {
+                        // Fused SwiGLU: Gate GEMV + Up GEMV + SiLU in ONE single dispatch!
+                        self.encode_gemv_swiglu(
+                            enc,
+                            &dense.gate,
+                            &dense.up,
+                            &self.ffn_input_buf,
+                            &self.gate_buf,
+                        );
+                    } else {
+                        self.encode_gate_up_dispatch(
                             enc,
                             &dense.gate,
                             &dense.up,
@@ -6564,40 +6749,32 @@ impl MetalLfm2Model {
                             &self.gate_buf,
                             &self.up_buf,
                         );
-                    } else {
-                        self.encode_gemv_weight(
+                        // LoRA gate/up deltas on the raw projections, before silu_mul.
+                        self.encode_lora_hook(
                             enc,
-                            &dense.gate,
+                            lora.as_ref(),
+                            i,
+                            LoraTarget::FfnGate,
                             &self.ffn_input_buf,
                             &self.gate_buf,
                         );
-                        self.encode_gemv_weight(enc, &dense.up, &self.ffn_input_buf, &self.up_buf);
+                        self.encode_lora_hook(
+                            enc,
+                            lora.as_ref(),
+                            i,
+                            LoraTarget::FfnUp,
+                            &self.ffn_input_buf,
+                            &self.up_buf,
+                        );
+                        self.encode_elementwise(
+                            enc,
+                            &self.pipelines.silu_mul_inplace,
+                            &self.gate_buf,
+                            &self.up_buf,
+                            &self.params.elementwise_is,
+                            dense.gate.m,
+                        );
                     }
-                    // LoRA gate/up deltas on the raw projections, before silu_mul.
-                    self.encode_lora_hook(
-                        enc,
-                        lora.as_ref(),
-                        i,
-                        LoraTarget::FfnGate,
-                        &self.ffn_input_buf,
-                        &self.gate_buf,
-                    );
-                    self.encode_lora_hook(
-                        enc,
-                        lora.as_ref(),
-                        i,
-                        LoraTarget::FfnUp,
-                        &self.ffn_input_buf,
-                        &self.up_buf,
-                    );
-                    self.encode_elementwise(
-                        enc,
-                        &self.pipelines.silu_mul_inplace,
-                        &self.gate_buf,
-                        &self.up_buf,
-                        &self.params.elementwise_is,
-                        dense.gate.m,
-                    );
                     // FFN-down + residual. `ffn_input_buf` is free here (consumed by the
                     // gate/up projection), so it doubles as the Granite scaled-add temp.
                     self.encode_residual_proj(
@@ -6764,19 +6941,14 @@ impl MetalLfm2Model {
                 }
                 MetalFfn::Dense(d) => d,
             };
-            if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
-                self.encode_gemv_gate_up(
-                    enc,
-                    &dense.gate,
-                    &dense.up,
-                    &self.ffn_input_buf,
-                    &self.gate_buf,
-                    &self.up_buf,
-                );
-            } else {
-                self.encode_gemv_weight(enc, &dense.gate, &self.ffn_input_buf, &self.gate_buf);
-                self.encode_gemv_weight(enc, &dense.up, &self.ffn_input_buf, &self.up_buf);
-            }
+            self.encode_gate_up_dispatch(
+                enc,
+                &dense.gate,
+                &dense.up,
+                &self.ffn_input_buf,
+                &self.gate_buf,
+                &self.up_buf,
+            );
             self.encode_elementwise(
                 enc,
                 &self.pipelines.silu_mul_inplace,
@@ -6946,29 +7118,14 @@ impl MetalLfm2Model {
                             &self.ffn_input_buf,
                             &lw.ffn_norm,
                         );
-                        if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
-                            self.encode_gemv_gate_up(
-                                enc,
-                                &dense.gate,
-                                &dense.up,
-                                &self.ffn_input_buf,
-                                &self.gate_buf,
-                                &self.up_buf,
-                            );
-                        } else {
-                            self.encode_gemv_weight(
-                                enc,
-                                &dense.gate,
-                                &self.ffn_input_buf,
-                                &self.gate_buf,
-                            );
-                            self.encode_gemv_weight(
-                                enc,
-                                &dense.up,
-                                &self.ffn_input_buf,
-                                &self.up_buf,
-                            );
-                        }
+                        self.encode_gate_up_dispatch(
+                            enc,
+                            &dense.gate,
+                            &dense.up,
+                            &self.ffn_input_buf,
+                            &self.gate_buf,
+                            &self.up_buf,
+                        );
                     });
                     self.gpu_sampled_pass(timer, cb, "ffn_silu_down", |enc| {
                         self.encode_elementwise(
@@ -7159,29 +7316,14 @@ impl MetalLfm2Model {
                             &self.ffn_input_buf,
                             &lw.ffn_norm,
                         );
-                        if dense.gate.dtype == DType::Q4_0 && dense.up.dtype == DType::Q4_0 {
-                            self.encode_gemv_gate_up(
-                                enc,
-                                &dense.gate,
-                                &dense.up,
-                                &self.ffn_input_buf,
-                                &self.gate_buf,
-                                &self.up_buf,
-                            );
-                        } else {
-                            self.encode_gemv_weight(
-                                enc,
-                                &dense.gate,
-                                &self.ffn_input_buf,
-                                &self.gate_buf,
-                            );
-                            self.encode_gemv_weight(
-                                enc,
-                                &dense.up,
-                                &self.ffn_input_buf,
-                                &self.up_buf,
-                            );
-                        }
+                        self.encode_gate_up_dispatch(
+                            enc,
+                            &dense.gate,
+                            &dense.up,
+                            &self.ffn_input_buf,
+                            &self.gate_buf,
+                            &self.up_buf,
+                        );
                     });
                     // silu_mul + ffn_down residual (Granite-scaled;
                     // `ffn_input_buf` is free here and doubles as the

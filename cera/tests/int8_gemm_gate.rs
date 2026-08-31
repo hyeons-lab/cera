@@ -22,7 +22,7 @@
 //! a future change gives `Scalar` an int8 GEMM too, this test needs a different
 //! lever — not deletion.
 
-#![cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#![cfg(all(target_arch = "x86_64", not(has_blas)))]
 
 use cera::backend::cpu_features::{CpuTier, cpu_features};
 use cera::tensor::DType;

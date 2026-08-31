@@ -113,8 +113,8 @@ struct KernelContext_0
 #line 64
         return;
     }
-    float device* _S1 = (&kernelContext_3)->a_buf_0+i_3;
-    *((&kernelContext_3)->a_buf_0+i_3) = *_S1 / (1.0f + exp(- *_S1)) * (&kernelContext_3)->b_buf_0[i_3];
+    float g_0 = clamp(*((&kernelContext_3)->a_buf_0+i_3), -80.0f, 80.0f);
+    *((&kernelContext_3)->a_buf_0+i_3) = g_0 / (1.0f + exp(- g_0)) * (&kernelContext_3)->b_buf_0[i_3];
     return;
 }
 

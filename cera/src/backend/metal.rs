@@ -406,6 +406,11 @@ pub mod shaders {
     /// Weighted sum of a token's expert outputs, generated from
     /// `shaders/slang/moe_combine.slang`.
     pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.metal"));
+    /// Fused Q4_0 SwiGLU FFN: silu(gate) * up in a single pass.
+    pub const FFN_SWIGLU_Q4_0: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/ffn_swiglu_q4_0.metal"));
+    /// Fused 3-in-1 Q/K/V Q4_0 GEMV in a single pass.
+    pub const GEMV_Q4_0_QKV: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv_q4_0_qkv.metal"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the wgpu backend's
     /// `wgpu::shaders::PER_HEAD_RMSNORM`. A `__target_switch`

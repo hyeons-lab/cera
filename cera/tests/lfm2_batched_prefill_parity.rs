@@ -154,7 +154,7 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<(f32, usize, usize)> {
 /// on runners with no guaranteed int8 support. Mirrors `CERA_REQUIRE_SIMD`
 /// in `simd.rs`.
 fn batched_path_is_live(rel: &str) -> bool {
-    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[cfg(all(target_arch = "x86_64", not(has_blas)))]
     if !cera::backend::cpu::int8_gemm_available() {
         let msg = format!(
             "{rel}: x86_64 host has no runtime int8 GEMM (needs avx2+fma), so `forward_prefill` \
@@ -182,10 +182,6 @@ fn check(rel: &str, tokens: &[u32]) {
         return;
     }
     let Some((cos, top_pre, top_seq)) = run_parity(rel, tokens) else {
-        // Absent fixture normally skips — but a skip that reports PASS is how a gate
-        // goes green forever without ever running. `CERA_REQUIRE_MODEL` makes the
-        // absence a hard failure, so a CI job that is supposed to have the fixture
-        // cannot quietly stop testing. Mirrors `CERA_REQUIRE_SIMD` in `simd.rs`.
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").is_err(),
             "CERA_REQUIRE_MODEL is set but the fixture is absent: {rel} \
@@ -194,7 +190,7 @@ fn check(rel: &str, tokens: &[u32]) {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
-    let is_flash = tokens.len() >= 256;
+    let is_flash = tokens.len() >= 16;
     let path = if is_flash { "flash" } else { "naive" };
     eprintln!("[parity] {rel} [{path}]: cosine={cos:.6} argmax pre={top_pre} seq={top_seq}");
 
@@ -214,7 +210,7 @@ fn check(rel: &str, tokens: &[u32]) {
     //    touches — flash attention reorders reductions, so the bar must be looser or
     //    it fails for reasons unrelated to the GEMM.
     //  - BLAS: f32 SGEMM vs int8 dot, a legitimate reduction difference.
-    let min_cos = if cfg!(feature = "blas") {
+    let min_cos = if cfg!(has_blas) {
         0.995
     } else if is_flash {
         0.998
@@ -237,6 +233,12 @@ fn check(rel: &str, tokens: &[u32]) {
 
 /// The whole point: a Q4_K_M LFM2 file mixes Q4_K and Q6_K, so this exercises
 /// both new K-quant GEMM kernels and their gates.
+#[test]
+#[ignore = "needs a real GGUF; run with --ignored"]
+fn lfm2_q4km_batched_prefill_single_token() {
+    check("target/oracle/models/LFM2.5-230M-Q4_K_M.gguf", &PROMPT[..1]);
+}
+
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn lfm2_q4km_batched_prefill_matches_sequential() {

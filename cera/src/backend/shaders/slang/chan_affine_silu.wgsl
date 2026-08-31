@@ -17,7 +17,7 @@ fn chan_affine_silu(@builtin(global_invocation_id) gid_0 : vec3<u32>)
         return;
     }
     var c_0 : u32 = idx_0 / t_0;
-    var v_0 : f32 = x_buf_0[idx_0] * w_buf_0[c_0] + b_buf_0[c_0];
+    var v_0 : f32 = clamp(x_buf_0[idx_0] * w_buf_0[c_0] + b_buf_0[c_0], -80.0f, 80.0f);
     x_buf_0[idx_0] = v_0 / (1.0f + exp(- v_0));
     return;
 }

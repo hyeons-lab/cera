@@ -21,7 +21,7 @@
 //! VNNI. The AVX2 kernels made every tier from `Avx2` up capable, so `scalar` is
 //! now the only x86 tier that forces the fallback this test needs.
 
-#![cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#![cfg(all(target_arch = "x86_64", not(has_blas)))]
 
 use std::sync::{Arc, Mutex};
 

@@ -67,7 +67,7 @@ kernel void silu_mul_inplace(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.n) return;
-    float g = a[gid];
+    float g = clamp(a[gid], -80.0f, 80.0f);
     a[gid] = (g / (1.0f + exp(-g))) * b[gid];
 }
 

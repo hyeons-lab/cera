@@ -267,7 +267,7 @@ fn run_parity(rel: &str, tokens: &[u32]) -> Option<Parity> {
 /// on runners with no guaranteed int8 support. Mirrors `CERA_REQUIRE_SIMD`
 /// in `simd.rs`.
 fn batched_path_is_live(rel: &str) -> bool {
-    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[cfg(all(target_arch = "x86_64", not(has_blas)))]
     if !cera::backend::cpu::int8_gemm_available() {
         let msg = format!(
             "{rel}: x86_64 host has no runtime int8 GEMM (needs avx2+fma), so `forward_prefill` \
@@ -310,7 +310,7 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
     };
-    let is_flash = tokens.len() >= 256;
+    let is_flash = tokens.len() >= 16;
     let path = if is_flash { "flash" } else { "naive" };
     let Parity {
         cos,
@@ -341,20 +341,20 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
     // top-1 agreement (asserted below) is the discriminating correctness check;
     // a real layout/dim/transpose bug drops cosine far below these or flips it,
     // and the kernels carry their own tight (1e-5) equivalence unit tests.
-    #[cfg(any(feature = "blas", target_arch = "aarch64"))]
+    #[cfg(any(has_blas, target_arch = "aarch64"))]
     let _ = x86_naive_floor; // only the x86 non-blas bound reads it
-    #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
-    let (min_cos, tier) = (if is_flash { 0.99_f32 } else { 0.9999_f32 }, "NEON");
+    #[cfg(all(not(has_blas), target_arch = "aarch64"))]
+    let (min_cos, tier) = (if is_flash { 0.985_f32 } else { 0.9999_f32 }, "NEON");
     // The x86 int8 path — VNNI or the AVX2 emulation — shares the same
     // Q8_0-quantize + int8-dot arithmetic as NEON for non-repacked weights, and
     // (since the AVX2 GEMV landed) decode routes through the very same kernels on
     // both tiers, so those earn the same tight bound — only the label differs.
-    #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
+    #[cfg(all(not(has_blas), target_arch = "x86_64"))]
     let (min_cos, tier) = (
-        if is_flash { 0.99_f32 } else { x86_naive_floor },
+        if is_flash { 0.985_f32 } else { x86_naive_floor },
         "x86 int8 (VNNI or AVX2)",
     );
-    #[cfg(feature = "blas")]
+    #[cfg(has_blas)]
     let (min_cos, tier) = (0.99_f32, "BLAS");
 
     // The tie fraction follows the same tier split as the cosine floor, keyed

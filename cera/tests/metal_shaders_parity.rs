@@ -744,6 +744,168 @@ fn test_gemv_q5_k() {
     assert_close("gemv_q5_k_accum", &want, &got, tol);
 }
 
+#[test]
+fn test_gemv_q5_k_gate_up() {
+    let Some(ctx) = setup() else { return };
+    let m = 512u32;
+    let k = 512u32;
+    let qk_k = 256usize;
+    let nb = k as usize / qk_k;
+
+    let (raw_g, exp_g) = synth_q5_k_rows(m, nb);
+    let (raw_u, exp_u) = synth_q5_k_rows(m, nb);
+
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+
+    let mut y_ref_g = vec![0.0f32; m as usize];
+    let mut y_ref_u = vec![0.0f32; m as usize];
+    for row in 0..m as usize {
+        let mut sg = 0.0f32;
+        let mut su = 0.0f32;
+        for i in 0..k as usize {
+            sg += exp_g[row * k as usize + i] * x[i];
+            su += exp_u[row * k as usize + i] * x[i];
+        }
+        y_ref_g[row] = sg;
+        y_ref_u[row] = su;
+    }
+
+    let ag_buf = ctx.upload_bytes(&raw_g);
+    let au_buf = ctx.upload_bytes(&raw_u);
+    let x_buf = ctx.upload_f32(&x);
+    let yg_buf = ctx.create_buffer((m as u64) * 4);
+    let yu_buf = ctx.create_buffer((m as u64) * 4);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k]));
+
+    let pl = ctx
+        .create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k_gate_up")
+        .unwrap();
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pl);
+    enc.set_buffer(0, Some(&ag_buf), 0);
+    enc.set_buffer(1, Some(&au_buf), 0);
+    enc.set_buffer(2, Some(&x_buf), 0);
+    enc.set_buffer(3, Some(&yg_buf), 0);
+    enc.set_buffer(4, Some(&yu_buf), 0);
+    enc.set_buffer(5, Some(&p_buf), 0);
+    enc.dispatch_thread_groups(tg_size((m as u64).div_ceil(4)), tg_size(64));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    let got_g = ctx.read_f32(&yg_buf, m as usize);
+    let got_u = ctx.read_f32(&yu_buf, m as usize);
+    let scale_g = y_ref_g.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let scale_u = y_ref_u.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    assert_close("gemv_q5_k_gate_up(gate)", &y_ref_g, &got_g, 1e-4 * scale_g);
+    assert_close("gemv_q5_k_gate_up(up)", &y_ref_u, &got_u, 1e-4 * scale_u);
+}
+
+#[test]
+fn test_gemv_q6_k_gate_up() {
+    use cera::quant::{BlockQ6K, dequantize_q6_k_block};
+    let Some(ctx) = setup() else { return };
+    let m = 512u32;
+    let k = 512u32;
+    let qk_k = 256usize;
+    let nb = k as usize / qk_k;
+
+    let synth_q6k = |seed_off: usize| {
+        let mut raw = Vec::with_capacity(m as usize * nb * 210);
+        let mut exp = vec![0.0f32; m as usize * k as usize];
+        for row in 0..m as usize {
+            for b in 0..nb {
+                let mut blk = BlockQ6K {
+                    ql: [0u8; 128],
+                    qh: [0u8; 64],
+                    scales: [0i8; 16],
+                    d: half::f16::from_f32(
+                        0.01 + (row as f32 * 0.003 + seed_off as f32).sin() * 0.002,
+                    )
+                    .to_bits(),
+                };
+                for i in 0..128 {
+                    blk.ql[i] = ((row * 37 + b * 13 + i + seed_off) & 0xFF) as u8;
+                }
+                for i in 0..64 {
+                    blk.qh[i] = ((row * 11 + b * 7 + i + seed_off) & 0xFF) as u8;
+                }
+                for i in 0..16 {
+                    blk.scales[i] = (((row * 3 + b * 5 + i + seed_off) as i32 & 0x7F) - 32) as i8;
+                }
+                let dq = dequantize_q6_k_block(&blk);
+                let row_off = row * k as usize + b * qk_k;
+                exp[row_off..row_off + qk_k].copy_from_slice(&dq);
+                raw.extend_from_slice(&blk.ql);
+                raw.extend_from_slice(&blk.qh);
+                let sc_bytes: &[u8] = bytemuck::cast_slice(&blk.scales);
+                raw.extend_from_slice(sc_bytes);
+                raw.extend_from_slice(&blk.d.to_le_bytes());
+            }
+        }
+        raw.extend_from_slice(&[0u8; 16]);
+        (raw, exp)
+    };
+
+    let (raw_g, exp_g) = synth_q6k(0);
+    let (raw_u, exp_u) = synth_q6k(17);
+
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.013).sin()).collect();
+    let mut y_ref_g = vec![0.0f32; m as usize];
+    let mut y_ref_u = vec![0.0f32; m as usize];
+    for row in 0..m as usize {
+        let mut sg = 0.0f32;
+        let mut su = 0.0f32;
+        for i in 0..k as usize {
+            sg += exp_g[row * k as usize + i] * x[i];
+            su += exp_u[row * k as usize + i] * x[i];
+        }
+        y_ref_g[row] = sg;
+        y_ref_u[row] = su;
+    }
+
+    let ag_buf = ctx.upload_bytes(&raw_g);
+    let au_buf = ctx.upload_bytes(&raw_u);
+    let x_buf = ctx.upload_f32(&x);
+    let yg_buf = ctx.create_buffer((m as u64) * 4);
+    let yu_buf = ctx.create_buffer((m as u64) * 4);
+    let p_buf = ctx.upload_bytes(bytemuck::cast_slice(&[m, k]));
+
+    let pl = ctx
+        .create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k_gate_up")
+        .unwrap();
+    let cb = ctx.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pl);
+    enc.set_buffer(0, Some(&ag_buf), 0);
+    enc.set_buffer(1, Some(&au_buf), 0);
+    enc.set_buffer(2, Some(&x_buf), 0);
+    enc.set_buffer(3, Some(&yg_buf), 0);
+    enc.set_buffer(4, Some(&yu_buf), 0);
+    enc.set_buffer(5, Some(&p_buf), 0);
+    enc.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (m / 4) as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    let got_g = ctx.read_f32(&yg_buf, m as usize);
+    let got_u = ctx.read_f32(&yu_buf, m as usize);
+    assert_close("gemv_q6_k_gate_up(gate)", &y_ref_g, &got_g, 5e-3);
+    assert_close("gemv_q6_k_gate_up(up)", &y_ref_u, &got_u, 5e-3);
+}
+
 /// Batched Q5_K GEMM parity against the CPU `dequantize_q5_k_block` reference.
 ///
 /// Unlike the GEMV, this kernel rounds dequantized weights to `half` before the

@@ -35,7 +35,7 @@
 //! the claim; anything looser would pass while decode quietly used a different
 //! kernel, which is precisely the failure this guards.
 
-#![cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#![cfg(all(target_arch = "x86_64", not(has_blas)))]
 
 use cera::backend::cpu;
 use cera::backend::cpu_features::{CpuTier, cpu_features};
