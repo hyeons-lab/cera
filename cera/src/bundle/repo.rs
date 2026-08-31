@@ -473,7 +473,23 @@ pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, CeraError> {
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.text())
         .map_err(|e| CeraError::Backend(format!("list-bundles HTTP failed: {e}")))?;
-    parse_leap_bundles(&body)
+    let mut entries = parse_leap_bundles(&body)?;
+    if !entries.iter().any(|e| e.name == "LFM2.5-VL-3B-GGUF") {
+        entries.push(LeapBundleEntry {
+            name: "LFM2.5-VL-3B-GGUF".to_string(),
+            quants: vec![
+                "BF16".to_string(),
+                "F16".to_string(),
+                "Q4_0".to_string(),
+                "Q4_K_M".to_string(),
+                "Q5_K_M".to_string(),
+                "Q6_K".to_string(),
+                "Q8_0".to_string(),
+            ],
+        });
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]

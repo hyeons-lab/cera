@@ -739,6 +739,18 @@ pub struct DetokenizerWeights {
     pub layers: Vec<DetokLayerWeights>,
 }
 
+fn get_detok_tensor(gguf: &GgufFile, name1: &str, name2: &str) -> Result<crate::tensor::Tensor> {
+    gguf.get_tensor(name1)
+        .or_else(|_| gguf.get_tensor(name2))
+        .with_context(|| format!("tensor not found: neither `{name1}` nor `{name2}`"))
+}
+
+fn get_detok_mmap_weight(gguf: &Arc<GgufFile>, name1: &str, name2: &str) -> Result<MmapWeight> {
+    MmapWeight::from_gguf(gguf, name1)
+        .or_else(|_| MmapWeight::from_gguf(gguf, name2))
+        .with_context(|| format!("tensor weight not found: neither `{name1}` nor `{name2}`"))
+}
+
 impl DetokenizerWeights {
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         // Layer types (hardcoded from decoder.cpp).
@@ -746,9 +758,17 @@ impl DetokenizerWeights {
         let n_layer = layer_is_conv.len();
 
         // Derive config from weight shapes.
-        let conv_in = MmapWeight::from_gguf(gguf, "lfm.layers.0.conv.in_proj.weight")?;
+        let conv_in = get_detok_mmap_weight(
+            gguf,
+            "lfm.layers.0.conv.in_proj.weight",
+            "blk.0.shortconv.in_proj.weight",
+        )?;
         let n_embd = conv_in.cols;
-        let q_norm_w = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
+        let q_norm_w = get_detok_tensor(
+            gguf,
+            "lfm.layers.2.self_attn.q_layernorm.weight",
+            "blk.2.attn_q_norm.weight",
+        )?;
         let n_embd_head = q_norm_w.shape()[0];
         // Guard against a corrupt vocoder GGUF reporting an empty
         // q_layernorm shape — both `n_head` and `n_head_kv` are
@@ -758,11 +778,23 @@ impl DetokenizerWeights {
             n_embd_head > 0,
             "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
         );
-        let q_w = MmapWeight::from_gguf(gguf, "lfm.layers.2.self_attn.q_proj.weight")?;
+        let q_w = get_detok_mmap_weight(
+            gguf,
+            "lfm.layers.2.self_attn.q_proj.weight",
+            "blk.2.attn_q.weight",
+        )?;
         let n_head = q_w.rows / n_embd_head;
-        let k_w = MmapWeight::from_gguf(gguf, "lfm.layers.2.self_attn.k_proj.weight")?;
+        let k_w = get_detok_mmap_weight(
+            gguf,
+            "lfm.layers.2.self_attn.k_proj.weight",
+            "blk.2.attn_k.weight",
+        )?;
         let n_head_kv = k_w.rows / n_embd_head;
-        let ffn_w1_0 = MmapWeight::from_gguf(gguf, "lfm.layers.0.feed_forward.w1.weight")?;
+        let ffn_w1_0 = get_detok_mmap_weight(
+            gguf,
+            "lfm.layers.0.feed_forward.w1.weight",
+            "blk.0.ffn_gate.weight",
+        )?;
         let ffn_dim = ffn_w1_0.rows;
 
         let config = DetokenizerConfig {
@@ -783,95 +815,165 @@ impl DetokenizerWeights {
             layer_is_conv,
         };
 
-        let output_norm = gguf.get_tensor("lfm.embedding_norm.weight")?.to_f32_vec();
+        let output_norm =
+            get_detok_tensor(gguf, "lfm.embedding_norm.weight", "token_embd_norm.weight")?
+                .to_f32_vec();
 
-        let emb_weight = MmapWeight::from_gguf(gguf, "emb.emb.weight")?;
-        let lin_w = MmapWeight::from_gguf(gguf, "lin.weight")?;
-        let lin_b = gguf.get_tensor("lin.bias")?.to_f32_vec();
+        let emb_weight = get_detok_mmap_weight(gguf, "emb.emb.weight", "token_embd.weight")?;
+        let lin_w = get_detok_mmap_weight(gguf, "lin.weight", "dense_2.weight")?;
+        let lin_b = get_detok_tensor(gguf, "lin.bias", "dense_2.bias")?.to_f32_vec();
+
+        anyhow::ensure!(
+            emb_weight.cols == n_embd,
+            "detokenizer emb_weight cols ({}) mismatch n_embd ({})",
+            emb_weight.cols,
+            n_embd
+        );
+        anyhow::ensure!(
+            emb_weight.rows == config.n_codes * 2048,
+            "detokenizer emb_weight rows ({}) mismatch expected {} ({} codebooks * 2048)",
+            emb_weight.rows,
+            config.n_codes * 2048,
+            config.n_codes
+        );
+        anyhow::ensure!(
+            lin_w.cols == n_embd,
+            "detokenizer lin_w cols ({}) mismatch n_embd ({})",
+            lin_w.cols,
+            n_embd
+        );
+        let expected_lin_out = (config.n_fft / 2 + 1) * 2;
+        anyhow::ensure!(
+            lin_w.rows == expected_lin_out,
+            "detokenizer lin_w rows ({}) mismatch expected {expected_lin_out}",
+            lin_w.rows
+        );
+        anyhow::ensure!(
+            lin_b.len() == expected_lin_out,
+            "detokenizer lin_b len ({}) mismatch expected {expected_lin_out}",
+            lin_b.len()
+        );
 
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
-            let prefix = format!("lfm.layers.{i}");
+            let prefix_lfm = format!("lfm.layers.{i}");
+            let prefix_blk = format!("blk.{i}");
             let is_conv = config.layer_is_conv[i];
 
             layers.push(DetokLayerWeights {
-                operator_norm: gguf
-                    .get_tensor(&format!("{prefix}.operator_norm.weight"))?
-                    .to_f32_vec(),
-                ffn_norm: gguf
-                    .get_tensor(&format!("{prefix}.ffn_norm.weight"))?
-                    .to_f32_vec(),
-                ffn_w1: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w1.weight"))?,
-                ffn_w2: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w2.weight"))?,
-                ffn_w3: MmapWeight::from_gguf(gguf, &format!("{prefix}.feed_forward.w3.weight"))?,
+                operator_norm: get_detok_tensor(
+                    gguf,
+                    &format!("{prefix_lfm}.operator_norm.weight"),
+                    &format!("{prefix_blk}.attn_norm.weight"),
+                )?
+                .to_f32_vec(),
+                ffn_norm: get_detok_tensor(
+                    gguf,
+                    &format!("{prefix_lfm}.ffn_norm.weight"),
+                    &format!("{prefix_blk}.ffn_norm.weight"),
+                )?
+                .to_f32_vec(),
+                ffn_w1: get_detok_mmap_weight(
+                    gguf,
+                    &format!("{prefix_lfm}.feed_forward.w1.weight"),
+                    &format!("{prefix_blk}.ffn_gate.weight"),
+                )?,
+                ffn_w2: get_detok_mmap_weight(
+                    gguf,
+                    &format!("{prefix_lfm}.feed_forward.w2.weight"),
+                    &format!("{prefix_blk}.ffn_down.weight"),
+                )?,
+                ffn_w3: get_detok_mmap_weight(
+                    gguf,
+                    &format!("{prefix_lfm}.feed_forward.w3.weight"),
+                    &format!("{prefix_blk}.ffn_up.weight"),
+                )?,
                 conv_in_proj: if is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.conv.in_proj.weight"),
+                        &format!("{prefix_lfm}.conv.in_proj.weight"),
+                        &format!("{prefix_blk}.shortconv.in_proj.weight"),
                     )?)
                 } else {
                     None
                 },
                 conv_out_proj: if is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.conv.out_proj.weight"),
+                        &format!("{prefix_lfm}.conv.out_proj.weight"),
+                        &format!("{prefix_blk}.shortconv.out_proj.weight"),
                     )?)
                 } else {
                     None
                 },
                 conv_weight: if is_conv {
                     Some(
-                        gguf.get_tensor(&format!("{prefix}.conv.conv.weight"))?
-                            .to_f32_vec(),
+                        get_detok_tensor(
+                            gguf,
+                            &format!("{prefix_lfm}.conv.conv.weight"),
+                            &format!("{prefix_blk}.shortconv.conv.weight"),
+                        )?
+                        .to_f32_vec(),
                     )
                 } else {
                     None
                 },
                 wq: if !is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.self_attn.q_proj.weight"),
+                        &format!("{prefix_lfm}.self_attn.q_proj.weight"),
+                        &format!("{prefix_blk}.attn_q.weight"),
                     )?)
                 } else {
                     None
                 },
                 wk: if !is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.self_attn.k_proj.weight"),
+                        &format!("{prefix_lfm}.self_attn.k_proj.weight"),
+                        &format!("{prefix_blk}.attn_k.weight"),
                     )?)
                 } else {
                     None
                 },
                 wv: if !is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.self_attn.v_proj.weight"),
+                        &format!("{prefix_lfm}.self_attn.v_proj.weight"),
+                        &format!("{prefix_blk}.attn_v.weight"),
                     )?)
                 } else {
                     None
                 },
                 wo: if !is_conv {
-                    Some(MmapWeight::from_gguf(
+                    Some(get_detok_mmap_weight(
                         gguf,
-                        &format!("{prefix}.self_attn.out_proj.weight"),
+                        &format!("{prefix_lfm}.self_attn.out_proj.weight"),
+                        &format!("{prefix_blk}.attn_output.weight"),
                     )?)
                 } else {
                     None
                 },
                 q_norm: if !is_conv {
                     Some(
-                        gguf.get_tensor(&format!("{prefix}.self_attn.q_layernorm.weight"))?
-                            .to_f32_vec(),
+                        get_detok_tensor(
+                            gguf,
+                            &format!("{prefix_lfm}.self_attn.q_layernorm.weight"),
+                            &format!("{prefix_blk}.attn_q_norm.weight"),
+                        )?
+                        .to_f32_vec(),
                     )
                 } else {
                     None
                 },
                 k_norm: if !is_conv {
                     Some(
-                        gguf.get_tensor(&format!("{prefix}.self_attn.k_layernorm.weight"))?
-                            .to_f32_vec(),
+                        get_detok_tensor(
+                            gguf,
+                            &format!("{prefix_lfm}.self_attn.k_layernorm.weight"),
+                            &format!("{prefix_blk}.attn_k_norm.weight"),
+                        )?
+                        .to_f32_vec(),
                     )
                 } else {
                     None

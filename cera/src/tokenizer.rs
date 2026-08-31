@@ -489,6 +489,80 @@ impl BpeTokenizer {
             Err(_) => token_bytes.clone(),
         }
     }
+
+    /// Detect token offsets in `tokens` that correspond to semantic boundaries
+    /// (e.g. turn delimiters `<|im_end|>`, `<|eot_id|>`, `</s>`, `<end_of_turn>`,
+    /// tool markers `</tool_call>`, `</tool_response>`, or thinking closures `</thought>`, `</think>`).
+    pub fn find_semantic_anchor_indices(
+        &self,
+        tokens: &[u32],
+    ) -> Vec<(usize, crate::kv_cache::SemanticBoundaryKind)> {
+        let mut anchors = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            if let Some(kind) = self.classify_boundary_token(tok) {
+                // The anchor snapshot is captured *after* the boundary token (at prefix index i + 1)
+                anchors.push((i + 1, kind));
+            }
+        }
+        anchors
+    }
+
+    /// Classify whether a token ID represents a semantic boundary.
+    pub fn classify_boundary_token(
+        &self,
+        token_id: u32,
+    ) -> Option<crate::kv_cache::SemanticBoundaryKind> {
+        use crate::kv_cache::SemanticBoundaryKind;
+        let bytes = self.vocab.get(token_id as usize)?;
+        let s = std::str::from_utf8(bytes).ok()?.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Turn boundaries
+        if s == "<|im_end|>"
+            || s == "<|eot_id|>"
+            || s == "<|end_of_turn|>"
+            || s == "<end_of_turn>"
+            || s == "</s>"
+            || s == "<|endoftext|>"
+            || s == "[/INST]"
+            || s == "<|im_start|>"
+            || s == "<start_of_turn>"
+            || s == "[INST]"
+        {
+            return Some(SemanticBoundaryKind::Turn);
+        }
+
+        // Tool boundaries
+        if s == "</tool_call>"
+            || s == "</tool_response>"
+            || s == "</tool>"
+            || s == "<tool_call>"
+            || s == "<tool_response>"
+            || s == "[/tool_call]"
+            || s == "[tool_call]"
+        {
+            return Some(SemanticBoundaryKind::ToolCall);
+        }
+
+        // Thinking boundaries
+        if s == "</thought>" || s == "</think>" || s == "<thought>" || s == "<think>" {
+            return Some(SemanticBoundaryKind::Thinking);
+        }
+
+        // Image boundaries
+        if s == "<|image_pad|>"
+            || s == "<|vision_start|>"
+            || s == "<|vision_end|>"
+            || s == "[image]"
+            || s == "<image>"
+        {
+            return Some(SemanticBoundaryKind::ImageTokens);
+        }
+
+        None
+    }
 }
 
 // ── Chat template rendering ─────────────────────────────────────────────────
@@ -1425,5 +1499,48 @@ mod tests {
             1,
             "expected exactly one <image> marker; got {rendered:?}"
         );
+    }
+
+    #[test]
+    fn test_find_semantic_anchor_indices() {
+        use crate::kv_cache::SemanticBoundaryKind;
+        let mut tok = make_test_tokenizer();
+        // Add special boundary tokens to vocab
+        let im_end_id = tok.vocab.len() as u32;
+        tok.vocab.push(b"<|im_end|>".to_vec());
+        tok.token_to_id.insert(b"<|im_end|>".to_vec(), im_end_id);
+
+        let tool_call_id = tok.vocab.len() as u32;
+        tok.vocab.push(b"</tool_call>".to_vec());
+        tok.token_to_id
+            .insert(b"</tool_call>".to_vec(), tool_call_id);
+
+        let think_id = tok.vocab.len() as u32;
+        tok.vocab.push(b"</thought>".to_vec());
+        tok.token_to_id.insert(b"</thought>".to_vec(), think_id);
+
+        let image_id = tok.vocab.len() as u32;
+        tok.vocab.push(b"<|image_pad|>".to_vec());
+        tok.token_to_id.insert(b"<|image_pad|>".to_vec(), image_id);
+
+        let prompt = vec![
+            0,
+            1,
+            2,
+            im_end_id,
+            3,
+            4,
+            tool_call_id,
+            5,
+            think_id,
+            image_id,
+        ];
+        let anchors = tok.find_semantic_anchor_indices(&prompt);
+
+        assert_eq!(anchors.len(), 4);
+        assert_eq!(anchors[0], (4, SemanticBoundaryKind::Turn));
+        assert_eq!(anchors[1], (7, SemanticBoundaryKind::ToolCall));
+        assert_eq!(anchors[2], (9, SemanticBoundaryKind::Thinking));
+        assert_eq!(anchors[3], (10, SemanticBoundaryKind::ImageTokens));
     }
 }
