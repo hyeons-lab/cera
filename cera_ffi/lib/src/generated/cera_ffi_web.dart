@@ -2772,6 +2772,11 @@ final class CeraEngine {
   /// load time from the manifest's `inference_type`.
   ModalityCapabilities capabilities() => _unsupportedOnWeb('CeraEngine.capabilities');
 
+  /// Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+  /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+  /// or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+  void clearPrefixCache() => _unsupportedOnWeb('CeraEngine.clearPrefixCache');
+
   /// Resolved context-window size (KV cache cap) the engine was
   /// configured with. Mirrors the `context_size` field of the
   /// [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -2875,6 +2880,9 @@ final class CeraEngine {
   /// own count: in healthy models they match, but the model's
   /// config is the authoritative range for valid logit indices.
   int vocabSize() => _unsupportedOnWeb('CeraEngine.vocabSize');
+
+  /// Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+  void wipeAllPrefixCaches() => _unsupportedOnWeb('CeraEngine.wipeAllPrefixCaches');
 }
 
 final class CeraEngineFfiCodec {

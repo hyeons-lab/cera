@@ -871,6 +871,13 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func capabilities()  -> ModalityCapabilities
     
     /**
+     * Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+     * Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+     * or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+     */
+    func clearPrefixCache() 
+    
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -1003,6 +1010,11 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
      * config is the authoritative range for valid logit indices.
      */
     func vocabSize()  -> UInt32
+    
+    /**
+     * Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+     */
+    func wipeAllPrefixCaches() 
     
 }
 /**
@@ -1387,6 +1399,18 @@ open func capabilities() -> ModalityCapabilities  {
 }
     
     /**
+     * Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+     * Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+     * or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+     */
+open func clearPrefixCache()  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -1618,6 +1642,16 @@ open func vocabSize() -> UInt32  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+     */
+open func wipeAllPrefixCaches()  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
 
@@ -6417,6 +6451,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6460,6 +6497,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {

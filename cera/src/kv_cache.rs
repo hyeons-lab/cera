@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 use crate::CeraError;
 use crate::model::{BlockType, ModelConfig};
-use crate::time::Instant;
 use crate::turboquant::{
     CompressedKeyCache, CompressedValueCache, EncodeScratch, QueryRotationScratch, RotationState,
     TurboQuantConfig,
@@ -197,6 +196,76 @@ impl KvCompression {
 }
 
 /// Per-layer inference state.
+/// Capacity for the Conv rollback ring buffer (in number of tokens).
+pub const CONV_HISTORY_CAPACITY: usize = 64;
+
+/// Zero-allocation flat ring buffer storing recent convolution state snapshots
+/// for speculative decoding rollback.
+#[derive(Clone, Debug)]
+pub struct ConvHistory {
+    snapshots: Vec<f32>,
+    positions: [usize; CONV_HISTORY_CAPACITY],
+    head: usize,
+    count: usize,
+    buf_len: usize,
+}
+
+impl ConvHistory {
+    /// Create a new pre-allocated history ring buffer for a convolution layer with `buf_len` elements.
+    pub fn new(buf_len: usize) -> Self {
+        Self {
+            snapshots: vec![0.0f32; CONV_HISTORY_CAPACITY * buf_len],
+            positions: [0; CONV_HISTORY_CAPACITY],
+            head: 0,
+            count: 0,
+            buf_len,
+        }
+    }
+
+    /// Record a snapshot of `buffer` at sequence position `pos`.
+    /// Zero heap allocation: copies into the pre-allocated flat storage.
+    pub fn push(&mut self, pos: usize, buffer: &[f32]) {
+        if self.buf_len == 0 {
+            return;
+        }
+        debug_assert_eq!(buffer.len(), self.buf_len);
+        let offset = self.head * self.buf_len;
+        self.snapshots[offset..offset + self.buf_len].copy_from_slice(buffer);
+        self.positions[self.head] = pos;
+        self.head = (self.head + 1) % CONV_HISTORY_CAPACITY;
+        if self.count < CONV_HISTORY_CAPACITY {
+            self.count += 1;
+        }
+    }
+
+    /// Roll back the convolution `buffer` to the state at `target_pos`.
+    /// Returns `true` if the state was successfully found and restored.
+    pub fn rollback_to(&mut self, target_pos: usize, buffer: &mut [f32]) -> bool {
+        if target_pos == 0 {
+            buffer.fill(0.0);
+            self.clear();
+            return true;
+        }
+        for i in 0..self.count {
+            let idx = (self.head + CONV_HISTORY_CAPACITY - 1 - i) % CONV_HISTORY_CAPACITY;
+            if self.positions[idx] == target_pos {
+                let offset = idx * self.buf_len;
+                buffer.copy_from_slice(&self.snapshots[offset..offset + self.buf_len]);
+                self.head = (idx + 1) % CONV_HISTORY_CAPACITY;
+                self.count = self.count.saturating_sub(i);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reset all snapshot tracking without deallocating.
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum LayerState {
     /// KV cache for attention layers.
@@ -217,7 +286,11 @@ pub enum LayerState {
     },
     /// Rolling buffer for convolution layers.
     /// Stores previous `d_conv` pre-conv activations (bx values), time-major.
-    Conv { buffer: Vec<f32> },
+    Conv {
+        buffer: Vec<f32>,
+        /// Pre-allocated ring buffer history snapshots for speculative decoding rollback.
+        history: ConvHistory,
+    },
 }
 
 /// Pre-allocated scratch buffers reused across layers and tokens.
@@ -253,6 +326,10 @@ pub struct ScratchBuffers {
     pub q8_scales: Vec<f32>,
     /// Q8_0 quantization scratch: quants for the input vector (max_k entries).
     pub q8_quants: Vec<i8>,
+    /// Q8_0 quantization scratch for MoE down-projections.
+    pub q8_scales_down: Vec<f32>,
+    /// Q8_0 quantization scratch for MoE down-projections.
+    pub q8_quants_down: Vec<i8>,
     /// Dequantized weight scratch for BLAS prefill. Grown lazily on first use
     /// to the largest weight matrix the BLAS path encounters; reused across
     /// every subsequent GEMM call within and between forward passes. Stays
@@ -273,6 +350,10 @@ pub struct ScratchBuffers {
     /// combining weights, for one MoE layer. Held in scratch so routing
     /// allocates nothing per layer per token. Empty on dense models.
     pub moe_selected: Vec<(usize, f32)>,
+    /// Scratch for LM Head output logits (vocab_size). Reused across tokens to eliminate per-token heap allocation.
+    pub logits: Vec<f32>,
+    /// Scratch for token embedding lookup / hidden state input (hidden_size).
+    pub hidden_in: Vec<f32>,
 }
 
 /// Inference state across all layers.
@@ -333,11 +414,15 @@ impl InferenceState {
                 scores: Vec::new(),
                 q8_scales: Vec::new(),
                 q8_quants: Vec::new(),
+                q8_scales_down: Vec::new(),
+                q8_quants_down: Vec::new(),
                 dequant_weight_scratch: Vec::new(),
                 lora_tmp: Vec::new(),
                 moe_probs: Vec::new(),
                 moe_expert_out: Vec::new(),
                 moe_selected: Vec::new(),
+                logits: Vec::new(),
+                hidden_in: Vec::new(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
@@ -387,7 +472,10 @@ impl InferenceState {
                     key_cache_f16.clear();
                     value_cache_f16.clear();
                 }
-                LayerState::Conv { buffer } => buffer.iter_mut().for_each(|x| *x = 0.0),
+                LayerState::Conv { buffer, history } => {
+                    buffer.fill(0.0);
+                    history.clear();
+                }
             }
         }
     }
@@ -552,9 +640,13 @@ impl InferenceState {
                             compressed_values,
                         })
                     }
-                    BlockType::GatedConv => Ok(LayerState::Conv {
-                        buffer: zeroed_f32(checked_elems::<f32>(d_conv, config.hidden_size)?)?,
-                    }),
+                    BlockType::GatedConv => {
+                        let buf_len = checked_elems::<f32>(d_conv, config.hidden_size)?;
+                        Ok(LayerState::Conv {
+                            buffer: zeroed_f32(buf_len)?,
+                            history: ConvHistory::new(buf_len),
+                        })
+                    }
                 }
             },
         ) {
@@ -579,6 +671,8 @@ impl InferenceState {
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
                 q8_quants: Vec::new(), // resized per GEMV input dimension
+                q8_scales_down: Vec::new(),
+                q8_quants_down: Vec::new(),
                 // Grown lazily to max(3*hs*hs, is*hs) on the first BLAS GEMM
                 // call. Stays empty if the `blas` feature is off.
                 dequant_weight_scratch: Vec::new(),
@@ -600,6 +694,8 @@ impl InferenceState {
                     .as_ref()
                     .map(|m| Vec::with_capacity(m.n_expert_used))
                     .unwrap_or_default(),
+                logits: zeroed_f32(config.vocab_size)?,
+                hidden_in: zeroed_f32(config.hidden_size)?,
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
@@ -807,15 +903,12 @@ impl InferenceState {
                     };
                     layers.push(snap);
                 }
-                LayerState::Conv { buffer } => layers.push(LayerSnapshot::Conv {
+                LayerState::Conv { buffer, .. } => layers.push(LayerSnapshot::Conv {
                     buffer: bytemuck::cast_slice(buffer).to_vec(),
                 }),
             }
         }
-        Some(StateSnapshot {
-            layers,
-            seq_len: self.seq_len,
-        })
+        Some(StateSnapshot::new(layers, self.seq_len))
     }
 
     /// Restore a previously captured `StateSnapshot` into this state's
@@ -941,14 +1034,6 @@ impl InferenceState {
                     // isn't TurboQuant-configured; the caller
                     // should have detected the incompatibility
                     // before calling restore (see `LayerSnapshot::is_compressed`
-                    // + the lookup-time gate in `Lfm2Model::forward_prefill`).
-                    assert!(
-                        compressed_keys.is_some() && compressed_values.is_some(),
-                        "AttentionCompressed snapshot restored into a live state \
-                         missing compressed slots — caller must gate on \
-                         `LayerSnapshot::is_compressed()` matching \
-                         `LayerState::is_compressed()`"
-                    );
                     *compressed_keys = Some(
                         crate::turboquant::decode_compressed_keys(keys)
                             .expect("invalid TQK1 blob in snapshot"),
@@ -963,8 +1048,12 @@ impl InferenceState {
                     key_cache.clear();
                     value_cache.clear();
                 }
-                (LayerState::Conv { buffer }, LayerSnapshot::Conv { buffer: snap_buf }) => {
+                (
+                    LayerState::Conv { buffer, history },
+                    LayerSnapshot::Conv { buffer: snap_buf },
+                ) => {
                     decode_f32_into(buffer, snap_buf);
+                    history.clear();
                 }
                 _ => panic!("snapshot layer kind doesn't match state layer kind"),
             }
@@ -980,12 +1069,11 @@ impl InferenceState {
     /// the next forward continues from the accepted boundary. Unlike
     /// [`Self::shift_kv_with_rope`], **no RoPE fixup is needed** — surviving cells
     /// keep their original absolute positions, so this is a plain `Vec::truncate`.
+    /// For convolution layers, rolling buffer state is rewound using recorded history snapshots.
     ///
     /// Preconditions (enforced in all builds):
     /// - `len <= seq_len`
     /// - `!self.is_compressed()` — TurboQuant caches have no tail-truncate.
-    /// - No `Conv` layers — LFM2's gated-conv state is not position-indexed, so a
-    ///   KV tail-truncate cannot roll it back (spec-decode is dense-only in Phase 1).
     pub fn truncate_to(&mut self, len: usize) {
         assert!(
             len <= self.seq_len,
@@ -1036,10 +1124,17 @@ impl InferenceState {
                     trunc(key_cache_f16, seq_len, len);
                     trunc(value_cache_f16, seq_len, len);
                 }
-                LayerState::Conv { .. } => panic!(
-                    "truncate_to called on a state with Conv layers (LFM2); conv state \
-                     is not position-indexed and cannot be tail-truncated"
-                ),
+                LayerState::Conv { buffer, history } => {
+                    if !history.rollback_to(len, buffer) {
+                        tracing::warn!(
+                            target: "cera::kv_cache",
+                            target_len = len,
+                            "truncate_to target pos not in ConvHistory ring buffer window; zeroing Conv buffer"
+                        );
+                        buffer.fill(0.0);
+                        history.clear();
+                    }
+                }
             }
         }
         self.seq_len = len;
@@ -1376,15 +1471,76 @@ mod cache_tag_tests {
 
 // ── KV Prefix Cache ─────────────────────────────────────────────────────
 
+/// Classification of semantic boundaries in agentic and multimodal workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum SemanticBoundaryKind {
+    Unspecified = 0,
+    Turn = 1,
+    ToolCall = 2,
+    ToolOutput = 3,
+    Thinking = 4,
+    ImageTokens = 5,
+    SystemPrompt = 6,
+}
+
+impl From<u8> for SemanticBoundaryKind {
+    fn from(val: u8) -> Self {
+        match val {
+            1 => Self::Turn,
+            2 => Self::ToolCall,
+            3 => Self::ToolOutput,
+            4 => Self::Thinking,
+            5 => Self::ImageTokens,
+            6 => Self::SystemPrompt,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
 /// Snapshot of model KV + conv state after prefilling a token sequence.
 /// Backend-agnostic: stores raw bytes that the backend knows how to restore.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StateSnapshot {
     pub layers: Vec<LayerSnapshot>,
     pub seq_len: usize,
+    pub anchor_depth: u32,
+    pub boundary_kind: u8,
+    pub semantic_hash: u64,
+    pub shift_offset: u32,
 }
 
-#[derive(Clone)]
+impl StateSnapshot {
+    pub fn new(layers: Vec<LayerSnapshot>, seq_len: usize) -> Self {
+        Self {
+            layers,
+            seq_len,
+            anchor_depth: 0,
+            boundary_kind: 0,
+            semantic_hash: 0,
+            shift_offset: 0,
+        }
+    }
+
+    pub fn with_anchor(
+        mut self,
+        depth: u32,
+        kind: SemanticBoundaryKind,
+        semantic_hash: u64,
+    ) -> Self {
+        self.anchor_depth = depth;
+        self.boundary_kind = kind as u8;
+        self.semantic_hash = semantic_hash;
+        self
+    }
+
+    pub fn with_shift_offset(mut self, shift: u32) -> Self {
+        self.shift_offset = shift;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum LayerSnapshot {
     /// Raw f32 KV bytes (CPU / wgpu) or raw f16 (Metal). Backend
     /// chooses the element width; the byte length implicitly carries
@@ -1492,6 +1648,8 @@ pub struct KvCacheConfig {
     pub max_warm_bytes: u64,
     /// Max cold-tier (disk) total size in bytes.
     pub max_cold_bytes: u64,
+    /// Max warm-tier semantic anchor snapshots retained.
+    pub max_warm_anchors: usize,
 }
 
 impl Default for KvCacheConfig {
@@ -1501,6 +1659,7 @@ impl Default for KvCacheConfig {
             max_warm_entries: 32,
             max_warm_bytes: 256 * 1024 * 1024,
             max_cold_bytes: 10 * 1024 * 1024 * 1024,
+            max_warm_anchors: 16,
         }
     }
 }
@@ -1508,7 +1667,7 @@ impl Default for KvCacheConfig {
 struct CacheEntry {
     tokens: Vec<u32>,
     snapshot: StateSnapshot,
-    last_used: Cell<Instant>,
+    last_used: Cell<u64>,
 }
 
 /// Two-tier KV prefix cache: warm (memory) + cold (disk via FlatBuffers).
@@ -1518,6 +1677,7 @@ pub struct KvPrefixCache {
     pub config: KvCacheConfig,
     model_fingerprint: u64,
     warm_bytes: u64,
+    tick: Cell<u64>,
 }
 
 impl KvPrefixCache {
@@ -1527,7 +1687,14 @@ impl KvPrefixCache {
             model_fingerprint: model_fingerprint(model_config, model_id),
             config,
             warm_bytes: 0,
+            tick: Cell::new(0),
         }
+    }
+
+    fn next_tick(&self) -> u64 {
+        let t = self.tick.get().wrapping_add(1);
+        self.tick.set(t);
+        t
     }
 
     /// Find the longest cached **strict** prefix of `tokens` — an entry covering
@@ -1553,13 +1720,14 @@ impl KvPrefixCache {
     /// Filtering here rather than in each backend keeps warm and cold consistent
     /// and fixes all three backends at once.
     pub fn find_longest_prefix(&mut self, tokens: &[u32]) -> Option<(StateSnapshot, usize)> {
+        let tick = self.next_tick();
         let warm_hit = self
             .warm
             .values()
             .filter(|e| e.tokens.len() < tokens.len() && tokens.starts_with(&e.tokens))
             .max_by_key(|e| e.tokens.len())
             .map(|e| {
-                e.last_used.set(Instant::now());
+                e.last_used.set(tick);
                 (e.snapshot.clone(), e.tokens.len())
             });
 
@@ -1578,41 +1746,99 @@ impl KvPrefixCache {
         #[cfg(not(feature = "disk-cache"))]
         let cold_hit: Option<(StateSnapshot, usize)> = None;
 
-        let best = match (warm_hit, cold_hit) {
-            (Some(w), Some(c)) if c.1 > w.1 => Some(c),
-            (Some(w), _) => Some(w),
-            (None, c) => c,
+        let (best, is_cold) = match (warm_hit, cold_hit) {
+            (Some(w), Some(c)) if c.1 > w.1 => (Some(c), true),
+            (Some(w), _) => (Some(w), false),
+            (None, Some(c)) => (Some(c), true),
+            (None, None) => (None, false),
         };
 
-        // If the best hit came from the cold tier, promote it to warm.
-        // The `< tokens.len()` bound matches the lookup filter above: a full-length
-        // warm entry can never be returned, so treating it as "we already have
-        // something at least as good" would block promotion forever and re-read the
-        // multi-MB cold file on every call.
-        if let Some((snapshot, len)) = &best
-            && !self.warm.values().any(|e| {
-                e.tokens.len() >= *len
-                    && e.tokens.len() < tokens.len()
-                    && tokens.starts_with(&e.tokens)
-            })
-        {
-            let hash = hash_tokens(&tokens[..*len]);
-            let snap_bytes = snapshot.byte_size() as u64;
-            self.evict_warm_if_needed(snap_bytes);
-            if let Some(old) = self.warm.insert(
-                hash,
-                CacheEntry {
-                    tokens: tokens[..*len].to_vec(),
-                    snapshot: snapshot.clone(),
-                    last_used: Cell::new(Instant::now()),
-                },
-            ) {
-                self.warm_bytes -= old.snapshot.byte_size() as u64;
-            }
-            self.warm_bytes += snap_bytes;
+        // If the best hit came from the cold tier, promote it to warm without redundant O(N) scan.
+        if is_cold && let Some((snapshot, len)) = &best {
+            self.promote_cold_to_warm(snapshot, &tokens[..*len]);
         }
 
         best
+    }
+
+    /// Find the deepest cached semantic anchor that is a strict prefix of `tokens`.
+    /// Semantic anchors are snapshots saved at turn, tool, or thinking boundaries.
+    /// If no anchor is tagged, falls back to [`Self::find_longest_prefix`].
+    pub fn find_deepest_semantic_anchor(
+        &mut self,
+        tokens: &[u32],
+    ) -> Option<(StateSnapshot, usize)> {
+        let tick = self.next_tick();
+        let warm_anchor = self
+            .warm
+            .values()
+            .filter(|e| {
+                e.tokens.len() < tokens.len()
+                    && tokens.starts_with(&e.tokens)
+                    && (e.snapshot.anchor_depth > 0 || e.snapshot.boundary_kind > 0)
+            })
+            .max_by_key(|e| e.tokens.len())
+            .map(|e| {
+                e.last_used.set(tick);
+                (e.snapshot.clone(), e.tokens.len())
+            });
+
+        #[cfg(feature = "disk-cache")]
+        let cold_anchor = self
+            .config
+            .cache_dir
+            .clone()
+            .and_then(|dir| self.find_cold_anchor(&dir, tokens))
+            .map(|snapshot| {
+                let len = snapshot.seq_len;
+                (snapshot, len)
+            });
+        #[cfg(not(feature = "disk-cache"))]
+        let cold_anchor: Option<(StateSnapshot, usize)> = None;
+
+        let (best, is_cold) = match (warm_anchor, cold_anchor) {
+            (Some(w), Some(c)) if c.1 > w.1 => (Some(c), true),
+            (Some(w), _) => (Some(w), false),
+            (None, Some(c)) => (Some(c), true),
+            (None, None) => (None, false),
+        };
+
+        if is_cold && let Some((snapshot, len)) = &best {
+            self.promote_cold_to_warm(snapshot, &tokens[..*len]);
+        }
+
+        best.or_else(|| self.find_longest_prefix(tokens))
+    }
+
+    /// Cache a semantic anchor prefix's state with boundary metadata.
+    pub fn insert_anchor(
+        &mut self,
+        tokens: &[u32],
+        snapshot: StateSnapshot,
+        anchor_depth: u32,
+        boundary_kind: SemanticBoundaryKind,
+        semantic_hash: u64,
+    ) {
+        let snapshot = snapshot.with_anchor(anchor_depth, boundary_kind, semantic_hash);
+        self.insert(tokens, snapshot);
+    }
+
+    /// Get total warm cache memory in bytes.
+    pub fn warm_bytes(&self) -> u64 {
+        self.warm_bytes
+    }
+
+    /// Number of warm entries.
+    pub fn warm_count(&self) -> usize {
+        self.warm.len()
+    }
+
+    /// Number of tagged warm semantic anchors.
+    pub fn warm_anchor_count(&self) -> usize {
+        self.warm
+            .values()
+            .filter(|e| e.snapshot.anchor_depth > 0 || e.snapshot.boundary_kind > 0)
+            .count()
     }
 
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
@@ -1623,9 +1849,10 @@ impl KvPrefixCache {
         }
         let hash = hash_tokens(tokens);
         let snap_bytes = snapshot.byte_size() as u64;
+        let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
 
         // Evict from warm if needed.
-        self.evict_warm_if_needed(snap_bytes);
+        self.evict_warm_if_needed(snap_bytes, is_anchor);
 
         // Save to cold tier (if `disk-cache` feature on; otherwise no-op).
         #[cfg(feature = "disk-cache")]
@@ -1633,12 +1860,13 @@ impl KvPrefixCache {
             self.save_cold(dir, tokens, &snapshot);
         }
 
+        let tick = self.next_tick();
         if let Some(old) = self.warm.insert(
             hash,
             CacheEntry {
                 tokens: tokens.to_vec(),
                 snapshot,
-                last_used: Cell::new(Instant::now()),
+                last_used: Cell::new(tick),
             },
         ) {
             self.warm_bytes -= old.snapshot.byte_size() as u64;
@@ -1646,17 +1874,74 @@ impl KvPrefixCache {
         self.warm_bytes += snap_bytes;
     }
 
-    /// Total bytes in warm tier.
-    pub fn warm_bytes(&self) -> u64 {
-        self.warm_bytes
+    /// Clear all warm entries from the in-memory tier (e.g. during OS memory pressure).
+    pub fn clear_warm(&mut self) {
+        self.warm.clear();
+        self.warm_bytes = 0;
     }
 
-    /// Number of warm entries.
-    pub fn warm_count(&self) -> usize {
-        self.warm.len()
+    /// Clear all cache entries for this model (both warm memory tier and cold disk tier).
+    pub fn clear(&mut self) {
+        self.clear_warm();
+        #[cfg(feature = "disk-cache")]
+        if let Some(dir) = &self.config.cache_dir {
+            let fp_prefix = format!("{:016x}_", self.model_fingerprint);
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&fp_prefix)
+                        && (name_str.ends_with(".kvcache") || name_str.contains(".kvcache.tmp."))
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
 
-    fn evict_warm_if_needed(&mut self, new_bytes: u64) {
+    fn promote_cold_to_warm(&mut self, snapshot: &StateSnapshot, tokens: &[u32]) {
+        if self.config.max_warm_entries == 0 || self.config.max_warm_bytes == 0 {
+            return;
+        }
+        let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
+        let hash = hash_tokens(tokens);
+        let snap_bytes = snapshot.byte_size() as u64;
+        self.evict_warm_if_needed(snap_bytes, is_anchor);
+        let tick = self.next_tick();
+        if let Some(old) = self.warm.insert(
+            hash,
+            CacheEntry {
+                tokens: tokens.to_vec(),
+                snapshot: snapshot.clone(),
+                last_used: Cell::new(tick),
+            },
+        ) {
+            self.warm_bytes -= old.snapshot.byte_size() as u64;
+        }
+        self.warm_bytes += snap_bytes;
+    }
+
+    fn evict_warm_if_needed(&mut self, new_bytes: u64, is_anchor: bool) {
+        // 1. If anchor limit is reached, specifically target and evict the oldest anchor first
+        if is_anchor
+            && self.config.max_warm_anchors > 0
+            && self.warm_anchor_count() >= self.config.max_warm_anchors
+        {
+            let oldest_anchor_key = self
+                .warm
+                .iter()
+                .filter(|(_, e)| e.snapshot.anchor_depth > 0 || e.snapshot.boundary_kind > 0)
+                .min_by_key(|(_, e)| e.last_used.get())
+                .map(|(k, _)| *k);
+            if let Some(key) = oldest_anchor_key
+                && let Some(removed) = self.warm.remove(&key)
+            {
+                self.warm_bytes -= removed.snapshot.byte_size() as u64;
+            }
+        }
+
+        // 2. Fall back to standard LRU eviction for byte-size and total entry constraints
         while (self.warm.len() >= self.config.max_warm_entries
             || self.warm_bytes + new_bytes > self.config.max_warm_bytes)
             && !self.warm.is_empty()
@@ -1753,14 +2038,30 @@ impl KvPrefixCache {
                 seq_len: snapshot.seq_len as u32,
                 tokens: Some(tokens_vec),
                 layers: Some(layers_vec),
+                format_version: 2,
+                anchor_depth: snapshot.anchor_depth,
+                boundary_kind: snapshot.boundary_kind,
+                semantic_hash: snapshot.semantic_hash,
+                shift_offset: snapshot.shift_offset,
             },
         );
         builder.finish(entry, None);
 
         let data = builder.finished_data();
         let hash = hash_tokens(tokens);
-        let path = dir.join(self.cold_filename(hash));
-        let _ = std::fs::write(&path, data);
+        let target_path = dir.join(self.cold_filename(hash));
+        let tmp_path = dir.join(format!(
+            "{:016x}_{:016x}.kvcache.tmp.{}",
+            self.model_fingerprint,
+            hash,
+            std::process::id()
+        ));
+        if std::fs::write(&tmp_path, data).is_ok() {
+            let renamed = std::fs::rename(&tmp_path, &target_path).is_ok();
+            if !renamed && std::fs::copy(&tmp_path, &target_path).is_ok() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+        }
 
         self.evict_cold_if_needed(dir);
     }
@@ -1794,9 +2095,32 @@ impl KvPrefixCache {
     }
 
     #[cfg(feature = "disk-cache")]
+    fn find_cold_anchor(&self, dir: &Path, tokens: &[u32]) -> Option<StateSnapshot> {
+        let mut best: Option<StateSnapshot> = None;
+        for prefix_len in (1..tokens.len()).rev() {
+            let prefix = &tokens[..prefix_len];
+            let hash = hash_tokens(prefix);
+            let path = dir.join(self.cold_filename(hash));
+            if path.exists()
+                && let Some(snapshot) = self.load_cold_file(&path, tokens)
+                && (snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0)
+            {
+                best = Some(snapshot);
+                break;
+            }
+        }
+        best
+    }
+
+    #[cfg(feature = "disk-cache")]
     fn load_cold_file(&self, path: &Path, expected_prefix: &[u32]) -> Option<StateSnapshot> {
         let data = std::fs::read(path).ok()?;
         let entry = flatbuffers::root::<crate::generated::cera::cache::KvCacheEntry>(&data).ok()?;
+
+        // Validate format version: must be v2 (2). Legacy/invalid format triggers graceful cache miss.
+        if entry.format_version() != 2 {
+            return None;
+        }
 
         // Validate model fingerprint.
         if entry.model_fingerprint() != self.model_fingerprint {
@@ -1871,7 +2195,14 @@ impl KvPrefixCache {
             }
         }
 
-        Some(StateSnapshot { layers, seq_len })
+        Some(StateSnapshot {
+            layers,
+            seq_len,
+            anchor_depth: entry.anchor_depth(),
+            boundary_kind: entry.boundary_kind(),
+            semantic_hash: entry.semantic_hash(),
+            shift_offset: entry.shift_offset(),
+        })
     }
 
     #[cfg(feature = "disk-cache")]
@@ -1880,18 +2211,23 @@ impl KvPrefixCache {
             return;
         };
         let fp_prefix = format!("{:016x}_", self.model_fingerprint);
-        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
-                let name_str = name.to_string_lossy();
-                name_str.starts_with(&fp_prefix) && name_str.ends_with(".kvcache")
-            })
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                Some((e.path(), meta.len(), meta.modified().ok()?))
-            })
-            .collect();
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.contains(".kvcache.tmp.") {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+            if name_str.starts_with(&fp_prefix)
+                && name_str.ends_with(".kvcache")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+            {
+                files.push((entry.path(), meta.len(), modified));
+            }
+        }
 
         let total: u64 = files.iter().map(|(_, sz, _)| sz).sum();
         if total <= self.config.max_cold_bytes {
@@ -2007,10 +2343,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cera_cold_strict_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test");
-        let snapshot = |seq_len: usize| StateSnapshot {
-            layers: Vec::new(),
-            seq_len,
-        };
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
         let tokens = [7u32, 8, 9];
 
         // Saved at exactly the query length → unusable, must not be returned.
@@ -2055,10 +2388,7 @@ mod tests {
             &cfg,
             "test",
         );
-        let snapshot = |seq_len: usize| StateSnapshot {
-            layers: Vec::new(),
-            seq_len,
-        };
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
         let tokens = [1u32, 2, 3, 4];
 
         // Only a full-length entry exists → no usable hit.
@@ -2573,7 +2903,7 @@ mod tests {
         } else {
             panic!("layer 0 should be attention");
         };
-        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &mut state.layers[1] {
             buffer.iter_mut().for_each(|x| *x = 1.0);
         }
 
@@ -2590,7 +2920,7 @@ mod tests {
             assert_eq!(key_cache.capacity(), cap_k, "capacity must be retained");
             assert_eq!(value_cache.capacity(), cap_v);
         }
-        if let LayerState::Conv { buffer } = &state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &state.layers[1] {
             assert!(
                 buffer.iter().all(|&x| x == 0.0),
                 "conv buffer must be zeroed"
@@ -2619,7 +2949,7 @@ mod tests {
                 value_cache.push(-(i as f32) * 0.25);
             }
         }
-        if let LayerState::Conv { buffer } = &mut state.layers[1] {
+        if let LayerState::Conv { buffer, .. } = &mut state.layers[1] {
             for v in buffer.iter_mut() {
                 *v = 0.7;
             }
@@ -2651,7 +2981,7 @@ mod tests {
             _ => panic!("expected attention layer 0"),
         }
         match (&fresh.layers[1], &state.layers[1]) {
-            (LayerState::Conv { buffer: br }, LayerState::Conv { buffer: bo }) => {
+            (LayerState::Conv { buffer: br, .. }, LayerState::Conv { buffer: bo, .. }) => {
                 assert_eq!(br, bo, "conv buffer must round-trip exactly")
             }
             _ => panic!("expected conv layer 1"),
@@ -2752,5 +3082,148 @@ mod tests {
             _ => panic!("expected both states to have populated compressed caches"),
         }
         assert_eq!(fresh.seq_len, state.seq_len);
+    }
+
+    #[test]
+    fn conv_history_ring_buffer_and_rollback() {
+        let buf_len = 16;
+        let mut history = ConvHistory::new(buf_len);
+        let mut buf = vec![0.0f32; buf_len];
+
+        // Push 10 snapshots with recognizable values
+        for pos in 1..=10 {
+            buf.fill(pos as f32);
+            history.push(pos, &buf);
+        }
+
+        // Roll back to pos = 5
+        let mut restored = vec![0.0f32; buf_len];
+        assert!(history.rollback_to(5, &mut restored));
+        assert_eq!(restored, vec![5.0f32; buf_len]);
+
+        // Roll back to pos = 0 (clears buffer)
+        assert!(history.rollback_to(0, &mut restored));
+        assert_eq!(restored, vec![0.0f32; buf_len]);
+
+        // Roll back to non-existent position fails cleanly
+        assert!(!history.rollback_to(99, &mut restored));
+    }
+
+    #[test]
+    fn conv_history_ring_buffer_wraparound() {
+        let buf_len = 8;
+        let mut history = ConvHistory::new(buf_len);
+        let mut buf = vec![0.0f32; buf_len];
+
+        // Push 100 snapshots (exceeding CONV_HISTORY_CAPACITY = 64)
+        for pos in 1..=100 {
+            buf.fill(pos as f32);
+            history.push(pos, &buf);
+        }
+
+        let mut restored = vec![0.0f32; buf_len];
+        // Positions within the latest 64 steps (37..=100) must be retrievable
+        assert!(history.rollback_to(100, &mut restored));
+        assert_eq!(restored, vec![100.0f32; buf_len]);
+
+        assert!(history.rollback_to(50, &mut restored));
+        assert_eq!(restored, vec![50.0f32; buf_len]);
+
+        // Older positions that fell out of the ring buffer (> 64 steps old) return false
+        assert!(!history.rollback_to(10, &mut restored));
+    }
+
+    #[test]
+    fn semantic_anchor_lookup_and_boundary_tags() {
+        let cfg = tiny_config(2, 8);
+        let mut cache = KvPrefixCache::new(
+            KvCacheConfig {
+                cache_dir: None,
+                ..KvCacheConfig::default()
+            },
+            &cfg,
+            "test_anchor",
+        );
+        let snapshot = |seq_len: usize| StateSnapshot::new(Vec::new(), seq_len);
+        let tokens = [10u32, 20, 30, 40, 50, 60, 70];
+
+        // Insert non-anchor prefix at len 5
+        cache.insert(&tokens[..5], snapshot(5));
+
+        // Insert semantic anchor at len 3 (e.g. Turn boundary)
+        cache.insert_anchor(
+            &tokens[..3],
+            snapshot(3),
+            1,
+            SemanticBoundaryKind::Turn,
+            0x12345678,
+        );
+
+        // find_deepest_semantic_anchor finds the anchor at len 3
+        let (snap, len) = cache
+            .find_deepest_semantic_anchor(&tokens)
+            .expect("must find anchor");
+        assert_eq!(len, 3);
+        assert_eq!(snap.anchor_depth, 1);
+        assert_eq!(snap.boundary_kind, SemanticBoundaryKind::Turn as u8);
+        assert_eq!(snap.semantic_hash, 0x12345678);
+
+        // Standard find_longest_prefix still prefers the longest prefix (len 5)
+        let (_, longest_len) = cache
+            .find_longest_prefix(&tokens)
+            .expect("must find longest prefix");
+        assert_eq!(longest_len, 5);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn flatbuffers_v2_disk_roundtrip_with_anchors_and_atomic_tmp() {
+        let cfg = tiny_config(2, 16);
+        let dir = std::env::temp_dir().join(format!("cera_cold_v2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KvPrefixCache::new(KvCacheConfig::default(), &cfg, "cpu:test_v2");
+
+        let snap = StateSnapshot::new(
+            vec![
+                LayerSnapshot::Attention {
+                    k_data: vec![1, 2, 3, 4],
+                    v_data: vec![5, 6, 7, 8],
+                },
+                LayerSnapshot::Conv {
+                    buffer: vec![9, 10, 11, 12],
+                },
+            ],
+            4,
+        )
+        .with_anchor(2, SemanticBoundaryKind::ToolCall, 0xdeadbeef)
+        .with_shift_offset(0);
+
+        let tokens = [100u32, 101, 102, 103];
+        cache.save_cold(&dir, &tokens, &snap);
+
+        // Verify the file was written atomically and no orphan .tmp remains
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".kvcache")
+        );
+
+        // Load from disk and verify v2 schema fields
+        let loaded = cache
+            .find_cold_prefix(&dir, &[100, 101, 102, 103, 104])
+            .expect("must load v2 snapshot from disk");
+        assert_eq!(loaded.seq_len, 4);
+        assert_eq!(loaded.anchor_depth, 2);
+        assert_eq!(loaded.boundary_kind, SemanticBoundaryKind::ToolCall as u8);
+        assert_eq!(loaded.semantic_hash, 0xdeadbeef);
+        assert_eq!(loaded.shift_offset, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

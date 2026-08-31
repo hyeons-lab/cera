@@ -163,6 +163,11 @@ impl<'a> KvCacheEntry<'a> {
   pub const VT_SEQ_LEN: ::flatbuffers::VOffsetT = 6;
   pub const VT_TOKENS: ::flatbuffers::VOffsetT = 8;
   pub const VT_LAYERS: ::flatbuffers::VOffsetT = 10;
+  pub const VT_FORMAT_VERSION: ::flatbuffers::VOffsetT = 12;
+  pub const VT_ANCHOR_DEPTH: ::flatbuffers::VOffsetT = 14;
+  pub const VT_BOUNDARY_KIND: ::flatbuffers::VOffsetT = 16;
+  pub const VT_SEMANTIC_HASH: ::flatbuffers::VOffsetT = 18;
+  pub const VT_SHIFT_OFFSET: ::flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -174,10 +179,15 @@ impl<'a> KvCacheEntry<'a> {
     args: &'args KvCacheEntryArgs<'args>
   ) -> ::flatbuffers::WIPOffset<KvCacheEntry<'bldr>> {
     let mut builder = KvCacheEntryBuilder::new(_fbb);
+    builder.add_semantic_hash(args.semantic_hash);
     builder.add_model_fingerprint(args.model_fingerprint);
+    builder.add_shift_offset(args.shift_offset);
+    builder.add_anchor_depth(args.anchor_depth);
+    builder.add_format_version(args.format_version);
     if let Some(x) = args.layers { builder.add_layers(x); }
     if let Some(x) = args.tokens { builder.add_tokens(x); }
     builder.add_seq_len(args.seq_len);
+    builder.add_boundary_kind(args.boundary_kind);
     builder.finish()
   }
 
@@ -215,6 +225,46 @@ impl<'a> KvCacheEntry<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<LayerData>>>>(KvCacheEntry::VT_LAYERS, None)}
   }
+  /// Schema format version (v2 = 2).
+  #[inline]
+  pub fn format_version(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(KvCacheEntry::VT_FORMAT_VERSION, Some(2)).unwrap()}
+  }
+  /// Depth or index of semantic anchor (0 for standard prefix).
+  #[inline]
+  pub fn anchor_depth(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(KvCacheEntry::VT_ANCHOR_DEPTH, Some(0)).unwrap()}
+  }
+  /// Boundary kind tag (0 = unspecified, 1 = turn, 2 = tool_call, 3 = tool_output, 4 = thinking, 5 = image)
+  #[inline]
+  pub fn boundary_kind(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(KvCacheEntry::VT_BOUNDARY_KIND, Some(0)).unwrap()}
+  }
+  /// Hash of semantic context.
+  #[inline]
+  pub fn semantic_hash(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(KvCacheEntry::VT_SEMANTIC_HASH, Some(0)).unwrap()}
+  }
+  /// Context shift offset if RoPE context shift occurred (0 for non-shifted).
+  #[inline]
+  pub fn shift_offset(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(KvCacheEntry::VT_SHIFT_OFFSET, Some(0)).unwrap()}
+  }
 }
 
 impl ::flatbuffers::Verifiable for KvCacheEntry<'_> {
@@ -227,6 +277,11 @@ impl ::flatbuffers::Verifiable for KvCacheEntry<'_> {
      .visit_field::<u32>("seq_len", Self::VT_SEQ_LEN, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u32>>>("tokens", Self::VT_TOKENS, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<LayerData>>>>("layers", Self::VT_LAYERS, false)?
+     .visit_field::<u32>("format_version", Self::VT_FORMAT_VERSION, false)?
+     .visit_field::<u32>("anchor_depth", Self::VT_ANCHOR_DEPTH, false)?
+     .visit_field::<u8>("boundary_kind", Self::VT_BOUNDARY_KIND, false)?
+     .visit_field::<u64>("semantic_hash", Self::VT_SEMANTIC_HASH, false)?
+     .visit_field::<u32>("shift_offset", Self::VT_SHIFT_OFFSET, false)?
      .finish();
     Ok(())
   }
@@ -236,6 +291,11 @@ pub struct KvCacheEntryArgs<'a> {
     pub seq_len: u32,
     pub tokens: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u32>>>,
     pub layers: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, ::flatbuffers::ForwardsUOffset<LayerData<'a>>>>>,
+    pub format_version: u32,
+    pub anchor_depth: u32,
+    pub boundary_kind: u8,
+    pub semantic_hash: u64,
+    pub shift_offset: u32,
 }
 impl<'a> Default for KvCacheEntryArgs<'a> {
   #[inline]
@@ -245,6 +305,11 @@ impl<'a> Default for KvCacheEntryArgs<'a> {
       seq_len: 0,
       tokens: None,
       layers: None,
+      format_version: 2,
+      anchor_depth: 0,
+      boundary_kind: 0,
+      semantic_hash: 0,
+      shift_offset: 0,
     }
   }
 }
@@ -271,6 +336,26 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> KvCacheEntryBuilder<'a, 'b, A
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(KvCacheEntry::VT_LAYERS, layers);
   }
   #[inline]
+  pub fn add_format_version(&mut self, format_version: u32) {
+    self.fbb_.push_slot::<u32>(KvCacheEntry::VT_FORMAT_VERSION, format_version, 2);
+  }
+  #[inline]
+  pub fn add_anchor_depth(&mut self, anchor_depth: u32) {
+    self.fbb_.push_slot::<u32>(KvCacheEntry::VT_ANCHOR_DEPTH, anchor_depth, 0);
+  }
+  #[inline]
+  pub fn add_boundary_kind(&mut self, boundary_kind: u8) {
+    self.fbb_.push_slot::<u8>(KvCacheEntry::VT_BOUNDARY_KIND, boundary_kind, 0);
+  }
+  #[inline]
+  pub fn add_semantic_hash(&mut self, semantic_hash: u64) {
+    self.fbb_.push_slot::<u64>(KvCacheEntry::VT_SEMANTIC_HASH, semantic_hash, 0);
+  }
+  #[inline]
+  pub fn add_shift_offset(&mut self, shift_offset: u32) {
+    self.fbb_.push_slot::<u32>(KvCacheEntry::VT_SHIFT_OFFSET, shift_offset, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> KvCacheEntryBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     KvCacheEntryBuilder {
@@ -292,6 +377,11 @@ impl ::core::fmt::Debug for KvCacheEntry<'_> {
       ds.field("seq_len", &self.seq_len());
       ds.field("tokens", &self.tokens());
       ds.field("layers", &self.layers());
+      ds.field("format_version", &self.format_version());
+      ds.field("anchor_depth", &self.anchor_depth());
+      ds.field("boundary_kind", &self.boundary_kind());
+      ds.field("semantic_hash", &self.semantic_hash());
+      ds.field("shift_offset", &self.shift_offset());
       ds.finish()
   }
 }

@@ -400,6 +400,7 @@ impl TryFrom<EngineConfig> for cera::EngineConfig {
         Ok(cera::EngineConfig {
             context_size,
             backend: c.backend.into(),
+            draft_model: None,
             bundle_repo: c.bundle_repo.map(|r| r.inner.clone()),
         })
     }
@@ -984,6 +985,8 @@ impl CeraEngine {
             model: bytes.into(),
             multimodal_projector: multimodal_projector.map(Into::into),
             audio_decoder: None,
+            audio_tokenizer: None,
+            draft_model: None,
             // `parse_str` maps anything unrecognized to `Unknown(s)`,
             // which `from_parts` rejects by name, better than silently
             // falling back to text when a caller fat-fingers the string.
@@ -1235,6 +1238,18 @@ impl CeraEngine {
         self.inner
             .tokenizer()
             .special_token_id(fmt.call_start_marker())
+    }
+
+    /// Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+    /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+    /// or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+    pub fn clear_prefix_cache(&self) {
+        self.inner.clear_warm_cache();
+    }
+
+    /// Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+    pub fn wipe_all_prefix_caches(&self) {
+        self.inner.clear_cache();
     }
 }
 
@@ -2500,6 +2515,8 @@ impl CeraEngine {
                 model: bytes.into(),
                 multimodal_projector: multimodal_projector.map(Into::into),
                 audio_decoder: None,
+                audio_tokenizer: None,
+                draft_model: None,
                 inference_type: inference_type
                     .as_deref()
                     .map(cera::manifest::InferenceType::parse_str),

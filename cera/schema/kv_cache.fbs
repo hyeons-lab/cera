@@ -22,6 +22,16 @@ table KvCacheEntry {
   tokens: [uint32];
   /// Per-layer snapshot data.
   layers: [LayerData];
+  /// Schema format version (v2 = 2).
+  format_version: uint32 = 2;
+  /// Depth or index of semantic anchor (0 for standard prefix).
+  anchor_depth: uint32 = 0;
+  /// Boundary kind tag (0 = unspecified, 1 = turn, 2 = tool_call, 3 = tool_output, 4 = thinking, 5 = image)
+  boundary_kind: uint8 = 0;
+  /// Hash of semantic context.
+  semantic_hash: uint64 = 0;
+  /// Context shift offset if RoPE context shift occurred (0 for non-shifted).
+  shift_offset: uint32 = 0;
 }
 
 root_type KvCacheEntry;
