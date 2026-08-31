@@ -1216,7 +1216,7 @@ impl GpuContext {
                     .copy_from_slice(&data[0..(n_queries as usize * 8)]);
             }
             drop(data);
-            slice.unmap();
+            profiler.read_buf.unmap();
 
             let period_ns = profiler.timestamp_period as f64;
             let spans = profiler.spans.lock().unwrap_or_else(|p| p.into_inner());
