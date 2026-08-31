@@ -114,6 +114,7 @@ String _urlOf(Directory dir) {
   if (raw.startsWith('/')) return raw;
   // Normalized so `./web/cera` and `web/./cera` reduce to `web/cera`.
   final path = _normalizePath(raw);
+  if (path == 'web') return '';
   return path.startsWith('web/') ? path.substring(4) : path;
 }
 

@@ -340,8 +340,17 @@ sample_cera() { # backend label mask
   printf '%s\n' "$dec" >> "$LOG"
   # cera prints its decode summary BEFORE its prefill summary, so each value must
   # be taken from its own invocation rather than by position in the log.
-  record "$key|prefill" "$(sed -n 's/.*prefill tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$pre" | head -1)"
-  record "$key|decode" "$(sed -n 's/.*decode tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$dec" | head -1)"
+  local pf_val dc_val
+  pf_val=$(sed -n 's/.*prefill tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$pre" | head -1)
+  dc_val=$(sed -n 's/.*decode tok\/s: p50=\([0-9.]*\).*/\1/p' <<<"$dec" | head -1)
+  if [[ -z "$pf_val" ]]; then
+    echo "warning: $key prefill failed (see log for details)" | tee -a "$LOG"
+  fi
+  if [[ -z "$dc_val" ]]; then
+    echo "warning: $key decode failed (see log for details)" | tee -a "$LOG"
+  fi
+  record "$key|prefill" "$pf_val"
+  record "$key|decode" "$dc_val"
   printf '%s\n%s\n' "$pre" "$dec" | grep -E "^gpu I/O" >> "$LOG" || true
 }
 

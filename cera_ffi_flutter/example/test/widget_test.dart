@@ -7,6 +7,7 @@
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
 import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
+import 'package:cera_ffi_flutter_example/widgets/bundle_picker_dialog.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -118,4 +119,32 @@ void main() {
     expect(find.text('It is sunny today.'), findsOneWidget);
     expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);
   });
+
+  testWidgets(
+    'bundle picker dialog renders catalog with DSpark quant choices',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: BundlePickerDialog(
+              currentBundleName: 'LFM2.5-1.2B-Instruct-GGUF',
+              currentQuant: 'Q4_K_M + DSpark',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Select Model'), findsOneWidget);
+      expect(find.text('Catalog & Download'), findsOneWidget);
+
+      // Switch to Catalog & Download tab
+      await tester.tap(find.text('Catalog & Download'));
+      await tester.pumpAndSettle();
+
+      // Verify bundle list renders with DSpark sidecar indicators
+      expect(find.text('LFM2.5-1.2B-Instruct'), findsWidgets);
+      expect(find.textContaining('DSpark'), findsWidgets);
+    },
+  );
 }

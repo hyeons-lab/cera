@@ -1675,15 +1675,6 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
-      # OpenBLAS for the `blas` leg below.
-      - name: Install OpenBLAS
-        run: |
-          # See the integration-test job: a broken packages.microsoft.com
-          # InRelease intermittently breaks apt update on these runners.
-          while IFS= read -r f; do
-            sudo rm -f -- "$f"
-          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
-          sudo apt-get update && sudo apt-get install -y libopenblas-dev
       # On a PR this is the `core` set (267 MB): both int8 GEMM kernels plus the
       # K-quant path. On a main push or manual dispatch it is `all` (6.3 GB),
       # adding the dense-transformer fixtures. Two separate cache entries rather
@@ -1714,25 +1705,11 @@ jobs:
             cera-parity-fixtures-${{ steps.fixtures.outputs.set }}-
       - name: Fetch GGUF fixtures
         run: ./scripts/fetch_test_models.sh --set ${{ steps.fixtures.outputs.set }}
-      # The no-blas leg's coverage depends on the runner's ISA, so record what
-      # this one actually is. Without it, a green run is ambiguous between
-      # "batched path verified" and "batched path skipped for lack of avx2+fma"
-      # (the bar used to be VNNI; the AVX2 int8 kernels lowered it).
+      # The native leg's coverage depends on the runner's ISA, so record what
+      # this one actually is.
       - name: Report CPU tier
         run: cargo run --release -q -p cera-cli -- cpu
-      # Leg 1 — deterministic. With `blas` the batched path is OpenBLAS SGEMM,
-      # which every runner has, so this leg cannot skip for lack of hardware
-      # and its green is always meaningful. (`CERA_REQUIRE_BATCHED` is
-      # deliberately NOT set: the liveness check is `cfg(not(feature = "blas"))`,
-      # so under `blas` it compiles out and the variable would assert nothing —
-      # setting it here would look like a guarantee while doing nothing.)
-      - name: Parity (blas batched path)
-        run: |
-          cargo test -p cera --release --features blas --no-fail-fast \
-            --test llama_batched_prefill_parity \
-            --test lfm2_batched_prefill_parity \
-            -- --ignored --nocapture
-      # Leg 2 — opportunistic. Covers the x86_64 int8 path, which is what the
+      # Covers the x86_64 native int8 / K-quant SIMD paths (AVX2, AVX-512, VNNI).
       # CPU backend actually uses in a default build. Deliberately does NOT set
       # CERA_REQUIRE_BATCHED, and a missing instruction set is a coverage gap to
       # read in the log (the tests print an explicit SKIP line), not a build
@@ -1791,20 +1768,6 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
-      # OpenBLAS provides cblas_sgemm for the cera `blas` feature
-      # (linked via `openblas-src` / `cblas-sys`, see cera/Cargo.toml).
-      # On x86_64 this is the actual SGEMM impl behind
-      # `try_blas_prefill_gemm` — meaningful only after this PR lifted
-      # the `cfg(target_arch = "aarch64")` gate that previously made
-      # `--features blas` a no-op on this runner.
-      - name: Install OpenBLAS
-        run: |
-          # Remove every apt source referencing packages.microsoft.com — see the
-          # lavapipe job for why (intermittent invalid InRelease breaks update).
-          while IFS= read -r f; do
-            sudo rm -f -- "$f"
-          done < <(grep -Frl packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null || true)
-          sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Cache downloaded test models
         uses: actions/cache@v5
         with:
@@ -1819,22 +1782,15 @@ jobs:
       # `cargo test -- --ignored` without `--test` would sweep every
       # #[ignore]'d test in the workspace (Metal microbenchmarks,
       # parity tests requiring CERA_TEST_MODEL, etc.), most of which
-      # don't belong on an Ubuntu CI runner. `--features remote,blas`:
-      # `remote` for the bundle downloader + cache shim, `blas` to
-      # route SGEMM through OpenBLAS instead of the scalar fallback.
-      # `blas_correctness` is the new oracle that asserts BLAS-on-
-      # x86_64 produces tokens identical to the aarch64+blas reference;
-      # if it fails on Ubuntu CI but passes on macOS, we have a
-      # platform-specific BLAS bug to chase.
+      # don't belong on an Ubuntu CI runner.
       - name: Run gated integration tests
         env:
           CERA_TEST_DOWNLOAD: "1"
         run: |
-          cargo test -p cera --features remote,blas \
+          cargo test -p cera --features remote \
             --test shift_real_model \
             --test bundle_download \
             --test bundle_from_id \
-            --test blas_correctness \
             -- --ignored
 
   parity-test:

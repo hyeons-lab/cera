@@ -260,7 +260,7 @@ class _TurnBubble extends StatelessWidget {
                             ],
                             if (turn.stats!.ttftMs != null) ...[
                               Text(
-                                '· TTFT ${turn.stats!.ttftMs}ms',
+                                '· ${turn.stats!.tokens > 0 ? "TTFT" : "TTFA"} ${turn.stats!.ttftMs}ms',
                                 style: TextStyle(
                                   fontSize: 11,
                                   color: theme.colorScheme.onSurfaceVariant

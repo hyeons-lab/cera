@@ -42,6 +42,66 @@
 </head>
 <body>
   <script>
+    console.info('[cera:html:version] v0.5.0 (build: 2026-08-29-rev21-local-models-webgpu)');
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(regs) {
+        for (var i = 0; i < regs.length; i++) {
+          regs[i].unregister().catch(function() {});
+        }
+      }).catch(function() {});
+    }
+    if (typeof window !== 'undefined' && 'caches' in window) {
+      caches.keys().then(function(keys) {
+        for (var i = 0; i < keys.length; i++) {
+          if (keys[i].indexOf('flutter') !== -1) {
+            caches.delete(keys[i]).catch(function() {});
+          }
+        }
+      }).catch(function() {});
+    }
+
+    const LOCAL_MODELS_DIR = '/models-local';
+    function toLocalModelUrl(url) {
+      if (typeof url !== 'string' || !url.startsWith('https://huggingface.co/')) return url;
+      const base = url.split('?')[0].split('/').pop();
+      return `${LOCAL_MODELS_DIR}/${base}`;
+    }
+    if (typeof window !== 'undefined' && (location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+      const origFetch = window.fetch.bind(window);
+      window.fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+        const mapped = toLocalModelUrl(url);
+        if (mapped !== url) {
+          try {
+            const localReq = input instanceof Request ? new Request(mapped, input) : mapped;
+            const res = await origFetch(localReq, init);
+            if (res.ok) return res;
+          } catch (_) {}
+        }
+        return origFetch(input, init);
+      };
+    }
+
+    window.ceraClearOpfsCache = async function() {
+      if (!navigator.storage || !navigator.storage.getDirectory) {
+        console.warn('OPFS storage not supported');
+        return false;
+      }
+      try {
+        const root = await navigator.storage.getDirectory();
+        for await (const [name] of root.entries()) {
+          await root.removeEntry(name, { recursive: true }).catch(() => {});
+        }
+        console.info('[cera:opfs] OPFS root storage cleared successfully');
+        return true;
+      } catch (err) {
+        console.warn('[cera:opfs] failed to clear OPFS storage:', err);
+        return false;
+      }
+    };
+    if (new URLSearchParams(location.search).get('clear_opfs') === '1') {
+      window.ceraClearOpfsCache();
+    }
     window.ceraDecodeAudioBlob = async function(blobUrl, targetSr) {
       try {
         const res = await fetch(blobUrl);
@@ -69,40 +129,101 @@
     let activeStreamer = null;
 
     class CeraAudioStreamer {
-      constructor(sampleRate = 24000) {
+      constructor(sampleRate) {
         this.sampleRate = sampleRate;
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         this.ctx = new AudioCtx({ sampleRate: this.sampleRate });
-        this.nextStartTime = this.ctx.currentTime;
+        this.nextStartTime = 0;
         this.isPlaying = true;
+        this.chunkCount = 0;
+        this.prebuffer = [];
+        this.hasStartedPlayback = false;
         console.info(`[cera:audio] live streamer session started at ${sampleRate}Hz`);
       }
 
-      appendChunk(raw) {
-        if (!this.isPlaying || !raw) return;
-        const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
-        if (data.length === 0) return;
-        if (this.ctx.state === 'suspended') {
-          this.ctx.resume().catch(() => {});
-        }
+      _scheduleBuffer(data) {
         const buf = this.ctx.createBuffer(1, data.length, this.sampleRate);
         buf.copyToChannel(data, 0);
         const src = this.ctx.createBufferSource();
         src.buffer = buf;
         src.connect(this.ctx.destination);
         const cur = this.ctx.currentTime;
-        const startTime = Math.max(cur + 0.005, this.nextStartTime);
+        
+        let startTime;
+        if (!this.hasStartedPlayback) {
+          startTime = cur + 0.150;
+          this.hasStartedPlayback = true;
+        } else {
+          startTime = Math.max(cur, this.nextStartTime);
+        }
         src.start(startTime);
         this.nextStartTime = startTime + buf.duration;
+        return { startTime, cur };
+      }
+
+      appendChunk(raw) {
+        if (!this.isPlaying || !raw) return;
+        const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+        if (data.length === 0) return;
+        this.chunkCount++;
+        if (this.ctx.state === 'suspended') {
+          this.ctx.resume().catch(() => {});
+        }
+
+        // Clamp floating point audio samples to [-1.0, 1.0] before sending to Web Audio DAC
+        let clipped = 0;
+        for (let i = 0; i < data.length; i++) {
+          if (data[i] > 1.0) {
+            data[i] = 1.0;
+            clipped++;
+          } else if (data[i] < -1.0) {
+            data[i] = -1.0;
+            clipped++;
+          }
+        }
+
+        // Prebuffer at least 10 chunks (800ms) to ensure butter-smooth continuous playback
+        if (!this.hasStartedPlayback && this.prebuffer.length < 10) {
+          this.prebuffer.push(data);
+          if (this.prebuffer.length === 10) {
+            for (const chunk of this.prebuffer) {
+              this._scheduleBuffer(chunk);
+            }
+            this.prebuffer = [];
+          }
+          return;
+        }
+
+        const { startTime, cur } = this._scheduleBuffer(data);
+
+        if (this.chunkCount <= 20 || this.chunkCount % 50 === 0) {
+          let sumSq = 0, min = Infinity, max = -Infinity;
+          for (let i = 0; i < data.length; i++) {
+            const v = data[i];
+            sumSq += v * v;
+          }
+          const rms = Math.sqrt(sumSq / data.length);
+          console.info(
+            `[cera:audio] appendChunk #${this.chunkCount}: len=${data.length}, rms=${rms.toFixed(4)}, start=${startTime.toFixed(3)}s, cur=${cur.toFixed(3)}s, diff=${(startTime - cur).toFixed(3)}s`,
+          );
+        }
       }
 
       finish() {
         console.info('[cera:html] streamer finish called');
+        // Flush any remaining prebuffered chunks
+        if (this.prebuffer.length > 0) {
+          for (const chunk of this.prebuffer) {
+            this._scheduleBuffer(chunk);
+          }
+          this.prebuffer = [];
+        }
       }
 
       stop() {
         console.info('[cera:html] streamer stop called');
         this.isPlaying = false;
+        this.prebuffer = [];
         if (this.ctx && this.ctx.state !== 'closed') {
           try { this.ctx.close(); } catch (_) {}
         }
@@ -137,18 +258,33 @@
       try {
         const manifestUrl = `https://huggingface.co/LiquidAI/LeapBundles/raw/main/${bundleName}/${quant}.json`;
         const manifestRes = await fetch(manifestUrl);
-        if (!manifestRes.ok) return '{}';
-        const manifest = await manifestRes.json();
-        const loadTime = manifest.load_time_parameters || {};
         const urls = [];
-        for (const key of ['model', 'multimodal_projector', 'audio_decoder', 'audio_tokenizer']) {
-          const val = loadTime[key];
-          if (val && typeof val === 'string' && val.trim().length > 0) {
-            const trimmed = val.trim();
-            const resolved = trimmed.startsWith('http') ? trimmed : new URL(trimmed, manifestUrl).href;
-            urls.push(resolved);
+        if (manifestRes.ok) {
+          const manifest = await manifestRes.json();
+          const loadTime = manifest.load_time_parameters || {};
+          for (const key of ['model', 'multimodal_projector', 'audio_decoder', 'audio_tokenizer']) {
+            const val = loadTime[key];
+            if (val && typeof val === 'string' && val.trim().length > 0) {
+              const trimmed = val.trim();
+              const resolved = trimmed.startsWith('http') ? trimmed : new URL(trimmed, manifestUrl).href;
+              urls.push(resolved);
+            }
+          }
+        } else {
+          const cleanQuant = quant.split(/[\+\s]/)[0];
+          if (bundleName.includes('VL-3B')) {
+            const mmprojQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : 'Q8_0';
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-${cleanQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-${mmprojQuant}.gguf`);
+          } else if (bundleName.includes('Audio')) {
+            const sidecarQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : (cleanQuant === 'Q8_0' ? 'Q8_0' : 'Q4_0');
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/LFM2.5-Audio-1.5B-${cleanQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/mmproj-LFM2.5-Audio-1.5B-${sidecarQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF-LEAP/resolve/main/vocoder-LFM2.5-Audio-1.5B-${sidecarQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/tokenizer-LFM2.5-Audio-1.5B-${sidecarQuant}.gguf`);
           }
         }
+        if (urls.length === 0) return '{}';
         const sizes = {};
         await Promise.all(
           urls.map(async (url) => {
@@ -183,6 +319,10 @@
       }
       activeAudioCtx = ctx;
       const data = raw instanceof Float32Array ? raw : new Float32Array(raw);
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] > 1.0) data[i] = 1.0;
+        else if (data[i] < -1.0) data[i] = -1.0;
+      }
       console.info(
         `[cera:html] ceraPlayAudio called with ${data.length} samples at ${sr}Hz, ctx.state=${ctx.state}`,
       );

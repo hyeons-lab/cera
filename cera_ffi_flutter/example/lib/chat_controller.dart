@@ -16,6 +16,10 @@ class ChatController extends ValueNotifier<ChatState> {
   ChatController({Future<String?> Function()? defaultStoreDir})
     : _defaultStoreDir = defaultStoreDir ?? (() async => null),
       super(const ChatState()) {
+    const kAppRevisionBadge = 'rev20-clean-cpu-depthformer-webgpu-llm';
+    debugPrint(
+      '[cera:chat:version] ChatController v0.5.0 (build: $kAppRevisionBadge)',
+    );
     _loadDownloadedRecords();
   }
 
@@ -75,7 +79,16 @@ class ChatController extends ValueNotifier<ChatState> {
       case UpdateSettingsIntent():
         await _onUpdateSettings(intent);
       case SetUIModeIntent():
-        value = value.copyWith(uiMode: intent.mode);
+        var newSettings = value.settings;
+        if (intent.mode == AppUIMode.ttsStudio) {
+          if ((value.capabilities?.audioOut ?? false) &&
+              newSettings.audioChatMode != AudioChatMode.textToSpeech) {
+            newSettings = newSettings.copyWith(
+              audioChatMode: AudioChatMode.textToSpeech,
+            );
+          }
+        }
+        value = value.copyWith(uiMode: intent.mode, settings: newSettings);
     }
   }
 
@@ -266,6 +279,9 @@ class ChatController extends ValueNotifier<ChatState> {
   }
 
   Future<void> _onLoadBundle(LoadBundleIntent intent) async {
+    debugPrint(
+      '[cera:flutter] LoadBundleIntent: bundleName=${intent.bundleName}, quant=${intent.quant}, displayName=${intent.displayName}',
+    );
     final label = '${intent.displayName} · ${intent.quant}';
     final bundleSource = BundleModelSource(
       name: label,
@@ -330,7 +346,8 @@ class ChatController extends ValueNotifier<ChatState> {
     Map<String, int> knownFileSizes = {};
     if (isBundle && bundleName != null && quant != null) {
       try {
-        knownFileSizes = await probeBundleFileSizes(bundleName, quant);
+        final cleanQuant = quant.contains(' ') ? quant.split(' ').first : quant;
+        knownFileSizes = await probeBundleFileSizes(bundleName, cleanQuant);
       } catch (_) {}
     }
 
@@ -534,9 +551,17 @@ class ChatController extends ValueNotifier<ChatState> {
       initialStatus = 'Thinking...';
     }
 
+    final rawPromptText = prompt.trim();
+    final promptText = isTts
+        ? normalizeSpeechText(rawPromptText)
+        : rawPromptText;
+    final framedPromptText = promptText.isNotEmpty
+        ? promptText
+        : (imageBytes != null ? 'Describe this image.' : '');
+
     final assistantTurn = Turn(
       role: 'assistant',
-      text: '',
+      text: isTts ? framedPromptText : '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
       statusText: initialStatus,
@@ -549,20 +574,18 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    final promptText = prompt.trim();
-    final framedPromptText = promptText.isNotEmpty
-        ? promptText
-        : (imageBytes != null ? 'Describe this image.' : '');
+    final modelLabel = value.loadedModel is BundleModelSource
+        ? '${(value.loadedModel as BundleModelSource).bundleName} (${(value.loadedModel as BundleModelSource).quant})'
+        : (value.loadedModel?.name ?? 'unknown');
 
     debugPrint(
-      '[cera:chat] Submitting user message: "$framedPromptText" '
+      '[cera:chat] Submitting user message for "$modelLabel": "$framedPromptText" '
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
     final voicePersona = value.uiMode == AppUIMode.ttsStudio
         ? value.settings.ttsStudioVoice
         : value.settings.chatVoice;
-
     final String? systemPrompt = isTts
         ? 'Perform TTS. $voicePersona'.trim()
         : (isInterleaved
@@ -782,12 +805,19 @@ class ChatController extends ValueNotifier<ChatState> {
     _generationCompleter = done;
     var hasError = false;
 
+    final modelLabel = value.loadedModel is BundleModelSource
+        ? '${(value.loadedModel as BundleModelSource).bundleName} (${(value.loadedModel as BundleModelSource).quant})'
+        : (value.loadedModel?.name ?? 'unknown');
+
     debugPrint(
-      '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) and starting generation...',
+      '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) for "$modelLabel" and starting generation...',
     );
 
     final generatedAudioSamples = <double>[];
     int? audioSampleRate;
+    int? firstAudioMs;
+    int? lastAudioMs;
+    int audioChunkCount = 0;
     final mode = value.settings.audioChatMode;
     final isTts = mode == AudioChatMode.textToSpeech;
     final isAudioChat = mode == AudioChatMode.interleaved || isTts;
@@ -808,6 +838,10 @@ class ChatController extends ValueNotifier<ChatState> {
                 if (rate <= 0 || _disposed || _generationId != generationId) {
                   return;
                 }
+                final nowMs = stopwatch.elapsedMilliseconds;
+                firstAudioMs ??= nowMs;
+                lastAudioMs = nowMs;
+                audioChunkCount++;
                 debugPrint(
                   '[cera:chat] Received ${pcm.length} audio samples at $rate Hz',
                 );
@@ -832,13 +866,15 @@ class ChatController extends ValueNotifier<ChatState> {
             firstTokenMs = stopwatch.elapsedMilliseconds;
             debugPrint('[cera:chat] First token received in ${firstTokenMs}ms');
           }
-          _updateLastTurn(
-            (t) => t.copyWith(
-              isGenerating: true,
-              statusText: () => null,
-              text: t.text + piece,
-            ),
-          );
+          if (!isTts) {
+            _updateLastTurn(
+              (t) => t.copyWith(
+                isGenerating: true,
+                statusText: () => null,
+                text: t.text + piece,
+              ),
+            );
+          }
         },
         onError: (err) {
           hasError = true;
@@ -902,8 +938,10 @@ class ChatController extends ValueNotifier<ChatState> {
       }
 
       final totalMs = stopwatch.elapsedMilliseconds;
-      final ttft = firstTokenMs;
-      final decodeMs = ttft != null ? (totalMs - ttft) : totalMs;
+      final ttft = firstTokenMs ?? firstAudioMs;
+      final decodeMs = firstTokenMs != null
+          ? (totalMs - firstTokenMs!)
+          : (firstAudioMs != null ? (totalMs - firstAudioMs!) : totalMs);
       final tps = totalTokens > 1 && decodeMs > 0
           ? ((totalTokens - 1) / (decodeMs / 1000.0))
           : (totalTokens == 1 && totalMs > 0
@@ -914,9 +952,25 @@ class ChatController extends ValueNotifier<ChatState> {
       final audioDurationSec = generatedAudioSamples.isNotEmpty
           ? (generatedAudioSamples.length / rate)
           : null;
-      final audioRtf = (audioDurationSec != null && totalMs > 0)
-          ? (audioDurationSec / (totalMs / 1000.0))
-          : null;
+
+      double? audioRtf;
+      if (audioDurationSec != null) {
+        double audioGenMs;
+        if (firstAudioMs != null &&
+            lastAudioMs != null &&
+            audioChunkCount > 1) {
+          final intervalMs = lastAudioMs! - firstAudioMs!;
+          final perChunkMs = intervalMs / (audioChunkCount - 1);
+          audioGenMs = perChunkMs * audioChunkCount;
+        } else if (firstAudioMs != null) {
+          audioGenMs = (totalMs - firstAudioMs!).toDouble();
+        } else {
+          audioGenMs = decodeMs.toDouble();
+        }
+        if (audioGenMs > 0) {
+          audioRtf = audioDurationSec / (audioGenMs / 1000.0);
+        }
+      }
 
       stats = TurnStats(
         tokens: totalTokens,
@@ -927,9 +981,10 @@ class ChatController extends ValueNotifier<ChatState> {
         audioRtf: audioRtf,
       );
 
+      final latencyLabel = totalTokens > 0 ? 'TTFT' : 'TTFA';
       debugPrint(
-        '[cera:chat] Generation completed: $totalTokens tokens in ${totalMs}ms '
-        '(${tps.toStringAsFixed(1)} tok/s, TTFT: ${ttft ?? totalMs}ms'
+        '[cera:chat] Generation completed for "$modelLabel": $totalTokens tokens in ${totalMs}ms '
+        '(${tps.toStringAsFixed(1)} tok/s, $latencyLabel: ${ttft ?? totalMs}ms'
         '${audioDurationSec != null ? ", ${audioDurationSec.toStringAsFixed(1)}s audio, RTF: ${audioRtf?.toStringAsFixed(2)}x" : ""})',
       );
     }
@@ -1049,4 +1104,39 @@ class ChatController extends ValueNotifier<ChatState> {
     _ceraEngine?.terminate();
     super.dispose();
   }
+}
+
+/// Normalizes and cleans raw text for speech synthesis by removing timestamps,
+/// stage directions in parentheses, corrupted Unicode characters, and formatting markers.
+String normalizeSpeechText(String input) {
+  var text = input;
+  // Strip Unicode replacement characters and corrupted bytes
+  text = text.replaceAll('\uFFFD', ' ');
+  // Strip bracketed and parenthesized timestamps (e.g., [0:00 - 0:04] or (0:00 - 0:38))
+  text = text.replaceAll(
+    RegExp(r'\[\s*\d+:\d+\s*(?:[-~]\s*\d+:\d+)?\s*\]'),
+    ' ',
+  );
+  text = text.replaceAll(
+    RegExp(r'\(\s*\d+:\d+\s*(?:[-~]\s*\d+:\d+)?\s*\)'),
+    ' ',
+  );
+  // Strip script stage directions in parentheses (e.g., (App loading...), (Card: ...))
+  text = text.replaceAll(
+    RegExp(
+      r'\([^)]*(?:Card|App|Screen|Demo|Intro|Summary|Deep dive|Full draft|Confirmation|Gmail|LinkedIn|transition|scene|visual|photo)[^)]*\)',
+      caseSensitive: false,
+    ),
+    ' ',
+  );
+  // Strip voiceover script headers (e.g., Voiceover Script "...")
+  text = text.replaceAll(
+    RegExp(r'Voiceover Script[^\n]*\n?', caseSensitive: false),
+    ' ',
+  );
+  // Normalize quotes and dashes into natural speech pauses
+  text = text.replaceAll(RegExp(r'["“”]'), '');
+  text = text.replaceAll(RegExp(r'[\u2014\u2013]'), ', ');
+  text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return text;
 }
