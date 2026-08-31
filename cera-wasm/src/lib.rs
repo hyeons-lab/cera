@@ -3606,8 +3606,9 @@ mod webgpu {
                     && sampler.is_none()
                     && let Some(ref mut drafter) = self.drafter
                 {
+                    let suggested_k = drafter.suggested_k().unwrap_or(2);
                     let room = max_seq_len.saturating_sub(pos + 1);
-                    let max_k = 2.min(room);
+                    let max_k = suggested_k.min(room);
                     if max_k > 0 {
                         let drafted = drafter.draft(&token_history, max_k);
                         if !drafted.is_empty() {
