@@ -32,7 +32,6 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft.workspace = true
 flatbuffers.workspace = true
-cblas-sys = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 # Image decode + resize for the VL input preprocessor. PNG + JPEG
@@ -40,14 +39,11 @@ sha2 = { workspace = true, optional = true }
 # don't pay for themselves until users demand WebP/AVIF/etc.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
-# BLAS providers: Apple Accelerate on macOS + iOS (unlocks AMX), OpenBLAS elsewhere.
-# Only the provider crate for the current target is pulled in, so cross-platform
-# builds with the `blas` feature work out of the box on supported hosts.
+# BLAS provider: Apple Accelerate on macOS + iOS (unlocks hardware AMX coprocessor).
+# Non-Apple platforms (Linux, Android, Windows, WASM) exclusively use Cera's native SIMD kernels.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 accelerate-src = { workspace = true, optional = true }
-
-[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
-openblas-src = { workspace = true, optional = true }
+cblas-sys = { workspace = true, optional = true }
 
 # `sched_setaffinity` + `cpu_set_t` for pinning the compute thread pool's
 # workers to performance cores. Linux + Android only (Darwin ignores affinity
@@ -188,7 +184,7 @@ mmap = ["dep:memmap2", "std-fs"]
 disk-cache = ["std-fs"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:futures-channel"]
 metal = ["dep:metal", "dep:objc", "mmap"]
-blas = ["dep:cblas-sys", "dep:accelerate-src", "dep:openblas-src"]
+blas = ["dep:cblas-sys", "dep:accelerate-src"]
 # BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and
 # tightly-scoped embedded builds don't pull reqwest. (See
 # `src/bundle/mod.rs` for the verification policy.)

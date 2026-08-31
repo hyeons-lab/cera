@@ -59,6 +59,13 @@ fn main() {
     if want_wgsl || want_msl {
         compile_slang_multitarget(want_wgsl, want_msl);
     }
+
+    // Emit `has_blas` only when the `blas` feature is active on Apple platforms (macOS/iOS).
+    // Non-Apple targets (Linux, Android, Windows, wasm) exclusively run native SIMD kernels.
+    println!("cargo:rustc-check-cfg=cfg(has_blas)");
+    if std::env::var_os("CARGO_FEATURE_BLAS").is_some() && is_apple {
+        println!("cargo:rustc-cfg=has_blas");
+    }
 }
 
 /// Slang passthrough kernels, by basename under `src/backend/shaders/spirv/`.
@@ -154,6 +161,9 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "moe_route",
     "moe_gemv_q4_0",
     "moe_combine",
+    "ffn_swiglu_q4_0",
+    "gemv_q4_0_fast",
+    "gemv_q4_0_qkv",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

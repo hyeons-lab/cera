@@ -62,7 +62,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use crate::{console_info, console_warn};
+use cera::bundle::LeapBundleEntry;
 use cera::bundle::cache_key::{
     LEAP_BUNDLES_API_URL, cache_relative_segments, leap_bundles_manifest_url, parse_leap_bundles,
     validate_path_segment,
@@ -404,7 +407,7 @@ impl BundleRepo {
     }
 
     /// Cached bytes for `url`, downloading first if needed.
-    async fn read_or_download(
+    pub(crate) async fn read_or_download(
         &self,
         url: &str,
         expected_sha256: Option<&str>,
@@ -419,6 +422,33 @@ impl BundleRepo {
             )));
         };
         read_file(&handle).await
+    }
+
+    /// Ensure `url` is cached in OPFS and open a synchronous access handle to it.
+    #[allow(dead_code)]
+    pub(crate) async fn open_sync_handle(
+        &self,
+        url: &str,
+        expected_sha256: Option<&str>,
+        on_progress: Option<&Function>,
+    ) -> Result<FileSystemSyncAccessHandle, JsError> {
+        self.ensure_cached(url, expected_sha256, on_progress)
+            .await?;
+        let Some(handle) = self.file_handle(url, false).await? else {
+            return Err(JsError::new(&format!(
+                "`{url}` vanished from the cache between download and open; \
+                 another tab may have cleared the store"
+            )));
+        };
+        if !has_sync_access(&handle) {
+            return Err(JsError::new(
+                "FileSystemSyncAccessHandle is not supported in this thread context (must run inside Web Worker)",
+            ));
+        }
+        let sync = JsFuture::from(handle.create_sync_access_handle())
+            .await
+            .map_err(|e| js_err("opening OPFS sync handle", e))?;
+        Ok(sync.unchecked_into())
     }
 
     /// Whether the cached entry for `url` can be reused.
@@ -437,6 +467,27 @@ impl BundleRepo {
         let Some(handle) = self.file_handle(url, false).await? else {
             return Ok(false);
         };
+
+        // GGUF self-healing integrity validation: verify magic bytes `GGUF`
+        if url.ends_with(".gguf") {
+            let size = file_size(&handle).await?;
+            if size < 4.0 {
+                console_warn(&format!(
+                    "[cera-wasm] evicting corrupt truncated GGUF entry `{url}` (size={size} bytes)"
+                ));
+                let _ = self.remove(url.to_string()).await;
+                return Ok(false);
+            }
+            if let Ok(magic) = read_file_magic(&handle, 4).await
+                && magic != *b"GGUF"
+            {
+                console_warn(&format!(
+                    "[cera-wasm] evicting corrupt cached GGUF entry `{url}` (invalid header magic)"
+                ));
+                let _ = self.remove(url.to_string()).await;
+                return Ok(false);
+            }
+        }
 
         if let Some(expected) = expected_sha256 {
             // Fast path: trust the sidecar. We wrote it after the last
@@ -978,6 +1029,39 @@ async fn file_size(handle: &FileSystemFileHandle) -> Result<f64, JsError> {
     Ok(file.size())
 }
 
+/// Read the first `len` bytes of a cached file to probe magic headers without reading the full file into memory.
+async fn read_file_magic(handle: &FileSystemFileHandle, len: usize) -> Result<Vec<u8>, JsError> {
+    if has_sync_access(handle)
+        && let Ok(sync) = JsFuture::from(handle.create_sync_access_handle()).await
+    {
+        let sync: FileSystemSyncAccessHandle = sync.unchecked_into();
+        let size = sync
+            .get_size()
+            .map_err(|e| js_err("sizing the cache entry", e))? as usize;
+        let read_len = len.min(size);
+        let mut buf = vec![0u8; read_len];
+        let opts = FileSystemReadWriteOptions::new();
+        opts.set_at(0.0);
+        let res = sync.read_with_u8_array_and_options(&mut buf, &opts);
+        sync.close();
+        let read = res.map_err(|e| js_err("reading magic from OPFS", e))? as usize;
+        buf.truncate(read);
+        return Ok(buf);
+    }
+
+    let file: File = JsFuture::from(handle.get_file())
+        .await
+        .map_err(|e| js_err("opening the cache entry", e))?
+        .unchecked_into();
+    let slice = file
+        .slice_with_f64_and_f64(0.0, len as f64)
+        .map_err(|e| js_err("slicing cache entry", e))?;
+    let buffer = JsFuture::from(slice.array_buffer())
+        .await
+        .map_err(|e| js_err("reading slice from cache entry", e))?;
+    Ok(Uint8Array::new(&buffer).to_vec())
+}
+
 /// Read a cached file into wasm memory.
 ///
 /// Uses a sync access handle when the scope allows one: `read` fills a
@@ -993,7 +1077,22 @@ async fn read_file(handle: &FileSystemFileHandle) -> Result<Vec<u8>, JsError> {
         let size = sync
             .get_size()
             .map_err(|e| js_err("sizing the cache entry", e))?;
-        let mut buf = vec![0u8; size as usize];
+        if size > 2_147_483_648.0 {
+            sync.close();
+            return Err(JsError::new(&format!(
+                "model file ({:.2} GB) exceeds 32-bit WebAssembly memory limits (max ~2 GB); please select a quantized variant (e.g. Q4_K_M, Q4_0)",
+                size / (1024.0 * 1024.0 * 1024.0)
+            )));
+        }
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(size as usize).is_err() {
+            sync.close();
+            return Err(JsError::new(&format!(
+                "insufficient WebAssembly linear memory to allocate {:.2} GB for model; please use a quantized variant (e.g. Q4_K_M, Q4_0)",
+                size / (1024.0 * 1024.0 * 1024.0)
+            )));
+        }
+        buf.resize(size as usize, 0);
         let read = sync.read_with_u8_array(&mut buf);
         // Release the exclusive lock before propagating any error, or
         // the next open of this file fails with NoModificationAllowed.
@@ -1185,7 +1284,25 @@ pub async fn list_leap_bundles() -> Result<JsValue, JsError> {
     .as_string()
     .ok_or_else(|| JsError::new("the LeapBundles catalog was not text"))?;
 
-    let entries = parse_leap_bundles(&body).map_err(|e| JsError::new(&e.to_string()))?;
+    let mut entries = parse_leap_bundles(&body).map_err(|e| JsError::new(&e.to_string()))?;
+    let target_name = "LFM2.5-VL-3B-GGUF";
+    if let Err(pos) = entries.binary_search_by(|e| e.name.as_str().cmp(target_name)) {
+        entries.insert(
+            pos,
+            LeapBundleEntry {
+                name: target_name.to_string(),
+                quants: vec![
+                    "BF16".to_string(),
+                    "F16".to_string(),
+                    "Q4_0".to_string(),
+                    "Q4_K_M".to_string(),
+                    "Q5_K_M".to_string(),
+                    "Q6_K".to_string(),
+                    "Q8_0".to_string(),
+                ],
+            },
+        );
+    }
     let out = js_sys::Array::new();
     for entry in entries {
         let obj = js_sys::Object::new();
@@ -1198,6 +1315,23 @@ pub async fn list_leap_bundles() -> Result<JsValue, JsError> {
         out.push(&obj);
     }
     Ok(out.into())
+}
+
+/// Read GGUF metadata and tensor directory from an OPFS sync handle without buffering the full model in memory.
+pub fn read_gguf_header_from_sync_handle(
+    sync: &FileSystemSyncAccessHandle,
+) -> Result<cera::gguf::GgufFile, JsError> {
+    let file_size = sync.get_size().map_err(|e| js_err("sizing GGUF file", e))? as u64;
+    let header_read_size = ((4 * 1024 * 1024) as u64).min(file_size) as usize;
+    let mut header_buf = vec![0u8; header_read_size];
+    let opts = FileSystemReadWriteOptions::new();
+    opts.set_at(0.0);
+    let read = sync
+        .read_with_u8_array_and_options(&mut header_buf, &opts)
+        .map_err(|e| js_err("reading GGUF header from OPFS", e))?;
+    header_buf.truncate(read as usize);
+    cera::gguf::GgufFile::from_header_bytes(Arc::from(header_buf.into_boxed_slice()), file_size)
+        .map_err(|e| JsError::new(&format!("parsing GGUF header from OPFS: {e:#}")))
 }
 
 fn set(obj: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), JsError> {
@@ -1218,9 +1352,127 @@ pub(crate) async fn load_bundle(
     quant: &str,
     on_progress: Option<&Function>,
 ) -> Result<cera::ModelBytes, JsError> {
-    let manifest_url =
-        leap_bundles_manifest_url(bundle_id, quant).map_err(|e| JsError::new(&e.to_string()))?;
-    load_manifest(repo, &manifest_url, on_progress).await
+    let want_dspark = quant.contains("DSpark") || quant.contains("dspark");
+    let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+    console_info(&format!(
+        "[cera-wasm] load_bundle: bundle_id=\"{bundle_id}\", quant=\"{quant}\", want_dspark={want_dspark}, clean_quant=\"{clean_quant}\""
+    ));
+    let mut model_bytes =
+        if let Some(manifest) = cera::bundle::known_bundle_manifest(bundle_id, clean_quant) {
+            load_manifest_struct(
+                repo,
+                &manifest,
+                "https://huggingface.co/LiquidAI/LeapBundles",
+                on_progress,
+            )
+            .await?
+        } else {
+            let manifest_url = leap_bundles_manifest_url(bundle_id, clean_quant)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            load_manifest(repo, &manifest_url, on_progress).await?
+        };
+    let companion_url = if want_dspark && model_bytes.draft_model.is_none() {
+        cera::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
+    } else {
+        None
+    };
+    console_info(&format!(
+        "[cera-wasm] companion DSpark draft URL: {companion_url:?}"
+    ));
+    if let Some(draft_url) = companion_url {
+        console_info(&format!(
+            "[cera-wasm] downloading/reading companion DSpark draft GGUF from \"{draft_url}\"..."
+        ));
+        match repo.read_or_download(&draft_url, None, on_progress).await {
+            Ok(draft) => {
+                console_info(&format!(
+                    "[cera-wasm] companion DSpark draft GGUF loaded: {} bytes",
+                    draft.len()
+                ));
+                model_bytes.draft_model = Some(draft.into());
+            }
+            Err(e) => {
+                console_warn(&format!(
+                    "[cera-wasm] failed to download/read companion DSpark draft from \"{draft_url}\": {e:?}"
+                ));
+            }
+        }
+    }
+    Ok(model_bytes)
+}
+
+/// Load the bundle described by the parsed manifest.
+pub(crate) async fn load_manifest_struct(
+    repo: &BundleRepo,
+    manifest: &cera::manifest::Manifest,
+    base_url: &str,
+    on_progress: Option<&Function>,
+) -> Result<cera::ModelBytes, JsError> {
+    let model_url = join_url(base_url, &manifest.files.model).map_err(|e| JsError::new(&e))?;
+    let model = repo.read_or_download(&model_url, None, on_progress).await?;
+
+    let mmproj = match manifest
+        .files
+        .multimodal_projector
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(rel) => {
+            let url = join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+            Some(repo.read_or_download(&url, None, on_progress).await?)
+        }
+        None => None,
+    };
+
+    let audio_decoder = match manifest
+        .files
+        .audio_decoder
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(rel) => {
+            let url = join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+            Some(repo.read_or_download(&url, None, on_progress).await?)
+        }
+        None => None,
+    };
+
+    let audio_tokenizer = match manifest
+        .files
+        .audio_tokenizer
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(rel) => {
+            let url = join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+            Some(repo.read_or_download(&url, None, on_progress).await?)
+        }
+        None => None,
+    };
+
+    let draft_model = match manifest
+        .files
+        .draft_model
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(rel) => {
+            let url = join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+            Some(repo.read_or_download(&url, None, on_progress).await?)
+        }
+        None => None,
+    };
+
+    Ok(cera::ModelBytes {
+        model: model.into(),
+        multimodal_projector: mmproj.map(Into::into),
+        audio_decoder: audio_decoder.map(Into::into),
+        audio_tokenizer: audio_tokenizer.map(Into::into),
+        draft_model: draft_model.map(Into::into),
+        inference_type: Some(manifest.inference_type.clone()),
+        chat_template: manifest.chat_template.clone(),
+        generation_defaults: Some(manifest.generation_defaults.clone()),
+    })
 }
 
 /// Load the bundle described by the manifest at `manifest_url`.
@@ -1234,37 +1486,7 @@ pub(crate) async fn load_manifest(
         .await?;
     let manifest = cera::manifest::Manifest::from_bytes(&manifest_bytes)
         .map_err(|e| JsError::new(&format!("parsing `{manifest_url}`: {e:#}")))?;
-
-    let model_url = join_url(manifest_url, &manifest.files.model).map_err(|e| JsError::new(&e))?;
-    let model = repo.read_or_download(&model_url, None, on_progress).await?;
-
-    let mmproj = match manifest.files.multimodal_projector.as_deref() {
-        Some(rel) => {
-            let url = join_url(manifest_url, rel).map_err(|e| JsError::new(&e))?;
-            Some(repo.read_or_download(&url, None, on_progress).await?)
-        }
-        None => None,
-    };
-
-    let audio_decoder = match manifest.files.audio_decoder.as_deref() {
-        Some(rel) => {
-            let url = join_url(manifest_url, rel).map_err(|e| JsError::new(&e))?;
-            Some(repo.read_or_download(&url, None, on_progress).await?)
-        }
-        None => None,
-    };
-
-    Ok(cera::ModelBytes {
-        model: model.into(),
-        multimodal_projector: mmproj.map(Into::into),
-        audio_decoder: audio_decoder.map(Into::into),
-        // The manifest states the modality outright, so unlike
-        // `fromGgufParts` this path never has to infer it from whether
-        // an mmproj was supplied.
-        inference_type: Some(manifest.inference_type),
-        chat_template: manifest.chat_template,
-        generation_defaults: Some(manifest.generation_defaults),
-    })
+    load_manifest_struct(repo, &manifest, manifest_url, on_progress).await
 }
 
 /// Resolve a manifest entry against the manifest's own URL.
@@ -1275,7 +1497,7 @@ pub(crate) async fn load_manifest(
 /// Returns the message rather than a `JsError` so the rules above stay
 /// testable: a `JsError` is write-only from Rust, so a test could only
 /// assert that an error occurred, not that it's the right one.
-fn join_url(manifest_url: &str, entry: &str) -> Result<String, String> {
+pub(crate) fn join_url(manifest_url: &str, entry: &str) -> Result<String, String> {
     let lower = entry.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Ok(entry.to_string());

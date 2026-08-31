@@ -87,10 +87,7 @@ fn lm_head_cost_vs_verification_batch() {
     // one result this benchmark must never be mistaken for.
     // `dense_gemm_head_fixture` fails the run rather than let that happen; the
     // capture below covers what a pre-flight gate cannot see.
-    #[cfg(all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(feature = "blas")
-    ))]
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     let (model, detail) = {
         let (model, detail) = common::dense_gemm_head_fixture(&path);
         let detail = if std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1") {
@@ -104,10 +101,7 @@ fn lm_head_cost_vs_verification_batch() {
     // row's logits come from the per-row loop. Under `blas` the batched
     // hidden-state prefill still runs — only the projection differs — so this
     // says exactly that rather than claiming the whole path changed.
-    #[cfg(not(all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(feature = "blas")
-    )))]
+    #[cfg(not(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas))))]
     let (model, detail) = {
         let model = cera::model::load_model(cera::gguf::GgufFile::open(&path).unwrap(), None, 8192)
             .unwrap();

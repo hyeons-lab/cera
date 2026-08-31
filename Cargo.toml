@@ -43,13 +43,11 @@ objc = "0.2"
 rustfft = "6.4"
 flatbuffers = "25"
 tempfile = "3"
-# BLAS bindings for SGEMM on CPU prefill. On macOS the `accelerate-src` provider
-# dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit);
-# on Linux the `openblas-src` provider pulls in OpenBLAS. Gated behind the `blas`
-# feature in the cera crate so non-BLAS builds still work via the NEON integer path.
+# BLAS bindings for SGEMM on Apple platforms (macOS/iOS). The `accelerate-src` provider
+# dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit).
+# Non-Apple platforms (Linux, Android, Windows, WASM) use Cera's native SIMD kernels.
 cblas-sys = "0.1"
 accelerate-src = "0.3"
-openblas-src = { version = "0.10", features = ["system"] }
 # Optional HTTP + hashing for the `remote` feature (BundleRepo downloader).
 # Kept OpenSSL-free via rustls-tls so cross-compile (wasm, android, iOS)
 # stays straightforward.
@@ -81,6 +79,7 @@ web-time = "1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 wasm-bindgen-test = "0.3"
+console_error_panic_hook = "0.1"
 # Worker-pool init shim that lights up rayon on `wasm32-unknown-unknown`.
 # Provides a `#[wasm_bindgen]` `init_thread_pool(num_threads)` export
 # that JS callers `await` once before any rayon work; under the hood
@@ -95,3 +94,4 @@ wasm-bindgen-rayon = "1"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+

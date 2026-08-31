@@ -158,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_warm_bytes: 0,
             max_cold_bytes: 0,
             cache_dir: None,
+            ..Default::default()
         });
     }
 

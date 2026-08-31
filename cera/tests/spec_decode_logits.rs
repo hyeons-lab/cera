@@ -542,10 +542,7 @@ fn session_spec_respects_max_seq_len() {
 /// path, precisely the false pass this test exists to prevent.
 #[test]
 #[ignore = "needs a real dense GGUF; set CERA_DENSE_MODEL"]
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 fn batched_all_logits_reaches_the_lm_head_gemm() {
     let Some(path) = dense_model_or_skip() else {
         return;

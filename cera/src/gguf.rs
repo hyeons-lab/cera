@@ -87,9 +87,10 @@ pub struct TensorInfo {
 /// default for `open(path)`; `Owned` backs `from_bytes` / `from_reader`
 /// (WASM builds, in-memory buffers, tests). Kept private — callers
 /// go through `GgufFile::mmap_data()` / `get_tensor()` / `tensor_data()`.
+#[derive(Clone)]
 enum Backing {
     #[cfg(feature = "mmap")]
-    Mmap(Mmap),
+    Mmap(Arc<Mmap>),
     Owned(Arc<[u8]>),
 }
 
@@ -139,6 +140,21 @@ pub struct GgufFile {
     /// Offset in the buffer where tensor data begins (after header +
     /// metadata + tensor infos).
     data_offset: usize,
+}
+
+impl Clone for GgufFile {
+    fn clone(&self) -> Self {
+        Self {
+            metadata: self.metadata.clone(),
+            tensors: self.tensors.clone(),
+            data: SafeDataPtr {
+                ptr: self.data.ptr,
+                len: self.data.len,
+            },
+            _backing: self._backing.clone(),
+            data_offset: self.data_offset,
+        }
+    }
 }
 
 // ── Reader helper ───────────────────────────────────────────────────────────
@@ -338,7 +354,7 @@ impl GgufFile {
         // as an acceptable risk for the duration of the `GgufFile` —
         // callers are expected not to mutate model files in-flight.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_backing(Backing::Mmap(mmap))
+        Self::from_backing(Backing::Mmap(Arc::new(mmap)))
     }
 
     /// Convenience: [`Self::open`] + wrap in `Arc`. The mmap-backed
@@ -403,10 +419,26 @@ impl GgufFile {
         Self::from_bytes(Arc::from(buf.into_boxed_slice()))
     }
 
+    /// Parse GGUF metadata and tensor index from a header byte buffer, given the total file size on disk.
+    /// Used for streaming weight loaders (e.g. browser OPFS or chunked network loaders) where the full
+    /// model payload is not buffered in RAM.
+    pub fn from_header_bytes(header_bytes: Arc<[u8]>, file_size: u64) -> Result<Self> {
+        Self::from_backing_with_file_size(Backing::Owned(header_bytes), file_size)
+    }
+
     /// Core parse: take a backing, walk the header + tensor infos, and
     /// build the final `GgufFile`. All three public constructors funnel
     /// through here so there's one source of truth for format parsing.
     fn from_backing(backing: Backing) -> Result<Self> {
+        let file_size = match &backing {
+            #[cfg(feature = "mmap")]
+            Backing::Mmap(m) => m.len() as u64,
+            Backing::Owned(a) => a.len() as u64,
+        };
+        Self::from_backing_with_file_size(backing, file_size)
+    }
+
+    fn from_backing_with_file_size(backing: Backing, file_size: u64) -> Result<Self> {
         // Derive a stable byte view of the backing. NonNull from a slice
         // of at least one byte is guaranteed non-null; for a zero-byte
         // buffer we bail early with a nicer error than the "magic
@@ -416,7 +448,7 @@ impl GgufFile {
         #[allow(clippy::infallible_destructuring_match)]
         let data_slice: &[u8] = match &backing {
             #[cfg(feature = "mmap")]
-            Backing::Mmap(m) => m,
+            Backing::Mmap(m) => m.as_ref(),
             Backing::Owned(a) => a,
         };
         ensure!(
@@ -424,7 +456,6 @@ impl GgufFile {
             "GGUF buffer too small ({} bytes; need at least 24 for the header)",
             data_slice.len()
         );
-        let file_size = data_slice.len();
 
         let ptr = NonNull::new(data_slice.as_ptr() as *mut u8)
             .expect("non-empty slice always yields non-null pointer");
@@ -528,12 +559,9 @@ impl GgufFile {
                 )
             })?;
             if size_bytes > 0 {
-                let abs_usize = usize::try_from(abs_offset).with_context(|| {
-                    format!("tensor {name} offset {abs_offset} exceeds usize range")
-                })?;
-                let end = abs_usize.checked_add(size_bytes).with_context(|| {
+                let end = abs_offset.checked_add(size_bytes as u64).with_context(|| {
                     format!(
-                        "tensor {name} end offset overflow (offset={abs_usize}, size={size_bytes})"
+                        "tensor {name} end offset overflow (offset={abs_offset}, size={size_bytes})"
                     )
                 })?;
                 ensure!(
@@ -560,7 +588,7 @@ impl GgufFile {
             tensors,
             data: SafeDataPtr {
                 ptr,
-                len: file_size,
+                len: data_slice.len(),
             },
             _backing: backing,
             data_offset,

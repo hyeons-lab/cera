@@ -26,7 +26,7 @@
 
 use anyhow::Result;
 
-use crate::backend::cpu::RopeType;
+pub use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::model::ModelConfig;
 use crate::model::transformer::WeightRef;
@@ -37,7 +37,7 @@ use crate::model::transformer::WeightRef;
 /// has no `attn_*` refs (returns `None`); a plain transformer layer has no
 /// `conv_*` refs. Callers branch on the block type and only touch the refs
 /// they expect to be `Some`.
-pub(crate) trait GpuWeightSource {
+pub trait GpuWeightSource {
     fn config(&self) -> &ModelConfig;
     fn gguf(&self) -> &GgufFile;
 
@@ -57,6 +57,16 @@ pub(crate) trait GpuWeightSource {
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`, `head_dim/2`);
     /// `None` ⇒ plain RoPE.
     fn rope_freqs(&self) -> Option<&[f32]>;
+
+    /// Token embedding tensor metadata (`token_embd.weight`).
+    fn embedding_tensor(&self) -> Result<crate::tensor::Tensor> {
+        self.gguf().get_tensor("token_embd.weight")
+    }
+
+    /// Token embedding tensor raw byte slice.
+    fn embedding_tensor_data(&self) -> Result<&[u8]> {
+        self.gguf().tensor_data("token_embd.weight")
+    }
 
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
     // The metal loader maps weights by absolute `wref.start` offset into its own
@@ -240,11 +250,11 @@ pub(crate) fn stacked_expert_layout(
             first.dtype,
         );
         anyhow::ensure!(
-            r.start == first.start + e * stride as usize,
+            r.start == first.start + (e as u64) * (stride as u64),
             "layer {layer}: {what} expert {e} starts at byte {} but a {stride}-byte stride from \
              expert 0 puts it at {}; the experts are not evenly stacked",
             r.start,
-            first.start + e * stride as usize,
+            first.start + (e as u64) * (stride as u64),
         );
         Ok(())
     })?;
