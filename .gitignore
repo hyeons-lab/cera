@@ -38,7 +38,14 @@ cera-wasm/examples/**/pkg/
 # Models
 *.gguf
 *.onnx
+*.pt
 models/
+models-local
+models-local/
+training/.venv/
+training/checkpoints/
+training/data/
+training/**/__pycache__/
 
 # Environment
 .env
