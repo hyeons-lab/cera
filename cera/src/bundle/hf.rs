@@ -516,27 +516,52 @@ const QUANT_PREFERENCE_ORDER: &[&str] = &[
 /// Only returns `Some(url)` if a draft sidecar file actually exists on Hugging Face
 /// for the given model repo/bundle and specific quantization.
 pub fn known_companion_dspark_url(bundle_or_repo: &str, quant: &str) -> Option<String> {
-    let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+    let clean_quant_buf = quant
+        .split(['+', ' '])
+        .next()
+        .unwrap_or(quant)
+        .trim()
+        .to_ascii_uppercase();
+    let clean_quant = clean_quant_buf.as_str();
     let lower = bundle_or_repo.to_ascii_lowercase();
+    let endpoint = hf_base_endpoint();
     if lower.contains("lfm2.5-2.6b") {
         match clean_quant {
-            "Q4_K_M" => Some("https://huggingface.co/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q4_K_M.gguf".to_string()),
-            "Q8_0" => Some("https://huggingface.co/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q8_0.gguf".to_string()),
-            "F16" => Some("https://huggingface.co/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-F16.gguf".to_string()),
+            "Q4_K_M" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q4_K_M.gguf"
+            )),
+            "Q8_0" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q8_0.gguf"
+            )),
+            "F16" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-2.6B-DSpark-GGUF/resolve/main/LFM2.5-2.6B-DSpark-F16.gguf"
+            )),
             _ => None,
         }
     } else if lower.contains("lfm2.5-1.2b") {
         match clean_quant {
-            "Q4_K_M" => Some("https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-Q4_K_M.gguf".to_string()),
-            "Q8_0" => Some("https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-Q8_0.gguf".to_string()),
-            "F16" => Some("https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-F16.gguf".to_string()),
+            "Q4_K_M" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-Q4_K_M.gguf"
+            )),
+            "Q8_0" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-Q8_0.gguf"
+            )),
+            "F16" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/resolve/main/LFM2.5-1.2B-Instruct-DSpark-F16.gguf"
+            )),
             _ => None,
         }
     } else if lower.contains("lfm2.5-8b") {
         match clean_quant {
-            "Q4_K_M" => Some("https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-Q4_K_M.gguf".to_string()),
-            "Q8_0" => Some("https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-Q8_0.gguf".to_string()),
-            "F16" => Some("https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-F16.gguf".to_string()),
+            "Q4_K_M" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-Q4_K_M.gguf"
+            )),
+            "Q8_0" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-Q8_0.gguf"
+            )),
+            "F16" => Some(format!(
+                "{endpoint}/LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF/resolve/main/LFM2.5-8B-A1B-DSpark-F16.gguf"
+            )),
             _ => None,
         }
     } else {

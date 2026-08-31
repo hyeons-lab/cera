@@ -107,7 +107,7 @@ fn test_turboquant_flatbuffers_v2_roundtrip_and_clear() {
     cache.clear_warm();
     assert_eq!(cache.warm_count(), 0);
 
-    // 3. Query strict prefix — must load from cold tier FlatBuffers v2 disk storage!
+    // 3. Query strict prefix - must load from cold tier FlatBuffers v2 disk storage!
     let mut query_tokens = tokens.clone();
     query_tokens.push(999);
     let (loaded, len) = cache

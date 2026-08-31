@@ -38,12 +38,8 @@ pub struct DSparkConfig {
 impl DSparkConfig {
     /// Parse DSpark configuration from a GGUF file.
     pub fn from_gguf(gguf: &GgufFile, base_vocab: usize, base_hidden: usize) -> Result<Self> {
-        let arch = gguf.get_str("general.architecture").unwrap_or("dflash");
-        let rope_type = if arch.starts_with("qwen")
-            || arch.starts_with("lfm")
-            || arch == "dflash"
-            || arch == "dspark"
-        {
+        let arch = gguf.get_str("general.architecture").unwrap_or("dspark");
+        let rope_type = if arch.starts_with("qwen") {
             cpu::RopeType::Neox
         } else {
             cpu::RopeType::Norm
@@ -164,7 +160,10 @@ impl DSparkConfig {
             num_heads.is_multiple_of(num_kv_heads),
             "DSpark num_heads ({num_heads}) must be a positive multiple of num_kv_heads ({num_kv_heads})"
         );
-        ensure!(head_dim > 0, "DSpark head_dim must be positive");
+        ensure!(
+            head_dim > 0 && head_dim.is_multiple_of(2),
+            "DSpark head_dim ({head_dim}) must be a positive even integer for RoPE rotation"
+        );
         ensure!(
             intermediate_size > 0,
             "DSpark intermediate_size must be positive"
@@ -1013,6 +1012,21 @@ pub(crate) struct DSparkGpuWeightSource {
     feature = "gpu",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
+impl DSparkGpuWeightSource {
+    fn is_base_weight(&self, wref: &WeightRef) -> bool {
+        std::ptr::eq(wref, &self.dspark.base_embd_ref)
+            || self
+                .dspark
+                .base_output_ref
+                .as_ref()
+                .is_some_and(|r| std::ptr::eq(wref, r))
+    }
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
 impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -1057,26 +1071,14 @@ impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource 
         self.dspark.base_gguf.tensor_data("token_embd.weight")
     }
     fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
-        let is_base = std::ptr::eq(wref, &self.dspark.base_embd_ref)
-            || self
-                .dspark
-                .base_output_ref
-                .as_ref()
-                .is_some_and(|r| std::ptr::eq(wref, r));
-        if is_base {
+        if self.is_base_weight(wref) {
             transformer::weight_data(&self.dspark.base_gguf, wref)
         } else {
             transformer::weight_data(&self.dspark.gguf, wref)
         }
     }
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
-        let is_base = std::ptr::eq(wref, &self.dspark.base_embd_ref)
-            || self
-                .dspark
-                .base_output_ref
-                .as_ref()
-                .is_some_and(|r| std::ptr::eq(wref, r));
-        let gguf = if is_base {
+        let gguf = if self.is_base_weight(wref) {
             &self.dspark.base_gguf
         } else {
             &self.dspark.gguf

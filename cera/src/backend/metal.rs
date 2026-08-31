@@ -107,10 +107,7 @@ impl MetalContext {
         // creation that follows. Cloning the cached `Library` (cheap,
         // it's an NSObject handle) lets us drop the lock immediately.
         {
-            let cache = self
-                .library_cache
-                .lock()
-                .expect("library_cache mutex poisoned");
+            let cache = self.library_cache.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(lib) = cache.get(&key) {
                 let library = lib.clone();
                 drop(cache);
@@ -129,7 +126,7 @@ impl MetalContext {
             .map_err(|e| anyhow::anyhow!("MSL compile failed: {e}"))?;
         self.library_cache
             .lock()
-            .expect("library_cache mutex poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .entry(key)
             .or_insert_with(|| library.clone());
         build_pipeline(&self.device, &library, entry)

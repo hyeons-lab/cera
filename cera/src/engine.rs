@@ -630,7 +630,7 @@ impl CeraEngine {
                     .to_string(),
             )
         })?;
-        let want_dspark = quant.contains("DSpark") || quant.contains("dspark");
+        let want_dspark = quant.to_ascii_lowercase().contains("dspark");
         let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
         let (mut manifest, manifest_dir) = if let Some(known) =
             crate::bundle::known_bundle_manifest(bundle_id, clean_quant)
@@ -639,7 +639,7 @@ impl CeraEngine {
         } else {
             let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, clean_quant)?;
             // No caller-supplied hash for manifest JSONs (LeapBundles schema
-            // doesn't carry one, and the file is tiny — etag fallback is
+            // doesn't carry one, and the file is tiny: etag fallback is
             // sufficient). Manifest-level per-file hashes, when they land,
             // would be threaded through from inside `from_manifest_file`.
             let manifest_path = repo.resolve_url(&manifest_url, None)?;

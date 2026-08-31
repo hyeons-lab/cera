@@ -67,6 +67,7 @@ void main(List<String> args) {
     'fromBundleIdAsync(String bundleId, String quant, EngineConfig config) {',
     'fromPathAsync(String path, EngineConfig config) {',
     'fromBytesAsync(Uint8List bytes, EngineConfig config) {',
+    'fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) {',
   ];
   for (final sig in asyncSigs) {
     final fixed = '${sig.substring(0, sig.length - 1)}async {';

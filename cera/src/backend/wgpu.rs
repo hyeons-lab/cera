@@ -1148,7 +1148,7 @@ impl GpuContext {
         profiler
             .spans
             .lock()
-            .expect("profiler mutex poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .push((label.to_string(), idx, idx + 1));
         Some(wgpu::ComputePassTimestampWrites {
             query_set: &profiler.query_set,
@@ -1165,7 +1165,7 @@ impl GpuContext {
             profiler
                 .spans
                 .lock()
-                .expect("profiler mutex poisoned")
+                .unwrap_or_else(|p| p.into_inner())
                 .clear();
         }
     }
@@ -1202,40 +1202,50 @@ impl GpuContext {
             tx.send(r).ok();
         });
         self.device.poll_wait();
-        rx.recv().unwrap().unwrap();
+        if let Ok(Ok(())) = rx.recv() {
+            let data = match slice.get_mapped_range() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("get_mapped_range failed in dump_profile: {e:?}");
+                    return;
+                }
+            };
+            let mut timestamps = vec![0u64; n_queries as usize];
+            if data.len() >= n_queries as usize * 8 {
+                bytemuck::cast_slice_mut(&mut timestamps)
+                    .copy_from_slice(&data[0..(n_queries as usize * 8)]);
+            }
+            drop(data);
+            slice.unmap();
 
-        let data = slice.get_mapped_range().expect("get_mapped_range failed");
-        let mut timestamps = vec![0u64; n_queries as usize];
-        bytemuck::cast_slice_mut(&mut timestamps)
-            .copy_from_slice(&data[0..(n_queries as usize * 8)]);
+            let period_ns = profiler.timestamp_period as f64;
+            let spans = profiler.spans.lock().unwrap_or_else(|p| p.into_inner());
 
-        let period_ns = profiler.timestamp_period as f64;
-        let spans = profiler.spans.lock().expect("profiler mutex poisoned");
+            // Aggregate by label
+            let mut totals: std::collections::HashMap<String, (f64, usize)> =
+                std::collections::HashMap::new();
+            for (label, start_idx, end_idx) in spans.iter() {
+                let start = timestamps[*start_idx as usize];
+                let end = timestamps[*end_idx as usize];
+                let us = (end.wrapping_sub(start)) as f64 * period_ns / 1000.0;
+                let entry = totals.entry(label.clone()).or_insert((0.0, 0));
+                entry.0 += us;
+                entry.1 += 1;
+            }
 
-        // Aggregate by label
-        let mut totals: std::collections::HashMap<String, (f64, usize)> =
-            std::collections::HashMap::new();
-        for (label, start_idx, end_idx) in spans.iter() {
-            let start = timestamps[*start_idx as usize];
-            let end = timestamps[*end_idx as usize];
-            let us = (end.wrapping_sub(start)) as f64 * period_ns / 1000.0;
-            let entry = totals.entry(label.clone()).or_insert((0.0, 0));
-            entry.0 += us;
-            entry.1 += 1;
+            let mut sorted: Vec<_> = totals.into_iter().collect();
+            sorted.sort_by(|a, b| {
+                b.1.0
+                    .partial_cmp(&a.1.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let total_us: f64 = sorted.iter().map(|(_, (us, _))| us).sum();
+            eprintln!("── GPU Profile ({total_us:.0}µs total) ──");
+            for (label, (us, count)) in &sorted {
+                let pct = us / total_us * 100.0;
+                eprintln!("  {label:20} {us:8.0}µs ({count:3}×) {pct:5.1}%");
+            }
         }
-
-        let mut sorted: Vec<_> = totals.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-        let total_us: f64 = sorted.iter().map(|(_, (us, _))| us).sum();
-
-        eprintln!("── GPU Profile ({total_us:.0}µs total) ──");
-        for (label, (us, count)) in &sorted {
-            let pct = us / total_us * 100.0;
-            eprintln!("  {label:20} {us:8.0}µs ({count:3}×) {pct:5.1}%");
-        }
-
-        drop(data);
-        profiler.read_buf.unmap();
     }
 }
 

@@ -10,8 +10,9 @@ Future<Map<String, int>> probeBundleFileSizes(
   final client = HttpClient();
   client.connectionTimeout = const Duration(seconds: 3);
   try {
+    final cleanQuant = quant.split(RegExp(r'[+ ]')).first.trim();
     final manifestUrl =
-        'https://huggingface.co/LiquidAI/LeapBundles/raw/main/$bundleName/$quant.json';
+        'https://huggingface.co/LiquidAI/LeapBundles/raw/main/$bundleName/$cleanQuant.json';
     final manifestUri = Uri.parse(manifestUrl);
     final fileUrls = <String>[];
     try {
@@ -32,6 +33,7 @@ Future<Map<String, int>> probeBundleFileSizes(
             'multimodal_projector',
             'audio_decoder',
             'audio_tokenizer',
+            'draft_model',
           ]) {
             final val = loadTime[key];
             if (val is String && val.trim().isNotEmpty) {

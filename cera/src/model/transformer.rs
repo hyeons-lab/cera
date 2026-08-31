@@ -1227,21 +1227,44 @@ pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
         DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
         DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {
-            let floats: &[f32] = bytemuck::cast_slice(row_data);
-            out.copy_from_slice(floats);
+            if let Ok(floats) = bytemuck::try_cast_slice::<u8, f32>(row_data) {
+                if floats.len() == out.len() {
+                    out.copy_from_slice(floats);
+                } else {
+                    for (o, &f) in out.iter_mut().zip(floats) {
+                        *o = f;
+                    }
+                }
+            } else {
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<4>().0) {
+                    *o = f32::from_le_bytes(*chunk);
+                }
+            }
         }
         DType::F16 => {
-            let halves: &[u16] = bytemuck::cast_slice(row_data);
-            assert_eq!(halves.len(), out.len(), "F16 embedding row length");
-            for (o, &h) in out.iter_mut().zip(halves) {
-                *o = crate::quant::f16_to_f32(h);
+            if let Ok(halves) = bytemuck::try_cast_slice::<u8, u16>(row_data) {
+                assert_eq!(halves.len(), out.len(), "F16 embedding row length");
+                for (o, &h) in out.iter_mut().zip(halves) {
+                    *o = crate::quant::f16_to_f32(h);
+                }
+            } else {
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
+                    let h = u16::from_le_bytes(*chunk);
+                    *o = crate::quant::f16_to_f32(h);
+                }
             }
         }
         DType::BF16 => {
-            let halves: &[u16] = bytemuck::cast_slice(row_data);
-            assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
-            for (o, &h) in out.iter_mut().zip(halves) {
-                *o = crate::quant::bf16_to_f32(h);
+            if let Ok(halves) = bytemuck::try_cast_slice::<u8, u16>(row_data) {
+                assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
+                for (o, &h) in out.iter_mut().zip(halves) {
+                    *o = crate::quant::bf16_to_f32(h);
+                }
+            } else {
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
+                    let h = u16::from_le_bytes(*chunk);
+                    *o = crate::quant::bf16_to_f32(h);
+                }
             }
         }
         _ => panic!("unsupported embedding dtype: {:?}", dtype),
@@ -1873,7 +1896,7 @@ pub(crate) fn forward_ffn_block(
     let fused_swiglu_done = false;
 
     if !fused_swiglu_done {
-        // LoRA on gate/up — BEFORE the SwiGLU mul (which reads both), input is the
+        // LoRA on gate/up - BEFORE the SwiGLU mul (which reads both), input is the
         // normed FFN input.
         if let Some(lora) = &lora {
             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {

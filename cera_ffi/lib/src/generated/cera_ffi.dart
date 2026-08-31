@@ -12839,7 +12839,7 @@ final class CeraEngine {
   /// off the caller's thread, and the vision encoder's weights are
   /// built during the load. Same weak cancellation, and both buffers
   /// are moved into the blocking task.
-  static Future<CeraEngine> fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) {
+  static Future<CeraEngine> fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) async {
     return _bindings().ceraEngineCreateFromPartsAsync(bytes, multimodalProjector, inferenceType, config);
   }
 

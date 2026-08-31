@@ -277,6 +277,12 @@ impl Manifest {
         self.inner.files.model.clone()
     }
 
+    /// URL of the companion DSpark draft model GGUF for speculative decoding.
+    #[wasm_bindgen(getter, js_name = draftModelUrl)]
+    pub fn draft_model_url(&self) -> Option<String> {
+        self.inner.files.draft_model.clone()
+    }
+
     /// URL of the multimodal projector GGUF if the manifest declares
     /// one (VL / audio models). `undefined` for plain text models.
     #[wasm_bindgen(getter, js_name = multimodalProjectorUrl)]
@@ -2192,7 +2198,7 @@ mod webgpu {
             kv_compression: Option<crate::TurboQuantConfig>,
             on_progress: Option<js_sys::Function>,
         ) -> Result<WebGpuSession, JsError> {
-            let want_dspark = quant.contains("DSpark") || quant.contains("dspark");
+            let want_dspark = quant.to_ascii_lowercase().contains("dspark");
             let clean_quant = quant.split(['+', ' ']).next().unwrap_or(&quant).trim();
             let manifest = if let Some(known) =
                 cera::bundle::known_bundle_manifest(&bundle_id, clean_quant)
@@ -3192,7 +3198,8 @@ mod webgpu {
             if let Some(ref mut d) = self.drafter {
                 cera::spec::Drafter::reset(d.as_mut());
             }
-            let mut token_history = Vec::<u32>::new();
+            let mut token_history = ids.to_vec();
+            token_history.push(next);
             let mut spec_drafted_count = 0usize;
             let mut spec_accepted_count = 0usize;
             console_info(&format!(
@@ -3204,8 +3211,6 @@ mod webgpu {
                 self.model.supports_all_logits(),
                 sampler.is_none()
             ));
-
-            let (audio_temp, audio_top_k) = (audio_temp, audio_top_k);
 
             let mut decoder = if has_audio_weights
                 && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
@@ -3262,7 +3267,7 @@ mod webgpu {
                 if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                if Some(next) == self.eos || next == 7 || next == 2 {
+                if Some(next) == self.eos || (self.eos.is_none() && (next == 7 || next == 2)) {
                     break;
                 }
 
@@ -3759,7 +3764,7 @@ mod webgpu {
             let spec_info = if spec_drafted_count > 0 {
                 let pct = (spec_accepted_count as f64) / (spec_drafted_count as f64) * 100.0;
                 format!(
-                    "\n - Speculative DSpark:   accepted {spec_accepted_count}/{spec_drafted_count} ({pct:.1}%)"
+                    "\n - Speculative Decode:   accepted {spec_accepted_count}/{spec_drafted_count} ({pct:.1}%)"
                 )
             } else {
                 String::new()

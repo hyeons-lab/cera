@@ -9,9 +9,13 @@ import subprocess
 import json
 from pathlib import Path
 
-CERA_BIN = "/Users/dberrios/development/cera/worktrees/dspark-sidecar/target/release/cera"
-DRAFT_GGUF = "/Users/dberrios/development/cera/worktrees/dspark-sidecar/training/checkpoints/lfm2.5-vl-450m-dspark-Q4_0.gguf"
-PHOTO_DIR = Path("/Users/dberrios/development/cera/worktrees/dspark-sidecar/training/data/test_photos")
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+CERA_BIN = os.environ.get("CERA_BIN", str(REPO_ROOT / "target" / "release" / "cera"))
+DRAFT_GGUF = os.environ.get(
+    "DRAFT_GGUF",
+    str(REPO_ROOT / "training" / "checkpoints" / "lfm2.5-vl-450m-dspark-Q4_0.gguf"),
+)
+PHOTO_DIR = Path(os.environ.get("PHOTO_DIR", str(REPO_ROOT / "training" / "data" / "test_photos")))
 CACHE_DIR = Path("/tmp/cera_kv_bench_cache")
 
 # Clean bench cache dir

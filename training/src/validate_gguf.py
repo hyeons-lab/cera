@@ -13,11 +13,10 @@ Tests for:
 import sys
 import os
 import argparse
-import math
 import torch
 import torch.nn.functional as F
 
-from model import DSparkMarkovModel, DSparkStandaloneModel, apply_interleaved_rope
+from model import DSparkMarkovModel
 
 def test_model_rope_diversity():
     """

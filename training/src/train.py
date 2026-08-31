@@ -21,10 +21,12 @@ from transformers import AutoModel, AutoTokenizer
 from model import DSparkStandaloneModel, DSparkMarkovModel
 from data import prepare_dataset, collate_fn
 
-def compute_acceptance_length(drafter, base_model, lm_head_weight, tok_embd_weight, eval_loader, device, block_size=9, num_batches=15, is_markov=False, target_layers=[3, 7, 11]):
+def compute_acceptance_length(drafter, base_model, lm_head_weight, tok_embd_weight, eval_loader, device, block_size=9, num_batches=15, is_markov=False, target_layers=None):
     """
     Evaluates empirical speculative acceptance length (tau out of block_size) against the target base model.
     """
+    if target_layers is None:
+        target_layers = [3, 7, 11]
     drafter.eval()
     total_accepted = 0
     total_rounds = 0
@@ -99,7 +101,7 @@ def train(args):
 
     print("Loading base model & tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    base_model = AutoModel.from_pretrained(model_id, dtype=torch.float32, trust_remote_code=True).to(device)
+    base_model = AutoModel.from_pretrained(model_id, torch_dtype=torch.float32, trust_remote_code=True).to(device)
     base_model.eval()
 
     # Freeze base model weights
@@ -237,14 +239,14 @@ def train(args):
 
         # Evaluate acceptance length
         if train_standalone:
-            acc_s = compute_acceptance_length(models["standalone"], base_model, lm_head_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=False)
+            acc_s = compute_acceptance_length(models["standalone"], base_model, tok_embd_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=False)
             print(f"  [Standalone / Cera] Mean Acceptance: {acc_s:.2f}/{block_size} tokens", flush=True)
             if acc_s > best_acceptance["standalone"]:
                 best_acceptance["standalone"] = acc_s
                 torch.save(models["standalone"].state_dict(), os.path.join(checkpoint_dir, "best_dspark_standalone.pt"))
 
         if train_markov:
-            acc_m = compute_acceptance_length(models["markov"], base_model, lm_head_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=True, target_layers=target_layers)
+            acc_m = compute_acceptance_length(models["markov"], base_model, tok_embd_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=True, target_layers=target_layers)
             print(f"  [Markov / llama.cpp] Mean Acceptance: {acc_m:.2f}/{block_size} tokens", flush=True)
             if acc_m > best_acceptance["markov"]:
                 best_acceptance["markov"] = acc_m

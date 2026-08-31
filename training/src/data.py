@@ -5,7 +5,7 @@ Streams/batches datasets, tokenizes sequences, and feeds them into the training 
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
 class DSparkTextDataset(Dataset):

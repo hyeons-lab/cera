@@ -1100,7 +1100,7 @@ pub struct GpuLfm2Model {
     /// `[MAX_PREFILL_TOKENS × intermediate_size]` — FFN up output;
     /// also reused as scratch for V projections.
     prefill_up_buf: wgpu::Buffer,
-    /// `[MAX_SPEC_TOKENS × vocab_size]` — batched speculative verification logits buffer.
+    /// `[MAX_SPEC_TOKENS × vocab_size]` - batched speculative verification logits buffer.
     prefill_all_logits_buf: wgpu::Buffer,
     // GPU state
     gpu_state: GpuState,
@@ -4966,15 +4966,21 @@ impl GpuLfm2Model {
                     state,
                     DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
                 )
-                .expect("LogitsUnsubmitted returned None");
-            self.ctx.begin_download_with_encoder(
+                .ok_or_else(|| anyhow::anyhow!("LogitsUnsubmitted returned None"))?;
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.argmax_out_buf,
                 std::mem::size_of::<u32>() as u64,
-            )
-        };
+            ))
+        }?;
         let bytes = pending.recv().await?;
-        let token = bytemuck::pod_read_unaligned::<u32>(&bytes);
+        if bytes.len() < 4 {
+            anyhow::bail!(
+                "GPU argmax readback buffer truncated (expected 4 bytes, got {})",
+                bytes.len()
+            );
+        }
+        let token = bytemuck::pod_read_unaligned::<u32>(&bytes[..4]);
         Ok(token)
     }
 
@@ -5034,7 +5040,10 @@ impl GpuLfm2Model {
             )
         };
         let bytes = pending.recv().await?;
-        let token = bytemuck::pod_read_unaligned::<u32>(&bytes);
+        if bytes.len() < std::mem::size_of::<u32>() {
+            anyhow::bail!("short read ({}) for argmax token readback", bytes.len());
+        }
+        let token = bytemuck::pod_read_unaligned::<u32>(&bytes[..4]);
         Ok(token)
     }
 

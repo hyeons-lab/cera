@@ -1352,7 +1352,7 @@ pub(crate) async fn load_bundle(
     quant: &str,
     on_progress: Option<&Function>,
 ) -> Result<cera::ModelBytes, JsError> {
-    let want_dspark = quant.contains("DSpark") || quant.contains("dspark");
+    let want_dspark = quant.to_ascii_lowercase().contains("dspark");
     let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
     console_info(&format!(
         "[cera-wasm] load_bundle: bundle_id=\"{bundle_id}\", quant=\"{quant}\", want_dspark={want_dspark}, clean_quant=\"{clean_quant}\""

@@ -9,7 +9,6 @@ Supports:
 import sys
 import os
 import torch
-import numpy as np
 import gguf
 
 def copy_tokenizer_metadata(writer: gguf.GGUFWriter):
@@ -50,8 +49,10 @@ def export_to_gguf(
     intermediate_size: int = 4096,
     block_size: int = 9,
     markov_rank: int = 256,
-    target_layers: list[int] = [3, 7, 11],
+    target_layers: list[int] | None = None,
 ):
+    if target_layers is None:
+        target_layers = [3, 7, 11]
     print(f"Loading checkpoint from {checkpoint_path}...")
     state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
@@ -60,8 +61,7 @@ def export_to_gguf(
     arch_name = "dflash" if is_markov_model else "dspark"
     gguf_writer = gguf.GGUFWriter(output_gguf_path, arch_name)
 
-    if is_markov_model:
-        copy_tokenizer_metadata(gguf_writer)
+    copy_tokenizer_metadata(gguf_writer)
 
     # Write model architecture metadata
     gguf_writer.add_architecture()
@@ -76,10 +76,10 @@ def export_to_gguf(
     gguf_writer.add_uint32(f"{arch_name}.feed_forward_length", intermediate_size)
     gguf_writer.add_uint32(f"{arch_name}.vocab_size", vocab_size)
     gguf_writer.add_float32(f"{arch_name}.attention.layer_norm_rms_epsilon", 1e-5)
+    gguf_writer.add_float32(f"{arch_name}.rope.freq_base", 10000.0)
 
     if is_markov_model:
         gguf_writer.add_uint32("dflash.context_length", 2048)
-        gguf_writer.add_uint32("dflash.block_size", block_size)
         gguf_writer.add_bool("dflash.sample_from_anchor", True)
         gguf_writer.add_uint32("tokenizer.ggml.mask_token_id", 64402)
         gguf_writer.add_uint32("tokenizer.ggml.padding_token_id", 64402)

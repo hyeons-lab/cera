@@ -132,18 +132,12 @@ struct CliDownloadProgress {
 
 impl CliDownloadProgress {
     fn reset(&self) {
-        let mut guard = self
-            .last_url
-            .lock()
-            .expect("CliDownloadProgress lock poisoned");
+        let mut guard = self.last_url.lock().unwrap_or_else(|p| p.into_inner());
         *guard = None;
     }
 
     fn finish_line(&self) {
-        let mut guard = self
-            .last_url
-            .lock()
-            .expect("CliDownloadProgress lock poisoned");
+        let mut guard = self.last_url.lock().unwrap_or_else(|p| p.into_inner());
         if guard.take().is_some() {
             eprintln!();
         }
@@ -155,10 +149,7 @@ impl cera::bundle::DownloadProgress for CliDownloadProgress {
         // URL transition → seal the prior line with a newline so it stays
         // legible after the next file's progress overwrites the position.
         {
-            let mut guard = self
-                .last_url
-                .lock()
-                .expect("CliDownloadProgress lock poisoned");
+            let mut guard = self.last_url.lock().unwrap_or_else(|p| p.into_inner());
             let new_file = guard.as_deref() != Some(url);
             if new_file {
                 if guard.is_some() {
@@ -4399,7 +4390,7 @@ fn main() -> Result<()> {
                     if engages {
                         String::new()
                     } else {
-                        " — NOTE: model/KV not eligible, decode falls back to non-spec".to_string()
+                        " - NOTE: model/KV not eligible, decode falls back to non-spec".to_string()
                     }
                 );
             }

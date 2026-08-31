@@ -1068,6 +1068,8 @@ pub struct MetalDepthformer {
     codebook_to_logits: Vec<MetalWeight>, // 8 × [1024→2049] F32
     codebook_emb_f32: Vec<Buffer>,        // 8 × [2049 × 1024] F32 for CPU lookup
     // Scratch
+    src_emb_buf: Buffer,
+    dl_cols: usize,
     hidden_buf: Buffer,
     normed_buf: Buffer,
     accum_buf: Buffer, // scratch for gemv + add_inplace residual
@@ -1225,6 +1227,7 @@ impl MetalDepthformer {
             kv_v.push(ctx.create_buffer((df_cfg.max_seq_len * kv_dim * 2) as u64));
         }
 
+        let src_emb_buf = buf(dl_cols);
         let hidden_buf = buf(n_embd);
         let normed_buf = buf(n_embd);
         let accum_buf = buf(n_embd.max(df_cfg.ffn_dim));
@@ -1245,6 +1248,8 @@ impl MetalDepthformer {
             codebook_norms,
             codebook_to_logits,
             codebook_emb_f32,
+            src_emb_buf,
+            dl_cols,
             hidden_buf,
             normed_buf,
             accum_buf,
@@ -1291,43 +1296,30 @@ impl MetalDepthformer {
             let cb = self.ctx.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
 
-            // 1. depth_linear projection: embedding → hidden_buf
+            // 1. depth_linear projection: embedding -> hidden_buf
             let dl = &self.depth_linear_slices[j];
-            // Write embedding to hidden_buf (reuse as input scratch)
-            // Actually we need the embedding in a GPU buffer. Write to normed_buf as scratch.
             unsafe {
-                let dst = self.normed_buf.contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, embedding.len());
+                let dst = self.src_emb_buf.contents() as *mut f32;
+                std::ptr::copy_nonoverlapping(
+                    embedding.as_ptr(),
+                    dst,
+                    embedding.len().min(self.dl_cols),
+                );
             }
             // depth_linear GEMV
-            self.encode_df_gemv(enc, dl, &self.normed_buf, &self.hidden_buf);
-            // Add bias on CPU (small vector, not worth GPU dispatch)
-            // Note: must happen after GPU writes hidden_buf but before reading it.
-            // We commit+wait the depth_linear GEMV separately, then add bias on CPU.
-            // Actually, we're inside a single CB — can't read back yet. Add bias after commit.
-            // For now, skip bias — it's a small additive constant unlikely to flip argmax.
-            // TODO: restructure to add bias after first CB commit
+            self.encode_df_gemv(enc, dl, &self.src_emb_buf, &self.hidden_buf);
 
             // 2. Add previous codebook's embedding (if j > 0)
             if j > 0 && prev_token >= 0 {
-                // Read embedding row from the dequantized F32 table on CPU
                 let emb_buf = &self.codebook_emb_f32[j - 1];
                 let tok = prev_token as usize;
-                // Add embedding row to hidden_buf via CPU (unified memory)
-                unsafe {
-                    let hidden = std::slice::from_raw_parts_mut(
-                        self.hidden_buf.contents() as *mut f32,
-                        n_embd,
-                    );
-                    let emb = std::slice::from_raw_parts(
-                        emb_buf.contents() as *const f32,
-                        dec.n_vocab * n_embd,
-                    );
-                    let row = &emb[tok * n_embd..(tok + 1) * n_embd];
-                    for (h, e) in hidden.iter_mut().zip(row) {
-                        *h += e;
-                    }
-                }
+                let offset = (tok * n_embd * std::mem::size_of::<f32>()) as u64;
+                let params = ElementwiseParams::new(n_embd as u32);
+                enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+                enc.set_buffer(0, Some(&self.hidden_buf), 0);
+                enc.set_buffer(1, Some(emb_buf), offset);
+                params.set(enc, 2);
+                enc.dispatch_thread_groups(sz1d((n_embd as u64).div_ceil(256)), sz1d(256));
             }
 
             // 3. Depthformer: 6 transformer layers
@@ -1451,7 +1443,7 @@ impl MetalDepthformer {
             let logits = unsafe {
                 std::slice::from_raw_parts(self.logits_buf.contents() as *const f32, dec.n_vocab)
             };
-            let sampled = if temperature <= 0.0 || top_k <= 1 {
+            let sampled = if !temperature.is_finite() || temperature <= 0.0 || top_k <= 1 {
                 crate::sampler::argmax(logits) as i32
             } else {
                 let mut logits_vec = logits.to_vec();

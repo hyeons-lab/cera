@@ -256,13 +256,14 @@
 
     window.ceraProbeBundleFiles = async function(bundleName, quant) {
       try {
-        const manifestUrl = `https://huggingface.co/LiquidAI/LeapBundles/raw/main/${bundleName}/${quant}.json`;
+        const cleanQuant = quant.split(/[\+\s]/)[0];
+        const manifestUrl = `https://huggingface.co/LiquidAI/LeapBundles/raw/main/${bundleName}/${cleanQuant}.json`;
         const manifestRes = await fetch(manifestUrl);
         const urls = [];
         if (manifestRes.ok) {
           const manifest = await manifestRes.json();
           const loadTime = manifest.load_time_parameters || {};
-          for (const key of ['model', 'multimodal_projector', 'audio_decoder', 'audio_tokenizer']) {
+          for (const key of ['model', 'multimodal_projector', 'audio_decoder', 'audio_tokenizer', 'draft_model']) {
             const val = loadTime[key];
             if (val && typeof val === 'string' && val.trim().length > 0) {
               const trimmed = val.trim();
@@ -271,7 +272,6 @@
             }
           }
         } else {
-          const cleanQuant = quant.split(/[\+\s]/)[0];
           if (bundleName.includes('VL-3B')) {
             const mmprojQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : 'Q8_0';
             urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-${cleanQuant}.gguf`);

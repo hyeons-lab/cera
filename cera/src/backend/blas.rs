@@ -1,7 +1,7 @@
 //! Thin BLAS wrapper for prefill GEMM via Apple's Accelerate framework.
 //!
 //! On macOS/iOS this dispatches through Apple's Accelerate framework, which
-//! routes SGEMM to the AMX (Apple Matrix eXtension) coprocessor unit — delivering
+//! routes SGEMM to the AMX (Apple Matrix eXtension) coprocessor unit - delivering
 //! ~1.5-2 TFLOPs f32.
 //!
 //! Non-Apple platforms (Linux, Android, Windows, WASM) exclusively use Cera's
@@ -442,20 +442,17 @@ struct AmxWorkerGuard;
 impl Drop for AmxWorkerGuard {
     fn drop(&mut self) {
         // We MUST block until the background thread is done writing to the caller's stack/heap buffers.
-        // Bounded spin-yield fallback to prevent permanent livelock if the worker panicked.
-        let mut iterations = 0u32;
+        let mut yields = 0u32;
         while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
             for _ in 0..64 {
                 core::hint::spin_loop();
             }
             if WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
-                iterations = iterations.saturating_add(1);
-                if iterations > 500_000 {
-                    // Worker thread stalled or panicked: break to avoid hanging the entire process
-                    WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
-                    return;
-                }
                 std::thread::yield_now();
+                yields += 1;
+                if yields > 1_000_000 {
+                    break;
+                }
             }
         }
         WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
@@ -463,14 +460,16 @@ impl Drop for AmxWorkerGuard {
 }
 
 static WORKER_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+static WORKER_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn init_dual_amx_pool() {
+fn init_dual_amx_pool() -> bool {
     WORKER_INIT.call_once(|| {
-        let _ = std::thread::Builder::new()
+        if let Ok(handle) = std::thread::Builder::new()
             .name("cera-amx-worker-1".into())
             .spawn(|| {
                 set_thread_affinity(2); // Cluster 1
                 let _ = WORKER_THREAD.set(std::thread::current());
+                WORKER_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);
                 loop {
                     // Spin-wait for work, parking after brief spin to prevent 100% CPU core pinning
                     let mut spins = 0u32;
@@ -483,9 +482,9 @@ fn init_dual_amx_pool() {
                         }
                     }
 
-                    // Execute task on AMX 1
+                    // Execute task on AMX 1, catching unwinds so STATE_DONE is guaranteed to be set
                     let task = unsafe { *WORKER_TASK.0.get() };
-                    unsafe {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                         cblas_sgemm(
                             CBLAS_ORDER::CblasRowMajor,
                             CBLAS_TRANSPOSE::CblasNoTrans,
@@ -502,13 +501,17 @@ fn init_dual_amx_pool() {
                             task.c_ptr as *mut f32,
                             task.ldc,
                         );
-                    }
+                    }));
 
                     // Mark done
                     WORKER_STATE.store(STATE_DONE, std::sync::atomic::Ordering::Release);
                 }
-            });
+            })
+        {
+            let _ = handle;
+        }
     });
+    WORKER_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Concurrently compute two independent GEMMs across Cluster 0 (AMX 0) and Cluster 1 (AMX 1):
@@ -544,7 +547,11 @@ pub fn sgemm_dual_parallel(
         "sgemm_dual_parallel: task 2 dimensions exceed i32::MAX"
     );
 
-    init_dual_amx_pool();
+    if !init_dual_amx_pool() {
+        sgemm_rowmajor_nt(n1, m1, k1, b1, a1, c1);
+        sgemm_rowmajor_nt(n2, m2, k2, b2, a2, c2);
+        return;
+    }
 
     // If worker is busy or contended, fall back to sequential CBLAS to avoid clobbering state
     if WORKER_STATE
@@ -629,7 +636,10 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         return;
     }
 
-    init_dual_amx_pool();
+    if !init_dual_amx_pool() {
+        sgemm_rowmajor_nt(n, m, k, b, a, c);
+        return;
+    }
 
     // If worker is busy or contended, fall back to single-threaded CBLAS
     if WORKER_STATE

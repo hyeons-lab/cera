@@ -276,7 +276,7 @@ impl Lfm2Model {
     /// Metal's (their state shapes differ even where the byte format matches); the
     /// mode tag keeps f32, f16, and each TurboQuant configuration apart.
     fn cache_namespace(&self) -> String {
-        let tag = self.kv_cache_tag.lock().expect("kv_cache_tag poisoned");
+        let tag = self.kv_cache_tag.lock().unwrap_or_else(|p| p.into_inner());
         Self::namespace_for(tag.as_deref().unwrap_or(""), &self.model_id)
     }
 

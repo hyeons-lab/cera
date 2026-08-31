@@ -87,8 +87,8 @@ class DSparkLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor = None,
-        mask: torch.Tensor = None,
+        positions: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self-attention
         norm_x = self.attn_norm(x)
@@ -214,7 +214,7 @@ class DSparkMarkovModel(nn.Module):
     """
     def __init__(
         self,
-        target_layers: list[int] = [3, 7, 11],
+        target_layers: list[int] | None = None,
         hidden_size: int = 1024,
         vocab_size: int = 65536,
         num_layers: int = 5,
@@ -226,6 +226,8 @@ class DSparkMarkovModel(nn.Module):
         freq_base: float = 10000.0,
     ):
         super().__init__()
+        if target_layers is None:
+            target_layers = [3, 7, 11]
         self.target_layers = target_layers
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
@@ -258,7 +260,7 @@ class DSparkMarkovModel(nn.Module):
         draft_token_ids: torch.Tensor,           # [B, K] = [anchor, 64402, 64402, ...]
         token_embd_weight: torch.Tensor,         # [vocab_size, hidden_size]
         base_lm_head_weight: torch.Tensor,       # [vocab_size, hidden_size]
-        prev_tokens: torch.Tensor = None,        # [B, K] real teacher-forced previous tokens
+        prev_tokens: torch.Tensor | None = None, # [B, K] real teacher-forced previous tokens
         start_pos: int = 0,                      # Context start position
     ):
         B, K = draft_token_ids.shape

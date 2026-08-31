@@ -133,7 +133,7 @@ fn agent_multi_turn_thought_stripping_anchor_hit() {
         .find_deepest_semantic_anchor(&turn2_tokens)
         .expect("must find deepest matching semantic anchor");
 
-    // Must hit Anchor 2 (len 20) — skipping all re-computation of system prompt and user question 1!
+    // Must hit Anchor 2 (len 20) - skipping all re-computation of system prompt and user question 1!
     assert_eq!(anchor_len, 20);
     assert_eq!(snap.anchor_depth, 2);
     assert_eq!(snap.boundary_kind, SemanticBoundaryKind::Turn as u8);
@@ -248,7 +248,7 @@ fn cold_tier_flatbuffers_v2_and_graceful_fallback() {
     // 1. Save valid FlatBuffers v2 snapshot via public cache.insert
     cache.insert(&tokens, snap);
 
-    // 2. Query strict prefix — must load cleanly from cold tier
+    // 2. Query strict prefix - must load cleanly from cold tier
     let (loaded, len) = cache
         .find_deepest_semantic_anchor(&[42, 43, 44, 45, 46, 47])
         .expect("must load v2 snapshot from disk");

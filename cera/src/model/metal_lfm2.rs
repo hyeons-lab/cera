@@ -3674,7 +3674,11 @@ impl MetalLfm2Model {
             }
         } else if !lora_active && let Some(timer) = &self.gpu_timer {
             timer.next_idx.store(0, Ordering::Relaxed);
-            timer.labels.lock().expect("timer mutex poisoned").clear();
+            timer
+                .labels
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
             let cb = self.ctx.queue.new_command_buffer();
             self.encode_layers_gpu_timed(cb, pos, timer);
             self.gpu_sampled_pass(timer, cb, "out", |enc| {
@@ -6172,7 +6176,7 @@ struct GpuTimer {
 impl GpuTimer {
     fn record_pair(&self, cat: &'static str, delta_ticks: u64) {
         let delta_ns = delta_ticks as f64 * self.ns_per_tick;
-        let mut totals = self.totals_ns.lock().expect("timer mutex poisoned");
+        let mut totals = self.totals_ns.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((_, v)) = totals.iter_mut().find(|(k, _)| *k == cat) {
             *v += delta_ns;
         } else {
@@ -6186,7 +6190,7 @@ impl GpuTimer {
 
     fn print(&self) {
         let tokens = self.tokens.load(Ordering::Relaxed).max(1) as f64;
-        let totals = self.totals_ns.lock().expect("timer mutex poisoned");
+        let totals = self.totals_ns.lock().unwrap_or_else(|p| p.into_inner());
         let total_ns: f64 = totals.iter().map(|(_, v)| v).sum();
         eprintln!(
             "[cera-metal] per-category GPU µs/token ({} tokens):",
@@ -6232,7 +6236,7 @@ impl CategoryTimer {
     }
 
     fn record(&self, cat: &'static str, ms: f64) {
-        let mut totals = self.totals.lock().expect("timer mutex poisoned");
+        let mut totals = self.totals.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((_, v)) = totals.iter_mut().find(|(k, _)| *k == cat) {
             *v += ms;
         } else {
@@ -6246,7 +6250,7 @@ impl CategoryTimer {
 
     fn print(&self) {
         let tokens = self.tokens.load(Ordering::Relaxed).max(1) as f64;
-        let totals = self.totals.lock().expect("timer mutex poisoned");
+        let totals = self.totals.lock().unwrap_or_else(|p| p.into_inner());
         let total_ms: f64 = totals.iter().map(|(_, v)| v).sum();
         eprintln!(
             "[cera-metal] per-category ms/token breakdown ({} tokens):",
@@ -6303,7 +6307,11 @@ impl MetalLfm2Model {
         let enc = cb.compute_command_encoder_with_descriptor(desc);
         f(enc);
         enc.end_encoding();
-        timer.labels.lock().expect("timer mutex poisoned").push(cat);
+        timer
+            .labels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(cat);
         timer.next_idx.store(idx + 2, Ordering::Relaxed);
     }
 
@@ -6319,7 +6327,7 @@ impl MetalLfm2Model {
             length: n as u64,
         };
         let samples = timer.sample_buf.resolve_counter_range(range);
-        let labels = timer.labels.lock().expect("timer mutex poisoned");
+        let labels = timer.labels.lock().unwrap_or_else(|p| p.into_inner());
         // Each category has a (start, end) pair at indices [2i, 2i+1].
         for (i, cat) in labels.iter().enumerate() {
             let a = samples[i * 2];

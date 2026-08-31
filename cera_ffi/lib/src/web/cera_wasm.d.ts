@@ -586,6 +586,10 @@ export class Manifest {
      */
     readonly modelUrl: string;
     /**
+     * URL of the companion DSpark draft model GGUF for speculative decoding.
+     */
+    readonly draftModelUrl: string | undefined;
+    /**
      * URL of the multimodal projector GGUF if the manifest declares
      * one (VL / audio models). `undefined` for plain text models.
      */

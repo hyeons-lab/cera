@@ -1915,10 +1915,7 @@ impl Session {
         // switching kernels mid-loop would complicate the reproducibility-critical
         // decode body (see the RNG-step note below) for a path that is typically
         // short. Revisit if pre-trigger prose dominates a real workload.
-        let want_greedy = opts.temperature <= 0.0
-            || opts.top_k == 1
-            || self.drafter.is_some()
-            || opts.spec.is_some();
+        let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
         let greedy = want_greedy && opts.grammar.is_none();
 
         // Speculative-decoding fast path. Engages only on the plain greedy path

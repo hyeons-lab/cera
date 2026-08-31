@@ -130,7 +130,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
   }
 
   bool _hasHfDSparkDraft(String bundleName, String quant) {
-    final clean = quant.contains(' ') ? quant.split(' ').first : quant;
+    final clean = quant.split(RegExp(r'[+ ]')).first.trim().toUpperCase();
     final name = bundleName.toLowerCase();
     // Specific model families have official DSpark draft sidecars published on Hugging Face:
     // (LiquidAI/LFM2.5-2.6B-DSpark-GGUF, LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF, LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF)
