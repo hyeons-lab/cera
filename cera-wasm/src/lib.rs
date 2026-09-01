@@ -3194,8 +3194,7 @@ mod webgpu {
             // When a draft model is attached, or when temperature is omitted on WebGPU, default to 0.0
             // rather than falling back to CPU manifest defaults (which specify temperature: 0.1).
             let has_audio_weights = self.audio_decoder.is_some() && self.detok_weights.is_some();
-            let resolved_temp =
-                temperature.unwrap_or_else(|| if has_audio_weights { 0.7 } else { 0.0 });
+            let resolved_temp = temperature.unwrap_or(if has_audio_weights { 0.7 } else { 0.0 });
             let cfg = cera::sampler::SamplerConfig {
                 temperature: resolved_temp,
                 top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
@@ -3375,13 +3374,12 @@ mod webgpu {
                                     codes: _,
                                 } => {
                                     dec.observe_pcm(&pcm);
-                                    if !pcm.is_empty() {
-                                        if let Some(cb) = on_audio {
-                                            let array = js_sys::Float32Array::from(pcm.as_slice());
-                                            let rate_val =
-                                                JsValue::from_f64(dec.sample_rate() as f64);
-                                            let _ = cb.call2(&JsValue::null(), &array, &rate_val);
-                                        }
+                                    if !pcm.is_empty()
+                                        && let Some(cb) = on_audio
+                                    {
+                                        let array = js_sys::Float32Array::from(pcm.as_slice());
+                                        let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
+                                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                                     }
                                     if dec.is_silence_terminated() {
                                         console_info(&format!(
@@ -3519,12 +3517,12 @@ mod webgpu {
                                 ..
                             } => {
                                 dec.observe_pcm(&pcm);
-                                if !pcm.is_empty() {
-                                    if let Some(cb) = on_audio {
-                                        let array = js_sys::Float32Array::from(pcm.as_slice());
-                                        let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
-                                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
-                                    }
+                                if !pcm.is_empty()
+                                    && let Some(cb) = on_audio
+                                {
+                                    let array = js_sys::Float32Array::from(pcm.as_slice());
+                                    let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
+                                    let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                                 }
                                 if text_done && dec.is_silence_terminated() {
                                     console_info(&format!(
