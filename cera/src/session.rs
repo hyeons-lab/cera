@@ -2151,7 +2151,7 @@ impl Session {
             let is_audio_transition = decoder.is_some()
                 && (token == crate::audio_engine::TOKEN_TEXT_END
                     || token == crate::audio_engine::TOKEN_AUDIO_START);
-            if is_audio_transition {
+            if decoder.is_some() && token == crate::audio_engine::TOKEN_TEXT_END {
                 text_done = true;
             }
 
@@ -2174,7 +2174,12 @@ impl Session {
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
                 pos += 1;
 
-                let mut audio_budget = crate::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET;
+                let mut audio_budget =
+                    if token == crate::audio_engine::TOKEN_AUDIO_START || text_done {
+                        usize::MAX
+                    } else {
+                        crate::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET
+                    };
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         finish = FinishReason::Cancelled;
@@ -2190,7 +2195,7 @@ impl Session {
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
                         crate::audio_engine::FrameOutcome::End => {
-                            if text_done {
+                            if is_audio_transition || text_done {
                                 break;
                             }
                             let text_end_logits = self.model.forward(
@@ -2215,7 +2220,7 @@ impl Session {
                             if !pcm.is_empty() {
                                 sink.on_audio_frames(&pcm, dec.sample_rate());
                             }
-                            if text_done && dec.is_silence_terminated() {
+                            if (is_audio_transition || text_done) && dec.is_silence_terminated() {
                                 break;
                             }
                             audio_embedding
@@ -2243,7 +2248,7 @@ impl Session {
                     self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
 
-                if text_done {
+                if is_audio_transition || text_done {
                     if finish == FinishReason::MaxTokens {
                         finish = FinishReason::Stop;
                     }

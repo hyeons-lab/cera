@@ -93,7 +93,6 @@ impl AudioSilenceWatchdog {
     pub fn observe_pcm(&mut self, pcm: &[f32]) -> f32 {
         self.audio_frames_count += 1;
         if pcm.is_empty() {
-            self.consecutive_silent_frames += 1;
             return 0.0;
         }
         let rms = (pcm.iter().map(|&x| x * x).sum::<f32>() / pcm.len() as f32).sqrt();
@@ -748,7 +747,6 @@ pub fn generate_audio(
 
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                     pos += 1;
-                    generated += 1;
                 }
 
                 if text_done {
@@ -838,7 +836,6 @@ pub fn generate_audio(
                 // Feed codes back as embedding → next hidden state.
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                 pos += 1;
-                generated += 1;
             }
         }
     }

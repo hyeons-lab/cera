@@ -2399,13 +2399,6 @@ mod webgpu {
             }
         }
 
-        /// Parse `vocoder_bytes` as an audio decoder & detokenizer and attach it,
-        /// giving this GPU session audio output synthesis via `AudioOutputDecoder`.
-        #[allow(dead_code)]
-        fn attach_vocoder(&mut self, vocoder_bytes: Arc<[u8]>) -> Result<(), JsError> {
-            self.attach_audio_sidecars(Some(vocoder_bytes), None)
-        }
-
         /// Parse audio decoder (depthformer) & detokenizer sidecars and attach them,
         /// giving this GPU session audio output synthesis via `AudioOutputDecoder`.
         fn attach_audio_sidecars(
@@ -3194,7 +3187,12 @@ mod webgpu {
             // When a draft model is attached, or when temperature is omitted on WebGPU, default to 0.0
             // rather than falling back to CPU manifest defaults (which specify temperature: 0.1).
             let has_audio_weights = self.audio_decoder.is_some() && self.detok_weights.is_some();
-            let resolved_temp = temperature.unwrap_or(if has_audio_weights { 0.7 } else { 0.0 });
+            let resolved_temp =
+                temperature.unwrap_or(if self.drafter.is_none() && has_audio_weights {
+                    0.7
+                } else {
+                    0.0
+                });
             let cfg = cera::sampler::SamplerConfig {
                 temperature: resolved_temp,
                 top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
@@ -3371,7 +3369,7 @@ mod webgpu {
                                 cera::audio_engine::FrameOutcome::Codes {
                                     audio_embedding,
                                     pcm,
-                                    codes: _,
+                                    ..
                                 } => {
                                     dec.observe_pcm(&pcm);
                                     if !pcm.is_empty()
@@ -3713,25 +3711,22 @@ mod webgpu {
                 && dec.audio_frames() > 0
             {
                 let t_fin0 = js_sys::Date::now();
-                dec.finish_async(|pcm, rate| {
-                    total_samples += pcm.len();
-                    console_info(&format!(
-                        "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
-                        pcm.len(),
-                        rate
-                    ));
-                    if let Some(cb) = on_audio {
-                        let array = js_sys::Float32Array::from(pcm);
-                        let rate_val = JsValue::from_f64(rate as f64);
-                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
-                    }
-                })
-                .await
-                .map_err(map_err)?;
+                total_samples = dec
+                    .finish_async(|pcm, rate| {
+                        console_info(&format!(
+                            "[cera-wasm] WebGpuSession vocoder finish produced {} PCM samples at {} Hz",
+                            pcm.len(),
+                            rate
+                        ));
+                        if let Some(cb) = on_audio {
+                            let array = js_sys::Float32Array::from(pcm);
+                            let rate_val = JsValue::from_f64(rate as f64);
+                            let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                        }
+                    })
+                    .await
+                    .map_err(map_err)?;
                 time_vocoder_finish_ms += js_sys::Date::now() - t_fin0;
-                if dec.streamed_samples() > 0 {
-                    total_samples = dec.streamed_samples();
-                }
                 console_info(&format!(
                     "[cera-wasm] WebGpuSession audio generation finished with {} frames and {} total samples",
                     dec.audio_frames(),
