@@ -679,7 +679,9 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         "sgemm_split2_parallel: dimensions exceed i32::MAX"
     );
 
-    if n * m < 4096 || m < 512 || !m.is_multiple_of(32) {
+    // Require 64-element alignment so m_top (m / 2) is a multiple of 32 (128 bytes),
+    // guaranteeing clean 128-byte Apple Silicon L2 cache line partition boundaries.
+    if n * m < 4096 || m < 512 || !m.is_multiple_of(64) {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;
     }
