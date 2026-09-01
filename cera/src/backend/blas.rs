@@ -119,15 +119,9 @@ pub fn sgemm_rowmajor_nt(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: 
         m
     );
 
-    let Ok(n_i) = i32::try_from(n) else {
-        return;
-    };
-    let Ok(m_i) = i32::try_from(m) else {
-        return;
-    };
-    let Ok(k_i) = i32::try_from(k) else {
-        return;
-    };
+    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nt: n exceeds i32 limits");
+    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nt: m exceeds i32 limits");
+    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nt: k exceeds i32 limits");
 
     unsafe {
         cblas_sgemm(
@@ -165,24 +159,12 @@ pub unsafe fn sgemm_rowmajor_nn_ld(
     c: *mut f32,
     ldc: usize,
 ) {
-    let Ok(n_i) = i32::try_from(n) else {
-        return;
-    };
-    let Ok(m_i) = i32::try_from(m) else {
-        return;
-    };
-    let Ok(k_i) = i32::try_from(k) else {
-        return;
-    };
-    let Ok(ldb_i) = i32::try_from(ldb) else {
-        return;
-    };
-    let Ok(lda_i) = i32::try_from(lda) else {
-        return;
-    };
-    let Ok(ldc_i) = i32::try_from(ldc) else {
-        return;
-    };
+    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nn_ld: n exceeds i32 limits");
+    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nn_ld: m exceeds i32 limits");
+    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nn_ld: k exceeds i32 limits");
+    let ldb_i = i32::try_from(ldb).expect("sgemm_rowmajor_nn_ld: ldb exceeds i32 limits");
+    let lda_i = i32::try_from(lda).expect("sgemm_rowmajor_nn_ld: lda exceeds i32 limits");
+    let ldc_i = i32::try_from(ldc).expect("sgemm_rowmajor_nn_ld: ldc exceeds i32 limits");
 
     unsafe {
         cblas_sgemm(
@@ -236,24 +218,16 @@ pub fn sgemm_rowmajor_nn_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let Ok(n_i) = i32::try_from(n) else {
-                return;
-            };
-            let Ok(mt_i) = i32::try_from(m_t) else {
-                return;
-            };
-            let Ok(k_i) = i32::try_from(k) else {
-                return;
-            };
-            let Ok(lda_i) = i32::try_from(m) else {
-                return;
-            };
-            let Ok(ldb_i) = i32::try_from(k) else {
-                return;
-            };
-            let Ok(ldc_i) = i32::try_from(m) else {
-                return;
-            };
+            let n_i = i32::try_from(n).expect("sgemm_rowmajor_nn_parallel: n exceeds i32 limits");
+            let mt_i =
+                i32::try_from(m_t).expect("sgemm_rowmajor_nn_parallel: m_t exceeds i32 limits");
+            let k_i = i32::try_from(k).expect("sgemm_rowmajor_nn_parallel: k exceeds i32 limits");
+            let lda_i =
+                i32::try_from(m).expect("sgemm_rowmajor_nn_parallel: lda exceeds i32 limits");
+            let ldb_i =
+                i32::try_from(k).expect("sgemm_rowmajor_nn_parallel: ldb exceeds i32 limits");
+            let ldc_i =
+                i32::try_from(m).expect("sgemm_rowmajor_nn_parallel: ldc exceeds i32 limits");
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -318,24 +292,18 @@ pub unsafe fn sgemm_rowmajor_nn_ld_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let Ok(n_i) = i32::try_from(n) else {
-                return;
-            };
-            let Ok(mt_i) = i32::try_from(m_t) else {
-                return;
-            };
-            let Ok(k_i) = i32::try_from(k) else {
-                return;
-            };
-            let Ok(ldb_i) = i32::try_from(ldb) else {
-                return;
-            };
-            let Ok(lda_i) = i32::try_from(lda) else {
-                return;
-            };
-            let Ok(ldc_i) = i32::try_from(ldc) else {
-                return;
-            };
+            let n_i =
+                i32::try_from(n).expect("sgemm_rowmajor_nn_ld_parallel: n exceeds i32 limits");
+            let mt_i =
+                i32::try_from(m_t).expect("sgemm_rowmajor_nn_ld_parallel: m_t exceeds i32 limits");
+            let k_i =
+                i32::try_from(k).expect("sgemm_rowmajor_nn_ld_parallel: k exceeds i32 limits");
+            let ldb_i =
+                i32::try_from(ldb).expect("sgemm_rowmajor_nn_ld_parallel: ldb exceeds i32 limits");
+            let lda_i =
+                i32::try_from(lda).expect("sgemm_rowmajor_nn_ld_parallel: lda exceeds i32 limits");
+            let ldc_i =
+                i32::try_from(ldc).expect("sgemm_rowmajor_nn_ld_parallel: ldc exceeds i32 limits");
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -373,24 +341,12 @@ pub unsafe fn sgemm_rowmajor_nt_ld(
     c: *mut f32,
     ldc: usize,
 ) {
-    let Ok(n_i) = i32::try_from(n) else {
-        return;
-    };
-    let Ok(m_i) = i32::try_from(m) else {
-        return;
-    };
-    let Ok(k_i) = i32::try_from(k) else {
-        return;
-    };
-    let Ok(ldb_i) = i32::try_from(ldb) else {
-        return;
-    };
-    let Ok(lda_i) = i32::try_from(lda) else {
-        return;
-    };
-    let Ok(ldc_i) = i32::try_from(ldc) else {
-        return;
-    };
+    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nt_ld: n exceeds i32 limits");
+    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nt_ld: m exceeds i32 limits");
+    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nt_ld: k exceeds i32 limits");
+    let ldb_i = i32::try_from(ldb).expect("sgemm_rowmajor_nt_ld: ldb exceeds i32 limits");
+    let lda_i = i32::try_from(lda).expect("sgemm_rowmajor_nt_ld: lda exceeds i32 limits");
+    let ldc_i = i32::try_from(ldc).expect("sgemm_rowmajor_nt_ld: ldc exceeds i32 limits");
 
     unsafe {
         cblas_sgemm(
@@ -531,29 +487,35 @@ fn init_dual_amx_pool() -> bool {
                         }
                     }
 
-                    // Execute task on AMX 1, catching unwinds so STATE_DONE is guaranteed to be set
+                    // Execute task on AMX 1, ensuring STATE_DONE is always set even if unwinding
+                    struct TaskDoneGuard;
+                    impl Drop for TaskDoneGuard {
+                        fn drop(&mut self) {
+                            WORKER_STATE.store(STATE_DONE, std::sync::atomic::Ordering::Release);
+                        }
+                    }
                     let task = unsafe { *WORKER_TASK.0.get() };
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                        cblas_sgemm(
-                            CBLAS_ORDER::CblasRowMajor,
-                            CBLAS_TRANSPOSE::CblasNoTrans,
-                            CBLAS_TRANSPOSE::CblasTrans,
-                            task.n,
-                            task.m,
-                            task.k,
-                            1.0,
-                            task.b_ptr as *const f32,
-                            task.ldb,
-                            task.a_ptr as *const f32,
-                            task.lda,
-                            0.0,
-                            task.c_ptr as *mut f32,
-                            task.ldc,
-                        );
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = TaskDoneGuard;
+                        unsafe {
+                            cblas_sgemm(
+                                CBLAS_ORDER::CblasRowMajor,
+                                CBLAS_TRANSPOSE::CblasNoTrans,
+                                CBLAS_TRANSPOSE::CblasTrans,
+                                task.n,
+                                task.m,
+                                task.k,
+                                1.0,
+                                task.b_ptr as *const f32,
+                                task.ldb,
+                                task.a_ptr as *const f32,
+                                task.lda,
+                                0.0,
+                                task.c_ptr as *mut f32,
+                                task.ldc,
+                            );
+                        }
                     }));
-
-                    // Mark done
-                    WORKER_STATE.store(STATE_DONE, std::sync::atomic::Ordering::Release);
                 }
             })
         {

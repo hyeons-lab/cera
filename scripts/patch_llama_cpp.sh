@@ -54,6 +54,10 @@ else
     else
         echo "⚠️ Standard git apply check failed, attempting 3-way merge / fallback..."
         git apply --3way "${PATCH_FILE}" || patch -p1 < "${PATCH_FILE}"
+        if find . -maxdepth 3 -name "*.rej" 2>/dev/null | grep -q .; then
+            echo "❌ Error: Patch application produced rejected hunks (*.rej)."
+            exit 1
+        fi
         echo "✅ Applied patch with 3-way merge fallback."
     fi
 fi
