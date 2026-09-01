@@ -291,15 +291,9 @@ impl GpuWeightSource for OpfsGpuWeightSource {
         let wref = WeightRef::new(info.offset, info.size_bytes, info.dtype, 1, 1);
         self.read_into_chunk(&wref)
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        // SAFETY: OpfsGpuWeightSource is !Send and !Sync, used sequentially during WebGPU initialization.
-        // The returned slice borrows from an internal mutable reuse buffer (`chunk_buf`).
-        // Callers MUST fully consume or copy the returned slice before making subsequent calls.
-        unsafe {
-            let chunk_ptr = self.chunk_buf.as_ptr();
-            let len = info.size_bytes.min((*chunk_ptr).len());
-            let slice = std::slice::from_raw_parts((*chunk_ptr).as_ptr(), len);
-            Ok(std::borrow::Cow::Borrowed(slice))
-        }
+        let chunk = self.chunk_buf.borrow();
+        let len = info.size_bytes.min(chunk.len());
+        Ok(std::borrow::Cow::Owned(chunk[..len].to_vec()))
     }
 
     fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
@@ -307,15 +301,9 @@ impl GpuWeightSource for OpfsGpuWeightSource {
             tracing::error!("OPFS weight read failed for {wref:?}: {e:?}");
             return std::borrow::Cow::Borrowed(&[]);
         }
-        // SAFETY: OpfsGpuWeightSource is !Send and !Sync, used sequentially during WebGPU initialization.
-        // The returned slice borrows from an internal mutable reuse buffer (`chunk_buf`).
-        // Callers MUST fully consume or upload the returned slice before making subsequent calls.
-        unsafe {
-            let chunk_ptr = self.chunk_buf.as_ptr();
-            let len = wref.size.min((*chunk_ptr).len());
-            let slice = std::slice::from_raw_parts((*chunk_ptr).as_ptr(), len);
-            std::borrow::Cow::Borrowed(slice)
-        }
+        let chunk = self.chunk_buf.borrow();
+        let len = wref.size.min(chunk.len());
+        std::borrow::Cow::Owned(chunk[..len].to_vec())
     }
 
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {

@@ -122,9 +122,9 @@ pub fn sgemm_rowmajor_nt(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: 
         m
     );
 
-    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nt: n exceeds i32 limits");
-    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nt: m exceeds i32 limits");
-    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nt: k exceeds i32 limits");
+    let (Ok(n_i), Ok(m_i), Ok(k_i)) = (i32::try_from(n), i32::try_from(m), i32::try_from(k)) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(
@@ -165,12 +165,16 @@ pub unsafe fn sgemm_rowmajor_nn_ld(
     if n == 0 || m == 0 || k == 0 {
         return;
     }
-    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nn_ld: n exceeds i32 limits");
-    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nn_ld: m exceeds i32 limits");
-    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nn_ld: k exceeds i32 limits");
-    let ldb_i = i32::try_from(ldb).expect("sgemm_rowmajor_nn_ld: ldb exceeds i32 limits");
-    let lda_i = i32::try_from(lda).expect("sgemm_rowmajor_nn_ld: lda exceeds i32 limits");
-    let ldc_i = i32::try_from(ldc).expect("sgemm_rowmajor_nn_ld: ldc exceeds i32 limits");
+    let (Ok(n_i), Ok(m_i), Ok(k_i), Ok(ldb_i), Ok(lda_i), Ok(ldc_i)) = (
+        i32::try_from(n),
+        i32::try_from(m),
+        i32::try_from(k),
+        i32::try_from(ldb),
+        i32::try_from(lda),
+        i32::try_from(ldc),
+    ) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(
@@ -227,16 +231,16 @@ pub fn sgemm_rowmajor_nn_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let n_i = i32::try_from(n).expect("sgemm_rowmajor_nn_parallel: n exceeds i32 limits");
-            let mt_i =
-                i32::try_from(m_t).expect("sgemm_rowmajor_nn_parallel: m_t exceeds i32 limits");
-            let k_i = i32::try_from(k).expect("sgemm_rowmajor_nn_parallel: k exceeds i32 limits");
-            let lda_i =
-                i32::try_from(m).expect("sgemm_rowmajor_nn_parallel: lda exceeds i32 limits");
-            let ldb_i =
-                i32::try_from(k).expect("sgemm_rowmajor_nn_parallel: ldb exceeds i32 limits");
-            let ldc_i =
-                i32::try_from(m).expect("sgemm_rowmajor_nn_parallel: ldc exceeds i32 limits");
+            let (Ok(n_i), Ok(mt_i), Ok(k_i), Ok(lda_i), Ok(ldb_i), Ok(ldc_i)) = (
+                i32::try_from(n),
+                i32::try_from(m_t),
+                i32::try_from(k),
+                i32::try_from(m),
+                i32::try_from(k),
+                i32::try_from(m),
+            ) else {
+                return;
+            };
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -304,18 +308,16 @@ pub unsafe fn sgemm_rowmajor_nn_ld_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let n_i =
-                i32::try_from(n).expect("sgemm_rowmajor_nn_ld_parallel: n exceeds i32 limits");
-            let mt_i =
-                i32::try_from(m_t).expect("sgemm_rowmajor_nn_ld_parallel: m_t exceeds i32 limits");
-            let k_i =
-                i32::try_from(k).expect("sgemm_rowmajor_nn_ld_parallel: k exceeds i32 limits");
-            let ldb_i =
-                i32::try_from(ldb).expect("sgemm_rowmajor_nn_ld_parallel: ldb exceeds i32 limits");
-            let lda_i =
-                i32::try_from(lda).expect("sgemm_rowmajor_nn_ld_parallel: lda exceeds i32 limits");
-            let ldc_i =
-                i32::try_from(ldc).expect("sgemm_rowmajor_nn_ld_parallel: ldc exceeds i32 limits");
+            let (Ok(n_i), Ok(mt_i), Ok(k_i), Ok(ldb_i), Ok(lda_i), Ok(ldc_i)) = (
+                i32::try_from(n),
+                i32::try_from(m_t),
+                i32::try_from(k),
+                i32::try_from(ldb),
+                i32::try_from(lda),
+                i32::try_from(ldc),
+            ) else {
+                return;
+            };
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -356,12 +358,16 @@ pub unsafe fn sgemm_rowmajor_nt_ld(
     if n == 0 || m == 0 || k == 0 {
         return;
     }
-    let n_i = i32::try_from(n).expect("sgemm_rowmajor_nt_ld: n exceeds i32 limits");
-    let m_i = i32::try_from(m).expect("sgemm_rowmajor_nt_ld: m exceeds i32 limits");
-    let k_i = i32::try_from(k).expect("sgemm_rowmajor_nt_ld: k exceeds i32 limits");
-    let ldb_i = i32::try_from(ldb).expect("sgemm_rowmajor_nt_ld: ldb exceeds i32 limits");
-    let lda_i = i32::try_from(lda).expect("sgemm_rowmajor_nt_ld: lda exceeds i32 limits");
-    let ldc_i = i32::try_from(ldc).expect("sgemm_rowmajor_nt_ld: ldc exceeds i32 limits");
+    let (Ok(n_i), Ok(m_i), Ok(k_i), Ok(ldb_i), Ok(lda_i), Ok(ldc_i)) = (
+        i32::try_from(n),
+        i32::try_from(m),
+        i32::try_from(k),
+        i32::try_from(ldb),
+        i32::try_from(lda),
+        i32::try_from(ldc),
+    ) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(
@@ -672,13 +678,13 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         "sgemm_split2_parallel: dimensions exceed i32::MAX"
     );
 
-    let m_top = (m / 2) & !31;
-    let m_bot = m - m_top;
-
-    if n * m < 4096 || m < 512 || m_top == 0 || m_bot == 0 {
+    if n * m < 4096 || m < 512 || !m.is_multiple_of(32) {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;
     }
+
+    let m_top = m / 2;
+    let m_bot = m - m_top;
 
     if !init_dual_amx_pool() {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
