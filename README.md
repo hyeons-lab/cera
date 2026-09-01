@@ -218,7 +218,7 @@ const pooled = session.hiddenStatesMeanPooled(tokens); // Float32Array
 ## TurboQuant KV-cache compression
 
 Cera includes the **first implementation of TurboQuant**
-([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025) for
+([arXiv:2504.19874](https://arxiv.org/abs/2504.19874), Google Research 2025: *TurboQuant: Extreme KV Cache Compression*) for
 LFM2, compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32)**
 with near-lossless quality and **no calibration**. On a 1.6B LFM2 model at 4K
 tokens that's ~192 MB → ~16 MB of KV, with decode staying within ±5% of f32.
@@ -242,6 +242,22 @@ uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `--n-keep`
 context shift is not supported with any TurboQuant mode on any backend.
 
 See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
+
+## FreeToken: Semantic Anchor Caching
+
+Cera implements **FreeToken** ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588), 2024: *FreeToken: Fast and Resource-Efficient KV Cache for Long-Context LLMs*), a semantic-aware caching hierarchy that accelerates multi-turn chat and long-context inference:
+
+- **Semantic Anchor Extraction**: Identifies key sentence boundaries and high-entropy prompt positions as persistent semantic anchors (`cera::kv_cache::KvPrefixCache`).
+- **Hierarchical Warm & Cold Tiering**: Promotes active conversation prefixes to warm in-memory cache and compresses older history into cold TurboQuant storage, eliminating redundant prefill computation.
+- **FlatBuffers v2 Disk Serialization**: Fast, zero-copy persistence format for saving and restoring warm prefix caches across session lifecycles without full prompt re-evaluations.
+
+## DSpark: Neural Speculative Decoding
+
+Cera includes support for **DSpark** ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608), 2024: *DSpark: High-Throughput Speculative Decoding with Lightweight Drafters*), accelerating inference throughput via parallel multi-token draft verification:
+
+- **Lightweight Sidecar Drafters**: Load compact draft models (`cera::spec::dspark`) that share embedding and GGUF weight backings with the target model without redundant memory mapping.
+- **Parallel GPU Verification**: Validates draft token sequences in a single forward pass with batched LM-head verification on CPU, Metal, and WebGPU.
+- **Automatic Drafter Discovery**: Bundle loader automatically discovers and attaches paired DSpark sidecar models from LeapBundles and Hugging Face repositories.
 
 ## Voice Activity Detection (Silero VAD v5)
 

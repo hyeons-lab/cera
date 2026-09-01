@@ -21,6 +21,9 @@ cera = "0.5"
 
 ## Highlights in 0.5.0
 
+- **FreeToken: Semantic Anchor Caching ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588))**: Two-tier prefix caching (`cera::kv_cache::KvPrefixCache`) with semantic anchor points, TurboQuant cold storage compression, and FlatBuffers v2 disk persistence.
+- **DSpark: Neural Speculative Decoding ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608))**: Neural speculative drafting via lightweight sidecars (`cera::spec::dspark`), parallel multi-token GPU verification on Metal and WebGPU, and batched LM-head verification.
+- **TurboQuant KV-Cache Compression ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874))**: Pure-Rust PolarQuant + QJL compression achieving ~12x KV-cache memory reduction across CPU, Metal, and WebGPU backends.
 - **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`SileroVad`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
 - **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with on-the-fly zero-disk streaming quantization of remote SafeTensors models directly to GGUF in memory.
 - **WebGPU Depthformer Acceleration & Voice Modes**: High-performance compute shaders for Depthformer audio decoder, unified web runtime, and 4 dedicated voice interaction modes.
