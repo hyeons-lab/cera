@@ -429,7 +429,7 @@ static WORKER_INIT: std::sync::Once = std::sync::Once::new();
 
 #[inline(always)]
 fn set_thread_affinity(_cluster_tag: i32) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe {
         unsafe extern "C" {
             fn mach_task_self() -> u32;
@@ -594,7 +594,8 @@ pub fn sgemm_dual_parallel(
         "sgemm_dual_parallel: task 2 dimensions exceed i32::MAX"
     );
 
-    if !init_dual_amx_pool() {
+    let total_area = (n1 * m1) + (n2 * m2);
+    if total_area < 2048 || !init_dual_amx_pool() {
         sgemm_rowmajor_nt(n1, m1, k1, b1, a1, c1);
         sgemm_rowmajor_nt(n2, m2, k2, b2, a2, c2);
         return;
