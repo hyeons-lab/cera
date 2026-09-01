@@ -225,10 +225,9 @@ impl ConvHistory {
     /// Record a snapshot of `buffer` at sequence position `pos`.
     /// Zero heap allocation: copies into the pre-allocated flat storage.
     pub fn push(&mut self, pos: usize, buffer: &[f32]) {
-        if self.buf_len == 0 {
+        if self.buf_len == 0 || buffer.len() != self.buf_len {
             return;
         }
-        debug_assert_eq!(buffer.len(), self.buf_len);
         let offset = self.head * self.buf_len;
         self.snapshots[offset..offset + self.buf_len].copy_from_slice(buffer);
         self.positions[self.head] = pos;
@@ -241,6 +240,9 @@ impl ConvHistory {
     /// Roll back the convolution `buffer` to the state at `target_pos`.
     /// Returns `true` if the state was successfully found and restored.
     pub fn rollback_to(&mut self, target_pos: usize, buffer: &mut [f32]) -> bool {
+        if buffer.len() != self.buf_len {
+            return false;
+        }
         if target_pos == 0 {
             buffer.fill(0.0);
             self.clear();

@@ -97,6 +97,9 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
 /// Compute `C[n, m] = B[n, k] * A^T[k, m]` in row-major layout where B has shape [n, k] (ld_b = k)
 /// and A has shape [m, k] (ld_a = k). Both inputs are 100% contiguous along the inner contraction dimension k.
 pub fn sgemm_rowmajor_nt(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: &mut [f32]) {
+    if n == 0 || m == 0 || k == 0 {
+        return;
+    }
     assert!(
         b.len() >= n * k,
         "sgemm_rowmajor_nt: B buffer too small: {} < {} * {}",
@@ -159,6 +162,9 @@ pub unsafe fn sgemm_rowmajor_nn_ld(
     c: *mut f32,
     ldc: usize,
 ) {
+    if n == 0 || m == 0 || k == 0 {
+        return;
+    }
     let n_i = i32::try_from(n).expect("sgemm_rowmajor_nn_ld: n exceeds i32 limits");
     let m_i = i32::try_from(m).expect("sgemm_rowmajor_nn_ld: m exceeds i32 limits");
     let k_i = i32::try_from(k).expect("sgemm_rowmajor_nn_ld: k exceeds i32 limits");
@@ -195,6 +201,9 @@ pub fn sgemm_rowmajor_nn_parallel(
     a: &[f32],
     c: &mut [f32],
 ) {
+    if n == 0 || m == 0 || k == 0 {
+        return;
+    }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         sgemm_rowmajor_nn(n, m, k, b, a, c);
@@ -265,6 +274,9 @@ pub unsafe fn sgemm_rowmajor_nn_ld_parallel(
     c: *mut f32,
     ldc: usize,
 ) {
+    if n == 0 || m == 0 || k == 0 {
+        return;
+    }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         unsafe {
@@ -341,6 +353,9 @@ pub unsafe fn sgemm_rowmajor_nt_ld(
     c: *mut f32,
     ldc: usize,
 ) {
+    if n == 0 || m == 0 || k == 0 {
+        return;
+    }
     let n_i = i32::try_from(n).expect("sgemm_rowmajor_nt_ld: n exceeds i32 limits");
     let m_i = i32::try_from(m).expect("sgemm_rowmajor_nt_ld: m exceeds i32 limits");
     let k_i = i32::try_from(k).expect("sgemm_rowmajor_nt_ld: k exceeds i32 limits");
@@ -543,6 +558,14 @@ pub fn sgemm_dual_parallel(
     a2: &[f32],
     c2: &mut [f32],
 ) {
+    if n1 == 0 || m1 == 0 || k1 == 0 {
+        sgemm_rowmajor_nt(n2, m2, k2, b2, a2, c2);
+        return;
+    }
+    if n2 == 0 || m2 == 0 || k2 == 0 {
+        sgemm_rowmajor_nt(n1, m1, k1, b1, a1, c1);
+        return;
+    }
     assert!(b1.len() >= n1 * k1, "sgemm_dual_parallel: b1 underflow");
     assert!(a1.len() >= m1 * k1, "sgemm_dual_parallel: a1 underflow");
     assert!(c1.len() >= n1 * m1, "sgemm_dual_parallel: c1 underflow");
