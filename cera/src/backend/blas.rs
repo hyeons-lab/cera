@@ -467,12 +467,17 @@ struct AmxWorkerGuard;
 impl Drop for AmxWorkerGuard {
     fn drop(&mut self) {
         // We MUST block until the background thread is done writing to the caller's stack/heap buffers.
+        let start = std::time::Instant::now();
         while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
             for _ in 0..64 {
                 core::hint::spin_loop();
             }
             if WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
                 std::thread::yield_now();
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                tracing::error!("AmxWorkerGuard: worker thread timed out; forcing STATE_IDLE");
+                break;
             }
         }
         WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
@@ -665,7 +670,10 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         "sgemm_split2_parallel: dimensions exceed i32::MAX"
     );
 
-    if m < 512 {
+    let m_top = (m / 2) & !31;
+    let m_bot = m - m_top;
+
+    if m < 512 || m_top == 0 || m_bot == 0 {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;
     }
@@ -691,9 +699,6 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
 
     let _amx_guard = AmxWorkerGuard;
     let _affinity_guard = AffinityGuard::set(1);
-
-    let m_top = m / 2;
-    let m_bot = m - m_top;
 
     let b_ptr = b.as_ptr() as usize;
     let a_top_ptr = a.as_ptr() as usize;
