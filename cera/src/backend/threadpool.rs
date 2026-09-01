@@ -1187,7 +1187,7 @@ impl RowPool {
             self.shared
                 .state
                 .store(pack_state(next_epoch, active), Ordering::SeqCst);
-            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+            if self.shared.parked_count.load(Ordering::Acquire) > 0 {
                 for h in self.workers.iter().take(active - 1) {
                     h.thread().unpark();
                 }
@@ -1197,7 +1197,7 @@ impl RowPool {
                 .pending
                 .store(self.num_threads - 1, Ordering::Release);
             self.shared.state.fetch_add(1, Ordering::SeqCst);
-            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+            if self.shared.parked_count.load(Ordering::Acquire) > 0 {
                 for h in &self.workers {
                     h.thread().unpark();
                 }

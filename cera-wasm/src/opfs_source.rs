@@ -291,8 +291,9 @@ impl GpuWeightSource for OpfsGpuWeightSource {
         let wref = WeightRef::new(info.offset, info.size_bytes, info.dtype, 1, 1);
         self.read_into_chunk(&wref)
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        // SAFETY: OpfsGpuWeightSource is used sequentially during WebGPU initialization.
-        // The returned slice is immediately consumed and copied to WebGPU staging buffer before the next read.
+        // SAFETY: OpfsGpuWeightSource is !Send and !Sync, used sequentially during WebGPU initialization.
+        // The returned slice borrows from an internal mutable reuse buffer (`chunk_buf`).
+        // Callers MUST fully consume or copy the returned slice before making subsequent calls.
         unsafe {
             let chunk_ptr = self.chunk_buf.as_ptr();
             let len = info.size_bytes.min((*chunk_ptr).len());
@@ -306,8 +307,9 @@ impl GpuWeightSource for OpfsGpuWeightSource {
             tracing::error!("OPFS weight read failed for {wref:?}: {e:?}");
             return std::borrow::Cow::Borrowed(&[]);
         }
-        // SAFETY: OpfsGpuWeightSource is used sequentially during WebGPU initialization.
-        // The returned slice is immediately uploaded to WebGPU before the next weight_bytes call.
+        // SAFETY: OpfsGpuWeightSource is !Send and !Sync, used sequentially during WebGPU initialization.
+        // The returned slice borrows from an internal mutable reuse buffer (`chunk_buf`).
+        // Callers MUST fully consume or upload the returned slice before making subsequent calls.
         unsafe {
             let chunk_ptr = self.chunk_buf.as_ptr();
             let len = wref.size.min((*chunk_ptr).len());
