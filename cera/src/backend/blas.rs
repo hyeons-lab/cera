@@ -442,17 +442,12 @@ struct AmxWorkerGuard;
 impl Drop for AmxWorkerGuard {
     fn drop(&mut self) {
         // We MUST block until the background thread is done writing to the caller's stack/heap buffers.
-        let mut yields = 0u32;
         while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
             for _ in 0..64 {
                 core::hint::spin_loop();
             }
             if WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
                 std::thread::yield_now();
-                yields += 1;
-                if yields > 1_000_000 {
-                    break;
-                }
             }
         }
         WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
@@ -878,6 +873,34 @@ mod tests {
         let mut c = vec![0.0f32; 4];
         sgemm_rowmajor_nn(2, 2, 2, &a, &b, &mut c);
         assert_eq!(c, vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_concurrent_sgemm_dual_parallel() {
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let handle = std::thread::spawn(|| {
+                let m = 32;
+                let n = 16;
+                let k = 32;
+                let a1 = vec![1.0f32; m * k];
+                let a2 = vec![2.0f32; m * k];
+                let b = vec![1.0f32; n * k];
+                let mut c1 = vec![0.0f32; m * n];
+                let mut c2 = vec![0.0f32; m * n];
+                sgemm_dual_parallel(m, n, k, &a1, &a2, &b, &mut c1, &mut c2);
+                for &val in &c1 {
+                    assert!((val - k as f32).abs() < 1e-4);
+                }
+                for &val in &c2 {
+                    assert!((val - (2.0 * k as f32)).abs() < 1e-4);
+                }
+            });
+            handles.push(handle);
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// Microbenchmark: ffn_up shape (m=6912, n=2002, k=2048) — compare the

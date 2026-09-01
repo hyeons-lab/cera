@@ -643,7 +643,7 @@ fn upload_moe(
         let bytes = refs
             .iter()
             .fold(Vec::with_capacity(total as usize), |mut acc: Vec<u8>, r| {
-                acc.extend_from_slice(src.weight_bytes(r));
+                acc.extend_from_slice(&src.weight_bytes(r));
                 acc
             });
         Ok(GpuMoeWeight {
@@ -1624,7 +1624,7 @@ impl GpuLfm2Model {
                 // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
                 // round-up guarantee.
                 let data = src.weight_bytes(wref);
-                (ctx.upload_storage(data, name), wref.dtype)
+                (ctx.upload_storage(&data, name), wref.dtype)
             } else {
                 // Every other dtype (F16/BF16/F32 sources, Q4_1, Q2_K, ...) is
                 // dequantized to F32 here. F32 has both a decode GEMV (`gemv_f32`)

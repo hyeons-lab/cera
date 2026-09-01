@@ -1775,8 +1775,8 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         self.rope_freqs.as_deref()
     }
 
-    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
-        transformer::weight_data(&self.gguf, wref)
+    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(transformer::weight_data(&self.gguf, wref))
     }
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
         transformer::dequantize_weight(&self.gguf, wref)

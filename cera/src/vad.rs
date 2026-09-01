@@ -906,6 +906,14 @@ mod tests {
             .unwrap();
         assert!((0.0..=1.0).contains(&prob_8k));
 
+        // Test non-finite chunk rejection
+        let mut nan_chunk = [0.0f32; 512];
+        nan_chunk[10] = f32::NAN;
+        assert!(
+            vad.process_chunk(&nan_chunk, VadSampleRate::Rate16kHz)
+                .is_err()
+        );
+
         // Test short audio buffer (< 512 samples)
         let short_audio = [0.0f32; 128];
         let timestamps = vad

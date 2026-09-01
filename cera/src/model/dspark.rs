@@ -1067,15 +1067,19 @@ impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource 
     fn embedding_tensor(&self) -> Result<crate::tensor::Tensor> {
         self.dspark.base_gguf.get_tensor("token_embd.weight")
     }
-    fn embedding_tensor_data(&self) -> Result<&[u8]> {
-        self.dspark.base_gguf.tensor_data("token_embd.weight")
+    fn embedding_tensor_data(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        self.dspark
+            .base_gguf
+            .tensor_data("token_embd.weight")
+            .map(std::borrow::Cow::Borrowed)
     }
-    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
-        if self.is_base_weight(wref) {
+    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
+        let bytes = if self.is_base_weight(wref) {
             transformer::weight_data(&self.dspark.base_gguf, wref)
         } else {
             transformer::weight_data(&self.dspark.gguf, wref)
-        }
+        };
+        std::borrow::Cow::Borrowed(bytes)
     }
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
         let gguf = if self.is_base_weight(wref) {

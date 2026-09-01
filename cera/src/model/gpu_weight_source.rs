@@ -64,15 +64,17 @@ pub trait GpuWeightSource {
     }
 
     /// Token embedding tensor raw byte slice.
-    fn embedding_tensor_data(&self) -> Result<&[u8]> {
-        self.gguf().tensor_data("token_embd.weight")
+    fn embedding_tensor_data(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        self.gguf()
+            .tensor_data("token_embd.weight")
+            .map(std::borrow::Cow::Borrowed)
     }
 
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
     // The metal loader maps weights by absolute `wref.start` offset into its own
     // mmap buffer, so it needs neither the byte slice nor a full dequantize.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    fn weight_bytes(&self, wref: &WeightRef) -> &[u8];
+    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]>;
     // The metal loader references weights via mmap byte offsets and never
     // dequantizes a full matrix, so this accessor is dead under `metal` alone
     // (live under `gpu`, where non-kernel dtypes are uploaded as F32).

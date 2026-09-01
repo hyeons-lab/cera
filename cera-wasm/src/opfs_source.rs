@@ -282,10 +282,7 @@ impl GpuWeightSource for OpfsGpuWeightSource {
         Ok(Tensor::new(data, info.shape.clone(), info.dtype))
     }
 
-    /// SAFETY NOTICE: The returned slice is extremely transient and points directly into
-    /// `self.chunk_buf`. Subsequent reads or weight fetches will overwrite this data.
-    /// The caller must consume or copy this slice immediately before calling weight methods again.
-    fn embedding_tensor_data(&self) -> anyhow::Result<&[u8]> {
+    fn embedding_tensor_data(&self) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
         let info = self
             .gguf
             .tensors
@@ -294,28 +291,19 @@ impl GpuWeightSource for OpfsGpuWeightSource {
         let wref = WeightRef::new(info.offset, info.size_bytes, info.dtype, 1, 1);
         self.read_into_chunk(&wref)
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let ptr = self.chunk_buf.as_ptr();
-        unsafe {
-            let data_ptr = (*ptr).as_ptr();
-            let len = info.size_bytes.min((*ptr).len());
-            Ok(std::slice::from_raw_parts(data_ptr, len))
-        }
+        let chunk = self.chunk_buf.borrow();
+        let len = info.size_bytes.min(chunk.len());
+        Ok(std::borrow::Cow::Owned(chunk[..len].to_vec()))
     }
 
-    /// SAFETY NOTICE: The returned slice is extremely transient and points directly into
-    /// `self.chunk_buf`. Subsequent reads or weight fetches will overwrite this data.
-    /// The caller must consume or copy this slice immediately before calling weight methods again.
-    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
         if let Err(e) = self.read_into_chunk(wref) {
             tracing::error!("OPFS weight read failed for {wref:?}: {e:?}");
-            return &[];
+            return std::borrow::Cow::Borrowed(&[]);
         }
-        let ptr = self.chunk_buf.as_ptr();
-        unsafe {
-            let data_ptr = (*ptr).as_ptr();
-            let len = wref.size.min((*ptr).len());
-            std::slice::from_raw_parts(data_ptr, len)
-        }
+        let chunk = self.chunk_buf.borrow();
+        let len = wref.size.min(chunk.len());
+        std::borrow::Cow::Owned(chunk[..len].to_vec())
     }
 
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
