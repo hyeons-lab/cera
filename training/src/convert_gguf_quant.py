@@ -57,21 +57,22 @@ def export_quantized_gguf(
     if target_layers is None:
         target_layers = [3, 7, 11]
     print(f"Loading checkpoint from {checkpoint_path}...")
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    try:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     is_markov_model = "fc.weight" in state_dict or "markov_w1" in state_dict
     arch_name = "dflash" if is_markov_model else "dspark"
 
     gguf_type = gguf.GGMLQuantizationType.Q4_0 if quant_type.upper() == "Q4_0" else gguf.GGMLQuantizationType.Q8_0
-    print(f"Target 2D Matrix Quantization: {quant_type.upper()} ({gguf_type}) for architecture '{arch_name}'")
-
     gguf_writer = gguf.GGUFWriter(output_gguf_path, arch_name)
+
     copy_tokenizer_metadata(gguf_writer)
 
-    # Architecture metadata
+    # Write model architecture metadata
     gguf_writer.add_architecture()
     gguf_writer.add_string("general.architecture", arch_name)
-    gguf_writer.add_uint32(f"{arch_name}.context_length", 2048)
     gguf_writer.add_uint32(f"{arch_name}.block_size", block_size)
     gguf_writer.add_uint32(f"{arch_name}.markov_rank", markov_rank)
     gguf_writer.add_uint32(f"{arch_name}.block_count", num_layers)
@@ -84,14 +85,11 @@ def export_quantized_gguf(
     gguf_writer.add_float32(f"{arch_name}.attention.layer_norm_rms_epsilon", 1e-5)
     gguf_writer.add_float32(f"{arch_name}.rope.freq_base", 10000.0)
 
-    def add_maybe_quantized(name, tensor):
+    def add_maybe_quantized(name: str, tensor: torch.Tensor):
         arr = tensor.float().numpy()
-        if arr.ndim >= 2 and arr.size >= 256 and (arr.size % 32 == 0):
-            # Quantize 2D weight matrix
-            quant_data = q.quantize(arr, gguf_type)
-            gguf_writer.add_tensor(name, quant_data, raw_dtype=gguf_type)
+        if should_quantize_tensor(name):
+            gguf_writer.add_quantized_tensor(name, gguf_type, arr)
         else:
-            # Keep 1D norms / bias in FP32
             gguf_writer.add_tensor(name, arr)
 
     if is_markov_model:
@@ -100,7 +98,11 @@ def export_quantized_gguf(
         gguf_writer.add_uint32("tokenizer.ggml.mask_token_id", 64402)
         gguf_writer.add_uint32("tokenizer.ggml.padding_token_id", 64402)
         if "target_layers" in state_dict:
-            target_layers = state_dict["target_layers"]
+            tl = state_dict["target_layers"]
+            if isinstance(tl, torch.Tensor):
+                target_layers = tl.tolist()
+            else:
+                target_layers = [int(l) for l in tl]
         gguf_writer.add_array("target_layers", [int(l) for l in target_layers])
         gguf_writer.add_array("dflash.target_layers", [int(l) for l in target_layers])
 

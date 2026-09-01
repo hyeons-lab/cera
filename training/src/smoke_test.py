@@ -3,7 +3,12 @@ from transformers import AutoModel, AutoTokenizer
 from model import DSparkMarkovModel
 import torch.nn.functional as F
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 print("Running smoke test on", device)
 
 tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2.5-VL-450M", trust_remote_code=True)

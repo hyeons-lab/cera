@@ -54,7 +54,10 @@ def export_to_gguf(
     if target_layers is None:
         target_layers = [3, 7, 11]
     print(f"Loading checkpoint from {checkpoint_path}...")
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    try:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     is_markov_model = "fc.weight" in state_dict or "markov_w1" in state_dict
 
@@ -84,7 +87,11 @@ def export_to_gguf(
         gguf_writer.add_uint32("tokenizer.ggml.mask_token_id", 64402)
         gguf_writer.add_uint32("tokenizer.ggml.padding_token_id", 64402)
         if "target_layers" in state_dict:
-            target_layers = state_dict["target_layers"]
+            tl = state_dict["target_layers"]
+            if isinstance(tl, torch.Tensor):
+                target_layers = tl.tolist()
+            else:
+                target_layers = [int(l) for l in tl]
         gguf_writer.add_array("target_layers", [int(l) for l in target_layers])
         gguf_writer.add_array("dflash.target_layers", [int(l) for l in target_layers])
 

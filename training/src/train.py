@@ -76,7 +76,12 @@ def compute_acceptance_length(drafter, base_model, lm_head_weight, tok_embd_weig
     return avg_acceptance
 
 def train(args):
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Using device: {device}")
 
     # Hyperparameters
@@ -168,6 +173,7 @@ def train(args):
         for m in models.values():
             m.train()
         loss_accum = {k: torch.zeros(1, device=device) for k in models}
+        processed_steps = 0
         start_time = time.time()
 
         for step, batch in enumerate(train_loader):
@@ -184,6 +190,7 @@ def train(args):
             if t_max <= 0:
                 continue
 
+            processed_steps += 1
             t = random.randint(0, t_max)
             target_tokens = input_ids[:, t + 1 : t + 1 + block_size]
             prev_tokens = input_ids[:, t : t + block_size]
@@ -234,7 +241,7 @@ def train(args):
                 print(f"  [Epoch {epoch:02d}] Step {step+1}/{len(train_loader)}...", flush=True)
 
         elapsed = time.time() - start_time
-        loss_str = " | ".join([f"{k} Loss: {loss_accum[k].item()/max(1, len(train_loader)):.4f}" for k in models])
+        loss_str = " | ".join([f"{k} Loss: {loss_accum[k].item()/max(1, processed_steps):.4f}" for k in models])
         print(f"Epoch {epoch:02d}/{epochs:02d} | {loss_str} | Time: {elapsed:.1f}s", flush=True)
 
         # Evaluate acceptance length
@@ -251,7 +258,7 @@ def train(args):
             if acc_m > best_acceptance["markov"]:
                 best_acceptance["markov"] = acc_m
                 state_dict_m = models["markov"].state_dict()
-                state_dict_m["target_layers"] = target_layers
+                state_dict_m["target_layers"] = torch.tensor(target_layers, dtype=torch.int32)
                 torch.save(state_dict_m, os.path.join(checkpoint_dir, "best_dspark_markov.pt"))
 
     print(f"\n=======================================================", flush=True)

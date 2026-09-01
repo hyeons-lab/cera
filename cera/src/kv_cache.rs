@@ -1851,8 +1851,15 @@ impl KvPrefixCache {
         let snap_bytes = snapshot.byte_size() as u64;
         let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
 
+        let existing_bytes = self
+            .warm
+            .get(&hash)
+            .map(|e| e.snapshot.byte_size() as u64)
+            .unwrap_or(0);
+        let net_new_bytes = snap_bytes.saturating_sub(existing_bytes);
+
         // Evict from warm if needed.
-        self.evict_warm_if_needed(snap_bytes, is_anchor);
+        self.evict_warm_if_needed(net_new_bytes, is_anchor);
 
         // Save to cold tier (if `disk-cache` feature on; otherwise no-op).
         #[cfg(feature = "disk-cache")]
@@ -1907,7 +1914,13 @@ impl KvPrefixCache {
         let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
         let hash = hash_tokens(tokens);
         let snap_bytes = snapshot.byte_size() as u64;
-        self.evict_warm_if_needed(snap_bytes, is_anchor);
+        let existing_bytes = self
+            .warm
+            .get(&hash)
+            .map(|e| e.snapshot.byte_size() as u64)
+            .unwrap_or(0);
+        let net_new_bytes = snap_bytes.saturating_sub(existing_bytes);
+        self.evict_warm_if_needed(net_new_bytes, is_anchor);
         let tick = self.next_tick();
         if let Some(old) = self.warm.insert(
             hash,

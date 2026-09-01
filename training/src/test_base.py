@@ -10,7 +10,12 @@ tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 print("Tokenizer vocab size:", len(tokenizer))
 
 print("Loading base model with AutoModel...")
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 try:
     model = AutoModelForImageTextToText.from_pretrained(
         model_id,
