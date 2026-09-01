@@ -476,8 +476,10 @@ impl Drop for AmxWorkerGuard {
                 std::thread::yield_now();
             }
             if start.elapsed() > std::time::Duration::from_secs(5) {
-                tracing::error!("AmxWorkerGuard: worker thread timed out; forcing STATE_IDLE");
-                break;
+                tracing::error!(
+                    "AmxWorkerGuard: worker thread timed out; aborting process to prevent buffer corruption"
+                );
+                std::process::abort();
             }
         }
         WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);
@@ -673,7 +675,7 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
     let m_top = (m / 2) & !31;
     let m_bot = m - m_top;
 
-    if m < 512 || m_top == 0 || m_bot == 0 {
+    if n * m < 4096 || m < 512 || m_top == 0 || m_bot == 0 {
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;
     }
