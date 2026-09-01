@@ -142,8 +142,8 @@ impl DSparkConfig {
             "DSpark head_dim ({head_dim}) must be a positive even integer for RoPE rotation"
         );
         ensure!(
-            intermediate_size > 0 && intermediate_size % 32 == 0,
-            "DSpark intermediate_size ({intermediate_size}) must be a positive multiple of 32 for Q8_0 SIMD quantization"
+            intermediate_size > 0,
+            "DSpark intermediate_size must be positive"
         );
         ensure!(vocab_size > 0, "DSpark vocab_size must be positive");
         ensure!(block_size > 0, "DSpark block_size must be positive");
