@@ -834,7 +834,7 @@ impl RowPool {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn set_macos_thread_qos_interactive() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
@@ -884,10 +884,10 @@ impl RowPool {
                     retry_cooldown: 0,
                 })
             };
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             static QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         QOS_SET.with(|q| {
             if !q.get() {
                 set_macos_thread_qos_interactive();
@@ -1187,7 +1187,7 @@ impl RowPool {
             self.shared
                 .state
                 .store(pack_state(next_epoch, active), Ordering::SeqCst);
-            if self.shared.parked_count.load(Ordering::Acquire) > 0 {
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
                 for h in self.workers.iter().take(active - 1) {
                     h.thread().unpark();
                 }
@@ -1197,7 +1197,7 @@ impl RowPool {
                 .pending
                 .store(self.num_threads - 1, Ordering::Release);
             self.shared.state.fetch_add(1, Ordering::SeqCst);
-            if self.shared.parked_count.load(Ordering::Acquire) > 0 {
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
                 for h in &self.workers {
                     h.thread().unpark();
                 }
@@ -1323,7 +1323,7 @@ fn worker_loop(
     spread_mask: &'static [usize],
     spin_limit: u32,
 ) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         thread_local! {
             static WORKER_QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
