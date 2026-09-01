@@ -558,11 +558,8 @@ pub fn generate_audio(
 
     let mut next_token = sampler.sample(&mut logits);
 
-    // Track consecutive audio segments after text_done to detect trailing garbage.
-    // When the model finishes text (text_done) but doesn't emit audio_end cleanly,
-    // we cap the number of trailing audio segments to avoid infinite generation.
-    let mut trailing_audio_segments: usize = 0;
-    const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
+    let mut total_voiced_frames: usize = 0;
+    let mut audio_frames_count: usize = 0;
 
     'outer: loop {
         if generated >= config.max_tokens || pos >= model_config.max_seq_len {
@@ -609,21 +606,21 @@ pub fn generate_audio(
             // extracts from the decode of the LAST text token.
             if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
             {
-                if text_done {
-                    trailing_audio_segments += 1;
-                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
-                        break;
-                    }
-                }
-
                 let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
                 pos += 1;
 
                 modality = Modality::Audio;
                 modality_budget = 12;
+                let mut consecutive_silent_frames = 0usize;
 
                 // Run audio loop with this embedding.
                 loop {
+                    if generated >= config.max_tokens
+                        || pos >= model_config.max_seq_len
+                        || audio_frames_count >= 4096
+                    {
+                        break;
+                    }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
                         FrameOutcome::End => {
@@ -641,8 +638,25 @@ pub fn generate_audio(
                             pcm,
                             ..
                         } => {
+                            audio_frames_count += 1;
                             if !pcm.is_empty() {
+                                let rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
+                                    / pcm.len().max(1) as f32)
+                                    .sqrt();
+                                if rms >= 0.001 {
+                                    total_voiced_frames += 1;
+                                    consecutive_silent_frames = 0;
+                                } else {
+                                    consecutive_silent_frames += 1;
+                                }
                                 audio_callback(&pcm, decoder.sample_rate());
+                            }
+                            if text_done
+                                && (consecutive_silent_frames >= 30
+                                    || (total_voiced_frames >= 5
+                                        && consecutive_silent_frames >= 25))
+                            {
+                                break;
                             }
                             audio_embedding
                         }
@@ -705,14 +719,9 @@ pub fn generate_audio(
                             break 'outer;
                         }
                         AudioMode::Interleaved => {
-                            // Interleaved: transition back to text. The
-                            // trailing-audio-segments cap
-                            // (MAX_TRAILING_AUDIO_SEGMENTS) bounds runaway
-                            // post-audio cycles in the text branch above.
-                            // Reachable here when the model emits
-                            // TOKEN_AUDIO_START explicitly (line ~273) — the
-                            // text-branch's budget-driven Interleaved block
-                            // has its own audio loop that handles End inline.
+                            // Interleaved: transition back to text. Trailing
+                            // silence detection and safety frame limits bound
+                            // runaway cycles.
                             modality = Modality::Text;
                             text_done = true;
                             modality_budget = 6;
@@ -740,8 +749,8 @@ pub fn generate_audio(
                             audio_callback(&pcm, decoder.sample_rate());
                         }
                         if matches!(config.mode, AudioMode::Sequential)
-                            && voiced_frames >= 5
-                            && consecutive_silent_frames >= 40
+                            && (consecutive_silent_frames >= 40
+                                || (voiced_frames >= 5 && consecutive_silent_frames >= 30))
                         {
                             break 'outer;
                         }
