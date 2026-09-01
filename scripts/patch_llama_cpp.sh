@@ -30,11 +30,11 @@ if [[ ! -f "${PATCH_FILE}" ]]; then
 fi
 
 if [[ ! -d "${TARGET_DIR}" ]]; then
-    if [[ -d "${HOME}/development/llama.cpp" ]]; then
-        TARGET_DIR="${HOME}/development/llama.cpp"
+    if [[ -n "${LLAMA_CPP_DIR:-}" && -d "${LLAMA_CPP_DIR}" ]]; then
+        TARGET_DIR="${LLAMA_CPP_DIR}"
     else
         echo "❌ Error: Target llama.cpp directory not found: ${TARGET_DIR}"
-        echo "Usage: $0 [path/to/llama.cpp] [--build]"
+        echo "Usage: $0 [path/to/llama.cpp] [--build] (or set LLAMA_CPP_DIR)"
         exit 1
     fi
 fi

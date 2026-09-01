@@ -3201,7 +3201,7 @@ mod webgpu {
             let mut spec_drafted_count = 0usize;
             let mut spec_accepted_count = 0usize;
             console_info(&format!(
-                "[cera-wasm:version] v{} (build: 2026-08-29-rev20-clean-cpu-depthformer-webgpu-llm) generate started: prompt_tokens={}, max_tokens={}, has_dspark={}, supports_all_logits={}, is_greedy={}, temp={resolved_temp}",
+                "[cera-wasm:version] v{} (build: 2026-08-29-rev20-clean-cpu-depthformer-webgpu-llm) generate started: prompt_tokens={}, max_tokens={}, has_drafter={}, supports_all_logits={}, is_greedy={}, temp={resolved_temp}",
                 env!("CARGO_PKG_VERSION"),
                 ids.len(),
                 max_tokens,

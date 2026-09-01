@@ -10,7 +10,9 @@ echo " Target: Apple M1 Max (MPS) | 15 Epochs | Window k=9"
 echo " Modes: [1] Standalone Drafter (Cera)  [2] Markov Drafter (llama.cpp)"
 echo "=========================================================="
 
-source .venv/bin/activate
+if [ -f .venv/bin/activate ]; then
+    source .venv/bin/activate
+fi
 
 # 1. Joint Training of both drafters simultaneously
 python src/train.py --mode both --epochs 15 --batch-size 8 --grad-accum-steps 4

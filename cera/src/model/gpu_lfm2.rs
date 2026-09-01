@@ -43,7 +43,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use crate::CeraError;
 use crate::backend::cpu::RopeType;
@@ -1323,13 +1323,12 @@ impl GpuLfm2Model {
         model_id: String,
         ctx: GpuContext,
     ) -> Result<Self> {
-        let max_ctx = context_size.min(dspark.config.to_model_config(context_size).max_seq_len);
-        let dspark_cfg = dspark.config.to_model_config(max_ctx);
+        let dspark_cfg = dspark.config.to_model_config(context_size);
         let dspark_src = crate::model::dspark::DSparkGpuWeightSource {
             config: dspark_cfg,
             dspark,
         };
-        Self::from_weight_source_with_ctx(&dspark_src, max_ctx, model_id, ctx)
+        Self::from_weight_source_with_ctx(&dspark_src, context_size, model_id, ctx)
     }
 
     /// Like `from_weight_source` but with an externally-constructed
@@ -1788,17 +1787,22 @@ impl GpuLfm2Model {
             let is_conv = config.block_types[i] == BlockType::GatedConv;
 
             let (conv_in_proj, conv_out_proj, conv_weight) = if is_conv {
-                let ip = src.conv_in_proj_ref(i).expect("conv layer missing in_proj");
+                let ip = src
+                    .conv_in_proj_ref(i)
+                    .ok_or_else(|| anyhow!("conv layer missing in_proj"))?;
                 let op = src
                     .conv_out_proj_ref(i)
-                    .expect("conv layer missing out_proj");
+                    .ok_or_else(|| anyhow!("conv layer missing out_proj"))?;
                 (
                     Some(upload_weight(ip, &format!("l{i}.conv_ip"))),
                     Some(upload_weight(op, &format!("l{i}.conv_op"))),
-                    Some(ctx.upload_f32(
-                        src.conv_weight(i).expect("conv layer missing conv weight"),
-                        &format!("l{i}.conv_w"),
-                    )),
+                    Some(
+                        ctx.upload_f32(
+                            src.conv_weight(i)
+                                .ok_or_else(|| anyhow!("conv layer missing conv weight"))?,
+                            &format!("l{i}.conv_w"),
+                        ),
+                    ),
                 )
             } else {
                 (None, None, None)
@@ -1810,19 +1814,23 @@ impl GpuLfm2Model {
             let (attn_q, attn_k, attn_v, attn_output, attn_q_norm, attn_k_norm) = if !is_conv {
                 (
                     Some(upload_weight(
-                        src.attn_q_ref(i).expect("attn layer missing q"),
+                        src.attn_q_ref(i)
+                            .ok_or_else(|| anyhow!("attn layer missing q"))?,
                         &format!("l{i}.attn_q"),
                     )),
                     Some(upload_weight(
-                        src.attn_k_ref(i).expect("attn layer missing k"),
+                        src.attn_k_ref(i)
+                            .ok_or_else(|| anyhow!("attn layer missing k"))?,
                         &format!("l{i}.attn_k"),
                     )),
                     Some(upload_weight(
-                        src.attn_v_ref(i).expect("attn layer missing v"),
+                        src.attn_v_ref(i)
+                            .ok_or_else(|| anyhow!("attn layer missing v"))?,
                         &format!("l{i}.attn_v"),
                     )),
                     Some(upload_weight(
-                        src.attn_output_ref(i).expect("attn layer missing output"),
+                        src.attn_output_ref(i)
+                            .ok_or_else(|| anyhow!("attn layer missing output"))?,
                         &format!("l{i}.attn_o"),
                     )),
                     upload_opt_f32(src.attn_q_norm_weight(i), &format!("l{i}.qn")),

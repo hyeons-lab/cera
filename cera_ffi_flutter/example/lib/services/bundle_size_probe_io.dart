@@ -49,7 +49,6 @@ Future<Map<String, int>> probeBundleFileSizes(
     } catch (_) {}
 
     if (fileUrls.isEmpty) {
-      final cleanQuant = quant.split(RegExp(r'[\+\s]')).first;
       if (bundleName.contains('VL-3B')) {
         final String mmprojQuant;
         if (cleanQuant == 'F16' || cleanQuant == 'BF16') {

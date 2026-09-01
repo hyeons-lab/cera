@@ -119,9 +119,15 @@ pub fn sgemm_rowmajor_nt(n: usize, m: usize, k: usize, b: &[f32], a: &[f32], c: 
         m
     );
 
-    let n_i = i32::try_from(n).expect("n overflow");
-    let m_i = i32::try_from(m).expect("m overflow");
-    let k_i = i32::try_from(k).expect("k overflow");
+    let Ok(n_i) = i32::try_from(n) else {
+        return;
+    };
+    let Ok(m_i) = i32::try_from(m) else {
+        return;
+    };
+    let Ok(k_i) = i32::try_from(k) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(
@@ -159,12 +165,24 @@ pub unsafe fn sgemm_rowmajor_nn_ld(
     c: *mut f32,
     ldc: usize,
 ) {
-    let n_i = i32::try_from(n).expect("n overflow");
-    let m_i = i32::try_from(m).expect("m overflow");
-    let k_i = i32::try_from(k).expect("k overflow");
-    let ldb_i = i32::try_from(ldb).expect("ldb overflow");
-    let lda_i = i32::try_from(lda).expect("lda overflow");
-    let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+    let Ok(n_i) = i32::try_from(n) else {
+        return;
+    };
+    let Ok(m_i) = i32::try_from(m) else {
+        return;
+    };
+    let Ok(k_i) = i32::try_from(k) else {
+        return;
+    };
+    let Ok(ldb_i) = i32::try_from(ldb) else {
+        return;
+    };
+    let Ok(lda_i) = i32::try_from(lda) else {
+        return;
+    };
+    let Ok(ldc_i) = i32::try_from(ldc) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(
@@ -218,12 +236,24 @@ pub fn sgemm_rowmajor_nn_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let n_i = i32::try_from(n).expect("n overflow");
-            let mt_i = i32::try_from(m_t).expect("m_t overflow");
-            let k_i = i32::try_from(k).expect("k overflow");
-            let lda_i = i32::try_from(m).expect("lda overflow");
-            let ldb_i = i32::try_from(k).expect("ldb overflow");
-            let ldc_i = i32::try_from(m).expect("ldc overflow");
+            let Ok(n_i) = i32::try_from(n) else {
+                return;
+            };
+            let Ok(mt_i) = i32::try_from(m_t) else {
+                return;
+            };
+            let Ok(k_i) = i32::try_from(k) else {
+                return;
+            };
+            let Ok(lda_i) = i32::try_from(m) else {
+                return;
+            };
+            let Ok(ldb_i) = i32::try_from(k) else {
+                return;
+            };
+            let Ok(ldc_i) = i32::try_from(m) else {
+                return;
+            };
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -288,12 +318,24 @@ pub unsafe fn sgemm_rowmajor_nn_ld_parallel(
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
 
-            let n_i = i32::try_from(n).expect("n overflow");
-            let mt_i = i32::try_from(m_t).expect("m_t overflow");
-            let k_i = i32::try_from(k).expect("k overflow");
-            let ldb_i = i32::try_from(ldb).expect("ldb overflow");
-            let lda_i = i32::try_from(lda).expect("lda overflow");
-            let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+            let Ok(n_i) = i32::try_from(n) else {
+                return;
+            };
+            let Ok(mt_i) = i32::try_from(m_t) else {
+                return;
+            };
+            let Ok(k_i) = i32::try_from(k) else {
+                return;
+            };
+            let Ok(ldb_i) = i32::try_from(ldb) else {
+                return;
+            };
+            let Ok(lda_i) = i32::try_from(lda) else {
+                return;
+            };
+            let Ok(ldc_i) = i32::try_from(ldc) else {
+                return;
+            };
 
             cblas_sgemm(
                 CBLAS_ORDER::CblasRowMajor,
@@ -331,12 +373,24 @@ pub unsafe fn sgemm_rowmajor_nt_ld(
     c: *mut f32,
     ldc: usize,
 ) {
-    let n_i = i32::try_from(n).expect("n overflow");
-    let m_i = i32::try_from(m).expect("m overflow");
-    let k_i = i32::try_from(k).expect("k overflow");
-    let ldb_i = i32::try_from(ldb).expect("ldb overflow");
-    let lda_i = i32::try_from(lda).expect("lda overflow");
-    let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+    let Ok(n_i) = i32::try_from(n) else {
+        return;
+    };
+    let Ok(m_i) = i32::try_from(m) else {
+        return;
+    };
+    let Ok(k_i) = i32::try_from(k) else {
+        return;
+    };
+    let Ok(ldb_i) = i32::try_from(ldb) else {
+        return;
+    };
+    let Ok(lda_i) = i32::try_from(lda) else {
+        return;
+    };
+    let Ok(ldc_i) = i32::try_from(ldc) else {
+        return;
+    };
 
     unsafe {
         cblas_sgemm(

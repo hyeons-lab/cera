@@ -333,9 +333,10 @@ impl DSparkSessionDrafter {
                 &mut self.scratch_normed,
             );
         }
+        self.synced_tokens.truncate(self.synced_pos);
+        self.synced_tokens
+            .extend_from_slice(&tokens[self.synced_tokens.len()..prefix_len]);
         self.synced_pos = prefix_len;
-        self.synced_tokens.clear();
-        self.synced_tokens.extend_from_slice(tokens);
         Some(&self.scratch_hidden)
     }
 

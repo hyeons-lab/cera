@@ -540,12 +540,14 @@ impl CeraEngine {
         };
         aux.audio_decoder = audio_decoder;
         aux.detok_weights = detok_weights;
-        let base_gguf_arc = Arc::new(gguf.clone());
+        let base_gguf_arc = parts.draft_model.as_ref().map(|_| Arc::new(gguf.clone()));
         aux.drafter = parts
             .draft_model
             .as_ref()
             .and_then(|b| parse_aux_gguf(b, "draft model"))
-            .and_then(|draft_gguf| init_dspark_drafter(draft_gguf, &base_gguf_arc, "bytes"));
+            .and_then(|draft_gguf| {
+                init_dspark_drafter(draft_gguf, base_gguf_arc.as_ref()?, "bytes")
+            });
 
         let mut manifest = Manifest::synthetic(
             Path::new("<bytes>"),
@@ -1773,7 +1775,7 @@ fn try_load_drafter(
         }
     };
 
-    init_dspark_drafter(draft_gguf, base_gguf, &draft_path.display().to_string())
+    init_dspark_drafter(draft_gguf, base_gguf, &draft_path.to_string_lossy())
 }
 
 #[cfg(not(feature = "mmap"))]
