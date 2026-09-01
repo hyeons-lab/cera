@@ -614,6 +614,10 @@ pub fn sgemm_dual_parallel(
         )
         .is_err()
     {
+        tracing::debug!(
+            target: "cera::backend::blas",
+            "AMX dual worker busy; falling back to sequential CBLAS"
+        );
         sgemm_rowmajor_nt(n1, m1, k1, b1, a1, c1);
         sgemm_rowmajor_nt(n2, m2, k2, b2, a2, c2);
         return;
@@ -707,6 +711,10 @@ pub fn sgemm_split2_parallel(n: usize, m: usize, k: usize, b: &[f32], a: &[f32],
         )
         .is_err()
     {
+        tracing::debug!(
+            target: "cera::backend::blas",
+            "AMX dual worker busy; falling back to single-threaded CBLAS"
+        );
         sgemm_rowmajor_nt(n, m, k, b, a, c);
         return;
     }
