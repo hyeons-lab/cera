@@ -3153,26 +3153,16 @@ mod webgpu {
                 pos += 1;
             }
 
-            let (_def_temp, def_top_p, def_top_k, def_min_p, def_rep_pen, audio_temp, audio_top_k) =
+            let (def_top_p, def_top_k, def_min_p, def_rep_pen, audio_temp, audio_top_k) =
                 match &self.generation_defaults {
                     Some(cera::manifest::GenerationDefaults::Text {
-                        temperature,
                         top_p,
                         top_k,
                         min_p,
                         repetition_penalty,
                         ..
-                    }) => (
-                        *temperature,
-                        *top_p,
-                        *top_k,
-                        *min_p,
-                        *repetition_penalty,
-                        0.7,
-                        40,
-                    ),
+                    }) => (*top_p, *top_k, *min_p, *repetition_penalty, 0.7, 40),
                     Some(cera::manifest::GenerationDefaults::Audio {
-                        temperature,
                         top_p,
                         top_k,
                         min_p,
@@ -3181,15 +3171,14 @@ mod webgpu {
                         audio_top_k,
                         ..
                     }) => (
-                        *temperature,
                         *top_p,
                         *top_k,
                         *min_p,
                         *repetition_penalty,
                         audio_temperature.unwrap_or(0.7),
-                        audio_top_k.map(|k| k as usize).unwrap_or(40),
+                        audio_top_k.unwrap_or(40) as usize,
                     ),
-                    _ => (None, None, None, None, None, 0.7, 40),
+                    None => (None, None, None, None, 0.7, 40),
                 };
 
             // Greedy stays on the GPU-argmax path, which reads back four bytes
@@ -3205,13 +3194,8 @@ mod webgpu {
             // When a draft model is attached, or when temperature is omitted on WebGPU, default to 0.0
             // rather than falling back to CPU manifest defaults (which specify temperature: 0.1).
             let has_audio_weights = self.audio_decoder.is_some() && self.detok_weights.is_some();
-            let resolved_temp = temperature.unwrap_or_else(|| {
-                if self.drafter.is_none() && has_audio_weights {
-                    0.7
-                } else {
-                    0.0
-                }
-            });
+            let resolved_temp =
+                temperature.unwrap_or_else(|| if has_audio_weights { 0.7 } else { 0.0 });
             let cfg = cera::sampler::SamplerConfig {
                 temperature: resolved_temp,
                 top_p: top_p.or(def_top_p).unwrap_or(defaults.top_p),
@@ -3258,7 +3242,7 @@ mod webgpu {
             let mut spec_drafted_count = 0usize;
             let mut spec_accepted_count = 0usize;
             console_info(&format!(
-                "[cera-wasm:version] v{} (build: 2026-08-29-rev20-clean-cpu-depthformer-webgpu-llm) generate started: prompt_tokens={}, max_tokens={}, has_drafter={}, supports_all_logits={}, is_greedy={}, temp={resolved_temp}",
+                "[cera-wasm:version] v{} generate started: prompt_tokens={}, max_tokens={}, has_drafter={}, supports_all_logits={}, is_greedy={}, temp={resolved_temp}",
                 env!("CARGO_PKG_VERSION"),
                 ids.len(),
                 max_tokens,
@@ -3303,10 +3287,12 @@ mod webgpu {
             let mut time_depthformer_ms = 0.0;
             let mut time_vocoder_finish_ms = 0.0;
             let mut llm_hidden_passes = 0usize;
-            let mut audio_frames_count = 0usize;
-            let mut total_voiced_frames = 0usize;
             let mut text_tokens_count = 0usize;
-            let mut modality_budget = if is_interleaved { 6usize } else { usize::MAX };
+            let mut modality_budget = if is_interleaved {
+                cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET
+            } else {
+                usize::MAX
+            };
             let mut text_done = false;
             let gen_start_time = js_sys::Date::now();
 
@@ -3356,16 +3342,13 @@ mod webgpu {
                         time_llm_audio_ms += js_sys::Date::now() - t_emb0;
                         pos += 1;
 
-                        let mut frame_count = 0;
-                        let mut voiced_frames = 0usize;
-                        let mut consecutive_silent_frames = 0usize;
                         let can_use_gpu_buf = dec.supports_gpu_depthformer();
                         let mut use_gpu_buf = false;
                         loop {
                             if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            if pos >= max_seq_len || audio_frames_count >= 4096 {
+                            if pos >= max_seq_len || dec.is_safety_limit_reached() {
                                 break;
                             }
                             let t_df0 = js_sys::Date::now();
@@ -3381,28 +3364,18 @@ mod webgpu {
                             let audio_emb = match outcome {
                                 cera::audio_engine::FrameOutcome::End => {
                                     console_info(&format!(
-                                        "[cera-wasm] WebGpuSession vocoder emitted End code after {frame_count} frames"
+                                        "[cera-wasm] WebGpuSession vocoder emitted End code after {} frames",
+                                        dec.audio_frames()
                                     ));
                                     break;
                                 }
                                 cera::audio_engine::FrameOutcome::Codes {
                                     audio_embedding,
                                     pcm,
-                                    codes,
+                                    codes: _,
                                 } => {
-                                    frame_count += 1;
-                                    audio_frames_count += 1;
-                                    let mut rms = 0.0f32;
+                                    dec.observe_pcm(&pcm);
                                     if !pcm.is_empty() {
-                                        rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
-                                            / pcm.len().max(1) as f32)
-                                            .sqrt();
-                                        if rms >= 0.001 {
-                                            voiced_frames += 1;
-                                            consecutive_silent_frames = 0;
-                                        } else {
-                                            consecutive_silent_frames += 1;
-                                        }
                                         if let Some(cb) = on_audio {
                                             let array = js_sys::Float32Array::from(pcm.as_slice());
                                             let rate_val =
@@ -3410,20 +3383,10 @@ mod webgpu {
                                             let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                                         }
                                     }
-                                    if frame_count <= 15
-                                        || frame_count % 10 == 0
-                                        || consecutive_silent_frames == 1
-                                        || consecutive_silent_frames >= 28
-                                    {
+                                    if dec.is_silence_terminated() {
                                         console_info(&format!(
-                                            "[cera-wasm] frame #{frame_count:02} (pos={pos}): rms={rms:.4}, voiced={voiced_frames}, silent={consecutive_silent_frames}, codes={codes:?}"
-                                        ));
-                                    }
-                                    if consecutive_silent_frames >= 40
-                                        || (voiced_frames >= 5 && consecutive_silent_frames >= 30)
-                                    {
-                                        console_info(&format!(
-                                            "[cera-wasm] WebGpuSession audio ended on trailing silence after {frame_count} frames ({voiced_frames} voiced frames)"
+                                            "[cera-wasm] WebGpuSession audio ended on trailing silence after {} frames",
+                                            dec.audio_frames()
                                         ));
                                         break;
                                     }
@@ -3494,14 +3457,13 @@ mod webgpu {
                     time_llm_audio_ms += js_sys::Date::now() - t_emb0;
                     pos += 1;
 
-                    let mut audio_budget = 12usize;
+                    let mut audio_budget = cera::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET;
                     let can_use_gpu_buf = dec.supports_gpu_depthformer();
                     let mut use_gpu_buf = false;
-                    let mut consecutive_silent_frames = 0usize;
                     loop {
                         if self.cancel.load(std::sync::atomic::Ordering::Relaxed)
                             || pos >= max_seq_len
-                            || audio_frames_count >= 4096
+                            || dec.is_safety_limit_reached()
                         {
                             break;
                         }
@@ -3544,9 +3506,11 @@ mod webgpu {
                                         .await
                                         .map_err(map_err)?,
                                 };
+                                token_history.push(next);
                                 time_llm_text_ms += js_sys::Date::now() - t_trans0;
                                 pos += 1;
-                                modality_budget = 6;
+                                modality_budget =
+                                    cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                                 break;
                             }
                             cera::audio_engine::FrameOutcome::Codes {
@@ -3554,30 +3518,19 @@ mod webgpu {
                                 pcm,
                                 ..
                             } => {
-                                audio_frames_count += 1;
+                                dec.observe_pcm(&pcm);
                                 if !pcm.is_empty() {
-                                    let rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
-                                        / pcm.len().max(1) as f32)
-                                        .sqrt();
-                                    if rms >= 0.001 {
-                                        total_voiced_frames += 1;
-                                        consecutive_silent_frames = 0;
-                                    } else {
-                                        consecutive_silent_frames += 1;
-                                    }
                                     if let Some(cb) = on_audio {
                                         let array = js_sys::Float32Array::from(pcm.as_slice());
                                         let rate_val = JsValue::from_f64(dec.sample_rate() as f64);
                                         let _ = cb.call2(&JsValue::null(), &array, &rate_val);
                                     }
                                 }
-                                if text_done
-                                    && (consecutive_silent_frames >= 30
-                                        || (total_voiced_frames >= 5
-                                            && consecutive_silent_frames >= 25))
-                                {
+                                if text_done && dec.is_silence_terminated() {
                                     console_info(&format!(
-                                        "[cera-wasm] Interleaved audio ended on trailing silence ({total_voiced_frames} total voiced frames, {consecutive_silent_frames} trailing silent frames)"
+                                        "[cera-wasm] Interleaved audio ended on trailing silence ({} total voiced frames, {} trailing silent frames)",
+                                        dec.watchdog.total_voiced_frames,
+                                        dec.watchdog.consecutive_silent_frames
                                     ));
                                     break;
                                 }
@@ -3611,9 +3564,10 @@ mod webgpu {
                                     .await
                                     .map_err(map_err)?,
                             };
+                            token_history.push(next);
                             time_llm_text_ms += js_sys::Date::now() - t_trans0;
                             pos += 1;
-                            modality_budget = 6;
+                            modality_budget = cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             break;
                         }
 
@@ -3759,7 +3713,6 @@ mod webgpu {
             let mut total_samples = 0;
             if let Some(mut dec) = decoder
                 && dec.audio_frames() > 0
-                && let Some(cb) = on_audio
             {
                 let t_fin0 = js_sys::Date::now();
                 dec.finish_async(|pcm, rate| {
@@ -3769,9 +3722,11 @@ mod webgpu {
                         pcm.len(),
                         rate
                     ));
-                    let array = js_sys::Float32Array::from(pcm);
-                    let rate_val = JsValue::from_f64(rate as f64);
-                    let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                    if let Some(cb) = on_audio {
+                        let array = js_sys::Float32Array::from(pcm);
+                        let rate_val = JsValue::from_f64(rate as f64);
+                        let _ = cb.call2(&JsValue::null(), &array, &rate_val);
+                    }
                 })
                 .await
                 .map_err(map_err)?;
@@ -3787,7 +3742,9 @@ mod webgpu {
             }
 
             let total_gen_ms = js_sys::Date::now() - gen_start_time;
-            let audio_dur_sec = total_samples as f64 / 24000.0;
+            let sample_rate = decoder.as_ref().map(|d| d.sample_rate()).unwrap_or(24000) as f64;
+            let audio_frames_count = decoder.as_ref().map(|d| d.audio_frames()).unwrap_or(0);
+            let audio_dur_sec = total_samples as f64 / sample_rate;
             let rtf = if total_gen_ms > 0.0 {
                 audio_dur_sec / (total_gen_ms / 1000.0)
             } else {

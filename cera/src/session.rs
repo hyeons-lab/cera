@@ -2041,10 +2041,8 @@ impl Session {
             } else {
                 None
             };
-        let mut modality_budget = 6usize;
+        let mut modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
         let mut text_done = false;
-        let mut total_voiced_frames = 0usize;
-        let mut audio_frames_count = 0usize;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -2157,9 +2155,9 @@ impl Session {
                 text_done = true;
             }
 
+            self.token_history.push(token);
             if !is_audio_transition {
                 pending.push(token);
-                self.token_history.push(token);
                 generated += 1;
                 modality_budget = modality_budget.saturating_sub(1);
             }
@@ -2176,14 +2174,13 @@ impl Session {
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
                 pos += 1;
 
-                let mut audio_budget = 12usize;
-                let mut consecutive_silent_frames = 0usize;
+                let mut audio_budget = crate::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET;
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         finish = FinishReason::Cancelled;
                         break;
                     }
-                    if generated >= opts.max_tokens || audio_frames_count >= 4096 {
+                    if dec.is_safety_limit_reached() {
                         break;
                     }
                     if pos >= self.max_seq_len {
@@ -2206,7 +2203,7 @@ impl Session {
                             }
                             logits = text_end_logits;
                             pos += 1;
-                            modality_budget = 6;
+                            modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             break;
                         }
                         crate::audio_engine::FrameOutcome::Codes {
@@ -2214,24 +2211,11 @@ impl Session {
                             pcm,
                             ..
                         } => {
-                            audio_frames_count += 1;
+                            dec.observe_pcm(&pcm);
                             if !pcm.is_empty() {
-                                let rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
-                                    / pcm.len().max(1) as f32)
-                                    .sqrt();
-                                if rms >= 0.001 {
-                                    total_voiced_frames += 1;
-                                    consecutive_silent_frames = 0;
-                                } else {
-                                    consecutive_silent_frames += 1;
-                                }
                                 sink.on_audio_frames(&pcm, dec.sample_rate());
                             }
-                            if text_done
-                                && (consecutive_silent_frames >= 30
-                                    || (total_voiced_frames >= 5
-                                        && consecutive_silent_frames >= 25))
-                            {
+                            if text_done && dec.is_silence_terminated() {
                                 break;
                             }
                             audio_embedding
@@ -2248,7 +2232,7 @@ impl Session {
                             greedy_next = crate::sampler::argmax(&logits);
                         }
                         pos += 1;
-                        modality_budget = 6;
+                        modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                         break;
                     }
 
@@ -2256,12 +2240,11 @@ impl Session {
                         self.model
                             .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
                     pos += 1;
-                    generated += 1;
                     self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
 
                 if text_done {
-                    if finish != FinishReason::Cancelled {
+                    if finish == FinishReason::MaxTokens {
                         finish = FinishReason::Stop;
                     }
                     break;
