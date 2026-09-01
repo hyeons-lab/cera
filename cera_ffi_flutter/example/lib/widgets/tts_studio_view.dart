@@ -84,6 +84,7 @@ class _TtsStudioViewState extends State<TtsStudioView> {
       await widget.controller.dispatch(
         const UpdateSettingsIntent(audioChatMode: AudioChatMode.textToSpeech),
       );
+      if (!mounted) return;
     }
 
     widget.controller.dispatch(SendMessageIntent(text));

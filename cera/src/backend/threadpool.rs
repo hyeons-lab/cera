@@ -239,6 +239,10 @@ struct Shared {
     /// Set by a worker whose closure panicked; the dispatcher re-raises the
     /// panic on the calling thread after the barrier drains.
     panicked: AtomicBool,
+    /// Number of background workers currently in `thread::park()`. Avoids
+    /// issuing `unpark()` syscalls on every GEMV dispatch when workers are
+    /// actively spin-waiting in user space.
+    parked_count: AtomicUsize,
     /// The panicking worker's original payload, resumed on the calling thread
     /// so the panic message/type survive the thread hop (rayon's contract).
     /// Only touched on the panic path — never on a normal dispatch.
@@ -786,6 +790,7 @@ impl RowPool {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         });
@@ -827,7 +832,20 @@ impl RowPool {
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
+}
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn set_macos_thread_qos_interactive() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+impl RowPool {
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
     /// every host thread that ever dispatches would be permanently pinned to
@@ -866,7 +884,16 @@ impl RowPool {
                     retry_cooldown: 0,
                 })
             };
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            static QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        QOS_SET.with(|q| {
+            if !q.get() {
+                set_macos_thread_qos_interactive();
+                q.set(true);
+            }
+        });
         let Some(core) = self.caller_pin else {
             return;
         };
@@ -1159,17 +1186,21 @@ impl RowPool {
             let next_epoch = state_epoch(self.shared.state.load(Ordering::Relaxed)) + 1;
             self.shared
                 .state
-                .store(pack_state(next_epoch, active), Ordering::Release);
-            for h in self.workers.iter().take(active - 1) {
-                h.thread().unpark();
+                .store(pack_state(next_epoch, active), Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in self.workers.iter().take(active - 1) {
+                    h.thread().unpark();
+                }
             }
         } else {
             self.shared
                 .pending
                 .store(self.num_threads - 1, Ordering::Release);
-            self.shared.state.fetch_add(1, Ordering::Release);
-            for h in &self.workers {
-                h.thread().unpark();
+            self.shared.state.fetch_add(1, Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in &self.workers {
+                    h.thread().unpark();
+                }
             }
         }
 
@@ -1242,6 +1273,27 @@ impl Drop for DrainGuard<'_> {
     }
 }
 
+/// RAII guard ensuring `parked_count` is decremented on scope exit,
+/// preventing counter skew or thread desynchronization if a worker unwinds or panics.
+struct ParkedGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> ParkedGuard<'a> {
+    #[inline]
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ParkedGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for RowPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
@@ -1271,6 +1323,19 @@ fn worker_loop(
     spread_mask: &'static [usize],
     spin_limit: u32,
 ) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        thread_local! {
+            static WORKER_QOS_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        WORKER_QOS_SET.with(|q| {
+            if !q.get() {
+                set_macos_thread_qos_interactive();
+                q.set(true);
+            }
+        });
+    }
+
     if let Some(core) = pin_core {
         let _ = pin_current_thread_to_core(core);
     } else if !spread_mask.is_empty() {
@@ -1337,8 +1402,13 @@ fn worker_loop(
             if spins < spin_limit {
                 std::hint::spin_loop();
             } else {
-                // park() returns immediately if an unpark token is pending, so
-                // there's no lost-wakeup between the epoch check and the park.
+                let _guard = ParkedGuard::enter(&shared.parked_count);
+                // Check state one last time after declaring intent to park
+                if shared.state.load(Ordering::SeqCst) != last_state
+                    || shared.shutdown.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
                 thread::park();
                 parked = true;
             }
@@ -1603,6 +1673,7 @@ mod tests {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         };
@@ -1645,6 +1716,7 @@ mod tests {
             pending: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            parked_count: AtomicUsize::new(0),
             panic_payload: Mutex::new(None),
             job: UnsafeCell::new(None),
         };

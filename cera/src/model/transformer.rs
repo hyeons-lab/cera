@@ -76,9 +76,10 @@ pub mod oracle_dump {
 /// layout differs from GGUF's, and kept *alongside* the mmap weights — prefill
 /// only, decode keeps the standard mmap layout — so it costs roughly one extra
 /// weight-sized copy for each repacked weight.
-#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 #[derive(Clone)]
-pub(crate) enum Repacked {
+#[allow(dead_code)]
+pub enum Repacked {
     Q40 {
         packed: Vec<u8>,
         scales: Vec<f32>,
@@ -95,15 +96,15 @@ pub(crate) enum Repacked {
 ///
 /// Gated to the one config that reads it — the x86 no-BLAS prefill path — so it
 /// does not read as dead code where `gemm_preq`'s repacked branch is compiled out.
-#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 #[derive(Clone)]
-pub(crate) struct RepackedWeight {
+pub struct RepackedWeight {
     pub kind: Repacked,
     pub m: usize,
     pub k: usize,
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 impl std::fmt::Debug for RepackedWeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print the buffers — they can be hundreds of MiB.
@@ -124,21 +125,41 @@ impl std::fmt::Debug for RepackedWeight {
 /// load time to avoid HashMap lookups during inference. Semantics match
 /// `lfm2::WeightRef`.
 #[derive(Debug, Clone)]
-pub(crate) struct WeightRef {
-    pub start: usize,
+pub struct WeightRef {
+    pub start: u64,
     pub size: usize,
     pub dtype: DType,
     pub m: usize,
     pub k: usize,
     /// Set by [`WeightRef::with_repack`] for Q4_0 / Q4_K projection weights on
-    /// hosts with the x86 int8 kernels. `None` when unset (other dtypes, ragged
+    /// hosts with the int8 kernels. `None` when unset (other dtypes, ragged
     /// row counts, or weights that never hit the batched GEMM). The field exists
     /// only on the target/feature combo whose `gemm_preq` reads it.
-    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
     pub repacked: Option<std::sync::Arc<RepackedWeight>>,
+    #[cfg(has_blas)]
+    pub cached_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
+    #[cfg(has_blas)]
+    pub cached_f32_transposed: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
 }
 
 impl WeightRef {
+    pub fn new(start: u64, size: usize, dtype: DType, m: usize, k: usize) -> Self {
+        Self {
+            start,
+            size,
+            dtype,
+            m,
+            k,
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+            repacked: None,
+            #[cfg(has_blas)]
+            cached_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
+            #[cfg(has_blas)]
+            cached_f32_transposed: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
     /// Repack this weight for the prefill GEMM if it qualifies, returning the
     /// (possibly augmented) ref. Call at projection-weight resolution sites.
     ///
@@ -156,51 +177,50 @@ impl WeightRef {
     /// not. It wants a measurement, not an assumption: the extra copy and its
     /// resident memory are still real, and speculative decoding is off by
     /// default.
-    #[allow(unused_variables, unused_mut)]
-    pub(crate) fn with_repack(mut self, gguf: &GgufFile) -> Self {
-        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[allow(unused_mut)]
+    pub(crate) fn with_repack(mut self, _gguf: &GgufFile) -> Self {
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
         {
-            let kind = if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
+            let gguf = _gguf;
+            let mut kind = None;
+            if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
                 let (packed, scales) =
                     cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
-                Some(Repacked::Q40 { packed, scales })
-            } else if self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k) {
-                let (packed, dsc, dmn) =
-                    cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
-                Some(Repacked::Q4K { packed, dsc, dmn })
-            } else {
-                None
-            };
-            if let Some(kind) = kind {
-                self.repacked = Some(std::sync::Arc::new(RepackedWeight {
-                    kind,
+                kind = Some(Repacked::Q40 { packed, scales });
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if kind.is_none()
+                    && self.dtype == DType::Q4KM
+                    && cpu::q4_k_repack_supported(self.m, self.k)
+                {
+                    let (packed, dsc, dmn) =
+                        cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q4K { packed, dsc, dmn });
+                }
+            }
+            self.repacked = kind.map(|k| {
+                std::sync::Arc::new(RepackedWeight {
+                    kind: k,
                     m: self.m,
                     k: self.k,
-                }));
-            }
+                })
+            });
         }
         self
     }
 }
 
-/// Resolve a tensor name to a pre-computed byte range in the mmap.
-pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
+/// Resolve a tensor name to a byte range in `data`, returning the weight's
+/// metadata and row/col dimensions as a [`WeightRef`].
+pub fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
     let info = gguf
         .tensors
         .get(name)
         .with_context(|| format!("tensor not found: {name}"))?;
 
-    // info.offset is already absolute (data_offset + raw_offset from GGUF)
-    let start =
-        usize::try_from(info.offset).with_context(|| format!("tensor {name} offset overflow"))?;
+    let start = info.offset;
 
-    // A tensor whose GGML type cannot be mapped is recorded as F32 with
-    // `size_bytes == 0` so `inspect` can still list it (see `gguf.rs`). Catch
-    // that here rather than handing a zero-length slice to a kernel that will
-    // index it and panic — the caller gets the actual type name instead.
-    // Reports the numeric id alongside the name, matching `GgufFile::tensor_range`:
-    // `ggml_type_name` returns "???" for an id it does not know, so the name alone
-    // would say nothing at all about a type newer than this build.
     ensure!(
         info.size_bytes > 0,
         "tensor {name} has unsupported GGML type {} ({}) — cera cannot run this file",
@@ -210,24 +230,14 @@ pub(crate) fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
 
     let size = info.size_bytes;
     let dtype = info.dtype;
-
-    // GGUF shape: [inner_dim, outer_dim] → in memory: outer_dim rows of inner_dim elements
-    let k = info.shape.first().copied().unwrap_or(1); // inner dim (elements per row)
+    let k = info.shape.first().copied().unwrap_or(1);
     let m = if info.shape.len() > 1 {
         info.shape[1]
     } else {
         1
-    }; // outer dim (number of rows)
+    };
 
-    Ok(WeightRef {
-        start,
-        size,
-        dtype,
-        m,
-        k,
-        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-        repacked: None,
-    })
+    Ok(WeightRef::new(start, size, dtype, m, k))
 }
 
 /// Resolve one expert's slice of a stacked MoE expert tensor to a byte range,
@@ -247,29 +257,22 @@ pub(crate) fn resolve_expert_weight(
     expert: usize,
 ) -> Result<WeightRef> {
     let (start, size, m, k, dtype) = gguf.tensor_meta_expert(name, expert)?;
-    Ok(WeightRef {
-        start,
-        size,
-        dtype,
-        m,
-        k,
-        #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
-        repacked: None,
-    })
+    Ok(WeightRef::new(start as u64, size, dtype, m, k))
 }
 
 /// Get the raw bytes for a pre-resolved weight.
 #[inline]
 pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] {
-    &gguf.mmap_data()[wref.start..wref.start + wref.size]
+    let start = usize::try_from(wref.start).expect("weight offset fits in usize for CPU execution");
+    &gguf.mmap_data()[start..start + wref.size]
 }
 
 /// Gated exactly like `batched_gemm_supports` itself, which is
-/// `#[cfg(any(aarch64, x86_64, feature = "blas"))]`. Without this the module
+/// `#[cfg(any(aarch64, x86_64, has_blas))]`. Without this the module
 /// still compiles into a wasm32 test build and fails on a function that does
 /// not exist there. CI lints the host target only, so nothing caught it.
 #[cfg(test)]
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 mod gate_tests {
     use super::*;
 
@@ -342,7 +345,7 @@ mod gate_tests {
         for k in [256usize, 512, 2048] {
             assert_eq!(
                 batched_gemm_supports(DType::Q5KM, k),
-                cfg!(feature = "blas"),
+                cfg!(has_blas),
                 "Q5_K at k={k} must track the `blas` feature exactly"
             );
         }
@@ -363,7 +366,7 @@ mod gate_tests {
     /// than it looks: it forces a visit, not a correct edit. Add a variant to
     /// the match and forget the array and the sweep still passes, having
     /// quietly skipped it.
-    #[cfg(feature = "blas")]
+    #[cfg(has_blas)]
     const ALL_DTYPES: [DType; 11] = [
         DType::F32,
         DType::F16,
@@ -379,7 +382,7 @@ mod gate_tests {
     ];
 
     /// Wildcard-free, so a new `DType` variant stops compiling here.
-    #[cfg(feature = "blas")]
+    #[cfg(has_blas)]
     fn all_dtypes_is_exhaustive(d: DType) -> bool {
         match d {
             DType::F32
@@ -405,9 +408,9 @@ mod gate_tests {
     /// activations in the reused output buffer. Neither the gate test nor the
     /// dequantizer's own unit test connects the two; this does.
     ///
-    /// Only meaningful under `blas` (that is the only configuration in which
-    /// `try_blas_prefill_gemm` exists), and CI runs a `--features blas` leg.
-    #[cfg(feature = "blas")]
+    /// Only meaningful under `has_blas` (that is the only configuration in which
+    /// `try_blas_prefill_gemm` exists), and CI runs a macOS Accelerate leg.
+    #[cfg(has_blas)]
     #[test]
     fn blas_gate_agrees_with_dequantizer_table() {
         assert!(
@@ -468,24 +471,48 @@ pub(crate) fn gemv_preq(
     cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
 }
 
-/// Quantize `x` to Q8_0 into the state's reusable scratch buffers.
+/// GEMV with pre-quantized Q8_0 input computing argmax directly without writing logits.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
+#[allow(dead_code)]
+pub(crate) fn gemv_preq_argmax(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    x_f32: &[f32],
+    q8s: &[f32],
+    q8q: &[i8],
+) -> usize {
+    let data = weight_data(gguf, wref);
+    cpu::gemv_with_preq_argmax(wref.dtype, data, q8s, q8q, x_f32, wref.m, wref.k)
+}
+
+/// Quantize `x` to Q8_0 into the provided scratch buffers without borrowing the whole InferenceState.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn quantize_to_scratch_bufs(
+    x: &[f32],
+    q8_scales: &mut Vec<f32>,
+    q8_quants: &mut Vec<i8>,
+) {
     assert_eq!(
         x.len() % 32,
         0,
         "quantize_to_scratch: x.len() must be divisible by 32"
     );
     let nb = x.len() / 32;
-    state.scratch.q8_scales.resize(nb, 0.0);
-    state.scratch.q8_quants.resize(x.len(), 0);
+    q8_scales.resize(nb, 0.0);
+    q8_quants.resize(x.len(), 0);
     unsafe {
-        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-            x,
-            &mut state.scratch.q8_scales,
-            &mut state.scratch.q8_quants,
-        );
+        crate::backend::simd::neon::quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
     }
+}
+
+/// Quantize `x` to Q8_0 into the state's reusable scratch buffers.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
+    quantize_to_scratch_bufs(
+        x,
+        &mut state.scratch.q8_scales,
+        &mut state.scratch.q8_quants,
+    );
 }
 
 // ── Batched-GEMM prefill helpers ────────────────────────────────────────────
@@ -525,7 +552,7 @@ pub(crate) fn quantize_to_scratch(x: &[f32], state: &mut InferenceState) {
 /// one — a row that short could not have been K-quantized in the first place — but
 /// "the format guarantees it" is precisely how the last two silent fallbacks got
 /// written, so it is checked rather than assumed).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 /// `#[doc(hidden)] pub` so `int8_gemm_gate.rs` can assert on the gate itself,
 /// not just on the predicate it consults. That binary forces
 /// `CERA_CPU_TIER=scalar` in a dedicated process, which a unit test cannot do —
@@ -541,9 +568,7 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // bar to every tier from `Avx2` up, which is why the predicate is a tier
         // comparison and not a VNNI check. Under `blas` the question is moot —
         // that path dequantizes and SGEMMs.
-        DType::Q4_0 | DType::Q8_0 => {
-            cfg!(feature = "blas") || crate::backend::cpu::int8_gemm_available()
-        }
+        DType::Q4_0 | DType::Q8_0 => cfg!(has_blas) || crate::backend::cpu::int8_gemm_available(),
         // Q4_1's int8 GEMM reuses the K-quants' dotprod col-sum machinery (its `m`
         // term needs `Σ(activation)` exactly as their `dmin` term does), so it shares
         // their availability predicate — dotprod on aarch64, AVX2-int8 on x86, or the
@@ -559,7 +584,7 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // matmul and leaving the previous layer's activations in the reused
         // output buffer. Narrower than it looks, and deliberately so: the
         // dequant+SGEMM route is the only Q5_K batched path that exists.
-        DType::Q5KM => cfg!(feature = "blas") && k.is_multiple_of(256),
+        DType::Q5KM => cfg!(has_blas) && k.is_multiple_of(256),
         _ => false,
     }
 }
@@ -574,14 +599,14 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
 /// machine cannot reproduce that. It *is* called on x86_64, where it now answers
 /// for the x86 K-quant GEMM kernels (VNNI and AVX2 alike) — so this is a lint
 /// cfg, not a statement about which targets reach it.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 fn k_quant_gemm_available() -> bool {
     // BLAS dequantizes the weight and SGEMMs, so it needs no int8 kernel.
-    #[cfg(feature = "blas")]
+    #[cfg(has_blas)]
     {
         true
     }
-    #[cfg(all(not(feature = "blas"), target_arch = "aarch64"))]
+    #[cfg(all(not(has_blas), target_arch = "aarch64"))]
     {
         crate::backend::simd::neon::k_quant_gemm_available()
     }
@@ -589,13 +614,13 @@ fn k_quant_gemm_available() -> bool {
     // Q4_0/Q8_0 int8 kernels. Both are emitted by the same macro and both are
     // instantiated at the VNNI and AVX2 tiers, so this needs neither VNNI nor
     // the `avx512` crate feature — just avx2+fma.
-    #[cfg(all(not(feature = "blas"), target_arch = "x86_64"))]
+    #[cfg(all(not(has_blas), target_arch = "x86_64"))]
     {
         crate::backend::cpu::int8_gemm_available()
     }
     // No BLAS, no NEON, no x86 int8: no batched K-quant path on this target.
     #[cfg(all(
-        not(feature = "blas"),
+        not(has_blas),
         not(target_arch = "aarch64"),
         not(target_arch = "x86_64")
     ))]
@@ -611,7 +636,7 @@ fn k_quant_gemm_available() -> bool {
 /// ~4x prefill on CPU (T1) and ~340x the submits on GPU (T8) before anyone noticed,
 /// both times because the fallback said nothing. If prefill is slow and this is
 /// quiet, the dtypes are not the reason.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
     use std::sync::Mutex;
     // A Vec, not a HashSet: `DType` is not `Hash`, the set holds a handful of
@@ -633,21 +658,13 @@ pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
 }
 
 /// Signature shared by every `quant::dequantize_*_matrix`.
-#[cfg(feature = "blas")]
-type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
+#[cfg(has_blas)]
+pub(crate) type MatrixDequantizer = fn(&[u8], usize, usize, &mut [f32]);
 
 /// The whole-matrix dequantizer the BLAS prefill route uses for `dtype`, or
 /// `None` if there is none.
-///
-/// Split out of [`try_blas_prefill_gemm`] so that the set of dtypes the BLAS
-/// path can actually *run* is a value a test can inspect, rather than a `match`
-/// buried mid-function. [`batched_gemm_supports`] and this function are two
-/// lists that must agree, and callers discard `try_blas_prefill_gemm`'s bool, so
-/// a disagreement is silent corruption rather than a failure: the GEMM is
-/// skipped and the reused output buffer still holds the previous layer's
-/// activations. `blas_gate_agrees_with_dequantizer_table` pins the implication.
-#[cfg(feature = "blas")]
-fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
+#[cfg(has_blas)]
+pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
     match dtype {
         DType::Q4_0 => Some(crate::quant::dequantize_q4_0_matrix),
         DType::Q4_1 => Some(crate::quant::dequantize_q4_1_matrix),
@@ -663,7 +680,7 @@ fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
 /// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
 /// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes;
 /// callers gate on dtype upfront so the `false` arm is defensive.
-#[cfg(feature = "blas")]
+#[cfg(has_blas)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_blas_prefill_gemm(
     gguf: &GgufFile,
@@ -673,27 +690,213 @@ pub(crate) fn try_blas_prefill_gemm(
     m: usize,
     n: usize,
     k: usize,
-    dequant_scratch: &mut Vec<f32>,
+    _dequant_scratch: &mut Vec<f32>,
 ) -> bool {
     debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
     debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
-    let data = weight_data(gguf, wref);
-    if dequant_scratch.len() < m * k {
-        dequant_scratch.resize(m * k, 0.0);
+
+    // Optional persistent caching via environment variable for memory-unconstrained microbenchmarks.
+    let should_cache = std::env::var("CERA_BLAS_CACHE_WEIGHTS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if should_cache {
+        let dequant = wref.cached_f32.get_or_init(|| {
+            let data = weight_data(gguf, wref);
+            if let Some(dequantize) = blas_dequantizer(wref.dtype) {
+                let mut buf = vec![0.0f32; m * k];
+                dequantize(data, m, k, &mut buf);
+                buf
+            } else {
+                Vec::new()
+            }
+        });
+        if dequant.is_empty() {
+            report_uncomputed_gemm("try_blas_prefill_gemm", wref.dtype, k);
+            return false;
+        }
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
+        return true;
     }
-    let dequant = &mut dequant_scratch[..m * k];
-    let Some(dequantize) = blas_dequantizer(wref.dtype) else {
-        // Reachable only if `batched_gemm_supports` admitted a dtype this
-        // function cannot run, which is the silent-corruption case: the caller
-        // ignores this `false` and goes on to read an output buffer that still
-        // holds the previous layer's activations. Same failure as `gemm_preq`
-        // declining, so it gets the same debug panic and release log.
+
+    // Default zero-leak on-demand streaming dequantization (drops CPU RAM from 17.6GB -> 2.8GB):
+    let data = weight_data(gguf, wref);
+    if let Some(dequantize) = blas_dequantizer(wref.dtype) {
+        let mut row_buf = vec![0.0f32; m * k];
+        dequantize(data, m, k, &mut row_buf);
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, &row_buf, b, out);
+        true
+    } else {
         report_uncomputed_gemm("try_blas_prefill_gemm", wref.dtype, k);
-        return false;
-    };
-    dequantize(data, m, k, dequant);
-    crate::backend::blas::sgemm_rowmajor_nn(m, n, k, dequant, b, out);
-    true
+        false
+    }
+}
+
+/// Dequantize a weight tensor on-demand into row-major transposed float buffer `[k, m]`.
+#[cfg(has_blas)]
+pub(crate) fn dequantize_weight_transposed(gguf: &GgufFile, wref: &WeightRef) -> Vec<f32> {
+    let (m, k) = (wref.m, wref.k);
+    let data = weight_data(gguf, wref);
+    if let Some(dequantize) = blas_dequantizer(wref.dtype) {
+        let mut row_buf = vec![0.0f32; m * k];
+        dequantize(data, m, k, &mut row_buf);
+        let mut col_buf = vec![0.0f32; k * m];
+        for r in 0..m {
+            for c in 0..k {
+                col_buf[c * m + r] = row_buf[r * k + c];
+            }
+        }
+        col_buf
+    } else {
+        Vec::new()
+    }
+}
+
+/// Prefill GEMM with row-major tokens `b[n, k]` and transposed weights `wref^T[k, m]` producing `out[n, m]`.
+#[cfg(has_blas)]
+pub(crate) fn get_dequantized_f32<'a>(gguf: &GgufFile, wref: &'a WeightRef) -> &'a [f32] {
+    wref.cached_f32_transposed
+        .get_or_init(|| dequantize_weight_transposed(gguf, wref))
+}
+
+#[cfg(has_blas)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_blas_prefill_gemm_rowmajor(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    b: &[f32],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(
+        wref.m, m,
+        "try_blas_prefill_gemm_rowmajor: weight m mismatch"
+    );
+    debug_assert_eq!(
+        wref.k, k,
+        "try_blas_prefill_gemm_rowmajor: weight k mismatch"
+    );
+
+    let should_cache = std::env::var("CERA_BLAS_CACHE_WEIGHTS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if should_cache {
+        let dequant = get_dequantized_f32(gguf, wref);
+        if dequant.is_empty() {
+            report_uncomputed_gemm("try_blas_prefill_gemm_rowmajor", wref.dtype, k);
+            return false;
+        }
+        crate::backend::blas::sgemm_rowmajor_nn_parallel(n, m, k, b, dequant, out);
+        return true;
+    }
+
+    // Default zero-leak on-demand streaming dequantization with native BLAS transpose:
+    let data = weight_data(gguf, wref);
+    if let Some(dequantize) = blas_dequantizer(wref.dtype) {
+        let mut row_buf = vec![0.0f32; m * k];
+        dequantize(data, m, k, &mut row_buf);
+        crate::backend::blas::sgemm_rowmajor_nt_parallel(n, m, k, b, &row_buf, out);
+        true
+    } else {
+        report_uncomputed_gemm("try_blas_prefill_gemm_rowmajor", wref.dtype, k);
+        false
+    }
+}
+
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_repacked_gemm_rowmajor(
+    wref: &WeightRef,
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(wref.m, m, "try_repacked_gemm_rowmajor: weight m mismatch");
+    debug_assert_eq!(wref.k, k, "try_repacked_gemm_rowmajor: weight k mismatch");
+    if let Some(rp) = &wref.repacked {
+        let ran = match &rp.kind {
+            Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                packed, scales, b_scales, b_quants, out, n, m, k,
+            ),
+            _ => false,
+        };
+        if ran {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_rowmajor(
+    gguf: &GgufFile,
+    wref: &WeightRef,
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    if try_repacked_gemm_rowmajor(wref, b_scales, b_quants, out, n, m, k) {
+        return true;
+    }
+    let mut col_out = vec![0.0f32; m * n];
+    if gemm_preq(gguf, wref, b_scales, b_quants, &mut col_out, m, n, k) {
+        gemm_out_to_rows(&col_out, m, n, m, out);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_repacked_gate_up_silu_rowmajor(
+    gate: &WeightRef,
+    up: &WeightRef,
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    debug_assert_eq!(
+        gate.m, m,
+        "try_repacked_gate_up_silu_rowmajor: gate m mismatch"
+    );
+    debug_assert_eq!(
+        gate.k, k,
+        "try_repacked_gate_up_silu_rowmajor: gate k mismatch"
+    );
+    debug_assert_eq!(up.m, m, "try_repacked_gate_up_silu_rowmajor: up m mismatch");
+    debug_assert_eq!(up.k, k, "try_repacked_gate_up_silu_rowmajor: up k mismatch");
+    #[allow(clippy::collapsible_if)]
+    if let (Some(g_rp), Some(u_rp)) = (&gate.repacked, &up.repacked) {
+        if let (
+            Repacked::Q40 {
+                packed: gp,
+                scales: gs,
+            },
+            Repacked::Q40 {
+                packed: up,
+                scales: us,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
+            return cpu::gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                gp, gs, up, us, b_scales, b_quants, out, m, n, k,
+            );
+        }
+    }
+    false
 }
 
 /// Batched GEMM with pre-quantized Q8_0 input columns (the no-BLAS fallback).
@@ -702,11 +905,8 @@ pub(crate) fn try_blas_prefill_gemm(
 /// when a kernel ran.
 /// A `false` return means nothing was computed and the caller's output buffer
 /// still holds whatever was in it, so callers must gate rather than ignore it.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
-#[allow(clippy::too_many_arguments)]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn gemm_preq(
     gguf: &GgufFile,
     wref: &WeightRef,
@@ -755,7 +955,7 @@ pub(crate) fn gemm_preq(
     // dedicated prefill kernel — no per-column hsum. Only present on x86 hosts
     // with the int8 kernels, and only for weights that pass the dtype's
     // `*_repack_supported`, so this is a no-op fall-through everywhere else.
-    #[cfg(all(target_arch = "x86_64", not(feature = "blas")))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
     if let Some(rp) = &wref.repacked {
         debug_assert_eq!(rp.m, m, "gemm_preq: repacked m mismatch");
         debug_assert_eq!(rp.k, k, "gemm_preq: repacked k mismatch");
@@ -763,9 +963,12 @@ pub(crate) fn gemm_preq(
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             ),
+            #[cfg(target_arch = "x86_64")]
             Repacked::Q4K { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_dispatch(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
             ),
+            #[allow(unreachable_patterns)]
+            _ => false,
         };
         if !ran {
             report_uncomputed_gemm("gemm_preq", wref.dtype, k);
@@ -801,11 +1004,8 @@ pub(crate) fn gemm_preq(
 /// exclusive by cfg: `gemm_preq` without `blas`, `try_blas_prefill_gemm` with.
 /// Both fail the same way and deserve the same noise.
 #[cfg(any(
-    all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(feature = "blas")
-    ),
-    feature = "blas"
+    all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)),
+    has_blas
 ))]
 fn report_uncomputed_gemm(route: &str, dtype: DType, k: usize) {
     debug_assert!(
@@ -833,10 +1033,8 @@ fn report_uncomputed_gemm(route: &str, dtype: DType, k: usize) {
 /// multi-hundred-MB fixture, so CI would otherwise never execute it — and a
 /// swapped index here is silent, returning another position's logits rather
 /// than failing.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, dst: &mut [f32]) {
     assert!(
         cols <= rows,
@@ -858,10 +1056,8 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
 /// (no-`blas` fallback). `col` is a scratch column of length ≥ `dim`;
 /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
 /// batched int8 GEMM kernels consume — the same layout on NEON, VNNI, and AVX2.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub(crate) fn quantize_columns(
     mat: &[f32],
     dim: usize,
@@ -873,12 +1069,11 @@ pub(crate) fn quantize_columns(
     // Q8_0 packs 32-element blocks; `dim` must divide evenly (else the tail is
     // silently dropped by `dim / 32`). Assert alignment + scratch capacity at the
     // top so misuse is caught before the unsafe NEON quantizer runs.
-    debug_assert_eq!(
-        dim % 32,
-        0,
+    assert!(
+        dim.is_multiple_of(32),
         "quantize_columns: dim ({dim}) must be a multiple of 32"
     );
-    debug_assert!(
+    assert!(
         mat.len() >= dim * n
             && col.len() >= dim
             && scales.len() >= n * (dim / 32)
@@ -906,27 +1101,22 @@ pub(crate) fn quantize_columns(
     // runs (and `dispatch_rows` itself degrades to caller-serial anyway).
     #[cfg(feature = "parallel")]
     {
-        // Resolve once so the entry gate and the per-worker granularity are
-        // provably the same value (the "one value, one meaning" contract).
         let min_cols = cpu::prequant_par_min_cols();
         if n >= min_cols {
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
             cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
                 let mat = mat_ptr as *const f32;
-                // SAFETY: column `j` exclusively owns `quants[j*dim .. (j+1)*dim]`
-                // (columns are disjoint), and `mat` is read-only. Quantize one
-                // Q8_0 block at a time out of a stack gather buffer, so there is
-                // no per-worker heap scratch to thread through the pool.
                 let qcol = (quants_ptr as *mut i8).wrapping_add(j * dim);
                 let mut blk = [0.0f32; 32];
                 for b in 0..nb {
                     for (t, bt) in blk.iter_mut().enumerate() {
                         *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
                     }
-                    // SAFETY: column `j` exclusively owns this 32-quant span.
-                    let qs = unsafe { core::slice::from_raw_parts_mut(qcol.add(b * 32), 32) };
-                    cpu::quantize_f32_to_q8_0_into(&blk, &mut sc[b..b + 1], qs);
+                    unsafe {
+                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
+                        cpu::quantize_f32_to_q8_0_into(&blk, &mut sc[b..b + 1], qs);
+                    }
                 }
             });
             return;
@@ -939,6 +1129,56 @@ pub(crate) fn quantize_columns(
         }
         cpu::quantize_f32_to_q8_0_into(
             &col[..dim],
+            &mut scales[j * nb..(j + 1) * nb],
+            &mut quants[j * dim..(j + 1) * dim],
+        );
+    }
+}
+
+/// Quantize all `n` token rows of a row-major `[n × dim]` activation matrix to Q8_0.
+/// Used by LFM2 prefill activations where token vectors are stored contiguously.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub(crate) fn quantize_rows(
+    mat: &[f32],
+    dim: usize,
+    n: usize,
+    scales: &mut [f32],
+    quants: &mut [i8],
+) {
+    assert!(
+        dim.is_multiple_of(32),
+        "quantize_rows: dim must be divisible by 32"
+    );
+    assert!(
+        mat.len() >= dim * n && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
+        "quantize_rows: scratch too small for dim={dim}, n={n}"
+    );
+    let nb = dim / 32;
+
+    #[cfg(feature = "parallel")]
+    {
+        let min_cols = cpu::prequant_par_min_cols();
+        if n >= min_cols {
+            let mat_ptr = mat.as_ptr() as usize;
+            let quants_ptr = quants.as_mut_ptr() as usize;
+            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
+                let tok_f32 = unsafe {
+                    core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)
+                };
+                let tok_qs = unsafe {
+                    core::slice::from_raw_parts_mut((quants_ptr as *mut i8).add(j * dim), dim)
+                };
+                cpu::quantize_f32_to_q8_0_into(tok_f32, sc, tok_qs);
+            });
+            return;
+        }
+    }
+
+    for j in 0..n {
+        let tok_f32 = &mat[j * dim..(j + 1) * dim];
+        cpu::quantize_f32_to_q8_0_into(
+            tok_f32,
             &mut scales[j * nb..(j + 1) * nb],
             &mut quants[j * dim..(j + 1) * dim],
         );
@@ -976,7 +1216,12 @@ pub(crate) fn dequantize_row_into(
     let row_start = row_idx * row_bytes;
     let row_data = &data[row_start..row_start + row_bytes];
 
-    match wref.dtype {
+    dequantize_row_slice(wref.dtype, row_data, out);
+}
+
+/// Dequantize raw row bytes of `dtype` into `out`.
+pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
+    match dtype {
         DType::Q6K => crate::quant::dequantize_q6_k_row(row_data, out),
         DType::Q8_0 => crate::quant::dequantize_q8_0_row(row_data, out),
         DType::Q4_0 => crate::quant::dequantize_q4_0_row(row_data, out),
@@ -984,35 +1229,57 @@ pub(crate) fn dequantize_row_into(
         DType::Q4KM => crate::quant::dequantize_q4_k_m_row(row_data, out),
         DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {
-            let floats: &[f32] = bytemuck::cast_slice(row_data);
-            out.copy_from_slice(floats);
+            if let Ok(floats) = bytemuck::try_cast_slice::<u8, f32>(row_data) {
+                assert_eq!(floats.len(), out.len(), "F32 embedding row length");
+                out.copy_from_slice(floats);
+            } else {
+                assert_eq!(
+                    row_data.len() / 4,
+                    out.len(),
+                    "F32 unaligned embedding row byte length"
+                );
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<4>().0) {
+                    *o = f32::from_le_bytes(*chunk);
+                }
+            }
         }
-        // An unquantized GGUF stores its embedding table at the file's own
-        // precision, so a straight `convert_hf_to_gguf.py --outtype f16` (or
-        // bf16) lands here. Both widen on read exactly as
-        // `MmapWeight::dequantize_row` does for the same dtypes; this path
-        // simply never had the arms, which made an otherwise loadable model
-        // panic on its first token.
-        // The `zip`s below stop at the shorter side, so a row that did not
-        // match `out` would leave part of the embedding as whatever the buffer
-        // held. The F32 arm gets this for free from `copy_from_slice`, which
-        // panics on a length mismatch; assert so these behave the same on a
-        // malformed file instead of returning a quietly half-filled row.
         DType::F16 => {
-            let halves: &[u16] = bytemuck::cast_slice(row_data);
-            assert_eq!(halves.len(), out.len(), "F16 embedding row length");
-            for (o, &h) in out.iter_mut().zip(halves) {
-                *o = crate::quant::f16_to_f32(h);
+            if let Ok(halves) = bytemuck::try_cast_slice::<u8, u16>(row_data) {
+                assert_eq!(halves.len(), out.len(), "F16 embedding row length");
+                for (o, &h) in out.iter_mut().zip(halves) {
+                    *o = crate::quant::f16_to_f32(h);
+                }
+            } else {
+                assert_eq!(
+                    row_data.len() / 2,
+                    out.len(),
+                    "F16 unaligned embedding row byte length"
+                );
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
+                    let h = u16::from_le_bytes(*chunk);
+                    *o = crate::quant::f16_to_f32(h);
+                }
             }
         }
         DType::BF16 => {
-            let halves: &[u16] = bytemuck::cast_slice(row_data);
-            assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
-            for (o, &h) in out.iter_mut().zip(halves) {
-                *o = crate::quant::bf16_to_f32(h);
+            if let Ok(halves) = bytemuck::try_cast_slice::<u8, u16>(row_data) {
+                assert_eq!(halves.len(), out.len(), "BF16 embedding row length");
+                for (o, &h) in out.iter_mut().zip(halves) {
+                    *o = crate::quant::bf16_to_f32(h);
+                }
+            } else {
+                assert_eq!(
+                    row_data.len() / 2,
+                    out.len(),
+                    "BF16 unaligned embedding row byte length"
+                );
+                for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
+                    let h = u16::from_le_bytes(*chunk);
+                    *o = crate::quant::bf16_to_f32(h);
+                }
             }
         }
-        _ => panic!("unsupported embedding dtype: {:?}", wref.dtype),
+        _ => panic!("unsupported embedding dtype: {:?}", dtype),
     }
 }
 
@@ -1508,17 +1775,37 @@ pub(crate) fn forward_attn_block(
     }
 
     // Output projection: attn_out (n_heads * head_dim) → out (hidden_size).
-    let out = &mut state.scratch.out[..hidden_size];
-    gemv(
-        gguf,
-        weights.attn_output,
-        &state.scratch.attn_out[..q_dim],
-        out,
-    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        quantize_to_scratch_bufs(
+            &state.scratch.attn_out[..q_dim],
+            &mut state.scratch.q8_scales,
+            &mut state.scratch.q8_quants,
+        );
+        gemv_preq(
+            gguf,
+            weights.attn_output,
+            &state.scratch.attn_out[..q_dim],
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            &mut state.scratch.out[..hidden_size],
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let out = &mut state.scratch.out[..hidden_size];
+        gemv(
+            gguf,
+            weights.attn_output,
+            &state.scratch.attn_out[..q_dim],
+            out,
+        );
+    }
     // LoRA on the output projection (input is the attention output).
     if let Some(lora) = &lora
         && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
     {
+        let out = &mut state.scratch.out[..hidden_size];
         crate::lora::apply_decode(
             t,
             &state.scratch.attn_out[..q_dim],
@@ -1550,22 +1837,52 @@ pub(crate) fn forward_ffn_block(
     let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
     {
-        gemv_preq(
-            gguf,
-            weights.ffn_gate,
-            ffn_input,
-            &state.scratch.q8_scales,
-            &state.scratch.q8_quants,
-            &mut state.scratch.gate[..intermediate_size],
-        );
-        gemv_preq(
-            gguf,
-            weights.ffn_up,
-            ffn_input,
-            &state.scratch.q8_scales,
-            &state.scratch.q8_quants,
-            &mut state.scratch.up[..intermediate_size],
-        );
+        let can_fuse_swiglu = lora.is_none()
+            && weights.ffn_gate.dtype == DType::Q4_0
+            && weights.ffn_up.dtype == DType::Q4_0;
+        if can_fuse_swiglu {
+            let g_data = weight_data(gguf, weights.ffn_gate);
+            let u_data = weight_data(gguf, weights.ffn_up);
+            cpu::gemv_q4_0_gate_up_swiglu_with_q8(
+                g_data,
+                u_data,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.gate[..intermediate_size],
+                intermediate_size,
+                hidden_size,
+            );
+        } else if weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0 {
+            let g_data = weight_data(gguf, weights.ffn_gate);
+            let u_data = weight_data(gguf, weights.ffn_up);
+            cpu::gemv_q4_0_fused2_with_q8(
+                g_data,
+                u_data,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.gate[..intermediate_size],
+                &mut state.scratch.up[..intermediate_size],
+                intermediate_size,
+                hidden_size,
+            );
+        } else {
+            gemv_preq(
+                gguf,
+                weights.ffn_gate,
+                ffn_input,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.gate[..intermediate_size],
+            );
+            gemv_preq(
+                gguf,
+                weights.ffn_up,
+                ffn_input,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.up[..intermediate_size],
+            );
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1583,31 +1900,40 @@ pub(crate) fn forward_ffn_block(
         );
     }
 
-    // LoRA on gate/up — BEFORE the SwiGLU mul (which reads both), input is the
-    // normed FFN input.
-    if let Some(lora) = &lora {
-        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-            crate::lora::apply_decode(
-                t,
-                ffn_input,
-                &mut state.scratch.gate[..intermediate_size],
-                &mut state.scratch.lora_tmp,
-            );
-        }
-        if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-            crate::lora::apply_decode(
-                t,
-                ffn_input,
-                &mut state.scratch.up[..intermediate_size],
-                &mut state.scratch.lora_tmp,
-            );
-        }
-    }
+    #[cfg(target_arch = "aarch64")]
+    let fused_swiglu_done = lora.is_none()
+        && weights.ffn_gate.dtype == DType::Q4_0
+        && weights.ffn_up.dtype == DType::Q4_0;
+    #[cfg(not(target_arch = "aarch64"))]
+    let fused_swiglu_done = false;
 
-    cpu::silu_mul_inplace(
-        &mut state.scratch.gate[..intermediate_size],
-        &state.scratch.up[..intermediate_size],
-    );
+    if !fused_swiglu_done {
+        // LoRA on gate/up - BEFORE the SwiGLU mul (which reads both), input is the
+        // normed FFN input.
+        if let Some(lora) = &lora {
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
+                crate::lora::apply_decode(
+                    t,
+                    ffn_input,
+                    &mut state.scratch.gate[..intermediate_size],
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+            if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
+                crate::lora::apply_decode(
+                    t,
+                    ffn_input,
+                    &mut state.scratch.up[..intermediate_size],
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+        }
+
+        cpu::silu_mul_inplace(
+            &mut state.scratch.gate[..intermediate_size],
+            &state.scratch.up[..intermediate_size],
+        );
+    }
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -1651,12 +1977,7 @@ pub(crate) fn forward_ffn_block(
     }
 }
 
-#[cfg(all(
-    test,
-    target_arch = "aarch64",
-    not(feature = "blas"),
-    feature = "parallel"
-))]
+#[cfg(all(test, target_arch = "aarch64", not(has_blas), feature = "parallel"))]
 mod tests {
     use super::*;
 
@@ -1669,10 +1990,7 @@ mod tests {
     /// so a swap or stride error lands on a value that identifies the mistake.
     /// The `cols < rows` case is the one a square test cannot see — getting it
     /// wrong shifts every logit past the first position by the pad width.
-    #[cfg(all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(feature = "blas")
-    ))]
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     #[test]
     fn gemm_out_to_rows_transposes_and_drops_pad_rows() {
         // (rows, n, cols): square first, then a padded head.
@@ -1728,13 +2046,11 @@ mod tests {
             for (i, ci) in rc.iter_mut().enumerate() {
                 *ci = mat[i * n + j];
             }
-            unsafe {
-                crate::backend::simd::neon::quantize_f32_to_q8_0_neon(
-                    &rc,
-                    &mut ref_scales[j * nb..(j + 1) * nb],
-                    &mut ref_quants[j * dim..(j + 1) * dim],
-                );
-            }
+            cpu::quantize_f32_to_q8_0_into(
+                &rc,
+                &mut ref_scales[j * nb..(j + 1) * nb],
+                &mut ref_quants[j * dim..(j + 1) * dim],
+            );
         }
 
         assert_eq!(

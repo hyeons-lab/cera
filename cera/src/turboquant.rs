@@ -311,8 +311,12 @@ pub fn quantize_scalar(val: f32, boundaries: &[f32; 3]) -> u8 {
 /// Pack 2-bit indices into bytes, LSB-first. 4 values per byte.
 /// `indices` length must be a multiple of 4.
 pub fn pack_2bit(indices: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(indices.len() % 4, 0);
-    debug_assert_eq!(out.len(), indices.len() / 4);
+    assert_eq!(indices.len() % 4, 0, "indices len must be multiple of 4");
+    assert_eq!(
+        out.len(),
+        indices.len() / 4,
+        "out len must be indices.len() / 4"
+    );
     for (i, chunk) in indices.as_chunks::<4>().0.iter().enumerate() {
         out[i] = chunk[0] | (chunk[1] << 2) | (chunk[2] << 4) | (chunk[3] << 6);
     }
@@ -320,7 +324,11 @@ pub fn pack_2bit(indices: &[u8], out: &mut [u8]) {
 
 /// Unpack 2-bit indices from bytes. 4 values per byte, LSB-first.
 pub fn unpack_2bit(packed: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), packed.len() * 4);
+    assert_eq!(
+        out.len(),
+        packed.len() * 4,
+        "out len must be packed.len() * 4"
+    );
     for (i, &byte) in packed.iter().enumerate() {
         out[i * 4] = byte & 0x03;
         out[i * 4 + 1] = (byte >> 2) & 0x03;
@@ -331,8 +339,12 @@ pub fn unpack_2bit(packed: &[u8], out: &mut [u8]) {
 
 /// Pack sign bits into bytes, LSB-first. 8 values per byte.
 pub fn pack_1bit(signs: &[bool], out: &mut [u8]) {
-    debug_assert_eq!(signs.len() % 8, 0);
-    debug_assert_eq!(out.len(), signs.len() / 8);
+    assert_eq!(signs.len() % 8, 0, "signs len must be multiple of 8");
+    assert_eq!(
+        out.len(),
+        signs.len() / 8,
+        "out len must be signs.len() / 8"
+    );
     for (i, chunk) in signs.as_chunks::<8>().0.iter().enumerate() {
         let mut byte = 0u8;
         for (j, &s) in chunk.iter().enumerate() {
@@ -346,7 +358,11 @@ pub fn pack_1bit(signs: &[bool], out: &mut [u8]) {
 
 /// Unpack sign bits from bytes. Returns +1.0 for set bit, -1.0 for unset.
 pub fn unpack_1bit_to_signs(packed: &[u8], out: &mut [f32]) {
-    debug_assert_eq!(out.len(), packed.len() * 8);
+    assert_eq!(
+        out.len(),
+        packed.len() * 8,
+        "out len must be packed.len() * 8"
+    );
     for (i, &byte) in packed.iter().enumerate() {
         for j in 0..8 {
             out[i * 8 + j] = if (byte >> j) & 1 == 1 { 1.0 } else { -1.0 };
@@ -575,7 +591,7 @@ pub fn compress_and_append_keys(
 
         // 1. Compute norm
         let norm = vec_norm(k_head);
-        if norm < 1e-12 {
+        if !norm.is_finite() || norm < 1e-12 {
             scratch.polar_packed[..polar_bytes].fill(0);
             scratch.jl_packed[..jl_bytes].fill(0);
             cache.append(
@@ -615,7 +631,7 @@ pub fn compress_and_append_keys(
         let residual_norm = residual_sq.sqrt();
 
         // 4. QJL: normalize residual, apply second RHT, pack signs directly
-        if residual_norm > 1e-12 {
+        if residual_norm.is_finite() && residual_norm > 1e-12 {
             let inv_rnorm = 1.0 / residual_norm;
             for v in rot[..head_dim].iter_mut() {
                 *v *= inv_rnorm;
@@ -670,7 +686,7 @@ pub fn compress_and_append_values(
 
         // 1. Compute norm. Zero vectors short-circuit to all-zero packed bytes.
         let norm = vec_norm(v_head);
-        if norm < 1e-12 {
+        if !norm.is_finite() || norm < 1e-12 {
             scratch.polar_packed[..polar_bytes].fill(0);
             cache.append(
                 h,
@@ -742,7 +758,7 @@ pub fn dequantize_key(
     }
 
     // Add QJL reconstruction
-    if residual_norm > 1e-12 {
+    if residual_norm.is_finite() && residual_norm > 1e-12 {
         let mut jl_signs_f32 = vec![0.0f32; head_dim];
         unpack_1bit_to_signs(jl_packed, &mut jl_signs_f32);
 
@@ -754,7 +770,7 @@ pub fn dequantize_key(
         // But for full reconstruction we just use residual_norm * direction
         let scale = residual_norm;
         let dir_norm = vec_norm(&jl_signs_f32);
-        if dir_norm > 1e-12 {
+        if dir_norm.is_finite() && dir_norm > 1e-12 {
             let s = scale / dir_norm;
             for i in 0..head_dim {
                 out[i] += jl_signs_f32[i] * s;
@@ -1191,7 +1207,10 @@ pub fn decode_compressed_keys(buf: &[u8]) -> Option<CompressedKeyCache> {
     }
     let polar_per = head_dim / 4;
     let jl_per = head_dim / 8;
-    let body_len = n_kv_heads * (seq_len * (polar_per + jl_per) + 4 * seq_len);
+    let per_head = seq_len
+        .checked_mul(polar_per + jl_per)?
+        .checked_add(4usize.checked_mul(seq_len)?)?;
+    let body_len = n_kv_heads.checked_mul(per_head)?;
     if buf.len() != Tq1Header::SIZE + body_len {
         return None;
     }
@@ -1293,7 +1312,10 @@ pub fn decode_compressed_values(buf: &[u8]) -> Option<CompressedValueCache> {
         return None;
     }
     let polar_per = head_dim / 4;
-    let body_len = n_kv_heads * (seq_len * polar_per + 2 * seq_len);
+    let per_head = seq_len
+        .checked_mul(polar_per)?
+        .checked_add(2usize.checked_mul(seq_len)?)?;
+    let body_len = n_kv_heads.checked_mul(per_head)?;
     if buf.len() != Tq1Header::SIZE + body_len {
         return None;
     }

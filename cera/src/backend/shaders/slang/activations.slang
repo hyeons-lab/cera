@@ -47,7 +47,7 @@ void silu_inplace(uint3 gid : SV_DispatchThreadID) {
     if (i >= par_buf[0].x) {
         return;
     }
-    float v = x_buf[i];
+    float v = clamp(x_buf[i], -80.0f, 80.0f);
     x_buf[i] = v / (1.0f + exp(-v));
 }
 

@@ -17,7 +17,7 @@
 pub mod cache_key;
 pub mod hf;
 
-pub use cache_key::{LeapBundleEntry, leap_bundles_manifest_url};
+pub use cache_key::{LeapBundleEntry, known_bundle_manifest, leap_bundles_manifest_url};
 pub use hf::{
     GgufFileEntry, HfModelInfo, HfRepoContents, HfSibling, HfSpec, classify_repo_siblings,
     default_cache_dir, extract_quant_from_filename, resolve_hf_manifest,

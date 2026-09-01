@@ -23,9 +23,50 @@
 //! *integrity policy* differs (see `cera-wasm`'s bundle module on what
 //! CORS makes impossible in a browser); the addressing does not.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
 use crate::session::CeraError;
+
+/// Return a pre-configured [`Manifest`] for known models (such as `LFM2.5-VL-3B-GGUF`)
+/// whose individual manifests have not yet landed in `LiquidAI/LeapBundles`.
+pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
+    let clean_id = bundle_id.strip_prefix("LiquidAI/").unwrap_or(bundle_id);
+    let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+    if clean_id == "LFM2.5-VL-3B-GGUF" {
+        let mmproj = if clean_quant == "F16" || clean_quant == "BF16" {
+            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-F16.gguf"
+        } else {
+            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-Q8_0.gguf"
+        };
+        let model = format!(
+            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-{clean_quant}.gguf"
+        );
+        Some(Manifest {
+            inference_type: InferenceType::LlamaCppImageToText,
+            schema_version: "1.0.0".to_string(),
+            files: ManifestFiles {
+                model,
+                multimodal_projector: Some(mmproj.to_string()),
+                audio_decoder: None,
+                audio_tokenizer: None,
+                draft_model: None,
+                extras: HashMap::new(),
+            },
+            chat_template: None,
+            generation_defaults: GenerationDefaults::Text {
+                temperature: Some(0.1),
+                min_p: Some(0.15),
+                top_p: None,
+                top_k: None,
+                repetition_penalty: Some(1.05),
+            },
+            raw: serde_json::Value::Null,
+        })
+    } else {
+        None
+    }
+}
 
 /// HuggingFace model-info endpoint for the LeapBundles repo. The
 /// response carries a `siblings` array listing every file in the
@@ -116,10 +157,11 @@ pub fn cache_relative_segments(url: &str) -> Result<Vec<String>, CeraError> {
 /// segments. URL-reserved characters (`?`, `#`, `%`) are rejected so
 /// they can't alter URL semantics when interpolated.
 pub fn leap_bundles_manifest_url(bundle_id: &str, quant: &str) -> Result<String, CeraError> {
-    validate_path_segment("bundle_id", bundle_id)?;
+    let clean_id = bundle_id.strip_prefix("LiquidAI/").unwrap_or(bundle_id);
+    validate_path_segment("bundle_id", clean_id)?;
     validate_path_segment("quant", quant)?;
     Ok(format!(
-        "https://huggingface.co/LiquidAI/LeapBundles/resolve/main/{bundle_id}/{quant}.json"
+        "https://huggingface.co/LiquidAI/LeapBundles/resolve/main/{clean_id}/{quant}.json"
     ))
 }
 

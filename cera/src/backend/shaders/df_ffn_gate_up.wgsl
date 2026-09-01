@@ -16,7 +16,8 @@ fn load_w13_vec4(idx: u32) -> vec4<f32> {
 }
 
 fn silu(v: f32) -> f32 {
-    return v / (1.0 + exp(-v));
+    let clamped = clamp(v, -80.0, 80.0);
+    return clamped / (1.0 + exp(-clamped));
 }
 
 const NR: u32 = 8u;

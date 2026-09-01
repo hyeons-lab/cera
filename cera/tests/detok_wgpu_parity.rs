@@ -396,3 +396,49 @@ fn multi_frame_stability() {
     }
     eprintln!("multi_frame_stability: PASSED");
 }
+
+#[test]
+fn depthformer_frame_sampling_parity() {
+    if !gpu_available() {
+        return;
+    }
+    let Some((gguf, path)) = load_vocoder() else {
+        return;
+    };
+
+    use cera::model::audio_decoder::AudioGpu;
+
+    let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
+    let gpu = cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(&gguf, &path).unwrap();
+
+    let emb_dim = dec_w.decoder_config.n_embd;
+    let mut rng_emb = vec![0.0f32; emb_dim];
+    for (i, v) in rng_emb.iter_mut().enumerate() {
+        *v = ((i as f32 * 0.13).sin() * 0.5).clamp(-1.0, 1.0);
+    }
+
+    let mut cpu_state =
+        cera::model::audio_decoder::DepthformerState::new(&dec_w.depthformer_config);
+
+    for step in 0..5 {
+        let cpu_codes = cera::model::audio_decoder::sample_audio_frame(
+            &dec_w,
+            &mut cpu_state,
+            &rng_emb,
+            0.0,
+            1,
+        );
+
+        let gpu_codes = pollster::block_on(gpu.sample_audio_frame_async(&rng_emb, 0.0, 1)).unwrap();
+
+        eprintln!("Step {step} CPU codes: {cpu_codes:?}");
+        eprintln!("Step {step} GPU codes: {gpu_codes:?}");
+        assert_eq!(
+            cpu_codes, gpu_codes,
+            "Step {step}: GPU DepthFormer codes must match CPU exactly"
+        );
+
+        let fb = cera::model::audio_decoder::embed_audio_token(&dec_w, &cpu_codes);
+        rng_emb.copy_from_slice(&fb);
+    }
+}

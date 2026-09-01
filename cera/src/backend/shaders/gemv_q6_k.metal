@@ -175,3 +175,161 @@ kernel void gemv_q6_k_accum(
         }
     }
 }
+
+static inline void gemv_q6_k_compute_dual(
+    const device uchar* a_gate,
+    const device uchar* a_up,
+    const device float* x,
+    constant Params& params,
+    uint tiisg, uint sgitg, uint tg_id,
+    thread uint& first_row,
+    thread float* totals_g,
+    thread float* totals_u
+) {
+    uint k = params.k;
+    uint nb = k / QK_K;
+    uint row_bytes = nb * Q6K_BYTES;
+    first_row = (tg_id * NSG + sgitg) * NR;
+
+    if (params.m == 0u) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < NR; r++) {
+            totals_g[r] = 0.0f;
+            totals_u[r] = 0.0f;
+        }
+        return;
+    }
+
+    device const uchar* row_base_g[NR];
+    device const uchar* row_base_u[NR];
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < NR; r++) {
+        uint safe_row = min(first_row + r, params.m - 1u);
+        row_base_g[r] = a_gate + safe_row * row_bytes;
+        row_base_u[r] = a_up   + safe_row * row_bytes;
+    }
+
+    const uint tid = tiisg / 2;
+    const uint ix  = tiisg & 1u;
+    const uint ip  = tid >> 3;
+    const uint il  = tid & 7u;
+    const uint l0  = 4u * il;
+    const uint is  = 8u * ip + l0 / 16u;
+
+    const uint y_offset   = 128u * ip + l0;
+    const uint q_offset_l = 64u * ip + l0;
+    const uint q_offset_h = 32u * ip + l0;
+
+    const uchar kmask1 = 0x03;
+    const uchar kmask2 = 0x0C;
+    const uchar kmask3 = 0x30;
+    const uchar kmask4 = 0xC0;
+
+    float sumf_g[NR] = {0.0f, 0.0f};
+    float sumf_u[NR] = {0.0f, 0.0f};
+
+    for (uint b = ix; b < nb; b += 2u) {
+        device const float* yb = x + b * QK_K + y_offset;
+
+        float yl[16];
+        #pragma clang loop unroll(full)
+        for (uint l = 0u; l < 4u; l++) {
+            yl[4u*l + 0u] = yb[l +  0];
+            yl[4u*l + 1u] = yb[l + 32];
+            yl[4u*l + 2u] = yb[l + 64];
+            yl[4u*l + 3u] = yb[l + 96];
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint row = 0u; row < NR; row++) {
+            // Gate
+            {
+                device const uchar* blk_base = row_base_g[row] + b * Q6K_BYTES;
+                device const uchar* q1 = blk_base + q_offset_l;
+                device const uchar* q2 = q1 + 32;
+                device const uchar* qh = blk_base + 128u + q_offset_h;
+                device const char*  sc = (device const char*)(blk_base + 128u + 64u) + is;
+                device const half*  dh = (device const half*)(blk_base + 128u + 64u + 16u);
+
+                float4 sums = float4(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint l = 0u; l < 4u; l++) {
+                    int q6_1 = int((q1[l]        & 0x0Fu) | ((qh[l] & kmask1) << 4u)) - 32;
+                    int q6_2 = int((q2[l]        & 0x0Fu) | ((qh[l] & kmask2) << 2u)) - 32;
+                    int q6_3 = int((q1[l] >> 4u)          | ((qh[l] & kmask3)      )) - 32;
+                    int q6_4 = int((q2[l] >> 4u)          | ((qh[l] & kmask4) >> 2u)) - 32;
+                    sums[0] += yl[4u*l + 0u] * float(q6_1);
+                    sums[1] += yl[4u*l + 1u] * float(q6_2);
+                    sums[2] += yl[4u*l + 2u] * float(q6_3);
+                    sums[3] += yl[4u*l + 3u] * float(q6_4);
+                }
+
+                float dblk = float(*dh);
+                sumf_g[row] += dblk * (sums[0] * float(sc[0])
+                                     + sums[1] * float(sc[2])
+                                     + sums[2] * float(sc[4])
+                                     + sums[3] * float(sc[6]));
+            }
+
+            // Up
+            {
+                device const uchar* blk_base = row_base_u[row] + b * Q6K_BYTES;
+                device const uchar* q1 = blk_base + q_offset_l;
+                device const uchar* q2 = q1 + 32;
+                device const uchar* qh = blk_base + 128u + q_offset_h;
+                device const char*  sc = (device const char*)(blk_base + 128u + 64u) + is;
+                device const half*  dh = (device const half*)(blk_base + 128u + 64u + 16u);
+
+                float4 sums = float4(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint l = 0u; l < 4u; l++) {
+                    int q6_1 = int((q1[l]        & 0x0Fu) | ((qh[l] & kmask1) << 4u)) - 32;
+                    int q6_2 = int((q2[l]        & 0x0Fu) | ((qh[l] & kmask2) << 2u)) - 32;
+                    int q6_3 = int((q1[l] >> 4u)          | ((qh[l] & kmask3)      )) - 32;
+                    int q6_4 = int((q2[l] >> 4u)          | ((qh[l] & kmask4) >> 2u)) - 32;
+                    sums[0] += yl[4u*l + 0u] * float(q6_1);
+                    sums[1] += yl[4u*l + 1u] * float(q6_2);
+                    sums[2] += yl[4u*l + 2u] * float(q6_3);
+                    sums[3] += yl[4u*l + 3u] * float(q6_4);
+                }
+
+                float dblk = float(*dh);
+                sumf_u[row] += dblk * (sums[0] * float(sc[0])
+                                     + sums[1] * float(sc[2])
+                                     + sums[2] * float(sc[4])
+                                     + sums[3] * float(sc[6]));
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        totals_g[row] = simd_sum(sumf_g[row]);
+        totals_u[row] = simd_sum(sumf_u[row]);
+    }
+}
+
+kernel void gemv_q6_k_gate_up(
+    const device uchar* a_gate [[buffer(0)]],
+    const device uchar* a_up [[buffer(1)]],
+    const device float* x [[buffer(2)]],
+    device float* y_gate [[buffer(3)]],
+    device float* y_up [[buffer(4)]],
+    constant Params& params [[buffer(5)]],
+    uint tiisg [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint first_row;
+    float totals_g[NR];
+    float totals_u[NR];
+    uint tgi = tg_id.x + tg_id.y * 65535u;
+    gemv_q6_k_compute_dual(a_gate, a_up, x, params, tiisg, sgitg, tgi, first_row, totals_g, totals_u);
+    #pragma clang loop unroll(full)
+    for (uint row = 0u; row < NR; row++) {
+        if (tiisg == 0u && first_row + row < params.m) {
+            y_gate[first_row + row] = totals_g[row];
+            y_up[first_row + row]   = totals_u[row];
+        }
+    }
+}

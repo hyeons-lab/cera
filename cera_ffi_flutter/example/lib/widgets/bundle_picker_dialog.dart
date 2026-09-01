@@ -36,10 +36,111 @@ class BundlePickerDialog extends StatefulWidget {
 }
 
 class _BundlePickerDialogState extends State<BundlePickerDialog> {
-  late final Future<List<CeraBundle>> _bundles = Cera.listBundles();
+  late final Future<List<CeraBundle>> _bundles = _fetchBundles();
   List<DownloadedModelRecord> _downloaded = [];
   bool _loadingDownloaded = true;
   _PickerTab _tab = _PickerTab.downloaded;
+
+  Future<List<CeraBundle>> _fetchBundles() async {
+    List<CeraBundle> live = [];
+    try {
+      live = await Cera.listBundles();
+    } catch (_) {}
+
+    final map = {for (final b in live) b.name: b};
+
+    if (map.isEmpty) {
+      const defaults = [
+        CeraBundle(
+          name: 'LFM2.5-2.6B-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-2.6B-Agent-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-2.6B-Thinking-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-1.2B-Instruct-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-1.2B-Thinking-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-8B-A1B-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-8B-A1B-Instruct-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-700M-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-350M-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-230M-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-VL-3B-GGUF',
+          quants: ['Q4_K_M', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2.5-Audio-1.5B-GGUF',
+          quants: ['Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2-1.2B-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2-700M-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2-350M-GGUF',
+          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
+        ),
+        CeraBundle(
+          name: 'LFM2-2.6B-Exp-GGUF',
+          quants: ['Q4_K_M', 'Q8_0', 'F16'],
+        ),
+      ];
+      for (final b in defaults) {
+        map[b.name] = b;
+      }
+    }
+
+    final list = map.values.toList();
+    list.sort(
+      (a, b) =>
+          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+    );
+    return list;
+  }
+
+  bool _hasHfDSparkDraft(String bundleName, String quant) {
+    final clean = quant.split(RegExp(r'[+ ]')).first.trim().toUpperCase();
+    final name = bundleName.toLowerCase();
+    // Specific model families have official DSpark draft sidecars published on Hugging Face:
+    // (LiquidAI/LFM2.5-2.6B-DSpark-GGUF, LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF, LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF)
+    if (name.contains('lfm2.5-2.6b') ||
+        name.contains('lfm2.5-1.2b') ||
+        name.contains('lfm2.5-8b')) {
+      return clean == 'Q4_K_M' || clean == 'Q8_0' || clean == 'F16';
+    }
+    return false;
+  }
 
   @override
   void initState() {
@@ -243,18 +344,17 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             model.bundleName == widget.currentBundleName &&
             model.quant == widget.currentQuant;
 
-        return Container(
-          decoration: BoxDecoration(
-            color: isActive
-                ? theme.colorScheme.primary.withValues(alpha: 0.16)
-                : null,
+        return Material(
+          color: isActive
+              ? theme.colorScheme.primary.withValues(alpha: 0.16)
+              : Colors.transparent,
+          shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(8),
-            border: isActive
-                ? Border.all(
+            side: isActive
+                ? BorderSide(
                     color: theme.colorScheme.primary.withValues(alpha: 0.4),
-                    width: 1,
                   )
-                : null,
+                : BorderSide.none,
           ),
           child: ListTile(
             dense: true,
@@ -306,13 +406,42 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                   ),
               ],
             ),
-            subtitle: Text(
-              model.quant,
-              style: TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 12,
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
+            subtitle: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  model.quant,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                if (model.quant.toLowerCase().contains('dspark')) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+                      ),
+                    ),
+                    child: const Text(
+                      'DSpark',
+                      style: TextStyle(
+                        color: Color(0xFFF59E0B),
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
             trailing: Row(
               mainAxisSize: MainAxisSize.min,
@@ -405,8 +534,18 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
           itemBuilder: (context, i) {
             final bundle = bundles[i];
             final isCurrentBundle = bundle.name == widget.currentBundleName;
-            final quants = bundle.quants;
-            final n = quants.length;
+
+            final quantOptions = <String>[];
+            int dsparkCount = 0;
+            for (final q in bundle.quants) {
+              quantOptions.add(q);
+              if (_hasHfDSparkDraft(bundle.name, q)) {
+                quantOptions.add('$q + DSpark');
+                dsparkCount++;
+              }
+            }
+            final n = bundle.quants.length;
+
             return ExpansionTile(
               key: PageStorageKey(bundle.name),
               initiallyExpanded: isCurrentBundle,
@@ -418,6 +557,31 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
                   ),
+                  if (bundle.name.toLowerCase().contains('dspark') ||
+                      dsparkCount > 0) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 1.5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+                        ),
+                      ),
+                      child: const Text(
+                        'DSpark',
+                        style: TextStyle(
+                          color: Color(0xFFF59E0B),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
                   if (isCurrentBundle)
                     Container(
                       padding: const EdgeInsets.symmetric(
@@ -458,14 +622,16 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                 ],
               ),
               subtitle: Text(
-                '$n quantization${n == 1 ? "" : "s"}',
+                dsparkCount > 0
+                    ? '$n base quants · $dsparkCount with DSpark sidecar'
+                    : '$n quantization${n == 1 ? '' : 's'}',
                 style: TextStyle(
                   color: theme.colorScheme.onSurfaceVariant,
                   fontSize: 12,
                 ),
               ),
               children: [
-                for (final quant in quants)
+                for (final quant in quantOptions)
                   Builder(
                     builder: (context) {
                       final isLoadedQuant =
@@ -473,16 +639,21 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       final isDownloaded = _downloaded.any(
                         (r) => r.bundleName == bundle.name && r.quant == quant,
                       );
-                      return Container(
+                      final isDSpark = quant.contains('DSpark');
+                      final baseQuant = isDSpark
+                          ? quant.split(' ').first
+                          : quant;
+
+                      return Material(
                         color: isLoadedQuant
                             ? theme.colorScheme.primary.withValues(alpha: 0.16)
-                            : null,
+                            : Colors.transparent,
                         child: ListTile(
                           dense: true,
                           title: Row(
                             children: [
                               Text(
-                                quant,
+                                baseQuant,
                                 style: TextStyle(
                                   fontFamily: 'monospace',
                                   fontWeight: isLoadedQuant
@@ -493,6 +664,34 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                       : null,
                                 ),
                               ),
+                              if (isDSpark) ...[
+                                const SizedBox(width: 8),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 1.5,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(
+                                      0xFFF59E0B,
+                                    ).withValues(alpha: 0.2),
+                                    borderRadius: BorderRadius.circular(4),
+                                    border: Border.all(
+                                      color: const Color(
+                                        0xFFF59E0B,
+                                      ).withValues(alpha: 0.4),
+                                    ),
+                                  ),
+                                  child: const Text(
+                                    'DSpark Sidecar',
+                                    style: TextStyle(
+                                      color: Color(0xFFF59E0B),
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              ],
                               if (isLoadedQuant) ...[
                                 const SizedBox(width: 8),
                                 Container(
@@ -608,14 +807,17 @@ class _TabButton extends StatelessWidget {
                 ),
                 const SizedBox(width: 6),
               ],
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
-                  color: isSelected
-                      ? theme.colorScheme.onSurface
-                      : theme.colorScheme.onSurfaceVariant,
+              Flexible(
+                child: Text(
+                  label,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                    color: isSelected
+                        ? theme.colorScheme.onSurface
+                        : theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ),
               if (count != null && count! > 0) ...[

@@ -1,3 +1,4 @@
+pub mod dspark;
 pub mod lfm2;
 pub mod llama;
 pub mod transformer;
@@ -16,7 +17,13 @@ pub mod gpu_turboquant;
     feature = "gpu",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-pub(crate) mod gpu_weight_source;
+pub mod gpu_weight_source;
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+pub use gpu_weight_source::{GpuWeightSource, RopeType};
+pub use transformer::WeightRef;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_lfm2;
@@ -270,11 +277,10 @@ pub trait Model: Send + Sync {
     /// one, since `verify_draft` rewinds unconditionally and every fully-accepted
     /// round lands there, so keep it free.
     ///
-    /// An override also replaces the default's two refusals, and both are
-    /// load-bearing: `truncate_to` panics on a TurboQuant-compressed state and on
-    /// an LFM2 conv window, neither of which has a tail to slice. The conv one is
-    /// what currently stands between an LFM2 spec run and a corrupted conv
-    /// window. Keep them, or reject the state before it reaches here.
+    /// An override also replaces the default's refusals: `truncate_to` panics on a
+    /// TurboQuant-compressed state which does not have an uncompressed tail to slice.
+    /// LFM2 conv layers preserve short-conv history via `ConvHistory` ring buffers to
+    /// safely rewind during speculative decoding.
     ///
     /// The default forwards to `state.truncate_to(len)`, which is correct for
     /// every model whose KV lives entirely in `state`.
@@ -503,6 +509,12 @@ pub trait Model: Send + Sync {
 
     /// Configure the KV prefix cache. No-op for backends without caching.
     fn configure_cache(&self, _config: crate::kv_cache::KvCacheConfig) {}
+
+    /// Clear the in-memory warm KV prefix cache (preserves cold disk tier).
+    fn clear_warm_cache(&self) {}
+
+    /// Clear the KV prefix cache (both warm and cold tiers). No-op for backends without caching.
+    fn clear_cache(&self) {}
 
     /// Snapshot the current KV and conv state for prefix caching.
     ///

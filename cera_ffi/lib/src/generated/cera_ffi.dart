@@ -164,7 +164,7 @@ class EngineConfig {
     /// `max_seq_len`. Pass `0` to use the model's full declared
     /// `max_seq_len` (translated to `usize::MAX` internally, then
     /// capped by the loader).
-    required this.contextSize,
+    this.contextSize = 4096,
     required this.backend,
     /// Bundle repository for resolving `http(s)://` URLs in manifests
     /// (or for [`CeraEngine::from_bundle_id`]). `None` means "remote
@@ -172,7 +172,9 @@ class EngineConfig {
     /// rooted at a persistent cache directory to enable remote
     /// downloads. Construct the repo once + reuse it across engine
     /// loads so its HTTP client pool + on-disk cache are shared.
-    required this.bundleRepo,
+    this.bundleRepo = null,
+    /// Optional path to a DSpark speculative draft model GGUF file.
+    this.draftModel = null,
   });
 
   /// KV-cache capacity in tokens. Capped by the model's own
@@ -188,20 +190,24 @@ class EngineConfig {
   /// downloads. Construct the repo once + reuse it across engine
   /// loads so its HTTP client pool + on-disk cache are shared.
   final BundleRepo? bundleRepo;
+  /// Optional path to a DSpark speculative draft model GGUF file.
+  final String? draftModel;
 
   Map<String, dynamic> toJson() {
     return {
       'contextSize': this.contextSize,
       'backend': BackendPreferenceFfiCodec.encode(this.backend),
       'bundleRepo': this.bundleRepo == null ? null : (() { final __tmp = this.bundleRepo!; return BundleRepoFfiCodec.lower(__tmp); })(),
+      'draftModel': this.draftModel,
     };
   }
 
   factory EngineConfig.fromJson(Map<String, dynamic> json) {
     return EngineConfig(
-      contextSize: (json['contextSize'] as num).toInt(),
+      contextSize: json.containsKey('contextSize') ? (json['contextSize'] as num).toInt() : 4096,
       backend: BackendPreferenceFfiCodec.decode(json['backend'] as String),
-      bundleRepo: json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })(),
+      bundleRepo: json.containsKey('bundleRepo') ? json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })() : null,
+      draftModel: json.containsKey('draftModel') ? json['draftModel'] == null ? null : json['draftModel'] as String : null,
     );
   }
 
@@ -209,26 +215,28 @@ class EngineConfig {
     int? contextSize,
     BackendPreference? backend,
     Object? bundleRepo = _sentinel,
+    Object? draftModel = _sentinel,
   }) {
     return EngineConfig(
       contextSize: contextSize ?? this.contextSize,
       backend: backend ?? this.backend,
       bundleRepo: bundleRepo == _sentinel ? this.bundleRepo : bundleRepo as BundleRepo?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
     );
   }
 
   @override
   String toString() {
-    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo)';
+    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo, draftModel: $draftModel)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo;
+      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo && draftModel == other.draftModel;
 
   @override
-  int get hashCode => Object.hash(contextSize, backend, bundleRepo);
+  int get hashCode => Object.hash(contextSize, backend, bundleRepo, draftModel);
 }
 
 /// A detected speech segment with sample and millisecond boundaries.
@@ -2772,6 +2780,12 @@ void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {
       calloc.free(cloneStatusPtr);
     }
   }
+  if (value.draftModel == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.draftModel!);
+  }
 }
 
 Uint8List _uniffiEncodeEngineConfig(EngineConfig value) {
@@ -3776,6 +3790,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities != 65060) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_capabilities`: expected 65060, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache != 5238) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: expected 5238, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_context_size');
@@ -3925,6 +3949,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size != 13487) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_vocab_size`: expected 13487, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches != 16144) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches`: expected 16144, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress;
     try {
@@ -7265,6 +7299,69 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineClearPrefixCacheFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_clear_prefix_cache');
+
+  void ceraEngineInvokeClearPrefixCache(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ceraEngineClearPrefixCacheFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineContextSizeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_context_size');
 
   int ceraEngineInvokeContextSize(int handle) {
@@ -8527,6 +8624,69 @@ class CeraFfiFfi {
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return (returnBuf + 0).ref.u32;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineWipeAllPrefixCachesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches');
+
+  void ceraEngineInvokeWipeAllPrefixCaches(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ceraEngineWipeAllPrefixCachesFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -12693,7 +12853,7 @@ final class CeraEngine {
   /// off the caller's thread, and the vision encoder's weights are
   /// built during the load. Same weak cancellation, and both buffers
   /// are moved into the blocking task.
-  static Future<CeraEngine> fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) {
+  static Future<CeraEngine> fromPartsAsync(Uint8List bytes, Uint8List? multimodalProjector, String? inferenceType, EngineConfig config) async {
     return _bindings().ceraEngineCreateFromPartsAsync(bytes, multimodalProjector, inferenceType, config);
   }
 
@@ -12765,6 +12925,14 @@ final class CeraEngine {
   ModalityCapabilities capabilities() {
     _ensureOpen();
     return _ffi.ceraEngineInvokeCapabilities(_handle);
+  }
+
+  /// Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+  /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+  /// or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+  void clearPrefixCache() {
+    _ensureOpen();
+    _ffi.ceraEngineInvokeClearPrefixCache(_handle);
   }
 
   /// Resolved context-window size (KV cache cap) the engine was
@@ -12914,6 +13082,12 @@ final class CeraEngine {
   int vocabSize() {
     _ensureOpen();
     return _ffi.ceraEngineInvokeVocabSize(_handle);
+  }
+
+  /// Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+  void wipeAllPrefixCaches() {
+    _ensureOpen();
+    _ffi.ceraEngineInvokeWipeAllPrefixCaches(_handle);
   }
 
 }

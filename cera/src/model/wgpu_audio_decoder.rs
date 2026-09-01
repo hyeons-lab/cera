@@ -128,21 +128,38 @@ pub struct WgpuAudioDecoder {
     hann: Buffer,
 
     // Scratch (all sized for N_FRAMES tokens).
-    hidden_buf: Buffer,       // residual stream [N x hs]
-    normed_buf: Buffer,       // rmsnorm out / attn out [N x max(hs, q_dim)]
-    proj_buf: Buffer,         // conv in_proj [N x 3hs] / attn Q [N x q_dim]
-    gate_buf: Buffer,         // attn K / op residual / ffn gate [N x max(hs, kv_dim, ffn)]
-    up_buf: Buffer,           // attn V / ffn up / ffn down [N x max(hs, kv_dim, ffn)]
-    q_single: Buffer,         // one token's Q [q_dim]
-    attn_single: Buffer,      // one token's attn out [q_dim]
-    spectrum_buf: Buffer,     // [N x (n_fft_bins*2)]
-    rope_freqs_dummy: Buffer, // 1-element buffer bound at qk_norm_rope binding 5
+    hidden_buf: Buffer,           // residual stream [N x hs]
+    normed_buf: Buffer,           // rmsnorm out / attn out [N x max(hs, q_dim)]
+    proj_buf: Buffer,             // conv in_proj [N x 3hs] / attn Q [N x q_dim]
+    gate_buf: Buffer,             // attn K / op residual / ffn gate [N x max(hs, kv_dim, ffn)]
+    up_buf: Buffer,               // attn V / ffn up / ffn down [N x max(hs, kv_dim, ffn)]
+    q_single: Buffer,             // one token's Q [q_dim]
+    attn_single: Buffer,          // one token's attn out [q_dim]
+    spectrum_buf: Buffer,         // [N x (n_fft_bins*2)]
+    spectrum_staging_buf: Buffer, // pre-allocated staging buffer for zero-alloc spectrum readback
+    rope_freqs_dummy: Buffer,     // 1-element buffer bound at qk_norm_rope binding 5
 
     // Persistent state.
     conv_bufs: Vec<Option<Buffer>>, // [d_conv x hs] per conv layer
     kv_k: Vec<Option<Buffer>>,      // [swa x kv_dim] f32 per attn layer
     kv_v: Vec<Option<Buffer>>,
     n_past: AtomicUsize,
+}
+
+fn get_detok_tensor(gguf: &GgufFile, name1: &str, name2: &str) -> Result<crate::tensor::Tensor> {
+    gguf.get_tensor(name1)
+        .or_else(|_| gguf.get_tensor(name2))
+        .with_context(|| format!("tensor not found: neither `{name1}` nor `{name2}`"))
+}
+
+fn get_detok_mmap_weight(
+    gguf: &Arc<GgufFile>,
+    name1: &str,
+    name2: &str,
+) -> Result<crate::model::weights::MmapWeight> {
+    crate::model::weights::MmapWeight::from_gguf(gguf, name1)
+        .or_else(|_| crate::model::weights::MmapWeight::from_gguf(gguf, name2))
+        .with_context(|| format!("tensor weight not found: neither `{name1}` nor `{name2}`"))
 }
 
 impl WgpuAudioDecoder {
@@ -152,11 +169,27 @@ impl WgpuAudioDecoder {
     }
 
     pub fn from_gguf_with_context(ctx: GpuContext, gguf: &Arc<GgufFile>) -> Result<Self> {
+        Self::from_ggufs_with_context(ctx, gguf, None)
+    }
+
+    pub fn from_ggufs_with_context(
+        ctx: GpuContext,
+        detok_gguf: &Arc<GgufFile>,
+        depthformer_gguf: Option<&Arc<GgufFile>>,
+    ) -> Result<Self> {
+        let gguf = detok_gguf;
         // Config from tensor shapes (same derivation as DetokenizerWeights).
-        let conv_in =
-            crate::model::weights::MmapWeight::from_gguf(gguf, "lfm.layers.0.conv.in_proj.weight")?;
+        let conv_in = get_detok_mmap_weight(
+            gguf,
+            "lfm.layers.0.conv.in_proj.weight",
+            "blk.0.shortconv.in_proj.weight",
+        )?;
         let n_embd = conv_in.cols;
-        let q_norm_t = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
+        let q_norm_t = get_detok_tensor(
+            gguf,
+            "lfm.layers.2.self_attn.q_layernorm.weight",
+            "blk.2.attn_q_norm.weight",
+        )?;
         let head_dim = q_norm_t.shape()[0];
         // `n_head` and `n_kv` below both divide by this, so a corrupt vocoder
         // GGUF reporting an empty q_layernorm shape would be a div-by-zero
@@ -166,19 +199,22 @@ impl WgpuAudioDecoder {
             head_dim > 0,
             "detokenizer n_embd_head must be > 0 (q_layernorm shape was empty)"
         );
-        let q_w = crate::model::weights::MmapWeight::from_gguf(
+        let q_w = get_detok_mmap_weight(
             gguf,
             "lfm.layers.2.self_attn.q_proj.weight",
+            "blk.2.attn_q.weight",
         )?;
         let n_head = q_w.rows / head_dim;
-        let k_w = crate::model::weights::MmapWeight::from_gguf(
+        let k_w = get_detok_mmap_weight(
             gguf,
             "lfm.layers.2.self_attn.k_proj.weight",
+            "blk.2.attn_k.weight",
         )?;
         let n_kv = k_w.rows / head_dim;
-        let ffn_w1_0 = crate::model::weights::MmapWeight::from_gguf(
+        let ffn_w1_0 = get_detok_mmap_weight(
             gguf,
             "lfm.layers.0.feed_forward.w1.weight",
+            "blk.0.ffn_gate.weight",
         )?;
         let ffn_dim = ffn_w1_0.rows;
 
@@ -327,57 +363,100 @@ impl WgpuAudioDecoder {
         };
 
         // Dequantize each weight to f32 (CPU-matching precision) and upload.
-        let make_weight = |name: &str| -> Result<GpuWeight> {
-            let t = gguf.get_tensor(name)?;
+        let make_weight = |name1: &str, name2: &str| -> Result<GpuWeight> {
+            let t = get_detok_tensor(gguf, name1, name2)?;
             let f32_data = t.to_f32_vec();
             let shape = t.shape();
             let (rows, cols) = match shape.len() {
                 1 => (1, shape[0]),
                 2 => (shape[1], shape[0]),
-                _ => anyhow::bail!("unexpected rank for {name}"),
+                _ => anyhow::bail!("unexpected rank for {name1} / {name2}"),
             };
-            let buf = ctx.upload_f32(&f32_data, name);
+            let buf = ctx.upload_f32(&f32_data, name1);
             Ok(GpuWeight {
                 buf,
                 m: rows as u32,
                 k: cols as u32,
             })
         };
-        let upload_vec = |name: &str| -> Result<Buffer> {
-            Ok(ctx.upload_f32(&gguf.get_tensor(name)?.to_f32_vec(), name))
+        let upload_vec = |name1: &str, name2: &str| -> Result<Buffer> {
+            Ok(ctx.upload_f32(&get_detok_tensor(gguf, name1, name2)?.to_f32_vec(), name1))
         };
 
         let mut layers = Vec::with_capacity(n_layer);
         for i in 0..n_layer {
-            let pfx = format!("lfm.layers.{i}");
+            let pfx_lfm = format!("lfm.layers.{i}");
+            let pfx_blk = format!("blk.{i}");
             let is_conv = cfg.layer_is_conv[i];
             let (cin, cop, cw) = if is_conv {
                 (
-                    Some(make_weight(&format!("{pfx}.conv.in_proj.weight"))?),
-                    Some(make_weight(&format!("{pfx}.conv.out_proj.weight"))?),
-                    Some(upload_vec(&format!("{pfx}.conv.conv.weight"))?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.conv.in_proj.weight"),
+                        &format!("{pfx_blk}.shortconv.in_proj.weight"),
+                    )?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.conv.out_proj.weight"),
+                        &format!("{pfx_blk}.shortconv.out_proj.weight"),
+                    )?),
+                    Some(upload_vec(
+                        &format!("{pfx_lfm}.conv.conv.weight"),
+                        &format!("{pfx_blk}.shortconv.conv.weight"),
+                    )?),
                 )
             } else {
                 (None, None, None)
             };
             let (wq, wk, wv, wo, qn, kn) = if !is_conv {
                 (
-                    Some(make_weight(&format!("{pfx}.self_attn.q_proj.weight"))?),
-                    Some(make_weight(&format!("{pfx}.self_attn.k_proj.weight"))?),
-                    Some(make_weight(&format!("{pfx}.self_attn.v_proj.weight"))?),
-                    Some(make_weight(&format!("{pfx}.self_attn.out_proj.weight"))?),
-                    Some(upload_vec(&format!("{pfx}.self_attn.q_layernorm.weight"))?),
-                    Some(upload_vec(&format!("{pfx}.self_attn.k_layernorm.weight"))?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.self_attn.q_proj.weight"),
+                        &format!("{pfx_blk}.attn_q.weight"),
+                    )?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.self_attn.k_proj.weight"),
+                        &format!("{pfx_blk}.attn_k.weight"),
+                    )?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.self_attn.v_proj.weight"),
+                        &format!("{pfx_blk}.attn_v.weight"),
+                    )?),
+                    Some(make_weight(
+                        &format!("{pfx_lfm}.self_attn.out_proj.weight"),
+                        &format!("{pfx_blk}.attn_output.weight"),
+                    )?),
+                    Some(upload_vec(
+                        &format!("{pfx_lfm}.self_attn.q_layernorm.weight"),
+                        &format!("{pfx_blk}.attn_q_norm.weight"),
+                    )?),
+                    Some(upload_vec(
+                        &format!("{pfx_lfm}.self_attn.k_layernorm.weight"),
+                        &format!("{pfx_blk}.attn_k_norm.weight"),
+                    )?),
                 )
             } else {
                 (None, None, None, None, None, None)
             };
             layers.push(DetokLayerGpu {
-                operator_norm: upload_vec(&format!("{pfx}.operator_norm.weight"))?,
-                ffn_norm: upload_vec(&format!("{pfx}.ffn_norm.weight"))?,
-                ffn_w1: make_weight(&format!("{pfx}.feed_forward.w1.weight"))?,
-                ffn_w2: make_weight(&format!("{pfx}.feed_forward.w2.weight"))?,
-                ffn_w3: make_weight(&format!("{pfx}.feed_forward.w3.weight"))?,
+                operator_norm: upload_vec(
+                    &format!("{pfx_lfm}.operator_norm.weight"),
+                    &format!("{pfx_blk}.attn_norm.weight"),
+                )?,
+                ffn_norm: upload_vec(
+                    &format!("{pfx_lfm}.ffn_norm.weight"),
+                    &format!("{pfx_blk}.ffn_norm.weight"),
+                )?,
+                ffn_w1: make_weight(
+                    &format!("{pfx_lfm}.feed_forward.w1.weight"),
+                    &format!("{pfx_blk}.ffn_gate.weight"),
+                )?,
+                ffn_w2: make_weight(
+                    &format!("{pfx_lfm}.feed_forward.w2.weight"),
+                    &format!("{pfx_blk}.ffn_down.weight"),
+                )?,
+                ffn_w3: make_weight(
+                    &format!("{pfx_lfm}.feed_forward.w3.weight"),
+                    &format!("{pfx_blk}.ffn_up.weight"),
+                )?,
                 conv_in_proj: cin,
                 conv_out_proj: cop,
                 conv_weight: cw,
@@ -390,9 +469,9 @@ impl WgpuAudioDecoder {
             });
         }
 
-        let output_norm = upload_vec("lfm.embedding_norm.weight")?;
-        let lin_w = make_weight("lin.weight")?;
-        let lin_b = upload_vec("lin.bias")?;
+        let output_norm = upload_vec("lfm.embedding_norm.weight", "token_embd_norm.weight")?;
+        let lin_w = make_weight("lin.weight", "dense_2.weight")?;
+        let lin_b = upload_vec("lin.bias", "dense_2.bias")?;
         // The lin head GEMM writes `lin_w.m` rows at a `spec_per_frame` stride into
         // `spectrum_buf`. Both are pinned to `n_fft`, but assert the shared
         // assumption so a vocoder with a different head width fails at load rather
@@ -429,7 +508,14 @@ impl WgpuAudioDecoder {
         let up_buf = alloc(N_FRAMES * big, "audio_detok_up");
         let q_single = alloc(q_dim, "audio_detok_q_single");
         let attn_single = alloc(q_dim, "audio_detok_attn_single");
-        let spectrum_buf = alloc(N_FRAMES * (n_embd_bins(&cfg)), "audio_detok_spectrum");
+        let spec_len = N_FRAMES * (n_embd_bins(&cfg));
+        let spectrum_buf = alloc(spec_len, "audio_detok_spectrum");
+        let spectrum_staging_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("audio_spectrum_staging"),
+            size: (spec_len * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let rope_freqs_dummy = ctx.upload_f32(&[1.0f32], "audio_detok_rope_dummy");
 
         let mut conv_bufs = vec![None; n_layer];
@@ -444,7 +530,8 @@ impl WgpuAudioDecoder {
             }
         }
 
-        let depthformer = match WgpuDepthformer::try_from_gguf(&ctx, &pipes, gguf) {
+        let df_src = depthformer_gguf.unwrap_or(detok_gguf);
+        let depthformer = match WgpuDepthformer::try_from_gguf(&ctx, &pipes, df_src) {
             Ok(df) => {
                 tracing::info!("[cera:wgpu_audio_decoder] WebGPU depthformer loaded successfully");
                 Some(df)
@@ -476,6 +563,7 @@ impl WgpuAudioDecoder {
             q_single,
             attn_single,
             spectrum_buf,
+            spectrum_staging_buf,
             rope_freqs_dummy,
             conv_bufs,
             kv_k,
@@ -936,15 +1024,40 @@ impl WgpuAudioDecoder {
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         let (n_frames, spec_per_frame) =
             self.encode_detokenize_to_spectrum(&mut enc, cpu_weights, codes);
-        let pending = self.ctx.begin_download_with_encoder(
-            enc,
-            &self.spectrum_buf,
-            (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64,
-        );
-        let bytes = pending.recv().await?;
+        let size = (n_frames * spec_per_frame * std::mem::size_of::<f32>()) as u64;
+        enc.copy_buffer_to_buffer(&self.spectrum_buf, 0, &self.spectrum_staging_buf, 0, size);
+        self.ctx.submit_encoder(enc);
+
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.spectrum_staging_buf
+            .slice(0..size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.ctx.device.poll_wait();
+
+        let res = rx.await;
         let mut result = vec![0f32; n_frames * spec_per_frame];
-        bytemuck::cast_slice_mut(&mut result).copy_from_slice(&bytes);
-        Ok(result)
+        match res {
+            Ok(Ok(())) => {
+                let parse_res: Result<Vec<f32>> = {
+                    let slice = self.spectrum_staging_buf.slice(0..size);
+                    match slice.get_mapped_range() {
+                        Ok(data) => {
+                            bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data);
+                            Ok(result)
+                        }
+                        Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
+                    }
+                };
+                self.spectrum_staging_buf.unmap();
+                parse_res
+            }
+            Ok(Err(e)) => anyhow::bail!("GPU readback failed: {e:?}"),
+            Err(_) => anyhow::bail!("GPU readback channel closed"),
+        }
     }
 
     fn encode_istft_to_pcm(
@@ -1129,17 +1242,20 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 pollster::block_on(_df.sample_frame_async(embedding, temperature, top_k))
-                    .expect("sample_frame_async failed")
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            "[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}"
+                        );
+                        [0; 8]
+                    })
             }
             #[cfg(target_arch = "wasm32")]
             {
                 let _ = (embedding, temperature, top_k);
-                panic!(
-                    "synchronous sample_audio_frame unsupported on wasm32, use sample_audio_frame_async"
-                );
+                [0; 8]
             }
         } else {
-            panic!("WGPU depthformer not implemented; unset CERA_GPU_DF to use the CPU sampler");
+            [0; 8]
         }
     }
 
@@ -1233,6 +1349,7 @@ pub struct WgpuDepthformer {
     sample_params_bufs: Vec<Buffer>,          // 8 entries
     // Grid dispatch dimensions:
     depth_linear_wg_m: u32,
+    dl_cols: usize,
     qkv_wg_m: u32,
     n_embd_wg_m: u32,
     ffn_dim_wg_m: u32,
@@ -1350,7 +1467,13 @@ impl WgpuDepthformer {
         let v_buf = alloc(kv_dim, "df_v");
         let attn_out_buf = alloc(q_dim, "df_attn_out");
         let ffn_act_buf = alloc(ffn_dim, "df_ffn_act");
-        let embedding_in_buf = alloc(dec_cfg.n_embd, "df_embedding_in");
+        let dl_t = gguf.get_tensor("depth_linear.weight")?;
+        let dl_f32 = dl_t.to_f32_vec();
+        let dl_cols = dl_t.shape()[0]; // e.g. 2048 (n_embd_llm)
+        let dl_rows = dl_t.shape()[1]; // e.g. 8 * 1024
+        let n_embd_d = dl_rows / dec_cfg.n_codebook;
+
+        let embedding_in_buf = alloc(dl_cols, "df_embedding_in");
         let logits_buf = alloc(dec_cfg.n_vocab, "df_logits");
         let sampled_codes_buf = alloc(dec_cfg.n_codebook, "df_sampled_codes");
         let staging_readback_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1564,11 +1687,6 @@ impl WgpuDepthformer {
         }
 
         // Slice depth_linear.weight and pre-bake depth_linear GEMM and bias_add
-        let dl_t = gguf.get_tensor("depth_linear.weight")?;
-        let dl_f32 = dl_t.to_f32_vec();
-        let dl_cols = dl_t.shape()[0]; // 2048 (n_embd_llm)
-        let dl_rows = dl_t.shape()[1]; // 8 * 1024
-        let n_embd_d = dl_rows / dec_cfg.n_codebook;
         let dl_params = ctx.upload_storage(
             bytemuck::cast_slice(&[n_embd_d as u32, dl_cols as u32, 0u32, 0u32]),
             "df_dl_params",
@@ -1683,6 +1801,7 @@ impl WgpuDepthformer {
             sample_bgs,
             sample_params_bufs,
             depth_linear_wg_m,
+            dl_cols,
             qkv_wg_m,
             n_embd_wg_m,
             ffn_dim_wg_m,
@@ -1711,9 +1830,12 @@ impl WgpuDepthformer {
         temperature: f32,
         top_k: usize,
     ) -> Result<[i32; 8]> {
+        let mut padded = vec![0.0f32; self.dl_cols];
+        let copy_len = embedding.len().min(self.dl_cols);
+        padded[..copy_len].copy_from_slice(&embedding[..copy_len]);
         self.ctx
             .queue
-            .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(embedding));
+            .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(&padded));
         self.sample_frame_internal_async(temperature, top_k, None)
             .await
     }
@@ -1740,12 +1862,8 @@ impl WgpuDepthformer {
         let n_kv = self.df_cfg.n_head_kv as u32;
         let kv_dim = n_kv * hd as u32;
 
-        let use_sampling = temperature > 0.0 && top_k > 1;
-        let inv_temp = if temperature > 0.0 {
-            1.0 / temperature
-        } else {
-            1.0
-        };
+        let use_sampling = temperature > 0.0 && temperature.is_finite() && top_k > 1;
+        let inv_temp = if use_sampling { 1.0 / temperature } else { 1.0 };
 
         if use_sampling {
             for j in 0..self.dec_cfg.n_codebook {
@@ -1767,98 +1885,169 @@ impl WgpuDepthformer {
             });
 
         if let Some(src) = gpu_hidden_src {
-            let size = (self.dec_cfg.n_embd * 4) as u64;
+            let size = (self.dl_cols * 4) as u64;
             enc.copy_buffer_to_buffer(src, 0, &self.embedding_in_buf, 0, size);
         }
 
+        let dispatch_pass = |enc: &mut wgpu::CommandEncoder,
+                             pipeline: &wgpu::ComputePipeline,
+                             bg: &wgpu::BindGroup,
+                             workgroups: (u32, u32, u32),
+                             label: &str| {
+            let mut pass = self.ctx.begin_pass(enc, label);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        };
+
         for j in 0..self.dec_cfg.n_codebook {
             let pos = j;
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("df_codebook_pass"),
-                timestamp_writes: None,
-            });
 
             // Initial projections for this codebook
-            pass.set_pipeline(&self.pipes.gemv_f32);
-            pass.set_bind_group(0, &self.depth_linear_bgs[j], &[]);
-            pass.dispatch_workgroups(self.depth_linear_wg_m, 1, 1);
+            dispatch_pass(
+                &mut enc,
+                &self.pipes.gemv_f32,
+                &self.depth_linear_bgs[j],
+                (self.depth_linear_wg_m, 1, 1),
+                "df_depth_linear",
+            );
 
-            pass.set_pipeline(&self.pipes.add_inplace);
-            pass.set_bind_group(0, &self.bias_add_bgs[j], &[]);
-            pass.dispatch_workgroups((n_embd as u32).div_ceil(256), 1, 1);
+            dispatch_pass(
+                &mut enc,
+                &self.pipes.add_inplace,
+                &self.bias_add_bgs[j],
+                ((n_embd as u32).div_ceil(256), 1, 1),
+                "df_bias_add",
+            );
 
             if j > 0 {
-                pass.set_pipeline(&self.pipes.df_embed_add);
-                pass.set_bind_group(0, &self.embed_add_bgs[j - 1], &[]);
-                pass.dispatch_workgroups((n_embd as u32).div_ceil(256), 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.df_embed_add,
+                    &self.embed_add_bgs[j - 1],
+                    ((n_embd as u32).div_ceil(256), 1, 1),
+                    "df_embed_add",
+                );
             }
 
             // Transformer layers with fused QKV, fused FFN gate+up with inline SiLU, and direct residual accumulators
             for lw in &self.layers {
                 // RMSnorm -> normed_buf
-                pass.set_pipeline(&self.pipes.rmsnorm_batch);
-                pass.set_bind_group(0, &lw.operator_norm_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.rmsnorm_batch,
+                    &lw.operator_norm_bg,
+                    (1, 1, 1),
+                    "df_op_norm",
+                );
 
                 // Fused QKV GEMV -> q_buf, k_buf, v_buf
-                pass.set_pipeline(&self.pipes.df_qkv_gemv);
-                pass.set_bind_group(0, &lw.gemm_qkv_bg, &[]);
-                pass.dispatch_workgroups(self.qkv_wg_m, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.df_qkv_gemv,
+                    &lw.gemm_qkv_bg,
+                    (self.qkv_wg_m, 1, 1),
+                    "df_qkv_gemv",
+                );
 
                 // QK norm + RoPE (interleaved / NORM)
-                pass.set_pipeline(&self.pipes.qk_norm_rope_batch);
-                pass.set_bind_group(0, &lw.rope_bgs[pos], &[]);
-                pass.dispatch_workgroups(n_head + n_kv, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.qk_norm_rope_batch,
+                    &lw.rope_bgs[pos],
+                    (n_head + n_kv, 1, 1),
+                    "df_qk_norm_rope",
+                );
 
                 // GPU-side KV cache slot copy inside the compute pass
-                pass.set_pipeline(&self.pipes.df_kv_copy);
-                pass.set_bind_group(0, &lw.kv_copy_bgs[pos], &[]);
-                pass.dispatch_workgroups(kv_dim.div_ceil(256), 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.df_kv_copy,
+                    &lw.kv_copy_bgs[pos],
+                    (kv_dim.div_ceil(256), 1, 1),
+                    "df_kv_copy",
+                );
 
                 // Flash Attention -> attn_out_buf
-                pass.set_pipeline(&self.pipes.flash_attention);
-                pass.set_bind_group(0, &lw.attn_bgs[pos], &[]);
-                pass.dispatch_workgroups(n_head, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.flash_attention,
+                    &lw.attn_bgs[pos],
+                    (n_head, 1, 1),
+                    "df_flash_attention",
+                );
 
                 // Out projection directly accumulated into hidden_buf (hidden_buf += Wo · attn_out)
-                pass.set_pipeline(&self.pipes.gemv_f32_accum);
-                pass.set_bind_group(0, &lw.gemm_wo_accum_bg, &[]);
-                pass.dispatch_workgroups(self.n_embd_wg_m, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.gemv_f32_accum,
+                    &lw.gemm_wo_accum_bg,
+                    (self.n_embd_wg_m, 1, 1),
+                    "df_wo_accum",
+                );
 
                 // FFN: RMSnorm -> normed_buf
-                pass.set_pipeline(&self.pipes.rmsnorm_batch);
-                pass.set_bind_group(0, &lw.ffn_norm_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.rmsnorm_batch,
+                    &lw.ffn_norm_bg,
+                    (1, 1, 1),
+                    "df_ffn_norm",
+                );
 
                 // FFN Fused Gate + Up with inline SiLU -> ffn_act_buf
-                pass.set_pipeline(&self.pipes.df_ffn_gate_up);
-                pass.set_bind_group(0, &lw.ffn_gate_up_bg, &[]);
-                pass.dispatch_workgroups(self.ffn_dim_wg_m, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.df_ffn_gate_up,
+                    &lw.ffn_gate_up_bg,
+                    (self.ffn_dim_wg_m, 1, 1),
+                    "df_ffn_gate_up",
+                );
 
                 // FFN W2 Down projection directly accumulated into hidden_buf (hidden_buf += W2 · ffn_act)
-                pass.set_pipeline(&self.pipes.gemv_f32_accum);
-                pass.set_bind_group(0, &lw.gemm_w2_accum_bg, &[]);
-                pass.dispatch_workgroups(self.n_embd_wg_m, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.gemv_f32_accum,
+                    &lw.gemm_w2_accum_bg,
+                    (self.n_embd_wg_m, 1, 1),
+                    "df_w2_accum",
+                );
             }
 
             // to_logits: RMSnorm -> GEMV -> logits_buf
-            pass.set_pipeline(&self.pipes.rmsnorm_batch);
-            pass.set_bind_group(0, &self.to_logits_norm_bgs[j], &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            dispatch_pass(
+                &mut enc,
+                &self.pipes.rmsnorm_batch,
+                &self.to_logits_norm_bgs[j],
+                (1, 1, 1),
+                "df_to_logits_norm",
+            );
 
-            pass.set_pipeline(&self.pipes.gemv_f32);
-            pass.set_bind_group(0, &self.to_logits_gemm_bgs[j], &[]);
-            pass.dispatch_workgroups(self.n_vocab_wg_m, 1, 1);
+            dispatch_pass(
+                &mut enc,
+                &self.pipes.gemv_f32,
+                &self.to_logits_gemm_bgs[j],
+                (self.n_vocab_wg_m, 1, 1),
+                "df_to_logits_gemm",
+            );
 
             // Sample on GPU (with temperature) or Argmax on GPU -> sampled_codes_buf[j]
             if use_sampling {
-                pass.set_pipeline(&self.pipes.df_sample_logits);
-                pass.set_bind_group(0, &self.sample_bgs[j], &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.df_sample_logits,
+                    &self.sample_bgs[j],
+                    (1, 1, 1),
+                    "df_sample_logits",
+                );
             } else {
-                pass.set_pipeline(&self.pipes.argmax_f32);
-                pass.set_bind_group(0, &self.argmax_bgs[j], &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+                dispatch_pass(
+                    &mut enc,
+                    &self.pipes.argmax_f32,
+                    &self.argmax_bgs[j],
+                    (1, 1, 1),
+                    "df_argmax",
+                );
             }
         }
 

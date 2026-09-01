@@ -396,6 +396,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_bos_token(uint64_t ptr, RustCall
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_capabilities(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
+void uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONTEXT_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONTEXT_SIZE
 uint64_t uniffi_cera_ffi_fn_method_ceraengine_context_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -469,6 +474,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_transcribe(uint64_t ptr, RustBuf
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_VOCAB_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_VOCAB_SIZE
 uint32_t uniffi_cera_ffi_fn_method_ceraengine_vocab_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_WIPE_ALL_PREFIX_CACHES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_WIPE_ALL_PREFIX_CACHES
+void uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_DOWNLOADPROGRESSSINK
@@ -1126,6 +1136,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_capabilities(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CONTEXT_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CONTEXT_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_context_size(void
@@ -1213,6 +1229,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_transcribe(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_VOCAB_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_VOCAB_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_vocab_size(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_WIPE_ALL_PREFIX_CACHES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_WIPE_ALL_PREFIX_CACHES
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches(void
     
 );
 #endif

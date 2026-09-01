@@ -63,6 +63,6 @@ void silu_mul_inplace(uint3 gid : SV_DispatchThreadID) {
     if (i >= par_buf[0].x) {
         return;
     }
-    float g = a_buf[i];
+    float g = clamp(a_buf[i], -80.0f, 80.0f);
     a_buf[i] = (g / (1.0f + exp(-g))) * b_buf[i];
 }

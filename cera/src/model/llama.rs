@@ -22,17 +22,14 @@ use crate::backend::cpu;
 use crate::backend::cpu::RopeType;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 use crate::kv_cache::LayerState;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // Only the batched-LM-head warning path names `DType` unqualified; every other
 // reference is fully qualified. Gate the import to that path so `--features blas`
 // and non-int8 targets do not see it as unused under clippy's `-D warnings`.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 use crate::tensor::DType;
 
 // ── Per-layer weight references ─────────────────────────────────────────────
@@ -106,10 +103,7 @@ pub struct LlamaModel {
 /// One call site today. A second decline path for the same head and dtype would
 /// be masked by the first and should pass its own discriminator rather than rely
 /// on the message text differing.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 fn warn_lm_head_unbatched(head: &str, dtype: DType) {
     use std::sync::Mutex;
     // A Vec, not a HashSet: `DType` is not `Hash`, and the set is tiny. Same
@@ -138,10 +132,7 @@ fn warn_lm_head_unbatched(head: &str, dtype: DType) {
 /// moves on. Same lever-for-measurement role as `CERA_CPU_TIER`.
 ///
 /// Read once per process — this sits in the verification hot path.
-#[cfg(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(feature = "blas")
-))]
+#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 fn lm_head_gemm_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1"))
@@ -638,10 +629,7 @@ impl LlamaModel {
     /// that nothing ran. The last is a release-build safety net rather than an
     /// expected outcome, since it means the gate and the kernel table have
     /// drifted, and `gemm_preq` trips a `debug_assert` on it first.
-    #[cfg(all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        not(feature = "blas")
-    ))]
+    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
     fn project_logits_batched(&self, hidden: &[f32], n: usize) -> Option<Vec<f32>> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
@@ -729,7 +717,7 @@ impl LlamaModel {
     /// with the `blas` feature); the per-token fallback covers the rest. On
     /// x86_64 the kernel is additionally a *runtime* property, so the dtype scan
     /// below also asks `batched_gemm_supports` before committing to this path.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     /// Batched-GEMM prefill. When `hidden_out` is `Some`, this captures the
     /// per-token post-final-norm hidden states into it (row-major `[n * hs]`),
     /// skips the logit projection, and returns an empty Vec — the hidden-states
@@ -870,13 +858,13 @@ impl LlamaModel {
         // NEON-fallback Q8_0 input scratch. One buffer set sized to the largest
         // GEMM k-dim (hs, q_dim, or is) — each quantize call is immediately
         // followed by its paired GEMM with the same k, so reuse is safe.
-        #[cfg(not(feature = "blas"))]
+        #[cfg(not(has_blas))]
         let max_dim = hs.max(q_dim).max(is);
-        #[cfg(not(feature = "blas"))]
+        #[cfg(not(has_blas))]
         let mut col = vec![0.0f32; max_dim];
-        #[cfg(not(feature = "blas"))]
+        #[cfg(not(has_blas))]
         let mut bq_scales = vec![0.0f32; n * (max_dim / 32)];
-        #[cfg(not(feature = "blas"))]
+        #[cfg(not(has_blas))]
         let mut bq_quants = vec![0i8; n * max_dim];
 
         // Flash attention (tiled + rayon) beats the naive per-token loop only for
@@ -920,7 +908,7 @@ impl LlamaModel {
             }
 
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
-            #[cfg(feature = "blas")]
+            #[cfg(has_blas)]
             {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
@@ -953,7 +941,7 @@ impl LlamaModel {
                     &mut state.scratch.dequant_weight_scratch,
                 );
             }
-            #[cfg(not(feature = "blas"))]
+            #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
                     &normed,
@@ -1284,7 +1272,7 @@ impl LlamaModel {
             }
 
             // Batched output projection GEMM → block_out[hs × n] (k = q_dim).
-            #[cfg(feature = "blas")]
+            #[cfg(has_blas)]
             {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
@@ -1297,7 +1285,7 @@ impl LlamaModel {
                     &mut state.scratch.dequant_weight_scratch,
                 );
             }
-            #[cfg(not(feature = "blas"))]
+            #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
                     &out_proj_input,
@@ -1356,7 +1344,7 @@ impl LlamaModel {
             }
 
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
-            #[cfg(feature = "blas")]
+            #[cfg(has_blas)]
             {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
@@ -1379,7 +1367,7 @@ impl LlamaModel {
                     &mut state.scratch.dequant_weight_scratch,
                 );
             }
-            #[cfg(not(feature = "blas"))]
+            #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
                     &ffn_input,
@@ -1436,7 +1424,7 @@ impl LlamaModel {
 
             cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
 
-            #[cfg(feature = "blas")]
+            #[cfg(has_blas)]
             {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
@@ -1449,7 +1437,7 @@ impl LlamaModel {
                     &mut state.scratch.dequant_weight_scratch,
                 );
             }
-            #[cfg(not(feature = "blas"))]
+            #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
                     &gate_mat,
@@ -1573,7 +1561,7 @@ impl Model for LlamaModel {
         // An active LoRA is applied in-batch (via `apply_prefill` after each
         // projection GEMM); non-gemmable dtypes fall back to the per-token decode
         // hooks, which apply it too.
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         if tokens.len() > 1 {
             let mut out = Vec::new();
             self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
@@ -1635,7 +1623,7 @@ impl Model for LlamaModel {
         // An active LoRA is applied in-batch (`apply_prefill` after each projection
         // GEMM), so it no longer forces the per-token path; non-gemmable dtypes
         // still fall back to the per-token decode hooks, which apply it too.
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
             return self.forward_prefill_batched(tokens, start_pos, state, None);
         }
@@ -1675,7 +1663,7 @@ impl Model for LlamaModel {
         // tested batched-prefill KV append (same gate as `forward_prefill`). The
         // oracle-dump harness needs the per-token substep records, so defer to
         // the per-token path when it is active.
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         if n > 1 && !transformer::oracle_dump::is_active() {
             let hs = self.config.hidden_size;
             let mut hidden = Vec::new();
@@ -1687,7 +1675,7 @@ impl Model for LlamaModel {
             // of once each. It declines to the per-row loop below when the head's
             // dtype has no batched kernel (a Q5_K head, or an x86 host below the
             // AVX2 tier) — see `project_logits_batched` for the full list.
-            #[cfg(not(feature = "blas"))]
+            #[cfg(not(has_blas))]
             if let Some(logits) = self.project_logits_batched(&hidden, n) {
                 return logits;
             }
@@ -1787,8 +1775,8 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         self.rope_freqs.as_deref()
     }
 
-    fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
-        transformer::weight_data(&self.gguf, wref)
+    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(transformer::weight_data(&self.gguf, wref))
     }
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
         transformer::dequantize_weight(&self.gguf, wref)

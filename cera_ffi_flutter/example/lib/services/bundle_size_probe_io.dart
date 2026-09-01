@@ -10,38 +10,94 @@ Future<Map<String, int>> probeBundleFileSizes(
   final client = HttpClient();
   client.connectionTimeout = const Duration(seconds: 3);
   try {
+    final cleanQuant = quant.split(RegExp(r'[+ ]')).first.trim();
     final manifestUrl =
-        'https://huggingface.co/LiquidAI/LeapBundles/raw/main/$bundleName/$quant.json';
+        'https://huggingface.co/LiquidAI/LeapBundles/raw/main/$bundleName/$cleanQuant.json';
     final manifestUri = Uri.parse(manifestUrl);
-    final req = await client
-        .getUrl(manifestUri)
-        .timeout(const Duration(seconds: 3));
-    final res = await req.close().timeout(const Duration(seconds: 3));
-    if (res.statusCode != 200) return {};
-    final jsonStr = await utf8.decoder
-        .bind(res)
-        .join()
-        .timeout(const Duration(seconds: 3));
-    final data = jsonDecode(jsonStr) as Map<String, dynamic>;
-    final loadTime = data['load_time_parameters'] as Map<String, dynamic>?;
-    if (loadTime == null) return {};
-
     final fileUrls = <String>[];
-    for (final key in [
-      'model',
-      'multimodal_projector',
-      'audio_decoder',
-      'audio_tokenizer',
-    ]) {
-      final val = loadTime[key];
-      if (val is String && val.trim().isNotEmpty) {
-        final trimmed = val.trim();
-        final resolved = trimmed.startsWith('http')
-            ? trimmed
-            : manifestUri.resolve(trimmed).toString();
-        fileUrls.add(resolved);
+    try {
+      final req = await client
+          .getUrl(manifestUri)
+          .timeout(const Duration(seconds: 3));
+      final res = await req.close().timeout(const Duration(seconds: 3));
+      if (res.statusCode == 200) {
+        final jsonStr = await utf8.decoder
+            .bind(res)
+            .join()
+            .timeout(const Duration(seconds: 3));
+        final data = jsonDecode(jsonStr) as Map<String, dynamic>;
+        final loadTime = data['load_time_parameters'] as Map<String, dynamic>?;
+        if (loadTime != null) {
+          for (final key in [
+            'model',
+            'multimodal_projector',
+            'audio_decoder',
+            'audio_tokenizer',
+            'draft_model',
+          ]) {
+            final val = loadTime[key];
+            if (val is String && val.trim().isNotEmpty) {
+              final trimmed = val.trim();
+              final resolved = trimmed.startsWith('http')
+                  ? trimmed
+                  : manifestUri.resolve(trimmed).toString();
+              fileUrls.add(resolved);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (fileUrls.isEmpty) {
+      if (bundleName.contains('VL-3B')) {
+        final String mmprojQuant;
+        if (cleanQuant == 'F16' || cleanQuant == 'BF16') {
+          mmprojQuant = 'F16';
+        } else {
+          mmprojQuant = 'Q8_0';
+        }
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/'
+          'LFM2.5-VL-3B-$cleanQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/'
+          'mmproj-LFM2.5-VL-3B-$mmprojQuant.gguf',
+        );
+      } else if (bundleName.contains('Audio')) {
+        final String sidecarQuant;
+        if (cleanQuant == 'F16' || cleanQuant == 'BF16') {
+          sidecarQuant = 'F16';
+        } else if (cleanQuant == 'Q8_0') {
+          sidecarQuant = 'Q8_0';
+        } else {
+          sidecarQuant = 'Q4_0';
+        }
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/'
+          'LFM2.5-Audio-1.5B-$cleanQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/'
+          'mmproj-LFM2.5-Audio-1.5B-$sidecarQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF-LEAP/resolve/main/'
+          'vocoder-LFM2.5-Audio-1.5B-$sidecarQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/'
+          'tokenizer-LFM2.5-Audio-1.5B-$sidecarQuant.gguf',
+        );
+      } else if (quant.contains('DSpark') || quant.contains('dspark')) {
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-1.5B-DSpark-GGUF/resolve/main/'
+          'dspark-LFM2.5-1.5B-$cleanQuant.gguf',
+        );
       }
     }
+
+    if (fileUrls.isEmpty) return {};
 
     final sizes = <String, int>{};
     await Future.wait(

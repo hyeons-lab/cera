@@ -44,7 +44,7 @@ struct KernelContext_0
     }
 
     uint c_0 = idx_0 / t_0;
-    float v_0 = *((&kernelContext_0)->x_buf_0+idx_0) * (&kernelContext_0)->w_buf_0[c_0] + (&kernelContext_0)->b_buf_0[c_0];
+    float v_0 = clamp(*((&kernelContext_0)->x_buf_0+idx_0) * (&kernelContext_0)->w_buf_0[c_0] + (&kernelContext_0)->b_buf_0[c_0], -80.0f, 80.0f);
     *((&kernelContext_0)->x_buf_0+idx_0) = v_0 / (1.0f + exp(- v_0));
     return;
 }

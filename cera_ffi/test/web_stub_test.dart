@@ -21,6 +21,7 @@ void main() {
         contextSize: 2048,
         backend: BackendPreference.cpu,
         bundleRepo: null,
+        draftModel: null,
       );
       expect(config.contextSize, 2048);
       expect(config.backend, BackendPreference.cpu);
@@ -33,6 +34,7 @@ void main() {
             contextSize: 2048,
             backend: BackendPreference.cpu,
             bundleRepo: null,
+            draftModel: null,
           ),
         ),
       );
@@ -72,6 +74,7 @@ void main() {
             contextSize: 0,
             backend: BackendPreference.auto,
             bundleRepo: null,
+            draftModel: null,
           ),
         ),
         throwsUnsupportedError,

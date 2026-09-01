@@ -17,7 +17,7 @@
 //! LFM2.5-230M-Q4_K_M at this tier, the two arms are indistinguishable (decode
 //! p50 75.7 vs 76.1 tok/s, n=20). This is a correctness-of-predicate guard.
 
-#![cfg(all(target_arch = "x86_64", feature = "avx512", not(feature = "blas")))]
+#![cfg(all(target_arch = "x86_64", feature = "avx512", not(has_blas)))]
 
 use cera::backend::cpu_features::{CpuTier, cpu_features};
 

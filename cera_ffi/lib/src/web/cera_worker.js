@@ -29,7 +29,33 @@
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
 
+console.info('[cera:worker:version] v0.5.0 (build: 2026-08-29-rev21-local-models-webgpu)');
+
 'use strict';
+
+const LOCAL_MODELS_DIR = '/models-local';
+
+function toLocalModelUrl(url) {
+  if (typeof url !== 'string' || !url.startsWith('https://huggingface.co/')) return url;
+  const base = url.split('?')[0].split('/').pop();
+  return `${LOCAL_MODELS_DIR}/${base}`;
+}
+
+if (typeof self !== 'undefined' && self.location && (self.location.hostname === 'localhost' || self.location.hostname === '127.0.0.1')) {
+  const origFetch = self.fetch.bind(self);
+  self.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+    const mapped = toLocalModelUrl(url);
+    if (mapped !== url) {
+      try {
+        const localReq = input instanceof Request ? new Request(mapped, input) : mapped;
+        const res = await origFetch(localReq, init);
+        if (res.ok) return res;
+      } catch (_) {}
+    }
+    return origFetch(input, init);
+  };
+}
 
 /**
  * An error the host should surface as its platform's "not supported here"
@@ -56,7 +82,9 @@ let gpu = null; // {session, tokenizer}
 
 /** Human-readable description of the backend that actually loaded. */
 let backendLabel = 'none';
+let currentModelLabel = 'unknown';
 let pendingAudioSuffixTokens = null;
+let pendingImage = null;
 let isCancelled = false;
 let cancelSharedBuffer = null;
 let cancelArray = null;
@@ -118,8 +146,11 @@ function tokenizer() {
  */
 function encodePrompt(text, first) {
   const tk = tokenizer();
-  const ids = Array.from(tk.encode(text));
-  const bos = tk.bosToken;
+  const ids =
+    typeof tk.encodeSpecial === 'function'
+      ? Array.from(tk.encodeSpecial(text, false))
+      : Array.from(tk.encode(text));
+  const bos = tk.bosToken ?? tk.bosTokenId;
   if (first && tk.addBosToken && bos != null && ids[0] !== bos) {
     ids.unshift(bos);
   }
@@ -221,6 +252,7 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
     cancelHandle: typeof session.cancelHandle === 'function' ? session.cancelHandle() : null,
   };
   backendLabel = `webgpu: ${session.adapter}`;
+  currentModelLabel = 'custom GGUF';
   return true;
 }
 
@@ -282,6 +314,7 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress, turb
     cancelHandle: typeof session.cancelHandle === 'function' ? session.cancelHandle() : null,
   };
   backendLabel = `webgpu: ${session.adapter}`;
+  currentModelLabel = `${bundleId} (${quant})`;
   return null;
 }
 
@@ -291,6 +324,7 @@ function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant) {
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
   initCpuSession(engine, turboQuant);
+  currentModelLabel = 'custom GGUF';
 }
 
 function initCpuSession(engine, turboQuant) {
@@ -327,6 +361,7 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress, tur
     onProgress,
   );
   initCpuSession(engine, turboQuant);
+  currentModelLabel = `${bundleId} (${quant})`;
 }
 
 /**
@@ -455,6 +490,7 @@ const OPS = {
       // `auto`. The CPU load is the fallback, but the GPU reason is the more
       // useful half of a double failure: it is the one that says whether the
       // download itself failed, so it rides along rather than being discarded.
+      console.warn(`[cera:worker] WebGPU backend failed to load bundle "${bundleId}", falling back to CPU:`, why);
       try {
         await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
       } catch (err) {
@@ -480,8 +516,8 @@ const OPS = {
   /**
    * Feed an image into the live conversation.
    *
-   * Both paths append patch embeddings to the same KV cache `generate` writes
-   * to, so ordering is the caller's: image first, then the question.
+   * Queued to be spliced into the proper user-turn `<|image_start|>` envelope
+   * at the start of the next `generate` call.
    */
   async appendImage({ bytes, maxLongSize }) {
     const t0 = performance.now();
@@ -490,16 +526,9 @@ const OPS = {
     console.info(
       `[cera:worker] appendImage: received ${view.byteLength} bytes of raw image data (maxLongSize cap: ${cap ?? 'model-default'})`,
     );
-    if (gpu) {
-      await gpu.session.appendImage(view, cap);
-    } else {
-      console.info(
-        '[cera:worker] appendImage: preprocessing and encoding image patches on CPU session (this may take several seconds)...',
-      );
-      cpu.session.appendImage(view, cap);
-    }
+    pendingImage = { view, cap };
     const elapsed = (performance.now() - t0).toFixed(1);
-    console.info(`[cera:worker] appendImage: total image dispatch completed in ${elapsed}ms`);
+    console.info(`[cera:worker] appendImage: queued image for envelope splicing in ${elapsed}ms`);
     return null;
   },
 
@@ -707,7 +736,7 @@ const OPS = {
     const { prompt, maxTokens } = req;
     const currentPos = position();
     console.info(
-      `[cera:worker] generate: starting generation on "${backendLabel}" (context position: ${currentPos}, maxTokens: ${maxTokens})`,
+      `[cera:worker] generate: starting generation for "${currentModelLabel}" on "${backendLabel}" (context position: ${currentPos}, maxTokens: ${maxTokens})`,
     );
     // Seeding is per SESSION in the CPU wasm API, not per generate:
     // `GenerateOpts` has no seed field and assigning one just creates a dead JS
@@ -731,20 +760,97 @@ const OPS = {
       }
     }
     let ids;
-    const pendingSuffix = pendingAudioSuffixTokens;
-    pendingAudioSuffixTokens = null;
-    if (pendingSuffix != null && (!prompt || prompt.trim() === '')) {
-      ids = pendingSuffix;
-      console.info(`[cera:worker] generate: using ${ids.length} pending audio suffix tokens for generation`);
-    } else if (pendingSuffix != null) {
-      const promptIds = encodePrompt(prompt, currentPos === 0);
-      ids = new Uint32Array(pendingSuffix.length + promptIds.length);
-      ids.set(pendingSuffix, 0);
-      ids.set(promptIds, pendingSuffix.length);
-      console.info(`[cera:worker] generate: combined ${pendingSuffix.length} audio suffix tokens and ${promptIds.length} prompt tokens`);
+    const pendingImg = pendingImage;
+    pendingImage = null;
+
+    if (pendingImg != null) {
+      const tk = tokenizer();
+      const imgStartId = tk.specialTokenId('<|image_start|>') ?? tk.specialTokenId('<vision_start>');
+      const imgEndId = tk.specialTokenId('<|image_end|>') ?? tk.specialTokenId('<vision_end>');
+      const imgMarkerId = tk.specialTokenId('<image>') ?? tk.specialTokenId('<|image_pad|>');
+
+      let prefixTokens = [];
+      let suffixTokens = [];
+
+      const userHeader = '<|im_start|>user\n';
+      const userHeaderIdx = prompt ? prompt.lastIndexOf(userHeader) : -1;
+
+      if (prompt && prompt.includes('<image>') && imgMarkerId != null) {
+        const allTokens = Array.from(tk.encodeSpecial(prompt, false));
+        const splitIdx = allTokens.indexOf(imgMarkerId);
+        if (splitIdx >= 0) {
+          prefixTokens = allTokens.slice(0, splitIdx);
+          suffixTokens = allTokens.slice(splitIdx + 1);
+        } else {
+          suffixTokens = allTokens;
+        }
+      } else if (userHeaderIdx !== -1) {
+        const prefixText = prompt.slice(0, userHeaderIdx + userHeader.length);
+        const suffixText = prompt.slice(userHeaderIdx + userHeader.length);
+        prefixTokens = Array.from(encodePrompt(prefixText, currentPos === 0));
+        suffixTokens = Array.from(tk.encodeSpecial(suffixText, false));
+      } else if (prompt && prompt.trim() !== '') {
+        prefixTokens = [];
+        suffixTokens = Array.from(encodePrompt(prompt, currentPos === 0));
+      }
+
+      const bosId = tk.bosToken ?? tk.bosTokenId;
+      if (currentPos === 0 && tk.addBosToken && bosId != null) {
+        if (prefixTokens.length === 0) {
+          prefixTokens.push(bosId);
+        } else if (prefixTokens[0] !== bosId) {
+          prefixTokens.unshift(bosId);
+        }
+      }
+
+      const t0 = performance.now();
+      if (gpu) {
+        if (prefixTokens.length > 0) {
+          console.info(`[cera:worker] generate (VL): appending ${prefixTokens.length} prefix tokens before image...`);
+          gpu.session.appendTokens(new Uint32Array(prefixTokens));
+        }
+        if (imgStartId != null) {
+          gpu.session.appendTokens(new Uint32Array([imgStartId]));
+        }
+        console.info(`[cera:worker] generate (VL): encoding and seeding image embeddings into WebGPU KV cache...`);
+        await gpu.session.appendImage(pendingImg.view, pendingImg.cap);
+        if (imgEndId != null) {
+          gpu.session.appendTokens(new Uint32Array([imgEndId]));
+        }
+        console.info(`[cera:worker] generate (VL): image envelope seeded in ${(performance.now() - t0).toFixed(1)}ms; generating with ${suffixTokens.length} prompt suffix tokens`);
+        ids = new Uint32Array(suffixTokens);
+      } else {
+        if (prefixTokens.length > 0) {
+          console.info(`[cera:worker] generate (VL): appending ${prefixTokens.length} prefix tokens before image...`);
+          cpu.session.appendTokens(Uint32Array.from(prefixTokens));
+        }
+        if (imgStartId != null) {
+          cpu.session.appendTokens(Uint32Array.from([imgStartId]));
+        }
+        console.info(`[cera:worker] generate (VL): encoding and seeding image embeddings on CPU session...`);
+        cpu.session.appendImage(pendingImg.view, pendingImg.cap);
+        if (imgEndId != null) {
+          cpu.session.appendTokens(Uint32Array.from([imgEndId]));
+        }
+        console.info(`[cera:worker] generate (VL): image envelope seeded in ${(performance.now() - t0).toFixed(1)}ms; generating with ${suffixTokens.length} prompt suffix tokens`);
+        ids = Uint32Array.from(suffixTokens);
+      }
     } else {
-      ids = encodePrompt(prompt, currentPos === 0);
-      console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
+      const pendingSuffix = pendingAudioSuffixTokens;
+      pendingAudioSuffixTokens = null;
+      if (pendingSuffix != null && (!prompt || prompt.trim() === '')) {
+        ids = pendingSuffix;
+        console.info(`[cera:worker] generate: using ${ids.length} pending audio suffix tokens for generation`);
+      } else if (pendingSuffix != null) {
+        const promptIds = encodePrompt(prompt, currentPos === 0);
+        ids = new Uint32Array(pendingSuffix.length + promptIds.length);
+        ids.set(pendingSuffix, 0);
+        ids.set(promptIds, pendingSuffix.length);
+        console.info(`[cera:worker] generate: combined ${pendingSuffix.length} audio suffix tokens and ${promptIds.length} prompt tokens`);
+      } else {
+        ids = encodePrompt(prompt, currentPos === 0);
+        console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
+      }
     }
     const started = performance.now();
     let firstTokenTime = null;
@@ -785,7 +891,7 @@ const OPS = {
       post({ event: 'token', text: piece });
     };
     console.info(
-      `[cera:worker] generate op started: backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
+      `[cera:worker] generate op started: model="${currentModelLabel}", backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
     );
     const onAudio = (pcm, sampleRate) => {
       if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
@@ -892,7 +998,7 @@ const OPS = {
         ? ((tokenCount - 1) / (decodeMs / 1000)).toFixed(1)
         : (tokenCount / (ms / 1000)).toFixed(1);
     console.info(
-      `[cera:worker] generate: completed ${tokenCount} tokens in ${ms.toFixed(1)}ms (${tps} tok/s)`,
+      `[cera:worker] generate: completed ${tokenCount} tokens for "${currentModelLabel}" in ${ms.toFixed(1)}ms (${tps} tok/s)`,
     );
     return { text, elapsedMs: ms };
   },
@@ -921,6 +1027,7 @@ const OPS = {
    */
   reset() {
     pendingAudioSuffixTokens = null;
+    pendingImage = null;
     if (cpu) {
       // `Session.reset`, not a fresh session. It clears KV, position and token
       // history and lowers the cancel flag, which is all rebuilding did, while
@@ -971,6 +1078,7 @@ const OPS = {
 
   close() {
     pendingAudioSuffixTokens = null;
+    pendingImage = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own
     // `Arc<BpeTokenizer>` clone, so freeing the engine does not reclaim them.
     // Terminating the worker would, but this protocol is documented as usable

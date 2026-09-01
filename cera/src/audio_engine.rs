@@ -68,9 +68,11 @@ pub enum FrameOutcome {
     /// Codes sampled + detokenized; `audio_embedding` is the feedback
     /// embedding the caller should pass back through the main LLM.
     /// `pcm` contains the progressive real-time audio chunk for this frame.
+    /// `codes` contains the 8 discrete acoustic codebook indices for this frame.
     Codes {
         audio_embedding: Vec<f32>,
         pcm: Vec<f32>,
+        codes: [i32; 8],
     },
     /// Audio stream terminated (`codes[0] == AUDIO_END_CODE`). No
     /// spectrum produced for this frame; caller should return control
@@ -217,6 +219,7 @@ impl<'a> AudioOutputDecoder<'a> {
             return FrameOutcome::Codes {
                 audio_embedding,
                 pcm: vec![],
+                codes,
             };
         }
 
@@ -239,6 +242,7 @@ impl<'a> AudioOutputDecoder<'a> {
         FrameOutcome::Codes {
             audio_embedding,
             pcm,
+            codes,
         }
     }
 
@@ -272,13 +276,24 @@ impl<'a> AudioOutputDecoder<'a> {
             return Ok(FrameOutcome::Codes {
                 audio_embedding,
                 pcm: vec![],
+                codes,
             });
         }
 
         let t1 = Instant::now();
         let spectrum = if let Some(g) = self.gpu {
-            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await?
+            match g
+                .detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await
+            {
+                Ok(spec) => spec,
+                Err(_) => detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    &codes,
+                ),
+            }
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -295,6 +310,7 @@ impl<'a> AudioOutputDecoder<'a> {
         Ok(FrameOutcome::Codes {
             audio_embedding,
             pcm,
+            codes,
         })
     }
 
@@ -329,13 +345,24 @@ impl<'a> AudioOutputDecoder<'a> {
             return Ok(FrameOutcome::Codes {
                 audio_embedding,
                 pcm: vec![],
+                codes,
             });
         }
 
         let t1 = Instant::now();
         let spectrum = if let Some(g) = self.gpu {
-            g.detokenize_to_spectrum_async(self.detok_weights, &codes)
-                .await?
+            match g
+                .detokenize_to_spectrum_async(self.detok_weights, &codes)
+                .await
+            {
+                Ok(spec) => spec,
+                Err(_) => detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    &codes,
+                ),
+            }
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -352,6 +379,7 @@ impl<'a> AudioOutputDecoder<'a> {
         Ok(FrameOutcome::Codes {
             audio_embedding,
             pcm,
+            codes,
         })
     }
 
@@ -611,6 +639,7 @@ pub fn generate_audio(
                         FrameOutcome::Codes {
                             audio_embedding,
                             pcm,
+                            ..
                         } => {
                             if !pcm.is_empty() {
                                 audio_callback(&pcm, decoder.sample_rate());
@@ -660,6 +689,9 @@ pub fn generate_audio(
             pos += 1;
             generated += 1;
 
+            let mut voiced_frames = 0usize;
+            let mut consecutive_silent_frames = 0usize;
+
             loop {
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
@@ -693,9 +725,25 @@ pub fn generate_audio(
                     FrameOutcome::Codes {
                         audio_embedding,
                         pcm,
+                        ..
                     } => {
                         if !pcm.is_empty() {
+                            let rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
+                                / pcm.len().max(1) as f32)
+                                .sqrt();
+                            if rms >= 0.001 {
+                                voiced_frames += 1;
+                                consecutive_silent_frames = 0;
+                            } else {
+                                consecutive_silent_frames += 1;
+                            }
                             audio_callback(&pcm, decoder.sample_rate());
+                        }
+                        if matches!(config.mode, AudioMode::Sequential)
+                            && voiced_frames >= 5
+                            && consecutive_silent_frames >= 40
+                        {
+                            break 'outer;
                         }
                         audio_embedding
                     }

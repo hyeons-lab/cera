@@ -39,6 +39,6 @@ void chan_affine_silu(uint3 gid : SV_DispatchThreadID) {
     }
 
     uint c = idx / t;
-    float v = x_buf[idx] * w_buf[c] + b_buf[c];
+    float v = clamp(x_buf[idx] * w_buf[c] + b_buf[c], -80.0f, 80.0f);
     x_buf[idx] = v / (1.0f + exp(-v));
 }

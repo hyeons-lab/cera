@@ -96,6 +96,8 @@ pub struct EngineConfig {
     pub context_size: usize,
     /// Which compute backend to prefer.
     pub backend: BackendPreference,
+    /// Optional speculative decoding draft model GGUF path (e.g. DSpark sidecar).
+    pub draft_model: Option<PathBuf>,
     /// Optional repository used to resolve `http(s)://` URLs found in a
     /// manifest's `files` entries. When `None`, remote URLs fail with a
     /// clear error asking the caller to either set this field or
@@ -109,6 +111,7 @@ impl Default for EngineConfig {
         Self {
             context_size: 4096,
             backend: BackendPreference::Auto,
+            draft_model: None,
             #[cfg(feature = "remote")]
             bundle_repo: None,
         }
@@ -129,6 +132,8 @@ pub struct ModelFiles {
     pub audio_decoder: Option<PathBuf>,
     /// Optional: audio tokenizer (usually a `.safetensors` checkpoint).
     pub audio_tokenizer: Option<PathBuf>,
+    /// Optional: speculative decoding draft model GGUF (e.g. DSpark / DFlash).
+    pub draft_model: Option<PathBuf>,
     /// Forward-compat: any additional named aux file.
     pub extras: std::collections::HashMap<String, PathBuf>,
     /// Explicit inference type. `None` → auto-detect from GGUF
@@ -159,6 +164,10 @@ pub struct ModelBytes {
     pub multimodal_projector: Option<Arc<[u8]>>,
     /// Optional vocoder GGUF for audio output decoding.
     pub audio_decoder: Option<Arc<[u8]>>,
+    /// Optional audio tokenizer / detokenizer GGUF for speech synthesis.
+    pub audio_tokenizer: Option<Arc<[u8]>>,
+    /// Optional speculative decoding draft model GGUF (e.g. DSpark / DFlash).
+    pub draft_model: Option<Arc<[u8]>>,
     /// Explicit inference type. `None` auto-detects from the primary GGUF's
     /// `general.architecture`, then upgrades text → VL when an mmproj is
     /// present (see [`CeraEngine::from_parts`] for why).
@@ -176,6 +185,8 @@ impl ModelBytes {
             model: model.into(),
             multimodal_projector: None,
             audio_decoder: None,
+            audio_tokenizer: None,
+            draft_model: None,
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
             generation_defaults: None,
@@ -191,6 +202,7 @@ impl ModelFiles {
             multimodal_projector: None,
             audio_decoder: None,
             audio_tokenizer: None,
+            draft_model: None,
             extras: std::collections::HashMap::new(),
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
@@ -213,6 +225,8 @@ struct AuxWeights {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Parsed detokenizer, for audio-out bundles.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    /// Pre-parsed speculative decoding drafter (e.g. from in-memory bytes).
+    drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
 
 /// Short summary of the loaded model. Matches the shape planned for the
@@ -287,6 +301,8 @@ pub struct CeraEngine {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Detokenizer weights for audio output generation.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    /// Optional speculative decoding drafter (e.g. DSpark sidecar draft model).
+    drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
 
 impl CeraEngine {
@@ -446,42 +462,63 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let (audio_decoder, detok_weights) = if let Some(voc_bytes) = parts.audio_decoder {
-            match GgufFile::from_bytes(voc_bytes) {
-                Ok(voc_gguf) => {
-                    let voc_arc = Arc::new(voc_gguf);
-                    let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_arc)
+        let (audio_decoder, detok_weights) = {
+            let voc_arc = parts
+                .audio_decoder
+                .and_then(|b| GgufFile::from_bytes(b).ok())
+                .map(Arc::new);
+            let tok_arc = parts
+                .audio_tokenizer
+                .and_then(|b| GgufFile::from_bytes(b).ok())
+                .map(Arc::new);
+
+            let dec = if let Some(ref vg) = voc_arc {
+                crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
+                    .map_err(|e| {
+                        tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                        e
+                    })
+                    .ok()
+                    .map(Arc::new)
+            } else if let Some(ref g) = mmproj {
+                crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
+                    .ok()
+                    .map(Arc::new)
+            } else {
+                None
+            };
+
+            // The vocoder owns the detokenizer, so it is tried first, and each
+            // source is a real fallback rather than an `else if` arm: a
+            // present-but-unparseable file used to end the chain and leave the
+            // session with no detokenizer at all.
+            //
+            // Order matters beyond tidiness. `DetokenizerWeights::from_gguf`
+            // accepts fallback tensor names (`token_embd.weight`, `dense_2.*`,
+            // `token_embd_norm.weight`) so a combined GGUF still loads, and an
+            // audio *tokenizer* GGUF carries every one of them -- it is a whole
+            // separate `lfm2` model. Parsing it as a detokenizer therefore
+            // succeeds while silently substituting the wrong model's tensors:
+            // a 65536-row `token_embd.weight` stands in for the 16384-row
+            // `emb.emb.weight` code table (8 codebooks x 2048), so audio codes
+            // index a table that has nothing to do with them. The audio still
+            // sounds broadly like speech, which is what let it go unnoticed,
+            // but frames land wrong and some run an order of magnitude past
+            // [-1, 1].
+            let detok = [voc_arc.as_ref(), tok_arc.as_ref(), mmproj.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|g| {
+                    crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
                         .map_err(|e| {
-                            tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                            tracing::warn!("failed to parse detokenizer weights: {e:#}");
                             e
                         })
                         .ok()
-                        .map(Arc::new);
-                    let detok =
-                        crate::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_arc)
-                            .map_err(|e| {
-                                tracing::warn!("failed to parse detokenizer weights: {e:#}");
-                                e
-                            })
-                            .ok()
-                            .map(Arc::new);
-                    (dec, detok)
-                }
-                Err(e) => {
-                    tracing::warn!("failed to read vocoder GGUF file: {e:#}");
-                    (None, None)
-                }
-            }
-        } else if let Some(ref g) = mmproj {
-            let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
-                .ok()
-                .map(Arc::new);
-            let detok = crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
-                .ok()
-                .map(Arc::new);
+                        .map(Arc::new)
+                });
+
             (dec, detok)
-        } else {
-            (None, None)
         };
 
         let mut aux = match (&inference_type, mmproj) {
@@ -490,17 +527,27 @@ impl CeraEngine {
                 audio_encoder: None,
                 audio_decoder: None,
                 detok_weights: None,
+                drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
                 vision_mmproj: None,
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
+                drafter: None,
             },
             _ => AuxWeights::default(),
         };
         aux.audio_decoder = audio_decoder;
         aux.detok_weights = detok_weights;
+        aux.drafter = parts
+            .draft_model
+            .as_ref()
+            .and_then(|b| parse_aux_gguf(b, "draft model"))
+            .and_then(|draft_gguf| {
+                let base_gguf_arc = Arc::new(gguf.clone());
+                init_dspark_drafter(draft_gguf, &base_gguf_arc, "bytes")
+            });
 
         let mut manifest = Manifest::synthetic(
             Path::new("<bytes>"),
@@ -585,13 +632,39 @@ impl CeraEngine {
                     .to_string(),
             )
         })?;
-        let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, quant)?;
-        // No caller-supplied hash for manifest JSONs (LeapBundles schema
-        // doesn't carry one, and the file is tiny — etag fallback is
-        // sufficient). Manifest-level per-file hashes, when they land,
-        // would be threaded through from inside `from_manifest_file`.
-        let manifest_path = repo.resolve_url(&manifest_url, None)?;
-        Self::from_manifest_file(&manifest_path, cfg)
+        let want_dspark = quant.to_ascii_lowercase().contains("dspark");
+        let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+        let (mut manifest, manifest_dir) = if let Some(known) =
+            crate::bundle::known_bundle_manifest(bundle_id, clean_quant)
+        {
+            (known, None)
+        } else {
+            let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, clean_quant)?;
+            // No caller-supplied hash for manifest JSONs (LeapBundles schema
+            // doesn't carry one, and the file is tiny: etag fallback is
+            // sufficient). Manifest-level per-file hashes, when they land,
+            // would be threaded through from inside `from_manifest_file`.
+            let manifest_path = repo.resolve_url(&manifest_url, None)?;
+            let m = Manifest::from_file(&manifest_path).map_err(|e| {
+                CeraError::Backend(format!(
+                    "parsing manifest `{}`: {e}",
+                    manifest_path.display()
+                ))
+            })?;
+            (m, manifest_path.parent().map(|p| p.to_path_buf()))
+        };
+
+        if want_dspark
+            && manifest.files.draft_model.is_none()
+            && let Some(draft_url) =
+                crate::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
+        {
+            manifest.files.draft_model = Some(draft_url);
+        }
+
+        resolve_all_manifest_files(&mut manifest, manifest_dir.as_deref(), &cfg)?;
+        let primary = PathBuf::from(&manifest.files.model);
+        Self::from_manifest_with_primary(manifest, &primary, cfg)
     }
 
     /// Load from a Hugging Face repository spec or URL, e.g.
@@ -698,19 +771,24 @@ impl CeraEngine {
         // on the manifest for the audio pipeline to pick up separately.
         check_inference_type_supported(&manifest.inference_type)?;
 
-        let tokenizer = BpeTokenizer::from_gguf(&gguf)
+        let gguf_arc = Arc::new(gguf);
+        let tokenizer = BpeTokenizer::from_gguf(&gguf_arc)
             .map_err(|e| CeraError::Backend(format!("loading tokenizer: {e}")))?;
         // Extract `general.file_type` BEFORE `load_text_model` consumes
         // the gguf — that's the only place this metadata exists, and
         // we need it for the metadata's quantization label.
-        let quantization = gguf
+        let quantization = gguf_arc
             .get_u32("general.file_type")
             .map(ftype_label)
             .unwrap_or_else(|| "unknown".to_string());
+        let drafter = aux
+            .drafter
+            .or_else(|| try_load_drafter(&manifest, &cfg, &gguf_arc));
+        let model_gguf = Arc::try_unwrap(gguf_arc).unwrap_or_else(|a| (*a).clone());
         // `load_text_model` returns `Box<dyn Model>`; convert to `Arc`
         // at the engine boundary. `Arc::from(Box<T>)` is documented on
         // `Arc` for exactly this sizing dance (including `T: ?Sized`).
-        let model: Arc<dyn Model> = Arc::from(load_text_model(gguf, path, &cfg)?);
+        let model: Arc<dyn Model> = Arc::from(load_text_model(model_gguf, path, &cfg)?);
         let metadata = build_metadata(model.as_ref(), &tokenizer, &manifest, quantization);
         // Eager mmproj load for audio + VL bundles. Gated on
         // `path.is_some()` because hermetic constructors
@@ -757,7 +835,14 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
-        let audio_decoder = aux.audio_decoder.filter(|dec| {
+        let (eager_audio_decoder, eager_detok_weights) =
+            if path.is_some() && aux.audio_decoder.is_none() {
+                try_load_audio_decoder_and_detok(&manifest)
+            } else {
+                (aux.audio_decoder, aux.detok_weights)
+            };
+
+        let audio_decoder = eager_audio_decoder.filter(|dec| {
             let model_dim = model.config().hidden_size;
             let vocoder_dim = dec.decoder_config.n_embd;
             if vocoder_dim != model_dim {
@@ -770,7 +855,7 @@ impl CeraEngine {
             }
         });
         let detok_weights = if audio_decoder.is_some() {
-            aux.detok_weights
+            eager_detok_weights
         } else {
             None
         };
@@ -787,6 +872,7 @@ impl CeraEngine {
             vision_encoder,
             gpu_vision_encoder,
             gpu_audio_encoder,
+            drafter,
         })
     }
 
@@ -870,6 +956,10 @@ impl CeraEngine {
         // Auto-attach vocoder for audio output generation when present.
         if let (Some(decoder), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
             session.attach_vocoder(Arc::clone(decoder), Arc::clone(detok));
+        }
+        // Auto-attach speculative decoding drafter when present.
+        if let Some(drafter) = &self.drafter {
+            session.attach_drafter(drafter.as_ref());
         }
         session.set_default_generate_opts(self.default_generate_opts());
         Ok(session)
@@ -1111,6 +1201,16 @@ impl CeraEngine {
     pub fn configure_cache(&self, cfg: KvCacheConfig) {
         self.model.configure_cache(cfg);
     }
+
+    /// Clear the in-memory warm KV prefix cache, preserving cold disk files.
+    pub fn clear_warm_cache(&self) {
+        self.model.clear_warm_cache();
+    }
+
+    /// Clear the model's KV prefix cache (both warm memory and cold disk tiers).
+    pub fn clear_cache(&self) {
+        self.model.clear_cache();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1298,7 @@ fn resolve_all_manifest_files(
         &mut manifest.files.multimodal_projector,
         &mut manifest.files.audio_decoder,
         &mut manifest.files.audio_tokenizer,
+        &mut manifest.files.draft_model,
     ] {
         if let Some(s) = slot.as_ref() {
             let resolved = resolve_url_or_path(s, manifest_dir, cfg)?;
@@ -1305,6 +1406,10 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
         .audio_tokenizer
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    let draft_model = files
+        .draft_model
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     let mut extras_str = std::collections::HashMap::with_capacity(files.extras.len());
     for (k, v) in &files.extras {
         extras_str.insert(k.clone(), v.to_string_lossy().into_owned());
@@ -1328,6 +1433,9 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
             "audio_tokenizer".into(),
             serde_json::Value::String(v.clone()),
         );
+    }
+    if let Some(v) = &draft_model {
+        load_params.insert("draft_model".into(), serde_json::Value::String(v.clone()));
     }
     for (k, v) in &extras_str {
         load_params.insert(k.clone(), serde_json::Value::String(v.clone()));
@@ -1359,6 +1467,7 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
             multimodal_projector: mmproj,
             audio_decoder,
             audio_tokenizer,
+            draft_model,
             extras: extras_str,
         },
         chat_template: files.chat_template.clone(),
@@ -1485,48 +1594,100 @@ fn parse_aux_gguf(bytes: &Arc<[u8]>, kind: &str) -> Option<Arc<GgufFile>> {
                 target: "cera::engine",
                 kind = %kind,
                 error = %format!("{e:#}"),
-                "in-memory mmproj GGUF failed to parse; that modality will \
-                 surface as 'no encoder attached'. Text-only chat against \
-                 this bundle still works."
+                "in-memory {kind} GGUF failed to parse; continuing without this component"
             );
             None
         }
     }
 }
 
-/// Wasm / no-mmap stub: the loader unconditionally returns `None`
-/// because `GgufFile::open` (the only path-based opener) is
-/// `mmap`-gated. Hermetic constructors are the only way audio
-/// support reaches those targets, and they already skip the eager
-/// load by virtue of `path = None`.
+/// Eager audio decoder & detokenizer GGUF loader for audio-out bundles.
+#[cfg(feature = "mmap")]
+fn try_load_audio_decoder_and_detok(
+    manifest: &Manifest,
+) -> (
+    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+) {
+    if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
+        return (None, None);
+    }
+    let voc_path = manifest.files.audio_decoder.as_deref().map(Path::new);
+    let tok_path = manifest.files.audio_tokenizer.as_deref().map(Path::new);
+
+    let voc_gguf = voc_path.and_then(|p| match GgufFile::open_arc(p) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!("failed to open audio_decoder GGUF `{}`: {e:#}", p.display());
+            None
+        }
+    });
+
+    let tok_gguf = tok_path.and_then(|p| match GgufFile::open_arc(p) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(
+                "failed to open audio_tokenizer GGUF `{}`: {e:#}",
+                p.display()
+            );
+            None
+        }
+    });
+
+    let dec = if let Some(ref vg) = voc_gguf {
+        crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
+
+    // Vocoder first, then the audio tokenizer, for the reason spelled out on
+    // the other detokenizer load above: a tokenizer GGUF parses as a
+    // detokenizer through the fallback tensor names while carrying a different
+    // model's weights.
+    let detok = [voc_gguf.as_ref(), tok_gguf.as_ref()]
+        .into_iter()
+        .flatten()
+        .find_map(|g| {
+            crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
+                .ok()
+                .map(Arc::new)
+        });
+
+    (dec, detok)
+}
+
+#[cfg(not(feature = "mmap"))]
+fn try_load_audio_decoder_and_detok(
+    _manifest: &Manifest,
+) -> (
+    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+) {
+    (None, None)
+}
+
 #[cfg(not(feature = "mmap"))]
 fn try_load_audio_encoder(_manifest: &Manifest) -> Option<Arc<AudioEncoderWeights>> {
     None
 }
 
-/// Phase-1 VL loader: open the mmproj GGUF and stash it as an
-/// `Arc<GgufFile>` for later phases to parse into typed
-/// `VisionEncoderWeights`. Mirrors `try_load_audio_encoder`'s
-/// shape; failure is non-fatal so a VL bundle with a missing or
-/// broken mmproj still works for text-only chat (the gate has
-/// already accepted the LLM half).
+/// Eager vision mmproj GGUF loader for VL bundles. Returns the raw
+/// parsed GGUF; `VisionEncoderWeights` are constructed separately
+/// in [`from_parts`].
 #[cfg(feature = "mmap")]
 fn try_load_vision_encoder_gguf(manifest: &Manifest) -> Option<Arc<GgufFile>> {
-    if !matches!(manifest.inference_type, InferenceType::LlamaCppImageToText) {
-        return None;
-    }
-    let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
-    let path = Path::new(mmproj_path);
-    match GgufFile::open(path) {
-        Ok(g) => Some(Arc::new(g)),
+    let path = manifest.files.multimodal_projector.as_ref()?;
+    let p = Path::new(path);
+    match GgufFile::open_arc(p) {
+        Ok(g) => Some(g),
         Err(e) => {
             tracing::warn!(
                 target: "cera::engine",
-                path = %path.display(),
+                path = %path,
                 error = %format!("{e:#}"),
-                "vision mmproj GGUF failed to open; image input will surface \
-                 as 'no vision encoder attached' once that path lands. \
-                 Text-only chat against this bundle still works."
+                "failed to open vision mmproj GGUF; skipping vision encoder"
             );
             None
         }
@@ -1538,6 +1699,93 @@ fn try_load_vision_encoder_gguf(_manifest: &Manifest) -> Option<Arc<GgufFile>> {
     None
 }
 
+/// Common initializer for DSpark draft models sharing base embeddings and LM head.
+pub fn init_dspark_drafter(
+    draft_gguf: Arc<GgufFile>,
+    base_gguf: &Arc<GgufFile>,
+    source_label: &str,
+) -> Option<Arc<dyn crate::spec::Drafter>> {
+    let base_embd_ref = match crate::model::transformer::resolve_weight(
+        base_gguf,
+        "token_embd.weight",
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                error = %format!("{e:#}"),
+                "failed to resolve token_embd.weight in base model for draft pairing ({source_label})"
+            );
+            return None;
+        }
+    };
+
+    let base_output_ref =
+        crate::model::transformer::resolve_weight(base_gguf, "output.weight").ok();
+
+    match crate::model::dspark::DSparkDraftModel::from_gguf(
+        draft_gguf,
+        Arc::clone(base_gguf),
+        base_embd_ref,
+        base_output_ref,
+    ) {
+        Ok(dspark) => Some(Arc::new(dspark)),
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                error = %format!("{e:#}"),
+                "failed to initialize DSpark draft model from {source_label}; falling back to non-draft inference"
+            );
+            None
+        }
+    }
+}
+
+/// Eager draft model loader for speculative decoding (e.g. DSpark draft sidecar).
+#[cfg(feature = "mmap")]
+fn try_load_drafter(
+    manifest: &Manifest,
+    cfg: &EngineConfig,
+    base_gguf: &Arc<GgufFile>,
+) -> Option<Arc<dyn crate::spec::Drafter>> {
+    let draft_path = cfg
+        .draft_model
+        .as_deref()
+        .or_else(|| manifest.files.draft_model.as_deref().map(Path::new))?;
+
+    if !draft_path.exists() {
+        tracing::warn!(
+            target: "cera::engine",
+            path = %draft_path.display(),
+            "draft model file does not exist; skipping draft model"
+        );
+        return None;
+    }
+
+    let draft_gguf = match GgufFile::open_arc(draft_path) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                path = %draft_path.display(),
+                error = %format!("{e:#}"),
+                "failed to open draft model GGUF; falling back to non-draft inference"
+            );
+            return None;
+        }
+    };
+
+    init_dspark_drafter(draft_gguf, base_gguf, &draft_path.to_string_lossy())
+}
+
+#[cfg(not(feature = "mmap"))]
+fn try_load_drafter(
+    _manifest: &Manifest,
+    _cfg: &EngineConfig,
+    _base_gguf: &Arc<GgufFile>,
+) -> Option<Arc<dyn crate::spec::Drafter>> {
+    None
+}
 /// Parse the eagerly-mmapped mmproj GGUF into typed
 /// `VisionEncoderWeights`. Failure is non-fatal — text-only chat
 /// against a VL bundle still works without typed weights — so a
@@ -1999,6 +2247,7 @@ mod tests {
                     multimodal_projector: Some("mmproj.gguf".to_string()),
                     audio_decoder: Some("decoder.gguf".to_string()),
                     audio_tokenizer: Some("tokenizer.safetensors".to_string()),
+                    draft_model: None,
                     extras,
                 },
                 chat_template: None,
@@ -2046,6 +2295,7 @@ mod tests {
                     multimodal_projector: None,
                     audio_decoder: None,
                     audio_tokenizer: None,
+                    draft_model: None,
                     extras: std::collections::HashMap::new(),
                 },
                 chat_template: None,
@@ -2086,6 +2336,7 @@ mod tests {
                 multimodal_projector: Some(PathBuf::from("/m/mmproj.gguf")),
                 audio_decoder: Some(PathBuf::from("/m/ad.gguf")),
                 audio_tokenizer: Some(PathBuf::from("/m/at.safetensors")),
+                draft_model: None,
                 extras: std::collections::HashMap::new(),
                 inference_type: Some(InferenceType::LlamaCppLfm2AudioV1),
                 chat_template: None,

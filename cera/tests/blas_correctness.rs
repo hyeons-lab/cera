@@ -37,7 +37,12 @@
 //! explicit `--features ...` invocation skips unless opted in to the
 //! ~210 MB download.
 
-#![cfg(all(feature = "remote", feature = "mmap", feature = "blas"))]
+#![cfg(all(
+    feature = "remote",
+    feature = "mmap",
+    feature = "blas",
+    any(target_os = "macos", target_os = "ios")
+))]
 
 mod common;
 
@@ -84,6 +89,7 @@ fn blas_prefill_matches_aarch64_reference() {
         EngineConfig {
             context_size: CTX,
             backend: BackendPreference::Cpu,
+            draft_model: None,
             bundle_repo: Some(repo),
         },
     )

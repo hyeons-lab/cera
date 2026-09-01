@@ -577,6 +577,8 @@ pub struct Session {
     /// takes an explicit per-call override. Preserved across
     /// [`Self::reset`] — it's a preprocessing preference, not KV state.
     image_max_long_size: Option<u32>,
+    /// Optional speculative decoding drafter (e.g. DSpark draft sidecar model).
+    drafter: Option<Box<dyn crate::spec::Drafter>>,
     /// Cached grammar logit-mask (per-token output bytes + EOS/special flags). Built
     /// lazily on the first grammar-constrained `generate` and reused across calls — it
     /// depends only on the tokenizer, not on the grammar. Taken into a local for the
@@ -716,6 +718,7 @@ impl Session {
             vision_encoder: None,
             gpu_vision_encoder: None,
             image_max_long_size: None,
+            drafter: None,
             grammar_mask: None,
             hs_scratch: None,
             hs_scratch_cap: 0,
@@ -731,6 +734,11 @@ impl Session {
     /// Override the default generation options for this session.
     pub fn set_default_generate_opts(&mut self, opts: GenerateOpts) {
         self.default_opts = opts;
+    }
+
+    /// Attach a speculative decoding drafter (e.g. DSpark sidecar model).
+    pub fn attach_drafter(&mut self, drafter: &dyn crate::spec::Drafter) {
+        self.drafter = Some(drafter.clone_drafter());
     }
 
     /// Attach vocoder weights so [`Self::generate`] can synthesize PCM audio
@@ -941,6 +949,9 @@ impl Session {
         self.prefill_tokens = 0;
         self.prefill_elapsed = Duration::ZERO;
         self.cancel.store(false, Ordering::Relaxed);
+        if let Some(drafter) = &mut self.drafter {
+            drafter.reset();
+        }
         // Re-seed the sampler so deterministic runs stay deterministic after reset().
         let sampler_cfg = SamplerConfig {
             seed: self.config.seed,
@@ -1266,6 +1277,9 @@ impl Session {
             // advances them differently), which is why drafting is a heuristic
             // whose output `verify_draft` re-derives regardless.
             shift_token_history(&mut self.token_history, n_keep, shift_needed);
+            if let Some(drafter) = &mut self.drafter {
+                drafter.reset();
+            }
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             // Pre-shift `last_logits` corresponded to position `before - 1`;
@@ -1406,6 +1420,9 @@ impl Session {
             // positions themselves are never recorded — which is why drafting off
             // it is a heuristic that `verify_draft` re-derives regardless.
             shift_token_history(&mut self.token_history, n_keep, shift_needed);
+            if let Some(drafter) = &mut self.drafter {
+                drafter.reset();
+            }
             self.position_atomic
                 .store(self.current_pos as u32, Ordering::Relaxed);
             self.last_logits = None;
@@ -1908,7 +1925,13 @@ impl Session {
         // weight-read a bandwidth-bound decode is limited by. Output is a valid
         // greedy decode; see `generate_greedy_spec` and `crate::spec`. Any other
         // configuration falls through to the normal decode loop below.
-        if let Some(sd) = opts.spec
+        let spec_opt = opts.spec.or_else(|| {
+            self.drafter.as_ref().map(|d| SpecDecode {
+                ngram: 2,
+                k: d.suggested_k().unwrap_or(6),
+            })
+        });
+        if let Some(sd) = spec_opt
             && greedy
             && self.model.supports_all_logits()
             && !self.state.is_compressed()
@@ -2175,6 +2198,7 @@ impl Session {
                         crate::audio_engine::FrameOutcome::Codes {
                             audio_embedding,
                             pcm,
+                            ..
                         } => {
                             if !pcm.is_empty() {
                                 sink.on_audio_frames(&pcm, dec.sample_rate());
@@ -2414,8 +2438,12 @@ impl Session {
             // `max_seq_len`. Room after `t` is `max_seq_len - current_pos - 1`
             // (>= 0 since the loop-top guard ensured `current_pos < max_seq_len`).
             // An empty draft (no n-gram match, or no room) means a plain step.
-            let room = self.max_seq_len - self.current_pos - 1;
-            let mut draft = crate::spec::prompt_lookup_draft(&self.token_history, sd.ngram, sd.k);
+            let room = self.max_seq_len.saturating_sub(self.current_pos + 1);
+            let mut draft = if let Some(drafter) = &mut self.drafter {
+                drafter.draft(&self.token_history, sd.k)
+            } else {
+                crate::spec::prompt_lookup_draft(&self.token_history, sd.ngram, sd.k)
+            };
             if draft.len() > room {
                 draft.truncate(room);
             }
@@ -2440,6 +2468,11 @@ impl Session {
             let mut kept = 0usize;
             let mut stopped = false;
             for &q in &vr.accepted {
+                if self.cancel.load(Ordering::Relaxed) {
+                    finish = FinishReason::Cancelled;
+                    stopped = true;
+                    break;
+                }
                 if generated >= opts.max_tokens {
                     stopped = true;
                     break;
@@ -2809,6 +2842,7 @@ mod tests {
                 multimodal_projector: None,
                 audio_decoder: None,
                 audio_tokenizer: None,
+                draft_model: None,
                 extras: std::collections::HashMap::new(),
             },
             chat_template: None,
@@ -2838,6 +2872,7 @@ mod tests {
                 multimodal_projector: None,
                 audio_decoder: None,
                 audio_tokenizer: None,
+                draft_model: None,
                 extras: std::collections::HashMap::new(),
             },
             chat_template: None,

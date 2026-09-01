@@ -864,6 +864,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_capabilities(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_context_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(): Int
@@ -893,6 +895,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_ceraengine_transcribe(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_vocab_size(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches(): Int
 
     external fun uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress(): Int
 
@@ -1126,6 +1130,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_ceraengine_context_size(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1210,6 +1219,11 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Int
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_clone_downloadprogresssink(
         `handle`: Long,
@@ -1784,6 +1798,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1827,6 +1844,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
@@ -2928,6 +2948,13 @@ public interface CeraEngineInterface {
     fun `capabilities`(): ModalityCapabilities
 
     /**
+     * Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+     * Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+     * or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+     */
+    fun `clearPrefixCache`()
+
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -3066,6 +3093,11 @@ public interface CeraEngineInterface {
      * config is the authoritative range for valid logit indices.
      */
     fun `vocabSize`(): kotlin.UInt
+
+    /**
+     * Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+     */
+    fun `wipeAllPrefixCaches`()
 
     companion object
 }
@@ -3261,6 +3293,21 @@ open class CeraEngine :
                 }
             },
         )
+
+    /**
+     * Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
+     * Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
+     * or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+     */
+    override fun `clearPrefixCache`() =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     /**
      * Resolved context-window size (KV cache cap) the engine was
@@ -3563,6 +3610,19 @@ open class CeraEngine :
                 }
             },
         )
+
+    /**
+     * Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
+     */
+    override fun `wipeAllPrefixCaches`() =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     companion object {
         /**
@@ -6909,7 +6969,7 @@ data class EngineConfig(
      * `max_seq_len` (translated to `usize::MAX` internally, then
      * capped by the loader).
      */
-    var `contextSize`: kotlin.ULong,
+    var `contextSize`: kotlin.ULong = 4096uL,
     var `backend`: BackendPreference,
     /**
      * Bundle repository for resolving `http(s)://` URLs in manifests
@@ -6919,7 +6979,11 @@ data class EngineConfig(
      * downloads. Construct the repo once + reuse it across engine
      * loads so its HTTP client pool + on-disk cache are shared.
      */
-    var `bundleRepo`: BundleRepo?,
+    var `bundleRepo`: BundleRepo? = null,
+    /**
+     * Optional path to a DSpark speculative draft model GGUF file.
+     */
+    var `draftModel`: kotlin.String? = null,
 ) : Disposable {
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
@@ -6927,6 +6991,7 @@ data class EngineConfig(
             this.`contextSize`,
             this.`backend`,
             this.`bundleRepo`,
+            this.`draftModel`,
         )
     }
 
@@ -6942,13 +7007,15 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
             FfiConverterULong.read(buf),
             FfiConverterTypeBackendPreference.read(buf),
             FfiConverterOptionalTypeBundleRepo.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
 
     override fun allocationSize(value: EngineConfig) =
         (
             FfiConverterULong.allocationSize(value.`contextSize`) +
                 FfiConverterTypeBackendPreference.allocationSize(value.`backend`) +
-                FfiConverterOptionalTypeBundleRepo.allocationSize(value.`bundleRepo`)
+                FfiConverterOptionalTypeBundleRepo.allocationSize(value.`bundleRepo`) +
+                FfiConverterOptionalString.allocationSize(value.`draftModel`)
         )
 
     override fun write(
@@ -6958,6 +7025,7 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
         FfiConverterULong.write(value.`contextSize`, buf)
         FfiConverterTypeBackendPreference.write(value.`backend`, buf)
         FfiConverterOptionalTypeBundleRepo.write(value.`bundleRepo`, buf)
+        FfiConverterOptionalString.write(value.`draftModel`, buf)
     }
 }
 

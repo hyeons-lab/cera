@@ -52,6 +52,7 @@ Future<void> main(List<String> args) async {
       contextSize: 2048,
       backend: BackendPreference.cpu,
       bundleRepo: null,
+      draftModel: null,
     ),
   );
   final session = engine.newSession(

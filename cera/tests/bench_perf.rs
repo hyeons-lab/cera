@@ -869,6 +869,7 @@ fn test_q8_0_prefill_parity() {
         max_warm_entries: 0,
         max_warm_bytes: 0,
         max_cold_bytes: 0,
+        ..Default::default()
     });
     let cfg = model.config();
     let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
@@ -1043,6 +1044,7 @@ fn test_450m_prefill_phase_profile() {
         max_warm_entries: 0,
         max_warm_bytes: 0,
         max_cold_bytes: 0,
+        ..Default::default()
     });
     let cfg = model.config();
     let n = 128;
