@@ -3178,7 +3178,7 @@ mod webgpu {
                         audio_temperature.unwrap_or(0.7),
                         audio_top_k.unwrap_or(40) as usize,
                     ),
-                    None => (None, None, None, None, 0.7, 40),
+                    _ => (None, None, None, None, 0.7, 40),
                 };
 
             // Greedy stays on the GPU-argmax path, which reads back four bytes
@@ -3711,7 +3711,7 @@ mod webgpu {
             }
 
             let mut total_samples = 0;
-            if let Some(mut dec) = decoder
+            if let Some(ref mut dec) = decoder
                 && dec.audio_frames() > 0
             {
                 let t_fin0 = js_sys::Date::now();
