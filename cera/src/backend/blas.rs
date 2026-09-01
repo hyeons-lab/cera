@@ -754,12 +754,16 @@ pub fn sgemm_rowmajor_nt_parallel(
         let a_t = (a_ptr as *const f32).add(m_start * k);
         let c_t = (c_ptr as *mut f32).add(m_start);
 
-        let n_i = i32::try_from(n).expect("n overflow");
-        let mt_i = i32::try_from(m_t).expect("m_t overflow");
-        let k_i = i32::try_from(k).expect("k overflow");
-        let lda_i = i32::try_from(k).expect("lda overflow");
-        let ldb_i = i32::try_from(k).expect("ldb overflow");
-        let ldc_i = i32::try_from(m).expect("ldc overflow");
+        let (Ok(n_i), Ok(mt_i), Ok(k_i), Ok(lda_i), Ok(ldb_i), Ok(ldc_i)) = (
+            i32::try_from(n),
+            i32::try_from(m_t),
+            i32::try_from(k),
+            i32::try_from(k),
+            i32::try_from(k),
+            i32::try_from(m),
+        ) else {
+            return;
+        };
 
         cblas_sgemm(
             CBLAS_ORDER::CblasRowMajor,
@@ -813,12 +817,16 @@ pub unsafe fn sgemm_rowmajor_nt_ld_parallel(
         let a_t = (a_ptr as *const f32).add(m_start * lda);
         let c_t = (c_ptr as *mut f32).add(m_start);
 
-        let n_i = i32::try_from(n).expect("n overflow");
-        let mt_i = i32::try_from(m_t).expect("m_t overflow");
-        let k_i = i32::try_from(k).expect("k overflow");
-        let lda_i = i32::try_from(lda).expect("lda overflow");
-        let ldb_i = i32::try_from(ldb).expect("ldb overflow");
-        let ldc_i = i32::try_from(ldc).expect("ldc overflow");
+        let (Ok(n_i), Ok(mt_i), Ok(k_i), Ok(lda_i), Ok(ldb_i), Ok(ldc_i)) = (
+            i32::try_from(n),
+            i32::try_from(m_t),
+            i32::try_from(k),
+            i32::try_from(lda),
+            i32::try_from(ldb),
+            i32::try_from(ldc),
+        ) else {
+            return;
+        };
 
         cblas_sgemm(
             CBLAS_ORDER::CblasRowMajor,

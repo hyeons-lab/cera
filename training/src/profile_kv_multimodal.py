@@ -7,6 +7,7 @@ import os
 import time
 import subprocess
 import json
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -16,10 +17,10 @@ DRAFT_GGUF = os.environ.get(
     str(REPO_ROOT / "training" / "checkpoints" / "lfm2.5-vl-450m-dspark-Q4_0.gguf"),
 )
 PHOTO_DIR = Path(os.environ.get("PHOTO_DIR", str(REPO_ROOT / "training" / "data" / "test_photos")))
-CACHE_DIR = Path("/tmp/cera_kv_bench_cache")
+CACHE_DIR = Path(tempfile.gettempdir()) / f"cera_kv_bench_cache_{os.getuid() if hasattr(os, 'getuid') else 'user'}"
 
 # Clean bench cache dir
-if CACHE_DIR.exists():
+if CACHE_DIR.exists() and not CACHE_DIR.is_symlink():
     import shutil
     shutil.rmtree(CACHE_DIR)
 os.makedirs(CACHE_DIR, exist_ok=True)

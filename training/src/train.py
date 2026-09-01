@@ -246,14 +246,33 @@ def train(args):
 
         # Evaluate acceptance length
         if train_standalone:
-            acc_s = compute_acceptance_length(models["standalone"], base_model, tok_embd_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=False)
+            acc_s = compute_acceptance_length(
+                models["standalone"],
+                base_model,
+                lm_head_weight,
+                tok_embd_weight,
+                eval_loader,
+                device,
+                block_size=block_size,
+                is_markov=False,
+            )
             print(f"  [Standalone / Cera] Mean Acceptance: {acc_s:.2f}/{block_size} tokens", flush=True)
             if acc_s > best_acceptance["standalone"]:
                 best_acceptance["standalone"] = acc_s
                 torch.save(models["standalone"].state_dict(), os.path.join(checkpoint_dir, "best_dspark_standalone.pt"))
 
         if train_markov:
-            acc_m = compute_acceptance_length(models["markov"], base_model, tok_embd_weight, lm_head_weight, eval_loader, device, block_size=block_size, is_markov=True, target_layers=target_layers)
+            acc_m = compute_acceptance_length(
+                models["markov"],
+                base_model,
+                lm_head_weight,
+                tok_embd_weight,
+                eval_loader,
+                device,
+                block_size=block_size,
+                is_markov=True,
+                target_layers=target_layers,
+            )
             print(f"  [Markov / llama.cpp] Mean Acceptance: {acc_m:.2f}/{block_size} tokens", flush=True)
             if acc_m > best_acceptance["markov"]:
                 best_acceptance["markov"] = acc_m

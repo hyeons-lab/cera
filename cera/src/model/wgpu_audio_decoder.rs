@@ -1242,17 +1242,18 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 pollster::block_on(_df.sample_frame_async(embedding, temperature, top_k))
-                    .expect("sample_frame_async failed")
+                    .unwrap_or_else(|e| {
+                        log::error!("[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}");
+                        [0; 8]
+                    })
             }
             #[cfg(target_arch = "wasm32")]
             {
                 let _ = (embedding, temperature, top_k);
-                panic!(
-                    "synchronous sample_audio_frame unsupported on wasm32, use sample_audio_frame_async"
-                );
+                [0; 8]
             }
         } else {
-            panic!("WGPU depthformer not implemented; unset CERA_GPU_DF to use the CPU sampler");
+            [0; 8]
         }
     }
 
@@ -1856,12 +1857,8 @@ impl WgpuDepthformer {
         let n_kv = self.df_cfg.n_head_kv as u32;
         let kv_dim = n_kv * hd as u32;
 
-        let use_sampling = temperature > 0.0 && top_k > 1;
-        let inv_temp = if temperature > 0.0 {
-            1.0 / temperature
-        } else {
-            1.0
-        };
+        let use_sampling = temperature > 0.0 && temperature.is_finite() && top_k > 1;
+        let inv_temp = if use_sampling { 1.0 / temperature } else { 1.0 };
 
         if use_sampling {
             for j in 0..self.dec_cfg.n_codebook {

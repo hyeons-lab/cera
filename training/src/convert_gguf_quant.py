@@ -87,8 +87,9 @@ def export_quantized_gguf(
 
     def add_maybe_quantized(name: str, tensor: torch.Tensor):
         arr = tensor.float().numpy()
-        if should_quantize_tensor(name):
-            gguf_writer.add_quantized_tensor(name, gguf_type, arr)
+        if arr.ndim >= 2 and arr.size >= 256 and (arr.size % 32 == 0):
+            quant_data = q.quantize(arr, gguf_type)
+            gguf_writer.add_tensor(name, quant_data, raw_dtype=gguf_type)
         else:
             gguf_writer.add_tensor(name, arr)
 

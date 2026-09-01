@@ -311,8 +311,12 @@ pub fn quantize_scalar(val: f32, boundaries: &[f32; 3]) -> u8 {
 /// Pack 2-bit indices into bytes, LSB-first. 4 values per byte.
 /// `indices` length must be a multiple of 4.
 pub fn pack_2bit(indices: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(indices.len() % 4, 0);
-    debug_assert_eq!(out.len(), indices.len() / 4);
+    assert_eq!(indices.len() % 4, 0, "indices len must be multiple of 4");
+    assert_eq!(
+        out.len(),
+        indices.len() / 4,
+        "out len must be indices.len() / 4"
+    );
     for (i, chunk) in indices.as_chunks::<4>().0.iter().enumerate() {
         out[i] = chunk[0] | (chunk[1] << 2) | (chunk[2] << 4) | (chunk[3] << 6);
     }
@@ -320,7 +324,11 @@ pub fn pack_2bit(indices: &[u8], out: &mut [u8]) {
 
 /// Unpack 2-bit indices from bytes. 4 values per byte, LSB-first.
 pub fn unpack_2bit(packed: &[u8], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), packed.len() * 4);
+    assert_eq!(
+        out.len(),
+        packed.len() * 4,
+        "out len must be packed.len() * 4"
+    );
     for (i, &byte) in packed.iter().enumerate() {
         out[i * 4] = byte & 0x03;
         out[i * 4 + 1] = (byte >> 2) & 0x03;
@@ -331,8 +339,12 @@ pub fn unpack_2bit(packed: &[u8], out: &mut [u8]) {
 
 /// Pack sign bits into bytes, LSB-first. 8 values per byte.
 pub fn pack_1bit(signs: &[bool], out: &mut [u8]) {
-    debug_assert_eq!(signs.len() % 8, 0);
-    debug_assert_eq!(out.len(), signs.len() / 8);
+    assert_eq!(signs.len() % 8, 0, "signs len must be multiple of 8");
+    assert_eq!(
+        out.len(),
+        signs.len() / 8,
+        "out len must be signs.len() / 8"
+    );
     for (i, chunk) in signs.as_chunks::<8>().0.iter().enumerate() {
         let mut byte = 0u8;
         for (j, &s) in chunk.iter().enumerate() {
@@ -346,7 +358,11 @@ pub fn pack_1bit(signs: &[bool], out: &mut [u8]) {
 
 /// Unpack sign bits from bytes. Returns +1.0 for set bit, -1.0 for unset.
 pub fn unpack_1bit_to_signs(packed: &[u8], out: &mut [f32]) {
-    debug_assert_eq!(out.len(), packed.len() * 8);
+    assert_eq!(
+        out.len(),
+        packed.len() * 8,
+        "out len must be packed.len() * 8"
+    );
     for (i, &byte) in packed.iter().enumerate() {
         for j in 0..8 {
             out[i * 8 + j] = if (byte >> j) & 1 == 1 { 1.0 } else { -1.0 };

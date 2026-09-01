@@ -1300,11 +1300,11 @@ impl MetalDepthformer {
             let dl = &self.depth_linear_slices[j];
             unsafe {
                 let dst = self.src_emb_buf.contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(
-                    embedding.as_ptr(),
-                    dst,
-                    embedding.len().min(self.dl_cols),
-                );
+                let copy_len = embedding.len().min(self.dl_cols);
+                std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, copy_len);
+                if copy_len < self.dl_cols {
+                    std::ptr::write_bytes(dst.add(copy_len), 0, self.dl_cols - copy_len);
+                }
             }
             // depth_linear GEMV
             self.encode_df_gemv(enc, dl, &self.src_emb_buf, &self.hidden_buf);
@@ -1443,7 +1443,9 @@ impl MetalDepthformer {
             let logits = unsafe {
                 std::slice::from_raw_parts(self.logits_buf.contents() as *const f32, dec.n_vocab)
             };
-            let sampled = if !temperature.is_finite() || temperature <= 0.0 || top_k <= 1 {
+            let sampled = if logits.is_empty() {
+                0
+            } else if !temperature.is_finite() || temperature <= 0.0 || top_k <= 1 {
                 crate::sampler::argmax(logits) as i32
             } else {
                 let mut logits_vec = logits.to_vec();
@@ -1458,7 +1460,7 @@ impl MetalDepthformer {
                 indices.truncate(k);
                 let sum: f32 = indices.iter().map(|&i| logits_vec[i]).sum();
                 let mut r = rand::random::<f32>() * sum;
-                let mut picked = indices[0];
+                let mut picked = indices.first().copied().unwrap_or(0);
                 for &i in &indices {
                     r -= logits_vec[i];
                     if r <= 0.0 {

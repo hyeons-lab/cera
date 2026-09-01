@@ -1228,14 +1228,14 @@ pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
         DType::Q5KM => crate::quant::dequantize_q5_k_row(row_data, out),
         DType::F32 => {
             if let Ok(floats) = bytemuck::try_cast_slice::<u8, f32>(row_data) {
-                if floats.len() == out.len() {
-                    out.copy_from_slice(floats);
-                } else {
-                    for (o, &f) in out.iter_mut().zip(floats) {
-                        *o = f;
-                    }
-                }
+                assert_eq!(floats.len(), out.len(), "F32 embedding row length");
+                out.copy_from_slice(floats);
             } else {
+                assert_eq!(
+                    row_data.len() / 4,
+                    out.len(),
+                    "F32 unaligned embedding row byte length"
+                );
                 for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<4>().0) {
                     *o = f32::from_le_bytes(*chunk);
                 }
@@ -1248,6 +1248,11 @@ pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
                     *o = crate::quant::f16_to_f32(h);
                 }
             } else {
+                assert_eq!(
+                    row_data.len() / 2,
+                    out.len(),
+                    "F16 unaligned embedding row byte length"
+                );
                 for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
                     let h = u16::from_le_bytes(*chunk);
                     *o = crate::quant::f16_to_f32(h);
@@ -1261,6 +1266,11 @@ pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
                     *o = crate::quant::bf16_to_f32(h);
                 }
             } else {
+                assert_eq!(
+                    row_data.len() / 2,
+                    out.len(),
+                    "BF16 unaligned embedding row byte length"
+                );
                 for (o, chunk) in out.iter_mut().zip(row_data.as_chunks::<2>().0) {
                     let h = u16::from_le_bytes(*chunk);
                     *o = crate::quant::bf16_to_f32(h);

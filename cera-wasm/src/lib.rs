@@ -3149,9 +3149,7 @@ mod webgpu {
             // rather than falling back to CPU manifest defaults (which specify temperature: 0.1).
             let has_audio_weights = self.audio_decoder.is_some() && self.detok_weights.is_some();
             let resolved_temp = temperature.unwrap_or_else(|| {
-                if self.drafter.is_some() {
-                    0.0
-                } else if has_audio_weights {
+                if self.drafter.is_none() && has_audio_weights {
                     0.7
                 } else {
                     0.0
