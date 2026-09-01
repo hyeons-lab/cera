@@ -3138,7 +3138,7 @@ mod webgpu {
                 None => return Ok(String::new()),
             };
             for &tok in prefix {
-                if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     self.state.seq_len = pos;
                     return Ok(String::new());
                 }
@@ -3301,7 +3301,7 @@ mod webgpu {
             let mut pending = Vec::<u8>::new();
 
             for _ in 0..max_tokens {
-                if self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
                 if Some(next) == self.eos || (self.eos.is_none() && (next == 7 || next == 2)) {

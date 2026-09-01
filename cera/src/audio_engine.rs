@@ -95,7 +95,19 @@ impl AudioSilenceWatchdog {
         if pcm.is_empty() {
             return 0.0;
         }
-        let rms = (pcm.iter().map(|&x| x * x).sum::<f32>() / pcm.len() as f32).sqrt();
+        let mut sum = 0.0f32;
+        let mut valid_samples = 0usize;
+        for &x in pcm {
+            if x.is_finite() {
+                sum += x * x;
+                valid_samples += 1;
+            }
+        }
+        if valid_samples == 0 {
+            self.consecutive_silent_frames += 1;
+            return 0.0;
+        }
+        let rms = (sum / valid_samples as f32).sqrt();
         if rms >= self.rms_threshold {
             self.total_voiced_frames += 1;
             self.consecutive_silent_frames = 0;
@@ -908,5 +920,32 @@ mod tests {
         assert!(!watchdog.is_safety_limit_reached());
         watchdog.audio_frames_count = AUDIO_SAFETY_FRAME_LIMIT;
         assert!(watchdog.is_safety_limit_reached());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_empty_pcm_resilience() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let empty_pcm: [f32; 0] = [];
+        let rms = watchdog.observe_pcm(&empty_pcm);
+        assert_eq!(rms, 0.0);
+        assert_eq!(watchdog.audio_frames_count, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 0);
+        assert_eq!(watchdog.total_voiced_frames, 0);
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_non_finite_resilience() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let corrupted_pcm = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let rms = watchdog.observe_pcm(&corrupted_pcm);
+        assert_eq!(rms, 0.0);
+        assert_eq!(watchdog.audio_frames_count, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 1);
+
+        let mixed_pcm = vec![0.05f32, f32::NAN, 0.05f32];
+        let rms_mixed = watchdog.observe_pcm(&mixed_pcm);
+        assert!(rms_mixed > 0.04 && rms_mixed < 0.06);
+        assert_eq!(watchdog.total_voiced_frames, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 0);
     }
 }
