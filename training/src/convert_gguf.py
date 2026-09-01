@@ -8,6 +8,7 @@ Supports:
 
 import sys
 import os
+import pickle
 import torch
 import gguf
 
@@ -56,7 +57,8 @@ def export_to_gguf(
     print(f"Loading checkpoint from {checkpoint_path}...")
     try:
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    except Exception:
+    except (TypeError, pickle.UnpicklingError, RuntimeError) as e:
+        print(f"Retrying torch.load with weights_only=False due to: {e}")
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     is_markov_model = "fc.weight" in state_dict or "markov_w1" in state_dict

@@ -259,6 +259,20 @@ impl ConvHistory {
         false
     }
 
+    /// Check whether a snapshot at `target_pos` is available in this ring buffer.
+    pub fn has_pos(&self, target_pos: usize) -> bool {
+        if target_pos == 0 {
+            return true;
+        }
+        for i in 0..self.count {
+            let idx = (self.head + CONV_HISTORY_CAPACITY - 1 - i) % CONV_HISTORY_CAPACITY;
+            if self.positions[idx] == target_pos {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Reset all snapshot tracking without deallocating.
     pub fn clear(&mut self) {
         self.head = 0;
@@ -1054,6 +1068,7 @@ impl InferenceState {
                 ) => {
                     decode_f32_into(buffer, snap_buf);
                     history.clear();
+                    history.push(snapshot.seq_len, buffer);
                 }
                 _ => panic!("snapshot layer kind doesn't match state layer kind"),
             }
@@ -1087,8 +1102,29 @@ impl InferenceState {
         if len == self.seq_len {
             return;
         }
+
+        // Validate whether all convolution layers can safely roll back to `len`.
+        // If any convolution layer lacks `len` in its history ring buffer, force `safe_len = 0`
+        // to safely reset the state and avoid corrupted convolution history.
+        let mut safe_len = len;
+        if safe_len > 0 {
+            for layer in self.layers.iter() {
+                if let LayerState::Conv { history, .. } = layer
+                    && !history.has_pos(safe_len)
+                {
+                    tracing::warn!(
+                        target: "cera::kv_cache",
+                        target_len = safe_len,
+                        "truncate_to target pos not in ConvHistory ring buffer; forcing full clear to prevent convolution state corruption"
+                    );
+                    safe_len = 0;
+                    break;
+                }
+            }
+        }
+
         let seq_len = self.seq_len;
-        // Truncate one time-major `[seq_len × kv_dim]` cache to `len` positions.
+        // Truncate one time-major `[seq_len × kv_dim]` cache to `safe_len` positions.
         // `kv_dim = cache.len() / seq_len` (exact — the cache is a whole multiple
         // of `seq_len`); an empty cache (the inactive f32/f16 slot) is a no-op.
         fn trunc<T>(cache: &mut Vec<T>, seq_len: usize, len: usize) {
@@ -1119,25 +1155,20 @@ impl InferenceState {
                     value_cache_f16,
                     ..
                 } => {
-                    trunc(key_cache, seq_len, len);
-                    trunc(value_cache, seq_len, len);
-                    trunc(key_cache_f16, seq_len, len);
-                    trunc(value_cache_f16, seq_len, len);
+                    trunc(key_cache, seq_len, safe_len);
+                    trunc(value_cache, seq_len, safe_len);
+                    trunc(key_cache_f16, seq_len, safe_len);
+                    trunc(value_cache_f16, seq_len, safe_len);
                 }
                 LayerState::Conv { buffer, history } => {
-                    if !history.rollback_to(len, buffer) {
-                        tracing::warn!(
-                            target: "cera::kv_cache",
-                            target_len = len,
-                            "truncate_to target pos not in ConvHistory ring buffer window; zeroing Conv buffer"
-                        );
+                    if !history.rollback_to(safe_len, buffer) {
                         buffer.fill(0.0);
                         history.clear();
                     }
                 }
             }
         }
-        self.seq_len = len;
+        self.seq_len = safe_len;
     }
 
     /// Drop KV cells `[n_keep .. n_keep + shift)` from every attention
@@ -3238,5 +3269,27 @@ mod tests {
         assert_eq!(loaded.shift_offset, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_conv_history_restore_and_truncate_safety() {
+        let mut conv = ConvHistory::new(4);
+        let buf = [1.0f32, 2.0, 3.0, 4.0];
+        conv.push(10, &buf);
+        assert!(conv.has_pos(10));
+        assert!(!conv.has_pos(5));
+        assert!(conv.has_pos(0));
+
+        let mut out = [0.0f32; 4];
+        assert!(conv.rollback_to(10, &mut out));
+        assert_eq!(out, buf);
+
+        // When rolled back beyond capacity (>64 tokens), has_pos returns false
+        conv.clear();
+        for pos in 1..=70 {
+            conv.push(pos, &[pos as f32; 4]);
+        }
+        assert!(!conv.has_pos(5)); // pos 5 was evicted from capacity 64
+        assert!(conv.has_pos(70));
     }
 }

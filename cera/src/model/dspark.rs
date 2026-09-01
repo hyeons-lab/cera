@@ -45,72 +45,49 @@ impl DSparkConfig {
             cpu::RopeType::Norm
         };
 
-        let pfx = |key: &str| -> String { format!("{arch}.{key}") };
+        let get_u32_any = |suffixes: &[&str]| -> Option<u32> {
+            for suffix in suffixes {
+                if let Some(v) = gguf.get_u32(&format!("{arch}.{suffix}")) {
+                    return Some(v);
+                }
+                if let Some(v) = gguf.get_u32(&format!("dspark.{suffix}")) {
+                    return Some(v);
+                }
+                if let Some(v) = gguf.get_u32(&format!("dflash.{suffix}")) {
+                    return Some(v);
+                }
+                if let Some(v) = gguf.get_u32(suffix) {
+                    return Some(v);
+                }
+            }
+            None
+        };
 
-        let hidden_size = gguf
-            .get_u32(&pfx("embedding_length"))
-            .or_else(|| gguf.get_u32("dflash.embedding_length"))
-            .or_else(|| gguf.get_u32("dspark.embedding_length"))
-            .or_else(|| gguf.get_u32(&pfx("hidden_size")))
-            .or_else(|| gguf.get_u32("dspark.hidden_size"))
-            .or_else(|| gguf.get_u32("dflash.hidden_size"))
+        let hidden_size = get_u32_any(&["embedding_length", "hidden_size"])
             .map(|v| v as usize)
             .unwrap_or(base_hidden);
 
-        let num_layers = gguf
-            .get_u32(&pfx("block_count"))
-            .or_else(|| gguf.get_u32("dflash.block_count"))
-            .or_else(|| gguf.get_u32("dspark.block_count"))
-            .or_else(|| gguf.get_u32(&pfx("num_layers")))
-            .or_else(|| gguf.get_u32("dspark.num_layers"))
-            .or_else(|| gguf.get_u32("dflash.num_layers"))
+        let num_layers = get_u32_any(&["block_count", "num_layers"])
             .map(|v| v as usize)
             .unwrap_or(5);
 
-        let num_heads = gguf
-            .get_u32(&pfx("attention.head_count"))
-            .or_else(|| gguf.get_u32("dflash.attention.head_count"))
-            .or_else(|| gguf.get_u32("dspark.attention.head_count"))
-            .or_else(|| gguf.get_u32(&pfx("num_heads")))
-            .or_else(|| gguf.get_u32("dspark.num_heads"))
-            .or_else(|| gguf.get_u32("dflash.num_heads"))
+        let num_heads = get_u32_any(&["attention.head_count", "num_heads"])
             .map(|v| v as usize)
             .unwrap_or(16);
 
-        let num_kv_heads = gguf
-            .get_u32(&pfx("attention.head_count_kv"))
-            .or_else(|| gguf.get_u32("dflash.attention.head_count_kv"))
-            .or_else(|| gguf.get_u32("dspark.attention.head_count_kv"))
-            .or_else(|| gguf.get_u32(&pfx("num_kv_heads")))
-            .or_else(|| gguf.get_u32("dspark.num_kv_heads"))
-            .or_else(|| gguf.get_u32("dflash.num_kv_heads"))
+        let num_kv_heads = get_u32_any(&["attention.head_count_kv", "num_kv_heads"])
             .map(|v| v as usize)
             .unwrap_or(8);
 
-        let head_dim = gguf
-            .get_u32(&pfx("attention.key_length"))
-            .or_else(|| gguf.get_u32("dflash.attention.key_length"))
-            .or_else(|| gguf.get_u32("dspark.attention.key_length"))
-            .or_else(|| gguf.get_u32(&pfx("head_dim")))
-            .or_else(|| gguf.get_u32("dspark.head_dim"))
-            .or_else(|| gguf.get_u32("dflash.head_dim"))
+        let head_dim = get_u32_any(&["attention.key_length", "head_dim"])
             .map(|v| v as usize)
             .unwrap_or_else(|| hidden_size / num_heads.max(1));
 
-        let intermediate_size = gguf
-            .get_u32(&pfx("feed_forward_length"))
-            .or_else(|| gguf.get_u32("dflash.feed_forward_length"))
-            .or_else(|| gguf.get_u32("dspark.feed_forward_length"))
-            .or_else(|| gguf.get_u32(&pfx("intermediate_size")))
-            .or_else(|| gguf.get_u32("dspark.intermediate_size"))
-            .or_else(|| gguf.get_u32("dflash.intermediate_size"))
+        let intermediate_size = get_u32_any(&["feed_forward_length", "intermediate_size"])
             .map(|v| v as usize)
             .unwrap_or_else(|| (hidden_size * 8) / 3);
 
-        let vocab_size = gguf
-            .get_u32(&pfx("vocab_size"))
-            .or_else(|| gguf.get_u32("dflash.vocab_size"))
-            .or_else(|| gguf.get_u32("dspark.vocab_size"))
+        let vocab_size = get_u32_any(&["vocab_size"])
             .map(|v| v as usize)
             .unwrap_or(base_vocab);
 
@@ -120,29 +97,29 @@ impl DSparkConfig {
             );
         }
 
-        let block_size = gguf
-            .get_u32(&pfx("block_size"))
-            .or_else(|| gguf.get_u32("dspark.block_size"))
-            .or_else(|| gguf.get_u32("dflash.block_size"))
+        if hidden_size != base_hidden {
+            anyhow::bail!(
+                "draft model hidden_size ({hidden_size}) must match base model hidden_size ({base_hidden}) to share embeddings and LM head"
+            );
+        }
+
+        let block_size = get_u32_any(&["block_size"])
             .map(|v| v as usize)
             .unwrap_or(9);
 
-        let markov_rank = gguf
-            .get_u32(&pfx("markov_rank"))
-            .or_else(|| gguf.get_u32("dspark.markov_rank"))
-            .or_else(|| gguf.get_u32("dflash.markov_rank"))
+        let markov_rank = get_u32_any(&["markov_rank"])
             .map(|v| v as usize)
             .unwrap_or(256);
 
         let rms_norm_eps = gguf
-            .get_f32(&pfx("attention.layer_norm_rms_epsilon"))
+            .get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
             .or_else(|| gguf.get_f32("dflash.attention.layer_norm_rms_epsilon"))
             .or_else(|| gguf.get_f32("dspark.attention.layer_norm_rms_epsilon"))
             .or_else(|| gguf.get_f32("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);
 
         let rope_theta = gguf
-            .get_f32(&pfx("rope.freq_base"))
+            .get_f32(&format!("{arch}.rope.freq_base"))
             .or_else(|| gguf.get_f32("dflash.rope.freq_base"))
             .or_else(|| gguf.get_f32("dspark.rope.freq_base"))
             .or_else(|| gguf.get_f32("rope.freq_base"))
@@ -150,18 +127,18 @@ impl DSparkConfig {
 
         ensure!(hidden_size > 0, "DSpark hidden_size must be positive");
         ensure!(
-            hidden_size.is_multiple_of(32),
+            hidden_size % 32 == 0,
             "DSpark hidden_size ({hidden_size}) must be divisible by 32 for SIMD alignment",
         );
         ensure!(num_layers > 0, "DSpark num_layers must be positive");
         ensure!(num_heads > 0, "DSpark num_heads must be positive");
         ensure!(num_kv_heads > 0, "DSpark num_kv_heads must be positive");
         ensure!(
-            num_heads.is_multiple_of(num_kv_heads),
+            num_heads % num_kv_heads == 0,
             "DSpark num_heads ({num_heads}) must be a positive multiple of num_kv_heads ({num_kv_heads})"
         );
         ensure!(
-            head_dim > 0 && head_dim.is_multiple_of(2),
+            head_dim > 0 && head_dim % 2 == 0,
             "DSpark head_dim ({head_dim}) must be a positive even integer for RoPE rotation"
         );
         ensure!(

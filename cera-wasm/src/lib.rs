@@ -2333,18 +2333,31 @@ mod webgpu {
                     session.attach_audio_sidecars(voc_bytes, tok_bytes)?;
                 }
 
-                let has_draft = manifest
+                let mut draft_bytes = None;
+                let draft_rel = manifest
                     .files
                     .draft_model
                     .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || want_dspark;
-                if has_draft {
-                    session.drafter = Some(Box::new(cera::spec::PromptLookupDrafter::new(2)));
-                    console_info(&format!(
-                        "[cera-wasm] enabled PromptLookup drafter for WebGpuSession \"{}\"",
-                        session.model_label
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        if want_dspark {
+                            cera::bundle::hf::known_companion_dspark_url(&bundle_id, clean_quant)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(rel) = draft_rel {
+                    let draft_url =
+                        crate::bundle::join_url(base_url, &rel).map_err(|e| JsError::new(&e))?;
+                    draft_bytes = Some(Arc::from(
+                        repo.read_or_download(&draft_url, None, on_progress.as_ref())
+                            .await?,
                     ));
+                }
+
+                if draft_bytes.is_some() || want_dspark {
+                    session.attach_drafter(draft_bytes, &gguf_arc);
                 }
 
                 Ok::<WebGpuSession, JsError>(session)
@@ -2360,8 +2373,12 @@ mod webgpu {
                     let parts =
                         crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref())
                             .await?;
-                    let mut session =
-                        Self::from_model_bytes(parts.model, context_size, kv_compression).await?;
+                    let mut session = Self::from_model_bytes(
+                        Arc::clone(&parts.model),
+                        context_size,
+                        kv_compression,
+                    )
+                    .await?;
                     session.model_label = format!("{bundle_id} ({quant})");
                     session.generation_defaults = parts.generation_defaults;
                     if let Some(mmproj) = parts.multimodal_projector {
@@ -2371,9 +2388,11 @@ mod webgpu {
                         session
                             .attach_audio_sidecars(parts.audio_decoder, parts.audio_tokenizer)?;
                     }
-                    let has_draft = parts.draft_model.is_some() || want_dspark;
-                    if has_draft {
-                        session.drafter = Some(Box::new(cera::spec::PromptLookupDrafter::new(2)));
+                    if parts.draft_model.is_some() || want_dspark {
+                        let base_gguf = Arc::new(
+                            cera::gguf::GgufFile::from_bytes(parts.model).map_err(map_err)?,
+                        );
+                        session.attach_drafter(parts.draft_model, &base_gguf);
                     }
                     Ok(session)
                 }
@@ -2558,6 +2577,44 @@ mod webgpu {
                 self.vision_encoder = Some(weights);
                 Ok(())
             }
+        }
+
+        /// Parse draft model sidecar (e.g. DSpark) and attach it for speculative decoding,
+        /// falling back to PromptLookupDrafter if no neural draft sidecar is available.
+        fn attach_drafter(
+            &mut self,
+            draft_bytes: Option<Arc<[u8]>>,
+            base_gguf: &Arc<cera::gguf::GgufFile>,
+        ) {
+            if let Some(db) = draft_bytes {
+                match cera::gguf::GgufFile::from_bytes(db) {
+                    Ok(draft_gguf) => {
+                        let draft_arc = Arc::new(draft_gguf);
+                        if let Some(drafter) = cera::engine::init_dspark_drafter(
+                            draft_arc,
+                            base_gguf,
+                            "wasm draft bytes",
+                        ) {
+                            self.drafter = Some(drafter.clone_drafter());
+                            console_info(&format!(
+                                "[cera-wasm] attached neural DSpark drafter for WebGpuSession \"{}\"",
+                                self.model_label
+                            ));
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        console_warn(&format!(
+                            "[cera-wasm] failed to parse draft model GGUF: {e:#}"
+                        ));
+                    }
+                }
+            }
+            self.drafter = Some(Box::new(cera::spec::PromptLookupDrafter::new(2)));
+            console_info(&format!(
+                "[cera-wasm] enabled PromptLookup drafter for WebGpuSession \"{}\"",
+                self.model_label
+            ));
         }
 
         /// Number of tokens currently in the KV cache.
@@ -3281,10 +3338,11 @@ mod webgpu {
                             Ok(s) => s.len(),
                             Err(e) => e.valid_up_to(),
                         };
-                        if valid > 0 {
-                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                            out.push_str(&piece);
-                            emit(on_token, &piece);
+                        if valid > 0
+                            && let Ok(piece) = std::str::from_utf8(&pending[..valid])
+                        {
+                            out.push_str(piece);
+                            emit(on_token, piece);
                         }
                         pending.clear();
                     }
@@ -3412,10 +3470,11 @@ mod webgpu {
                         Ok(s) => s.len(),
                         Err(e) => e.valid_up_to(),
                     };
-                    if valid > 0 {
-                        let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                        out.push_str(&piece);
-                        emit(on_token, &piece);
+                    if valid > 0
+                        && let Ok(piece) = std::str::from_utf8(&pending[..valid])
+                    {
+                        out.push_str(piece);
+                        emit(on_token, piece);
                         pending.drain(..valid);
                     }
                 }
@@ -3439,10 +3498,11 @@ mod webgpu {
                             Ok(s) => s.len(),
                             Err(e) => e.valid_up_to(),
                         };
-                        if valid > 0 {
-                            let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
-                            out.push_str(&piece);
-                            emit(on_token, &piece);
+                        if valid > 0
+                            && let Ok(piece) = std::str::from_utf8(&pending[..valid])
+                        {
+                            out.push_str(piece);
+                            emit(on_token, piece);
                             pending.drain(..valid);
                         }
                     }
@@ -3634,11 +3694,11 @@ mod webgpu {
                                         Ok(s) => s.len(),
                                         Err(e) => e.valid_up_to(),
                                     };
-                                    if valid > 0 {
-                                        let piece =
-                                            String::from_utf8_lossy(&pending[..valid]).into_owned();
-                                        out.push_str(&piece);
-                                        emit(on_token, &piece);
+                                    if valid > 0
+                                        && let Ok(piece) = std::str::from_utf8(&pending[..valid])
+                                    {
+                                        out.push_str(piece);
+                                        emit(on_token, piece);
                                         pending.drain(..valid);
                                     }
                                     token_history.push(d_tok);
