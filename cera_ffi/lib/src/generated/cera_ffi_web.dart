@@ -96,7 +96,7 @@ class EngineConfig {
     /// `max_seq_len`. Pass `0` to use the model's full declared
     /// `max_seq_len` (translated to `usize::MAX` internally, then
     /// capped by the loader).
-    required this.contextSize,
+    this.contextSize = 4096,
     required this.backend,
     /// Bundle repository for resolving `http(s)://` URLs in manifests
     /// (or for [`CeraEngine::from_bundle_id`]). `None` means "remote
@@ -104,7 +104,9 @@ class EngineConfig {
     /// rooted at a persistent cache directory to enable remote
     /// downloads. Construct the repo once + reuse it across engine
     /// loads so its HTTP client pool + on-disk cache are shared.
-    required this.bundleRepo,
+    this.bundleRepo = null,
+    /// Optional path to a DSpark speculative draft model GGUF file.
+    this.draftModel = null,
   });
 
   /// KV-cache capacity in tokens. Capped by the model's own
@@ -120,20 +122,24 @@ class EngineConfig {
   /// downloads. Construct the repo once + reuse it across engine
   /// loads so its HTTP client pool + on-disk cache are shared.
   final BundleRepo? bundleRepo;
+  /// Optional path to a DSpark speculative draft model GGUF file.
+  final String? draftModel;
 
   Map<String, dynamic> toJson() {
     return {
       'contextSize': this.contextSize,
       'backend': BackendPreferenceFfiCodec.encode(this.backend),
       'bundleRepo': this.bundleRepo == null ? null : (() { final __tmp = this.bundleRepo!; return BundleRepoFfiCodec.lower(__tmp); })(),
+      'draftModel': this.draftModel,
     };
   }
 
   factory EngineConfig.fromJson(Map<String, dynamic> json) {
     return EngineConfig(
-      contextSize: (json['contextSize'] as num).toInt(),
+      contextSize: json.containsKey('contextSize') ? (json['contextSize'] as num).toInt() : 4096,
       backend: BackendPreferenceFfiCodec.decode(json['backend'] as String),
-      bundleRepo: json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })(),
+      bundleRepo: json.containsKey('bundleRepo') ? json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })() : null,
+      draftModel: json.containsKey('draftModel') ? json['draftModel'] == null ? null : json['draftModel'] as String : null,
     );
   }
 
@@ -141,26 +147,28 @@ class EngineConfig {
     int? contextSize,
     BackendPreference? backend,
     Object? bundleRepo = _sentinel,
+    Object? draftModel = _sentinel,
   }) {
     return EngineConfig(
       contextSize: contextSize ?? this.contextSize,
       backend: backend ?? this.backend,
       bundleRepo: bundleRepo == _sentinel ? this.bundleRepo : bundleRepo as BundleRepo?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
     );
   }
 
   @override
   String toString() {
-    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo)';
+    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo, draftModel: $draftModel)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo;
+      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo && draftModel == other.draftModel;
 
   @override
-  int get hashCode => Object.hash(contextSize, backend, bundleRepo);
+  int get hashCode => Object.hash(contextSize, backend, bundleRepo, draftModel);
 }
 
 /// A detected speech segment with sample and millisecond boundaries.

@@ -35,8 +35,11 @@ def copy_tokenizer_metadata(writer: gguf.GGUFWriter):
                 if field.types[1] == gguf.GGUFValueType.STRING:
                     arr = [str(p.tobytes().decode("utf-8", errors="ignore")) for p in val]
                     writer.add_array(field.name, arr)
-                elif field.types[1] == gguf.GGUFValueType.INT32:
+                elif field.types[1] in (gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT32):
                     arr = [int(p[0]) for p in val]
+                    writer.add_array(field.name, arr)
+                elif field.types[1] == gguf.GGUFValueType.FLOAT32:
+                    arr = [float(p[0]) for p in val]
                     writer.add_array(field.name, arr)
 
 def export_to_gguf(

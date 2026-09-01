@@ -289,6 +289,7 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
         context_size: settings::CONTEXT_SIZE,
         backend: cera_ffi::BackendPreference::Cpu,
         bundle_repo: Some(repo),
+        draft_model: None,
     };
     let engine =
         cera_ffi::CeraEngine::from_bundle_id(args.bundle.to_string(), args.quant.to_string(), cfg)

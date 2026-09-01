@@ -2098,10 +2098,11 @@ impl KvPrefixCache {
             std::process::id()
         ));
         if std::fs::write(&tmp_path, data).is_ok() {
-            let renamed = std::fs::rename(&tmp_path, &target_path).is_ok();
-            if !renamed && std::fs::copy(&tmp_path, &target_path).is_ok() {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
+            // Cache inserts must be atomic. If rename fails (e.g. cross-device link),
+            // discard the cache entry rather than falling back to a non-atomic copy
+            // which could cause concurrent readers to ingest partial flatbuffers files.
+            let _ = std::fs::rename(&tmp_path, &target_path);
+            let _ = std::fs::remove_file(&tmp_path);
         }
 
         self.evict_cold_if_needed(dir);

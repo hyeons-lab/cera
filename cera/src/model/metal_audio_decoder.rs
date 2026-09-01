@@ -1065,6 +1065,7 @@ pub struct MetalDepthformer {
     pipes: DfPipelines,
     layers: Vec<DfLayerGpu>,
     depth_linear_slices: Vec<MetalWeight>, // 8 × [2048→1024] F32
+    depth_linear_biases: Vec<Buffer>,      // 8 × [1024] F32
     codebook_norms: Vec<Buffer>,
     codebook_to_logits: Vec<MetalWeight>, // 8 × [1024→2049] F32
     codebook_emb_f32: Vec<Buffer>,        // 8 × [2049 × 1024] F32 for CPU lookup
@@ -1186,6 +1187,24 @@ impl MetalDepthformer {
             });
         }
 
+        let dl_b = gguf
+            .get_tensor("depth_linear.bias")
+            .map(|t| t.to_f32_vec())
+            .unwrap_or_default();
+        let mut depth_linear_biases = Vec::with_capacity(dec_cfg.n_codebook);
+        for j in 0..dec_cfg.n_codebook {
+            let b_start = j * n_embd_d;
+            let b_end = (b_start + n_embd_d).min(dl_b.len());
+            let b_slice = if b_start < dl_b.len() {
+                &dl_b[b_start..b_end]
+            } else {
+                &[]
+            };
+            let mut b_vec = vec![0.0f32; n_embd_d];
+            b_vec[..b_slice.len()].copy_from_slice(b_slice);
+            depth_linear_biases.push(ctx.upload_f32(&b_vec));
+        }
+
         // Per-codebook weights
         let mut codebook_norms = Vec::with_capacity(dec_cfg.n_codebook);
         let mut codebook_to_logits = Vec::with_capacity(dec_cfg.n_codebook);
@@ -1246,6 +1265,7 @@ impl MetalDepthformer {
             layers,
             rope_freqs_dummy,
             depth_linear_slices,
+            depth_linear_biases,
             codebook_norms,
             codebook_to_logits,
             codebook_emb_f32,
@@ -1309,6 +1329,16 @@ impl MetalDepthformer {
             }
             // depth_linear GEMV
             self.encode_df_gemv(enc, dl, &self.src_emb_buf, &self.hidden_buf);
+
+            // depth_linear bias addition
+            if let Some(b_buf) = self.depth_linear_biases.get(j) {
+                let params = ElementwiseParams::new(n_embd as u32);
+                enc.set_compute_pipeline_state(&self.pipes.add_inplace);
+                enc.set_buffer(0, Some(&self.hidden_buf), 0);
+                enc.set_buffer(1, Some(b_buf), 0);
+                params.set(enc, 2);
+                enc.dispatch_thread_groups(sz1d((n_embd as u64).div_ceil(256)), sz1d(256));
+            }
 
             // 2. Add previous codebook's embedding (if j > 0)
             if j > 0 && prev_token >= 0 {

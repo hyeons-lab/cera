@@ -338,8 +338,9 @@ impl GpuWeightSource for OpfsGpuWeightSource {
         let chunk = self.chunk_buf.borrow();
         let data = &chunk[..wref.size.min(chunk.len())];
         let mut out = vec![0.0f32; wref.m * wref.k];
-        let block_size = wref.dtype.block_size();
-        let row_bytes = wref.k / block_size * wref.dtype.block_bytes();
+        let block_size = wref.dtype.block_size().max(1);
+        let blocks_per_row = wref.k.div_ceil(block_size);
+        let row_bytes = blocks_per_row * wref.dtype.block_bytes();
         for row in 0..wref.m {
             let start = row * row_bytes;
             let end = (row + 1) * row_bytes;

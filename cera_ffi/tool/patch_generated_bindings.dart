@@ -179,6 +179,12 @@ void main(List<String> args) {
       "      calloc.free(cloneStatusPtr);\n"
       "    }\n"
       "  }\n"
+      "  if (value.draftModel == null) {\n"
+      "    writer.writeI8(0);\n"
+      "  } else {\n"
+      "    writer.writeI8(1);\n"
+      "    writer.writeString(value.draftModel!);\n"
+      "  }\n"
       "}";
   if (src.contains(writeStub)) {
     src = src.replaceAll(writeStub, writeImpl);

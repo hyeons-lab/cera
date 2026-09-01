@@ -33,6 +33,7 @@ void main(List<String> args) {
       contextSize: 2048,
       backend: BackendPreference.cpu,
       bundleRepo: null,
+      draftModel: null,
     ),
   );
 

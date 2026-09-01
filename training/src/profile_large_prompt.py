@@ -6,6 +6,7 @@ import os
 import time
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -16,6 +17,10 @@ DRAFT_GGUF = os.environ.get(
 )
 PHOTO_DIR = Path(os.environ.get("PHOTO_DIR", str(REPO_ROOT / "training" / "data" / "test_photos")))
 CACHE_DIR = Path(tempfile.gettempdir()) / f"cera_kv_bench_cache_{os.getuid() if hasattr(os, 'getuid') else 'user'}"
+
+if CACHE_DIR.exists() and not CACHE_DIR.is_symlink():
+    shutil.rmtree(CACHE_DIR)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Build a comprehensive cataloging prompt with 10 few-shot examples (~1,200 tokens)
 examples = "\n".join([

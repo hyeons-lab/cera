@@ -6493,6 +6493,9 @@ impl GpuLfm2Model {
         if n == 0 {
             return Ok(Vec::new());
         }
+        if n > MAX_ALL_LOGITS_TOKENS {
+            anyhow::bail!("batch size {n} exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})");
+        }
         if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
             anyhow::bail!("batched prefill verification not supported for this model");
         }
@@ -6529,6 +6532,9 @@ impl GpuLfm2Model {
         let n = tokens.len();
         if n == 0 {
             return Ok(Vec::new());
+        }
+        if n > MAX_ALL_LOGITS_TOKENS {
+            anyhow::bail!("batch size {n} exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})");
         }
         if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
             anyhow::bail!("batched prefill verification not supported for this model");

@@ -3901,6 +3901,10 @@ public struct EngineConfig {
      * loads so its HTTP client pool + on-disk cache are shared.
      */
     public var bundleRepo: BundleRepo?
+    /**
+     * Optional path to a DSpark speculative draft model GGUF file.
+     */
+    public var draftModel: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3910,7 +3914,7 @@ public struct EngineConfig {
          * `max_seq_len`. Pass `0` to use the model's full declared
          * `max_seq_len` (translated to `usize::MAX` internally, then
          * capped by the loader).
-         */contextSize: UInt64, backend: BackendPreference, 
+         */contextSize: UInt64 = UInt64(4096), backend: BackendPreference, 
         /**
          * Bundle repository for resolving `http(s)://` URLs in manifests
          * (or for [`CeraEngine::from_bundle_id`]). `None` means "remote
@@ -3918,10 +3922,14 @@ public struct EngineConfig {
          * rooted at a persistent cache directory to enable remote
          * downloads. Construct the repo once + reuse it across engine
          * loads so its HTTP client pool + on-disk cache are shared.
-         */bundleRepo: BundleRepo?) {
+         */bundleRepo: BundleRepo? = nil, 
+        /**
+         * Optional path to a DSpark speculative draft model GGUF file.
+         */draftModel: String? = nil) {
         self.contextSize = contextSize
         self.backend = backend
         self.bundleRepo = bundleRepo
+        self.draftModel = draftModel
     }
 
     
@@ -3942,7 +3950,8 @@ public struct FfiConverterTypeEngineConfig: FfiConverterRustBuffer {
             try EngineConfig(
                 contextSize: FfiConverterUInt64.read(from: &buf), 
                 backend: FfiConverterTypeBackendPreference.read(from: &buf), 
-                bundleRepo: FfiConverterOptionTypeBundleRepo.read(from: &buf)
+                bundleRepo: FfiConverterOptionTypeBundleRepo.read(from: &buf), 
+                draftModel: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3950,6 +3959,7 @@ public struct FfiConverterTypeEngineConfig: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.contextSize, into: &buf)
         FfiConverterTypeBackendPreference.write(value.backend, into: &buf)
         FfiConverterOptionTypeBundleRepo.write(value.bundleRepo, into: &buf)
+        FfiConverterOptionString.write(value.draftModel, into: &buf)
     }
 }
 

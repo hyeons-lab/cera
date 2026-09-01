@@ -5,7 +5,7 @@
 //! rates. It shares the vocabulary, embedding table (`token_embd.weight`), and LM head
 //! with the base target model (e.g. LFM2.5).
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::sync::Arc;
 
 use crate::backend::cpu;
@@ -310,9 +310,8 @@ impl DSparkSessionDrafter {
                 &mut self.scratch_normed,
             );
         }
-        self.synced_tokens.truncate(self.synced_pos);
-        self.synced_tokens
-            .extend_from_slice(&tokens[self.synced_tokens.len()..prefix_len]);
+        self.synced_tokens.clear();
+        self.synced_tokens.extend_from_slice(&tokens[..prefix_len]);
         self.synced_pos = prefix_len;
         Some(&self.scratch_hidden)
     }
@@ -668,14 +667,16 @@ impl DSparkDraftModel {
         }
 
         let confidence_weight: Option<Arc<[f32]>> = draft_gguf
-            .get_tensor("confidence.weight")
-            .or_else(|_| draft_gguf.get_tensor("confidence_head.proj.weight"))
+            .get_tensor("confidence_head.weight")
+            .or_else(|_| draft_gguf.get_tensor("confidence.weight"))
+            .or_else(|_| draft_gguf.get_tensor("model.confidence_head.weight"))
+            .or_else(|_| draft_gguf.get_tensor("model.confidence_head.proj.weight"))
             .or_else(|_| draft_gguf.get_tensor("conf_proj.weight"))
             .or_else(|_| draft_gguf.get_tensor("conf_proj"))
-            .or_else(|_| draft_gguf.get_tensor("model.confidence_head.proj.weight"))
             .or_else(|_| draft_gguf.get_tensor("dflash.confidence.weight"))
             .or_else(|_| draft_gguf.get_tensor("dspark.confidence.weight"))
             .or_else(|_| draft_gguf.get_tensor(&format!("{arch}.confidence.weight")))
+            .ok()
             .map(|t| {
                 let data = t.to_f32_vec();
                 if data.len() >= config.hidden_size {
@@ -684,24 +685,14 @@ impl DSparkDraftModel {
                     // `hidden_size` features which carry the main draft representation.
                     Ok(Arc::from(&data[..config.hidden_size]))
                 } else {
-                    Err(anyhow!(
+                    bail!(
                         "confidence_weight length ({}) < hidden_size ({})",
                         data.len(),
                         config.hidden_size
-                    ))
+                    )
                 }
             })
-            .ok()
             .transpose()?;
-
-        if let Some(cw) = &confidence_weight {
-            ensure!(
-                cw.len() == config.hidden_size,
-                "confidence_weight length ({}) != hidden_size ({})",
-                cw.len(),
-                config.hidden_size
-            );
-        }
 
         Ok(Self {
             gguf: draft_gguf,

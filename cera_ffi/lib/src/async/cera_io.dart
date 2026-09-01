@@ -39,6 +39,7 @@ EngineConfig _configOf(CeraOptions options, [BundleRepo? repo]) => EngineConfig(
   contextSize: options.contextSize,
   backend: _backendOf(options.backend),
   bundleRepo: repo,
+  draftModel: null,
 );
 
 /// Maps the generated capability record onto the portable one.

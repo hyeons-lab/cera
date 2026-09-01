@@ -475,20 +475,14 @@ struct AmxWorkerGuard;
 
 impl Drop for AmxWorkerGuard {
     fn drop(&mut self) {
-        // We MUST block until the background thread is done writing to the caller's stack/heap buffers.
-        let start = std::time::Instant::now();
+        // We MUST block until the background thread is done writing to the caller's stack/heap buffers
+        // to prevent memory corruption during an unwind.
         while WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
             for _ in 0..64 {
                 core::hint::spin_loop();
             }
             if WORKER_STATE.load(std::sync::atomic::Ordering::Acquire) == STATE_RUNNING {
                 std::thread::yield_now();
-            }
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                tracing::error!(
-                    "AmxWorkerGuard: worker thread timed out; aborting process to prevent buffer corruption"
-                );
-                std::process::abort();
             }
         }
         WORKER_STATE.store(STATE_IDLE, std::sync::atomic::Ordering::Release);

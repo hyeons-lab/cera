@@ -6969,7 +6969,7 @@ data class EngineConfig(
      * `max_seq_len` (translated to `usize::MAX` internally, then
      * capped by the loader).
      */
-    var `contextSize`: kotlin.ULong,
+    var `contextSize`: kotlin.ULong = 4096uL,
     var `backend`: BackendPreference,
     /**
      * Bundle repository for resolving `http(s)://` URLs in manifests
@@ -6979,7 +6979,11 @@ data class EngineConfig(
      * downloads. Construct the repo once + reuse it across engine
      * loads so its HTTP client pool + on-disk cache are shared.
      */
-    var `bundleRepo`: BundleRepo?,
+    var `bundleRepo`: BundleRepo? = null,
+    /**
+     * Optional path to a DSpark speculative draft model GGUF file.
+     */
+    var `draftModel`: kotlin.String? = null,
 ) : Disposable {
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
@@ -6987,6 +6991,7 @@ data class EngineConfig(
             this.`contextSize`,
             this.`backend`,
             this.`bundleRepo`,
+            this.`draftModel`,
         )
     }
 
@@ -7002,13 +7007,15 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
             FfiConverterULong.read(buf),
             FfiConverterTypeBackendPreference.read(buf),
             FfiConverterOptionalTypeBundleRepo.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
 
     override fun allocationSize(value: EngineConfig) =
         (
             FfiConverterULong.allocationSize(value.`contextSize`) +
                 FfiConverterTypeBackendPreference.allocationSize(value.`backend`) +
-                FfiConverterOptionalTypeBundleRepo.allocationSize(value.`bundleRepo`)
+                FfiConverterOptionalTypeBundleRepo.allocationSize(value.`bundleRepo`) +
+                FfiConverterOptionalString.allocationSize(value.`draftModel`)
         )
 
     override fun write(
@@ -7018,6 +7025,7 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
         FfiConverterULong.write(value.`contextSize`, buf)
         FfiConverterTypeBackendPreference.write(value.`backend`, buf)
         FfiConverterOptionalTypeBundleRepo.write(value.`bundleRepo`, buf)
+        FfiConverterOptionalString.write(value.`draftModel`, buf)
     }
 }
 

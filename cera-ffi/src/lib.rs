@@ -342,6 +342,7 @@ pub struct EngineConfig {
     /// `max_seq_len`. Pass `0` to use the model's full declared
     /// `max_seq_len` (translated to `usize::MAX` internally, then
     /// capped by the loader).
+    #[uniffi(default = 4096)]
     pub context_size: u64,
     pub backend: BackendPreference,
     /// Bundle repository for resolving `http(s)://` URLs in manifests
@@ -350,7 +351,11 @@ pub struct EngineConfig {
     /// rooted at a persistent cache directory to enable remote
     /// downloads. Construct the repo once + reuse it across engine
     /// loads so its HTTP client pool + on-disk cache are shared.
+    #[uniffi(default = None)]
     pub bundle_repo: Option<Arc<BundleRepo>>,
+    /// Optional path to a DSpark speculative draft model GGUF file.
+    #[uniffi(default = None)]
+    pub draft_model: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -367,6 +372,7 @@ impl Default for EngineConfig {
             // remote-URL loading set it explicitly before passing the
             // config to `CeraEngine::from_path` / `from_bundle_id`.
             bundle_repo: None,
+            draft_model: core.draft_model.map(|p| p.to_string_lossy().to_string()),
         }
     }
 }
@@ -400,7 +406,7 @@ impl TryFrom<EngineConfig> for cera::EngineConfig {
         Ok(cera::EngineConfig {
             context_size,
             backend: c.backend.into(),
-            draft_model: None,
+            draft_model: c.draft_model.map(std::path::PathBuf::from),
             bundle_repo: c.bundle_repo.map(|r| r.inner.clone()),
         })
     }
@@ -2959,6 +2965,7 @@ mod tests {
             context_size: 0,
             backend: BackendPreference::Cpu,
             bundle_repo: Some(repo.clone()),
+            draft_model: None,
         };
         let core: cera::EngineConfig = ffi.try_into().unwrap();
         let core_repo = core.bundle_repo.expect("bundle_repo must be Some");
@@ -3013,6 +3020,7 @@ mod tests {
             context_size: 0,
             backend: BackendPreference::Cpu,
             bundle_repo: None,
+            draft_model: None,
         };
         let core: cera::EngineConfig = ffi.try_into().unwrap();
         assert_eq!(core.context_size, usize::MAX);
@@ -3030,6 +3038,7 @@ mod tests {
             context_size: u64::MAX,
             backend: BackendPreference::Cpu,
             bundle_repo: None,
+            draft_model: None,
         };
         let result: Result<cera::EngineConfig, FfiError> = ffi.try_into();
         #[cfg(target_pointer_width = "32")]

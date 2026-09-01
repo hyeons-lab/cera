@@ -19,20 +19,21 @@ class DSparkTextDataset(Dataset):
         return self.sequences[idx]
 
 def prepare_dataset(tokenizer, max_length=128, total_samples=2400):
-    print(f"Loading and assembling ~{total_samples} samples across domains...", flush=True)
+    per_domain = max(1, total_samples // 4)
+    print(f"Loading and assembling ~{total_samples} samples ({per_domain} per domain)...", flush=True)
     
     # 1. Code instruction
     try:
-        code_data = load_dataset("m-a-p/CodeFeedback-Filtered-Instruction", split="train[:600]")
+        code_data = load_dataset("m-a-p/CodeFeedback-Filtered-Instruction", split=f"train[:{per_domain}]")
         code_texts = [f"### Instruction:\n{item['query']}\n\n### Response:\n{item['answer']}" for item in code_data]
     except Exception as e:
         print("Falling back on python code instructions:", e, flush=True)
-        code_data = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split="train[:600]")
+        code_data = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split=f"train[:{per_domain}]")
         code_texts = [f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['output']}" for item in code_data]
 
     # 2. Function calling / Tool use
     try:
-        tool_data = load_dataset("glaiveai/glaive-function-calling-v2", split="train[:600]")
+        tool_data = load_dataset("glaiveai/glaive-function-calling-v2", split=f"train[:{per_domain}]")
         tool_texts = [item["chat"] for item in tool_data if "chat" in item]
     except Exception as e:
         print("Falling back on tool data:", e, flush=True)
@@ -40,7 +41,7 @@ def prepare_dataset(tokenizer, max_length=128, total_samples=2400):
 
     # 3. Chat / SFT
     try:
-        chat_data = load_dataset("HuggingFaceTB/smoltalk", "everyday-conversations", split="train[:600]")
+        chat_data = load_dataset("HuggingFaceTB/smoltalk", "everyday-conversations", split=f"train[:{per_domain}]")
         chat_texts = []
         for item in chat_data:
             if "messages" in item:
@@ -54,7 +55,7 @@ def prepare_dataset(tokenizer, max_length=128, total_samples=2400):
 
     # 4. Math / CoT
     try:
-        math_data = load_dataset("openai/gsm8k", "main", split="train[:600]")
+        math_data = load_dataset("openai/gsm8k", "main", split=f"train[:{per_domain}]")
         math_texts = [f"Question: {item['question']}\nAnswer: {item['answer']}" for item in math_data]
     except Exception as e:
         print("Math data fallback:", e, flush=True)

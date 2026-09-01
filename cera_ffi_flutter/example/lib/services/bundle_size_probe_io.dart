@@ -89,6 +89,11 @@ Future<Map<String, int>> probeBundleFileSizes(
           'https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/'
           'tokenizer-LFM2.5-Audio-1.5B-$sidecarQuant.gguf',
         );
+      } else if (quant.contains('DSpark') || quant.contains('dspark')) {
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM2.5-1.5B-DSpark-GGUF/resolve/main/'
+          'dspark-LFM2.5-1.5B-$cleanQuant.gguf',
+        );
       }
     }
 
