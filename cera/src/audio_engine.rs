@@ -87,12 +87,30 @@ impl AudioSilenceWatchdog {
         Self::default()
     }
 
+    pub fn new_with_thresholds(
+        rms_threshold: f32,
+        min_voiced_frames: usize,
+        silent_frames_cutoff: usize,
+        silent_frames_cutoff_voiced: usize,
+    ) -> Self {
+        Self {
+            total_voiced_frames: 0,
+            consecutive_silent_frames: 0,
+            audio_frames_count: 0,
+            rms_threshold,
+            min_voiced_frames,
+            silent_frames_cutoff,
+            silent_frames_cutoff_voiced,
+        }
+    }
+
     /// Observe a new decoded PCM buffer and update silence/voiced counters.
     /// Returns the computed RMS energy.
     #[inline]
     pub fn observe_pcm(&mut self, pcm: &[f32]) -> f32 {
         self.audio_frames_count += 1;
         if pcm.is_empty() {
+            self.consecutive_silent_frames += 1;
             return 0.0;
         }
         let mut sum = 0.0f32;
@@ -225,13 +243,17 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Returns the computed RMS energy.
     #[inline]
     pub fn observe_pcm(&mut self, pcm: &[f32]) -> f32 {
+        if !self.streaming {
+            self.watchdog.audio_frames_count += 1;
+            return 0.0;
+        }
         self.watchdog.observe_pcm(pcm)
     }
 
     /// Check if trailing silence has reached the termination threshold.
     #[inline]
     pub fn is_silence_terminated(&self) -> bool {
-        self.watchdog.is_silence_terminated()
+        self.streaming && self.watchdog.is_silence_terminated()
     }
 
     /// Check if the safety frame limit (4096 frames) has been reached.
@@ -852,7 +874,7 @@ pub fn generate_audio(
         }
     }
 
-    // Batch ISTFT: all accumulated spectrum → PCM in one pass with proper overlap.
+    // Drain any remaining buffered samples or execute batch ISTFT.
     let audio_samples = decoder.finish(&mut audio_callback);
 
     Ok(AudioGenerateResult {
@@ -929,8 +951,25 @@ mod tests {
         let rms = watchdog.observe_pcm(&empty_pcm);
         assert_eq!(rms, 0.0);
         assert_eq!(watchdog.audio_frames_count, 1);
-        assert_eq!(watchdog.consecutive_silent_frames, 0);
+        assert_eq!(watchdog.consecutive_silent_frames, 1);
         assert_eq!(watchdog.total_voiced_frames, 0);
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_custom_thresholds() {
+        let mut watchdog = AudioSilenceWatchdog::new_with_thresholds(0.002, 3, 10, 8);
+        assert_eq!(watchdog.rms_threshold, 0.002);
+        assert_eq!(watchdog.min_voiced_frames, 3);
+        assert_eq!(watchdog.silent_frames_cutoff, 10);
+        assert_eq!(watchdog.silent_frames_cutoff_voiced, 8);
+
+        let silent_pcm = vec![0.0f32; 1920];
+        for _ in 0..9 {
+            watchdog.observe_pcm(&silent_pcm);
+            assert!(!watchdog.is_silence_terminated());
+        }
+        watchdog.observe_pcm(&silent_pcm);
+        assert!(watchdog.is_silence_terminated());
     }
 
     #[test]

@@ -2151,7 +2151,7 @@ impl Session {
             let is_audio_transition = decoder.is_some()
                 && (token == crate::audio_engine::TOKEN_TEXT_END
                     || token == crate::audio_engine::TOKEN_AUDIO_START);
-            if decoder.is_some() && token == crate::audio_engine::TOKEN_TEXT_END {
+            if is_audio_transition && token == crate::audio_engine::TOKEN_TEXT_END {
                 text_done = true;
             }
 
