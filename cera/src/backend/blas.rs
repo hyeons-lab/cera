@@ -885,10 +885,11 @@ mod tests {
                 let k = 32;
                 let a1 = vec![1.0f32; m * k];
                 let a2 = vec![2.0f32; m * k];
-                let b = vec![1.0f32; n * k];
-                let mut c1 = vec![0.0f32; m * n];
-                let mut c2 = vec![0.0f32; m * n];
-                sgemm_dual_parallel(m, n, k, &a1, &a2, &b, &mut c1, &mut c2);
+                let b1 = vec![1.0f32; n * k];
+                let b2 = vec![1.0f32; n * k];
+                let mut c1 = vec![0.0f32; n * m];
+                let mut c2 = vec![0.0f32; n * m];
+                sgemm_dual_parallel(n, m, k, &b1, &a1, &mut c1, n, m, k, &b2, &a2, &mut c2);
                 for &val in &c1 {
                     assert!((val - k as f32).abs() < 1e-4);
                 }

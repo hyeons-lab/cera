@@ -1574,7 +1574,7 @@ impl GpuLfm2Model {
         {
             LmHead::Quantized(GpuWeight {
                 tensor: GpuTensor {
-                    buffer: ctx.upload_storage(lm_head_bytes, "lm_head"),
+                    buffer: ctx.upload_storage(&lm_head_bytes, "lm_head"),
                     dtype: lm_head_dtype,
                     shape: vec![config.vocab_size, config.hidden_size],
                 },

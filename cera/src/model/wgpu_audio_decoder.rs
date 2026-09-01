@@ -1243,7 +1243,9 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
             {
                 pollster::block_on(_df.sample_frame_async(embedding, temperature, top_k))
                     .unwrap_or_else(|e| {
-                        log::error!("[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}");
+                        tracing::error!(
+                            "[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}"
+                        );
                         [0; 8]
                     })
             }

@@ -400,7 +400,6 @@ fn test_end_to_end_tts_synthesis_gpu_parity() {
         dot / (na * nb).max(1e-8)
     };
     eprintln!("Initial audio_start hidden state cosine: {cos_0:.6}");
-    let mut gpu_hidden_buf = gpu_model.hidden_buffer();
     pos += 1;
 
     let mut cpu_all_pcm = vec![];

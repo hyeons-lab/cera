@@ -7,7 +7,9 @@
 
 use cera::kv_cache::InferenceState;
 use cera::model::Model;
-use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights, embed_audio_token};
+use cera::model::audio_decoder::{
+    AudioDecoderWeights, AudioGpu, DetokenizerWeights, embed_audio_token,
+};
 use cera::model::lfm2::Lfm2Model;
 use std::path::PathBuf;
 use std::sync::Arc;
