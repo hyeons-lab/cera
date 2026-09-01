@@ -140,7 +140,8 @@ impl MetalAudioDecoder {
         let (_, _, conv_in_cols, _) = gguf.tensor_meta("lfm.layers.0.conv.in_proj.weight")?;
         let n_embd = conv_in_cols;
         let q_norm_t = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
-        let head_dim = q_norm_t.shape()[0];
+        let head_dim = *q_norm_t.shape().first().unwrap_or(&0);
+        anyhow::ensure!(head_dim > 0, "invalid q_layernorm head_dim");
         let (_, q_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.q_proj.weight")?;
         let n_head = q_rows / head_dim;
         let (_, k_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.k_proj.weight")?;
@@ -1526,7 +1527,10 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         match &self.depthformer {
             Some(df) => df.sample_frame(embedding, temperature, top_k),
-            None => panic!("Metal depthformer not loaded — use CPU fallback"),
+            None => {
+                tracing::warn!("Metal depthformer not loaded, returning empty audio frame");
+                [0; 8]
+            }
         }
     }
 

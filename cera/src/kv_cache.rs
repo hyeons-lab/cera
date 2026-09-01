@@ -1050,19 +1050,19 @@ impl InferenceState {
                     // isn't TurboQuant-configured; the caller
                     // should have detected the incompatibility
                     // before calling restore (see `LayerSnapshot::is_compressed`
-                    *compressed_keys = Some(
-                        crate::turboquant::decode_compressed_keys(keys)
-                            .expect("invalid TQK1 blob in snapshot"),
-                    );
-                    *compressed_values = Some(
-                        crate::turboquant::decode_compressed_values(values)
-                            .expect("invalid TQV1 blob in snapshot"),
-                    );
-                    // f32 caches are unused under compression; clear
-                    // them so stale data from a prior uncompressed
-                    // restore can't leak.
-                    key_cache.clear();
-                    value_cache.clear();
+                    if let (Some(ck), Some(cv)) = (
+                        crate::turboquant::decode_compressed_keys(keys),
+                        crate::turboquant::decode_compressed_values(values),
+                    ) {
+                        *compressed_keys = Some(ck);
+                        *compressed_values = Some(cv);
+                        key_cache.clear();
+                        value_cache.clear();
+                    } else {
+                        tracing::error!(
+                            "invalid TQK1/TQV1 compressed blob in snapshot; skipping layer restore"
+                        );
+                    }
                 }
                 (
                     LayerState::Conv { buffer, history },
@@ -1884,15 +1884,15 @@ impl KvPrefixCache {
         let snap_bytes = snapshot.byte_size() as u64;
         let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
 
-        let existing_bytes = self
-            .warm
-            .get(&hash)
-            .map(|e| e.snapshot.byte_size() as u64)
-            .unwrap_or(0);
-        let net_new_bytes = snap_bytes.saturating_sub(existing_bytes);
+        // Remove old entry first if present so warm_bytes and capacity checks are 100% exact
+        if let Some(old) = self.warm.remove(&hash) {
+            self.warm_bytes = self
+                .warm_bytes
+                .saturating_sub(old.snapshot.byte_size() as u64);
+        }
 
         // Evict from warm if needed.
-        self.evict_warm_if_needed(net_new_bytes, is_anchor);
+        self.evict_warm_if_needed(snap_bytes, is_anchor);
 
         // Save to cold tier (if `disk-cache` feature on; otherwise no-op).
         #[cfg(feature = "disk-cache")]
@@ -1901,16 +1901,14 @@ impl KvPrefixCache {
         }
 
         let tick = self.next_tick();
-        if let Some(old) = self.warm.insert(
+        self.warm.insert(
             hash,
             CacheEntry {
                 tokens: tokens.to_vec(),
                 snapshot,
                 last_used: Cell::new(tick),
             },
-        ) {
-            self.warm_bytes -= old.snapshot.byte_size() as u64;
-        }
+        );
         self.warm_bytes += snap_bytes;
     }
 
@@ -1947,24 +1945,21 @@ impl KvPrefixCache {
         let is_anchor = snapshot.anchor_depth > 0 || snapshot.boundary_kind > 0;
         let hash = hash_tokens(tokens);
         let snap_bytes = snapshot.byte_size() as u64;
-        let existing_bytes = self
-            .warm
-            .get(&hash)
-            .map(|e| e.snapshot.byte_size() as u64)
-            .unwrap_or(0);
-        let net_new_bytes = snap_bytes.saturating_sub(existing_bytes);
-        self.evict_warm_if_needed(net_new_bytes, is_anchor);
+        if let Some(old) = self.warm.remove(&hash) {
+            self.warm_bytes = self
+                .warm_bytes
+                .saturating_sub(old.snapshot.byte_size() as u64);
+        }
+        self.evict_warm_if_needed(snap_bytes, is_anchor);
         let tick = self.next_tick();
-        if let Some(old) = self.warm.insert(
+        self.warm.insert(
             hash,
             CacheEntry {
                 tokens: tokens.to_vec(),
                 snapshot: snapshot.clone(),
                 last_used: Cell::new(tick),
             },
-        ) {
-            self.warm_bytes -= old.snapshot.byte_size() as u64;
-        }
+        );
         self.warm_bytes += snap_bytes;
     }
 
@@ -2197,15 +2192,22 @@ impl KvPrefixCache {
         for l in layers_fb {
             match l.type_tag() {
                 0 => {
+                    let k_bytes = l.k_data()?.bytes().to_vec();
+                    let v_bytes = l.v_data()?.bytes().to_vec();
+                    if !k_bytes.len().is_multiple_of(4) || !v_bytes.len().is_multiple_of(4) {
+                        return None;
+                    }
                     layers.push(LayerSnapshot::Attention {
-                        k_data: l.k_data()?.bytes().to_vec(),
-                        v_data: l.v_data()?.bytes().to_vec(),
+                        k_data: k_bytes,
+                        v_data: v_bytes,
                     });
                 }
                 1 => {
-                    layers.push(LayerSnapshot::Conv {
-                        buffer: l.k_data()?.bytes().to_vec(),
-                    });
+                    let buf_bytes = l.k_data()?.bytes().to_vec();
+                    if !buf_bytes.len().is_multiple_of(4) {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::Conv { buffer: buf_bytes });
                 }
                 2 => {
                     let keys = l.k_data()?.bytes().to_vec();

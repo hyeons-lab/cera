@@ -1069,12 +1069,11 @@ pub(crate) fn quantize_columns(
     // Q8_0 packs 32-element blocks; `dim` must divide evenly (else the tail is
     // silently dropped by `dim / 32`). Assert alignment + scratch capacity at the
     // top so misuse is caught before the unsafe NEON quantizer runs.
-    debug_assert_eq!(
-        dim % 32,
-        0,
+    assert!(
+        dim.is_multiple_of(32),
         "quantize_columns: dim ({dim}) must be a multiple of 32"
     );
-    debug_assert!(
+    assert!(
         mat.len() >= dim * n
             && col.len() >= dim
             && scales.len() >= n * (dim / 32)
@@ -1147,8 +1146,11 @@ pub(crate) fn quantize_rows(
     scales: &mut [f32],
     quants: &mut [i8],
 ) {
-    debug_assert_eq!(dim % 32, 0, "quantize_rows: dim must be divisible by 32");
-    debug_assert!(
+    assert!(
+        dim.is_multiple_of(32),
+        "quantize_rows: dim must be divisible by 32"
+    );
+    assert!(
         mat.len() >= dim * n && scales.len() >= n * (dim / 32) && quants.len() >= n * dim,
         "quantize_rows: scratch too small for dim={dim}, n={n}"
     );

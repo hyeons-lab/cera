@@ -9,7 +9,6 @@ Supports training:
 
 import os
 import time
-import math
 import random
 import argparse
 import torch

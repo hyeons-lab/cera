@@ -584,7 +584,11 @@ pub(crate) mod neon {
                 let amax = vmaxvq_f32(a6);
 
                 let d = amax / 127.0;
-                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let id = if d.is_finite() && d > 0.0 {
+                    1.0 / d
+                } else {
+                    0.0
+                };
                 let d_stored = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
                 scales[bi] = d_stored;
 
@@ -635,6 +639,10 @@ pub(crate) mod neon {
     ) {
         unsafe {
             let n = x.len();
+            assert!(
+                n.is_multiple_of(32),
+                "input length {n} is not a multiple of 32"
+            );
             let n_blocks = n / 32;
             assert!(
                 weight.len() >= n,
@@ -751,12 +759,16 @@ pub(crate) mod neon {
                 let max_all = vmaxnmq_f32(max0123, max4567);
                 let amax = vmaxnmvq_f32(max_all);
 
-                let (d, id) = if amax == 0.0 {
+                let (d, id) = if !amax.is_finite() || amax <= 0.0 {
                     (0.0f32, 0.0f32)
                 } else {
                     let d_raw = amax / 127.0;
                     let d_f16 = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d_raw));
-                    let id_val = if d_f16 != 0.0 { 1.0 / d_f16 } else { 0.0 };
+                    let id_val = if d_f16.is_finite() && d_f16 > 0.0 {
+                        1.0 / d_f16
+                    } else {
+                        0.0
+                    };
                     (d_f16, id_val)
                 };
                 *scales.as_mut_ptr().add(b) = d;

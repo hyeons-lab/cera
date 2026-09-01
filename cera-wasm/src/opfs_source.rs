@@ -78,24 +78,48 @@ impl OpfsGpuWeightSource {
                 .ok_or_else(|| JsError::new(&format!("tensor not found: {name}")))?;
             let bytes = read_tensor_bytes(info)?;
             match info.dtype {
-                DType::F32 => Ok(bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect()),
-                DType::F16 => Ok(bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| cera::quant::f16_to_f32(u16::from_le_bytes(*c)))
-                    .collect()),
-                DType::BF16 => Ok(bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| cera::quant::bf16_to_f32(u16::from_le_bytes(*c)))
-                    .collect()),
+                DType::F32 => {
+                    if !bytes.len().is_multiple_of(4) {
+                        return Err(JsError::new(&format!(
+                            "tensor {name} length {} is not a multiple of 4 for F32",
+                            bytes.len()
+                        )));
+                    }
+                    Ok(bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect())
+                }
+                DType::F16 => {
+                    if !bytes.len().is_multiple_of(2) {
+                        return Err(JsError::new(&format!(
+                            "tensor {name} length {} is not a multiple of 2 for F16",
+                            bytes.len()
+                        )));
+                    }
+                    Ok(bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| cera::quant::f16_to_f32(u16::from_le_bytes(*c)))
+                        .collect())
+                }
+                DType::BF16 => {
+                    if !bytes.len().is_multiple_of(2) {
+                        return Err(JsError::new(&format!(
+                            "tensor {name} length {} is not a multiple of 2 for BF16",
+                            bytes.len()
+                        )));
+                    }
+                    Ok(bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| cera::quant::bf16_to_f32(u16::from_le_bytes(*c)))
+                        .collect())
+                }
                 dt => {
                     let numel: usize = info.shape.iter().product();
                     let mut out = vec![0.0f32; numel];

@@ -2021,6 +2021,33 @@ pub fn gemv_q4_0_concat3_with_q8(
     m3: usize,
     k: usize,
 ) {
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4_0>();
+    assert!(
+        k.is_multiple_of(32),
+        "gemv_q4_0_concat3_with_q8: k must be a multiple of 32"
+    );
+    assert!(
+        a1_quant.len() >= m1 * row_bytes,
+        "a1_quant buffer underflow"
+    );
+    assert!(
+        a2_quant.len() >= m2 * row_bytes,
+        "a2_quant buffer underflow"
+    );
+    assert!(
+        a3_quant.len() >= m3 * row_bytes,
+        "a3_quant buffer underflow"
+    );
+    assert!(
+        x_scales.len() >= blocks_per_row,
+        "x_scales buffer underflow"
+    );
+    assert!(x_quants.len() >= k, "x_quants buffer underflow");
+    assert!(y1.len() >= m1, "y1 buffer underflow");
+    assert!(y2.len() >= m2, "y2 buffer underflow");
+    assert!(y3.len() >= m3, "y3 buffer underflow");
+
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_q8_0_concat3_neon(
             a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
@@ -2976,11 +3003,15 @@ pub fn rmsnorm_and_quantize_q8_0(
     quants: &mut [i8],
     out_normed: Option<&mut [f32]>,
 ) {
-    debug_assert_eq!(x.len(), weight.len());
+    assert_eq!(x.len(), weight.len());
     let n = x.len();
+    assert!(n.is_multiple_of(32));
     let n_blocks = n / 32;
-    debug_assert!(scales.len() >= n_blocks);
-    debug_assert!(quants.len() >= n);
+    assert!(scales.len() >= n_blocks);
+    assert!(quants.len() >= n);
+    if let Some(ref out) = out_normed {
+        assert!(out.len() >= n);
+    }
 
     #[cfg(target_arch = "aarch64")]
     unsafe {

@@ -620,7 +620,9 @@ pub fn sample_audio_frame(
         cb.to_logits.gemv(&state.normed, &mut state.logits);
 
         // Sample (greedy if temperature <= 0 or top_k <= 1, otherwise top-k).
-        let sampled = if !temperature.is_finite() || temperature <= 0.0 || top_k <= 1 {
+        let sampled = if state.logits.is_empty() {
+            0
+        } else if !temperature.is_finite() || temperature <= 0.0 || top_k <= 1 {
             crate::sampler::argmax(&state.logits) as i32
         } else {
             // Temperature scaling + top-k sampling.
@@ -630,7 +632,7 @@ pub fn sample_audio_frame(
             }
             cpu::softmax_inplace(&mut state.logits);
             let n_logits = state.logits.len();
-            let k = top_k.min(n_logits);
+            let k = top_k.min(n_logits).max(1);
             state.indices.clear();
             state.indices.extend(0..n_logits);
             if k < n_logits {

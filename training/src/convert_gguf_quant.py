@@ -9,7 +9,6 @@ Supports:
 import sys
 import os
 import torch
-import numpy as np
 import gguf
 import gguf.quants as q
 
@@ -65,7 +64,15 @@ def export_quantized_gguf(
     is_markov_model = "fc.weight" in state_dict or "markov_w1" in state_dict
     arch_name = "dflash" if is_markov_model else "dspark"
 
-    gguf_type = gguf.GGMLQuantizationType.Q4_0 if quant_type.upper() == "Q4_0" else gguf.GGMLQuantizationType.Q8_0
+    qt = quant_type.upper()
+    if qt == "Q4_0":
+        gguf_type = gguf.GGMLQuantizationType.Q4_0
+    elif qt == "F16":
+        gguf_type = gguf.GGMLQuantizationType.F16
+    elif qt == "Q8_0":
+        gguf_type = gguf.GGMLQuantizationType.Q8_0
+    else:
+        raise ValueError(f"Unsupported quantization type: {quant_type}. Supported: Q4_0, Q8_0, F16")
     gguf_writer = gguf.GGUFWriter(output_gguf_path, arch_name)
 
     copy_tokenizer_metadata(gguf_writer)

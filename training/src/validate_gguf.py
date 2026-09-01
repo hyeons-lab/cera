@@ -10,7 +10,6 @@ Tests for:
 5. Draft Block Diversity & Entropy (asserts non-collapse across draft positions 1..K-1)
 """
 
-import sys
 import os
 import argparse
 import torch
@@ -87,7 +86,10 @@ def test_checkpoint_file(checkpoint_path: str):
     """
     print(f"\nValidating PyTorch Checkpoint: {checkpoint_path}")
     assert os.path.exists(checkpoint_path), f"Checkpoint not found: {checkpoint_path}"
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    try:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     test_markov_transition_properties(state_dict)
 

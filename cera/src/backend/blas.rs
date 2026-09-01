@@ -208,6 +208,9 @@ pub fn sgemm_rowmajor_nn_parallel(
     if n == 0 || m == 0 || k == 0 {
         return;
     }
+    assert!(b.len() >= n * k, "sgemm_rowmajor_nn_parallel: b underflow");
+    assert!(a.len() >= k * m, "sgemm_rowmajor_nn_parallel: a underflow");
+    assert!(c.len() >= n * m, "sgemm_rowmajor_nn_parallel: c underflow");
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         sgemm_rowmajor_nn(n, m, k, b, a, c);

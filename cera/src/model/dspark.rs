@@ -142,8 +142,8 @@ impl DSparkConfig {
             "DSpark head_dim ({head_dim}) must be a positive even integer for RoPE rotation"
         );
         ensure!(
-            intermediate_size > 0,
-            "DSpark intermediate_size must be positive"
+            intermediate_size > 0 && intermediate_size % 32 == 0,
+            "DSpark intermediate_size ({intermediate_size}) must be a positive multiple of 32 for Q8_0 SIMD quantization"
         );
         ensure!(vocab_size > 0, "DSpark vocab_size must be positive");
         ensure!(block_size > 0, "DSpark block_size must be positive");
@@ -321,16 +321,10 @@ impl DSparkSessionDrafter {
     pub fn advance_draft_step(&mut self, token: u32, pos: usize) -> Option<&[f32]> {
         let state = self.state.as_mut()?;
         // Check confidence threshold if present
-        if let Some(conf_w) = self.model.confidence_weight.as_ref() {
-            let conf_dot = cpu::dot_f32(conf_w, &self.scratch_hidden);
-            if !conf_dot.is_finite() {
-                return None;
-            }
-            let clamped_neg_dot = (-conf_dot).clamp(-80.0, 80.0);
-            let prob = 1.0 / (1.0 + clamped_neg_dot.exp());
-            if !prob.is_finite() || prob < 0.35 {
-                return None;
-            }
+        if let Some(conf_w) = self.model.confidence_weight.as_ref()
+            && !Self::check_confidence(conf_w, &self.scratch_hidden)
+        {
+            return None;
         }
         Self::forward_token_id(
             &self.model,
@@ -341,6 +335,17 @@ impl DSparkSessionDrafter {
             &mut self.scratch_normed,
         );
         Some(&self.scratch_hidden)
+    }
+
+    #[inline]
+    fn check_confidence(conf_w: &[f32], hidden: &[f32]) -> bool {
+        let conf_dot = cpu::dot_f32(conf_w, hidden);
+        if !conf_dot.is_finite() {
+            return false;
+        }
+        let clamped_neg_dot = (-conf_dot).clamp(-80.0, 80.0);
+        let prob = 1.0 / (1.0 + clamped_neg_dot.exp());
+        prob.is_finite() && prob >= 0.35
     }
 
     fn forward_token_id(
@@ -860,16 +865,10 @@ impl Drafter for DSparkSessionDrafter {
             let pos = prefix_len + step;
 
             // Check confidence threshold if confidence head is present (evaluated on draft steps > 0)
-            if let Some(conf_w) = self.model.confidence_weight.as_ref().filter(|_| step > 0) {
-                let conf_dot = cpu::dot_f32(conf_w, &self.scratch_hidden);
-                if !conf_dot.is_finite() {
-                    break;
-                }
-                let clamped_neg_dot = (-conf_dot).clamp(-80.0, 80.0);
-                let prob = 1.0 / (1.0 + clamped_neg_dot.exp());
-                if !prob.is_finite() || prob < 0.35 {
-                    break;
-                }
+            if let Some(conf_w) = self.model.confidence_weight.as_ref().filter(|_| step > 0)
+                && !Self::check_confidence(conf_w, &self.scratch_hidden)
+            {
+                break;
             }
 
             // Project logits via base model LM head

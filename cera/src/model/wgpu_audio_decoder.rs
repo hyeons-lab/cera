@@ -1830,9 +1830,12 @@ impl WgpuDepthformer {
         temperature: f32,
         top_k: usize,
     ) -> Result<[i32; 8]> {
+        let mut padded = vec![0.0f32; self.dl_cols];
+        let copy_len = embedding.len().min(self.dl_cols);
+        padded[..copy_len].copy_from_slice(&embedding[..copy_len]);
         self.ctx
             .queue
-            .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(embedding));
+            .write_buffer(&self.embedding_in_buf, 0, bytemuck::cast_slice(&padded));
         self.sample_frame_internal_async(temperature, top_k, None)
             .await
     }

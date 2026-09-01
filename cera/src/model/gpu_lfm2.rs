@@ -3462,10 +3462,12 @@ impl GpuLfm2Model {
         while row_start < m {
             let rows = (m - row_start).min(tile_rows);
             let weight_offset = u64::from(row_start) * row_bytes;
-            let params_buf = self
-                .gemv_tile_params
-                .get(tile_idx)
-                .expect("preallocated LM-head GEMV tile params");
+            let Some(params_buf) = self.gemv_tile_params.get(tile_idx) else {
+                tracing::error!(
+                    "tile_idx {tile_idx} exceeds preallocated LM-head GEMV tile params count"
+                );
+                break;
+            };
             self.ctx.queue.write_buffer(
                 params_buf,
                 0,

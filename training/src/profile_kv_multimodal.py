@@ -6,7 +6,6 @@ Tests processing 4 distinct photos with and without KV Prefix Caching.
 import os
 import time
 import subprocess
-import json
 import tempfile
 from pathlib import Path
 
