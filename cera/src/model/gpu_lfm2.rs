@@ -1262,21 +1262,42 @@ impl GpuLfm2Model {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
-        Self::from_weight_source(&cpu_model, context_size, model_id)
+        let arch = gguf.architecture().unwrap_or("").to_lowercase();
+        match arch.as_str() {
+            "llama" | "qwen2" | "qwen3" | "granite" | "mistral" => {
+                let cpu_model =
+                    super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+                Self::from_weight_source(&cpu_model, context_size, model_id)
+            }
+            _ => {
+                let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+                Self::from_weight_source(&cpu_model, context_size, model_id)
+            }
+        }
     }
 
-    /// Construct an LFM2 GPU model with an externally-built [`GpuContext`].
-    /// The wasm/WebGPU entry point — callers build the context with
+    /// Construct a GPU model with an externally-built [`GpuContext`].
+    /// The wasm/WebGPU entry point: callers build the context with
     /// `GpuContext::new_async().await` (browser init is async) and hand it in.
+    /// Supports LFM2, LFM2-MoE, LLaMA, Mistral, Qwen2, Qwen3, and Granite.
     pub fn from_gguf_with_ctx(
         gguf: GgufFile,
         context_size: usize,
         model_id: String,
         ctx: GpuContext,
     ) -> Result<Self> {
-        let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
-        Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+        let arch = gguf.architecture().unwrap_or("").to_lowercase();
+        match arch.as_str() {
+            "llama" | "qwen2" | "qwen3" | "granite" | "mistral" => {
+                let cpu_model =
+                    super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+                Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+            }
+            _ => {
+                let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+                Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
+            }
+        }
     }
 
     /// Access the underlying GPU context (device, queue, adapter).
@@ -1285,7 +1306,7 @@ impl GpuLfm2Model {
     }
 
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
-    /// Mistral/Granite) — the `LlamaModel` family. Mirrors `from_gguf_with_id`
+    /// Mistral/Granite): the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of
     /// `Lfm2Model`. The GPU forward path is arch-generic; per-arch behavior
     /// (NEOX/NORM rope, QK-norm, QKV bias, untied output, Granite scalars) is

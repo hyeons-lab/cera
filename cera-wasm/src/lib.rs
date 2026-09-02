@@ -2185,10 +2185,10 @@ mod webgpu {
         /// on a single JS `ArrayBuffer` that loading through `create` runs into,
         /// and costs one copy of the model rather than two.
         ///
-        /// Throws for every reason `create` does, plus a bundle the GPU path
-        /// cannot serve: it is LFM2-only. A caller wanting a fallback should catch
-        /// and retry through `CeraEngine.fromBundleId`, which is what
-        /// `cera_worker.js` does for `backend: 'auto'`.
+        /// Throws for every reason `create` does, plus an unsupported architecture.
+        /// A caller wanting a fallback should catch and retry through
+        /// `CeraEngine.fromBundleId`, which is what `cera_worker.js` does for
+        /// `backend: 'auto'`.
         #[wasm_bindgen(js_name = fromBundleId)]
         pub async fn from_bundle_id(
             repo: &crate::bundle::BundleRepo,

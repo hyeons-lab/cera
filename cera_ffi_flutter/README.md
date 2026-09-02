@@ -195,24 +195,14 @@ page.
 What is narrower on the web than on native:
 
 - **`openPath` throws.** There is no filesystem; use `openBundle` or `openBytes`.
-- **The GPU path is LFM2-only.** `WebGpuSession` covers the `lfm2`/`lfm2.5`
-  family. A dense transformer (llama, qwen, granite) still runs, on the CPU
-  fallback, and `backend: CeraBackend.auto` arranges that silently; read
-  `cera.backend` if you need to know which one you got.
-- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
-  to clear it. Close the engine and open it again.
-- **`cancel` is best-effort.** It reaches neither backend's running decode:
-  the CPU decode is one synchronous wasm call occupying the worker, so the
-  message is not delivered until it has already finished, and `WebGpuSession`
-  exposes no cancel entry point at all. Cancelling the `generate` stream's
-  subscription stops delivery to your app immediately either way, which is what
-  a Stop button needs.
-- **Sampling is greedy on the GPU path.** `temperature`, `topP`, `topK` and
-  `seed` are honored on the CPU fallback and ignored on WebGPU, which decodes
-  greedily. Force `CeraBackend.cpu` if you need sampled output in a browser.
 - **The generated bindings are stubs**, as they have always been on the web:
   `dart:ffi` does not exist there. Everything in "The generated bindings" above
   is native-only.
+- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
+  to clear it in place. Close the engine and open it again.
+- **`cancel` is best-effort.** Cancelling the `generate` stream's
+  subscription stops delivery to your app immediately, which is what
+  a Stop button needs.
 
 ## Examples
 

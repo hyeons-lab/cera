@@ -220,8 +220,8 @@ async function ensureModule(moduleUrl) {
  * GPU cannot serve this model, so `auto` can fall through to the CPU.
  *
  * The failure modes are not all detectable up front: `navigator.gpu` can exist
- * while `requestAdapter` yields nothing, and `WebGpuSession` is LFM2-only, so a
- * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
+ * while `requestAdapter` yields nothing, or an unsupported custom architecture
+ * throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
 async function tryGpu(bytes, contextSize, mmproj, turboQuant) {

@@ -40,7 +40,7 @@ enum CeraBackend {
   ///
   /// The two platforms differ, because only one of them can honor the strict
   /// reading. On the **web** this does what it says: no WebGPU, no adapter, or
-  /// a non-LFM2 model (the GPU path is LFM2-only) is an error instead of the
+  /// an unsupported model architecture is an error instead of the
   /// silent CPU fallback [auto] would give. Choose it when a 40x quiet
   /// slowdown would be worse than a failure.
   ///

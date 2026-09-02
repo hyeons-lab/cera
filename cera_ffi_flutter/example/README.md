@@ -35,11 +35,11 @@ browser: it is the difference between roughly 58 tok/s on WebGPU and roughly
 probes for `WebGpuSession` and falls through to the CPU when the wasm does not
 carry it, so the wrong build produces a working demo rather than an error.
 
-Two more things decide whether you are actually on the GPU:
+Two things decide whether you are actually on the GPU:
 
-- **The model must be LFM2.** `WebGpuSession` is LFM2-only; a dense-transformer
-  GGUF throws from `create` and the worker falls back to the CPU, having done
-  nothing wrong.
+- **The model architecture must be supported on WebGPU.** `WebGpuSession` supports
+  `lfm2`/`lfm2.5`/`lfm2moe` as well as dense transformers (`llama`, `qwen2`, `qwen3`,
+  `granite`, `mistral`).
 - **The browser must expose `navigator.gpu`.** WebGPU is allowed on `localhost`
   without HTTPS, so local development needs no certificate.
 
