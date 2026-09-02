@@ -15,10 +15,9 @@
 //! kernel reads `array<f32>`), so there is no f16 cast and the path is a touch
 //! more accurate than Metal's f16 cache.
 //!
-//! Scope (PR1): the detokenizer only, which is the validated win. The
-//! depthformer (code sampling) stays on CPU; `supports_depthformer` reports
-//! that, so `CERA_GPU_DF=1` keeps sampling on the CPU rather than reaching the
-//! `sample_audio_frame` panic here. A WGPU depthformer is a follow-up.
+//! Scope: both the detokenizer and depthformer run on WGPU. The depthformer
+//! samples codebooks with a WGPU compute pipeline while fallback CPU decoding
+//! remains available via `AudioOutputDecoder`.
 //!
 //! The final ISTFT (`istft_to_pcm`) runs on the GPU too: `exp_polar` maps the
 //! polar half-spectrum to complex, a reg-tile GEMM against a precomputed real

@@ -1,6 +1,6 @@
 # Resolve `cera_ffi` from the sibling directory instead of pub.dev.
 #
-# The dependency in pubspec.yaml is a hosted pin (`cera_ffi: 0.5.0`), which is
+# The dependency in pubspec.yaml is a hosted pin (`cera_ffi: 0.5.1`), which is
 # what a published plugin must carry. In this repo that version may not exist on
 # pub.dev yet, and even when it does, the two packages are developed together
 # and a plugin must be tested against the working tree rather than the last

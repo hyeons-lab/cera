@@ -18,7 +18,7 @@ class ChatController extends ValueNotifier<ChatState> {
       super(const ChatState()) {
     const kAppRevisionBadge = 'rev20-clean-cpu-depthformer-webgpu-llm';
     debugPrint(
-      '[cera:chat:version] ChatController v0.5.0 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.5.1 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
