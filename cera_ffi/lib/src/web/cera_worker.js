@@ -1090,6 +1090,7 @@ const OPS = {
   },
 
   close() {
+    this.cancel();
     pendingAudioSuffixTokens = null;
     pendingImage = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own
