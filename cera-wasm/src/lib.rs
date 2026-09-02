@@ -1996,7 +1996,7 @@ mod webgpu {
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
         /// GGUF, upload the model to the GPU, and build a fresh inference
         /// state. `contextSize` defaults to 4096. Throws if WebGPU is
-        /// unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+        /// unavailable, the bytes aren't a valid GGUF, or the device
         /// rejects the model.
         ///
         /// `kvCompression` is optional and defaults to `null` (uncompressed f32
@@ -2006,7 +2006,7 @@ mod webgpu {
         /// (token, KV head) vector, so against f32's 32 bits the KV slabs shrink
         /// ~10.7x rather than the ~12.8x the bit rates alone suggest. Concretely,
         /// for LFM2-1.2B (6 attention layers, 8 KV heads x head_dim 64) that is
-        /// 24 KiB per token down to 2.25 KiB — at a 16K context, 384 MiB
+        /// 24 KiB per token down to 2.25 KiB: at a 16K context, 384 MiB
         /// (~403 MB) of GPU-side KV becomes 36 MiB (~38 MB).
         ///
         /// Both trailing parameters are optional, so to request compression while
@@ -3105,11 +3105,10 @@ mod webgpu {
                 return Ok(String::new());
             }
 
-            // If the prompt starts with BOS (1) or if pos + ids.len() > max_seq_len,
-            // reset sequence state to position 0 so standalone generations don't append to stale context.
-            if ids.first() == Some(&1)
-                || (self.tokenizer.bos_token().is_some()
-                    && ids.first() == self.tokenizer.bos_token().as_ref())
+            // If the prompt starts with BOS, reset sequence state to position 0
+            // so standalone generations don't append to stale context.
+            if self.tokenizer.bos_token().is_some()
+                && ids.first() == self.tokenizer.bos_token().as_ref()
             {
                 self.state.seq_len = 0;
             }

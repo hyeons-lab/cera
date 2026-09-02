@@ -273,7 +273,7 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
  * on a single `ArrayBuffer`, which is what the bundle constructors exist to
  * avoid.
  *
- * A failure *after* the download (a non-LFM2 architecture, the common one) has
+ * A failure *after* the download (e.g. an unsupported custom architecture) has
  * already populated the cache, so the CPU retry behind it loads from the store
  * rather than downloading again.
  */

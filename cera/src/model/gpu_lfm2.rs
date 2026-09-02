@@ -1284,7 +1284,8 @@ impl GpuLfm2Model {
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
             _ => {
-                let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+                let cpu_model =
+                    super::lfm2::Lfm2Model::from_gguf_with_id(gguf, context_size, model_id.clone())?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
         }
@@ -4774,19 +4775,24 @@ impl GpuLfm2Model {
                     state,
                     DecodeTail::LogitsUnsubmitted(TailArgmax::Dispatch),
                 )
-                .expect("LogitsUnsubmitted returned None");
+                .ok_or_else(|| anyhow::anyhow!("LogitsUnsubmitted returned None"))?;
 
-            self.ctx.begin_download_with_encoder(
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.argmax_out_buf,
                 std::mem::size_of::<u32>() as u64,
-            )
-        };
+            ))
+        }?;
 
         let bytes = pending.recv().await?;
-        let mut out = [0u32; 1];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
-        Ok(out[0])
+        if bytes.len() < 4 {
+            anyhow::bail!(
+                "GPU argmax readback buffer truncated (expected 4 bytes, got {})",
+                bytes.len()
+            );
+        }
+        let token = bytemuck::pod_read_unaligned::<u32>(&bytes[..4]);
+        Ok(token)
     }
 
     /// Async (wasm/WebGPU) decode step returning the full logits row, for
@@ -4811,6 +4817,7 @@ impl GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Result<Vec<f32>> {
         let vocab = self.config.vocab_size;
+        let expected_bytes = vocab * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
@@ -4823,20 +4830,26 @@ impl GpuLfm2Model {
                     state,
                     DecodeTail::LogitsUnsubmitted(TailArgmax::None),
                 )
-                .expect("LogitsUnsubmitted returned None");
+                .ok_or_else(|| anyhow::anyhow!("LogitsUnsubmitted returned None"))?;
 
-            self.ctx.begin_download_with_encoder(
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.logits_buf,
-                (vocab * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
 
         let bytes = pending.recv().await?;
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         // Copy into an aligned Vec rather than casting the byte slice: the
         // readback's buffer carries no f32 alignment guarantee.
         let mut out = vec![0f32; vocab];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
@@ -4848,22 +4861,29 @@ impl GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
+        let expected_bytes = hidden_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
             self.gpu_state.seq_len.store(pos, Ordering::Relaxed);
             let enc = self
                 .forward_inner_compute_tail(&[token], pos, state, DecodeTail::HiddenUnsubmitted)
-                .expect("HiddenUnsubmitted returned None");
-            self.ctx.begin_download_with_encoder(
+                .ok_or_else(|| anyhow::anyhow!("HiddenUnsubmitted returned None"))?;
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.hidden_buf,
-                (hidden_size * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
         let bytes = pending.recv().await?;
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU hidden readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut out = vec![0f32; hidden_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
@@ -4875,6 +4895,7 @@ impl GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Result<Vec<f32>> {
         let hidden_size = self.config.hidden_size;
+        let expected_bytes = hidden_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
@@ -4886,16 +4907,22 @@ impl GpuLfm2Model {
                     state,
                     DecodeTail::HiddenUnsubmitted,
                 )
-                .expect("HiddenUnsubmitted returned None");
-            self.ctx.begin_download_with_encoder(
+                .ok_or_else(|| anyhow::anyhow!("HiddenUnsubmitted returned None"))?;
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.hidden_buf,
-                (hidden_size * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
         let bytes = pending.recv().await?;
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU hidden readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut out = vec![0f32; hidden_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
@@ -4945,6 +4972,7 @@ impl GpuLfm2Model {
         state: &mut InferenceState,
     ) -> Result<Vec<f32>> {
         let vocab_size = self.config.vocab_size;
+        let expected_bytes = vocab_size * std::mem::size_of::<f32>();
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
@@ -4956,16 +4984,22 @@ impl GpuLfm2Model {
                     state,
                     DecodeTail::LogitsUnsubmitted(TailArgmax::None),
                 )
-                .expect("LogitsUnsubmitted returned None");
-            self.ctx.begin_download_with_encoder(
+                .ok_or_else(|| anyhow::anyhow!("LogitsUnsubmitted returned None"))?;
+            Ok::<_, anyhow::Error>(self.ctx.begin_download_with_encoder(
                 enc,
                 &self.logits_buf,
-                (vocab_size * std::mem::size_of::<f32>()) as u64,
-            )
-        };
+                expected_bytes as u64,
+            ))
+        }?;
         let bytes = pending.recv().await?;
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut out = vec![0f32; vocab_size];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
