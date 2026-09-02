@@ -984,10 +984,11 @@ jobs:
           KTLINT_BIN="$HOME/.cache/ktlint/ktlint"
           mkdir -p "$HOME/.cache/ktlint"
           if [ ! -x "$KTLINT_BIN" ]; then
-            curl --fail --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSLo "$KTLINT_BIN" \
+            curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused -sSLo "${KTLINT_BIN}.tmp" \
               "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
-            echo "${KTLINT_SHA256}  ${KTLINT_BIN}" | sha256sum -c -
-            chmod +x "$KTLINT_BIN"
+            echo "${KTLINT_SHA256}  ${KTLINT_BIN}.tmp" | sha256sum -c -
+            chmod +x "${KTLINT_BIN}.tmp"
+            mv "${KTLINT_BIN}.tmp" "$KTLINT_BIN"
           fi
           sudo cp "$KTLINT_BIN" /usr/local/bin/ktlint
           ktlint --version
