@@ -622,7 +622,7 @@ const OPS = {
         `[cera:worker] transcribe: running ASR on WebGPU (${samples.length} samples at ${sr}Hz)...`,
       );
       const t0 = performance.now();
-      const tk = gpu.session.tokenizer;
+      const tk = gpu.tokenizer ?? gpu.session.tokenizer;
       let markerName = '<|reserved_4|>';
       let markerId = tk.specialTokenId(markerName);
       if (markerId == null) {

@@ -3105,13 +3105,6 @@ mod webgpu {
                 return Ok(String::new());
             }
 
-            // If the prompt starts with BOS, reset sequence state to position 0
-            // so standalone generations don't append to stale context.
-            if self.tokenizer.bos_token().is_some()
-                && ids.first() == self.tokenizer.bos_token().as_ref()
-            {
-                self.state.seq_len = 0;
-            }
             let max_seq_len = self.model.config().max_seq_len;
             let mut pos = self.state.seq_len;
 
