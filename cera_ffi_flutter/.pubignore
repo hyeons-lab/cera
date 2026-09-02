@@ -27,3 +27,4 @@ build/
 /ios/cera_ffi_flutter/.build/
 /macos/cera_ffi_flutter/.build/
 .cera-xcframework-sha256
+*.bak
