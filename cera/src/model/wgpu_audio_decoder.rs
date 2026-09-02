@@ -1046,8 +1046,18 @@ impl WgpuAudioDecoder {
                     let slice = self.spectrum_staging_buf.slice(0..size);
                     match slice.get_mapped_range() {
                         Ok(data) => {
-                            bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data);
-                            Ok(result)
+                            let expected_bytes =
+                                n_frames * spec_per_frame * std::mem::size_of::<f32>();
+                            if data.len() < expected_bytes {
+                                Err(anyhow::anyhow!(
+                                    "GPU spectrum staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                                    data.len()
+                                ))
+                            } else {
+                                bytemuck::cast_slice_mut(&mut result)
+                                    .copy_from_slice(&data[..expected_bytes]);
+                                Ok(result)
+                            }
                         }
                         Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
                     }
@@ -1212,8 +1222,15 @@ impl WgpuAudioDecoder {
             (total_samples * std::mem::size_of::<f32>()) as u64,
         );
         let bytes = pending.recv().await?;
+        let expected_bytes = total_samples * std::mem::size_of::<f32>();
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU audio readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut pcm = vec![0f32; total_samples];
-        bytemuck::cast_slice_mut(&mut pcm).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut pcm).copy_from_slice(&bytes[..expected_bytes]);
         let padding = (n_fft - hop_length) / 2;
         if pcm.len() > padding {
             pcm.drain(..padding);

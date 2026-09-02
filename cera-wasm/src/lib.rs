@@ -2185,7 +2185,7 @@ mod webgpu {
         /// on a single JS `ArrayBuffer` that loading through `create` runs into,
         /// and costs one copy of the model rather than two.
         ///
-        /// Throws for every reason `create` does, plus an unsupported architecture.
+        /// Throws for every reason `create` does, plus bundle download/manifest errors.
         /// A caller wanting a fallback should catch and retry through
         /// `CeraEngine.fromBundleId`, which is what `cera_worker.js` does for
         /// `backend: 'auto'`.

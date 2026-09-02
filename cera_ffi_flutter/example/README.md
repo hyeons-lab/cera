@@ -39,7 +39,7 @@ Two things decide whether you are actually on the GPU:
 
 - **The model architecture must be supported on WebGPU.** `WebGpuSession` supports
   `lfm2`/`lfm2.5`/`lfm2moe` as well as dense transformers (`llama`, `qwen2`, `qwen3`,
-  `granite`, `mistral`).
+  `granite`, with classic Mistral served under `llama`).
 - **The browser must expose `navigator.gpu`.** WebGPU is allowed on `localhost`
   without HTTPS, so local development needs no certificate.
 

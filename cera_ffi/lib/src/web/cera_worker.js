@@ -1084,15 +1084,15 @@ const OPS = {
     // Terminating the worker would, but this protocol is documented as usable
     // standalone, where open/close cycles would otherwise accumulate them.
     if (cpu) {
-      cpu.tokenizer.free();
-      cpu.session.free();
-      cpu.engine.free();
+      cpu.tokenizer?.free();
+      cpu.session?.free();
+      cpu.engine?.free();
       cpu = null;
     }
     if (gpu) {
       gpu.cancelHandle?.free();
-      gpu.tokenizer.free();
-      gpu.session.free();
+      gpu.tokenizer?.free();
+      gpu.session?.free();
       gpu = null;
     }
     backendLabel = 'none';

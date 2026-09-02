@@ -1269,7 +1269,7 @@ impl GpuLfm2Model {
     /// Construct a GPU model with an externally-built [`GpuContext`].
     /// The wasm/WebGPU entry point: callers build the context with
     /// `GpuContext::new_async().await` (browser init is async) and hand it in.
-    /// Supports LFM2, LFM2-MoE, LLaMA, Mistral, Qwen2, Qwen3, and Granite.
+    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, with classic Mistral served under `llama`).
     pub fn from_gguf_with_ctx(
         gguf: GgufFile,
         context_size: usize,
@@ -6567,8 +6567,15 @@ impl GpuLfm2Model {
         };
 
         let bytes = pending.recv().await?;
+        let expected_bytes = n * vocab * std::mem::size_of::<f32>();
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU prefill logits readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut out = vec![0.0f32; n * vocab];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
@@ -6649,8 +6656,15 @@ impl GpuLfm2Model {
         };
 
         let bytes = pending.recv().await?;
+        let expected_bytes = n * std::mem::size_of::<u32>();
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU prefill argmax readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut out = vec![0u32; n];
-        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut out).copy_from_slice(&bytes[..expected_bytes]);
         Ok(out)
     }
 
