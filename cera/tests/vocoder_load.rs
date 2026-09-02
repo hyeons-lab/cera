@@ -220,7 +220,7 @@ fn test_end_to_end_tts_synthesis() {
     let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
     let detok_w = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf).unwrap();
 
-    let prompt = "<|startoftext|><|im_start|>system\nPerform TTS. Use the US female voice.<|im_end|>\n<|im_start|>user\nHello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B · Q4_0 model powered by Cera.<|im_end|>\n<|im_start|>assistant\n";
+    let prompt = "<|startoftext|><|im_start|>system\nPerform TTS. Use the US female voice.<|im_end|>\n<|im_start|>user\nHello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.<|im_end|>\n<|im_start|>assistant\n";
     let ids = tk.encode_special(prompt, false);
 
     use cera::model::Model;
@@ -341,7 +341,7 @@ fn test_end_to_end_tts_synthesis_gpu_parity() {
     )
     .unwrap();
 
-    let prompt = "<|startoftext|><|im_start|>system\nPerform TTS. Use the US female voice.<|im_end|>\n<|im_start|>user\nHello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B · Q4_0 model powered by Cera.<|im_end|>\n<|im_start|>assistant\n";
+    let prompt = "<|startoftext|><|im_start|>system\nPerform TTS. Use the US female voice.<|im_end|>\n<|im_start|>user\nHello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.<|im_end|>\n<|im_start|>assistant\n";
     let ids = tk.encode_special(prompt, false);
 
     use cera::model::Model;

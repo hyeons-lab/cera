@@ -4,11 +4,14 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
+import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
+import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
 import 'package:cera_ffi_flutter_example/widgets/bundle_picker_dialog.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
+import 'package:cera_ffi_flutter_example/widgets/tts_studio_view.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -145,6 +148,41 @@ void main() {
       // Verify bundle list renders with DSpark sidecar indicators
       expect(find.text('LFM2.5-1.2B-Instruct'), findsWidgets);
       expect(find.textContaining('DSpark'), findsWidgets);
+    },
+  );
+
+  testWidgets(
+    'tts studio view initializes with clean default text without quant suffix',
+    (WidgetTester tester) async {
+      const bundle = BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B',
+      );
+      final state = const ChatState().copyWith(loadedModel: () => bundle);
+      final controller = ChatController();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TtsStudioView(
+              state: state,
+              controller: controller,
+              onOpenCatalog: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text(
+          'Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('· Q4_0'), findsNothing);
     },
   );
 }

@@ -551,7 +551,7 @@ fn test_tts_studio_default_sample_text_synthesis() {
     let model = Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
 
-    let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B-GGUF (Q4_0) model powered by Cera.";
+    let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.";
     let messages = [
         cera::tokenizer::ChatMessage {
             role: "system".into(),
@@ -613,6 +613,81 @@ fn test_tts_studio_default_sample_text_synthesis() {
 }
 
 #[test]
+fn test_tts_studio_default_sample_text_synthesis_us_male_voice() {
+    let Some((model_gguf, vocoder_gguf)) = load_models() else {
+        return;
+    };
+    let tokenizer =
+        cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).expect("Failed to load tokenizer");
+    let model = Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
+
+    let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.";
+    let messages = [
+        cera::tokenizer::ChatMessage {
+            role: "system".into(),
+            content: "Perform TTS. Use the US male voice.".into(),
+        },
+        cera::tokenizer::ChatMessage {
+            role: "user".into(),
+            content: sample_text.into(),
+        },
+    ];
+    let formatted = cera::tokenizer::apply_chat_template(&tokenizer, &messages, true)
+        .expect("Failed to apply chat template");
+    let tokens = tokenizer.encode(&formatted);
+    println!("Prompt tokens count (US male voice): {}", tokens.len());
+
+    for (pos, &tok) in tokens.iter().enumerate() {
+        model.forward(&[tok], pos, &mut state);
+    }
+
+    let dec_w = AudioDecoderWeights::from_gguf(&vocoder_gguf).expect("Failed to load vocoder");
+    let detok_w = DetokenizerWeights::from_gguf(&vocoder_gguf).expect("Failed to load detok");
+    let mut decoder =
+        cera::audio_engine::AudioOutputDecoder::new(&dec_w, &detok_w, None, 0.0, 1, false);
+
+    let mut pos = tokens.len();
+    let mut emb = model.forward_embedding(&[128], pos, &mut state);
+    pos += 1;
+
+    let mut voiced_count = 0;
+    let mut silent_count = 0;
+    for f in 0..80 {
+        let outcome = decoder.decode_frame(&emb);
+        match outcome {
+            cera::audio_engine::FrameOutcome::End => {
+                println!("Frame {f:2}: END token");
+                break;
+            }
+            cera::audio_engine::FrameOutcome::Codes {
+                audio_embedding,
+                pcm,
+                codes,
+            } => {
+                let sum_sq: f32 = pcm.iter().map(|&x| x * x).sum();
+                let rms = (sum_sq / pcm.len().max(1) as f32).sqrt();
+                if rms >= 0.001 {
+                    voiced_count += 1;
+                    silent_count = 0;
+                } else {
+                    silent_count += 1;
+                }
+                println!(
+                    "Male Voice Frame {f:2} (pos={pos}): rms={rms:.4}, voiced={voiced_count}, silent={silent_count}, codes={codes:?}"
+                );
+                emb = model.forward_hidden_from_embedding(&audio_embedding, pos, &mut state);
+                pos += 1;
+            }
+        }
+    }
+    assert!(
+        voiced_count >= 10,
+        "TTS synthesis with US male voice must generate voiced frames (got {voiced_count})"
+    );
+}
+
+#[test]
 #[cfg(feature = "gpu")]
 fn test_tts_studio_default_sample_text_synthesis_gpu() {
     let Some((model_gguf, vocoder_gguf)) = load_models() else {
@@ -628,7 +703,7 @@ fn test_tts_studio_default_sample_text_synthesis_gpu() {
     .unwrap();
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
 
-    let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B   Q4_0 model powered by Cera.";
+    let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.";
     let messages = [
         cera::tokenizer::ChatMessage {
             role: "system".into(),
