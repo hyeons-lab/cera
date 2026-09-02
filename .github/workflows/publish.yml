@@ -170,6 +170,11 @@ jobs:
             exit 0
           fi
 
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not set. Configure CARGO_REGISTRY_TOKEN in repository secrets or uncheck crates when dispatching." >&2
+            exit 1
+          fi
+
           echo "=== PUBLISHING TO crates.io ==="
 
           crate_version() {
@@ -193,7 +198,7 @@ jobs:
           # `cera` dep against. The API returns 200 almost immediately, but the
           # index can lag, so a dependent publish would otherwise fail.
           index_has() {
-            curl -sS "https://index.crates.io/$(index_prefix "$1")/$1" 2>/dev/null \
+            curl -sS --connect-timeout 10 --max-time 20 "https://index.crates.io/$(index_prefix "$1")/$1" 2>/dev/null \
               | grep -q "\"vers\":\"$2\""
           }
 
@@ -561,14 +566,24 @@ jobs:
             exit 0
           fi
 
+          if [ -z "${ORG_GRADLE_PROJECT_mavenCentralUsername:-}" ] || [ -z "${ORG_GRADLE_PROJECT_mavenCentralPassword:-}" ]; then
+            echo "::error::Maven Central credentials (MAVEN_CENTRAL_USERNAME/PASSWORD) are not set. Configure them in repository secrets or uncheck jvm when dispatching." >&2
+            exit 1
+          fi
+
+          if [ -z "${ORG_GRADLE_PROJECT_signingInMemoryKey:-}" ] || [ -z "${ORG_GRADLE_PROJECT_signingInMemoryKeyPassword:-}" ]; then
+            echo "::error::GPG signing keys (MAVEN_SIGNING_KEY/PASSWORD) are not set. Configure them in repository secrets to sign non-SNAPSHOT Maven Central releases." >&2
+            exit 1
+          fi
+
           # Idempotent: unlike a snapshot, a released version cannot be
           # re-published to Maven Central, so skip if the coordinate is already
           # live. The JVM module's POM stands in for the whole deployment (both
           # modules release together under the same version). NOTE: Maven Central
-          # → repo1 sync can lag minutes after a release, so an immediate rerun
+          # -> repo1 sync can lag minutes after a release, so an immediate rerun
           # may not yet see it; wait before re-dispatching the jvm leg.
           pom_url="https://repo1.maven.org/maven2/com/hyeons-lab/cera-ffi-jvm/${VERSION}/cera-ffi-jvm-${VERSION}.pom"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
+          code=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
           if [ "$code" = "200" ]; then
             echo "✓ cera-ffi ${VERSION} already on Maven Central — skipping"
             exit 0
@@ -775,14 +790,14 @@ jobs:
           fi
 
           echo "=== Publishing cera_ffi@${VERSION} to pub.dev ==="
-          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
           if [ "$pkg_status" = "200" ]; then
             echo "✓ cera_ffi@${VERSION} already on pub.dev — skipping"
           else
             ( cd cera_ffi && dart pub publish --force )
             propagated=false
             for i in $(seq 1 30); do
-              status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+              status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
               if [ "$status" = "200" ]; then
                 echo "  cera_ffi@${VERSION} visible on pub.dev"
                 propagated=true
@@ -856,7 +871,7 @@ jobs:
           fi
 
           echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
-          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
           if [ "$pkg_status" = "200" ]; then
             echo "✓ cera_ffi_flutter@${VERSION} already on pub.dev — skipping"
             exit 0
