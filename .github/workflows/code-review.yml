@@ -18,7 +18,7 @@ on:
           - high
           - max
   pull_request:
-    types: [opened, synchronize, labeled]
+    types: [opened, labeled]
   issue_comment:
     types: [created]
   pull_request_review_comment:
@@ -37,10 +37,22 @@ jobs:
       group: ${{ format('code-review-{0}', inputs.pull_number || github.event.pull_request.number || github.event.issue.number || github.ref) }}
       cancel-in-progress: true
     if: |
-      (github.event_name == 'workflow_dispatch') ||
-      (github.event_name == 'pull_request' && (github.event.action == 'opened' || contains(github.event.pull_request.labels.*.name, 'needs antigravity review')) && (github.event.pull_request.head.repo.full_name == github.repository)) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && (contains(github.event.comment.body, '@antigravity') || contains(github.event.comment.body, '@Antigravity')) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review_comment' && (contains(github.event.comment.body, '@antigravity') || contains(github.event.comment.body, '@Antigravity')) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+      (github.actor != 'dependabot[bot]') && (
+        (github.event_name == 'workflow_dispatch') ||
+        (github.event_name == 'pull_request' && (
+          github.event.action == 'opened' ||
+          contains(github.event.pull_request.labels.*.name, 'needs antigravity review') ||
+          contains(github.event.pull_request.labels.*.name, 'antigravity-review')
+        ) && (github.event.pull_request.head.repo.full_name == github.repository)) ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request && (
+          contains(github.event.comment.body, '@antigravity') ||
+          contains(github.event.comment.body, '@Antigravity')
+        ) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' && (
+          contains(github.event.comment.body, '@antigravity') ||
+          contains(github.event.comment.body, '@Antigravity')
+        ) && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
