@@ -402,8 +402,8 @@ const OPS = {
       if (!(await tryGpu(view, ctx, proj, turboQuant))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
-            'navigator.gpu, no adapter could be acquired, or the model is not ' +
-            'an LFM2 GGUF (the only architecture with a browser GPU path). ' +
+            'navigator.gpu, no adapter could be acquired, or the model architecture ' +
+            'is unsupported on the browser GPU path. ' +
             'Use backend: auto to fall back to the CPU instead.',
         );
       }

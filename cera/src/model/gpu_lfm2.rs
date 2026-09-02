@@ -1262,18 +1262,8 @@ impl GpuLfm2Model {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        let arch = gguf.architecture().unwrap_or("").to_lowercase();
-        match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" | "mistral" => {
-                let cpu_model =
-                    super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
-                Self::from_weight_source(&cpu_model, context_size, model_id)
-            }
-            _ => {
-                let cpu_model = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
-                Self::from_weight_source(&cpu_model, context_size, model_id)
-            }
-        }
+        let ctx = GpuContext::new()?;
+        Self::from_gguf_with_ctx(gguf, context_size, model_id, ctx)
     }
 
     /// Construct a GPU model with an externally-built [`GpuContext`].

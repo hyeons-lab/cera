@@ -335,9 +335,9 @@ abstract interface class Cera {
   /// permission error partway into a multi-gigabyte download.
   ///
   /// The backend follows [CeraOptions.backend] as it does for [openBytes],
-  /// including the web's GPU-then-CPU fallback. Note that the browser GPU path
-  /// serves LFM2 bundles only, so a non-LFM2 choice there means the wasm CPU
-  /// backend and a large slowdown; [backend] reports which one took effect.
+  /// including the web's GPU-then-CPU fallback. If a model architecture is
+  /// unsupported on WebGPU, it automatically falls back to the wasm CPU
+  /// backend; [backend] reports which one took effect.
   static Future<Cera> openBundle(
     String name,
     String quant, {
