@@ -1040,10 +1040,14 @@ impl Session {
         }
         // The slot is always `Some` after the rebuild block (rebuild covers the
         // `is_none()` case), so this unwrap never fires.
-        let state = self
-            .hs_scratch
-            .as_mut()
-            .expect("hs_scratch is Some after the rebuild block");
+        let state = match self.hs_scratch.as_mut() {
+            Some(s) => s,
+            None => {
+                return Err(CeraError::Backend(
+                    "hs_scratch is None after rebuild block".into(),
+                ));
+            }
+        };
         if !rebuild {
             state.clear_for_reuse();
         }
@@ -1933,6 +1937,7 @@ impl Session {
         });
         if let Some(sd) = spec_opt
             && greedy
+            && self.audio_decoder.is_none()
             && self.model.supports_all_logits()
             && !self.state.is_compressed()
         {
@@ -2030,17 +2035,14 @@ impl Session {
         // two `generate(N/2)` calls with the same seed.
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
-                Some(
-                    crate::audio_engine::AudioOutputDecoder::new(dec, detok, None, 0.8, 4, false)
-                        .with_streaming(false),
-                )
+                Some(crate::audio_engine::AudioOutputDecoder::new(
+                    dec, detok, None, 0.7, 40, false,
+                ))
             } else {
                 None
             };
-        let mut modality_budget = 6usize;
+        let mut modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
         let mut text_done = false;
-        let mut trailing_audio_segments: usize = 0;
-        const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -2062,12 +2064,12 @@ impl Session {
                 sample_scratch.extend_from_slice(&logits);
                 // Mask only while armed. During the lazy pre-trigger phase (or
                 // after a completed tool call) decode is unconstrained.
-                if armed && let Some(state) = grammar_state.as_ref() {
+                if armed
+                    && let Some(state) = grammar_state.as_ref()
+                    && let Some(mask) = grammar_mask.as_ref()
+                {
                     // Mask logits to grammar-allowed tokens (EOS only when complete).
-                    let allowed = grammar_mask
-                        .as_ref()
-                        .expect("grammar_mask present when grammar_state is")
-                        .apply(state, &mut sample_scratch);
+                    let allowed = mask.apply(state, &mut sample_scratch);
                     if allowed == 0 {
                         finish = FinishReason::GrammarDeadEnd;
                         break;
@@ -2146,15 +2148,16 @@ impl Session {
             // the current position, so the drafts are rejected and the round is
             // wasted. Output stays correct either way (`verify_draft` re-derives
             // every token), which is exactly why the gap would go unnoticed.
-            let is_audio_transition = token == crate::audio_engine::TOKEN_AUDIO_START
-                || token == crate::audio_engine::TOKEN_TEXT_END;
-            if token == crate::audio_engine::TOKEN_TEXT_END {
+            let is_audio_transition = decoder.is_some()
+                && (token == crate::audio_engine::TOKEN_TEXT_END
+                    || token == crate::audio_engine::TOKEN_AUDIO_START);
+            if is_audio_transition && token == crate::audio_engine::TOKEN_TEXT_END {
                 text_done = true;
             }
 
+            self.token_history.push(token);
             if !is_audio_transition {
                 pending.push(token);
-                self.token_history.push(token);
                 generated += 1;
                 modality_budget = modality_budget.saturating_sub(1);
             }
@@ -2163,13 +2166,6 @@ impl Session {
                 && (is_audio_transition || (modality_budget == 0 || text_done))
                 && pos < self.max_seq_len
             {
-                if text_done {
-                    trailing_audio_segments += 1;
-                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
-                        break;
-                    }
-                }
-
                 if !pending.is_empty() {
                     sink.on_text_tokens(&pending);
                     pending.clear();
@@ -2178,21 +2174,41 @@ impl Session {
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
                 pos += 1;
 
-                let mut audio_budget = 12usize;
-                let mut end_reached = false;
+                let mut audio_budget =
+                    if token == crate::audio_engine::TOKEN_AUDIO_START || text_done {
+                        usize::MAX
+                    } else {
+                        crate::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET
+                    };
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         finish = FinishReason::Cancelled;
                         break;
                     }
-                    if generated >= opts.max_tokens || pos >= self.max_seq_len {
+                    if dec.is_safety_limit_reached() {
+                        break;
+                    }
+                    if pos >= self.max_seq_len {
+                        finish = FinishReason::ContextFull;
                         break;
                     }
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
                         crate::audio_engine::FrameOutcome::End => {
-                            text_done = true;
-                            end_reached = true;
+                            if is_audio_transition || text_done {
+                                break;
+                            }
+                            let text_end_logits = self.model.forward(
+                                &[crate::audio_engine::TOKEN_TEXT_END],
+                                pos,
+                                &mut self.state,
+                            );
+                            if greedy {
+                                greedy_next = crate::sampler::argmax(&text_end_logits);
+                            }
+                            logits = text_end_logits;
+                            pos += 1;
+                            modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             break;
                         }
                         crate::audio_engine::FrameOutcome::Codes {
@@ -2200,8 +2216,12 @@ impl Session {
                             pcm,
                             ..
                         } => {
+                            dec.observe_pcm(&pcm);
                             if !pcm.is_empty() {
                                 sink.on_audio_frames(&pcm, dec.sample_rate());
+                            }
+                            if (is_audio_transition || text_done) && dec.is_silence_terminated() {
+                                break;
                             }
                             audio_embedding
                         }
@@ -2217,7 +2237,7 @@ impl Session {
                             greedy_next = crate::sampler::argmax(&logits);
                         }
                         pos += 1;
-                        modality_budget = 6;
+                        modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
                         break;
                     }
 
@@ -2225,19 +2245,23 @@ impl Session {
                         self.model
                             .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
                     pos += 1;
-                    generated += 1;
+                    self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
 
-                if end_reached
-                    || finish == FinishReason::Cancelled
-                    || generated >= opts.max_tokens
-                    || pos >= self.max_seq_len
-                {
+                if is_audio_transition || text_done {
+                    if finish == FinishReason::MaxTokens {
+                        finish = FinishReason::Stop;
+                    }
                     break;
                 }
-                if audio_budget == 0 && !text_done {
-                    continue;
+                if finish == FinishReason::Cancelled || generated >= opts.max_tokens {
+                    break;
                 }
+                if pos >= self.max_seq_len {
+                    finish = FinishReason::ContextFull;
+                    break;
+                }
+                continue;
             }
 
             let should_flush_n = pending.len() >= flush_n;

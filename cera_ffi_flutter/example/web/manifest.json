@@ -1,11 +1,11 @@
 {
-    "name": "cera_ffi_flutter_example",
-    "short_name": "cera_ffi_flutter_example",
+    "name": "Cera - In-Browser WebGPU LLM & Voice Chat",
+    "short_name": "Cera",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#0b0c0e",
+    "theme_color": "#0b0c0e",
+    "description": "Run multimodal LLMs, real-time voice chat, and vision models directly in your browser with WebGPU hardware acceleration and zero server dependencies.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

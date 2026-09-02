@@ -51,6 +51,104 @@ pub struct AudioGenerateResult {
 pub const TOKEN_AUDIO_START: u32 = 128;
 pub const TOKEN_TEXT_END: u32 = 130;
 pub const AUDIO_END_CODE: i32 = 2048;
+pub const DEFAULT_INTERLEAVED_TEXT_BUDGET: usize = 6;
+pub const DEFAULT_INTERLEAVED_AUDIO_BUDGET: usize = 12;
+pub const AUDIO_SAFETY_FRAME_LIMIT: usize = 4096;
+
+/// Standard silence detection watchdog for voice synthesis across native and WebAssembly engines.
+/// Tracks RMS energy across frames and detects natural trailing speech termination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSilenceWatchdog {
+    pub total_voiced_frames: usize,
+    pub consecutive_silent_frames: usize,
+    pub audio_frames_count: usize,
+    pub rms_threshold: f32,
+    pub min_voiced_frames: usize,
+    pub silent_frames_cutoff: usize,
+    pub silent_frames_cutoff_voiced: usize,
+}
+
+impl Default for AudioSilenceWatchdog {
+    fn default() -> Self {
+        Self {
+            total_voiced_frames: 0,
+            consecutive_silent_frames: 0,
+            audio_frames_count: 0,
+            rms_threshold: 0.001,
+            min_voiced_frames: 5,
+            silent_frames_cutoff: 30,
+            silent_frames_cutoff_voiced: 25,
+        }
+    }
+}
+
+impl AudioSilenceWatchdog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn new_with_thresholds(
+        rms_threshold: f32,
+        min_voiced_frames: usize,
+        silent_frames_cutoff: usize,
+        silent_frames_cutoff_voiced: usize,
+    ) -> Self {
+        Self {
+            total_voiced_frames: 0,
+            consecutive_silent_frames: 0,
+            audio_frames_count: 0,
+            rms_threshold,
+            min_voiced_frames,
+            silent_frames_cutoff,
+            silent_frames_cutoff_voiced,
+        }
+    }
+
+    /// Observe a new decoded PCM buffer and update silence/voiced counters.
+    /// Returns the computed RMS energy.
+    #[inline]
+    pub fn observe_pcm(&mut self, pcm: &[f32]) -> f32 {
+        self.audio_frames_count += 1;
+        if pcm.is_empty() {
+            self.consecutive_silent_frames += 1;
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        let mut valid_samples = 0usize;
+        for &x in pcm {
+            if x.is_finite() {
+                sum += x * x;
+                valid_samples += 1;
+            }
+        }
+        if valid_samples == 0 {
+            self.consecutive_silent_frames += 1;
+            return 0.0;
+        }
+        let rms = (sum / valid_samples as f32).sqrt();
+        if rms >= self.rms_threshold {
+            self.total_voiced_frames += 1;
+            self.consecutive_silent_frames = 0;
+        } else {
+            self.consecutive_silent_frames += 1;
+        }
+        rms
+    }
+
+    /// Check if trailing silence has reached the termination threshold.
+    #[inline]
+    pub fn is_silence_terminated(&self) -> bool {
+        self.consecutive_silent_frames >= self.silent_frames_cutoff
+            || (self.total_voiced_frames >= self.min_voiced_frames
+                && self.consecutive_silent_frames >= self.silent_frames_cutoff_voiced)
+    }
+
+    /// Check if the safety frame ceiling has been reached.
+    #[inline]
+    pub fn is_safety_limit_reached(&self) -> bool {
+        self.audio_frames_count >= AUDIO_SAFETY_FRAME_LIMIT
+    }
+}
 
 #[derive(PartialEq)]
 enum Modality {
@@ -105,6 +203,8 @@ pub struct AudioOutputDecoder<'a> {
     streaming: bool,
     /// Buffered sampled codes across frames (used when `streaming == false`).
     all_codes: Vec<i32>,
+    /// Unified silence and loop safety watchdog.
+    pub watchdog: AudioSilenceWatchdog,
 }
 
 impl<'a> AudioOutputDecoder<'a> {
@@ -137,6 +237,29 @@ impl<'a> AudioOutputDecoder<'a> {
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
         self
+    }
+
+    /// Observe PCM output from a decoded frame and update silence/voiced counters.
+    /// Returns the computed RMS energy.
+    #[inline]
+    pub fn observe_pcm(&mut self, pcm: &[f32]) -> f32 {
+        if !self.streaming {
+            self.watchdog.audio_frames_count += 1;
+            return 0.0;
+        }
+        self.watchdog.observe_pcm(pcm)
+    }
+
+    /// Check if trailing silence has reached the termination threshold.
+    #[inline]
+    pub fn is_silence_terminated(&self) -> bool {
+        self.streaming && self.watchdog.is_silence_terminated()
+    }
+
+    /// Check if the safety frame limit (4096 frames) has been reached.
+    #[inline]
+    pub fn is_safety_limit_reached(&self) -> bool {
+        self.watchdog.is_safety_limit_reached()
     }
 
     pub fn new(
@@ -176,6 +299,7 @@ impl<'a> AudioOutputDecoder<'a> {
             use_gpu_df: gpu_depthformer && gpu.is_some_and(|g| g.supports_depthformer()),
             streaming: true,
             all_codes: Vec::new(),
+            watchdog: AudioSilenceWatchdog::new(),
         }
     }
 
@@ -551,18 +675,12 @@ pub fn generate_audio(
 
     // Interleaved mode counters.
     let mut modality_budget = match config.mode {
-        AudioMode::Interleaved => 6, // start with 6 text tokens
+        AudioMode::Interleaved => DEFAULT_INTERLEAVED_TEXT_BUDGET, // start with default text tokens
         AudioMode::Sequential => usize::MAX,
     };
     let mut text_done = false;
 
     let mut next_token = sampler.sample(&mut logits);
-
-    // Track consecutive audio segments after text_done to detect trailing garbage.
-    // When the model finishes text (text_done) but doesn't emit audio_end cleanly,
-    // we cap the number of trailing audio segments to avoid infinite generation.
-    let mut trailing_audio_segments: usize = 0;
-    const MAX_TRAILING_AUDIO_SEGMENTS: usize = 3;
 
     'outer: loop {
         if generated >= config.max_tokens || pos >= model_config.max_seq_len {
@@ -579,7 +697,7 @@ pub fn generate_audio(
             if next_token == TOKEN_AUDIO_START {
                 modality = Modality::Audio;
                 modality_budget = match config.mode {
-                    AudioMode::Interleaved => 12,
+                    AudioMode::Interleaved => DEFAULT_INTERLEAVED_AUDIO_BUDGET,
                     AudioMode::Sequential => usize::MAX,
                 };
                 continue;
@@ -609,21 +727,17 @@ pub fn generate_audio(
             // extracts from the decode of the LAST text token.
             if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
             {
-                if text_done {
-                    trailing_audio_segments += 1;
-                    if trailing_audio_segments > MAX_TRAILING_AUDIO_SEGMENTS {
-                        break;
-                    }
-                }
-
                 let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
                 pos += 1;
 
                 modality = Modality::Audio;
-                modality_budget = 12;
+                modality_budget = DEFAULT_INTERLEAVED_AUDIO_BUDGET;
 
                 // Run audio loop with this embedding.
                 loop {
+                    if pos >= model_config.max_seq_len || decoder.is_safety_limit_reached() {
+                        break;
+                    }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
                         FrameOutcome::End => {
@@ -633,7 +747,6 @@ pub fn generate_audio(
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
-                            generated += 1;
                             break;
                         }
                         FrameOutcome::Codes {
@@ -641,8 +754,12 @@ pub fn generate_audio(
                             pcm,
                             ..
                         } => {
+                            decoder.observe_pcm(&pcm);
                             if !pcm.is_empty() {
                                 audio_callback(&pcm, decoder.sample_rate());
+                            }
+                            if text_done && decoder.is_silence_terminated() {
+                                break;
                             }
                             audio_embedding
                         }
@@ -664,7 +781,6 @@ pub fn generate_audio(
 
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                     pos += 1;
-                    generated += 1;
                 }
 
                 if text_done {
@@ -673,7 +789,7 @@ pub fn generate_audio(
 
                 // Switch back to text.
                 modality = Modality::Text;
-                modality_budget = 6;
+                modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                 continue;
             }
 
@@ -689,10 +805,10 @@ pub fn generate_audio(
             pos += 1;
             generated += 1;
 
-            let mut voiced_frames = 0usize;
-            let mut consecutive_silent_frames = 0usize;
-
             loop {
+                if pos >= model_config.max_seq_len || decoder.is_safety_limit_reached() {
+                    break 'outer;
+                }
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
                     FrameOutcome::End => match config.mode {
@@ -705,17 +821,12 @@ pub fn generate_audio(
                             break 'outer;
                         }
                         AudioMode::Interleaved => {
-                            // Interleaved: transition back to text. The
-                            // trailing-audio-segments cap
-                            // (MAX_TRAILING_AUDIO_SEGMENTS) bounds runaway
-                            // post-audio cycles in the text branch above.
-                            // Reachable here when the model emits
-                            // TOKEN_AUDIO_START explicitly (line ~273) — the
-                            // text-branch's budget-driven Interleaved block
-                            // has its own audio loop that handles End inline.
+                            // Interleaved: transition back to text. Trailing
+                            // silence detection and safety frame limits bound
+                            // runaway cycles.
                             modality = Modality::Text;
                             text_done = true;
-                            modality_budget = 6;
+                            modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
@@ -727,21 +838,12 @@ pub fn generate_audio(
                         pcm,
                         ..
                     } => {
+                        decoder.observe_pcm(&pcm);
                         if !pcm.is_empty() {
-                            let rms = (pcm.iter().map(|&x| x * x).sum::<f32>()
-                                / pcm.len().max(1) as f32)
-                                .sqrt();
-                            if rms >= 0.001 {
-                                voiced_frames += 1;
-                                consecutive_silent_frames = 0;
-                            } else {
-                                consecutive_silent_frames += 1;
-                            }
                             audio_callback(&pcm, decoder.sample_rate());
                         }
-                        if matches!(config.mode, AudioMode::Sequential)
-                            && voiced_frames >= 5
-                            && consecutive_silent_frames >= 40
+                        if (matches!(config.mode, AudioMode::Sequential) || text_done)
+                            && decoder.is_silence_terminated()
                         {
                             break 'outer;
                         }
@@ -758,7 +860,7 @@ pub fn generate_audio(
                     && !text_done
                 {
                     modality = Modality::Text;
-                    modality_budget = 6;
+                    modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                     logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
                     next_token = sampler.sample(&mut logits);
                     pos += 1;
@@ -768,12 +870,11 @@ pub fn generate_audio(
                 // Feed codes back as embedding → next hidden state.
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                 pos += 1;
-                generated += 1;
             }
         }
     }
 
-    // Batch ISTFT: all accumulated spectrum → PCM in one pass with proper overlap.
+    // Drain any remaining buffered samples or execute batch ISTFT.
     let audio_samples = decoder.finish(&mut audio_callback);
 
     Ok(AudioGenerateResult {
@@ -784,4 +885,106 @@ pub fn generate_audio(
         depthformer_secs: decoder.time_depthformer.as_secs_f64(),
         detokenizer_secs: decoder.time_detokenizer.as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_silence_watchdog_initial_state() {
+        let watchdog = AudioSilenceWatchdog::new();
+        assert_eq!(watchdog.audio_frames_count, 0);
+        assert_eq!(watchdog.total_voiced_frames, 0);
+        assert_eq!(watchdog.consecutive_silent_frames, 0);
+        assert!(!watchdog.is_silence_terminated());
+        assert!(!watchdog.is_safety_limit_reached());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_unvoiced_cutoff() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let silent_pcm = vec![0.0f32; 1920];
+
+        for _ in 0..29 {
+            watchdog.observe_pcm(&silent_pcm);
+            assert!(!watchdog.is_silence_terminated());
+        }
+        watchdog.observe_pcm(&silent_pcm);
+        assert!(watchdog.is_silence_terminated());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_voiced_cutoff() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let voiced_pcm = vec![0.05f32; 1920];
+        let silent_pcm = vec![0.0f32; 1920];
+
+        for _ in 0..5 {
+            watchdog.observe_pcm(&voiced_pcm);
+        }
+        assert_eq!(watchdog.total_voiced_frames, 5);
+        assert_eq!(watchdog.consecutive_silent_frames, 0);
+        assert!(!watchdog.is_silence_terminated());
+
+        for _ in 0..24 {
+            watchdog.observe_pcm(&silent_pcm);
+            assert!(!watchdog.is_silence_terminated());
+        }
+        watchdog.observe_pcm(&silent_pcm);
+        assert!(watchdog.is_silence_terminated());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_safety_limit() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        watchdog.audio_frames_count = AUDIO_SAFETY_FRAME_LIMIT - 1;
+        assert!(!watchdog.is_safety_limit_reached());
+        watchdog.audio_frames_count = AUDIO_SAFETY_FRAME_LIMIT;
+        assert!(watchdog.is_safety_limit_reached());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_empty_pcm_resilience() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let empty_pcm: [f32; 0] = [];
+        let rms = watchdog.observe_pcm(&empty_pcm);
+        assert_eq!(rms, 0.0);
+        assert_eq!(watchdog.audio_frames_count, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 1);
+        assert_eq!(watchdog.total_voiced_frames, 0);
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_custom_thresholds() {
+        let mut watchdog = AudioSilenceWatchdog::new_with_thresholds(0.002, 3, 10, 8);
+        assert_eq!(watchdog.rms_threshold, 0.002);
+        assert_eq!(watchdog.min_voiced_frames, 3);
+        assert_eq!(watchdog.silent_frames_cutoff, 10);
+        assert_eq!(watchdog.silent_frames_cutoff_voiced, 8);
+
+        let silent_pcm = vec![0.0f32; 1920];
+        for _ in 0..9 {
+            watchdog.observe_pcm(&silent_pcm);
+            assert!(!watchdog.is_silence_terminated());
+        }
+        watchdog.observe_pcm(&silent_pcm);
+        assert!(watchdog.is_silence_terminated());
+    }
+
+    #[test]
+    fn test_audio_silence_watchdog_non_finite_resilience() {
+        let mut watchdog = AudioSilenceWatchdog::new();
+        let corrupted_pcm = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let rms = watchdog.observe_pcm(&corrupted_pcm);
+        assert_eq!(rms, 0.0);
+        assert_eq!(watchdog.audio_frames_count, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 1);
+
+        let mixed_pcm = vec![0.05f32, f32::NAN, 0.05f32];
+        let rms_mixed = watchdog.observe_pcm(&mixed_pcm);
+        assert!(rms_mixed > 0.04 && rms_mixed < 0.06);
+        assert_eq!(watchdog.total_voiced_frames, 1);
+        assert_eq!(watchdog.consecutive_silent_frames, 0);
+    }
 }
