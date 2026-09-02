@@ -59,7 +59,6 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          allow-unsafe-pr-checkout: true
           ref: ${{ (inputs.pull_number || github.event.issue.number || github.event.pull_request.number) && format('refs/pull/{0}/head', inputs.pull_number || github.event.issue.number || github.event.pull_request.number) || github.ref }}
 
       - name: Determine Review Effort
