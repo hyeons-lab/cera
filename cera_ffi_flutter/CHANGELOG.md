@@ -93,8 +93,9 @@ marked `publish_to: none` and was not a Flutter plugin.
   default deployment target fails with an SPM error that does not name the fix;
   see the README.
 - Web inference goes through `Cera` and needs its runtime installed once with
-  `dart run cera_ffi_flutter:install_web`. The GPU path is LFM2-only; other
-  architectures fall back to the wasm CPU build. `openPath` is unavailable
-  there (no filesystem), `reset` is unavailable on the GPU backend, and
-  `cancel` is best-effort. The *generated bindings* remain native-only: their
-  web branch is a stub whose every engine call throws `UnsupportedError`.
+  `dart run cera_ffi_flutter:install_web`. The GPU path supports LFM2 and dense
+  transformers (`llama`, `qwen2`, `qwen3`, `granite`); other architectures fall
+  back to the wasm CPU build. `openPath` is unavailable there (no filesystem),
+  `reset` is unavailable on the GPU backend, and `cancel` is best-effort. The
+  *generated bindings* remain native-only: their web branch is a stub whose
+  every engine call throws `UnsupportedError`.
