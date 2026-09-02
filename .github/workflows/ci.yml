@@ -960,26 +960,35 @@ jobs:
         with:
           toolchain: nightly-2026-07-10
       - uses: Swatinem/rust-cache@v2
+      - name: Cache ktlint
+        id: cache-ktlint
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ktlint
+          key: ktlint-1.8.0-a3fd6202
       - name: Install ktlint
         # Pin the ktlint version + verify its sha256 so the formatter
         # output is reproducible across CI runs + developer workstations
-        # AND so a compromised mirror can't slip a different binary past
-        # the drift check. Bump in lockstep with whatever's documented
+        # AND so a compromised mirror cannot slip a different binary past
+        # the drift check. Bump in lockstep with whatever is documented
         # in cera-ffi/README.md (regenerate the bindings in the same PR).
         #
-        # `curl --fail --proto '=https' --tlsv1.2` hardens the download
-        # against silent HTTP errors and legacy TLS downgrades.
+        # `curl --fail --proto '=https' --tlsv1.2 --retry 3` hardens the download
+        # against transient network errors and legacy TLS downgrades.
         # The sha256 below is for the ktlint 1.8.0 standalone release
         # binary from pinterest/ktlint; bumping the version requires
         # recomputing it (locally: `shasum -a 256 ktlint`).
         run: |
           KTLINT_VERSION=1.8.0
           KTLINT_SHA256=a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75
-          curl --fail --proto '=https' --tlsv1.2 -sSLo /tmp/ktlint \
-            "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
-          echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c -
-          chmod +x /tmp/ktlint
-          sudo mv /tmp/ktlint /usr/local/bin/ktlint
+          mkdir -p ~/.cache/ktlint
+          if [ ! -x ~/.cache/ktlint/ktlint ]; then
+            curl --fail --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSLo ~/.cache/ktlint/ktlint \
+              "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
+            echo "${KTLINT_SHA256}  ~/.cache/ktlint/ktlint" | sha256sum -c -
+            chmod +x ~/.cache/ktlint/ktlint
+          fi
+          sudo cp ~/.cache/ktlint/ktlint /usr/local/bin/ktlint
           ktlint --version
       - uses: extractions/setup-just@v4
       - name: Regenerate bindings and diff
