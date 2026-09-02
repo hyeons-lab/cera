@@ -376,8 +376,13 @@ jobs:
             exit 0
           fi
 
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN secret is not set. Configure NPM_TOKEN in repository secrets or uncheck npm when dispatching." >&2
+            exit 1
+          fi
+
           # Idempotent: npm rejects republishing an existing version, so skip if
-          # it's already up — a rerun then only retries what's missing.
+          # it's already up: a rerun then only retries what's missing.
           if npm view "${name}@${version}" version >/dev/null 2>&1; then
             echo "✓ ${name}@${version} already on npm — skipping"
             exit 0
@@ -487,9 +492,12 @@ jobs:
           archive="cera-ffi-${{ matrix.label }}-v${VERSION}.tar.gz"
           tar -czf "desktop-libs/${archive}" \
             -C "target/${{ matrix.target }}/release" "${{ matrix.lib }}"
-          # shasum is present on all three runner images (macOS, Linux,
-          # Windows/Git-Bash); sha256sum is not on macOS.
-          ( cd desktop-libs && shasum -a 256 "${archive}" > "${archive}.sha256" )
+          # Use sha256sum when available (Linux / Windows Git-Bash), falling back to shasum (macOS).
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd desktop-libs && sha256sum "${archive}" > "${archive}.sha256" )
+          else
+            ( cd desktop-libs && shasum -a 256 "${archive}" > "${archive}.sha256" )
+          fi
           cat "desktop-libs/${archive}.sha256"
 
       - name: Upload standalone cdylib
