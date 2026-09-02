@@ -981,14 +981,15 @@ jobs:
         run: |
           KTLINT_VERSION=1.8.0
           KTLINT_SHA256=a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75
-          mkdir -p ~/.cache/ktlint
-          if [ ! -x ~/.cache/ktlint/ktlint ]; then
-            curl --fail --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSLo ~/.cache/ktlint/ktlint \
+          KTLINT_BIN="$HOME/.cache/ktlint/ktlint"
+          mkdir -p "$HOME/.cache/ktlint"
+          if [ ! -x "$KTLINT_BIN" ]; then
+            curl --fail --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSLo "$KTLINT_BIN" \
               "https://github.com/pinterest/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
-            echo "${KTLINT_SHA256}  ~/.cache/ktlint/ktlint" | sha256sum -c -
-            chmod +x ~/.cache/ktlint/ktlint
+            echo "${KTLINT_SHA256}  ${KTLINT_BIN}" | sha256sum -c -
+            chmod +x "$KTLINT_BIN"
           fi
-          sudo cp ~/.cache/ktlint/ktlint /usr/local/bin/ktlint
+          sudo cp "$KTLINT_BIN" /usr/local/bin/ktlint
           ktlint --version
       - uses: extractions/setup-just@v4
       - name: Regenerate bindings and diff
