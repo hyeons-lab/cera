@@ -733,6 +733,17 @@ const OPS = {
         cpu.session.clearCancel();
       } catch (_) {}
     }
+    if (gpu) {
+      if (gpu.cancelHandle && typeof gpu.cancelHandle.clearCancel === 'function') {
+        try {
+          gpu.cancelHandle.clearCancel();
+        } catch (_) {}
+      } else if (gpu.session && typeof gpu.session.clearCancel === 'function') {
+        try {
+          gpu.session.clearCancel();
+        } catch (_) {}
+      }
+    }
     const { prompt, maxTokens } = req;
     const currentPos = position();
     console.info(

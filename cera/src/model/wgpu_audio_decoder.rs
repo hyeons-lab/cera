@@ -234,7 +234,7 @@ impl WgpuAudioDecoder {
             "detokenizer head_dim {head_dim} > 128; wgpu flash_attention cannot size q_shared/acc"
         );
         anyhow::ensure!(
-            n_kv > 0 && n_head.is_multiple_of(n_kv),
+            n_kv > 0 && n_head % n_kv == 0,
             "detokenizer GQA requires n_kv > 0 and n_head divisible by n_kv (n_head={n_head}, n_kv={n_kv})"
         );
 
