@@ -6656,7 +6656,7 @@ impl GpuLfm2Model {
         };
 
         let bytes = pending.recv().await?;
-        let expected_bytes = n * std::mem::size_of::<u32>();
+        let expected_bytes = std::mem::size_of_val(tokens);
         if bytes.len() < expected_bytes {
             anyhow::bail!(
                 "GPU prefill argmax readback buffer truncated (expected {expected_bytes} bytes, got {})",
