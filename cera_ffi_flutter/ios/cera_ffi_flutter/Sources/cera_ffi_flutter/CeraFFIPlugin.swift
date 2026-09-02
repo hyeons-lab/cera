@@ -13,5 +13,5 @@ enum CeraFFIPlugin {
     /// Version of the plugin this package was generated for. Not read by
     /// Flutter or by Dart; present so the file declares something and so a
     /// human reading the built app can tell which plugin version linked in.
-    static let version = "0.4.0"
+    static let version = "0.5.0"
 }

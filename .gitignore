@@ -57,3 +57,4 @@ cera_time.txt
 llama_time.txt
 bench_results.csv
 bench_log.txt
+__pycache__/

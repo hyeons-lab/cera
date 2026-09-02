@@ -73,6 +73,9 @@ PLUGIN_SITES=(
   "windows CMakeLists CERA_VERSION|cera_ffi_flutter/windows/CMakeLists.txt|(?<pre>^set\(CERA_VERSION \")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\"\))"
   "ios podspec s.version|cera_ffi_flutter/ios/cera_ffi_flutter.podspec|(?<pre>^\s*s\.version\s*=\s*')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
   "macos podspec s.version|cera_ffi_flutter/macos/cera_ffi_flutter.podspec|(?<pre>^\s*s\.version\s*=\s*')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
+  "ios CeraFFIPlugin version|cera_ffi_flutter/ios/cera_ffi_flutter/Sources/cera_ffi_flutter/CeraFFIPlugin.swift|(?<pre>^\s*static\s+let\s+version\s*=\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
+  "macos CeraFFIPlugin version|cera_ffi_flutter/macos/cera_ffi_flutter/Sources/cera_ffi_flutter/CeraFFIPlugin.swift|(?<pre>^\s*static\s+let\s+version\s*=\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
+  "CeraChat project.yml from version|examples/CeraChat/project.yml|(?<pre>^\s*from:\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
 )
 
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
