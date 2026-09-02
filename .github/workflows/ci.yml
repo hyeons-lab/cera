@@ -30,7 +30,7 @@ jobs:
     name: Format & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -64,7 +64,7 @@ jobs:
     needs: check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -82,7 +82,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -128,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -158,7 +158,7 @@ jobs:
     needs: check
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -196,7 +196,7 @@ jobs:
       # as they do on the Metal leg). Turns a skip into a failure.
       CERA_REQUIRE_PASSTHROUGH: 1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -354,7 +354,7 @@ jobs:
     env:
       CERA_REQUIRE_METAL: 1
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -402,7 +402,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -458,7 +458,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -523,7 +523,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -577,7 +577,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -659,7 +659,7 @@ jobs:
       matrix:
         target: [bundler, web, nodejs]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -815,7 +815,7 @@ jobs:
       matrix:
         target: [web, nodejs]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -955,7 +955,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1008,7 +1008,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1276,7 +1276,7 @@ jobs:
           - { os: windows-latest, platform: windows, lib: cera_ffi.dll,   dest: cera_ffi_flutter/windows }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1361,7 +1361,7 @@ jobs:
           - abi: x86
             rust_target: i686-linux-android
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1500,7 +1500,7 @@ jobs:
     needs: check
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1673,7 +1673,7 @@ jobs:
     # wrong numbers rather than crashing.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1766,7 +1766,7 @@ jobs:
     # post-merge speedup.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1809,7 +1809,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -1899,7 +1899,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10

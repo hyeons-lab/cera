@@ -102,7 +102,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -131,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -275,7 +275,7 @@ jobs:
             features: ''
             archive: zip
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -320,7 +320,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -409,7 +409,7 @@ jobs:
           - { os: ubuntu-latest,  label: linux-x86-64,   target: x86_64-unknown-linux-gnu, lib: libcera_ffi.so,    dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/linux-x86-64,  android: true  }
           - { os: windows-latest, label: win32-x86-64,   target: x86_64-pc-windows-msvc,  lib: cera_ffi.dll,      dest: cera-ffi-kotlin/cera-ffi-jvm/src/main/resources/win32-x86-64,  android: false }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -506,7 +506,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       # Pull every runner's native libs back into the module source trees. The
       # committed `cera_ffi.kt` binding is already in the repo (srcDir'd by both
@@ -588,7 +588,7 @@ jobs:
     outputs:
       checksum: ${{ steps.zip.outputs.checksum }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -657,7 +657,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -738,7 +738,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - uses: subosito/flutter-action@v2
         with:
@@ -850,7 +850,12 @@ jobs:
           fi
 
           rm -f cera_ffi_flutter/pubspec_overrides.yaml
-          ( cd cera_ffi_flutter && flutter pub publish --force )
+          (
+            cd cera_ffi_flutter
+            rm -rf .dart_tool pubspec.lock
+            flutter pub get
+            flutter pub publish --force
+          )
           echo "✓ cera_ffi_flutter@${VERSION} published successfully to pub.dev"
 
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
@@ -903,7 +908,7 @@ jobs:
       # set on this job) for the tag push only.
       - name: Checkout default branch
         if: ${{ needs.build-spm.result == 'success' }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0

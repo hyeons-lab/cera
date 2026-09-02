@@ -99,7 +99,7 @@ jobs:
           - arch: x86_64
             runner: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -224,7 +224,7 @@ jobs:
       matrix:
         device: [metal, gpu]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
@@ -292,7 +292,7 @@ jobs:
     name: GPU GEMM microbench
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-07-10
