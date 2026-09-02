@@ -126,7 +126,7 @@ const _: () = assert!(
      changing MUL_MAT_TILE_M/N"
 );
 const _: () = assert!(
-    MUL_MAT_TILE_K % 8 == 0,
+    MUL_MAT_TILE_K.is_multiple_of(8),
     "the Q4_0 shmem loader stages 8 consecutive k per thread and indexes within \
      one 32-element block; TILE_K must be a multiple of 8"
 );
