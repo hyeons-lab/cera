@@ -1278,7 +1278,7 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" | "mistral" => {
+            "llama" | "qwen2" | "qwen3" | "granite" => {
                 let cpu_model =
                     super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
