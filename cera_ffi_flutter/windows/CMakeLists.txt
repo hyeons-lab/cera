@@ -11,7 +11,7 @@ project(${PROJECT_NAME} LANGUAGES CXX)
 
 # Names a published release tag. Kept in lockstep with the Cargo workspace by
 # scripts/bump-version.sh (which verifies the write landed); do not hand-edit.
-set(CERA_VERSION "0.5.0")
+set(CERA_VERSION "0.5.1")
 set(CERA_LIB_LABEL "win32-x86-64")
 set(CERA_LIB_FILE "cera_ffi.dll")
 

@@ -3,7 +3,7 @@ members = ["cera", "cera-cli", "cera-ffi", "cera-parity", "cera-wasm"]
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.94"  # edition 2024 needs 1.85+; avx512 `_mm512_*` needs 1.89; the NEON f16 `vcvt_f32_f16` KV-cache widen needs 1.94
 license = "Apache-2.0 OR MIT"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- **WebGPU Dense Transformer Support**: Native WebGPU acceleration for dense transformer architectures (`llama`, `qwen2`, `qwen3`, `granite`) alongside LFM2 models.
+- **License Formatting**: Cleaned dual Apache-2.0 / MIT license formatting for full OSI license scoring on pub.dev.
+
 ## 0.5.0
 
 ### Added
