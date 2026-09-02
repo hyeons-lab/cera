@@ -62,6 +62,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? quant,
     String? storeDir,
     bool? turboQuant,
+    bool? wantsAudio,
   });
 }
 
@@ -608,6 +609,7 @@ class _WorkerCera implements Cera {
             topP: topP,
             topK: topK,
             seed: seed,
+            wantsAudio: onAudio != null,
           ),
         );
         unawaited(

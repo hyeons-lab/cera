@@ -2097,11 +2097,20 @@ impl WgpuDepthformer {
                     let slice = self.staging_readback_buf.slice(0..size);
                     match slice.get_mapped_range() {
                         Ok(data) => {
-                            let sampled_u32: &[u32] = bytemuck::cast_slice(&data);
-                            for (i, &c) in sampled_u32.iter().enumerate().take(8) {
-                                codes[i] = c as i32;
+                            let expected_bytes = 8 * std::mem::size_of::<u32>();
+                            if data.len() < expected_bytes {
+                                Err(anyhow::anyhow!(
+                                    "GPU staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                                    data.len()
+                                ))
+                            } else {
+                                for i in 0..8 {
+                                    codes[i] = bytemuck::pod_read_unaligned::<u32>(
+                                        &data[i * 4..(i + 1) * 4],
+                                    ) as i32;
+                                }
+                                Ok(codes)
                             }
-                            Ok(codes)
                         }
                         Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
                     }

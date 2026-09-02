@@ -29,7 +29,7 @@
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
 
-console.info('[cera:worker:version] v0.5.0 (build: 2026-08-29-rev21-local-models-webgpu)');
+console.info('[cera:worker:version] v0.5.1 (build: 2026-09-02-rev22-local-models-webgpu)');
 
 'use strict';
 
@@ -893,22 +893,24 @@ const OPS = {
     console.info(
       `[cera:worker] generate op started: model="${currentModelLabel}", backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
     );
-    const onAudio = (pcm, sampleRate) => {
-      if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
-        isCancelled = true;
-        if (cpu?.session?.cancel) {
-          try { cpu.session.cancel(); } catch (_) {}
+    const onAudio = req.wantsAudio
+      ? (pcm, sampleRate) => {
+          if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
+            isCancelled = true;
+            if (cpu?.session?.cancel) {
+              try { cpu.session.cancel(); } catch (_) {}
+            }
+            if (gpu?.cancelHandle?.cancel) {
+              try { gpu.cancelHandle.cancel(); } catch (_) {}
+            } else if (gpu?.session?.cancel) {
+              try { gpu.session.cancel(); } catch (_) {}
+            }
+            return;
+          }
+          const pcmArray = new Float32Array(pcm);
+          post({ event: 'audio', pcm: pcmArray, sampleRate }, [pcmArray.buffer]);
         }
-        if (gpu?.cancelHandle?.cancel) {
-          try { gpu.cancelHandle.cancel(); } catch (_) {}
-        } else if (gpu?.session?.cancel) {
-          try { gpu.session.cancel(); } catch (_) {}
-        }
-        return;
-      }
-      const pcmArray = new Float32Array(pcm);
-      post({ event: 'audio', pcm: pcmArray, sampleRate }, [pcmArray.buffer]);
-    };
+      : null;
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.

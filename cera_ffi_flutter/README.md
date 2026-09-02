@@ -27,8 +27,8 @@ Kotlin (`cera-ffi-kotlin`) and Swift bindings.
 | Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
 | iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
-| Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |
-| Windows  | — | `cera_ffi.dll` | downloaded + checksummed by CMake |
+| Linux    | - | `libcera_ffi.so` | downloaded + checksummed by CMake |
+| Windows  | - | `cera_ffi.dll` | downloaded + checksummed by CMake |
 | Web      | WebGPU, or wasm | `cera_wasm_bg.wasm` in your `web/` | one setup command; see [Web](#web) |
 
 Apple targets are wired for both **Swift Package Manager** and CocoaPods;
@@ -213,7 +213,7 @@ What is narrower on the web than on native:
   `just wasm-web-wgpu`, then from `example/`
   `dart run cera_ffi_flutter:install_web --from ../../cera-wasm/examples/webgpu/pkg`
   and `flutter run -d chrome`.
-- `../cera_ffi/example/` — plain-Dart CLI scripts covering each surface:
+- `../cera_ffi/example/`: plain-Dart CLI scripts covering each surface:
   `cera_chat.dart` (template → generate → decode), `cera_generate.dart`,
   `cera_async.dart`, `cera_stream.dart`, `cera_progress.dart`. They live with
   the API package because they need no Flutter.
