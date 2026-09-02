@@ -725,12 +725,13 @@ jobs:
   # ── pub.dev (cera_ffi & cera_ffi_flutter) ──────────────────────────────────
   publish-pub:
     name: Publish packages to pub.dev
-    needs: [version, build-spm]
+    needs: [version, build-spm, release]
     if: >-
       ${{ !cancelled()
           && github.event.inputs.pub == 'true'
           && needs.version.result == 'success'
-          && needs.build-spm.result != 'failure' }}
+          && needs.build-spm.result != 'failure'
+          && (github.event.inputs.dry_run == 'true' || needs.release.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -865,7 +866,7 @@ jobs:
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
     name: Tag & GitHub Release
-    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm, build-web-assets, publish-pub]
+    needs: [version, publish-crates, build-cli, publish-npm, jvm-native-libs, publish-jvm, build-spm, build-web-assets]
     # Real runs only, and only once every enabled leg succeeded. Disabled legs
     # are `skipped` (not `failure`), so they don't block the tag; any actual
     # failure does. `jvm-native-libs` is gated too: if it fails, `publish-jvm`
@@ -884,7 +885,6 @@ jobs:
           && needs.publish-jvm.result != 'failure'
           && needs.build-spm.result != 'failure'
           && needs.build-web-assets.result != 'failure'
-          && needs.publish-pub.result != 'failure'
           && (github.event.inputs.crates == 'true'
               || github.event.inputs.cli == 'true'
               || github.event.inputs.npm == 'true'

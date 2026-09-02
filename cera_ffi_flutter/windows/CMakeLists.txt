@@ -51,7 +51,7 @@ if(EXISTS "${CERA_LOCAL_LIB}")
   message(STATUS "cera_ffi_flutter: using locally-supplied ${CERA_LOCAL_LIB} (not verified)")
   set(CERA_LIB_PATH "${CERA_LOCAL_LIB}")
 elseif(NOT EXISTS "${CERA_LIB_PATH}")
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64|ARM64EC|arm64ec)$")
     message(FATAL_ERROR
       "cera_ffi_flutter: no prebuilt cera-ffi library for Windows on ARM. "
       "Build cera-ffi from source and place ${CERA_LIB_FILE} in ${CMAKE_CURRENT_SOURCE_DIR}, "
