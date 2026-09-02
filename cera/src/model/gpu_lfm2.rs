@@ -1279,13 +1279,19 @@ impl GpuLfm2Model {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
             "llama" | "qwen2" | "qwen3" | "granite" => {
-                let cpu_model =
-                    super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+                let cpu_model = super::llama::LlamaModel::from_gguf_with_id(
+                    gguf,
+                    context_size,
+                    model_id.clone(),
+                )?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
             _ => {
-                let cpu_model =
-                    super::lfm2::Lfm2Model::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+                let cpu_model = super::lfm2::Lfm2Model::from_gguf_with_id(
+                    gguf,
+                    context_size,
+                    model_id.clone(),
+                )?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
         }
