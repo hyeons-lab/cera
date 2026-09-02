@@ -824,6 +824,10 @@ jobs:
                 echo "::error::$f still has placeholders after rewrite" >&2
                 exit 1
               fi
+              if ! grep -q "${CHECKSUM}" "$f"; then
+                echo "::error::$f does not contain expected checksum ${CHECKSUM}" >&2
+                exit 1
+              fi
             done
           fi
 
@@ -1017,6 +1021,10 @@ jobs:
             # false-positive even after a correct rewrite.
             if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
               echo "::error::$f still has placeholders after rewrite" >&2
+              exit 1
+            fi
+            if ! grep -q "${CHECKSUM}" "$f"; then
+              echo "::error::$f does not contain expected checksum ${CHECKSUM}" >&2
               exit 1
             fi
           done
