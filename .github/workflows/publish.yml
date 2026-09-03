@@ -769,14 +769,14 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Validating cera_ffi package structure ==="
-          ( cd cera_ffi && dart analyze )
+          ( cd cera_ffi && dart pub get && dart analyze )
           ( cd cera_ffi && dart pub publish --dry-run )
 
       - name: Validate cera_ffi_flutter (Flutter plugin)
         run: |
           set -euo pipefail
           echo "=== Validating cera_ffi_flutter package structure ==="
-          ( cd cera_ffi_flutter && flutter analyze )
+          ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
           out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
           echo "$out"
           if grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; then
