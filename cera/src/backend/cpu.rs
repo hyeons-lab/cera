@@ -4919,7 +4919,7 @@ fn flash_attention_gqa_scalar_opt(
 /// `start_pos + n_queries` (same contract as the scalar/NEON kernels).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 unsafe fn flash_attention_gqa_avx2(
     q_mat: &[f32],
     k_cache: &[f32],
@@ -4935,22 +4935,24 @@ unsafe fn flash_attention_gqa_avx2(
     scale: f32,
     start_pos: usize,
 ) {
-    flash_attention_gqa_avx2_opt(
-        q_mat,
-        k_cache,
-        v_cache,
-        out,
-        n_heads_start,
-        group_size,
-        n_queries,
-        q_stride,
-        kv_dim,
-        kv_h_offset,
-        head_dim,
-        scale,
-        start_pos,
-        true,
-    );
+    unsafe {
+        flash_attention_gqa_avx2_opt(
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_start,
+            group_size,
+            n_queries,
+            q_stride,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            start_pos,
+            true,
+        );
+    }
 }
 
 /// AVX2 implementation of flash attention over a GQA head group with causal or bidirectional masking.
@@ -5125,7 +5127,7 @@ unsafe fn flash_attention_gqa_avx2_opt(
 /// that the buffers satisfy the same sizing contract as the scalar kernel.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 unsafe fn flash_attention_gqa_avx512(
     q_mat: &[f32],
     k_cache: &[f32],
@@ -5141,22 +5143,24 @@ unsafe fn flash_attention_gqa_avx512(
     scale: f32,
     start_pos: usize,
 ) {
-    flash_attention_gqa_avx512_opt(
-        q_mat,
-        k_cache,
-        v_cache,
-        out,
-        n_heads_start,
-        group_size,
-        n_queries,
-        q_stride,
-        kv_dim,
-        kv_h_offset,
-        head_dim,
-        scale,
-        start_pos,
-        true,
-    );
+    unsafe {
+        flash_attention_gqa_avx512_opt(
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_start,
+            group_size,
+            n_queries,
+            q_stride,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            start_pos,
+            true,
+        );
+    }
 }
 
 /// AVX-512 implementation of flash attention over a GQA head group with causal or bidirectional masking.

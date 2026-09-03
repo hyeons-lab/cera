@@ -267,6 +267,8 @@ pub struct LoraAdapterWeights {
     pub classifier_bias: Option<Vec<f32>>,
     /// Classification class label strings in index order.
     pub class_labels: Vec<String>,
+    /// Number of token classification classes (0 if not a classifier).
+    pub num_classes: usize,
 }
 
 impl LoraAdapterWeights {
@@ -277,16 +279,14 @@ impl LoraAdapterWeights {
 
     /// Number of token classification classes (0 if not a classifier).
     pub fn num_classes(&self) -> usize {
-        if !self.class_labels.is_empty() {
-            self.class_labels.len()
-        } else {
-            self.classifier_weight.as_ref().map_or(0, |w| w.len())
-        }
+        self.num_classes
     }
 
     /// Attach or replace class labels on an Arc-wrapped adapter.
     pub fn with_class_labels(mut self: Arc<Self>, labels: Vec<String>) -> Arc<Self> {
+        let n_cls = labels.len();
         if let Some(s) = Arc::get_mut(&mut self) {
+            s.num_classes = n_cls;
             s.class_labels = labels;
             self
         } else {
@@ -296,6 +296,7 @@ impl LoraAdapterWeights {
                 classifier_weight: self.classifier_weight.clone(),
                 classifier_bias: self.classifier_bias.clone(),
                 class_labels: labels,
+                num_classes: n_cls,
             })
         }
     }
@@ -307,12 +308,20 @@ impl LoraAdapterWeights {
         classifier_bias: Option<Vec<f32>>,
         class_labels: Vec<String>,
     ) -> Arc<Self> {
+        let num_classes = if !class_labels.is_empty() {
+            class_labels.len()
+        } else if let Some(ref b) = classifier_bias {
+            b.len()
+        } else {
+            0
+        };
         Arc::new(Self {
             layers: Vec::new(),
             default_scale: 1.0,
             classifier_weight: Some(classifier_weight),
             classifier_bias,
             class_labels,
+            num_classes,
         })
     }
     /// The delta for `(layer, target)`, or `None` if the adapter doesn't touch it.
@@ -571,22 +580,33 @@ impl LoraAdapterWeights {
             builder.add_factor(layer, target, is_a, factor);
         }
 
-        let (classifier_weight, classifier_bias) = if gguf.get_tensor("classifier.weight").is_ok() {
-            let w = gguf.get_tensor("classifier.weight")?.to_f32_vec();
-            let b = gguf
-                .get_tensor("classifier.bias")
-                .ok()
-                .map(|t| t.to_f32_vec());
-            (Some(w), b)
-        } else {
-            (None, None)
-        };
+        let (classifier_weight, classifier_bias, num_classes) =
+            if let Ok(tensor) = gguf.get_tensor("classifier.weight") {
+                let w = tensor.to_f32_vec();
+                let b = gguf
+                    .get_tensor("classifier.bias")
+                    .ok()
+                    .map(|t| t.to_f32_vec());
+                let n_cls = b
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or_else(|| tensor.shape().get(1).copied().unwrap_or(0));
+                (Some(w), b, n_cls)
+            } else {
+                (None, None, 0)
+            };
         let class_labels = gguf
             .get_string_array("token_classifier.labels")
             .map(|arr| arr.into_iter().map(|s| s.to_string()).collect())
             .unwrap_or_default();
 
-        builder.finish(alpha_meta, classifier_weight, classifier_bias, class_labels)
+        builder.finish(
+            alpha_meta,
+            classifier_weight,
+            classifier_bias,
+            class_labels,
+            num_classes,
+        )
     }
 
     // ── safetensors (PEFT) ────────────────────────────────────────────────────
@@ -647,14 +667,20 @@ impl LoraAdapterWeights {
         let mut builder = AdapterBuilder::new();
         let mut classifier_weight = None;
         let mut classifier_bias = None;
+        let mut num_classes = 0;
 
         for (name, entry) in st.tensors() {
             if name.ends_with("classifier.weight") {
+                if let Ok((rows, _cols)) = entry.shape2() {
+                    num_classes = rows;
+                }
                 classifier_weight = Some(st.dequantize(entry, bytes)?);
                 continue;
             }
             if name.ends_with("classifier.bias") {
-                classifier_bias = Some(st.dequantize(entry, bytes)?);
+                let b = st.dequantize(entry, bytes)?;
+                num_classes = b.len();
+                classifier_bias = Some(b);
                 continue;
             }
 
@@ -689,7 +715,13 @@ impl LoraAdapterWeights {
             builder.add_factor(layer, target, is_a, factor);
         }
         // PEFT keeps alpha out-of-band; default to alpha == rank (scale 1).
-        builder.finish(alpha, classifier_weight, classifier_bias, Vec::new())
+        builder.finish(
+            alpha,
+            classifier_weight,
+            classifier_bias,
+            Vec::new(),
+            num_classes,
+        )
     }
 }
 
@@ -852,11 +884,19 @@ impl AdapterBuilder {
         classifier_weight: Option<Vec<f32>>,
         classifier_bias: Option<Vec<f32>>,
         class_labels: Vec<String>,
+        num_classes: usize,
     ) -> Result<Arc<LoraAdapterWeights>> {
         ensure!(
             !self.factors.is_empty() || classifier_weight.is_some(),
             "adapter contains no LoRA or classifier tensors"
         );
+        let n_cls = if !class_labels.is_empty() {
+            class_labels.len()
+        } else if let Some(ref b) = classifier_bias {
+            b.len()
+        } else {
+            num_classes
+        };
         if self.factors.is_empty() {
             return Ok(Arc::new(LoraAdapterWeights {
                 layers: Vec::new(),
@@ -864,6 +904,7 @@ impl AdapterBuilder {
                 classifier_weight,
                 classifier_bias,
                 class_labels,
+                num_classes: n_cls,
             }));
         }
         // Reject an absurd layer index from a malformed/hostile name before it
@@ -957,6 +998,7 @@ impl AdapterBuilder {
             classifier_weight,
             classifier_bias,
             class_labels,
+            num_classes: n_cls,
         }))
     }
 }
@@ -2053,7 +2095,7 @@ mod tests {
 
         let adapter = LoraAdapterWeights::from_safetensors_bytes(&buf, None).unwrap();
         assert!(adapter.is_classifier());
-        assert_eq!(adapter.num_classes(), 24); // before labels attached, length of flat weight
+        assert_eq!(adapter.num_classes(), 3); // parsed from classifier.weight shape and bias length
 
         let labels = vec![
             "O".to_string(),

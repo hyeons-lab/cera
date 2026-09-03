@@ -241,11 +241,10 @@ pub fn extract_spans(
             BioesPrefix::S => {
                 let start_char = offsets[i].char_start;
                 let end_char = offsets[i].char_end;
-                let span_text = if start_char < end_char && end_char <= text.chars().count() {
-                    text.chars()
-                        .skip(start_char)
-                        .take(end_char - start_char)
-                        .collect()
+                let b_start = offsets[i].byte_start;
+                let b_end = offsets[i].byte_end;
+                let span_text = if b_start < b_end && b_end <= text.len() {
+                    text[b_start..b_end].to_string()
                 } else {
                     String::new()
                 };
@@ -273,6 +272,9 @@ pub fn extract_spans(
                     if sub_type != ent_type {
                         break;
                     }
+                    if sub_prefix == BioesPrefix::B || sub_prefix == BioesPrefix::S {
+                        break;
+                    }
                     sum_score += probs[j * num_classes + tags[j]];
                     end_token = j + 1;
                     if sub_prefix == BioesPrefix::E {
@@ -287,11 +289,10 @@ pub fn extract_spans(
                 let end_char = offsets[end_token - 1].char_end;
                 let span_len = end_token - start_token;
                 let avg_score = sum_score / (span_len as f32);
-                let span_text = if start_char < end_char && end_char <= text.chars().count() {
-                    text.chars()
-                        .skip(start_char)
-                        .take(end_char - start_char)
-                        .collect()
+                let b_start = offsets[start_token].byte_start;
+                let b_end = offsets[end_token - 1].byte_end;
+                let span_text = if b_start < b_end && b_end <= text.len() {
+                    text[b_start..b_end].to_string()
                 } else {
                     String::new()
                 };
@@ -350,6 +351,25 @@ pub fn detect_pii(
         return Err(CeraError::Backend(
             "neither model nor attached adapter has token classification labels".into(),
         ));
+    }
+
+    if class_labels.len() != num_classes {
+        return Err(CeraError::Backend(format!(
+            "mismatch between class labels count ({}) and num_classes ({})",
+            class_labels.len(),
+            num_classes
+        )));
+    }
+
+    let expected_logits_len = tokens.len() * num_classes;
+    if logits.len() != expected_logits_len {
+        return Err(CeraError::Backend(format!(
+            "logits length mismatch: expected {} ({} tokens * {} classes), got {}",
+            expected_logits_len,
+            tokens.len(),
+            num_classes,
+            logits.len()
+        )));
     }
 
     let tags = viterbi_decode(&logits, num_classes, class_labels);
@@ -571,10 +591,10 @@ mod tests {
                 logits[t * k] = 5.0; // O by default
             }
             if n >= 2 {
-                logits[0 * k] = -5.0;
-                logits[0 * k + 1] = 10.0; // B-NAME
-                logits[1 * k] = -5.0;
-                logits[1 * k + 3] = 10.0; // E-NAME
+                logits[0] = -5.0;
+                logits[1] = 10.0; // B-NAME
+                logits[k] = -5.0;
+                logits[k + 3] = 10.0; // E-NAME
             }
             Ok(logits)
         }
@@ -667,8 +687,8 @@ mod tests {
                 logits[t * k] = 5.0; // O
             }
             if n >= 1 {
-                logits[0 * k] = -5.0;
-                logits[0 * k + 1] = 10.0; // S-EMAIL
+                logits[0] = -5.0;
+                logits[1] = 10.0; // S-EMAIL
             }
             Ok(logits)
         }
@@ -724,5 +744,49 @@ mod tests {
         assert_eq!(spans[0].text, "X");
         assert_eq!(spans[0].start_char, 0);
         assert_eq!(spans[0].end_char, 1);
+    }
+
+    #[test]
+    fn test_consecutive_b_and_s_tags_extraction() {
+        let labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "E-NAME".to_string(),
+            "S-EMAIL".to_string(),
+        ];
+        let num_classes = labels.len();
+        let tags = vec![1, 1, 4]; // B-NAME, B-NAME, S-EMAIL
+        let text = "Alice Bob user@example.com";
+        let offsets = vec![
+            TokenOffset {
+                char_start: 0,
+                char_end: 5,
+                byte_start: 0,
+                byte_end: 5,
+            },
+            TokenOffset {
+                char_start: 6,
+                char_end: 9,
+                byte_start: 6,
+                byte_end: 9,
+            },
+            TokenOffset {
+                char_start: 10,
+                char_end: 26,
+                byte_start: 10,
+                byte_end: 26,
+            },
+        ];
+        let mut logits = vec![-10.0f32; 3 * num_classes];
+        logits[1] = 10.0;
+        logits[num_classes + 1] = 10.0;
+        logits[2 * num_classes + 4] = 10.0;
+
+        let spans = extract_spans(&tags, &labels, &offsets, text, &logits, num_classes);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "Alice");
+        assert_eq!(spans[1].text, "Bob");
+        assert_eq!(spans[2].text, "user@example.com");
     }
 }
