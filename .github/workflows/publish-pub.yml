@@ -116,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Checking if cera_ffi@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi@${VERSION} already on pub.dev - skipping"
@@ -129,7 +129,7 @@ jobs:
               ( cd cera_ffi && dart pub publish --force )
               propagated=false
               for i in $(seq 1 30); do
-                status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+                status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
                 if [ "$status" = "200" ]; then
                   echo "cera_ffi@${VERSION} visible on pub.dev"
                   propagated=true
@@ -152,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sS -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi_flutter@${VERSION} already on pub.dev - skipping"
