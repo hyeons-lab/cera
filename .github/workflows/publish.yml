@@ -826,7 +826,7 @@ jobs:
             echo "✓ cera_ffi_flutter package structure verified."
           else
             # Assert that package validation actually executed
-            if ! grep -q "Validating package..." <<<"$out"; then
+            if ! grep -Fq "Validating package" <<<"$out"; then
               echo "::error::cera_ffi_flutter dry-run failed before packaging validation" >&2
               echo "$out" >&2
               exit 1
