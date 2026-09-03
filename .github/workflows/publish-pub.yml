@@ -41,15 +41,6 @@ jobs:
       - name: Checkout tagged commit
         uses: actions/checkout@v7
 
-      # Set up the Dart SDK to provision the OIDC JWT token (PUB_TOKEN) for pub.dev.
-      # setup-dart's createPubOIDCToken() queries ACTIONS_ID_TOKEN_REQUEST_URL with
-      # audience https://pub.dev and runs `dart pub token add https://pub.dev --env-var PUB_TOKEN`.
-      # Without setup-dart, pub publish falls back to interactive browser OAuth in CI.
-      # While the subsequent Flutter SDK installation prepends its own bundled Dart
-      # binary to PATH, the credentials registered in PUB_TOKEN are preserved.
-      - name: Provision pub.dev OIDC token via setup-dart
-        uses: dart-lang/setup-dart@v1
-
       - name: Setup Flutter and Dart SDK
         uses: subosito/flutter-action@v2
         with:
@@ -253,6 +244,15 @@ jobs:
               exit 1
             fi
           done
+
+      # Provision a fresh pub.dev OIDC JWT token (PUB_TOKEN) immediately prior to
+      # publishing. GitHub Actions ID tokens typically expire in 5 minutes.
+      # Placing setup-dart after the release asset verification/wait loop guarantees
+      # that tokens never expire during the 10-minute XCFramework build polling window.
+      # setup-dart's createPubOIDCToken() queries ACTIONS_ID_TOKEN_REQUEST_URL with
+      # audience https://pub.dev and runs `dart pub token add https://pub.dev --env-var PUB_TOKEN`.
+      - name: Provision pub.dev OIDC token via setup-dart
+        uses: dart-lang/setup-dart@v1
 
       - name: Publish cera_ffi (Dart package)
         run: |
