@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+### Changed
+
+- **Version Alignment**: Bumped workspace patch version to 0.5.2 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.1
 
 ### Added
