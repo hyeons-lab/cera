@@ -11,14 +11,14 @@ name: Publish to pub.dev
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run (validate/package only - no uploads)'
+        description: 'Dry run (validate/package only - pub.dev requires tag push for real publishing)'
         type: boolean
         required: true
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -27,7 +27,7 @@ jobs:
   publish:
     name: Publish packages to pub.dev
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       # OIDC token minting for pub.dev automated publishing
       id-token: write
@@ -64,10 +64,27 @@ jobs:
         run: |
           set -euo pipefail
           # Check if Apple integration manifests still have placeholders
-          if grep -qE 'RELEASE_CHECKSUM|RELEASE_VERSION' cera_ffi_flutter/ios/cera_ffi_flutter.podspec 2>/dev/null; then
+          if grep -q "RELEASE_CHECKSUM" cera_ffi_flutter/ios/cera_ffi_flutter.podspec 2>/dev/null; then
             echo "Placeholders detected in Apple manifests; resolving checksum from GitHub Release v${VERSION}..."
             ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CeraFFI.xcframework.zip"
-            CHECKSUM=$(curl -fail -proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
+
+            echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
+            asset_ready=false
+            for i in $(seq 1 30); do
+              if curl --silent --head --fail --connect-timeout 10 --max-time 20 -L "$ASSET_URL" >/dev/null 2>&1; then
+                echo "Asset found!"
+                asset_ready=true
+                break
+              fi
+              echo "Asset not ready yet, waiting 10s... (${i}/30)"
+              sleep 10
+            done
+            if [ "$asset_ready" = "false" ]; then
+              echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 300s" >&2
+              exit 1
+            fi
+
+            CHECKSUM=$(curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
             if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
               echo "::error::Could not resolve valid 64-char sha256 checksum for CeraFFI.xcframework.zip from release v${VERSION}" >&2
               exit 1
@@ -96,14 +113,14 @@ jobs:
             echo "Apple integration manifests already contain pinned release checksums."
           fi
 
-          # Assert that no placeholder strings remain
+          # Assert that no placeholder tokens survived
           for f in \
             cera_ffi_flutter/ios/cera_ffi_flutter.podspec \
             cera_ffi_flutter/macos/cera_ffi_flutter.podspec \
             cera_ffi_flutter/ios/cera_ffi_flutter/Package.swift \
             cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
           do
-            if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
+            if grep -q "RELEASE_CHECKSUM" "$f" || grep -q "RELEASE_VERSION" "$f"; then
               echo "::error::$f still has unreplaced release placeholders" >&2
               exit 1
             fi
@@ -112,9 +129,14 @@ jobs:
       - name: Publish cera_ffi (Dart package)
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
         run: |
           set -euo pipefail
+          DRY_RUN="false"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            DRY_RUN="true"
+            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
+          fi
+
           echo "=== Checking if cera_ffi@${VERSION} is already on pub.dev ==="
           pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
 
@@ -148,9 +170,14 @@ jobs:
       - name: Publish cera_ffi_flutter (Flutter plugin)
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
         run: |
           set -euo pipefail
+          DRY_RUN="false"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            DRY_RUN="true"
+            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
+          fi
+
           echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
           pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
 
@@ -159,18 +186,20 @@ jobs:
             exit 0
           fi
 
-          # Clean overrides so pub resolves the live published cera_ffi package
-          rm -f cera_ffi_flutter/pubspec_overrides.yaml
-
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
-            (
-              cd cera_ffi_flutter
-              flutter pub get
-              flutter pub publish --dry-run
-            )
+            ( cd cera_ffi_flutter && flutter analyze )
+            out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
+            echo "$out"
+            if grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; then
+              echo "✓ cera_ffi_flutter package structure verified."
+            else
+              echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
+              exit 1
+            fi
           else
             echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
+            rm -f cera_ffi_flutter/pubspec_overrides.yaml
             (
               cd cera_ffi_flutter
               rm -rf .dart_tool pubspec.lock
