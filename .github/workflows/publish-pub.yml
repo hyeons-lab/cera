@@ -19,7 +19,7 @@ on:
       dry_run:
         description: 'Dry run only (validate packaging without uploading to pub.dev)'
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: publish-pub-${{ github.ref }}
@@ -42,10 +42,11 @@ jobs:
         uses: actions/checkout@v7
 
       # Set up the Dart SDK to provision the OIDC JWT token (PUB_TOKEN) for pub.dev.
+      # setup-dart's createPubOIDCToken() queries ACTIONS_ID_TOKEN_REQUEST_URL with
+      # audience https://pub.dev and runs `dart pub token add https://pub.dev --env-var PUB_TOKEN`.
+      # Without setup-dart, pub publish falls back to interactive browser OAuth in CI.
       # While the subsequent Flutter SDK installation prepends its own bundled Dart
-      # binary to PATH, running setup-dart performs the GitHub Actions OIDC exchange
-      # against ACTIONS_ID_TOKEN_REQUEST_URL. This follows the official Dart team
-      # reusable workflow pattern in dart-lang/setup-dart/.github/workflows/publish.yml.
+      # binary to PATH, the credentials registered in PUB_TOKEN are preserved.
       - name: Provision pub.dev OIDC token via setup-dart
         uses: dart-lang/setup-dart@v1
 
@@ -56,6 +57,8 @@ jobs:
           cache: true
 
       - name: Determine release version and verify tag
+        env:
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -99,7 +102,7 @@ jobs:
 
           DRY_RUN="false"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            if [ "${INPUT_DRY_RUN:-true}" = "true" ]; then
               DRY_RUN="true"
               echo "Manual dispatch: dry-run validation mode enabled (no upload)."
             else
