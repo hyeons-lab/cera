@@ -29,7 +29,7 @@
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
 
-console.info('[cera:worker:version] v0.5.0 (build: 2026-08-29-rev21-local-models-webgpu)');
+console.info('[cera:worker:version] v0.5.1 (build: 2026-09-02-rev22-local-models-webgpu)');
 
 'use strict';
 
@@ -220,8 +220,8 @@ async function ensureModule(moduleUrl) {
  * GPU cannot serve this model, so `auto` can fall through to the CPU.
  *
  * The failure modes are not all detectable up front: `navigator.gpu` can exist
- * while `requestAdapter` yields nothing, and `WebGpuSession` is LFM2-only, so a
- * dense-transformer GGUF throws from `create` after WebGPU itself came up fine.
+ * while `requestAdapter` yields nothing, or an unsupported custom architecture
+ * throws from `create` after WebGPU itself came up fine.
  * Both must degrade rather than fail the open.
  */
 async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
@@ -273,7 +273,7 @@ async function tryGpu(bytes, contextSize, mmproj, turboQuant) {
  * on a single `ArrayBuffer`, which is what the bundle constructors exist to
  * avoid.
  *
- * A failure *after* the download (a non-LFM2 architecture, the common one) has
+ * A failure *after* the download (e.g. an unsupported custom architecture) has
  * already populated the cache, so the CPU retry behind it loads from the store
  * rather than downloading again.
  */
@@ -402,8 +402,8 @@ const OPS = {
       if (!(await tryGpu(view, ctx, proj, turboQuant))) {
         throw new Error(
           'the WebGPU backend is unavailable: either this browser exposes no ' +
-            'navigator.gpu, no adapter could be acquired, or the model is not ' +
-            'an LFM2 GGUF (the only architecture with a browser GPU path). ' +
+            'navigator.gpu, no adapter could be acquired, or the model architecture ' +
+            'is unsupported on the browser GPU path. ' +
             'Use backend: auto to fall back to the CPU instead.',
         );
       }
@@ -622,7 +622,7 @@ const OPS = {
         `[cera:worker] transcribe: running ASR on WebGPU (${samples.length} samples at ${sr}Hz)...`,
       );
       const t0 = performance.now();
-      const tk = gpu.session.tokenizer;
+      const tk = gpu.tokenizer ?? gpu.session.tokenizer;
       let markerName = '<|reserved_4|>';
       let markerId = tk.specialTokenId(markerName);
       if (markerId == null) {
@@ -732,6 +732,17 @@ const OPS = {
       try {
         cpu.session.clearCancel();
       } catch (_) {}
+    }
+    if (gpu) {
+      if (gpu.cancelHandle && typeof gpu.cancelHandle.clearCancel === 'function') {
+        try {
+          gpu.cancelHandle.clearCancel();
+        } catch (_) {}
+      } else if (gpu.session && typeof gpu.session.clearCancel === 'function') {
+        try {
+          gpu.session.clearCancel();
+        } catch (_) {}
+      }
     }
     const { prompt, maxTokens } = req;
     const currentPos = position();
@@ -893,22 +904,24 @@ const OPS = {
     console.info(
       `[cera:worker] generate op started: model="${currentModelLabel}", backend=${gpu ? 'gpu' : 'cpu'}, maxTokens=${maxTokens}, ids=${ids.length}`,
     );
-    const onAudio = (pcm, sampleRate) => {
-      if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
-        isCancelled = true;
-        if (cpu?.session?.cancel) {
-          try { cpu.session.cancel(); } catch (_) {}
+    const onAudio = req.wantsAudio
+      ? (pcm, sampleRate) => {
+          if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
+            isCancelled = true;
+            if (cpu?.session?.cancel) {
+              try { cpu.session.cancel(); } catch (_) {}
+            }
+            if (gpu?.cancelHandle?.cancel) {
+              try { gpu.cancelHandle.cancel(); } catch (_) {}
+            } else if (gpu?.session?.cancel) {
+              try { gpu.session.cancel(); } catch (_) {}
+            }
+            return;
+          }
+          const pcmArray = new Float32Array(pcm);
+          post({ event: 'audio', pcm: pcmArray, sampleRate }, [pcmArray.buffer]);
         }
-        if (gpu?.cancelHandle?.cancel) {
-          try { gpu.cancelHandle.cancel(); } catch (_) {}
-        } else if (gpu?.session?.cancel) {
-          try { gpu.session.cancel(); } catch (_) {}
-        }
-        return;
-      }
-      const pcmArray = new Float32Array(pcm);
-      post({ event: 'audio', pcm: pcmArray, sampleRate }, [pcmArray.buffer]);
-    };
+      : null;
     if (gpu) {
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
@@ -1077,6 +1090,7 @@ const OPS = {
   },
 
   close() {
+    this.cancel();
     pendingAudioSuffixTokens = null;
     pendingImage = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own
@@ -1084,15 +1098,15 @@ const OPS = {
     // Terminating the worker would, but this protocol is documented as usable
     // standalone, where open/close cycles would otherwise accumulate them.
     if (cpu) {
-      cpu.tokenizer.free();
-      cpu.session.free();
-      cpu.engine.free();
+      cpu.tokenizer?.free();
+      cpu.session?.free();
+      cpu.engine?.free();
       cpu = null;
     }
     if (gpu) {
       gpu.cancelHandle?.free();
-      gpu.tokenizer.free();
-      gpu.session.free();
+      gpu.tokenizer?.free();
+      gpu.session?.free();
       gpu = null;
     }
     backendLabel = 'none';

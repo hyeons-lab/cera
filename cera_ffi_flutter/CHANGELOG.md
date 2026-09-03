@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- **WebGPU Dense Transformer Support**: Native WebGPU acceleration for dense transformer architectures (`llama`, `qwen2`, `qwen3`, `granite`) alongside LFM2 models.
+- **License Formatting**: Cleaned dual Apache-2.0 / MIT license formatting for full OSI license scoring on pub.dev.
+
 ## 0.5.0
 
 ### Added
@@ -86,8 +93,9 @@ marked `publish_to: none` and was not a Flutter plugin.
   default deployment target fails with an SPM error that does not name the fix;
   see the README.
 - Web inference goes through `Cera` and needs its runtime installed once with
-  `dart run cera_ffi_flutter:install_web`. The GPU path is LFM2-only; other
-  architectures fall back to the wasm CPU build. `openPath` is unavailable
-  there (no filesystem), `reset` is unavailable on the GPU backend, and
-  `cancel` is best-effort. The *generated bindings* remain native-only: their
-  web branch is a stub whose every engine call throws `UnsupportedError`.
+  `dart run cera_ffi_flutter:install_web`. The GPU path supports LFM2 and dense
+  transformers (`llama`, `qwen2`, `qwen3`, `granite`); other architectures fall
+  back to the wasm CPU build. `openPath` is unavailable there (no filesystem),
+  `reset` is unavailable on the GPU backend, and `cancel` is best-effort. The
+  *generated bindings* remain native-only: their web branch is a stub whose
+  every engine call throws `UnsupportedError`.

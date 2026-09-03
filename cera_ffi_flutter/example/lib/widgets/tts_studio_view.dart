@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import '../chat_controller.dart';
 import '../chat_intent.dart';
 import '../chat_state.dart';
+import '../model_source.dart';
 import 'audio_waveform.dart';
 
 /// Dedicated UI for on-device Neural Text-to-Speech synthesis using Cera's vocoder.
@@ -26,13 +27,22 @@ class _TtsStudioViewState extends State<TtsStudioView> {
   late final TextEditingController _textController;
 
   static String _getModelDisplayName(ChatState state) {
-    final rawName = state.loadedModel?.name;
+    final model = state.loadedModel;
+    if (model is BundleModelSource &&
+        model.displayName != null &&
+        model.displayName!.isNotEmpty) {
+      return model.displayName!;
+    }
+    final rawName = model?.name;
     if (rawName == null || rawName.isEmpty) {
       return 'LFM2';
     }
     var name = rawName;
     if (name.toLowerCase().endsWith('.gguf')) {
       name = name.substring(0, name.length - 5);
+    }
+    if (name.contains(' · ')) {
+      name = name.split(' · ').first;
     }
     return name;
   }

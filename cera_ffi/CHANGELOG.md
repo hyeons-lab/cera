@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- **WebGPU Dense Transformer Support**: Direct GPU execution support for dense transformer architectures (`llama`, `qwen2`, `qwen3`, `granite`) in addition to `lfm2`/`lfm2.5`/`lfm2moe`.
+- **License Formatting**: Cleaned dual Apache-2.0 / MIT license formatting for automated OSI recognition by `pana` on pub.dev.
+
 ## 0.5.0
 
 ### Added

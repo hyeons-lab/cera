@@ -88,12 +88,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
-          GEMINI_MODEL: 'gemini-3.7-flash'
+          GEMINI_MODEL: 'gemini-3.8-flash'
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           settings: |
             {
-              "model": "gemini-3.7-flash"
+              "model": "gemini-3.8-flash"
             }
           prompt: |
             # REVIEW TARGET

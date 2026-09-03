@@ -15,10 +15,9 @@
 //! kernel reads `array<f32>`), so there is no f16 cast and the path is a touch
 //! more accurate than Metal's f16 cache.
 //!
-//! Scope (PR1): the detokenizer only, which is the validated win. The
-//! depthformer (code sampling) stays on CPU; `supports_depthformer` reports
-//! that, so `CERA_GPU_DF=1` keeps sampling on the CPU rather than reaching the
-//! `sample_audio_frame` panic here. A WGPU depthformer is a follow-up.
+//! Scope: both the detokenizer and depthformer run on WGPU. The depthformer
+//! samples codebooks with a WGPU compute pipeline while fallback CPU decoding
+//! remains available via `AudioOutputDecoder`.
 //!
 //! The final ISTFT (`istft_to_pcm`) runs on the GPU too: `exp_polar` maps the
 //! polar half-spectrum to complex, a reg-tile GEMM against a precomputed real
@@ -1046,8 +1045,18 @@ impl WgpuAudioDecoder {
                     let slice = self.spectrum_staging_buf.slice(0..size);
                     match slice.get_mapped_range() {
                         Ok(data) => {
-                            bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data);
-                            Ok(result)
+                            let expected_bytes =
+                                n_frames * spec_per_frame * std::mem::size_of::<f32>();
+                            if data.len() < expected_bytes {
+                                Err(anyhow::anyhow!(
+                                    "GPU spectrum staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                                    data.len()
+                                ))
+                            } else {
+                                bytemuck::cast_slice_mut(&mut result)
+                                    .copy_from_slice(&data[..expected_bytes]);
+                                Ok(result)
+                            }
                         }
                         Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
                     }
@@ -1212,8 +1221,15 @@ impl WgpuAudioDecoder {
             (total_samples * std::mem::size_of::<f32>()) as u64,
         );
         let bytes = pending.recv().await?;
+        let expected_bytes = total_samples * std::mem::size_of::<f32>();
+        if bytes.len() < expected_bytes {
+            anyhow::bail!(
+                "GPU audio readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                bytes.len()
+            );
+        }
         let mut pcm = vec![0f32; total_samples];
-        bytemuck::cast_slice_mut(&mut pcm).copy_from_slice(&bytes);
+        bytemuck::cast_slice_mut(&mut pcm).copy_from_slice(&bytes[..expected_bytes]);
         let padding = (n_fft - hop_length) / 2;
         if pcm.len() > padding {
             pcm.drain(..padding);
@@ -2080,11 +2096,20 @@ impl WgpuDepthformer {
                     let slice = self.staging_readback_buf.slice(0..size);
                     match slice.get_mapped_range() {
                         Ok(data) => {
-                            let sampled_u32: &[u32] = bytemuck::cast_slice(&data);
-                            for (i, &c) in sampled_u32.iter().enumerate().take(8) {
-                                codes[i] = c as i32;
+                            let expected_bytes = 8 * std::mem::size_of::<u32>();
+                            if data.len() < expected_bytes {
+                                Err(anyhow::anyhow!(
+                                    "GPU staging readback buffer truncated (expected {expected_bytes} bytes, got {})",
+                                    data.len()
+                                ))
+                            } else {
+                                for i in 0..8 {
+                                    codes[i] = bytemuck::pod_read_unaligned::<u32>(
+                                        &data[i * 4..(i + 1) * 4],
+                                    ) as i32;
+                                }
+                                Ok(codes)
                             }
-                            Ok(codes)
                         }
                         Err(e) => Err(anyhow::anyhow!("get_mapped_range failed: {e:?}")),
                     }

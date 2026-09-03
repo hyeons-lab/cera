@@ -1996,7 +1996,7 @@ mod webgpu {
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
         /// GGUF, upload the model to the GPU, and build a fresh inference
         /// state. `contextSize` defaults to 4096. Throws if WebGPU is
-        /// unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+        /// unavailable, the bytes aren't a valid GGUF, or the device
         /// rejects the model.
         ///
         /// `kvCompression` is optional and defaults to `null` (uncompressed f32
@@ -2006,7 +2006,7 @@ mod webgpu {
         /// (token, KV head) vector, so against f32's 32 bits the KV slabs shrink
         /// ~10.7x rather than the ~12.8x the bit rates alone suggest. Concretely,
         /// for LFM2-1.2B (6 attention layers, 8 KV heads x head_dim 64) that is
-        /// 24 KiB per token down to 2.25 KiB — at a 16K context, 384 MiB
+        /// 24 KiB per token down to 2.25 KiB: at a 16K context, 384 MiB
         /// (~403 MB) of GPU-side KV becomes 36 MiB (~38 MB).
         ///
         /// Both trailing parameters are optional, so to request compression while
@@ -2185,10 +2185,10 @@ mod webgpu {
         /// on a single JS `ArrayBuffer` that loading through `create` runs into,
         /// and costs one copy of the model rather than two.
         ///
-        /// Throws for every reason `create` does, plus a bundle the GPU path
-        /// cannot serve: it is LFM2-only. A caller wanting a fallback should catch
-        /// and retry through `CeraEngine.fromBundleId`, which is what
-        /// `cera_worker.js` does for `backend: 'auto'`.
+        /// Throws for every reason `create` does, plus bundle download/manifest errors.
+        /// A caller wanting a fallback should catch and retry through
+        /// `CeraEngine.fromBundleId`, which is what `cera_worker.js` does for
+        /// `backend: 'auto'`.
         #[wasm_bindgen(js_name = fromBundleId)]
         pub async fn from_bundle_id(
             repo: &crate::bundle::BundleRepo,
@@ -3105,14 +3105,6 @@ mod webgpu {
                 return Ok(String::new());
             }
 
-            // If the prompt starts with BOS (1) or if pos + ids.len() > max_seq_len,
-            // reset sequence state to position 0 so standalone generations don't append to stale context.
-            if ids.first() == Some(&1)
-                || (self.tokenizer.bos_token().is_some()
-                    && ids.first() == self.tokenizer.bos_token().as_ref())
-            {
-                self.state.seq_len = 0;
-            }
             let max_seq_len = self.model.config().max_seq_len;
             let mut pos = self.state.seq_len;
 

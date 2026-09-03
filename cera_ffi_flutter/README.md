@@ -27,8 +27,8 @@ Kotlin (`cera-ffi-kotlin`) and Swift bindings.
 | Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
 | iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
-| Linux    | — | `libcera_ffi.so` | downloaded + checksummed by CMake |
-| Windows  | — | `cera_ffi.dll` | downloaded + checksummed by CMake |
+| Linux    | - | `libcera_ffi.so` | downloaded + checksummed by CMake |
+| Windows  | - | `cera_ffi.dll` | downloaded + checksummed by CMake |
 | Web      | WebGPU, or wasm | `cera_wasm_bg.wasm` in your `web/` | one setup command; see [Web](#web) |
 
 Apple targets are wired for both **Swift Package Manager** and CocoaPods;
@@ -195,24 +195,14 @@ page.
 What is narrower on the web than on native:
 
 - **`openPath` throws.** There is no filesystem; use `openBundle` or `openBytes`.
-- **The GPU path is LFM2-only.** `WebGpuSession` covers the `lfm2`/`lfm2.5`
-  family. A dense transformer (llama, qwen, granite) still runs, on the CPU
-  fallback, and `backend: CeraBackend.auto` arranges that silently; read
-  `cera.backend` if you need to know which one you got.
-- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
-  to clear it. Close the engine and open it again.
-- **`cancel` is best-effort.** It reaches neither backend's running decode:
-  the CPU decode is one synchronous wasm call occupying the worker, so the
-  message is not delivered until it has already finished, and `WebGpuSession`
-  exposes no cancel entry point at all. Cancelling the `generate` stream's
-  subscription stops delivery to your app immediately either way, which is what
-  a Stop button needs.
-- **Sampling is greedy on the GPU path.** `temperature`, `topP`, `topK` and
-  `seed` are honored on the CPU fallback and ignored on WebGPU, which decodes
-  greedily. Force `CeraBackend.cpu` if you need sampled output in a browser.
 - **The generated bindings are stubs**, as they have always been on the web:
   `dart:ffi` does not exist there. Everything in "The generated bindings" above
   is native-only.
+- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
+  to clear it in place. Close the engine and open it again.
+- **`cancel` is best-effort.** Cancelling the `generate` stream's
+  subscription stops delivery to your app immediately, which is what
+  a Stop button needs.
 
 ## Examples
 
@@ -223,7 +213,7 @@ What is narrower on the web than on native:
   `just wasm-web-wgpu`, then from `example/`
   `dart run cera_ffi_flutter:install_web --from ../../cera-wasm/examples/webgpu/pkg`
   and `flutter run -d chrome`.
-- `../cera_ffi/example/` — plain-Dart CLI scripts covering each surface:
+- `../cera_ffi/example/`: plain-Dart CLI scripts covering each surface:
   `cera_chat.dart` (template → generate → decode), `cera_generate.dart`,
   `cera_async.dart`, `cera_stream.dart`, `cera_progress.dart`. They live with
   the API package because they need no Flutter.
