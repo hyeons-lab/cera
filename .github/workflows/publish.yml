@@ -817,13 +817,27 @@ jobs:
           set -euo pipefail
           echo "=== Validating cera_ffi_flutter package structure ==="
           ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
-          out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
+          set +e
+          out=$(cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1)
+          exit_code=$?
+          set -e
           echo "$out"
-          if ! grep -qE "Package validation found the following error:|Package validation found the following errors:" <<<"$out"; then
+          if [ $exit_code -eq 0 ]; then
             echo "✓ cera_ffi_flutter package structure verified."
           else
-            echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
-            exit 1
+            # flutter pub publish failed: verify that failure is solely the expected unreleased sibling dependency
+            unexpected_errors=$(echo "$out" | sed -n '/Package validation found the following error/,/^$/p' | grep -vE "Dependency cera_ffi:.*doesn't exist on pub.dev" | grep -E '^[[:space:]]*\*' || true)
+            if grep -qE "Package validation found the following errors?:" <<<"$out" && [ -z "$unexpected_errors" ]; then
+              echo "✓ cera_ffi_flutter package structure verified (unreleased sibling dependency exempted)."
+            else
+              echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error(s):" >&2
+              if [ -n "$unexpected_errors" ]; then
+                echo "$unexpected_errors" >&2
+              else
+                echo "$out" >&2
+              fi
+              exit 1
+            fi
           fi
           echo "Notice: pub.dev automated publishing strictly requires a Git tag push event (on: push: tags:)."
           echo "cera_ffi and cera_ffi_flutter will be published via publish-pub.yml when the release tag is pushed."

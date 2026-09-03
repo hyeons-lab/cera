@@ -2,20 +2,24 @@ name: Publish to pub.dev
 
 # Publishes cera_ffi and cera_ffi_flutter to pub.dev via OpenID Connect (OIDC).
 #
-# IMPORTANT: pub.dev automated publishing strictly requires the GitHub Actions
-# workflow to be triggered by a Git tag push event (`on: push: tags:`).
-# OIDC tokens minted from branch pushes or `workflow_dispatch` are rejected by
-# pub.dev's token claim verifier. Pushing a tag `v<version>` triggers this
-# workflow and satisfies pub.dev's tag pattern requirement.
+# Authentication uses short-lived GitHub-signed OIDC JWT tokens minted by
+# dart-lang/setup-dart against ACTIONS_ID_TOKEN_REQUEST_URL.
 #
-# NOTE: Ensure pub.dev Admin settings for cera_ffi and cera_ffi_flutter authorize
-# workflow path .github/workflows/publish-pub.yml and tag pattern v*.
+# Supported triggers:
+# - Git tag push (`v<version>`): canonical automated publishing trigger.
+# - Manual dispatch (`workflow_dispatch`): enabled via the pub.dev Admin UI
+#   ("Enable publishing from workflow_dispatch events").
 
 on:
   push:
     tags:
       - 'v[0-9]*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run only (validate packaging without uploading to pub.dev)'
+        type: boolean
+        default: true
 
 concurrency:
   group: publish-pub-${{ github.ref }}
@@ -44,6 +48,8 @@ jobs:
           cache: true
 
       - name: Determine release version and verify tag
+        env:
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -87,8 +93,12 @@ jobs:
 
           DRY_RUN="false"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            DRY_RUN="true"
-            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
+            if [ "${INPUT_DRY_RUN:-true}" = "true" ]; then
+              DRY_RUN="true"
+              echo "Manual dispatch: dry-run validation mode enabled (no upload)."
+            else
+              echo "Manual dispatch: automated publishing enabled via pub.dev workflow_dispatch authorization."
+            fi
           fi
 
           echo "Resolved release version: ${VERSION}"
@@ -235,6 +245,16 @@ jobs:
             fi
           done
 
+      # Provision a fresh pub.dev OIDC JWT token (PUB_TOKEN) immediately prior to
+      # publishing. GitHub Actions ID tokens typically expire in 5 minutes.
+      # Placing setup-dart after the release asset verification/wait loop guarantees
+      # that tokens never expire during the 10-minute XCFramework build polling window.
+      # setup-dart's createPubOIDCToken() queries ACTIONS_ID_TOKEN_REQUEST_URL with
+      # audience https://pub.dev and runs `dart pub token add https://pub.dev --env-var PUB_TOKEN`.
+      - name: Provision pub.dev OIDC token via setup-dart
+        if: env.DRY_RUN == 'false'
+        uses: dart-lang/setup-dart@v1
+
       - name: Publish cera_ffi (Dart package)
         run: |
           set -euo pipefail
@@ -274,6 +294,15 @@ jobs:
             exit 1
           fi
 
+      # Refresh the pub.dev OIDC JWT token prior to publishing cera_ffi_flutter.
+      # The sibling cera_ffi index propagation loop can wait up to 300s, which risks
+      # exhausting the 5-minute TTL of the token minted for cera_ffi. Re-running
+      # setup-dart requests a fresh token from ACTIONS_ID_TOKEN_REQUEST_URL with a
+      # full 5-minute lifespan for the Flutter plugin publish step.
+      - name: Refresh pub.dev OIDC token for cera_ffi_flutter via setup-dart
+        if: env.DRY_RUN == 'false'
+        uses: dart-lang/setup-dart@v1
+
       - name: Publish cera_ffi_flutter (Flutter plugin)
         run: |
           set -euo pipefail
@@ -281,13 +310,27 @@ jobs:
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
             echo "Note: pubspec_overrides.yaml is intentionally retained for dry-run validation so local path dependencies resolve."
             ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
-            out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
+            set +e
+            out=$(cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1)
+            exit_code=$?
+            set -e
             echo "$out"
-            if ! grep -qE "Package validation found the following error:|Package validation found the following errors:" <<<"$out"; then
+            if [ $exit_code -eq 0 ]; then
               echo "✓ cera_ffi_flutter package structure verified."
             else
-              echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
-              exit 1
+              # flutter pub publish failed: verify that failure is solely the expected unreleased sibling dependency
+              unexpected_errors=$(echo "$out" | sed -n '/Package validation found the following error/,/^$/p' | grep -vE "Dependency cera_ffi:.*doesn't exist on pub.dev" | grep -E '^[[:space:]]*\*' || true)
+              if grep -qE "Package validation found the following errors?:" <<<"$out" && [ -z "$unexpected_errors" ]; then
+                echo "✓ cera_ffi_flutter package structure verified (unreleased sibling dependency exempted)."
+              else
+                echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error(s):" >&2
+                if [ -n "$unexpected_errors" ]; then
+                  echo "$unexpected_errors" >&2
+                else
+                  echo "$out" >&2
+                fi
+                exit 1
+              fi
             fi
             exit 0
           fi
