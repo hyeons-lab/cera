@@ -748,12 +748,11 @@ jobs:
   # ── pub.dev package validation (cera_ffi & cera_ffi_flutter) ───────────────
   publish-pub:
     name: Validate pub.dev packages
-    needs: [version, build-spm]
+    needs: [version]
     if: >-
       ${{ !cancelled()
           && github.event.inputs.pub == 'true'
-          && needs.version.result == 'success'
-          && needs.build-spm.result != 'failure' }}
+          && needs.version.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
