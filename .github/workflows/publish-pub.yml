@@ -7,6 +7,9 @@ name: Publish to pub.dev
 # OIDC tokens minted from branch pushes or `workflow_dispatch` are rejected by
 # pub.dev's token claim verifier. Pushing a tag `v<version>` triggers this
 # workflow and satisfies pub.dev's tag pattern requirement.
+#
+# NOTE: Ensure pub.dev Admin settings for cera_ffi and cera_ffi_flutter authorize
+# workflow path .github/workflows/publish-pub.yml and tag pattern v*.
 
 on:
   push:
@@ -66,12 +69,16 @@ jobs:
           echo "=== Verifying pubspec version consistency ==="
           for pkg in cera_ffi cera_ffi_flutter; do
             pkg_ver=$(grep -E '^version:' "${pkg}/pubspec.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"'\''\r ' || true)
-            if [ "$pkg_ver" != "$VERSION" ]; then
+            if [ -z "$pkg_ver" ] || [ "$pkg_ver" != "$VERSION" ]; then
               echo "::error::Version mismatch: ${pkg}/pubspec.yaml has version '${pkg_ver}' but release version is '${VERSION}'" >&2
               exit 1
             fi
           done
-          dep_ver=$(grep -E '^\s*cera_ffi:' cera_ffi_flutter/pubspec.yaml 2>/dev/null | awk '{print $2}' | tr -d '"'\''\r ' || true)
+          dep_ver=$(grep -E '^[[:space:]]*cera_ffi:[[:space:]]*[0-9]' cera_ffi_flutter/pubspec.yaml 2>/dev/null | head -n 1 | awk '{print $2}' | tr -d '"'\''\r ' || true)
+          if [ -z "$dep_ver" ]; then
+            echo "::error::Could not extract cera_ffi dependency pin from cera_ffi_flutter/pubspec.yaml" >&2
+            exit 1
+          fi
           if [ "$dep_ver" != "$VERSION" ]; then
             echo "::error::Dependency pin mismatch: cera_ffi_flutter/pubspec.yaml pins cera_ffi to '${dep_ver}' but expected '${VERSION}'" >&2
             exit 1
@@ -100,17 +107,21 @@ jobs:
           if [ "$DRY_RUN" = "false" ]; then
             echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
             asset_ready=false
+            last_code="000"
             for i in $(seq 1 60); do
-              if curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null; then
-                echo "Asset confirmed live on GitHub Releases!"
+              # Note: Omitting --fail is intentional here so %{http_code} captures 404 vs 200/206
+              http_code=$(curl -sSL --proto '=https' --tlsv1.2 --retry 2 --retry-connrefused --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" -r 0-0 "$ASSET_URL" 2>/dev/null || true)
+              last_code="${http_code:-000}"
+              if [ "$last_code" = "200" ] || [ "$last_code" = "206" ]; then
+                echo "Asset confirmed live on GitHub Releases (HTTP ${last_code})!"
                 asset_ready=true
                 break
               fi
-              echo "Asset not ready yet, waiting 10s... (${i}/60)"
+              echo "Asset not ready yet (HTTP ${last_code}), waiting 10s... (${i}/60)"
               sleep 10
             done
             if [ "$asset_ready" = "false" ]; then
-              echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 600s" >&2
+              echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 600s (last HTTP status: ${last_code})" >&2
               exit 1
             fi
           fi
@@ -126,51 +137,62 @@ jobs:
           PLACEHOLDER_REGEX='download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"'
           DUMMY_CHECKSUM="0000000000000000000000000000000000000000000000000000000000000000"
 
+          # Always resolve the live asset checksum on real release runs so we can
+          # either rewrite placeholders or assert that pre-pinned manifests match.
+          if [ "$DRY_RUN" = "true" ] && ! curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null 2>/dev/null; then
+            echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
+            CHECKSUM="${DUMMY_CHECKSUM}"
+          else
+            tmp_asset=$(mktemp "${TMPDIR:-/tmp}/cera_xcframework.XXXXXX")
+            trap 'rm -f "$tmp_asset"' EXIT
+            curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 --max-time 300 --speed-limit 1024 --speed-time 30 -sSL "$ASSET_URL" -o "$tmp_asset" || {
+              echo "::error::Failed to download XCFramework zip from ${ASSET_URL}" >&2
+              exit 1
+            }
+            if [ ! -s "$tmp_asset" ]; then
+              echo "::error::Downloaded asset $tmp_asset is empty (0 bytes)" >&2
+              exit 1
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+              CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
+            else
+              CHECKSUM=$(shasum -a 256 "$tmp_asset" | awk '{print $1}')
+            fi
+            rm -f "$tmp_asset"
+            trap - EXIT
+          fi
+
+          if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
+            echo "::error::Could not resolve valid 64-char sha256 checksum for CeraFFI.xcframework.zip from release v${VERSION}" >&2
+            exit 1
+          fi
+          echo "Resolved CHECKSUM=${CHECKSUM}"
+
           needs_rewrite=false
+          has_placeholders=false
           for f in "${MANIFESTS[@]}"; do
             if grep -qE "${PLACEHOLDER_REGEX}" "$f" 2>/dev/null || grep -q "${DUMMY_CHECKSUM}" "$f" 2>/dev/null; then
-              needs_rewrite=true
+              has_placeholders=true
               break
-            fi
-            if [[ "$f" == *.podspec ]]; then
-              if ! grep -q 'VERSION="'"${VERSION}"'"' "$f" 2>/dev/null; then
-                needs_rewrite=true
-                break
-              fi
-            else
-              if ! grep -q "releases/download/v${VERSION}/" "$f" 2>/dev/null; then
-                needs_rewrite=true
-                break
-              fi
             fi
           done
 
+          if [ "$DRY_RUN" = "true" ]; then
+            # In dry-run mode, rewrite manifests if they contain placeholders or do not match target CHECKSUM/VERSION
+            for f in "${MANIFESTS[@]}"; do
+              if grep -qE "${PLACEHOLDER_REGEX}" "$f" 2>/dev/null || ! grep -q "${CHECKSUM}" "$f" || ! grep -q "${VERSION}" "$f"; then
+                needs_rewrite=true
+                break
+              fi
+            done
+          elif [ "$DRY_RUN" = "false" ] && [ "$has_placeholders" = "true" ]; then
+            echo "::error::Tagged commit for release v${VERSION} contains unreplaced placeholders in Apple integration manifests." >&2
+            echo "::error::The release tag must be pinned to the commit created by the SPM step in publish.yml, not an unpinned branch commit." >&2
+            exit 1
+          fi
+
           if [ "$needs_rewrite" = "true" ]; then
             echo "Apple manifests require version/checksum updates for release v${VERSION}..."
-
-            if [ "$DRY_RUN" = "true" ] && ! curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null; then
-              echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
-              CHECKSUM="${DUMMY_CHECKSUM}"
-            else
-              tmp_asset=$(mktemp -t cera_xcframework.XXXXXX)
-              trap 'rm -f "$tmp_asset"' EXIT
-              curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset" || {
-                echo "::error::Failed to download XCFramework zip from ${ASSET_URL}" >&2
-                exit 1
-              }
-              if command -v sha256sum >/dev/null 2>&1; then
-                CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
-              else
-                CHECKSUM=$(shasum -a 256 "$tmp_asset" | awk '{print $1}')
-              fi
-            fi
-
-            if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
-              echo "::error::Could not resolve valid 64-char sha256 checksum for CeraFFI.xcframework.zip from release v${VERSION}" >&2
-              exit 1
-            fi
-            echo "Resolved CHECKSUM=${CHECKSUM}"
-
             for f in "${MANIFESTS[@]}"; do
               sed -i.bak \
                 -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
@@ -178,22 +200,17 @@ jobs:
                 -e "s|VERSION=\"RELEASE_VERSION\"|VERSION=\"${VERSION}\"|" \
                 -e "s|VERSION=\"[0-9][0-9A-Za-z.+-]*\"|VERSION=\"${VERSION}\"|" \
                 -e "s|EXPECTED_SHA=\"RELEASE_CHECKSUM\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
-                -e "s|EXPECTED_SHA=\"[0-9a-f]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+                -e "s|EXPECTED_SHA=\"[0-9a-fA-F]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
                 -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
-                -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+                -e "s|checksum: \"[0-9a-fA-F]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
                 "$f"
               rm -f "$f.bak"
-
-              if ! grep -q "${CHECKSUM}" "$f"; then
-                echo "::error::$f does not contain expected checksum ${CHECKSUM}" >&2
-                exit 1
-              fi
             done
           else
-            echo "Apple integration manifests already contain valid release pins for v${VERSION}."
+            echo "Apple integration manifests already contain verified release pins for v${VERSION}."
           fi
 
-          # Assert that no code placeholder patterns remain
+          # Assert that all manifests contain the expected checksum, version, and no placeholders
           for f in "${MANIFESTS[@]}"; do
             if grep -qE "${PLACEHOLDER_REGEX}" "$f"; then
               echo "::error::$f still has unreplaced release placeholders" >&2
@@ -201,6 +218,19 @@ jobs:
             fi
             if [ "$DRY_RUN" = "false" ] && grep -q "${DUMMY_CHECKSUM}" "$f"; then
               echo "::error::$f contains dummy zero checksum on a real release" >&2
+              exit 1
+            fi
+            if ! grep -q "${CHECKSUM}" "$f"; then
+              echo "::error::$f does not match expected checksum ${CHECKSUM}" >&2
+              exit 1
+            fi
+            if [[ "$f" == *.podspec ]]; then
+              if ! grep -q 'VERSION="'"${VERSION}"'"' "$f" || ! grep -qE "s\.version\s*=\s*['\"]${VERSION}['\"]" "$f"; then
+                echo "::error::$f does not contain expected VERSION=\"${VERSION}\" or s.version = '${VERSION}'" >&2
+                exit 1
+              fi
+            elif [[ "$f" == *.swift ]] && ! grep -q "releases/download/v${VERSION}/" "$f"; then
+              echo "::error::$f does not contain expected release URL for v${VERSION}" >&2
               exit 1
             fi
           done
@@ -217,7 +247,8 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
+          pkg_status=$(curl -sSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
+          pkg_status="${pkg_status:-000}"
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi@${VERSION} already on pub.dev - skipping"
@@ -228,7 +259,8 @@ jobs:
           ( cd cera_ffi && dart pub publish --force )
           propagated=false
           for i in $(seq 1 30); do
-            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
+            status=$(curl -sSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
+            status="${status:-000}"
             if [ "$status" = "200" ]; then
               echo "cera_ffi@${VERSION} visible on pub.dev"
               propagated=true
@@ -251,7 +283,7 @@ jobs:
             ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
             out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
             echo "$out"
-            if ! grep -q "Package validation found the following error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
+            if ! grep -qE "Package validation found the following error:|Package validation found the following errors:" <<<"$out"; then
               echo "✓ cera_ffi_flutter package structure verified."
             else
               echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
@@ -261,7 +293,8 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
+          pkg_status=$(curl -sSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
+          pkg_status="${pkg_status:-000}"
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi_flutter@${VERSION} already on pub.dev - skipping"
@@ -292,7 +325,8 @@ jobs:
 
           propagated=false
           for i in $(seq 1 30); do
-            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
+            status=$(curl -sSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
+            status="${status:-000}"
             if [ "$status" = "200" ]; then
               echo "cera_ffi_flutter@${VERSION} visible on pub.dev"
               propagated=true

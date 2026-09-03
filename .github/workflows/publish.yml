@@ -63,7 +63,7 @@ on:
         type: boolean
         default: true
       spm:
-        description: 'Swift Package Manager (CeraFFI.xcframework — rewrites Package.swift + retags on real runs)'
+        description: 'Swift Package Manager (CeraFFI.xcframework: rewrites Package.swift + retags on real runs)'
         type: boolean
         default: true
       web:
@@ -71,7 +71,7 @@ on:
         type: boolean
         default: true
       pub:
-        description: 'Validate pub.dev packages (cera_ffi & cera_ffi_flutter; publishing occurs on tag push via publish-pub.yml)'
+        description: 'Pre-validate pub.dev packages (REQUIRED: tag push automatically publishes to pub.dev; disable only for non-tag dry runs)'
         type: boolean
         default: true
 
@@ -114,6 +114,19 @@ jobs:
       # runs before anything publishes, so a drifted pin/coordinate can't ship.
       - name: Version drift check
         run: ./scripts/bump-version.sh --check
+
+      - name: Assert canonical release prerequisites
+        if: ${{ github.event.inputs.dry_run == 'false' }}
+        run: |
+          if [ "${{ github.event.inputs.spm }}" != "true" ]; then
+            echo "::error::Cannot cut release tag without SPM enabled. Downstream tag-triggered publishers (publish-pub.yml) and Swift consumers require CeraFFI.xcframework.zip and pinned manifests." >&2
+            exit 1
+          fi
+          if [ "${{ github.event.inputs.pub }}" != "true" ]; then
+            echo "::error::Cannot cut release tag with pub=false. Any canonical tag push automatically triggers publish-pub.yml to release on pub.dev. Enable 'pub: true' to ensure pre-validation passes before cutting the tag." >&2
+            exit 1
+          fi
+
       - name: Read version from `cera`
         id: version
         run: |
@@ -588,7 +601,7 @@ jobs:
           pom_url="https://repo1.maven.org/maven2/com/hyeons-lab/cera-ffi-jvm/${VERSION}/cera-ffi-jvm-${VERSION}.pom"
           code=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
           if [ "$code" = "200" ]; then
-            echo "✓ cera-ffi ${VERSION} already on Maven Central — skipping"
+            echo "✓ cera-ffi ${VERSION} already on Maven Central: skipping"
             exit 0
           fi
 
@@ -768,6 +781,30 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Verify pubspec versions and sibling dependency pins
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          echo "=== Verifying pubspec version consistency for release v${VERSION} ==="
+          for pkg in cera_ffi cera_ffi_flutter; do
+            pkg_ver=$(grep -E '^version:' "${pkg}/pubspec.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"'\''\r ' || true)
+            if [ -z "$pkg_ver" ] || [ "$pkg_ver" != "$VERSION" ]; then
+              echo "::error::Version mismatch: ${pkg}/pubspec.yaml has version '${pkg_ver}' but release version is '${VERSION}'" >&2
+              exit 1
+            fi
+          done
+          dep_ver=$(grep -E '^[[:space:]]*cera_ffi:[[:space:]]*[0-9]' cera_ffi_flutter/pubspec.yaml 2>/dev/null | head -n 1 | awk '{print $2}' | tr -d '"'\''\r ' || true)
+          if [ -z "$dep_ver" ]; then
+            echo "::error::Could not extract cera_ffi dependency pin from cera_ffi_flutter/pubspec.yaml" >&2
+            exit 1
+          fi
+          if [ "$dep_ver" != "$VERSION" ]; then
+            echo "::error::Dependency pin mismatch: cera_ffi_flutter/pubspec.yaml pins cera_ffi to '${dep_ver}' but expected '${VERSION}'" >&2
+            exit 1
+          fi
+          echo "✓ pubspec.yaml versions and dependency pins match release version ${VERSION}"
+
       - name: Validate cera_ffi (Dart package)
         run: |
           set -euo pipefail
@@ -782,7 +819,7 @@ jobs:
           ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
           out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
           echo "$out"
-          if ! grep -q "Package validation found the following error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
+          if ! grep -qE "Package validation found the following error:|Package validation found the following errors:" <<<"$out"; then
             echo "✓ cera_ffi_flutter package structure verified."
           else
             echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
@@ -826,7 +863,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Working tree — needed only for the SPM leg (Package.swift rewrite +
+      # Working tree: needed only for the SPM leg (Package.swift rewrite +
       # tag move). Checkout FIRST: actions/checkout cleans the workspace, so
       # the artifact downloads below (which land in release-assets/) must come
       # after it or they'd be wiped.
@@ -847,7 +884,7 @@ jobs:
           persist-credentials: true
           token: ${{ secrets.RELEASE_PAT || github.token }}
 
-      # CLI binaries to attach — present only when the `cli` leg ran.
+      # CLI binaries to attach: present only when the `cli` leg ran.
       - name: Download CLI artifacts
         if: ${{ needs.build-cli.result == 'success' }}
         uses: actions/download-artifact@v8
@@ -907,13 +944,13 @@ jobs:
             -e "s|releases/download/vRELEASE_VERSION/|releases/download/v${VERSION}/|" \
             -e "s|releases/download/v[0-9][0-9A-Za-z.+-]*/CeraFFI\.xcframework\.zip|releases/download/v${VERSION}/CeraFFI.xcframework.zip|" \
             -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
-            -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+            -e "s|checksum: \"[0-9a-fA-F]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
             Package.swift
           rm -f Package.swift.bak
           # Fail loud if a placeholder survived in the ACTUAL url/checksum
           # values. Match only the placeholder USAGE (`download/vRELEASE_VERSION/`
           # and `checksum: "RELEASE_CHECKSUM"`), NOT the doc comment above that
-          # names the tokens in backticks — a bare `RELEASE_VERSION` match there
+          # names the tokens in backticks: a bare `RELEASE_VERSION` match there
           # would false-positive even after a correct rewrite.
           if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"' Package.swift; then
             echo "::error::Package.swift still has placeholders after rewrite" >&2
@@ -940,9 +977,9 @@ jobs:
               -e "s|VERSION=\"RELEASE_VERSION\"|VERSION=\"${VERSION}\"|" \
               -e "s|VERSION=\"[0-9][0-9A-Za-z.+-]*\"|VERSION=\"${VERSION}\"|" \
               -e "s|EXPECTED_SHA=\"RELEASE_CHECKSUM\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
-              -e "s|EXPECTED_SHA=\"[0-9a-f]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
+              -e "s|EXPECTED_SHA=\"[0-9a-fA-F]\{64\}\"|EXPECTED_SHA=\"${CHECKSUM}\"|" \
               -e "s|checksum: \"RELEASE_CHECKSUM\"|checksum: \"${CHECKSUM}\"|" \
-              -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
+              -e "s|checksum: \"[0-9a-fA-F]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
               "$f"
             rm -f "$f.bak"
             # Match only placeholder USAGE, never the doc comments that name
@@ -1006,8 +1043,8 @@ jobs:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           generate_release_notes: true
-          # Assets are attached per-leg; tolerate any absence so a subset
-          # release (e.g. crates-only) still cuts the tag.
+          # Assets are attached per-leg: tolerate absence of optional legs
+          # (e.g. cli binaries or web runtime) while SPM is strictly required.
           fail_on_unmatched_files: false
           files: |
             release-assets/**/cera-*
@@ -1020,5 +1057,6 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           if [ -z "${RELEASE_PAT:-}" ]; then
-            echo "::notice::Release tag v${VERSION} pushed using default GITHUB_TOKEN. Note that downstream push:tags workflows (publish-pub.yml) are suppressed by GitHub recursion prevention unless RELEASE_PAT is configured in repository secrets. Configure RELEASE_PAT with Contents:write to automate pub.dev publishing on release."
+            echo "::warning::Release tag v${VERSION} pushed using default GITHUB_TOKEN. Downstream push:tags workflows (publish-pub.yml) are suppressed by GitHub recursion prevention unless RELEASE_PAT is configured in repository secrets. Configure RELEASE_PAT with Contents:write to automate pub.dev publishing on release."
+            echo "::notice::To publish pub.dev packages manually when RELEASE_PAT is not set, checkout the release tag first to ensure pinned Apple manifests are packaged: 'git fetch origin --tags && git checkout v${VERSION} && (cd cera_ffi && dart pub publish) && (cd cera_ffi_flutter && rm -f pubspec_overrides.yaml && { flutter pub get && flutter pub publish; rc=\$?; git checkout -- pubspec_overrides.yaml; exit \$rc; })'"
           fi
