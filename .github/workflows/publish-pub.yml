@@ -293,6 +293,15 @@ jobs:
             exit 1
           fi
 
+      # Refresh the pub.dev OIDC JWT token prior to publishing cera_ffi_flutter.
+      # The sibling cera_ffi index propagation loop can wait up to 300s, which risks
+      # exhausting the 5-minute TTL of the token minted for cera_ffi. Re-running
+      # setup-dart requests a fresh token from ACTIONS_ID_TOKEN_REQUEST_URL with a
+      # full 5-minute lifespan for the Flutter plugin publish step.
+      - name: Refresh pub.dev OIDC token for cera_ffi_flutter via setup-dart
+        if: env.DRY_RUN == 'false'
+        uses: dart-lang/setup-dart@v1
+
       - name: Publish cera_ffi_flutter (Flutter plugin)
         run: |
           set -euo pipefail
