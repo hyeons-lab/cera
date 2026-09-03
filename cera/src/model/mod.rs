@@ -1,3 +1,4 @@
+pub mod bert;
 pub mod dspark;
 pub mod lfm2;
 pub mod llama;
@@ -690,6 +691,9 @@ pub fn load_model(
             // "mistral3"/"mistral4" archs with different layouts, not served here).
             "qwen2" | "qwen3" | "llama" | "granite" => Box::new(
                 llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "bert" | "modernbert" => Box::new(
+                bert::BertModel::from_gguf_with_id(gguf, context_size, model_id)?,
             ),
             other => bail!("unsupported architecture: {other}"),
         };
