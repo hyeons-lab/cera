@@ -33,7 +33,10 @@ name: Publish
 #       its passphrase, used to sign the Maven release artifacts (required by
 #       Central for non-SNAPSHOT releases). The dry run publishes a SNAPSHOT
 #       locally and needs neither.
-# The tag + GitHub release uses the default GITHUB_TOKEN.
+#   RELEASE_PAT                             - optional Personal Access Token
+#       (Contents:write) used for checkout and release tag push to allow
+#       downstream `on: push: tags:` workflows (publish-pub.yml) to trigger.
+#       If not set, falls back to default GITHUB_TOKEN.
 
 on:
   workflow_dispatch:
@@ -198,7 +201,7 @@ jobs:
           # `cera` dep against. The API returns 200 almost immediately, but the
           # index can lag, so a dependent publish would otherwise fail.
           index_has() {
-            curl -sS --connect-timeout 10 --max-time 20 "https://index.crates.io/$(index_prefix "$1")/$1" 2>/dev/null \
+            curl -sSL --connect-timeout 10 --max-time 20 "https://index.crates.io/$(index_prefix "$1")/$1" 2>/dev/null \
               | grep -q "\"vers\":\"$2\""
           }
 
@@ -583,7 +586,7 @@ jobs:
           # -> repo1 sync can lag minutes after a release, so an immediate rerun
           # may not yet see it; wait before re-dispatching the jvm leg.
           pom_url="https://repo1.maven.org/maven2/com/hyeons-lab/cera-ffi-jvm/${VERSION}/cera-ffi-jvm-${VERSION}.pom"
-          code=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
+          code=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$pom_url" 2>/dev/null || echo 000)
           if [ "$code" = "200" ]; then
             echo "✓ cera-ffi ${VERSION} already on Maven Central — skipping"
             exit 0
@@ -779,7 +782,7 @@ jobs:
           ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
           out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
           echo "$out"
-          if grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; then
+          if ! grep -q "Package has [0-9]* error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
             echo "✓ cera_ffi_flutter package structure verified."
           else
             echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
@@ -833,8 +836,8 @@ jobs:
       # commits the checksum-rewritten Package.swift locally and points the
       # v<version> TAG at that commit (tags aren't covered by the branch
       # ruleset). Consumers resolve the tag; the default branch keeps the
-      # placeholder Package.swift. Uses GITHUB_TOKEN (needs `contents: write`,
-      # set on this job) for the tag push only.
+      # placeholder Package.swift. Uses RELEASE_PAT (if set) or GITHUB_TOKEN
+      # (needs `contents: write`, set on this job) for the tag push only.
       - name: Checkout default branch
         if: ${{ needs.build-spm.result == 'success' }}
         uses: actions/checkout@v7
@@ -842,6 +845,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.RELEASE_PAT || github.token }}
 
       # CLI binaries to attach — present only when the `cli` leg ran.
       - name: Download CLI artifacts
@@ -979,9 +983,9 @@ jobs:
             cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
           # Normally main carries placeholders so there is always a diff; guard
           # the anomalous no-diff case (main already pinned) so `set -e` + an
-          # empty `git commit` can't abort the release — just tag current HEAD.
+          # empty `git commit` can't abort the release: just tag current HEAD.
           if git diff --cached --quiet; then
-            echo "CeraFFI.xcframework already pinned for v${VERSION} — tagging current HEAD"
+            echo "CeraFFI.xcframework already pinned for v${VERSION}: tagging current HEAD"
           else
             git commit -m "chore(spm): pin CeraFFI.xcframework for v${VERSION}"
           fi
@@ -998,6 +1002,7 @@ jobs:
       - name: Create tag and GitHub release
         uses: softprops/action-gh-release@v3
         with:
+          token: ${{ secrets.RELEASE_PAT || github.token }}
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           generate_release_notes: true
@@ -1007,3 +1012,13 @@ jobs:
           files: |
             release-assets/**/cera-*
             release-assets/**/CeraFFI.xcframework.zip
+
+      - name: Downstream publishing trigger notice
+        if: success()
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if [ -z "${RELEASE_PAT:-}" ]; then
+            echo "::notice::Release tag v${VERSION} pushed using default GITHUB_TOKEN. Note that downstream push:tags workflows (publish-pub.yml) are suppressed by GitHub recursion prevention unless RELEASE_PAT is configured in repository secrets. Configure RELEASE_PAT with Contents:write to automate pub.dev publishing on release."
+          fi

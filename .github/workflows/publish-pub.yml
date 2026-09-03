@@ -25,7 +25,7 @@ jobs:
   publish:
     name: Publish packages to pub.dev
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       # OIDC token minting for pub.dev automated publishing
       id-token: write
@@ -63,6 +63,21 @@ jobs:
             exit 1
           fi
 
+          echo "=== Verifying pubspec version consistency ==="
+          for pkg in cera_ffi cera_ffi_flutter; do
+            pkg_ver=$(grep -E '^version:' "${pkg}/pubspec.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"'\''\r ' || true)
+            if [ "$pkg_ver" != "$VERSION" ]; then
+              echo "::error::Version mismatch: ${pkg}/pubspec.yaml has version '${pkg_ver}' but release version is '${VERSION}'" >&2
+              exit 1
+            fi
+          done
+          dep_ver=$(grep -E '^\s*cera_ffi:' cera_ffi_flutter/pubspec.yaml 2>/dev/null | awk '{print $2}' | tr -d '"'\''\r ' || true)
+          if [ "$dep_ver" != "$VERSION" ]; then
+            echo "::error::Dependency pin mismatch: cera_ffi_flutter/pubspec.yaml pins cera_ffi to '${dep_ver}' but expected '${VERSION}'" >&2
+            exit 1
+          fi
+          echo "✓ pubspec.yaml versions and dependency pins match release version ${VERSION}"
+
           DRY_RUN="false"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             DRY_RUN="true"
@@ -78,12 +93,15 @@ jobs:
           set -euo pipefail
           ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CeraFFI.xcframework.zip"
 
+          # Note: If the upstream publish.yml was run with SPM disabled (spm=false), this
+          # polling loop will intentionally timeout and fail. cera_ffi_flutter cannot be
+          # published without its backing XCFramework.
           # On real release runs, gate on CeraFFI.xcframework.zip being live on GitHub Releases
           if [ "$DRY_RUN" = "false" ]; then
             echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
             asset_ready=false
             for i in $(seq 1 30); do
-              if curl --silent --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 -L "$ASSET_URL" -o /dev/null 2>&1; then
+              if curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null; then
                 echo "Asset confirmed live on GitHub Releases!"
                 asset_ready=true
                 break
@@ -105,9 +123,12 @@ jobs:
             cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
           )
 
+          PLACEHOLDER_REGEX='download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"'
+          DUMMY_CHECKSUM="0000000000000000000000000000000000000000000000000000000000000000"
+
           needs_rewrite=false
           for f in "${MANIFESTS[@]}"; do
-            if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f" 2>/dev/null; then
+            if grep -qE "${PLACEHOLDER_REGEX}" "$f" 2>/dev/null || grep -q "${DUMMY_CHECKSUM}" "$f" 2>/dev/null; then
               needs_rewrite=true
               break
             fi
@@ -126,20 +147,22 @@ jobs:
 
           if [ "$needs_rewrite" = "true" ]; then
             echo "Apple manifests require version/checksum updates for release v${VERSION}..."
-            tmp_asset=$(mktemp)
-            trap 'rm -f "$tmp_asset"' EXIT
 
-            if [ "$DRY_RUN" = "true" ]; then
-              if curl --silent --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 -L "$ASSET_URL" -o /dev/null 2>&1; then
-                curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset"
+            if [ "$DRY_RUN" = "true" ] && ! curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null; then
+              echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
+              CHECKSUM="${DUMMY_CHECKSUM}"
+            else
+              tmp_asset=$(mktemp -t cera_xcframework.XXXXXX)
+              trap 'rm -f "$tmp_asset"' EXIT
+              curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset" || {
+                echo "::error::Failed to download XCFramework zip from ${ASSET_URL}" >&2
+                exit 1
+              }
+              if command -v sha256sum >/dev/null 2>&1; then
                 CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
               else
-                echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
-                CHECKSUM="0000000000000000000000000000000000000000000000000000000000000000"
+                CHECKSUM=$(shasum -a 256 "$tmp_asset" | awk '{print $1}')
               fi
-            else
-              curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset"
-              CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
             fi
 
             if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
@@ -172,8 +195,12 @@ jobs:
 
           # Assert that no code placeholder patterns remain
           for f in "${MANIFESTS[@]}"; do
-            if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
+            if grep -qE "${PLACEHOLDER_REGEX}" "$f"; then
               echo "::error::$f still has unreplaced release placeholders" >&2
+              exit 1
+            fi
+            if [ "$DRY_RUN" = "false" ] && grep -q "${DUMMY_CHECKSUM}" "$f"; then
+              echo "::error::$f contains dummy zero checksum on a real release" >&2
               exit 1
             fi
           done
@@ -190,28 +217,29 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi@${VERSION} already on pub.dev - skipping"
-          else
-            echo "=== Publishing cera_ffi@${VERSION} to pub.dev ==="
-            ( cd cera_ffi && dart pub publish --force )
-            propagated=false
-            for i in $(seq 1 30); do
-              status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
-              if [ "$status" = "200" ]; then
-                echo "cera_ffi@${VERSION} visible on pub.dev"
-                propagated=true
-                break
-              fi
-              echo "waiting for pub.dev index propagation (${i}/30)..."
-              sleep 10
-            done
-            if [ "$propagated" = "false" ]; then
-              echo "::error::cera_ffi@${VERSION} did not propagate to pub.dev index after 300s" >&2
-              exit 1
+            exit 0
+          fi
+
+          echo "=== Publishing cera_ffi@${VERSION} to pub.dev ==="
+          ( cd cera_ffi && dart pub publish --force )
+          propagated=false
+          for i in $(seq 1 30); do
+            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || true)
+            if [ "$status" = "200" ]; then
+              echo "cera_ffi@${VERSION} visible on pub.dev"
+              propagated=true
+              break
             fi
+            echo "waiting for pub.dev index propagation (${i}/30)..."
+            sleep 10
+          done
+          if [ "$propagated" = "false" ]; then
+            echo "::error::cera_ffi@${VERSION} did not propagate to pub.dev index after 300s" >&2
+            exit 1
           fi
 
       - name: Publish cera_ffi_flutter (Flutter plugin)
@@ -222,7 +250,7 @@ jobs:
             ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
             out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
             echo "$out"
-            if grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; then
+            if ! grep -q "Package has [0-9]* error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
               echo "✓ cera_ffi_flutter package structure verified."
             else
               echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
@@ -232,7 +260,7 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi_flutter@${VERSION} already on pub.dev - skipping"
@@ -240,21 +268,21 @@ jobs:
           fi
 
           echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
-          rm -f cera_ffi_flutter/pubspec_overrides.yaml
           (
             cd cera_ffi_flutter
-            rm -rf .dart_tool pubspec.lock
+            rm -f pubspec_overrides.yaml
             resolved=false
-            for attempt in $(seq 1 6); do
+            for attempt in $(seq 1 12); do
+              rm -rf .dart_tool pubspec.lock
               if flutter pub get; then
                 resolved=true
                 break
               fi
-              echo "flutter pub get failed (attempt ${attempt}/6), waiting for pub.dev dependency cache to propagate..."
-              sleep 5
+              echo "flutter pub get failed (attempt ${attempt}/12), waiting 10s for pub.dev dependency cache to propagate..."
+              sleep 10
             done
             if [ "$resolved" = "false" ]; then
-              echo "::error::flutter pub get failed to resolve dependencies after 6 attempts" >&2
+              echo "::error::flutter pub get failed to resolve dependencies after 12 attempts" >&2
               exit 1
             fi
             flutter analyze
@@ -263,7 +291,7 @@ jobs:
 
           propagated=false
           for i in $(seq 1 30); do
-            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
             if [ "$status" = "200" ]; then
               echo "cera_ffi_flutter@${VERSION} visible on pub.dev"
               propagated=true
