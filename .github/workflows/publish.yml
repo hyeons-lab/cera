@@ -769,6 +769,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Validating cera_ffi package structure ==="
+          ( cd cera_ffi && dart analyze )
           ( cd cera_ffi && dart pub publish --dry-run )
 
       - name: Validate cera_ffi_flutter (Flutter plugin)

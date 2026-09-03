@@ -13,12 +13,6 @@ on:
     tags:
       - 'v[0-9]*'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry-run package validation (real publishing requires tag push for OIDC authentication)'
-        type: boolean
-        required: true
-        default: true
 
 concurrency:
   group: publish-pub-${{ github.ref }}
@@ -77,13 +71,10 @@ jobs:
           fi
 
           echo "Resolved release version: ${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "DRY_RUN=${DRY_RUN}" >> "$GITHUB_ENV"
 
       - name: Verify release assets and resolve Apple framework checksums
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
           ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CeraFFI.xcframework.zip"
@@ -120,9 +111,17 @@ jobs:
             if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f" 2>/dev/null; then
               needs_rewrite=true
               break
-            elif ! grep -q "releases/download/v${VERSION}/" "$f" 2>/dev/null; then
-              needs_rewrite=true
-              break
+            fi
+            if [[ "$f" == *.podspec ]]; then
+              if ! grep -q 'VERSION="'"${VERSION}"'"' "$f" 2>/dev/null; then
+                needs_rewrite=true
+                break
+              fi
+            else
+              if ! grep -q "releases/download/v${VERSION}/" "$f" 2>/dev/null; then
+                needs_rewrite=true
+                break
+              fi
             fi
           done
 
@@ -181,11 +180,10 @@ jobs:
           done
 
       - name: Publish cera_ffi (Dart package)
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
+          ( cd cera_ffi && dart analyze )
+
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi package validation ==="
             ( cd cera_ffi && dart pub publish --dry-run )
@@ -218,9 +216,6 @@ jobs:
           fi
 
       - name: Publish cera_ffi_flutter (Flutter plugin)
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
-          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
