@@ -825,10 +825,18 @@ jobs:
           if [ $exit_code -eq 0 ]; then
             echo "✓ cera_ffi_flutter package structure verified."
           else
-            # flutter pub publish failed: verify that failure is solely the expected unreleased sibling dependency
+            # Assert that package validation actually executed
+            if ! grep -q "Validating package..." <<<"$out"; then
+              echo "::error::cera_ffi_flutter dry-run failed before packaging validation" >&2
+              echo "$out" >&2
+              exit 1
+            fi
+
+            # flutter pub publish --dry-run exits with 65 if any warnings or errors are found.
+            # Verify there are no unexpected packaging errors, exempting the unreleased sibling dependency.
             unexpected_errors=$(echo "$out" | sed -n '/Package validation found the following error/,/^$/p' | grep -vE "Dependency cera_ffi:.*doesn't exist on pub.dev" | grep -E '^[[:space:]]*\*' || true)
-            if grep -qE "Package validation found the following errors?:" <<<"$out" && [ -z "$unexpected_errors" ]; then
-              echo "✓ cera_ffi_flutter package structure verified (unreleased sibling dependency exempted)."
+            if [ -z "$unexpected_errors" ]; then
+              echo "✓ cera_ffi_flutter package structure verified (warnings accepted, unreleased sibling dependency exempted)."
             else
               echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error(s):" >&2
               if [ -n "$unexpected_errors" ]; then
