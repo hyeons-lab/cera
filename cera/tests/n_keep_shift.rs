@@ -440,6 +440,8 @@ fn mock_attention_config(max_seq_len: usize) -> ModelConfig {
         kv_heads_per_layer: vec![4],
         scalars: cera::model::ScalarMultipliers::default(),
         moe: None,
+        is_causal: true,
+        class_labels: Vec::new(),
     }
 }
 

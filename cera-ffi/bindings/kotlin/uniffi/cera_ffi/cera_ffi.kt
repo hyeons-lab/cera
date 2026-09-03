@@ -886,6 +886,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_detect_pii(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special(): Int
@@ -935,6 +937,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(): Int
 
     external fun uniffi_cera_ffi_checksum_method_modalitysink_on_done(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_piiclassifier_detect(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_append_audio(): Int
 
@@ -1015,6 +1019,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(): Int
 
     external fun ffi_cera_ffi_uniffi_contract_version(): Int
 }
@@ -1177,6 +1185,12 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_detect_pii(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1411,6 +1425,33 @@ internal object UniffiLib {
         `reason`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_cera_ffi_fn_clone_piiclassifier(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_piiclassifier(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter(
+        `basePath`: RustBuffer.ByValue,
+        `adapterPath`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_piiclassifier_from_path(
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_piiclassifier_detect(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_clone_session(
         `handle`: Long,
@@ -1869,6 +1910,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 53563) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1942,6 +1986,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
@@ -2062,6 +2109,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3108,6 +3161,11 @@ public interface CeraEngineInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
+     * Detect PII entity spans in text using the loaded token classification model.
+     */
+    fun `detectPii`(`text`: kotlin.String): List<FfiEntitySpan>
+
+    /**
      * Encode `text` into token IDs using the model's BPE tokenizer.
      * Empty input returns an empty vec.
      */
@@ -3487,6 +3545,23 @@ open class CeraEngine :
                 uniffiRustCall { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
                         it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Detect PII entity spans in text using the loaded token classification model.
+     */
+    @Throws(FfiException::class)
+    override fun `detectPii`(`text`: kotlin.String): List<FfiEntitySpan> =
+        FfiConverterSequenceTypeFfiEntitySpan.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_detect_pii(
+                        it,
+                        FfiConverterString.lower(`text`),
                         _status,
                     )
                 }
@@ -5952,6 +6027,283 @@ public object FfiConverterTypeModalitySink : FfiConverter<ModalitySink, Long> {
 //
 
 /**
+ * Zero-dependency PII Classifier for named entity recognition.
+ */
+public interface PiiClassifierInterface {
+    /**
+     * Detect PII entities in the input text.
+     */
+    fun `detect`(`text`: kotlin.String): List<FfiEntitySpan>
+
+    companion object
+}
+
+/**
+ * Zero-dependency PII Classifier for named entity recognition.
+ */
+open class PiiClassifier :
+    Disposable,
+    AutoCloseable,
+    PiiClassifierInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_piiclassifier(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier(handle, status)
+        }
+    }
+
+    /**
+     * Detect PII entities in the input text.
+     */
+    @Throws(FfiException::class)
+    override fun `detect`(`text`: kotlin.String): List<FfiEntitySpan> =
+        FfiConverterSequenceTypeFfiEntitySpan.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_piiclassifier_detect(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    companion object {
+        /**
+         * Load a base model with a separate LoRA classifier adapter.
+         */
+        @Throws(FfiException::class)
+        fun `fromBaseAndAdapter`(
+            `basePath`: kotlin.String,
+            `adapterPath`: kotlin.String,
+        ): PiiClassifier =
+            FfiConverterTypePiiClassifier.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter(
+                        FfiConverterString.lower(`basePath`),
+                        FfiConverterString.lower(`adapterPath`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Load a PII classification model from a local GGUF path.
+         */
+        @Throws(FfiException::class)
+        fun `fromPath`(`path`: kotlin.String): PiiClassifier =
+            FfiConverterTypePiiClassifier.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_path(FfiConverterString.lower(`path`), _status)
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePiiClassifier : FfiConverter<PiiClassifier, Long> {
+    override fun lower(value: PiiClassifier): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): PiiClassifier = PiiClassifier(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): PiiClassifier = lift(buf.getLong())
+
+    override fun allocationSize(value: PiiClassifier) = 8UL
+
+    override fun write(
+        value: PiiClassifier,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
  * Stateful inference handle. Wraps [`cera::Session`] behind a
  * `Mutex` so UniFFI's `Arc<Session>` shape works with methods that
  * need `&mut self` on the inner session (prefill, generate, reset).
@@ -7300,6 +7652,82 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
         FfiConverterTypeBackendPreference.write(value.`backend`, buf)
         FfiConverterOptionalTypeBundleRepo.write(value.`bundleRepo`, buf)
         FfiConverterOptionalString.write(value.`draftModel`, buf)
+    }
+}
+
+/**
+ * An identified PII entity span in source text.
+ */
+data class FfiEntitySpan(
+    /**
+     * Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+     */
+    var `entityType`: kotlin.String,
+    /**
+     * UTF-8 character start index in source text (inclusive).
+     */
+    var `startChar`: kotlin.ULong,
+    /**
+     * UTF-8 character end index in source text (exclusive).
+     */
+    var `endChar`: kotlin.ULong,
+    /**
+     * Token start index in sequence (inclusive).
+     */
+    var `startToken`: kotlin.ULong,
+    /**
+     * Token end index in sequence (exclusive).
+     */
+    var `endToken`: kotlin.ULong,
+    /**
+     * Extracted text slice.
+     */
+    var `text`: kotlin.String,
+    /**
+     * Mean classification confidence score across the span tokens [0.0..1.0].
+     */
+    var `score`: kotlin.Float,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiEntitySpan : FfiConverterRustBuffer<FfiEntitySpan> {
+    override fun read(buf: ByteBuffer): FfiEntitySpan =
+        FfiEntitySpan(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterFloat.read(buf),
+        )
+
+    override fun allocationSize(value: FfiEntitySpan) =
+        (
+            FfiConverterString.allocationSize(value.`entityType`) +
+                FfiConverterULong.allocationSize(value.`startChar`) +
+                FfiConverterULong.allocationSize(value.`endChar`) +
+                FfiConverterULong.allocationSize(value.`startToken`) +
+                FfiConverterULong.allocationSize(value.`endToken`) +
+                FfiConverterString.allocationSize(value.`text`) +
+                FfiConverterFloat.allocationSize(value.`score`)
+        )
+
+    override fun write(
+        value: FfiEntitySpan,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`entityType`, buf)
+        FfiConverterULong.write(value.`startChar`, buf)
+        FfiConverterULong.write(value.`endChar`, buf)
+        FfiConverterULong.write(value.`startToken`, buf)
+        FfiConverterULong.write(value.`endToken`, buf)
+        FfiConverterString.write(value.`text`, buf)
+        FfiConverterFloat.write(value.`score`, buf)
     }
 }
 
@@ -9461,6 +9889,34 @@ public object FfiConverterSequenceTypeChatMessage : FfiConverterRustBuffer<List<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeChatMessage.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiEntitySpan : FfiConverterRustBuffer<List<FfiEntitySpan>> {
+    override fun read(buf: ByteBuffer): List<FfiEntitySpan> {
+        val len = buf.getInt()
+        return List<FfiEntitySpan>(len) {
+            FfiConverterTypeFfiEntitySpan.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiEntitySpan>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiEntitySpan.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<FfiEntitySpan>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiEntitySpan.write(it, buf)
         }
     }
 }

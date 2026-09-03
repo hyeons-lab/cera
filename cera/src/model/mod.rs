@@ -146,11 +146,15 @@ pub struct ModelConfig {
     /// Per-layer KV head counts. Length = n_layers. 0 for conv layers.
     pub kv_heads_per_layer: Vec<usize>,
     /// Architecture scalar multipliers (Granite 3.x). Identity for every other
-    /// arch — see [`ScalarMultipliers`].
+    /// arch (see [`ScalarMultipliers`]).
     pub scalars: ScalarMultipliers,
     /// Mixture-of-experts parameters (`lfm2moe`). `None` for dense
     /// architectures, which is every other arch cera loads.
     pub moe: Option<MoeConfig>,
+    /// Whether attention is causal. True for generative models, false for bidirectional classifiers.
+    pub is_causal: bool,
+    /// Token classification labels if this model includes a token classification head.
+    pub class_labels: Vec<String>,
 }
 
 /// Mixture-of-experts routing parameters, for architectures whose feed-forward
@@ -616,6 +620,34 @@ pub trait Model: Send + Sync {
     /// backend's uncompressed KV (f32 on CPU and wgpu, f16 on native Metal).
     fn f16_kv_supported(&self) -> bool {
         false
+    }
+
+    /// Whether this model has a token classification head.
+    fn is_classifier(&self) -> bool {
+        false
+    }
+
+    /// Number of token classification classes (0 if not a classifier).
+    fn num_classes(&self) -> usize {
+        0
+    }
+
+    /// Token classification label strings in class ID order.
+    fn class_labels(&self) -> &[String] {
+        &[]
+    }
+
+    /// Run a forward pass returning token classification logits for all tokens,
+    /// formatted as row-major `[tokens.len() * num_classes]`.
+    fn classify_tokens(
+        &self,
+        tokens: &[u32],
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, crate::CeraError> {
+        let _ = (tokens, state);
+        Err(crate::CeraError::Backend(
+            "classification not supported by this model".into(),
+        ))
     }
 }
 

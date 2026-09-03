@@ -947,6 +947,11 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func defaultGenerateOpts()  -> GenerateOpts
     
     /**
+     * Detect PII entity spans in text using the loaded token classification model.
+     */
+    func detectPii(text: String) throws  -> [FfiEntitySpan]
+    
+    /**
      * Encode `text` into token IDs using the model's BPE tokenizer.
      * Empty input returns an empty vec.
      */
@@ -1494,6 +1499,18 @@ open func defaultGenerateOpts() -> GenerateOpts  {
     return try!  FfiConverterTypeGenerateOpts_lift(try! rustCall() {
     uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Detect PII entity spans in text using the loaded token classification model.
+     */
+open func detectPii(text: String)throws  -> [FfiEntitySpan]  {
+    return try  FfiConverterSequenceTypeFfiEntitySpan.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ceraengine_detect_pii(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),$0
     )
 })
 }
@@ -2907,6 +2924,158 @@ public func FfiConverterTypeModalitySink_lower(_ value: ModalitySink) -> UInt64 
 
 
 /**
+ * Zero-dependency PII Classifier for named entity recognition.
+ */
+public protocol PiiClassifierProtocol: AnyObject, Sendable {
+    
+    /**
+     * Detect PII entities in the input text.
+     */
+    func detect(text: String) throws  -> [FfiEntitySpan]
+    
+}
+/**
+ * Zero-dependency PII Classifier for named entity recognition.
+ */
+open class PiiClassifier: PiiClassifierProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_piiclassifier(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_piiclassifier(handle, $0) }
+    }
+
+    
+    /**
+     * Load a base model with a separate LoRA classifier adapter.
+     */
+public static func fromBaseAndAdapter(basePath: String, adapterPath: String)throws  -> PiiClassifier  {
+    return try  FfiConverterTypePiiClassifier_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter(
+        FfiConverterString.lower(basePath),
+        FfiConverterString.lower(adapterPath),$0
+    )
+})
+}
+    
+    /**
+     * Load a PII classification model from a local GGUF path.
+     */
+public static func fromPath(path: String)throws  -> PiiClassifier  {
+    return try  FfiConverterTypePiiClassifier_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_piiclassifier_from_path(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Detect PII entities in the input text.
+     */
+open func detect(text: String)throws  -> [FfiEntitySpan]  {
+    return try  FfiConverterSequenceTypeFfiEntitySpan.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_piiclassifier_detect(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePiiClassifier: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = PiiClassifier
+
+    public static func lift(_ handle: UInt64) throws -> PiiClassifier {
+        return PiiClassifier(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: PiiClassifier) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PiiClassifier {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: PiiClassifier, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePiiClassifier_lift(_ handle: UInt64) throws -> PiiClassifier {
+    return try FfiConverterTypePiiClassifier.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePiiClassifier_lower(_ value: PiiClassifier) -> UInt64 {
+    return FfiConverterTypePiiClassifier.lower(value)
+}
+
+
+
+
+
+
+/**
  * Stateful inference handle. Wraps [`cera::Session`] behind a
  * `Mutex` so UniFFI's `Arc<Session>` shape works with methods that
  * need `&mut self` on the inner session (prefill, generate, reset).
@@ -4163,6 +4332,125 @@ public func FfiConverterTypeEngineConfig_lift(_ buf: RustBuffer) throws -> Engin
 #endif
 public func FfiConverterTypeEngineConfig_lower(_ value: EngineConfig) -> RustBuffer {
     return FfiConverterTypeEngineConfig.lower(value)
+}
+
+
+/**
+ * An identified PII entity span in source text.
+ */
+public struct FfiEntitySpan: Equatable, Hashable {
+    /**
+     * Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+     */
+    public var entityType: String
+    /**
+     * UTF-8 character start index in source text (inclusive).
+     */
+    public var startChar: UInt64
+    /**
+     * UTF-8 character end index in source text (exclusive).
+     */
+    public var endChar: UInt64
+    /**
+     * Token start index in sequence (inclusive).
+     */
+    public var startToken: UInt64
+    /**
+     * Token end index in sequence (exclusive).
+     */
+    public var endToken: UInt64
+    /**
+     * Extracted text slice.
+     */
+    public var text: String
+    /**
+     * Mean classification confidence score across the span tokens [0.0..1.0].
+     */
+    public var score: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+         */entityType: String, 
+        /**
+         * UTF-8 character start index in source text (inclusive).
+         */startChar: UInt64, 
+        /**
+         * UTF-8 character end index in source text (exclusive).
+         */endChar: UInt64, 
+        /**
+         * Token start index in sequence (inclusive).
+         */startToken: UInt64, 
+        /**
+         * Token end index in sequence (exclusive).
+         */endToken: UInt64, 
+        /**
+         * Extracted text slice.
+         */text: String, 
+        /**
+         * Mean classification confidence score across the span tokens [0.0..1.0].
+         */score: Float) {
+        self.entityType = entityType
+        self.startChar = startChar
+        self.endChar = endChar
+        self.startToken = startToken
+        self.endToken = endToken
+        self.text = text
+        self.score = score
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiEntitySpan: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiEntitySpan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiEntitySpan {
+        return
+            try FfiEntitySpan(
+                entityType: FfiConverterString.read(from: &buf), 
+                startChar: FfiConverterUInt64.read(from: &buf), 
+                endChar: FfiConverterUInt64.read(from: &buf), 
+                startToken: FfiConverterUInt64.read(from: &buf), 
+                endToken: FfiConverterUInt64.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                score: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiEntitySpan, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.entityType, into: &buf)
+        FfiConverterUInt64.write(value.startChar, into: &buf)
+        FfiConverterUInt64.write(value.endChar, into: &buf)
+        FfiConverterUInt64.write(value.startToken, into: &buf)
+        FfiConverterUInt64.write(value.endToken, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterFloat.write(value.score, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEntitySpan_lift(_ buf: RustBuffer) throws -> FfiEntitySpan {
+    return try FfiConverterTypeFfiEntitySpan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEntitySpan_lower(_ value: FfiEntitySpan) -> RustBuffer {
+    return FfiConverterTypeFfiEntitySpan.lower(value)
 }
 
 
@@ -6442,6 +6730,31 @@ fileprivate struct FfiConverterSequenceTypeChatMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiEntitySpan: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiEntitySpan]
+
+    public static func write(_ value: [FfiEntitySpan], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiEntitySpan.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiEntitySpan] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiEntitySpan]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiEntitySpan.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiSpeechTimestamp: FfiConverterRustBuffer {
     typealias SwiftType = [FfiSpeechTimestamp]
 
@@ -6787,6 +7100,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 53563) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6860,6 +7176,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
@@ -6980,6 +7299,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
         return InitializationResult.apiChecksumMismatch
     }
 

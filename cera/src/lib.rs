@@ -29,6 +29,7 @@ pub fn build_info() -> String {
 pub mod audio_engine;
 pub mod backend;
 pub mod bundle;
+pub mod classifier;
 pub mod convert;
 pub mod engine;
 /// Auto-generated FlatBuffers code for KV cache serialization.
@@ -60,6 +61,9 @@ pub mod vad;
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
 // `cera::session::*`.
 pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
+pub use classifier::{
+    BioesPrefix, EntitySpan, detect_pii, extract_spans, parse_bioes, viterbi_decode,
+};
 pub use engine::{
     BackendPreference, CeraEngine, EngineConfig, ModelBytes, ModelFiles, ModelMetadata,
 };

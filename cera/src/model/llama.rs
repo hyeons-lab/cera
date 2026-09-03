@@ -265,6 +265,8 @@ impl LlamaModel {
             scalars,
             // Dense transformers only; the `llama`-family loader has no expert path.
             moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
         };
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).

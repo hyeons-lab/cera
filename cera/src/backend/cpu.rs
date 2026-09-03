@@ -4622,90 +4622,7 @@ pub fn flash_attention_gqa_cpu(
     scale: f32,
     start_pos: usize,
 ) {
-    // NEON kernel requires head_dim to be a multiple of 4 and <= 128.
-    // Fall back to scalar for unsupported dimensions.
-    #[cfg(target_arch = "aarch64")]
-    {
-        if head_dim.is_multiple_of(4) && head_dim <= 128 {
-            unsafe {
-                flash_attention_gqa_neon(
-                    q_mat,
-                    k_cache,
-                    v_cache,
-                    out,
-                    n_heads_start,
-                    group_size,
-                    n_queries,
-                    q_stride,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    start_pos,
-                );
-            }
-            return;
-        }
-    }
-    // x86 AVX-512 kernel: 16-wide zmm, needs head_dim a multiple of 16. Checked
-    // before the AVX2 path so an AVX-512 host uses the wider kernel; a head_dim
-    // that is a multiple of 8 but not 16 falls through to AVX2 below.
-    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
-    {
-        if head_dim.is_multiple_of(16) && head_dim <= 256 && is_x86_feature_detected!("avx512f") {
-            unsafe {
-                flash_attention_gqa_avx512(
-                    q_mat,
-                    k_cache,
-                    v_cache,
-                    out,
-                    n_heads_start,
-                    group_size,
-                    n_queries,
-                    q_stride,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    start_pos,
-                );
-            }
-            return;
-        }
-    }
-    // x86 AVX2+FMA kernel: needs head_dim a multiple of 8 (one ymm = 8 f32) and
-    // <= 256 (the acc/q register-array bound). Runtime-detected so a Haswell
-    // baseline build still falls back to scalar on a host without AVX2. Q/K/V
-    // are all f32 here (the KV cache is f32 on CPU), so this is plain FMA, not
-    // an int8 kernel — no tier gate beyond the CPUID check.
-    #[cfg(target_arch = "x86_64")]
-    {
-        if head_dim.is_multiple_of(8)
-            && head_dim <= 256
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
-        {
-            unsafe {
-                flash_attention_gqa_avx2(
-                    q_mat,
-                    k_cache,
-                    v_cache,
-                    out,
-                    n_heads_start,
-                    group_size,
-                    n_queries,
-                    q_stride,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    start_pos,
-                );
-            }
-            return;
-        }
-    }
-    flash_attention_gqa_scalar(
+    flash_attention_gqa_cpu_opt(
         q_mat,
         k_cache,
         v_cache,
@@ -4719,6 +4636,129 @@ pub fn flash_attention_gqa_cpu(
         head_dim,
         scale,
         start_pos,
+        true,
+    );
+}
+
+/// Flash-attention over a GQA head group on CPU, with selectable causal or bidirectional masking.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_gqa_cpu_opt(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+) {
+    // NEON kernel requires head_dim to be a multiple of 4 and <= 128.
+    // Fall back to scalar for unsupported dimensions.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if head_dim.is_multiple_of(4) && head_dim <= 128 {
+            unsafe {
+                flash_attention_gqa_neon_opt(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    is_causal,
+                );
+            }
+            return;
+        }
+    }
+    // x86 AVX-512 kernel: 16-wide zmm, needs head_dim a multiple of 16. Checked
+    // before the AVX2 path so an AVX-512 host uses the wider kernel; a head_dim
+    // that is a multiple of 8 but not 16 falls through to AVX2 below.
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    {
+        if head_dim.is_multiple_of(16) && head_dim <= 256 && is_x86_feature_detected!("avx512f") {
+            unsafe {
+                flash_attention_gqa_avx512_opt(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    is_causal,
+                );
+            }
+            return;
+        }
+    }
+    // x86 AVX2+FMA kernel: needs head_dim a multiple of 8 (one ymm = 8 f32) and
+    // <= 256 (the acc/q register-array bound). Runtime-detected so a Haswell
+    // baseline build still falls back to scalar on a host without AVX2. Q/K/V
+    // are all f32 here (the KV cache is f32 on CPU), so this is plain FMA, not
+    // an int8 kernel: no tier gate beyond the CPUID check.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if head_dim.is_multiple_of(8)
+            && head_dim <= 256
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            unsafe {
+                flash_attention_gqa_avx2_opt(
+                    q_mat,
+                    k_cache,
+                    v_cache,
+                    out,
+                    n_heads_start,
+                    group_size,
+                    n_queries,
+                    q_stride,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    is_causal,
+                );
+            }
+            return;
+        }
+    }
+    flash_attention_gqa_scalar_opt(
+        q_mat,
+        k_cache,
+        v_cache,
+        out,
+        n_heads_start,
+        group_size,
+        n_queries,
+        q_stride,
+        kv_dim,
+        kv_h_offset,
+        head_dim,
+        scale,
+        start_pos,
+        is_causal,
     );
 }
 
@@ -4740,6 +4780,42 @@ fn flash_attention_gqa_scalar(
     scale: f32,
     start_pos: usize,
 ) {
+    flash_attention_gqa_scalar_opt(
+        q_mat,
+        k_cache,
+        v_cache,
+        out,
+        n_heads_start,
+        group_size,
+        n_queries,
+        q_stride,
+        kv_dim,
+        kv_h_offset,
+        head_dim,
+        scale,
+        start_pos,
+        true,
+    );
+}
+
+/// Scalar fallback for flash attention over a GQA head group with causal or bidirectional masking.
+#[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
+fn flash_attention_gqa_scalar_opt(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+) {
     // Stack-allocated scratch to avoid heap alloc contention in parallel
     // dispatch. 256 covers all known model head_dims (64, 128, 160, 256).
     // The NEON kernel falls back to this scalar path for head_dim > 128.
@@ -4758,7 +4834,11 @@ fn flash_attention_gqa_scalar(
         let h_off = h * head_dim;
 
         for j in 0..n_queries {
-            let max_kv = start_pos + j + 1;
+            let max_kv = if is_causal {
+                start_pos + j + 1
+            } else {
+                start_pos + n_queries
+            };
 
             for d in 0..head_dim {
                 q_local[d] = q_mat[(h_off + d) * q_stride + j];
@@ -4855,6 +4935,44 @@ unsafe fn flash_attention_gqa_avx2(
     scale: f32,
     start_pos: usize,
 ) {
+    flash_attention_gqa_avx2_opt(
+        q_mat,
+        k_cache,
+        v_cache,
+        out,
+        n_heads_start,
+        group_size,
+        n_queries,
+        q_stride,
+        kv_dim,
+        kv_h_offset,
+        head_dim,
+        scale,
+        start_pos,
+        true,
+    );
+}
+
+/// AVX2 implementation of flash attention over a GQA head group with causal or bidirectional masking.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_avx2_opt(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+) {
     use std::arch::x86_64::*;
     unsafe {
         // Buffer-sizing tripwires, mirroring `flash_attention_gqa_neon`. The
@@ -4898,7 +5016,11 @@ unsafe fn flash_attention_gqa_avx2(
             let h_off = h * head_dim;
 
             for j in 0..n_queries {
-                let max_kv = start_pos + j + 1;
+                let max_kv = if is_causal {
+                    start_pos + j + 1
+                } else {
+                    start_pos + n_queries
+                };
 
                 // Gather Q[h, j] from the stride-q_stride column layout into a
                 // contiguous buffer, then into registers. One gather per query,
@@ -5019,6 +5141,44 @@ unsafe fn flash_attention_gqa_avx512(
     scale: f32,
     start_pos: usize,
 ) {
+    flash_attention_gqa_avx512_opt(
+        q_mat,
+        k_cache,
+        v_cache,
+        out,
+        n_heads_start,
+        group_size,
+        n_queries,
+        q_stride,
+        kv_dim,
+        kv_h_offset,
+        head_dim,
+        scale,
+        start_pos,
+        true,
+    );
+}
+
+/// AVX-512 implementation of flash attention over a GQA head group with causal or bidirectional masking.
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_avx512_opt(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+) {
     use std::arch::x86_64::*;
     unsafe {
         // Buffer-sizing tripwires, mirroring `flash_attention_gqa_neon`. The
@@ -5062,7 +5222,11 @@ unsafe fn flash_attention_gqa_avx512(
             let h_off = h * head_dim;
 
             for j in 0..n_queries {
-                let max_kv = start_pos + j + 1;
+                let max_kv = if is_causal {
+                    start_pos + j + 1
+                } else {
+                    start_pos + n_queries
+                };
 
                 for d in 0..head_dim {
                     q_gather[d] = *q_ptr.add((h_off + d) * q_stride + j);
@@ -5150,7 +5314,7 @@ unsafe fn flash_attention_gqa_avx512(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 /// NEON flash-attention over a GQA head group, tiled by `FLASH_TILE_KV`.
 unsafe fn flash_attention_gqa_neon(
     q_mat: &[f32],
@@ -5166,6 +5330,46 @@ unsafe fn flash_attention_gqa_neon(
     head_dim: usize,
     scale: f32,
     start_pos: usize,
+) {
+    unsafe {
+        flash_attention_gqa_neon_opt(
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_start,
+            group_size,
+            n_queries,
+            q_stride,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            start_pos,
+            true,
+        );
+    }
+}
+
+/// NEON implementation of flash attention over a GQA head group with causal or bidirectional masking.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_neon_opt(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
 ) {
     use std::arch::aarch64::*;
     unsafe {
@@ -5215,7 +5419,11 @@ unsafe fn flash_attention_gqa_neon(
             let h_off = h * head_dim;
 
             for j in 0..n_queries {
-                let max_kv = start_pos + j + 1;
+                let max_kv = if is_causal {
+                    start_pos + j + 1
+                } else {
+                    start_pos + n_queries
+                };
 
                 if q_stride == n_queries {
                     for i in 0..n_vecs {
@@ -7817,6 +8025,129 @@ mod tests {
         assert!(
             max_diff < 1e-4,
             "flash vs naive max_diff = {max_diff} (expected < 1e-4)"
+        );
+    }
+
+    #[test]
+    fn test_flash_attention_bidirectional_matches_naive() {
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let group_size = n_heads / n_kv_heads;
+        let head_dim = 64;
+        let hs = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let n = 8;
+        let start_pos = 4;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let total_seq = start_pos + n; // 12
+
+        // Random Q in [hs, n] stride-n layout
+        let mut q_mat = vec![0.0f32; hs * n];
+        let mut seed: u64 = 0xFEED_FACE;
+        for v in q_mat.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+
+        // Random K/V cache in [total_seq, kv_dim] layout
+        let mut k_cache = vec![0.0f32; total_seq * kv_dim];
+        for v in k_cache.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+        let mut v_cache = vec![0.0f32; total_seq * kv_dim];
+        for v in v_cache.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((seed >> 33) as i32 as f32) * 1e-9;
+        }
+
+        // Flash attention with is_causal = false
+        let chunk_size = group_size * n * head_dim;
+        let mut flash_raw = vec![0.0f32; n_kv_heads * chunk_size];
+        for kv_h in 0..n_kv_heads {
+            let chunk = &mut flash_raw[kv_h * chunk_size..(kv_h + 1) * chunk_size];
+            flash_attention_gqa_cpu_opt(
+                &q_mat,
+                &k_cache,
+                &v_cache,
+                chunk,
+                kv_h * group_size,
+                group_size,
+                n,
+                n,
+                kv_dim,
+                kv_h * head_dim,
+                head_dim,
+                scale,
+                start_pos,
+                false, // non-causal bidirectional
+            );
+        }
+        let mut flash_out = vec![0.0f32; hs * n];
+        for kv_h in 0..n_kv_heads {
+            for g in 0..group_size {
+                let h = kv_h * group_size + g;
+                let src_base = kv_h * chunk_size + g * n * head_dim;
+                for j in 0..n {
+                    for d in 0..head_dim {
+                        flash_out[(h * head_dim + d) * n + j] =
+                            flash_raw[src_base + j * head_dim + d];
+                    }
+                }
+            }
+        }
+
+        // Naive reference with full total_seq bidirectional visibility
+        let mut naive_out = vec![0.0f32; hs * n];
+        for j in 0..n {
+            let seq_len = total_seq; // bidirectional: all queries see full context
+            for h in 0..n_heads {
+                let kv_h = h / group_size;
+                let kv_h_offset = kv_h * head_dim;
+
+                let mut q_head = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    q_head[d] = q_mat[(h * head_dim + d) * n + j];
+                }
+
+                let mut scores = vec![0.0f32; seq_len];
+                attn_scores(
+                    &q_head,
+                    &k_cache,
+                    &mut scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+
+                softmax_inplace(&mut scores);
+
+                let mut attn_out = vec![0.0f32; head_dim];
+                attn_values(
+                    &scores,
+                    &v_cache,
+                    &mut attn_out,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
+
+                for d in 0..head_dim {
+                    naive_out[(h * head_dim + d) * n + j] = attn_out[d];
+                }
+            }
+        }
+
+        let mut max_diff = 0.0f32;
+        for i in 0..hs * n {
+            max_diff = max_diff.max((flash_out[i] - naive_out[i]).abs());
+        }
+        assert!(
+            max_diff < 1e-4,
+            "bidirectional flash vs naive max_diff = {max_diff} (expected < 1e-4)"
         );
     }
 

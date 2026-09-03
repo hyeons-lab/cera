@@ -429,6 +429,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(uint64_t ptr, Rust
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_DETECT_PII
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_DETECT_PII
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_detect_pii(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_ENCODE_TEXT
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_encode_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -637,6 +642,31 @@ void uniffi_cera_ffi_fn_method_modalitysink_on_audio_frames(uint64_t ptr, RustBu
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_DONE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_DONE
 void uniffi_cera_ffi_fn_method_modalitysink_on_done(uint64_t ptr, RustBuffer reason, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_PIICLASSIFIER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_PIICLASSIFIER
+uint64_t uniffi_cera_ffi_fn_clone_piiclassifier(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_PIICLASSIFIER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_PIICLASSIFIER
+void uniffi_cera_ffi_fn_free_piiclassifier(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_PIICLASSIFIER_FROM_BASE_AND_ADAPTER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_PIICLASSIFIER_FROM_BASE_AND_ADAPTER
+uint64_t uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter(RustBuffer base_path, RustBuffer adapter_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
+uint64_t uniffi_cera_ffi_fn_constructor_piiclassifier_from_path(RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_PIICLASSIFIER_DETECT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_PIICLASSIFIER_DETECT
+RustBuffer uniffi_cera_ffi_fn_method_piiclassifier_detect(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_SESSION
@@ -1199,6 +1229,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_DETECT_PII
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_DETECT_PII
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_detect_pii(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_ENCODE_TEXT
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_encode_text(void
@@ -1346,6 +1382,12 @@ uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_DONE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_DONE
 uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_done(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_PIICLASSIFIER_DETECT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_PIICLASSIFIER_DETECT
+uint16_t uniffi_cera_ffi_checksum_method_piiclassifier_detect(void
     
 );
 #endif
@@ -1586,6 +1628,18 @@ uint16_t uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_LORAADAPTERS_FROM_SAFETENSORS
 uint16_t uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_BASE_AND_ADAPTER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_BASE_AND_ADAPTER
+uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
+uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(void
     
 );
 #endif

@@ -1113,6 +1113,7 @@ pub fn inspect_and_resolve_manifest(
             auth_token: get_hf_auth_token(),
             progress,
             cancel: None,
+            tensor_overrides: Vec::new(),
         };
 
         return crate::convert::stream_quantize_hf_repo(&spec, opts);

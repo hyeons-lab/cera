@@ -1211,6 +1211,27 @@ impl CeraEngine {
     pub fn clear_cache(&self) {
         self.model.clear_cache();
     }
+
+    /// Run PII detection on input text using the loaded model and tokenizer.
+    pub fn detect_pii(&self, text: &str) -> Result<Vec<crate::classifier::EntitySpan>, CeraError> {
+        self.detect_pii_with_lora(text, None)
+    }
+
+    /// Run PII detection on input text with an optional attached LoRA adapter.
+    pub fn detect_pii_with_lora(
+        &self,
+        text: &str,
+        lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
+    ) -> Result<Vec<crate::classifier::EntitySpan>, CeraError> {
+        let mut state = crate::kv_cache::InferenceState::from_config(self.model.config())?;
+        state.lora = lora;
+        crate::classifier::detect_pii(
+            self.model.as_ref(),
+            self.tokenizer.as_ref(),
+            text,
+            &mut state,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
