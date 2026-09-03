@@ -6,7 +6,7 @@ import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 /// dart:js_interop, so no platform channel registration is needed.
 class CeraFfiFlutterWeb {
   /// Registers this plugin with the Flutter Web engine.
-  static void registerWith(Registrar registrar) {
-    // No-op: Cera communicates directly with cera.worker.js
+  static void registerWith(Registrar _) {
+    // No-op: Cera communicates directly with cera_worker.js
   }
 }
