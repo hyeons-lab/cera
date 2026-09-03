@@ -68,7 +68,7 @@ on:
         type: boolean
         default: true
       pub:
-        description: 'pub.dev (cera_ffi & cera_ffi_flutter)'
+        description: 'Validate pub.dev packages (cera_ffi & cera_ffi_flutter; publishing occurs on tag push via publish-pub.yml)'
         type: boolean
         default: true
 

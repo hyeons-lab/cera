@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run (validate/package only - pub.dev requires tag push for real publishing)'
+        description: 'Dry-run package validation (real publishing requires tag push for OIDC authentication)'
         type: boolean
         required: true
         default: true
@@ -70,19 +70,22 @@ jobs:
             exit 1
           fi
 
+          DRY_RUN="false"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            DRY_RUN="true"
+            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
+          fi
+
           echo "Resolved release version: ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
 
       - name: Verify release assets and resolve Apple framework checksums
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
-          DRY_RUN="false"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            DRY_RUN="true"
-          fi
-
           ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CeraFFI.xcframework.zip"
 
           # On real release runs, gate on CeraFFI.xcframework.zip being live on GitHub Releases
@@ -104,7 +107,7 @@ jobs:
             fi
           fi
 
-          # Inspect all four Apple manifests for unreplaced placeholders
+          # Inspect all four Apple manifests for placeholders or stale version pins
           MANIFESTS=(
             cera_ffi_flutter/ios/cera_ffi_flutter.podspec
             cera_ffi_flutter/macos/cera_ffi_flutter.podspec
@@ -117,20 +120,28 @@ jobs:
             if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f" 2>/dev/null; then
               needs_rewrite=true
               break
+            elif ! grep -q "releases/download/v${VERSION}/" "$f" 2>/dev/null; then
+              needs_rewrite=true
+              break
             fi
           done
 
           if [ "$needs_rewrite" = "true" ]; then
-            echo "Placeholders detected in Apple manifests; resolving checksum from GitHub Release v${VERSION}..."
+            echo "Apple manifests require version/checksum updates for release v${VERSION}..."
+            tmp_asset=$(mktemp)
+            trap 'rm -f "$tmp_asset"' EXIT
+
             if [ "$DRY_RUN" = "true" ]; then
               if curl --silent --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 -L "$ASSET_URL" -o /dev/null 2>&1; then
-                CHECKSUM=$(curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
+                curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset"
+                CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
               else
                 echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
                 CHECKSUM="0000000000000000000000000000000000000000000000000000000000000000"
               fi
             else
-              CHECKSUM=$(curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
+              curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" -o "$tmp_asset"
+              CHECKSUM=$(sha256sum "$tmp_asset" | awk '{print $1}')
             fi
 
             if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
@@ -158,7 +169,7 @@ jobs:
               fi
             done
           else
-            echo "Apple integration manifests already contain pinned release checksums."
+            echo "Apple integration manifests already contain valid release pins for v${VERSION}."
           fi
 
           # Assert that no code placeholder patterns remain
@@ -172,14 +183,9 @@ jobs:
       - name: Publish cera_ffi (Dart package)
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
-          DRY_RUN="false"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            DRY_RUN="true"
-            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
-          fi
-
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi package validation ==="
             ( cd cera_ffi && dart pub publish --dry-run )
@@ -214,14 +220,9 @@ jobs:
       - name: Publish cera_ffi_flutter (Flutter plugin)
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          DRY_RUN: ${{ steps.meta.outputs.dry_run }}
         run: |
           set -euo pipefail
-          DRY_RUN="false"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            DRY_RUN="true"
-            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
-          fi
-
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
             ( cd cera_ffi_flutter && flutter analyze )
