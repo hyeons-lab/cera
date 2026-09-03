@@ -41,7 +41,6 @@ jobs:
           cache: true
 
       - name: Determine release version and verify tag
-        id: meta
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
