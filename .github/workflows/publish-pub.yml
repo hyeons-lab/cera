@@ -100,17 +100,17 @@ jobs:
           if [ "$DRY_RUN" = "false" ]; then
             echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
             asset_ready=false
-            for i in $(seq 1 30); do
+            for i in $(seq 1 60); do
               if curl -sSL --fail --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 20 -r 0-0 "$ASSET_URL" -o /dev/null; then
                 echo "Asset confirmed live on GitHub Releases!"
                 asset_ready=true
                 break
               fi
-              echo "Asset not ready yet, waiting 10s... (${i}/30)"
+              echo "Asset not ready yet, waiting 10s... (${i}/60)"
               sleep 10
             done
             if [ "$asset_ready" = "false" ]; then
-              echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 300s" >&2
+              echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 600s" >&2
               exit 1
             fi
           fi
@@ -247,10 +247,11 @@ jobs:
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
+            echo "Note: pubspec_overrides.yaml is intentionally retained for dry-run validation so local path dependencies resolve."
             ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
             out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
             echo "$out"
-            if ! grep -q "Package has [0-9]* error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
+            if ! grep -q "Package validation found the following error" <<<"$out" && { grep -q "Package has 0 warnings" <<<"$out" || grep -q "Package has 1 warning" <<<"$out" || grep -q "Package validation found the following potential issue" <<<"$out"; }; then
               echo "✓ cera_ffi_flutter package structure verified."
             else
               echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error" >&2
