@@ -39,6 +39,10 @@ dependencies:
   # is no version of `cera_ffi` other than this one that can work with the
   # native library shipped alongside it. Kept in step by scripts/bump-version.sh.
   cera_ffi: 0.5.1
+  flutter:
+    sdk: flutter
+  flutter_web_plugins:
+    sdk: flutter
 
 dev_dependencies:
   # Only for analyzing this package's one re-export file; `analysis_options.yaml`
@@ -48,14 +52,14 @@ dev_dependencies:
 flutter:
   plugin:
     platforms:
-      # `ffiPlugin: true` on every platform: this is an FFI-only plugin. There
-      # is no platform channel and no per-platform Dart class, so Flutter's
-      # tooling only needs to build/bundle the native library. The Dart side
-      # calls it directly, from `package:cera_ffi`.
+      # `ffiPlugin: true` on native platforms: this is an FFI plugin for mobile
+      # and desktop. There is no platform channel and no per-platform Dart class;
+      # Flutter tooling builds/bundles the native library. The Dart side calls it
+      # directly from `package:cera_ffi`.
       #
-      # None of these build Rust. Each pulls the prebuilt library that the
-      # release pipeline already publishes, so app developers never need a Rust
-      # toolchain or the Android NDK.
+      # On web, Cera inference runs inside a Web Worker via cera-wasm and
+      # dart:js_interop. A lightweight registrant is declared here to satisfy
+      # Flutter's web plugin specification and register web platform support.
       android:
         ffiPlugin: true
       ios:
@@ -66,3 +70,6 @@ flutter:
         ffiPlugin: true
       windows:
         ffiPlugin: true
+      web:
+        pluginClass: CeraFfiFlutterWeb
+        fileName: src/web/cera_ffi_flutter_web.dart
