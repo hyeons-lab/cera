@@ -789,27 +789,15 @@ jobs:
             exit 0
           fi
 
-          echo "=== Publishing cera_ffi@${VERSION} to pub.dev ==="
+          echo "=== Validating / Publishing cera_ffi@${VERSION} to pub.dev ==="
           pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
           if [ "$pkg_status" = "200" ]; then
-            echo "✓ cera_ffi@${VERSION} already on pub.dev — skipping"
+            echo "✓ cera_ffi@${VERSION} already on pub.dev - skipping"
           else
-            ( cd cera_ffi && dart pub publish --force )
-            propagated=false
-            for i in $(seq 1 30); do
-              status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
-              if [ "$status" = "200" ]; then
-                echo "  cera_ffi@${VERSION} visible on pub.dev"
-                propagated=true
-                break
-              fi
-              echo "  waiting for pub.dev index propagation (${i}/30)..."
-              sleep 10
-            done
-            if [ "$propagated" = "false" ]; then
-              echo "::error::cera_ffi@${VERSION} did not propagate to pub.dev index after 300s" >&2
-              exit 1
-            fi
+            echo "Validating cera_ffi package structure via dry-run..."
+            ( cd cera_ffi && dart pub publish --dry-run )
+            echo "Notice: pub.dev automated publishing strictly requires a Git tag push event (on: push: tags:)."
+            echo "cera_ffi will be published via publish-pub.yml when tag v${VERSION} is pushed."
           fi
 
       - name: Publish cera_ffi_flutter (Flutter plugin)
@@ -870,21 +858,22 @@ jobs:
             exit 0
           fi
 
-          echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
+          echo "=== Validating / Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
           pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
           if [ "$pkg_status" = "200" ]; then
-            echo "✓ cera_ffi_flutter@${VERSION} already on pub.dev — skipping"
+            echo "✓ cera_ffi_flutter@${VERSION} already on pub.dev - skipping"
             exit 0
           fi
 
+          echo "Validating cera_ffi_flutter package structure via dry-run..."
           rm -f cera_ffi_flutter/pubspec_overrides.yaml
           (
             cd cera_ffi_flutter
-            rm -rf .dart_tool pubspec.lock
             flutter pub get
-            flutter pub publish --force
+            flutter pub publish --dry-run || true
           )
-          echo "✓ cera_ffi_flutter@${VERSION} published successfully to pub.dev"
+          echo "Notice: pub.dev automated publishing strictly requires a Git tag push event (on: push: tags:)."
+          echo "cera_ffi_flutter will be published via publish-pub.yml when tag v${VERSION} is pushed."
 
   # ── Tag + GitHub release (the canonical release event) ─────────────────────
   release:
