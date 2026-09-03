@@ -252,6 +252,7 @@ jobs:
       # setup-dart's createPubOIDCToken() queries ACTIONS_ID_TOKEN_REQUEST_URL with
       # audience https://pub.dev and runs `dart pub token add https://pub.dev --env-var PUB_TOKEN`.
       - name: Provision pub.dev OIDC token via setup-dart
+        if: env.DRY_RUN == 'false'
         uses: dart-lang/setup-dart@v1
 
       - name: Publish cera_ffi (Dart package)
@@ -309,16 +310,27 @@ jobs:
             echo "=== DRY RUN: cera_ffi_flutter package validation ==="
             echo "Note: pubspec_overrides.yaml is intentionally retained for dry-run validation so local path dependencies resolve."
             ( cd cera_ffi_flutter && flutter pub get && flutter analyze )
-            out=$( ( cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1 ) || true )
+            set +e
+            out=$(cd cera_ffi_flutter && flutter pub publish --dry-run 2>&1)
+            exit_code=$?
+            set -e
             echo "$out"
-            # Extract bullet points under the error section, filtering out the expected unreleased sibling dependency
-            unexpected_errors=$(echo "$out" | sed -n '/Package validation found the following error/,/^$/p' | grep -v "doesn't exist on pub.dev" | grep -E '^[[:space:]]*\*' || true)
-            if [ -z "$unexpected_errors" ]; then
+            if [ $exit_code -eq 0 ]; then
               echo "✓ cera_ffi_flutter package structure verified."
             else
-              echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error(s):" >&2
-              echo "$unexpected_errors" >&2
-              exit 1
+              # flutter pub publish failed: verify that failure is solely the expected unreleased sibling dependency
+              unexpected_errors=$(echo "$out" | sed -n '/Package validation found the following error/,/^$/p' | grep -vE "Dependency cera_ffi:.*doesn't exist on pub.dev" | grep -E '^[[:space:]]*\*' || true)
+              if grep -qE "Package validation found the following error:|Package validation found the following errors:" <<<"$out" && [ -z "$unexpected_errors" ]; then
+                echo "✓ cera_ffi_flutter package structure verified (unreleased sibling dependency exempted)."
+              else
+                echo "::error::cera_ffi_flutter dry-run failed with unexpected packaging error(s):" >&2
+                if [ -n "$unexpected_errors" ]; then
+                  echo "$unexpected_errors" >&2
+                else
+                  echo "$out" >&2
+                fi
+                exit 1
+              fi
             fi
             exit 0
           fi
