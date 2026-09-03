@@ -11,7 +11,7 @@ name: Publish to pub.dev
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -19,6 +19,10 @@ on:
         type: boolean
         required: true
         default: true
+
+concurrency:
+  group: publish-pub-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -47,48 +51,74 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "Tag: ${TAG}, Version: ${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
+          FILE_VERSION=""
           if [ -f VERSION ]; then
             FILE_VERSION=$(tr -d '[:space:]' < VERSION)
-            if [ "$VERSION" != "$FILE_VERSION" ]; then
-              echo "::warning::Tag version ($VERSION) differs from VERSION file ($FILE_VERSION)"
-            fi
           fi
+
+          if [[ "$TAG" =~ ^v[0-9] ]]; then
+            VERSION="${TAG#v}"
+            if [ -n "$FILE_VERSION" ] && [ "$VERSION" != "$FILE_VERSION" ]; then
+              echo "::error::Tag version ($VERSION) does not match VERSION file ($FILE_VERSION)" >&2
+              exit 1
+            fi
+          elif [ -n "$FILE_VERSION" ]; then
+            VERSION="$FILE_VERSION"
+            echo "Manual dispatch: extracted VERSION=${VERSION} from VERSION file"
+          else
+            echo "::error::Cannot determine release version from ref '$TAG'" >&2
+            exit 1
+          fi
+
+          echo "Resolved release version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve and verify Apple framework checksums
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          # Check if Apple integration manifests still have placeholders
-          if grep -q "RELEASE_CHECKSUM" cera_ffi_flutter/ios/cera_ffi_flutter.podspec 2>/dev/null; then
+          DRY_RUN="false"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] || [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN="true"
+          fi
+
+          # Match only placeholder code usages, ignoring header doc comments
+          if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' cera_ffi_flutter/ios/cera_ffi_flutter.podspec 2>/dev/null; then
             echo "Placeholders detected in Apple manifests; resolving checksum from GitHub Release v${VERSION}..."
             ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CeraFFI.xcframework.zip"
 
-            echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
-            asset_ready=false
-            for i in $(seq 1 30); do
-              if curl --silent --head --fail --connect-timeout 10 --max-time 20 -L "$ASSET_URL" >/dev/null 2>&1; then
-                echo "Asset found!"
-                asset_ready=true
-                break
+            # Check if asset is available; GitHub release S3 redirects require GET (-r 0-0 range) rather than HEAD
+            asset_available=false
+            if curl --silent --fail --connect-timeout 10 --max-time 20 -r 0-0 -L "$ASSET_URL" -o /dev/null 2>&1; then
+              asset_available=true
+            elif [ "$DRY_RUN" = "false" ]; then
+              echo "Waiting for CeraFFI.xcframework.zip to be attached to release v${VERSION}..."
+              for i in $(seq 1 30); do
+                if curl --silent --fail --connect-timeout 10 --max-time 20 -r 0-0 -L "$ASSET_URL" -o /dev/null 2>&1; then
+                  echo "Asset found!"
+                  asset_available=true
+                  break
+                fi
+                echo "Asset not ready yet, waiting 10s... (${i}/30)"
+                sleep 10
+              done
+            fi
+
+            if [ "$asset_available" = "true" ]; then
+              CHECKSUM=$(curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 10 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
+              if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
+                echo "::error::Could not resolve valid 64-char sha256 checksum for CeraFFI.xcframework.zip from release v${VERSION}" >&2
+                exit 1
               fi
-              echo "Asset not ready yet, waiting 10s... (${i}/30)"
-              sleep 10
-            done
-            if [ "$asset_ready" = "false" ]; then
+            elif [ "$DRY_RUN" = "true" ]; then
+              echo "Dry-run mode on unreleased version: using placeholder checksum for packaging validation"
+              CHECKSUM="0000000000000000000000000000000000000000000000000000000000000000"
+            else
               echo "::error::CeraFFI.xcframework.zip not found on release v${VERSION} after 300s" >&2
               exit 1
             fi
 
-            CHECKSUM=$(curl --fail --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 -sSL "$ASSET_URL" | sha256sum | awk '{print $1}')
-            if [ -z "$CHECKSUM" ] || [ ${#CHECKSUM} -ne 64 ]; then
-              echo "::error::Could not resolve valid 64-char sha256 checksum for CeraFFI.xcframework.zip from release v${VERSION}" >&2
-              exit 1
-            fi
             echo "Resolved CHECKSUM=${CHECKSUM}"
 
             for f in \
@@ -108,19 +138,24 @@ jobs:
                 -e "s|checksum: \"[0-9a-f]\{64\}\"|checksum: \"${CHECKSUM}\"|" \
                 "$f"
               rm -f "$f.bak"
+
+              if ! grep -q "${CHECKSUM}" "$f"; then
+                echo "::error::$f does not contain expected checksum ${CHECKSUM}" >&2
+                exit 1
+              fi
             done
           else
             echo "Apple integration manifests already contain pinned release checksums."
           fi
 
-          # Assert that no placeholder tokens survived
+          # Assert that no code placeholder patterns remain
           for f in \
             cera_ffi_flutter/ios/cera_ffi_flutter.podspec \
             cera_ffi_flutter/macos/cera_ffi_flutter.podspec \
             cera_ffi_flutter/ios/cera_ffi_flutter/Package.swift \
             cera_ffi_flutter/macos/cera_ffi_flutter/Package.swift
           do
-            if grep -q "RELEASE_CHECKSUM" "$f" || grep -q "RELEASE_VERSION" "$f"; then
+            if grep -qE 'download/vRELEASE_VERSION/|checksum: "RELEASE_CHECKSUM"|VERSION="RELEASE_VERSION"|EXPECTED_SHA="RELEASE_CHECKSUM"' "$f"; then
               echo "::error::$f still has unreplaced release placeholders" >&2
               exit 1
             fi
@@ -204,6 +239,7 @@ jobs:
               cd cera_ffi_flutter
               rm -rf .dart_tool pubspec.lock
               flutter pub get
+              flutter analyze
               flutter pub publish --force
             )
             echo "cera_ffi_flutter@${VERSION} published successfully to pub.dev"
