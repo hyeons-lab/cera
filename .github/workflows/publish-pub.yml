@@ -2,20 +2,24 @@ name: Publish to pub.dev
 
 # Publishes cera_ffi and cera_ffi_flutter to pub.dev via OpenID Connect (OIDC).
 #
-# IMPORTANT: pub.dev automated publishing strictly requires the GitHub Actions
-# workflow to be triggered by a Git tag push event (`on: push: tags:`).
-# OIDC tokens minted from branch pushes or `workflow_dispatch` are rejected by
-# pub.dev's token claim verifier. Pushing a tag `v<version>` triggers this
-# workflow and satisfies pub.dev's tag pattern requirement.
+# Authentication uses short-lived GitHub-signed OIDC JWT tokens minted by
+# dart-lang/setup-dart against ACTIONS_ID_TOKEN_REQUEST_URL.
 #
-# NOTE: Ensure pub.dev Admin settings for cera_ffi and cera_ffi_flutter authorize
-# workflow path .github/workflows/publish-pub.yml and tag pattern v*.
+# Supported triggers:
+# - Git tag push (`v<version>`): canonical automated publishing trigger.
+# - Manual dispatch (`workflow_dispatch`): enabled via the pub.dev Admin UI
+#   ("Enable publishing from workflow_dispatch events").
 
 on:
   push:
     tags:
       - 'v[0-9]*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run only (validate packaging without uploading to pub.dev)'
+        type: boolean
+        default: false
 
 concurrency:
   group: publish-pub-${{ github.ref }}
@@ -36,6 +40,14 @@ jobs:
     steps:
       - name: Checkout tagged commit
         uses: actions/checkout@v7
+
+      # Set up the Dart SDK to provision the OIDC JWT token (PUB_TOKEN) for pub.dev.
+      # While the subsequent Flutter SDK installation prepends its own bundled Dart
+      # binary to PATH, running setup-dart performs the GitHub Actions OIDC exchange
+      # against ACTIONS_ID_TOKEN_REQUEST_URL. This follows the official Dart team
+      # reusable workflow pattern in dart-lang/setup-dart/.github/workflows/publish.yml.
+      - name: Provision pub.dev OIDC token via setup-dart
+        uses: dart-lang/setup-dart@v1
 
       - name: Setup Flutter and Dart SDK
         uses: subosito/flutter-action@v2
@@ -87,8 +99,12 @@ jobs:
 
           DRY_RUN="false"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            DRY_RUN="true"
-            echo "Notice: workflow_dispatch triggers cannot authenticate to pub.dev via OIDC. Forcing dry-run validation."
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              DRY_RUN="true"
+              echo "Manual dispatch: dry-run validation mode enabled (no upload)."
+            else
+              echo "Manual dispatch: automated publishing enabled via pub.dev workflow_dispatch authorization."
+            fi
           fi
 
           echo "Resolved release version: ${VERSION}"
