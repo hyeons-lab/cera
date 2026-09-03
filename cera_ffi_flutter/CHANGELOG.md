@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+### Added
+
+- **Web Platform Support**: Registered the `web` platform in `pubspec.yaml` via a lightweight plugin registrant (`CeraFfiFlutterWeb`) so pub.dev and Flutter tooling officially recognise Web platform support for the plugin.
+
 ## 0.5.1
 
 ### Added
