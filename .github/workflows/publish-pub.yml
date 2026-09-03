@@ -190,7 +190,7 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi@${VERSION} already on pub.dev - skipping"
@@ -199,7 +199,7 @@ jobs:
             ( cd cera_ffi && dart pub publish --force )
             propagated=false
             for i in $(seq 1 30); do
-              status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
+              status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi/versions/${VERSION}" 2>/dev/null || echo "000")
               if [ "$status" = "200" ]; then
                 echo "cera_ffi@${VERSION} visible on pub.dev"
                 propagated=true
@@ -232,7 +232,7 @@ jobs:
           fi
 
           echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
-          pkg_status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+          pkg_status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
 
           if [ "$pkg_status" = "200" ]; then
             echo "cera_ffi_flutter@${VERSION} already on pub.dev - skipping"
@@ -244,14 +244,26 @@ jobs:
           (
             cd cera_ffi_flutter
             rm -rf .dart_tool pubspec.lock
-            flutter pub get
+            resolved=false
+            for attempt in $(seq 1 6); do
+              if flutter pub get; then
+                resolved=true
+                break
+              fi
+              echo "flutter pub get failed (attempt ${attempt}/6), waiting for pub.dev dependency cache to propagate..."
+              sleep 5
+            done
+            if [ "$resolved" = "false" ]; then
+              echo "::error::flutter pub get failed to resolve dependencies after 6 attempts" >&2
+              exit 1
+            fi
             flutter analyze
             flutter pub publish --force
           )
 
           propagated=false
           for i in $(seq 1 30); do
-            status=$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
+            status=$(curl -sSL --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || echo "000")
             if [ "$status" = "200" ]; then
               echo "cera_ffi_flutter@${VERSION} visible on pub.dev"
               propagated=true

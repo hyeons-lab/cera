@@ -816,8 +816,7 @@ jobs:
               || github.event.inputs.npm == 'true'
               || github.event.inputs.jvm == 'true'
               || github.event.inputs.spm == 'true'
-              || github.event.inputs.web == 'true'
-              || github.event.inputs.pub == 'true') }}
+              || github.event.inputs.web == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Least privilege: only this job creates the tag / release.
