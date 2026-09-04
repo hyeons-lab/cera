@@ -456,10 +456,86 @@ TurboQuant compresses keys to ~3 bits and values to ~2 bits:
             id: 'silero-vad-explanation',
             title: 'Streaming Speech Boundary Detection',
             content: `Cera includes a native pure-Rust implementation of Silero VAD v5:
-- Zero ONNX Runtime or Python required.
-- State-machine VadIterator evaluates continuous 512-sample audio frames (32ms at 16kHz).
-- Emits speech start and end timestamps with configurable silence padding.
-- Powers hands-free voice interaction in the Cera Flutter and mobile applications.`,
+- Zero ONNX Runtime or Python required: Model weights run directly from GGUF packaging using Cera compute kernels.
+- Real-time 512-sample streaming: State-machine VadIterator evaluates continuous 512-sample audio frames (32ms at 16kHz, or 256 samples at 8kHz).
+- Automatic boundary timestamping: Emits SpeechStart and SpeechEnd events with configurable confidence thresholds and silence padding.
+- Multiplatform FFI: Directly callable from Rust, Flutter/Dart, Swift, and Kotlin for hands-free interactive voice agents.`,
+            codeSnippets: {
+              rust: {
+                language: 'rust',
+                filename: 'vad_streaming.rs',
+                code: `use cera::vad::{SileroVad, VadConfig, VadIterator, VadSampleRate, VadEvent};
+
+// Load Silero VAD v5 natively from GGUF format (zero ONNX runtime):
+let mut vad = SileroVad::from_file("models/silero_vad.gguf")?;
+
+let config = VadConfig {
+    threshold: 0.5,
+    min_speech_duration_ms: 250,
+    min_silence_duration_ms: 100,
+    speech_pad_ms: 30,
+    ..Default::default()
+};
+
+let mut iterator = VadIterator::new(VadSampleRate::Rate16kHz, Some(config));
+
+// Stream continuous 512-sample PCM chunks (32ms frames at 16kHz):
+for chunk in pcm_chunks {
+    if let Some(event) = iterator.process_chunk(&mut vad, &chunk)? {
+        match event {
+            VadEvent::SpeechStart { sample, ms } => {
+                println!("User started speaking at {ms}ms (sample {sample})");
+            }
+            VadEvent::SpeechEnd { start_ms, end_ms, .. } => {
+                println!("Speech segment complete: {start_ms}ms to {end_ms}ms");
+                // Trigger downstream ASR transcription or speech generation
+            }
+        }
+    }
+}`,
+              },
+              flutter: {
+                language: 'dart',
+                filename: 'voice_vad.dart',
+                code: `import 'package:cera_ffi/cera_ffi.dart';
+
+final vad = await FfiSileroVad.fromFile('silero_vad.gguf');
+final iterator = FfiVadIterator(
+  rate: FfiVadSampleRate.rate16kHz,
+  config: FfiVadConfig(
+    threshold: 0.5,
+    minSpeechDurationMs: 250,
+    minSilenceDurationMs: 100,
+    speechPadMs: 30,
+  ),
+);
+
+// Feed streaming 512-sample audio frame from device microphone:
+final event = iterator.processChunk(vad: vad, chunk: micFrame512);
+if (event is FfiVadEventSpeechStart) {
+  print('Speech started at \${event.ms}ms');
+} else if (event is FfiVadEventSpeechEnd) {
+  print('Speech ended: \${event.startMs}ms - \${event.endMs}ms');
+}`,
+              },
+              apple: {
+                language: 'swift',
+                filename: 'VoiceAgent.swift',
+                code: `import Cera
+
+let vad = try FfiSileroVad.fromFile(path: "silero_vad.gguf")
+let iterator = FfiVadIterator(rate: .rate16kHz, config: nil)
+
+// In AVAudioEngine audio tap (512-sample PCM buffer):
+if let event = try iterator.processChunk(vad: vad, chunk: buffer) {
+    if let speechStart = event as? FfiVadEventSpeechStart {
+        print("User began speaking at \\(speechStart.ms)ms")
+    } else if let speechEnd = event as? FfiVadEventSpeechEnd {
+        print("User finished speaking: \\(speechEnd.startMs) - \\(speechEnd.endMs)ms")
+    }
+}`,
+              },
+            },
           },
         ],
       },

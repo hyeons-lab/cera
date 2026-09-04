@@ -71,7 +71,7 @@ export const ArchitectureDiagram: React.FC = () => {
               </span>
               <span className="text-[11px] text-emerald-400 font-mono">Pure Rust · Zero Runtime</span>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
               <div className="p-3 rounded-lg bg-[#0b0d17] border border-blue-500/20">
                 <div className="font-semibold text-slate-200 mb-1 flex items-center gap-1.5">
                   <CheckCircle2 className="w-3.5 h-3.5 text-blue-400" />
@@ -97,6 +97,15 @@ export const ArchitectureDiagram: React.FC = () => {
                 </div>
                 <p className="text-slate-400 text-[11px] leading-relaxed">
                   Byte-level GBNF grammar constraint engine, JSON-Schema enforcement, and format-aware tool calling.
+                </p>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0b0d17] border border-blue-500/20">
+                <div className="font-semibold text-slate-200 mb-1 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-blue-400" />
+                  Native Silero VAD v5
+                </div>
+                <p className="text-slate-400 text-[11px] leading-relaxed">
+                  Zero-dependency ONNX-free voice activity detection evaluating 512-sample frames with stateful speech boundary tracking.
                 </p>
               </div>
             </div>

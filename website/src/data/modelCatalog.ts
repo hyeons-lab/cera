@@ -97,4 +97,16 @@ export const modelCatalog: LeapBundleModel[] = [
     huggingFaceUrl: 'https://huggingface.co/ibm-granite/granite-3.2-3b-instruct',
     featured: false,
   },
+  {
+    id: 'Silero-VAD-v5',
+    name: 'Silero VAD v5 (Voice Activity Detection)',
+    architecture: 'vad',
+    parameters: '<2M',
+    modalities: ['audio'],
+    quants: ['F32'],
+    contextLength: 'Streaming (512 samples)',
+    description: 'Ultra-lightweight stateful voice activity detector running natively in pure Rust with zero ONNX dependencies. Real-time speech boundary detection at 8 kHz and 16 kHz.',
+    huggingFaceUrl: 'https://huggingface.co/snakers4/silero-vad',
+    featured: true,
+  },
 ];
