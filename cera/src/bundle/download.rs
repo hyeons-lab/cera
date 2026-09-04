@@ -170,8 +170,9 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
 /// Stream `url` into `dest` atomically + verify the content hash +
 /// persist a sidecar hash file.
 ///
-/// Writes to `<dest>.partial.<pid>.<unique>` first and renames on
-/// success. On integrity failure the partial is deleted.
+/// Writes to `<dest>.partial` first and renames on success. Interrupted
+/// downloads can resume from existing bytes in `<dest>.partial`.
+/// On integrity failure the partial is deleted.
 /// `expected_sha256` overrides any server-provided `X-Linked-Etag`.
 ///
 /// `progress`, when `Some`, is called periodically during the byte
@@ -205,6 +206,22 @@ fn get_hf_auth_token_for_url(url: &str) -> Option<String> {
     }
 }
 
+/// Destination path for in-progress downloads: `<dest>.partial`.
+/// A stable path per destination enables resuming interrupted downloads
+/// via HTTP Range requests.
+pub(crate) fn partial_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_owned();
+    s.push(".partial");
+    PathBuf::from(s)
+}
+
+/// Extract total file size from `Content-Range: bytes <start>-<end>/<total>`.
+fn extract_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let header_val = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let total_str = header_val.split('/').nth(1)?;
+    total_str.trim().parse::<u64>().ok()
+}
+
 pub(crate) fn download_to(
     client: &Client,
     url: &str,
@@ -216,125 +233,143 @@ pub(crate) fn download_to(
     const MAX_DOWNLOAD_RETRIES: u32 = 5;
     const BASE_RETRY_DELAY_MS: u64 = 1000;
 
+    let partial = partial_path(dest);
     let token = get_hf_auth_token_for_url(url);
-    let mut resp = {
-        let mut last_err = String::new();
-        let mut response = None;
-        for attempt in 0..MAX_DOWNLOAD_RETRIES {
-            if attempt > 0 {
-                let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1));
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            let mut req = client.get(url).timeout(DOWNLOAD_TIMEOUT);
-            if let Some(t) = &token {
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
-            }
-            match req.send() {
-                Ok(r) => {
-                    let status = r.status();
-                    if status.is_success() {
-                        response = Some(r);
-                        break;
-                    } else if status == reqwest::StatusCode::REQUEST_TIMEOUT
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error()
-                    {
-                        last_err = format!("HTTP {status}");
-                    } else {
-                        return Err(CeraError::Backend(format!("GET {url}: HTTP {status}")));
-                    }
+
+    let mut response_and_resuming = None;
+    let mut existing_len = 0u64;
+    let mut last_err = String::new();
+
+    for attempt in 0..MAX_DOWNLOAD_RETRIES {
+        if attempt > 0 {
+            let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1));
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
+        // Check if a partial download file already exists on disk.
+        existing_len = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+
+        let mut req = client.get(url).timeout(DOWNLOAD_TIMEOUT);
+        if let Some(t) = &token {
+            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        if existing_len > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={existing_len}-"));
+        }
+
+        match req.send() {
+            Ok(r) => {
+                let status = r.status();
+                if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    // 206 Partial Content: server accepted the Range header and is serving remaining bytes.
+                    response_and_resuming = Some((r, true));
+                    break;
+                } else if status.is_success() {
+                    // 200 OK: server sent the full file from byte 0 (Range ignored or not requested).
+                    response_and_resuming = Some((r, false));
+                    break;
+                } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    // 416 Range Not Satisfiable: partial file exceeded remote size or remote changed.
+                    // Reset partial file and retry from byte 0.
+                    let _ = fs::remove_file(&partial);
+                    existing_len = 0;
+                    last_err =
+                        format!("HTTP {status} (Range Not Satisfiable, resetting partial file)");
+                } else if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+                {
+                    last_err = format!("HTTP {status}");
+                } else {
+                    return Err(CeraError::Backend(format!("GET {url}: HTTP {status}")));
                 }
-                Err(e) => {
-                    last_err = format!("{e}");
-                }
+            }
+            Err(e) => {
+                last_err = format!("{e}");
             }
         }
-        match response {
-            Some(r) => r,
-            None => {
-                return Err(CeraError::Backend(format!(
-                    "GET {url} failed after {MAX_DOWNLOAD_RETRIES} attempts: {last_err}"
-                )));
-            }
+    }
+
+    let (mut resp, is_resuming) = match response_and_resuming {
+        Some(pair) => pair,
+        None => {
+            return Err(CeraError::Backend(format!(
+                "GET {url} failed after {MAX_DOWNLOAD_RETRIES} attempts: {last_err}"
+            )));
         }
     };
 
-    // Prefer the caller's hint (typically from a HEAD probe), then
-    // fall back to the GET response's Content-Length. Either may be
-    // None if neither path surfaced a size — consumers should display
-    // indeterminate progress in that case.
-    let total_bytes = total_bytes_hint.or_else(|| resp.content_length());
+    // Calculate total expected bytes across existing prefix and incoming response.
+    let total_bytes = if is_resuming {
+        extract_content_range_total(resp.headers())
+            .or_else(|| {
+                resp.content_length()
+                    .map(|rem| existing_len.saturating_add(rem))
+            })
+            .or(total_bytes_hint)
+    } else {
+        total_bytes_hint.or_else(|| resp.content_length())
+    };
 
-    // Server-side hash fallback when the caller didn't pin one.
+    // Server-side hash fallback when the caller did not pin one.
     let server_hash = extract_linked_sha256(resp.headers());
     let expected = expected_sha256
         .map(|s| s.to_ascii_lowercase())
         .or(server_hash);
 
-    // Unique temp suffix so two concurrent processes (or threads)
-    // fetching the same URL don't race on one `.partial` name. Random
-    // tail uses SystemTime nanos + thread id — cheap, no RNG dep.
-    let mut partial_name = dest.as_os_str().to_owned();
-    partial_name.push(format!(
-        ".partial.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    let partial = PathBuf::from(partial_name);
-
-    // Compute-and-close in an inner scope so the file handle is
-    // dropped before any cleanup or rename. On Windows, `fs::remove_file`
-    // (and `fs::rename` onto the destination) can fail if the handle
-    // is still open — we must release it before touching the partial
-    // path again. POSIX tolerates unlink-while-open, but closing early
-    // is strictly safer.
     let copy_result: Result<String, CeraError> = {
-        let mut file = fs::File::create(&partial)?;
+        let (mut file, hasher, initial_bytes) = if is_resuming && existing_len > 0 {
+            // Hash the existing on-disk prefix so running SHA-256 covers the whole file.
+            let mut prefix_file = fs::File::open(&partial)?;
+            let mut hasher = Sha256::new();
+            let copied = io::copy(&mut prefix_file, &mut hasher)?;
+            if copied != existing_len {
+                drop(prefix_file);
+                let _ = fs::remove_file(&partial);
+                return Err(CeraError::Backend(format!(
+                    "partial file size changed during resume for {url}"
+                )));
+            }
+            drop(prefix_file);
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&partial)?;
+            (file, hasher, existing_len)
+        } else {
+            let _ = fs::remove_file(&partial);
+            let file = fs::File::create(&partial)?;
+            let hasher = Sha256::new();
+            (file, hasher, 0u64)
+        };
+
         let mut hashing = HashingWriter {
             inner: &mut file,
-            hasher: Sha256::new(),
+            hasher,
         };
-        // Wrap the hashing writer to count + report bytes if a
-        // progress callback is attached. The wrapper's own write impl
-        // forwards to `hashing` then conditionally invokes the
-        // callback with throttling. When `progress` is None the
-        // wrapper is essentially a thin forwarder; the per-write
-        // overhead is one Option-check + a u64 add. Scoped so the
-        // mutable borrow on `hashing` ends before we finalize the
-        // hasher + emit the end-of-stream callback below. We capture
-        // both the final byte count AND the writer's last in-loop
-        // callback position — the end-of-stream callback below skips
-        // when those match, avoiding a duplicate fire at exact-256KB
-        // file sizes.
+
         let (final_bytes, last_in_loop_callback_at) = {
-            let mut counting = ProgressingWriter::new(&mut hashing, progress, url, total_bytes);
+            let mut counting =
+                ProgressingWriter::new(&mut hashing, progress, url, total_bytes, initial_bytes);
             io::copy(&mut resp, &mut counting)
                 .map_err(|e| CeraError::Backend(format!("write {}: {e}", partial.display())))?;
             (counting.bytes_written, counting.last_callback_at)
         };
+
         if let Some(p) = progress
             && final_bytes != last_in_loop_callback_at
         {
-            // Final 100% callback so consumers can flip a UI from
-            // "downloading" to "verifying" / "done" deterministically.
-            // The throttled in-loop callbacks may stop at e.g.
-            // bytes - 256KB; this guarantees the last reported value
-            // matches the actual stream length. Skipped when the
-            // in-loop callback already fired with `final_bytes`
-            // (de-dupe).
             p.on_progress(url, final_bytes, total_bytes);
         }
         let digest = hashing.hasher.finalize();
         file.sync_all()?;
         Ok(hex_encode(&digest))
     };
+
     let actual_hex = match copy_result {
         Ok(h) => h,
         Err(e) => {
-            // File handle is out of scope now — safe to unlink on Windows.
-            // Mid-stream failure must not leave a `.partial.<pid>.<hash>`
-            // behind; unique suffixes mean a retry won't overwrite.
-            let _ = fs::remove_file(&partial);
+            // Do not delete partial file on mid-stream transport errors so future retries can resume.
             return Err(e);
         }
     };
@@ -342,46 +377,20 @@ pub(crate) fn download_to(
     if let Some(exp) = expected.as_deref()
         && exp != actual_hex
     {
+        // Delete corrupt partial file on cryptographic integrity failure.
         let _ = fs::remove_file(&partial);
         return Err(CeraError::Backend(format!(
             "integrity check failed for {url}: expected sha256:{exp}, got sha256:{actual_hex}"
         )));
     }
 
-    // `fs::rename` on Windows fails if `dest` exists (POSIX would
-    // silently replace). Remove first so cache invalidation + re-
-    // download works cross-platform. If the rename itself fails
-    // (cross-filesystem move, permission issue, etc.), clean up the
-    // partial before propagating — otherwise each retry leaves yet
-    // another `.partial.<pid>.<unique>` file on disk since the
-    // unique suffix means retries never overwrite.
     let _ = fs::remove_file(dest);
     if let Err(e) = fs::rename(&partial, dest) {
         let _ = fs::remove_file(&partial);
         return Err(e.into());
     }
-    // Persist the sidecar hash so subsequent cache hits can skip
-    // rehashing a multi-GB GGUF. Best-effort; write failure only
-    // costs us one rehash on the next resolve.
     write_sidecar(dest, &actual_hex);
     Ok(())
-}
-
-/// Process-unique-ish suffix for the temp download filename. Combines
-/// SystemTime nanos with a thread ID hash — cheap and avoids pulling a
-/// dedicated RNG dep through just for this.
-fn unique_suffix() -> u64 {
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut h);
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        .hash(&mut h);
-    h.finish()
 }
 
 /// `io::Write` adapter that fans bytes into both the wrapped writer
@@ -430,14 +439,20 @@ impl<'a, W: io::Write> ProgressingWriter<'a, W> {
         progress: Option<&'a dyn crate::bundle::DownloadProgress>,
         url: &'a str,
         total_bytes: Option<u64>,
+        initial_bytes: u64,
     ) -> Self {
+        if let Some(p) = progress
+            && initial_bytes > 0
+        {
+            p.on_progress(url, initial_bytes, total_bytes);
+        }
         Self {
             inner,
             progress,
             url,
             total_bytes,
-            bytes_written: 0,
-            last_callback_at: 0,
+            bytes_written: initial_bytes,
+            last_callback_at: initial_bytes,
         }
     }
 }
@@ -518,6 +533,7 @@ mod tests {
             Some(&recorder as &dyn DownloadProgress),
             "https://example.com/foo.gguf",
             Some(1024 * 1024),
+            0,
         );
 
         // Below threshold: no callback.
@@ -571,6 +587,7 @@ mod tests {
             Some(&recorder as &dyn DownloadProgress),
             "https://example.com/exact.bin",
             Some(PROGRESS_THROTTLE_BYTES),
+            0,
         );
         // Single write that exactly hits the throttle threshold.
         writer
@@ -586,13 +603,6 @@ mod tests {
             "exactly one in-loop callback at the boundary"
         );
         assert_eq!(calls[0], PROGRESS_THROTTLE_BYTES);
-        // The download_to caller's de-dup guard
-        // (`final_bytes != last_in_loop_callback_at`) sees
-        // 256K == 256K and skips the end-of-stream callback. That's
-        // not exercised here directly (it's in download_to's body,
-        // which we'd need a real http response to drive); this test
-        // proves the writer exposes the `last_callback_at` field
-        // correctly for that guard to work.
     }
 
     /// `progress = None` → ProgressingWriter is a thin forwarder, no
@@ -602,11 +612,74 @@ mod tests {
     fn progressing_writer_with_none_progress_is_silent() {
         use std::io::Write as _;
         let mut sink = std::io::sink();
-        let mut writer = ProgressingWriter::new(&mut sink, None, "https://example.com/x", None);
+        let mut writer = ProgressingWriter::new(&mut sink, None, "https://example.com/x", None, 0);
         writer.write_all(&[0u8; 1024 * 1024]).unwrap();
         assert_eq!(writer.bytes_written, 1024 * 1024);
-        // Nothing to assert beyond "didn't panic / didn't dispatch
-        // through a None pointer".
+    }
+
+    #[test]
+    fn progressing_writer_reports_initial_resumed_position() {
+        use crate::bundle::DownloadProgress;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct Recorder {
+            calls: Mutex<Vec<(String, u64, Option<u64>)>>,
+        }
+        impl DownloadProgress for Recorder {
+            fn on_progress(&self, url: &str, bytes: u64, total: Option<u64>) {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((url.to_string(), bytes, total));
+            }
+        }
+
+        let recorder = Recorder::default();
+        let mut sink = std::io::sink();
+        let _writer = ProgressingWriter::new(
+            &mut sink,
+            Some(&recorder as &dyn DownloadProgress),
+            "https://example.com/model.gguf",
+            Some(1000),
+            750,
+        );
+
+        let calls = recorder.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "https://example.com/model.gguf");
+        assert_eq!(calls[0].1, 750);
+        assert_eq!(calls[0].2, Some(1000));
+    }
+
+    #[test]
+    fn partial_path_appends_extension() {
+        assert_eq!(
+            partial_path(Path::new("/cache/x.gguf")),
+            PathBuf::from("/cache/x.gguf.partial")
+        );
+    }
+
+    #[test]
+    fn extract_content_range_total_parses_standard_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 500-999/5000".parse().unwrap(),
+        );
+        assert_eq!(extract_content_range_total(&headers), Some(5000));
+
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 0-100/1000".parse().unwrap(),
+        );
+        assert_eq!(extract_content_range_total(&headers), Some(1000));
+
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            "bytes 500-999/*".parse().unwrap(),
+        );
+        assert_eq!(extract_content_range_total(&headers), None);
     }
 
     #[test]
@@ -661,6 +734,70 @@ mod tests {
         assert_eq!(
             sha256_file(&p).unwrap(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn test_download_to_resumes_partial_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let full_content = b"hello beautiful world of cera!";
+        let mut hasher = Sha256::new();
+        hasher.update(full_content);
+        let expected_sha256 = hex_encode(&hasher.finalize());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req_buf = vec![0u8; 1024];
+            let n = stream.read(&mut req_buf).unwrap();
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+
+            if req_str.contains("Range: bytes=5-") {
+                let body = &full_content[5..];
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 5-{}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    full_content.len() - 1,
+                    full_content.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            } else {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    full_content.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(full_content).unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("model.gguf");
+        let partial = partial_path(&dest);
+
+        // Pre-create partial file with first 5 bytes ("hello")
+        fs::write(&partial, &full_content[..5]).unwrap();
+
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{}/model.gguf", addr.port());
+
+        download_to(&client, &url, &dest, Some(&expected_sha256), None, None).unwrap();
+
+        server_thread.join().unwrap();
+
+        // Verify partial file was removed on completion and dest exists with full contents
+        assert!(!partial.exists());
+        assert!(dest.exists());
+        let downloaded = fs::read(&dest).unwrap();
+        assert_eq!(downloaded, full_content);
+        assert_eq!(
+            read_sidecar(&dest).as_deref(),
+            Some(expected_sha256.as_str())
         );
     }
 }

@@ -473,6 +473,22 @@ fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -2495,25 +2511,31 @@ public func FfiConverterTypeLoraAdapters_lower(_ value: LoraAdapters) -> UInt64 
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
- * receive tokens + audio frames + the finish reason as they happen.
+ * receive text chunks + thought chunks + audio frames + the finish reason
+ * as they happen.
  *
- * All methods are required from foreign implementations (UniFFI 0.28
+ * All methods are required from foreign implementations (UniFFI 0.31
  * foreign traits don't carry Rust's default-impl fallbacks). Callers
  * that don't care about a modality can provide an empty body.
  *
  * Threading: every method is invoked on the same Rust thread running
- * `generate` — the decode thread. If the foreign runtime requires
+ * `generate` (the decode thread). If the foreign runtime requires
  * marshalling onto a different thread (e.g. Swift's `@MainActor`) it
  * is the implementer's responsibility to dispatch the call there.
  */
 public protocol ModalitySink: AnyObject, Sendable {
     
     /**
-     * Called with each chunk of generated token IDs. Ownership of the
-     * `Vec<u32>` is transferred to the callback, so implementations
-     * may retain or store it directly if needed — no clone required.
+     * Called with each chunk of reasoning or chain-of-thought text
+     * extracted from thinking delimiters (<think>...</think>).
      */
-    func onTextTokens(tokens: [UInt32]) 
+    func onThoughtChunk(text: String) 
+    
+    /**
+     * Called with each chunk of generated user-facing text
+     * as soon as valid characters are produced.
+     */
+    func onTextChunk(text: String) 
     
     /**
      * Called with each chunk of generated PCM audio samples. Not
@@ -2539,14 +2561,15 @@ public protocol ModalitySink: AnyObject, Sendable {
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
- * receive tokens + audio frames + the finish reason as they happen.
+ * receive text chunks + thought chunks + audio frames + the finish reason
+ * as they happen.
  *
- * All methods are required from foreign implementations (UniFFI 0.28
+ * All methods are required from foreign implementations (UniFFI 0.31
  * foreign traits don't carry Rust's default-impl fallbacks). Callers
  * that don't care about a modality can provide an empty body.
  *
  * Threading: every method is invoked on the same Rust thread running
- * `generate` — the decode thread. If the foreign runtime requires
+ * `generate` (the decode thread). If the foreign runtime requires
  * marshalling onto a different thread (e.g. Swift's `@MainActor`) it
  * is the implementer's responsibility to dispatch the call there.
  */
@@ -2604,14 +2627,25 @@ open class ModalitySinkImpl: ModalitySink, @unchecked Sendable {
 
     
     /**
-     * Called with each chunk of generated token IDs. Ownership of the
-     * `Vec<u32>` is transferred to the callback, so implementations
-     * may retain or store it directly if needed — no clone required.
+     * Called with each chunk of reasoning or chain-of-thought text
+     * extracted from thinking delimiters (<think>...</think>).
      */
-open func onTextTokens(tokens: [UInt32])  {try! rustCall() {
-    uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens(
+open func onThoughtChunk(text: String)  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceUInt32.lower(tokens),$0
+        FfiConverterString.lower(text),$0
+    )
+}
+}
+    
+    /**
+     * Called with each chunk of generated user-facing text
+     * as soon as valid characters are produced.
+     */
+open func onTextChunk(text: String)  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),$0
     )
 }
 }
@@ -2676,9 +2710,9 @@ fileprivate struct UniffiCallbackInterfaceModalitySink {
                 fatalError("Uniffi callback interface ModalitySink: handle missing in uniffiClone")
             }
         },
-        onTextTokens: { (
+        onThoughtChunk: { (
             uniffiHandle: UInt64,
-            tokens: RustBuffer,
+            text: RustBuffer,
             uniffiOutReturn: UnsafeMutableRawPointer,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
         ) in
@@ -2687,8 +2721,32 @@ fileprivate struct UniffiCallbackInterfaceModalitySink {
                 guard let uniffiObj = try? FfiConverterTypeModalitySink.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return uniffiObj.onTextTokens(
-                     tokens: try FfiConverterSequenceUInt32.lift(tokens)
+                return uniffiObj.onThoughtChunk(
+                     text: try FfiConverterString.lift(text)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onTextChunk: { (
+            uniffiHandle: UInt64,
+            text: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeModalitySink.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onTextChunk(
+                     text: try FfiConverterString.lift(text)
                 )
             }
 
@@ -3013,12 +3071,9 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func defaultGenerateOpts() throws  -> GenerateOpts
     
     /**
-     * Run autoregressive decode and return all emitted tokens +
-     * a summary. Synchronous — the call blocks until the decode
-     * loop exits (`max_tokens`, EOS, `cancel()`, or error).
-     *
-     * For streaming (per-chunk delivery) and async, see the PR 4 /
-     * PR 5 follow-ups in `cera-ffi/README.md`.
+     * Run autoregressive decode and return all emitted text, tokens, and
+     * summary. Synchronous: the call blocks until the decode loop exits
+     * (`max_tokens`, EOS, `cancel()`, or error).
      */
     func generate(opts: GenerateOpts) throws  -> GenerateOutput
     
@@ -3048,17 +3103,17 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func generateAsync(opts: GenerateOpts) async throws  -> GenerateOutput
     
     /**
-     * Run autoregressive decode, streaming every token (and audio
+     * Run autoregressive decode, streaming every text chunk (and audio
      * frame, for audio-capable models) to a foreign [`ModalitySink`]
-     * as soon as it's produced. Returns only a [`GenerateSummary`] —
-     * token IDs are delivered through `sink.on_text_tokens`, not a
+     * as soon as it is produced. Returns only a [`GenerateSummary`]:
+     * text chunks are delivered through `sink.on_text_chunk`, not a
      * return value.
      *
      * Synchronous: the call blocks on the decode thread and each
      * `sink` method runs on that same thread before decoding
-     * continues. For async, see PR 5 in `cera-ffi/README.md`.
+     * continues.
      *
-     * **Callback reentrancy — deadlock hazard.** The session mutex is
+     * **Callback reentrancy: deadlock hazard.** The session mutex is
      * held for the entire call, and sink callbacks run while that
      * lock is held. Calling back into methods that also take the
      * mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -3179,6 +3234,22 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * instead of panicking across the FFI boundary.
      */
     func reset() throws 
+    
+    /**
+     * Append a multimodal message, automatically enforcing model-canonical
+     * media ordering, boundary token envelopes, and sample rate normalization.
+     */
+    func sendMessage(message: UserMessage) throws 
+    
+    /**
+     * Append a multimodal message and run generation synchronously.
+     */
+    func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts) throws  -> GenerateOutput
+    
+    /**
+     * Append a multimodal message and run streaming generation.
+     */
+    func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
     
     /**
      * Set a session-default cap on the longest side of an appended
@@ -3482,12 +3553,9 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
 }
     
     /**
-     * Run autoregressive decode and return all emitted tokens +
-     * a summary. Synchronous — the call blocks until the decode
-     * loop exits (`max_tokens`, EOS, `cancel()`, or error).
-     *
-     * For streaming (per-chunk delivery) and async, see the PR 4 /
-     * PR 5 follow-ups in `cera-ffi/README.md`.
+     * Run autoregressive decode and return all emitted text, tokens, and
+     * summary. Synchronous: the call blocks until the decode loop exits
+     * (`max_tokens`, EOS, `cancel()`, or error).
      */
 open func generate(opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -3539,17 +3607,17 @@ open func generateAsync(opts: GenerateOpts)async throws  -> GenerateOutput  {
 }
     
     /**
-     * Run autoregressive decode, streaming every token (and audio
+     * Run autoregressive decode, streaming every text chunk (and audio
      * frame, for audio-capable models) to a foreign [`ModalitySink`]
-     * as soon as it's produced. Returns only a [`GenerateSummary`] —
-     * token IDs are delivered through `sink.on_text_tokens`, not a
+     * as soon as it is produced. Returns only a [`GenerateSummary`]:
+     * text chunks are delivered through `sink.on_text_chunk`, not a
      * return value.
      *
      * Synchronous: the call blocks on the decode thread and each
      * `sink` method runs on that same thread before decoding
-     * continues. For async, see PR 5 in `cera-ffi/README.md`.
+     * continues.
      *
-     * **Callback reentrancy — deadlock hazard.** The session mutex is
+     * **Callback reentrancy: deadlock hazard.** The session mutex is
      * held for the entire call, and sink callbacks run while that
      * lock is held. Calling back into methods that also take the
      * mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -3744,6 +3812,45 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
 }
     
     /**
+     * Append a multimodal message, automatically enforcing model-canonical
+     * media ordering, boundary token envelopes, and sample rate normalization.
+     */
+open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_send_message(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeUserMessage_lower(message),$0
+    )
+}
+}
+    
+    /**
+     * Append a multimodal message and run generation synchronously.
+     */
+open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws  -> GenerateOutput  {
+    return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_send_message_and_generate(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeUserMessage_lower(message),
+        FfiConverterTypeGenerateOpts_lower(opts),$0
+    )
+})
+}
+    
+    /**
+     * Append a multimodal message and run streaming generation.
+     */
+open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
+    return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_send_message_streaming(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeUserMessage_lower(message),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterTypeModalitySink_lower(sink),$0
+    )
+})
+}
+    
+    /**
      * Set a session-default cap on the longest side of an appended
      * image, in pixels (`None` = no cap). Unlike the per-call
      * `max_long_size` argument to [`Self::append_image`], this default
@@ -3807,6 +3914,63 @@ public func FfiConverterTypeSession_lower(_ value: Session) -> UInt64 {
 }
 
 
+
+
+/**
+ * PCM audio input buffer.
+ */
+public struct AudioInput: Equatable, Hashable {
+    public var pcm: [Float]
+    public var sampleRate: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pcm: [Float], sampleRate: UInt32) {
+        self.pcm = pcm
+        self.sampleRate = sampleRate
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AudioInput: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAudioInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AudioInput {
+        return
+            try AudioInput(
+                pcm: FfiConverterSequenceFloat.read(from: &buf), 
+                sampleRate: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AudioInput, into buf: inout [UInt8]) {
+        FfiConverterSequenceFloat.write(value.pcm, into: &buf)
+        FfiConverterUInt32.write(value.sampleRate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioInput_lift(_ buf: RustBuffer) throws -> AudioInput {
+    return try FfiConverterTypeAudioInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioInput_lower(_ value: AudioInput) -> RustBuffer {
+    return FfiConverterTypeAudioInput.lower(value)
+}
 
 
 /**
@@ -4288,16 +4452,15 @@ public func FfiConverterTypeGenerateOpts_lower(_ value: GenerateOpts) -> RustBuf
 
 /**
  * Bundle of everything a synchronous `generate` call produces:
- * the generated token IDs plus the decode summary. The two are
- * returned together so callers don't have to manage a separate
- * callback channel; streaming (per-chunk delivery) lands in PR 4.
+ * the generated text string, token IDs, and decode summary.
  */
 public struct GenerateOutput: Equatable, Hashable {
     /**
-     * Generated token IDs, in order, not including any prompt
-     * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side, or with [`CeraEngine::decode_tokens`] from any
-     * foreign binding.
+     * Generated text (UTF-8 decoded).
+     */
+    public var text: String
+    /**
+     * Generated token IDs, in order, not including any prompt tokens.
      */
     public var tokens: [UInt32]
     public var summary: GenerateSummary
@@ -4306,11 +4469,12 @@ public struct GenerateOutput: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * Generated token IDs, in order, not including any prompt
-         * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-         * Rust side, or with [`CeraEngine::decode_tokens`] from any
-         * foreign binding.
+         * Generated text (UTF-8 decoded).
+         */text: String, 
+        /**
+         * Generated token IDs, in order, not including any prompt tokens.
          */tokens: [UInt32], summary: GenerateSummary) {
+        self.text = text
         self.tokens = tokens
         self.summary = summary
     }
@@ -4331,12 +4495,14 @@ public struct FfiConverterTypeGenerateOutput: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenerateOutput {
         return
             try GenerateOutput(
+                text: FfiConverterString.read(from: &buf), 
                 tokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 summary: FfiConverterTypeGenerateSummary.read(from: &buf)
         )
     }
 
     public static func write(_ value: GenerateOutput, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
         FfiConverterSequenceUInt32.write(value.tokens, into: &buf)
         FfiConverterTypeGenerateSummary.write(value.summary, into: &buf)
     }
@@ -4366,15 +4532,21 @@ public struct GenerateSummary: Equatable, Hashable {
     public var promptEvalTokens: UInt32
     public var promptEvalMs: UInt32
     public var decodeMs: UInt32
+    public var totalDurationMs: UInt32
+    public var decodeTokPerSec: Double
+    public var promptEvalTokPerSec: Double
     public var finishReason: FinishReason
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(tokensGenerated: UInt32, promptEvalTokens: UInt32, promptEvalMs: UInt32, decodeMs: UInt32, finishReason: FinishReason) {
+    public init(tokensGenerated: UInt32, promptEvalTokens: UInt32, promptEvalMs: UInt32, decodeMs: UInt32, totalDurationMs: UInt32, decodeTokPerSec: Double, promptEvalTokPerSec: Double, finishReason: FinishReason) {
         self.tokensGenerated = tokensGenerated
         self.promptEvalTokens = promptEvalTokens
         self.promptEvalMs = promptEvalMs
         self.decodeMs = decodeMs
+        self.totalDurationMs = totalDurationMs
+        self.decodeTokPerSec = decodeTokPerSec
+        self.promptEvalTokPerSec = promptEvalTokPerSec
         self.finishReason = finishReason
     }
 
@@ -4398,6 +4570,9 @@ public struct FfiConverterTypeGenerateSummary: FfiConverterRustBuffer {
                 promptEvalTokens: FfiConverterUInt32.read(from: &buf), 
                 promptEvalMs: FfiConverterUInt32.read(from: &buf), 
                 decodeMs: FfiConverterUInt32.read(from: &buf), 
+                totalDurationMs: FfiConverterUInt32.read(from: &buf), 
+                decodeTokPerSec: FfiConverterDouble.read(from: &buf), 
+                promptEvalTokPerSec: FfiConverterDouble.read(from: &buf), 
                 finishReason: FfiConverterTypeFinishReason.read(from: &buf)
         )
     }
@@ -4407,6 +4582,9 @@ public struct FfiConverterTypeGenerateSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.promptEvalTokens, into: &buf)
         FfiConverterUInt32.write(value.promptEvalMs, into: &buf)
         FfiConverterUInt32.write(value.decodeMs, into: &buf)
+        FfiConverterUInt32.write(value.totalDurationMs, into: &buf)
+        FfiConverterDouble.write(value.decodeTokPerSec, into: &buf)
+        FfiConverterDouble.write(value.promptEvalTokPerSec, into: &buf)
         FfiConverterTypeFinishReason.write(value.finishReason, into: &buf)
     }
 }
@@ -4913,6 +5091,67 @@ public func FfiConverterTypeToolDef_lift(_ buf: RustBuffer) throws -> ToolDef {
 #endif
 public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
     return FfiConverterTypeToolDef.lower(value)
+}
+
+
+/**
+ * User-facing multimodal input envelope.
+ */
+public struct UserMessage: Equatable, Hashable {
+    public var text: String?
+    public var images: [Data]
+    public var audio: AudioInput?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(text: String?, images: [Data], audio: AudioInput?) {
+        self.text = text
+        self.images = images
+        self.audio = audio
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UserMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUserMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UserMessage {
+        return
+            try UserMessage(
+                text: FfiConverterOptionString.read(from: &buf), 
+                images: FfiConverterSequenceData.read(from: &buf), 
+                audio: FfiConverterOptionTypeAudioInput.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UserMessage, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.text, into: &buf)
+        FfiConverterSequenceData.write(value.images, into: &buf)
+        FfiConverterOptionTypeAudioInput.write(value.audio, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserMessage_lift(_ buf: RustBuffer) throws -> UserMessage {
+    return try FfiConverterTypeUserMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffer {
+    return FfiConverterTypeUserMessage.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -5935,6 +6174,30 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
+    typealias SwiftType = AudioInput?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAudioInput.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAudioInput.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiVadConfig?
 
@@ -6098,6 +6361,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
         }
         return seq
     }
@@ -6536,13 +6824,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 54889) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 2908) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
@@ -6572,13 +6863,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
+    if (uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_generate_async() != 58489) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
@@ -6606,6 +6897,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 1595) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 40181) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {

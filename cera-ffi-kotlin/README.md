@@ -52,3 +52,43 @@ e.g. `0.4.0` everywhere.
 
 Versions (kotlin, AGP, vanniktech, compile/minSdk) are pinned in
 `gradle/libs.versions.toml`; publishing coordinates + POM in `gradle.properties`.
+
+## Android Model Downloading & Foreground Service
+
+`cera-ffi-android` includes idiomatic Android utilities under `com.hyeonslab.cera.android.download`:
+
+- **`AndroidBundleRepo`**: Companion helpers configured for Android persistent storage (`filesDir/cera-bundles`, never OS-purgeable `cacheDir`).
+- **`AndroidModelDownloader`**: Coroutine and Kotlin `Flow<DownloadState>` downloader that favors `CeraDownloadService` by default.
+- **`CeraDownloadService`**: Foreground service managing long-running model downloads with live progress notifications and process-death resilience.
+- **Resumable Downloads**: Interrupted downloads automatically resume via HTTP range requests from existing bytes in `<dest>.partial`.
+
+```kotlin
+import com.hyeonslab.cera.android.download.*
+import uniffi.cera_ffi.*
+
+// 1. One-line coroutine download + engine initialization:
+// By default (useService = true), downloading runs in CeraDownloadService with live notifications.
+val downloader = AndroidModelDownloader(context)
+val engine = downloader.downloadAndLoad(
+    bundleId = "LFM2-1.2B-GGUF",
+    quant = "Q4_0"
+) { bytesDownloaded, totalBytes, percent ->
+    println("Progress: $percent%")
+}
+
+// 2. Cold Flow streaming state:
+// Emits Connecting, Progress, Success, and Error states from the foreground service.
+// Set useService = false to download directly in-coroutine without system notifications.
+downloader.download("LFM2-1.2B-GGUF", "Q4_0").collect { state ->
+    when (state) {
+        is DownloadState.Connecting -> showSpinner()
+        is DownloadState.Progress -> updateProgressBar(state.percent ?: 0)
+        is DownloadState.Success -> onReady()
+        is DownloadState.Error -> showError(state.message)
+        else -> Unit
+    }
+}
+
+// 3. Or trigger via AndroidBundleRepo convenience functions:
+AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
+```

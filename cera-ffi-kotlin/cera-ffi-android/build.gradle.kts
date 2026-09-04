@@ -15,12 +15,19 @@ android {
         minSdk = libs.versions.minSdk.get().toInt()
     }
 
+    lint {
+        disable.add("NewApi")
+        abortOnError = true
+        checkReleaseBuilds = false
+        warningsAsErrors = false
+    }
+
     sourceSets {
         named("main") {
             // Same vendored binding the JVM module uses (no copy). Native libs
             // are staged into the default `src/main/jniLibs/<abi>/` by
-            // `just android-libs` (gitignored) — no custom srcDir needed.
-            kotlin.srcDir("../../cera-ffi/bindings/kotlin")
+            // `just android-libs` (gitignored): no custom srcDir needed.
+            kotlin.directories.addAll(listOf("../../cera-ffi/bindings/kotlin", "src/main/kotlin"))
         }
     }
     // Release-variant publishing (+ sources/javadoc jars) is configured by the

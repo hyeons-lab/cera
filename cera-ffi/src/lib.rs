@@ -1528,58 +1528,102 @@ pub struct GenerateSummary {
     pub prompt_eval_tokens: u32,
     pub prompt_eval_ms: u32,
     pub decode_ms: u32,
+    pub total_duration_ms: u32,
+    pub decode_tok_per_sec: f64,
+    pub prompt_eval_tok_per_sec: f64,
     pub finish_reason: FinishReason,
 }
 
 impl From<cera::GenerateSummary> for GenerateSummary {
     fn from(s: cera::GenerateSummary) -> Self {
+        let decode_tok_per_sec = s.decode_tok_per_sec();
+        let prompt_eval_tok_per_sec = s.prompt_eval_tok_per_sec();
+        let total_duration_ms = s.total_duration_ms();
         Self {
             tokens_generated: s.tokens_generated,
             prompt_eval_tokens: s.prompt_eval_tokens,
             prompt_eval_ms: s.prompt_eval_ms,
             decode_ms: s.decode_ms,
+            total_duration_ms,
+            decode_tok_per_sec,
+            prompt_eval_tok_per_sec,
             finish_reason: s.finish_reason.into(),
         }
     }
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
-/// the generated token IDs plus the decode summary. The two are
-/// returned together so callers don't have to manage a separate
-/// callback channel; streaming (per-chunk delivery) lands in PR 4.
+/// the generated text string, token IDs, and decode summary.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct GenerateOutput {
-    /// Generated token IDs, in order, not including any prompt
-    /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-    /// Rust side, or with [`CeraEngine::decode_tokens`] from any
-    /// foreign binding.
+    /// Generated text (UTF-8 decoded).
+    pub text: String,
+    /// Generated token IDs, in order, not including any prompt tokens.
     pub tokens: Vec<u32>,
     pub summary: GenerateSummary,
 }
 
+/// PCM audio input buffer.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AudioInput {
+    pub pcm: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+impl From<AudioInput> for cera::tokenizer::AudioInput {
+    fn from(a: AudioInput) -> Self {
+        Self {
+            pcm: a.pcm,
+            sample_rate: a.sample_rate,
+        }
+    }
+}
+
+/// User-facing multimodal input envelope.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct UserMessage {
+    pub text: Option<String>,
+    pub images: Vec<Vec<u8>>,
+    pub audio: Option<AudioInput>,
+}
+
+impl From<UserMessage> for cera::tokenizer::UserMessage {
+    fn from(m: UserMessage) -> Self {
+        Self {
+            text: m.text,
+            images: m.images,
+            audio: m.audio.map(Into::into),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// ModalitySink (foreign trait — PR 4)
+// ModalitySink (foreign trait)
 // ---------------------------------------------------------------------------
 
 /// Streaming sink for decode output. Foreign callers implement this
 /// trait (Kotlin class, Swift class, Python subclass) and pass an
 /// `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
-/// receive tokens + audio frames + the finish reason as they happen.
+/// receive text chunks + thought chunks + audio frames + the finish reason
+/// as they happen.
 ///
-/// All methods are required from foreign implementations (UniFFI 0.28
+/// All methods are required from foreign implementations (UniFFI 0.31
 /// foreign traits don't carry Rust's default-impl fallbacks). Callers
 /// that don't care about a modality can provide an empty body.
 ///
 /// Threading: every method is invoked on the same Rust thread running
-/// `generate` — the decode thread. If the foreign runtime requires
+/// `generate` (the decode thread). If the foreign runtime requires
 /// marshalling onto a different thread (e.g. Swift's `@MainActor`) it
 /// is the implementer's responsibility to dispatch the call there.
 #[uniffi::export(with_foreign)]
 pub trait ModalitySink: Send + Sync {
-    /// Called with each chunk of generated token IDs. Ownership of the
-    /// `Vec<u32>` is transferred to the callback, so implementations
-    /// may retain or store it directly if needed — no clone required.
-    fn on_text_tokens(&self, tokens: Vec<u32>);
+    /// Called with each chunk of reasoning or chain-of-thought text
+    /// extracted from thinking delimiters (<think>...</think>).
+    fn on_thought_chunk(&self, text: String);
+
+    /// Called with each chunk of generated user-facing text
+    /// as soon as valid characters are produced.
+    fn on_text_chunk(&self, text: String);
 
     /// Called with each chunk of generated PCM audio samples. Not
     /// called for text-only models; LFM2-Audio-class models emit here.
@@ -1597,35 +1641,187 @@ pub trait ModalitySink: Send + Sync {
     fn on_done(&self, reason: FinishReason);
 }
 
+const OPEN_THOUGHT_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"];
+const CLOSE_THOUGHT_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
+
+fn find_thought_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
+    let mut earliest: Option<(usize, &'a str)> = None;
+    for &tag in tags {
+        if let Some(pos) = text.find(tag) {
+            match earliest {
+                Some((min_pos, _)) if pos < min_pos => {
+                    earliest = Some((pos, tag));
+                }
+                None => {
+                    earliest = Some((pos, tag));
+                }
+                _ => {}
+            }
+        }
+    }
+    earliest
+}
+
+fn thought_partial_suffix_len(text: &str, tags: &[&str]) -> usize {
+    let mut max_len = 0;
+    let start = text.len().saturating_sub(32);
+    for (i, _) in text.char_indices() {
+        if i < start {
+            continue;
+        }
+        let suffix = &text[i..];
+        for &tag in tags {
+            if tag.starts_with(suffix) && suffix.len() < tag.len() {
+                max_len = max_len.max(suffix.len());
+            }
+        }
+    }
+    max_len
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingState {
+    Content,
+    Thinking,
+}
+
+struct StreamingThinkingParser {
+    state: ThinkingState,
+    buffer: String,
+}
+
+impl StreamingThinkingParser {
+    fn new() -> Self {
+        Self {
+            state: ThinkingState::Content,
+            buffer: String::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &str) -> Vec<(bool, String)> {
+        self.buffer.push_str(chunk);
+        let mut emissions = Vec::new();
+
+        loop {
+            let (tags, is_thought, next_state) = match self.state {
+                ThinkingState::Content => (OPEN_THOUGHT_TAGS, false, ThinkingState::Thinking),
+                ThinkingState::Thinking => (CLOSE_THOUGHT_TAGS, true, ThinkingState::Content),
+            };
+
+            if let Some((pos, tag)) = find_thought_tag(&self.buffer, tags) {
+                if pos > 0 {
+                    let text = self.buffer[..pos].to_string();
+                    emissions.push((is_thought, text));
+                }
+                let tag_len = tag.len();
+                self.buffer.drain(..pos + tag_len);
+                self.state = next_state;
+                continue;
+            }
+
+            let hold = thought_partial_suffix_len(&self.buffer, tags);
+            let safe_len = self.buffer.len() - hold;
+            if safe_len > 0 {
+                let text = self.buffer[..safe_len].to_string();
+                self.buffer.drain(..safe_len);
+                emissions.push((is_thought, text));
+            }
+            break;
+        }
+
+        emissions
+    }
+
+    fn flush(&mut self) -> Option<(bool, String)> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            let is_thought = self.state == ThinkingState::Thinking;
+            let text = std::mem::take(&mut self.buffer);
+            Some((is_thought, text))
+        }
+    }
+}
+
 /// Adapter from the UniFFI foreign trait to the internal
-/// [`cera::ModalitySink`]. Forwards every call; unavoidable `Vec`
-/// copy per chunk because UniFFI can't marshal a borrowed `&[u32]`
-/// or `&[f32]` across the ABI boundary. Impact is bounded: the
-/// decode loop emits chunks of at most a few tokens at a time, so
-/// the allocation volume is orders of magnitude lower than the decode
-/// itself. For audio the copy is larger but a single frame per decode
-/// step is still small (a few hundred f32s).
-///
-/// `done_called` tracks whether the underlying `cera::Session::generate`
-/// fired `on_done`. The FFI wrapper uses this to synthesize a
-/// terminal `on_done(Error)` if core returns an error before getting
-/// to its own `on_done` call (currently only possible on
-/// `CeraError::EmptyInput`, but robust against future error paths).
-/// Guards against double-firing if the core ever starts calling
-/// `on_done` internally on error paths.
+/// [`cera::ModalitySink`]. Decodes tokens to valid UTF-8 text chunks
+/// incrementally using the session's tokenizer, and forwards audio frames
+/// and terminal completion events.
 struct ForeignSinkAdapter {
     inner: Arc<dyn ModalitySink>,
+    tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+    pending_bytes: Vec<u8>,
+    parser: StreamingThinkingParser,
     done_called: bool,
+}
+
+impl ForeignSinkAdapter {
+    fn emit_chunk(&self, is_thought: bool, text: String) {
+        if !text.is_empty() {
+            if is_thought {
+                self.inner.on_thought_chunk(text);
+            } else {
+                self.inner.on_text_chunk(text);
+            }
+        }
+    }
 }
 
 impl cera::ModalitySink for ForeignSinkAdapter {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
-        self.inner.on_text_tokens(tokens.to_vec());
+        self.pending_bytes
+            .extend_from_slice(&self.tokenizer.decode_bytes(tokens));
+        loop {
+            if self.pending_bytes.is_empty() {
+                break;
+            }
+            match std::str::from_utf8(&self.pending_bytes) {
+                Ok(s) => {
+                    for (is_thought, text) in self.parser.feed(s) {
+                        self.emit_chunk(is_thought, text);
+                    }
+                    self.pending_bytes.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid_len = e.valid_up_to();
+                    if valid_len > 0 {
+                        if let Ok(piece) = std::str::from_utf8(&self.pending_bytes[..valid_len]) {
+                            for (is_thought, text) in self.parser.feed(piece) {
+                                self.emit_chunk(is_thought, text);
+                            }
+                        }
+                        self.pending_bytes.drain(..valid_len);
+                    }
+                    if let Some(err_len) = e.error_len() {
+                        for (is_thought, text) in self.parser.feed("\u{FFFD}") {
+                            self.emit_chunk(is_thought, text);
+                        }
+                        self.pending_bytes.drain(..err_len);
+                    } else {
+                        // Incomplete multi-byte sequence at end of buffer, wait for more tokens.
+                        break;
+                    }
+                }
+            }
+        }
     }
     fn on_audio_frames(&mut self, pcm: &[f32], sample_rate: u32) {
         self.inner.on_audio_frames(pcm.to_vec(), sample_rate);
     }
     fn on_done(&mut self, reason: cera::FinishReason) {
+        if !self.pending_bytes.is_empty() {
+            let piece = String::from_utf8_lossy(&self.pending_bytes);
+            if !piece.is_empty() {
+                for (is_thought, text) in self.parser.feed(&piece) {
+                    self.emit_chunk(is_thought, text);
+                }
+            }
+            self.pending_bytes.clear();
+        }
+        if let Some((is_thought, text)) = self.parser.flush() {
+            self.emit_chunk(is_thought, text);
+        }
         self.done_called = true;
         self.inner.on_done(reason.into());
     }
@@ -1979,12 +2175,9 @@ impl Session {
         Ok(GenerateOpts::from(guard.default_generate_opts()))
     }
 
-    /// Run autoregressive decode and return all emitted tokens +
-    /// a summary. Synchronous — the call blocks until the decode
-    /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
-    ///
-    /// For streaming (per-chunk delivery) and async, see the PR 4 /
-    /// PR 5 follow-ups in `cera-ffi/README.md`.
+    /// Run autoregressive decode and return all emitted text, tokens, and
+    /// summary. Synchronous: the call blocks until the decode loop exits
+    /// (`max_tokens`, EOS, `cancel()`, or error).
     pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError> {
         // Collector sink: captures every token the decode loop emits.
         // `on_done` is invoked once at the end regardless of exit
@@ -2001,24 +2194,27 @@ impl Session {
         // Compile the grammar (if any) before taking the session lock so a
         // malformed GBNF fails fast with `FfiError::GrammarParse`.
         let core: cera::GenerateOpts = opts.try_into()?;
-        let summary = self.lock_inner()?.generate(&core, &mut sink)?;
+        let mut guard = self.lock_inner()?;
+        let summary = guard.generate(&core, &mut sink)?;
+        let text = guard.tokenizer().decode(&sink.0);
         Ok(GenerateOutput {
+            text,
             tokens: sink.0,
             summary: summary.into(),
         })
     }
 
-    /// Run autoregressive decode, streaming every token (and audio
+    /// Run autoregressive decode, streaming every text chunk (and audio
     /// frame, for audio-capable models) to a foreign [`ModalitySink`]
-    /// as soon as it's produced. Returns only a [`GenerateSummary`] —
-    /// token IDs are delivered through `sink.on_text_tokens`, not a
+    /// as soon as it is produced. Returns only a [`GenerateSummary`]:
+    /// text chunks are delivered through `sink.on_text_chunk`, not a
     /// return value.
     ///
     /// Synchronous: the call blocks on the decode thread and each
     /// `sink` method runs on that same thread before decoding
-    /// continues. For async, see PR 5 in `cera-ffi/README.md`.
+    /// continues.
     ///
-    /// **Callback reentrancy — deadlock hazard.** The session mutex is
+    /// **Callback reentrancy: deadlock hazard.** The session mutex is
     /// held for the entire call, and sink callbacks run while that
     /// lock is held. Calling back into methods that also take the
     /// mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -2044,41 +2240,76 @@ impl Session {
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let mut adapter = ForeignSinkAdapter {
-            inner: sink,
-            done_called: false,
-        };
-        // Scope the lock so the synthesized on_done on the error path
-        // doesn't run with the session mutex held — foreign sinks
-        // already have to avoid session-reentrancy during success
-        // callbacks; reusing that contract on the error path keeps
-        // the hazard set minimal.
-        // Compile the grammar first; a malformed GBNF (`FfiError::GrammarParse`)
-        // routes through the same best-effort `on_done(Error)` path below as any
-        // other pre-decode failure.
         let outcome = match cera::GenerateOpts::try_from(opts) {
             Ok(core) => match self.lock_inner() {
-                Ok(mut guard) => guard.generate(&core, &mut adapter).map_err(FfiError::from),
-                Err(e) => Err(e),
+                Ok(mut guard) => {
+                    let mut adapter = ForeignSinkAdapter {
+                        inner: sink,
+                        tokenizer: guard.tokenizer_arc(),
+                        pending_bytes: Vec::new(),
+                        parser: StreamingThinkingParser::new(),
+                        done_called: false,
+                    };
+                    let result = guard.generate(&core, &mut adapter).map_err(FfiError::from);
+                    (result, adapter.done_called, adapter.inner)
+                }
+                Err(e) => (Err(e), false, sink),
             },
-            Err(e) => Err(e),
+            Err(e) => (Err(e), false, sink),
         };
         match outcome {
-            Ok(summary) => Ok(summary.into()),
-            Err(err) => {
-                if !adapter.done_called {
-                    // `FinishReason::Error` only carries a message string,
-                    // so flatten whichever typed FfiError variant via
-                    // Display. Foreign callers still receive the full
-                    // typed error from the return value; the sink's
-                    // on_done(Error) is a best-effort terminal signal.
-                    adapter.inner.on_done(FinishReason::Error {
-                        message: err.to_string(),
-                    });
+            (Ok(summary), _, _) => Ok(summary.into()),
+            (Err(err), done_called, inner) => {
+                if !done_called {
+                    let finish_reason = match &err {
+                        FfiError::Cancelled => FinishReason::Cancelled,
+                        _ => FinishReason::Error {
+                            message: err.to_string(),
+                        },
+                    };
+                    inner.on_done(finish_reason);
                 }
                 Err(err)
             }
         }
+    }
+
+    /// Append a multimodal message, automatically enforcing model-canonical
+    /// media ordering, boundary token envelopes, and sample rate normalization.
+    pub fn send_message(&self, message: UserMessage) -> Result<(), FfiError> {
+        let mut guard = self.lock_inner()?;
+        let core_msg: cera::tokenizer::UserMessage = message.into();
+        guard.append_user_message(&core_msg).map_err(FfiError::from)
+    }
+
+    /// Append a multimodal message and run generation synchronously.
+    pub fn send_message_and_generate(
+        &self,
+        message: UserMessage,
+        opts: GenerateOpts,
+    ) -> Result<GenerateOutput, FfiError> {
+        self.send_message(message)?;
+        self.generate(opts)
+    }
+
+    /// Append a multimodal message and run streaming generation.
+    pub fn send_message_streaming(
+        &self,
+        message: UserMessage,
+        opts: GenerateOpts,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        if let Err(err) = self.send_message(message) {
+            let finish_reason = match &err {
+                FfiError::Cancelled => FinishReason::Cancelled,
+                _ => FinishReason::Error {
+                    message: err.to_string(),
+                },
+            };
+            sink.on_done(finish_reason);
+            return Err(err);
+        }
+        self.generate_streaming(opts, sink)
     }
 
     /// Current KV position — how many tokens live in the cache.
@@ -3347,12 +3578,11 @@ mod tests {
     /// `ModalitySink` trait from Rust (what UniFFI codegens the foreign
     /// binding to look like on the Rust side) and driving it through
     /// the internal `cera::ModalitySink` impl. Confirms:
-    /// - `on_text_tokens` forwards with the exact bytes.
+    /// - `on_text_tokens` decodes to text and forwards as `on_text_chunk`.
     /// - `on_audio_frames` forwards with the exact bytes + rate.
     /// - `on_done` forwards and maps the FinishReason through `.into()`.
-    /// - All three run without the foreign side needing `&mut self` —
-    ///   interior mutability (Mutex/atomic) is the caller's burden,
-    ///   mirroring what Kotlin/Swift will see.
+    /// - Multi-byte UTF-8 character sequences split across token boundaries are
+    ///   buffered and emitted cleanly once completed.
     #[test]
     fn foreign_sink_adapter_forwards_every_method() {
         use cera::ModalitySink as CoreSink;
@@ -3360,14 +3590,18 @@ mod tests {
 
         #[derive(Default)]
         struct Recorder {
-            text: Mutex<Vec<u32>>,
+            thought: Mutex<Vec<String>>,
+            text: Mutex<Vec<String>>,
             audio: Mutex<Vec<(Vec<f32>, u32)>>,
             done: Mutex<Option<FinishReason>>,
         }
 
         impl ModalitySink for Recorder {
-            fn on_text_tokens(&self, tokens: Vec<u32>) {
-                self.text.lock().unwrap().extend(tokens);
+            fn on_thought_chunk(&self, text: String) {
+                self.thought.lock().unwrap().push(text);
+            }
+            fn on_text_chunk(&self, text: String) {
+                self.text.lock().unwrap().push(text);
             }
             fn on_audio_frames(&self, pcm: Vec<f32>, sample_rate: u32) {
                 self.audio.lock().unwrap().push((pcm, sample_rate));
@@ -3377,19 +3611,36 @@ mod tests {
             }
         }
 
+        let vocab = vec![
+            b"Hello".to_vec(), // 0
+            b" ".to_vec(),     // 1
+            b"world".to_vec(), // 2
+            vec![0xF0, 0x9F],  // 3 (first half of wave emoji: F0 9F 91 8B)
+            vec![0x91, 0x8B],  // 4 (second half of wave emoji)
+        ];
+        let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vocab));
+
         let recorder: Arc<Recorder> = Arc::new(Recorder::default());
         let mut adapter = ForeignSinkAdapter {
             inner: recorder.clone() as Arc<dyn ModalitySink>,
+            tokenizer,
+            pending_bytes: Vec::new(),
+            parser: StreamingThinkingParser::new(),
             done_called: false,
         };
 
         // Drive the adapter as cera's decode loop would.
-        adapter.on_text_tokens(&[1, 2, 3]);
-        adapter.on_text_tokens(&[4, 5]);
+        adapter.on_text_tokens(&[0, 1]);
+        adapter.on_text_tokens(&[2]);
+        // Split UTF-8 sequence across chunks:
+        adapter.on_text_tokens(&[3]); // incomplete UTF-8: should not emit yet
+        assert_eq!(&*recorder.text.lock().unwrap(), &["Hello ", "world"]);
+        adapter.on_text_tokens(&[4]); // completes wave emoji: should emit
+        assert_eq!(&*recorder.text.lock().unwrap(), &["Hello ", "world", "👋"]);
+
         adapter.on_audio_frames(&[0.1, 0.2, 0.3], 24_000);
         adapter.on_done(cera::FinishReason::MaxTokens);
 
-        assert_eq!(&*recorder.text.lock().unwrap(), &[1, 2, 3, 4, 5]);
         let audio = recorder.audio.lock().unwrap();
         assert_eq!(audio.len(), 1);
         assert_eq!(audio[0].0, vec![0.1, 0.2, 0.3]);
@@ -3404,9 +3655,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streaming_thinking_parser_splits_delimiters_across_chunks() {
+        let mut parser = StreamingThinkingParser::new();
+
+        // Chunk 1: regular text starting with partial open tag "<th"
+        let out1 = parser.feed("Intro text. <th");
+        assert_eq!(out1, vec![(false, "Intro text. ".to_string())]);
+
+        // Chunk 2: completes "<think>" and begins thought
+        let out2 = parser.feed("ink>Reasoning step 1. ");
+        assert_eq!(out2, vec![(true, "Reasoning step 1. ".to_string())]);
+
+        // Chunk 3: thought text with partial close tag "</th"
+        let out3 = parser.feed("Reasoning step 2. </th");
+        assert_eq!(out3, vec![(true, "Reasoning step 2. ".to_string())]);
+
+        // Chunk 4: completes "</think>" and gives final answer
+        let out4 = parser.feed("ink>Final answer.");
+        assert_eq!(out4, vec![(false, "Final answer.".to_string())]);
+
+        let flushed = parser.flush();
+        assert!(flushed.is_none());
+    }
+
+    #[test]
+    fn generate_summary_computes_throughput_stats() {
+        let core = cera::GenerateSummary {
+            tokens_generated: 100,
+            prompt_eval_tokens: 50,
+            prompt_eval_ms: 250,
+            decode_ms: 1000,
+            finish_reason: cera::FinishReason::Stop,
+        };
+        let ffi: GenerateSummary = core.into();
+        assert_eq!(ffi.tokens_generated, 100);
+        assert_eq!(ffi.prompt_eval_tokens, 50);
+        assert_eq!(ffi.prompt_eval_ms, 250);
+        assert_eq!(ffi.decode_ms, 1000);
+        assert_eq!(ffi.total_duration_ms, 1250);
+        assert!((ffi.decode_tok_per_sec - 100.0).abs() < 1e-4);
+        assert!((ffi.prompt_eval_tok_per_sec - 200.0).abs() < 1e-4);
+        assert!(matches!(ffi.finish_reason, FinishReason::Stop));
+    }
+
+    #[test]
+    fn user_message_and_audio_input_defaults() {
+        let msg = UserMessage {
+            text: Some("Describe this part".to_string()),
+            images: vec![vec![1, 2, 3]],
+            audio: Some(AudioInput {
+                pcm: vec![0.1, 0.2],
+                sample_rate: 16000,
+            }),
+        };
+        assert_eq!(msg.text.as_deref(), Some("Describe this part"));
+        assert_eq!(msg.images.len(), 1);
+        let core: cera::tokenizer::UserMessage = msg.clone().into();
+        assert_eq!(core.text.as_deref(), Some("Describe this part"));
+        assert_eq!(core.images.len(), 1);
+        let audio = msg.audio.unwrap();
+        assert_eq!(audio.sample_rate, 16000);
+        assert_eq!(audio.pcm.len(), 2);
+        let core_audio: cera::tokenizer::AudioInput = audio.into();
+        assert_eq!(core_audio.sample_rate, 16000);
+        assert_eq!(core_audio.pcm.len(), 2);
+    }
+
     /// Before `adapter.on_done` has been forwarded, `done_called`
     /// stays `false`. Protects the error-synthesis branch in
-    /// `Session::generate_streaming` — we can only safely synthesize
+    /// `Session::generate_streaming`: we can only safely synthesize
     /// a terminal `on_done(Error)` on failure when the inner
     /// `cera::Session::generate` hasn't already fired its own `on_done`.
     #[test]
@@ -3418,16 +3736,21 @@ mod tests {
             calls: Mutex<usize>,
         }
         impl ModalitySink for Recorder {
-            fn on_text_tokens(&self, _: Vec<u32>) {}
+            fn on_thought_chunk(&self, _: String) {}
+            fn on_text_chunk(&self, _: String) {}
             fn on_audio_frames(&self, _: Vec<f32>, _: u32) {}
             fn on_done(&self, _: FinishReason) {
                 *self.calls.lock().unwrap() += 1;
             }
         }
 
+        let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vec![]));
         let recorder: Arc<Recorder> = Arc::new(Recorder::default());
         let adapter = ForeignSinkAdapter {
             inner: recorder.clone() as Arc<dyn ModalitySink>,
+            tokenizer,
+            pending_bytes: Vec::new(),
+            parser: StreamingThinkingParser::new(),
             done_called: false,
         };
 
@@ -3443,8 +3766,12 @@ mod tests {
 
         // And the double-fire guard: if done_called were already true,
         // the wrapper must skip synthesis.
+        let tokenizer2 = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vec![]));
         let adapter_already_done = ForeignSinkAdapter {
             inner: recorder.clone() as Arc<dyn ModalitySink>,
+            tokenizer: tokenizer2,
+            pending_bytes: Vec::new(),
+            parser: StreamingThinkingParser::new(),
             done_called: true,
         };
         if !adapter_already_done.done_called {
@@ -3455,7 +3782,7 @@ mod tests {
         assert_eq!(
             *recorder.calls.lock().unwrap(),
             1,
-            "still one — no double-fire"
+            "still one: no double-fire"
         );
     }
 

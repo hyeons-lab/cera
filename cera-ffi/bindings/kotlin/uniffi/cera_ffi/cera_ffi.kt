@@ -740,13 +740,22 @@ internal interface UniffiCallbackInterfaceDownloadProgressSinkMethod0 : com.sun.
 internal interface UniffiCallbackInterfaceModalitySinkMethod0 : com.sun.jna.Callback {
     fun callback(
         `uniffiHandle`: Long,
-        `tokens`: RustBuffer.ByValue,
+        `text`: RustBuffer.ByValue,
         `uniffiOutReturn`: Pointer,
         uniffiCallStatus: UniffiRustCallStatus,
     )
 }
 
 internal interface UniffiCallbackInterfaceModalitySinkMethod1 : com.sun.jna.Callback {
+    fun callback(
+        `uniffiHandle`: Long,
+        `text`: RustBuffer.ByValue,
+        `uniffiOutReturn`: Pointer,
+        uniffiCallStatus: UniffiRustCallStatus,
+    )
+}
+
+internal interface UniffiCallbackInterfaceModalitySinkMethod2 : com.sun.jna.Callback {
     fun callback(
         `uniffiHandle`: Long,
         `pcm`: RustBuffer.ByValue,
@@ -756,7 +765,7 @@ internal interface UniffiCallbackInterfaceModalitySinkMethod1 : com.sun.jna.Call
     )
 }
 
-internal interface UniffiCallbackInterfaceModalitySinkMethod2 : com.sun.jna.Callback {
+internal interface UniffiCallbackInterfaceModalitySinkMethod3 : com.sun.jna.Callback {
     fun callback(
         `uniffiHandle`: Long,
         `reason`: RustBuffer.ByValue,
@@ -785,27 +794,30 @@ internal open class UniffiVTableCallbackInterfaceDownloadProgressSink(
     }
 }
 
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onTextTokens", "onAudioFrames", "onDone")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onThoughtChunk", "onTextChunk", "onAudioFrames", "onDone")
 internal open class UniffiVTableCallbackInterfaceModalitySink(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
-    @JvmField internal var `onTextTokens`: UniffiCallbackInterfaceModalitySinkMethod0? = null,
-    @JvmField internal var `onAudioFrames`: UniffiCallbackInterfaceModalitySinkMethod1? = null,
-    @JvmField internal var `onDone`: UniffiCallbackInterfaceModalitySinkMethod2? = null,
+    @JvmField internal var `onThoughtChunk`: UniffiCallbackInterfaceModalitySinkMethod0? = null,
+    @JvmField internal var `onTextChunk`: UniffiCallbackInterfaceModalitySinkMethod1? = null,
+    @JvmField internal var `onAudioFrames`: UniffiCallbackInterfaceModalitySinkMethod2? = null,
+    @JvmField internal var `onDone`: UniffiCallbackInterfaceModalitySinkMethod3? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
         `uniffiClone`: UniffiCallbackInterfaceClone? = null,
-        `onTextTokens`: UniffiCallbackInterfaceModalitySinkMethod0? = null,
-        `onAudioFrames`: UniffiCallbackInterfaceModalitySinkMethod1? = null,
-        `onDone`: UniffiCallbackInterfaceModalitySinkMethod2? = null,
-    ) : UniffiVTableCallbackInterfaceModalitySink(`uniffiFree`, `uniffiClone`, `onTextTokens`, `onAudioFrames`, `onDone`),
+        `onThoughtChunk`: UniffiCallbackInterfaceModalitySinkMethod0? = null,
+        `onTextChunk`: UniffiCallbackInterfaceModalitySinkMethod1? = null,
+        `onAudioFrames`: UniffiCallbackInterfaceModalitySinkMethod2? = null,
+        `onDone`: UniffiCallbackInterfaceModalitySinkMethod3? = null,
+    ) : UniffiVTableCallbackInterfaceModalitySink(`uniffiFree`, `uniffiClone`, `onThoughtChunk`, `onTextChunk`, `onAudioFrames`, `onDone`),
         Structure.ByValue
 
     internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceModalitySink) {
         `uniffiFree` = other.`uniffiFree`
         `uniffiClone` = other.`uniffiClone`
-        `onTextTokens` = other.`onTextTokens`
+        `onThoughtChunk` = other.`onThoughtChunk`
+        `onTextChunk` = other.`onTextChunk`
         `onAudioFrames` = other.`onAudioFrames`
         `onDone` = other.`onDone`
     }
@@ -914,7 +926,9 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_loraadapters_target_count(): Int
 
-    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(): Int
+    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk(): Int
 
     external fun uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames(): Int
 
@@ -961,6 +975,12 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_remove_lora(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_send_message(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_send_message_and_generate(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_send_message_streaming(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
 
@@ -1358,9 +1378,15 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_init_callback_vtable_modalitysink(`vtable`: UniffiVTableCallbackInterfaceModalitySink): Unit
 
-    external fun uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens(
+    external fun uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk(
         `ptr`: Long,
-        `tokens`: RustBuffer.ByValue,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1505,6 +1531,27 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_send_message(
+        `ptr`: Long,
+        `message`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_send_message_and_generate(
+        `ptr`: Long,
+        `message`: RustBuffer.ByValue,
+        `opts`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_send_message_streaming(
+        `ptr`: Long,
+        `message`: RustBuffer.ByValue,
+        `opts`: RustBuffer.ByValue,
+        `sink`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
         `ptr`: Long,
@@ -1873,13 +1920,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 54889) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 2908) {
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 44552) {
@@ -1909,13 +1959,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 57005) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 58489) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
@@ -1943,6 +1993,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 1595) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 40181) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
@@ -2301,6 +2360,26 @@ public object FfiConverterFloat : FfiConverter<Float, Float> {
         buf: ByteBuffer,
     ) {
         buf.putFloat(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterDouble : FfiConverter<Double, Double> {
+    override fun lift(value: Double): Double = value
+
+    override fun read(buf: ByteBuffer): Double = buf.getDouble()
+
+    override fun lower(value: Double): Double = value
+
+    override fun allocationSize(value: Double) = 8UL
+
+    override fun write(
+        value: Double,
+        buf: ByteBuffer,
+    ) {
+        buf.putDouble(value)
     }
 }
 
@@ -5359,24 +5438,30 @@ public object FfiConverterTypeLoraAdapters : FfiConverter<LoraAdapters, Long> {
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
- * receive tokens + audio frames + the finish reason as they happen.
+ * receive text chunks + thought chunks + audio frames + the finish reason
+ * as they happen.
  *
- * All methods are required from foreign implementations (UniFFI 0.28
+ * All methods are required from foreign implementations (UniFFI 0.31
  * foreign traits don't carry Rust's default-impl fallbacks). Callers
  * that don't care about a modality can provide an empty body.
  *
  * Threading: every method is invoked on the same Rust thread running
- * `generate` — the decode thread. If the foreign runtime requires
+ * `generate` (the decode thread). If the foreign runtime requires
  * marshalling onto a different thread (e.g. Swift's `@MainActor`) it
  * is the implementer's responsibility to dispatch the call there.
  */
 public interface ModalitySink {
     /**
-     * Called with each chunk of generated token IDs. Ownership of the
-     * `Vec<u32>` is transferred to the callback, so implementations
-     * may retain or store it directly if needed — no clone required.
+     * Called with each chunk of reasoning or chain-of-thought text
+     * extracted from thinking delimiters (<think>...</think>).
      */
-    fun `onTextTokens`(`tokens`: List<kotlin.UInt>)
+    fun `onThoughtChunk`(`text`: kotlin.String)
+
+    /**
+     * Called with each chunk of generated user-facing text
+     * as soon as valid characters are produced.
+     */
+    fun `onTextChunk`(`text`: kotlin.String)
 
     /**
      * Called with each chunk of generated PCM audio samples. Not
@@ -5407,14 +5492,15 @@ public interface ModalitySink {
  * Streaming sink for decode output. Foreign callers implement this
  * trait (Kotlin class, Swift class, Python subclass) and pass an
  * `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
- * receive tokens + audio frames + the finish reason as they happen.
+ * receive text chunks + thought chunks + audio frames + the finish reason
+ * as they happen.
  *
- * All methods are required from foreign implementations (UniFFI 0.28
+ * All methods are required from foreign implementations (UniFFI 0.31
  * foreign traits don't carry Rust's default-impl fallbacks). Callers
  * that don't care about a modality can provide an empty body.
  *
  * Threading: every method is invoked on the same Rust thread running
- * `generate` — the decode thread. If the foreign runtime requires
+ * `generate` (the decode thread). If the foreign runtime requires
  * marshalling onto a different thread (e.g. Swift's `@MainActor`) it
  * is the implementer's responsibility to dispatch the call there.
  */
@@ -5518,16 +5604,30 @@ open class ModalitySinkImpl :
     }
 
     /**
-     * Called with each chunk of generated token IDs. Ownership of the
-     * `Vec<u32>` is transferred to the callback, so implementations
-     * may retain or store it directly if needed — no clone required.
+     * Called with each chunk of reasoning or chain-of-thought text
+     * extracted from thinking delimiters (<think>...</think>).
      */
-    override fun `onTextTokens`(`tokens`: List<kotlin.UInt>) =
+    override fun `onThoughtChunk`(`text`: kotlin.String) =
         callWithHandle {
             uniffiRustCall { _status ->
-                UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens(
+                UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk(
                     it,
-                    FfiConverterSequenceUInt.lower(`tokens`),
+                    FfiConverterString.lower(`text`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Called with each chunk of generated user-facing text
+     * as soon as valid characters are produced.
+     */
+    override fun `onTextChunk`(`text`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk(
+                    it,
+                    FfiConverterString.lower(`text`),
                     _status,
                 )
             }
@@ -5581,16 +5681,16 @@ open class ModalitySinkImpl :
 
 // Put the implementation in an object so we don't pollute the top-level namespace
 internal object uniffiCallbackInterfaceModalitySink {
-    internal object `onTextTokens` : UniffiCallbackInterfaceModalitySinkMethod0 {
+    internal object `onThoughtChunk` : UniffiCallbackInterfaceModalitySinkMethod0 {
         override fun callback(
             `uniffiHandle`: Long,
-            `tokens`: RustBuffer.ByValue,
+            `text`: RustBuffer.ByValue,
             `uniffiOutReturn`: Pointer,
             uniffiCallStatus: UniffiRustCallStatus,
         ) {
             val uniffiObj = FfiConverterTypeModalitySink.handleMap.get(uniffiHandle)
-            val makeCall = {  uniffiObj.`onTextTokens`(
-                FfiConverterSequenceUInt.lift(`tokens`),
+            val makeCall = {  uniffiObj.`onThoughtChunk`(
+                FfiConverterString.lift(`text`),
             )
             }
             val writeReturn = { _: Unit -> Unit }
@@ -5598,7 +5698,24 @@ internal object uniffiCallbackInterfaceModalitySink {
         }
     }
 
-    internal object `onAudioFrames` : UniffiCallbackInterfaceModalitySinkMethod1 {
+    internal object `onTextChunk` : UniffiCallbackInterfaceModalitySinkMethod1 {
+        override fun callback(
+            `uniffiHandle`: Long,
+            `text`: RustBuffer.ByValue,
+            `uniffiOutReturn`: Pointer,
+            uniffiCallStatus: UniffiRustCallStatus,
+        ) {
+            val uniffiObj = FfiConverterTypeModalitySink.handleMap.get(uniffiHandle)
+            val makeCall = {  uniffiObj.`onTextChunk`(
+                FfiConverterString.lift(`text`),
+            )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object `onAudioFrames` : UniffiCallbackInterfaceModalitySinkMethod2 {
         override fun callback(
             `uniffiHandle`: Long,
             `pcm`: RustBuffer.ByValue,
@@ -5617,7 +5734,7 @@ internal object uniffiCallbackInterfaceModalitySink {
         }
     }
 
-    internal object `onDone` : UniffiCallbackInterfaceModalitySinkMethod2 {
+    internal object `onDone` : UniffiCallbackInterfaceModalitySinkMethod3 {
         override fun callback(
             `uniffiHandle`: Long,
             `reason`: RustBuffer.ByValue,
@@ -5648,7 +5765,8 @@ internal object uniffiCallbackInterfaceModalitySink {
         UniffiVTableCallbackInterfaceModalitySink.UniffiByValue(
             uniffiFree,
             uniffiClone,
-            `onTextTokens`,
+            `onThoughtChunk`,
+            `onTextChunk`,
             `onAudioFrames`,
             `onDone`,
         )
@@ -5982,12 +6100,9 @@ public interface SessionInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
-     * Run autoregressive decode and return all emitted tokens +
-     * a summary. Synchronous — the call blocks until the decode
-     * loop exits (`max_tokens`, EOS, `cancel()`, or error).
-     *
-     * For streaming (per-chunk delivery) and async, see the PR 4 /
-     * PR 5 follow-ups in `cera-ffi/README.md`.
+     * Run autoregressive decode and return all emitted text, tokens, and
+     * summary. Synchronous: the call blocks until the decode loop exits
+     * (`max_tokens`, EOS, `cancel()`, or error).
      */
     fun `generate`(`opts`: GenerateOpts): GenerateOutput
 
@@ -6017,17 +6132,17 @@ public interface SessionInterface {
     suspend fun `generateAsync`(`opts`: GenerateOpts): GenerateOutput
 
     /**
-     * Run autoregressive decode, streaming every token (and audio
+     * Run autoregressive decode, streaming every text chunk (and audio
      * frame, for audio-capable models) to a foreign [`ModalitySink`]
-     * as soon as it's produced. Returns only a [`GenerateSummary`] —
-     * token IDs are delivered through `sink.on_text_tokens`, not a
+     * as soon as it is produced. Returns only a [`GenerateSummary`]:
+     * text chunks are delivered through `sink.on_text_chunk`, not a
      * return value.
      *
      * Synchronous: the call blocks on the decode thread and each
      * `sink` method runs on that same thread before decoding
-     * continues. For async, see PR 5 in `cera-ffi/README.md`.
+     * continues.
      *
-     * **Callback reentrancy — deadlock hazard.** The session mutex is
+     * **Callback reentrancy: deadlock hazard.** The session mutex is
      * held for the entire call, and sink callbacks run while that
      * lock is held. Calling back into methods that also take the
      * mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -6154,6 +6269,29 @@ public interface SessionInterface {
      * instead of panicking across the FFI boundary.
      */
     fun `reset`()
+
+    /**
+     * Append a multimodal message, automatically enforcing model-canonical
+     * media ordering, boundary token envelopes, and sample rate normalization.
+     */
+    fun `sendMessage`(`message`: UserMessage)
+
+    /**
+     * Append a multimodal message and run generation synchronously.
+     */
+    fun `sendMessageAndGenerate`(
+        `message`: UserMessage,
+        `opts`: GenerateOpts,
+    ): GenerateOutput
+
+    /**
+     * Append a multimodal message and run streaming generation.
+     */
+    fun `sendMessageStreaming`(
+        `message`: UserMessage,
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
 
     /**
      * Set a session-default cap on the longest side of an appended
@@ -6544,12 +6682,9 @@ open class Session :
         )
 
     /**
-     * Run autoregressive decode and return all emitted tokens +
-     * a summary. Synchronous — the call blocks until the decode
-     * loop exits (`max_tokens`, EOS, `cancel()`, or error).
-     *
-     * For streaming (per-chunk delivery) and async, see the PR 4 /
-     * PR 5 follow-ups in `cera-ffi/README.md`.
+     * Run autoregressive decode and return all emitted text, tokens, and
+     * summary. Synchronous: the call blocks until the decode loop exits
+     * (`max_tokens`, EOS, `cancel()`, or error).
      */
     @Throws(FfiException::class)
     override fun `generate`(`opts`: GenerateOpts): GenerateOutput =
@@ -6608,17 +6743,17 @@ open class Session :
         )
 
     /**
-     * Run autoregressive decode, streaming every token (and audio
+     * Run autoregressive decode, streaming every text chunk (and audio
      * frame, for audio-capable models) to a foreign [`ModalitySink`]
-     * as soon as it's produced. Returns only a [`GenerateSummary`] —
-     * token IDs are delivered through `sink.on_text_tokens`, not a
+     * as soon as it is produced. Returns only a [`GenerateSummary`]:
+     * text chunks are delivered through `sink.on_text_chunk`, not a
      * return value.
      *
      * Synchronous: the call blocks on the decode thread and each
      * `sink` method runs on that same thread before decoding
-     * continues. For async, see PR 5 in `cera-ffi/README.md`.
+     * continues.
      *
-     * **Callback reentrancy — deadlock hazard.** The session mutex is
+     * **Callback reentrancy: deadlock hazard.** The session mutex is
      * held for the entire call, and sink callbacks run while that
      * lock is held. Calling back into methods that also take the
      * mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -6863,6 +6998,66 @@ open class Session :
         }
 
     /**
+     * Append a multimodal message, automatically enforcing model-canonical
+     * media ordering, boundary token envelopes, and sample rate normalization.
+     */
+    @Throws(FfiException::class)
+    override fun `sendMessage`(`message`: UserMessage) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_send_message(
+                    it,
+                    FfiConverterTypeUserMessage.lower(`message`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Append a multimodal message and run generation synchronously.
+     */
+    @Throws(FfiException::class)
+    override fun `sendMessageAndGenerate`(
+        `message`: UserMessage,
+        `opts`: GenerateOpts,
+    ): GenerateOutput =
+        FfiConverterTypeGenerateOutput.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_and_generate(
+                        it,
+                        FfiConverterTypeUserMessage.lower(`message`),
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Append a multimodal message and run streaming generation.
+     */
+    @Throws(FfiException::class)
+    override fun `sendMessageStreaming`(
+        `message`: UserMessage,
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        FfiConverterTypeGenerateSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_streaming(
+                        it,
+                        FfiConverterTypeUserMessage.lower(`message`),
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterTypeModalitySink.lower(`sink`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Set a session-default cap on the longest side of an appended
      * image, in pixels (`None` = no cap). Unlike the per-call
      * `max_long_size` argument to [`Self::append_image`], this default
@@ -6907,6 +7102,41 @@ public object FfiConverterTypeSession : FfiConverter<Session, Long> {
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
+    }
+}
+
+/**
+ * PCM audio input buffer.
+ */
+data class AudioInput(
+    var `pcm`: List<kotlin.Float>,
+    var `sampleRate`: kotlin.UInt,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAudioInput : FfiConverterRustBuffer<AudioInput> {
+    override fun read(buf: ByteBuffer): AudioInput =
+        AudioInput(
+            FfiConverterSequenceFloat.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+
+    override fun allocationSize(value: AudioInput) =
+        (
+            FfiConverterSequenceFloat.allocationSize(value.`pcm`) +
+                FfiConverterUInt.allocationSize(value.`sampleRate`)
+        )
+
+    override fun write(
+        value: AudioInput,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterSequenceFloat.write(value.`pcm`, buf)
+        FfiConverterUInt.write(value.`sampleRate`, buf)
     }
 }
 
@@ -7237,16 +7467,15 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
 
 /**
  * Bundle of everything a synchronous `generate` call produces:
- * the generated token IDs plus the decode summary. The two are
- * returned together so callers don't have to manage a separate
- * callback channel; streaming (per-chunk delivery) lands in PR 4.
+ * the generated text string, token IDs, and decode summary.
  */
 data class GenerateOutput(
     /**
-     * Generated token IDs, in order, not including any prompt
-     * tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-     * Rust side, or with [`CeraEngine::decode_tokens`] from any
-     * foreign binding.
+     * Generated text (UTF-8 decoded).
+     */
+    var `text`: kotlin.String,
+    /**
+     * Generated token IDs, in order, not including any prompt tokens.
      */
     var `tokens`: List<kotlin.UInt>,
     var `summary`: GenerateSummary,
@@ -7260,13 +7489,15 @@ data class GenerateOutput(
 public object FfiConverterTypeGenerateOutput : FfiConverterRustBuffer<GenerateOutput> {
     override fun read(buf: ByteBuffer): GenerateOutput =
         GenerateOutput(
+            FfiConverterString.read(buf),
             FfiConverterSequenceUInt.read(buf),
             FfiConverterTypeGenerateSummary.read(buf),
         )
 
     override fun allocationSize(value: GenerateOutput) =
         (
-            FfiConverterSequenceUInt.allocationSize(value.`tokens`) +
+            FfiConverterString.allocationSize(value.`text`) +
+                FfiConverterSequenceUInt.allocationSize(value.`tokens`) +
                 FfiConverterTypeGenerateSummary.allocationSize(value.`summary`)
         )
 
@@ -7274,6 +7505,7 @@ public object FfiConverterTypeGenerateOutput : FfiConverterRustBuffer<GenerateOu
         value: GenerateOutput,
         buf: ByteBuffer,
     ) {
+        FfiConverterString.write(value.`text`, buf)
         FfiConverterSequenceUInt.write(value.`tokens`, buf)
         FfiConverterTypeGenerateSummary.write(value.`summary`, buf)
     }
@@ -7287,6 +7519,9 @@ data class GenerateSummary(
     var `promptEvalTokens`: kotlin.UInt,
     var `promptEvalMs`: kotlin.UInt,
     var `decodeMs`: kotlin.UInt,
+    var `totalDurationMs`: kotlin.UInt,
+    var `decodeTokPerSec`: kotlin.Double,
+    var `promptEvalTokPerSec`: kotlin.Double,
     var `finishReason`: FinishReason,
 ) {
     companion object
@@ -7302,6 +7537,9 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterDouble.read(buf),
+            FfiConverterDouble.read(buf),
             FfiConverterTypeFinishReason.read(buf),
         )
 
@@ -7311,6 +7549,9 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
                 FfiConverterUInt.allocationSize(value.`promptEvalTokens`) +
                 FfiConverterUInt.allocationSize(value.`promptEvalMs`) +
                 FfiConverterUInt.allocationSize(value.`decodeMs`) +
+                FfiConverterUInt.allocationSize(value.`totalDurationMs`) +
+                FfiConverterDouble.allocationSize(value.`decodeTokPerSec`) +
+                FfiConverterDouble.allocationSize(value.`promptEvalTokPerSec`) +
                 FfiConverterTypeFinishReason.allocationSize(value.`finishReason`)
         )
 
@@ -7322,6 +7563,9 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
         FfiConverterUInt.write(value.`promptEvalTokens`, buf)
         FfiConverterUInt.write(value.`promptEvalMs`, buf)
         FfiConverterUInt.write(value.`decodeMs`, buf)
+        FfiConverterUInt.write(value.`totalDurationMs`, buf)
+        FfiConverterDouble.write(value.`decodeTokPerSec`, buf)
+        FfiConverterDouble.write(value.`promptEvalTokPerSec`, buf)
         FfiConverterTypeFinishReason.write(value.`finishReason`, buf)
     }
 }
@@ -7638,6 +7882,45 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterOptionalString.write(value.`description`, buf)
         FfiConverterString.write(value.`parametersJson`, buf)
+    }
+}
+
+/**
+ * User-facing multimodal input envelope.
+ */
+data class UserMessage(
+    var `text`: kotlin.String?,
+    var `images`: List<kotlin.ByteArray>,
+    var `audio`: AudioInput?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeUserMessage : FfiConverterRustBuffer<UserMessage> {
+    override fun read(buf: ByteBuffer): UserMessage =
+        UserMessage(
+            FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceByteArray.read(buf),
+            FfiConverterOptionalTypeAudioInput.read(buf),
+        )
+
+    override fun allocationSize(value: UserMessage) =
+        (
+            FfiConverterOptionalString.allocationSize(value.`text`) +
+                FfiConverterSequenceByteArray.allocationSize(value.`images`) +
+                FfiConverterOptionalTypeAudioInput.allocationSize(value.`audio`)
+        )
+
+    override fun write(
+        value: UserMessage,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterOptionalString.write(value.`text`, buf)
+        FfiConverterSequenceByteArray.write(value.`images`, buf)
+        FfiConverterOptionalTypeAudioInput.write(value.`audio`, buf)
     }
 }
 
@@ -8841,6 +9124,38 @@ public object FfiConverterOptionalTypeBundleRepo : FfiConverterRustBuffer<Bundle
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeAudioInput : FfiConverterRustBuffer<AudioInput?> {
+    override fun read(buf: ByteBuffer): AudioInput? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeAudioInput.read(buf)
+    }
+
+    override fun allocationSize(value: AudioInput?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeAudioInput.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: AudioInput?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeAudioInput.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiVadConfig : FfiConverterRustBuffer<FfiVadConfig?> {
     override fun read(buf: ByteBuffer): FfiVadConfig? {
         if (buf.get().toInt() == 0) {
@@ -9046,6 +9361,34 @@ public object FfiConverterSequenceString : FfiConverterRustBuffer<List<kotlin.St
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceByteArray : FfiConverterRustBuffer<List<kotlin.ByteArray>> {
+    override fun read(buf: ByteBuffer): List<kotlin.ByteArray> {
+        val len = buf.getInt()
+        return List<kotlin.ByteArray>(len) {
+            FfiConverterByteArray.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.ByteArray>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterByteArray.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<kotlin.ByteArray>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterByteArray.write(it, buf)
         }
     }
 }

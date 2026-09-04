@@ -700,8 +700,8 @@ messages without going through `Session::append_text`. Useful for:
 - Manual prompt construction with explicit special tokens.
 - Decoding token IDs streamed back from `generate` when driving an
   incremental UI (`generateStreaming` already returns text chunks
-  via `ModalitySink::on_text_tokens`, but consumers building a
-  per-token UI can decode IDs directly).
+  via `ModalitySink::on_text_chunk`, but consumers building a
+  custom token-level UI can encode/decode IDs directly).
 - Rendering a chat template against a list of `ChatMessage`s to
   produce the prompt string for `Session::append_text`.
 
@@ -868,9 +868,11 @@ run against the same engine concurrently (each holds its own
 | `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Fallible: `OutOfMemory` when the KV cache can't be allocated. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
-| `session.appendAudio(samples, sampleRate)` | `(Vec<f32>, u32) -> Result<(), FfiError>` | Encode PCM audio (mono `f32`, ~`[-1.0, 1.0]`, `sampleRate` must be 16000) through the bundle's audio mmproj (`AudioEncoderWeights`) and prefill it as soft tokens, for LFM2-Audio bundles. `CeraEngine.newSession` auto-attaches the audio encoder. `EmptyInput` on empty / too-short audio, `UnsupportedModality` on a non-audio model, `Backend` on sample-rate or encoder/LLM mismatch. |
-| `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full token list + summary in one shot. |
-| `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text tokens or audio frames per the model's modality). Returns the summary only; token IDs flow through the sink. |
+| `session.sendMessage(message)` | `(UserMessage) -> Result<(), FfiError>` | Append a multimodal envelope (`UserMessage` with optional `text`, `images`, `audio`) enforcing model-canonical ordering (vision-first for VL, audio-first for audio) and automatic 16 kHz resampling. |
+| `session.sendMessageAndGenerate(message, opts)` | `(UserMessage, GenerateOpts) -> Result<GenerateOutput, FfiError>` | Convenience combining `sendMessage` and `generate` under session lock. |
+| `session.sendMessageStreaming(message, opts, sink)` | `(UserMessage, GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Convenience combining `sendMessage` and `generateStreaming` under session lock. |
+| `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full text + token list + summary in one shot. |
+| `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text chunks or audio frames per the model's modality). Returns the summary only; text chunks flow through the sink. |
 | `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Cancel by dropping the future. |
 | `session.generateStreamingAsync(opts, sink)` | `async (GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Async + streaming. Cancel by dropping the future (also fires `Session::cancel` via the internal `AbortOnDrop` guard). |
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
@@ -891,22 +893,25 @@ val session = engine.newSession(SessionConfig())
 session.appendText("Hello, what is the capital of France?")
 val out = session.generate(GenerateOpts())
 println("decoded ${out.tokens.size} tokens, finish=${out.summary.finishReason}")
-println(engine.decodeTokens(out.tokens))
+println(out.text)
 ```
 
 ### Streaming (Swift)
 
 ```swift
 class StreamSink: ModalitySink {
-    var collected: [UInt32] = []
-    func onTextTokens(tokens: [UInt32]) {
-        collected.append(contentsOf: tokens)
+    func onThoughtChunk(text: String) {
+        // Handle streaming internal reasoning / thinking tokens
+        DispatchQueue.main.async { self.updateThinkingUI(text) }
+    }
+    func onTextChunk(text: String) {
         // Marshal off-thread; the callback fires on the decode thread.
-        DispatchQueue.main.async { self.updateUI(self.collected) }
+        DispatchQueue.main.async { self.updateUI(text) }
     }
     func onAudioFrames(pcm: [Float], sampleRate: UInt32) { /* LFM2-Audio */ }
     func onDone(reason: FinishReason) { print("done: \(reason)") }
-    func updateUI(_ tokens: [UInt32]) { /* render */ }
+    func updateUI(_ text: String) { /* render */ }
+    func updateThinkingUI(_ text: String) { /* render thinking */ }
 }
 
 let sink = StreamSink()
