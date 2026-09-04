@@ -32,6 +32,19 @@ extension type _WorkerOptions._(JSObject _) implements JSObject {
   external factory _WorkerOptions({String type});
 }
 
+extension type _ImagePayload._(JSObject _) implements JSObject {
+  external factory _ImagePayload({
+    JSArrayBuffer bytes,
+  });
+}
+
+extension type _AudioPayload._(JSObject _) implements JSObject {
+  external factory _AudioPayload({
+    JSAny pcm,
+    int sampleRate,
+  });
+}
+
 /// A request to the worker. One literal type covers every op; the fields an op
 /// does not use are simply absent, which reaches JS as `undefined`.
 extension type _Request._(JSObject _) implements JSObject {
@@ -64,6 +77,8 @@ extension type _Request._(JSObject _) implements JSObject {
     bool? turboQuant,
     bool? wantsAudio,
     bool? wantsThought,
+    JSArray<_ImagePayload>? images,
+    _AudioPayload? audio,
   });
 }
 
@@ -775,6 +790,152 @@ class _WorkerCera implements Cera {
     } finally {
       mine.complete();
     }
+  }
+
+  @override
+  Future<void> appendUserMessage(CeraUserMessage message) async {
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      final transferred = <JSAny>[];
+      final jsImages = <_ImagePayload>[];
+      for (final img in message.images) {
+        final buf = _detach(img);
+        transferred.add(buf);
+        jsImages.add(_ImagePayload(bytes: buf));
+      }
+      _AudioPayload? jsAudio;
+      if (message.audio != null) {
+        final floatList = message.audio!.pcm is Float32List
+            ? message.audio!.pcm as Float32List
+            : Float32List.fromList(message.audio!.pcm);
+        final buf = _detachF32(floatList);
+        transferred.add(buf);
+        jsAudio = _AudioPayload(
+          pcm: Float32List.view(buf.toDart).toJS,
+          sampleRate: message.audio!.sampleRate,
+        );
+      }
+      await _send(
+        _newId(),
+        (id) => _Request(
+          id: id,
+          op: 'appendUserMessage',
+          text: message.text,
+          images: jsImages.isEmpty ? null : jsImages.toJS,
+          audio: jsAudio,
+        ),
+        transfer: transferred,
+      );
+    } finally {
+      mine.complete();
+    }
+  }
+
+  @override
+  Stream<String> sendMessage(
+    CeraUserMessage message, {
+    int maxTokens = 256,
+    double? temperature,
+    double? topP,
+    int? topK,
+    int? seed,
+    void Function(String thought)? onThought,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
+  }) {
+    final controller = StreamController<String>();
+    var finished = false;
+    var started = false;
+
+    controller.onListen = () async {
+      final ahead = _queue;
+      final mine = Completer<void>();
+      _queue = mine.future;
+      try {
+        await ahead;
+      } catch (_) {}
+      if (_closed || !controller.hasListener) {
+        mine.complete();
+        if (_closed && controller.hasListener) {
+          controller.addError(StateError('this Cera engine is closed'));
+        }
+        if (!controller.isClosed) await controller.close();
+        return;
+      }
+      started = true;
+      final id = _newId();
+      _streams[id] = controller;
+      if (onThought != null) {
+        _thoughtCallbacks[id] = onThought;
+      }
+      if (onAudio != null) {
+        _audioCallbacks[id] = onAudio;
+      }
+      void terminate(Object? error, StackTrace? stack) {
+        finished = true;
+        _streams.remove(id);
+        _audioCallbacks.remove(id);
+        _thoughtCallbacks.remove(id);
+        if (!mine.isCompleted) mine.complete();
+        if (controller.isClosed) return;
+        if (error != null) controller.addError(error, stack);
+        controller.close();
+      }
+
+      try {
+        final transferred = <JSAny>[];
+        final jsImages = <_ImagePayload>[];
+        for (final img in message.images) {
+          final buf = _detach(img);
+          transferred.add(buf);
+          jsImages.add(_ImagePayload(bytes: buf));
+        }
+        _AudioPayload? jsAudio;
+        if (message.audio != null) {
+          final floatList = message.audio!.pcm is Float32List
+              ? message.audio!.pcm as Float32List
+              : Float32List.fromList(message.audio!.pcm);
+          final buf = _detachF32(floatList);
+          transferred.add(buf);
+          jsAudio = _AudioPayload(
+            pcm: Float32List.view(buf.toDart).toJS,
+            sampleRate: message.audio!.sampleRate,
+          );
+        }
+
+        final request = _send(
+          id,
+          (id) => _Request(
+            id: id,
+            op: 'sendMessage',
+            text: message.text,
+            images: jsImages.isEmpty ? null : jsImages.toJS,
+            audio: jsAudio,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            seed: seed,
+            wantsAudio: onAudio != null,
+            wantsThought: onThought != null,
+          ),
+          transfer: transferred,
+        );
+        unawaited(
+          request.then((_) => terminate(null, null), onError: terminate),
+        );
+      } on Object catch (e, st) {
+        terminate(e, st);
+      }
+    };
+    controller.onCancel = () async {
+      if (started && !finished && !_closed) await cancel();
+    };
+    return controller.stream;
   }
 
   @override

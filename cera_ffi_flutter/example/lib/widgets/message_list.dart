@@ -141,6 +141,15 @@ class _TurnBubble extends StatelessWidget {
                     ),
                   ),
                 ],
+                if (!isUser && turn.thought != null && turn.thought!.isNotEmpty) ...[
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _ThoughtBubble(
+                      thought: turn.thought!,
+                      isGenerating: turn.isGenerating && turn.text.isEmpty,
+                    ),
+                  ),
+                ],
                 if (turn.text.isNotEmpty || turn.isGenerating)
                   Container(
                     padding: const EdgeInsets.symmetric(
@@ -416,3 +425,104 @@ class _TypingIndicatorState extends State<_TypingIndicator>
     );
   }
 }
+
+class _ThoughtBubble extends StatefulWidget {
+  const _ThoughtBubble({
+    required this.thought,
+    required this.isGenerating,
+  });
+
+  final String thought;
+  final bool isGenerating;
+
+  @override
+  State<_ThoughtBubble> createState() => _ThoughtBubbleState();
+}
+
+class _ThoughtBubbleState extends State<_ThoughtBubble> {
+  bool _expanded = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 560),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(12),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.psychology_outlined,
+                    size: 15,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Thinking Process',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.primary,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                  if (widget.isGenerating) ...[
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 6),
+                  Icon(
+                    _expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded) ...[
+            Divider(
+              height: 1,
+              thickness: 1,
+              color: theme.colorScheme.outlineVariant.withValues(alpha: 0.3),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: SelectableText(
+                widget.thought,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  height: 1.45,
+                  fontStyle: FontStyle.italic,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+

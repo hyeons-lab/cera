@@ -1512,6 +1512,129 @@ impl LoraAdapters {
     }
 }
 
+/// PCM audio input buffer.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct AudioInput {
+    pub(crate) inner: cera::tokenizer::AudioInput,
+}
+
+#[wasm_bindgen]
+impl AudioInput {
+    #[wasm_bindgen(constructor)]
+    pub fn new(pcm: &[f32], sample_rate: u32) -> AudioInput {
+        AudioInput {
+            inner: cera::tokenizer::AudioInput {
+                pcm: pcm.to_vec(),
+                sample_rate,
+            },
+        }
+    }
+
+    #[wasm_bindgen(getter, js_name = sampleRate)]
+    pub fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate
+    }
+}
+
+/// User-facing multimodal input envelope.
+#[wasm_bindgen]
+#[derive(Clone, Default)]
+pub struct UserMessage {
+    pub(crate) inner: cera::tokenizer::UserMessage,
+}
+
+#[wasm_bindgen]
+impl UserMessage {
+    #[wasm_bindgen(constructor)]
+    pub fn new(text: Option<String>) -> UserMessage {
+        UserMessage {
+            inner: cera::tokenizer::UserMessage {
+                text,
+                images: Vec::new(),
+                audio: None,
+            },
+        }
+    }
+
+    #[wasm_bindgen(js_name = fromText)]
+    pub fn from_text(text: &str) -> UserMessage {
+        UserMessage {
+            inner: cera::tokenizer::UserMessage {
+                text: Some(text.to_string()),
+                images: Vec::new(),
+                audio: None,
+            },
+        }
+    }
+
+    #[wasm_bindgen(js_name = addImage)]
+    pub fn add_image(&mut self, image_bytes: &[u8]) {
+        self.inner.images.push(image_bytes.to_vec());
+    }
+
+    #[wasm_bindgen(js_name = setAudio)]
+    pub fn set_audio(&mut self, audio: &AudioInput) {
+        self.inner.audio = Some(audio.inner.clone());
+    }
+
+    #[wasm_bindgen(js_name = setText)]
+    pub fn set_text(&mut self, text: Option<String>) {
+        self.inner.text = text;
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> Option<String> {
+        self.inner.text.clone()
+    }
+}
+
+/// Streaming parser for isolating thinking and reasoning blocks from user-facing text.
+#[wasm_bindgen]
+pub struct StreamingThinkingParser {
+    inner: cera::session::StreamingThinkingParser,
+}
+
+#[wasm_bindgen]
+impl StreamingThinkingParser {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: cera::session::StreamingThinkingParser::new(),
+        }
+    }
+
+    /// Feeds a chunk and returns an array of [isThought: boolean, text: string].
+    #[wasm_bindgen]
+    pub fn feed(&mut self, chunk: &str) -> js_sys::Array {
+        let emissions = self.inner.feed(chunk);
+        let arr = js_sys::Array::new();
+        for (is_thought, text) in emissions {
+            let pair = js_sys::Array::new();
+            pair.push(&wasm_bindgen::JsValue::from_bool(is_thought));
+            pair.push(&wasm_bindgen::JsValue::from_str(&text));
+            arr.push(&pair);
+        }
+        arr
+    }
+
+    /// Flushes any buffered content at end of stream.
+    #[wasm_bindgen]
+    pub fn flush(&mut self) -> Option<js_sys::Array> {
+        self.inner.flush().map(|(is_thought, text)| {
+            let pair = js_sys::Array::new();
+            pair.push(&wasm_bindgen::JsValue::from_bool(is_thought));
+            pair.push(&wasm_bindgen::JsValue::from_str(&text));
+            pair
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 /// Stateful generation handle. Built via `CeraEngine.newSession(config)`.
 ///
 /// JS callers seed the conversation by calling `appendText` /
@@ -1726,6 +1849,15 @@ impl Session {
         self.inner.set_image_max_long_size(max_long_size);
     }
 
+    /// Append a user multimodal message to the session's context,
+    /// automatically placing media in the model's canonical order.
+    #[wasm_bindgen(js_name = appendUserMessage)]
+    pub fn append_user_message(&mut self, message: &UserMessage) -> Result<(), JsError> {
+        self.inner
+            .append_user_message(&message.inner)
+            .map_err(map_cera_err)
+    }
+
     /// Current KV cache position (number of tokens currently held).
     #[wasm_bindgen(getter)]
     pub fn position(&self) -> u32 {
@@ -1854,6 +1986,19 @@ impl Session {
             .map(|inner| GenerateSummary { inner })
             .map_err(map_cera_err)
     }
+
+    /// Append a multimodal message and generate a response.
+    #[wasm_bindgen(js_name = sendMessage)]
+    pub fn send_message(
+        &mut self,
+        message: &UserMessage,
+        opts: &GenerateOpts,
+        on_text_tokens: &js_sys::Function,
+        on_audio_frames: Option<js_sys::Function>,
+    ) -> Result<GenerateSummary, JsError> {
+        self.append_user_message(message)?;
+        self.generate(opts, on_text_tokens, on_audio_frames)
+    }
 }
 
 /// Internal `ModalitySink` implementation that trampolines text
@@ -1899,7 +2044,7 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // See devlog 000169.
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err};
+    use super::{Capabilities, Tokenizer, UserMessage, capabilities_to_js, console_info, console_warn, map_err};
     use cera::model::Model;
     use cera::time::Instant;
     use std::sync::Arc;
@@ -1952,6 +2097,7 @@ mod webgpu {
         /// Generation defaults from the bundle manifest.
         generation_defaults: Option<cera::manifest::GenerationDefaults>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        pending_suffix: Vec<u32>,
     }
 
     #[wasm_bindgen]
@@ -2141,6 +2287,7 @@ mod webgpu {
                 model_label: "custom GGUF".to_string(),
                 generation_defaults: None,
                 cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_suffix: Vec::new(),
             })
         }
 
@@ -2283,6 +2430,7 @@ mod webgpu {
                     model_label: format!("{bundle_id} ({quant})"),
                     generation_defaults: Some(manifest.generation_defaults.clone()),
                     cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    pending_suffix: Vec::new(),
                 };
 
                 if let Some(rel) = manifest
@@ -2923,6 +3071,293 @@ mod webgpu {
             Ok(())
         }
 
+        /// Append a multimodal message, automatically enforcing model-canonical
+        /// media ordering, boundary token envelopes, and sample rate normalization.
+        #[wasm_bindgen(js_name = appendUserMessage)]
+        pub async fn append_user_message(
+            &mut self,
+            message: &UserMessage,
+        ) -> Result<(), JsError> {
+            self.pending_suffix.clear();
+            let text_content = message.inner.text.as_deref().filter(|s| !s.is_empty());
+            let has_text = text_content.is_some();
+            let has_images = !message.inner.images.is_empty();
+            let has_audio = message.inner.audio.is_some();
+
+            if !has_text && !has_images && !has_audio {
+                return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+            }
+
+            if has_images && !self.image_in() {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            }
+            if has_audio && !self.audio_in() {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            }
+            if has_images && has_audio {
+                return Err(crate::map_cera_err(cera::CeraError::UnsupportedModality));
+            }
+
+            if let Some(audio) = &message.inner.audio {
+                if audio.pcm.is_empty() {
+                    return Err(crate::map_cera_err(cera::CeraError::EmptyInput));
+                }
+                if !(1000..=192_000).contains(&audio.sample_rate) {
+                    return Err(crate::map_cera_err(cera::CeraError::Backend(format!(
+                        "unsupported audio sample rate: {} Hz",
+                        audio.sample_rate
+                    ))));
+                }
+                if self.audio_encoder.is_none() {
+                    return Err(crate::map_cera_err(cera::CeraError::Backend(
+                        "WebGpuSession::append_user_message: no audio encoder attached".to_string(),
+                    )));
+                }
+            }
+
+            let initial_pos = self.state.seq_len;
+
+            // 1. Audio input:
+            if let Some(audio) = &message.inner.audio {
+                if self.tokenizer.chat_template().is_some() {
+                    let (marker_id, marker_name) =
+                        cera::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
+                            .into_iter()
+                            .find_map(|name| {
+                                self.tokenizer.special_token_id(name).map(|id| (id, name))
+                            })
+                            .ok_or_else(|| {
+                                crate::map_cera_err(cera::CeraError::Backend(
+                                    "no audio marker special token (<|reserved_4|>..7) in tokenizer"
+                                        .to_string(),
+                                ))
+                            })?;
+
+                    let user_content = match text_content {
+                        Some(text) => format!("{marker_name}\n{text}"),
+                        None => marker_name.to_string(),
+                    };
+
+                    let rendered = cera::tokenizer::apply_chat_template(
+                        &self.tokenizer,
+                        &[cera::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: user_content,
+                        }],
+                        true,
+                    )
+                    .map_err(|e| {
+                        crate::map_cera_err(cera::CeraError::Backend(format!(
+                            "chat template render: {e:#}"
+                        )))
+                    })?;
+
+                    let mut toks = self.tokenizer.encode(&rendered);
+                    if self.state.seq_len == 0
+                        && self.tokenizer.add_bos_token()
+                        && let Some(bos) = self.tokenizer.bos_token()
+                        && toks.first() != Some(&bos)
+                    {
+                        toks.insert(0, bos);
+                    }
+
+                    let split = match cera::engine::CeraEngine::split_tokens_at_marker(
+                        &toks,
+                        marker_id,
+                        marker_name,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.state.seq_len = initial_pos;
+                            return Err(crate::map_cera_err(e));
+                        }
+                    };
+
+                    if split > 0 {
+                        if let Err(e) = self.append_tokens(toks[..split].to_vec()) {
+                            self.state.seq_len = initial_pos;
+                            return Err(e);
+                        }
+                    }
+                    if let Err(e) = self.append_audio(&audio.pcm, audio.sample_rate) {
+                        self.state.seq_len = initial_pos;
+                        return Err(e);
+                    }
+                    if split + 1 < toks.len() {
+                        self.pending_suffix.extend_from_slice(&toks[split + 1..]);
+                    }
+                    return Ok(());
+                } else {
+                    return self.append_audio(&audio.pcm, audio.sample_rate);
+                }
+            }
+
+            // 2. Vision input:
+            if has_images {
+                if self.tokenizer.chat_template().is_some() {
+                    let mut content = Vec::with_capacity(message.inner.images.len() + 1);
+                    for _ in &message.inner.images {
+                        content.push(cera::tokenizer::ContentItem::Image);
+                    }
+                    if let Some(text) = text_content {
+                        content.push(cera::tokenizer::ContentItem::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    let rendered = cera::tokenizer::apply_chat_template(
+                        &self.tokenizer,
+                        &[cera::tokenizer::ChatMessageMultimodal {
+                            role: "user".to_string(),
+                            content,
+                        }],
+                        true,
+                    )
+                    .map_err(|e| {
+                        crate::map_cera_err(cera::CeraError::Backend(format!(
+                            "chat template render: {e:#}"
+                        )))
+                    })?;
+
+                    let probed = self.tokenizer.encode("<image>");
+                    if probed.len() != 1 {
+                        return Err(crate::map_cera_err(cera::CeraError::Backend(format!(
+                            "tokenizer doesn't have `<image>` as a single token (got {} tokens)",
+                            probed.len()
+                        ))));
+                    }
+                    let image_marker_id = probed[0];
+
+                    let img_start = self
+                        .tokenizer
+                        .special_token_id("<|image_start|>")
+                        .or_else(|| self.tokenizer.special_token_id("<vision_start>"))
+                        .ok_or_else(|| {
+                            crate::map_cera_err(cera::CeraError::Backend(
+                                "tokenizer missing `<|image_start|>` special token".to_string(),
+                            ))
+                        })?;
+                    let img_end = self
+                        .tokenizer
+                        .special_token_id("<|image_end|>")
+                        .or_else(|| self.tokenizer.special_token_id("<vision_end>"))
+                        .ok_or_else(|| {
+                            crate::map_cera_err(cera::CeraError::Backend(
+                                "tokenizer missing `<|image_end|>` special token".to_string(),
+                            ))
+                        })?;
+
+                    let mut tokens = self.tokenizer.encode(&rendered);
+                    if self.state.seq_len == 0
+                        && self.tokenizer.add_bos_token()
+                        && let Some(bos) = self.tokenizer.bos_token()
+                        && tokens.first() != Some(&bos)
+                    {
+                        tokens.insert(0, bos);
+                    }
+
+                    let segments = cera::session::splice_image_markers(&tokens, image_marker_id);
+                    let marker_count = segments
+                        .iter()
+                        .filter(|s| matches!(s, cera::session::ChatTemplateSegment::Image))
+                        .count();
+                    if marker_count != message.inner.images.len() {
+                        return Err(crate::map_cera_err(cera::CeraError::Backend(format!(
+                            "rendered chat template has {marker_count} `<image>` markers but caller supplied {} images",
+                            message.inner.images.len()
+                        ))));
+                    }
+
+                    let mut img_idx = 0;
+                    for (seg_idx, seg) in segments.iter().enumerate() {
+                        match *seg {
+                            cera::session::ChatTemplateSegment::Text { start, end } => {
+                                if seg_idx + 1 == segments.len() {
+                                    self.pending_suffix.extend_from_slice(&tokens[start..end]);
+                                } else if let Err(e) = self.append_tokens(tokens[start..end].to_vec()) {
+                                    self.state.seq_len = initial_pos;
+                                    self.pending_suffix.clear();
+                                    return Err(e);
+                                }
+                            }
+                            cera::session::ChatTemplateSegment::Image => {
+                                if let Err(e) = self.append_tokens(vec![img_start]) {
+                                    self.state.seq_len = initial_pos;
+                                    self.pending_suffix.clear();
+                                    return Err(e);
+                                }
+                                if let Err(e) =
+                                    self.append_image(&message.inner.images[img_idx], None).await
+                                {
+                                    self.state.seq_len = initial_pos;
+                                    self.pending_suffix.clear();
+                                    return Err(e);
+                                }
+                                if let Err(e) = self.append_tokens(vec![img_end]) {
+                                    self.state.seq_len = initial_pos;
+                                    self.pending_suffix.clear();
+                                    return Err(e);
+                                }
+                                img_idx += 1;
+                            }
+                        }
+                    }
+                    return Ok(());
+                } else {
+                    for img in &message.inner.images {
+                        if let Err(e) = self.append_image(img, None).await {
+                            self.state.seq_len = initial_pos;
+                            self.pending_suffix.clear();
+                            return Err(e);
+                        }
+                    }
+                    if let Some(text) = text_content {
+                        let mut tokens = self.tokenizer.encode(text);
+                        if self.state.seq_len == 0
+                            && self.tokenizer.add_bos_token()
+                            && let Some(bos) = self.tokenizer.bos_token()
+                            && tokens.first() != Some(&bos)
+                        {
+                            tokens.insert(0, bos);
+                        }
+                        self.pending_suffix.extend(tokens);
+                    }
+                    return Ok(());
+                }
+            }
+
+            // 3. Text-only input:
+            if let Some(text) = text_content {
+                let formatted = if self.tokenizer.chat_template().is_some() {
+                    cera::tokenizer::apply_chat_template(
+                        &self.tokenizer,
+                        &[cera::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: text.to_string(),
+                        }],
+                        true,
+                    )
+                    .map_err(|e| {
+                        crate::map_cera_err(cera::CeraError::Backend(format!(
+                            "chat template render: {e:#}"
+                        )))
+                    })?
+                } else {
+                    text.to_string()
+                };
+                let mut tokens = self.tokenizer.encode(&formatted);
+                if self.state.seq_len == 0
+                    && self.tokenizer.add_bos_token()
+                    && let Some(bos) = self.tokenizer.bos_token()
+                    && tokens.first() != Some(&bos)
+                {
+                    tokens.insert(0, bos);
+                }
+                self.pending_suffix.extend(tokens);
+            }
+
+            Ok(())
+        }
+
         /// The KV-cache mode this session actually resolved to:
         /// `"turboquant(seed=N)"` or `"uncompressed"`.
         ///
@@ -2971,16 +3406,13 @@ mod webgpu {
             top_k: Option<u32>,
             seed: Option<u64>,
             on_token: &js_sys::Function,
+            on_audio: Option<js_sys::Function>,
+            on_thought: Option<js_sys::Function>,
         ) -> Result<String, JsError> {
             let mut ids = self.tokenizer.encode(prompt);
             // Prepend BOS only at the start of a session, and only when the GGUF
-            // declares `add_bos_token` — a model with a BOS id but
-            // `add_bos_token = false` must not get a spurious leading BOS (which
-            // would desync this path from cera's CLI/session paths and
-            // llama.cpp). The on-GPU KV cache persists across `generate` calls,
-            // so prepending on a continuation would inject a BOS at a nonzero
-            // position mid-sequence. Also skip if the encoder already emitted it
-            // (chat template / special token).
+            // declares `add_bos_token`, provided the tokenizer has a BOS id and
+            // it has not already been emitted.
             if self.state.seq_len == 0
                 && self.tokenizer.add_bos_token()
                 && let Some(bos) = self.tokenizer.bos_token()
@@ -2996,7 +3428,8 @@ mod webgpu {
                 top_k,
                 seed,
                 on_token,
-                None,
+                on_audio.as_ref(),
+                on_thought.as_ref(),
             )
             .await
         }
@@ -3071,6 +3504,7 @@ mod webgpu {
             seed: Option<u64>,
             on_token: &js_sys::Function,
             on_audio: Option<js_sys::Function>,
+            on_thought: Option<js_sys::Function>,
         ) -> Result<String, JsError> {
             self.generate_ids(
                 tokens,
@@ -3081,6 +3515,38 @@ mod webgpu {
                 seed,
                 on_token,
                 on_audio.as_ref(),
+                on_thought.as_ref(),
+            )
+            .await
+        }
+
+        /// Append a multimodal message and generate a response, streaming tokens
+        /// and thoughts to their respective callbacks.
+        #[allow(clippy::too_many_arguments)]
+        #[wasm_bindgen(js_name = sendMessage)]
+        pub async fn send_message(
+            &mut self,
+            message: &UserMessage,
+            max_tokens: u32,
+            temperature: Option<f32>,
+            top_p: Option<f32>,
+            top_k: Option<u32>,
+            seed: Option<u64>,
+            on_token: &js_sys::Function,
+            on_audio: Option<js_sys::Function>,
+            on_thought: Option<js_sys::Function>,
+        ) -> Result<String, JsError> {
+            self.append_user_message(message).await?;
+            self.generate_ids(
+                Vec::new(),
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                on_token,
+                on_audio.as_ref(),
+                on_thought.as_ref(),
             )
             .await
         }
@@ -3100,10 +3566,14 @@ mod webgpu {
             seed: Option<u64>,
             on_token: &js_sys::Function,
             on_audio: Option<&js_sys::Function>,
+            on_thought: Option<&js_sys::Function>,
         ) -> Result<String, JsError> {
-            if ids.is_empty() {
+            let mut full_ids = std::mem::take(&mut self.pending_suffix);
+            full_ids.extend(ids);
+            if full_ids.is_empty() {
                 return Ok(String::new());
             }
+            let ids = full_ids;
 
             let max_seq_len = self.model.config().max_seq_len;
             let mut pos = self.state.seq_len;
@@ -3291,6 +3761,29 @@ mod webgpu {
             // corrupt non-ASCII output into U+FFFD replacement chars.
             let mut out = String::new();
             let mut pending = Vec::<u8>::new();
+            let mut thinking_parser =
+                on_thought.map(|_| cera::session::StreamingThinkingParser::new());
+
+            let mut emit_chunk = |parser: &mut Option<cera::session::StreamingThinkingParser>,
+                                  out_buf: &mut String,
+                                  piece: &str| {
+                if let Some(ref mut p) = parser {
+                    let thought_cb = on_thought.unwrap();
+                    for (is_thought, text) in p.feed(piece) {
+                        if !text.is_empty() {
+                            if is_thought {
+                                emit(thought_cb, &text);
+                            } else {
+                                out_buf.push_str(&text);
+                                emit(on_token, &text);
+                            }
+                        }
+                    }
+                } else {
+                    out_buf.push_str(piece);
+                    emit(on_token, piece);
+                }
+            };
 
             for _ in 0..max_tokens {
                 if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3315,8 +3808,7 @@ mod webgpu {
                         if valid > 0
                             && let Ok(piece) = std::str::from_utf8(&pending[..valid])
                         {
-                            out.push_str(piece);
-                            emit(on_token, piece);
+                            emit_chunk(&mut thinking_parser, &mut out, piece);
                         }
                         pending.clear();
                     }
@@ -3423,8 +3915,7 @@ mod webgpu {
                     if valid > 0
                         && let Ok(piece) = std::str::from_utf8(&pending[..valid])
                     {
-                        out.push_str(piece);
-                        emit(on_token, piece);
+                        emit_chunk(&mut thinking_parser, &mut out, piece);
                         pending.drain(..valid);
                     }
                 }
@@ -3632,8 +4123,7 @@ mod webgpu {
                                     if valid > 0
                                         && let Ok(piece) = std::str::from_utf8(&pending[..valid])
                                     {
-                                        out.push_str(piece);
-                                        emit(on_token, piece);
+                                        emit_chunk(&mut thinking_parser, &mut out, piece);
                                         pending.drain(..valid);
                                     }
                                     token_history.push(d_tok);
@@ -3771,11 +4261,23 @@ mod webgpu {
             ));
 
             // Flush any trailing bytes (an incomplete multi-byte char at the
-            // stop boundary — lossy as a last resort).
+            // stop boundary: lossy as a last resort).
             if !pending.is_empty() {
                 let piece = String::from_utf8_lossy(&pending).into_owned();
-                out.push_str(&piece);
-                emit(on_token, &piece);
+                emit_chunk(&mut thinking_parser, &mut out, &piece);
+            }
+            if let Some(ref mut parser) = thinking_parser {
+                let thought_cb = on_thought.unwrap();
+                if let Some((is_thought, text)) = parser.flush() {
+                    if !text.is_empty() {
+                        if is_thought {
+                            emit(thought_cb, &text);
+                        } else {
+                            out.push_str(&text);
+                            emit(on_token, &text);
+                        }
+                    }
+                }
             }
             self.state.seq_len = pos;
             Ok(out)

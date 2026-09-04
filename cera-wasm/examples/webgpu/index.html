@@ -68,6 +68,33 @@
       button:hover:not(:disabled) { background: var(--accent-hover); }
       button:disabled { opacity: 0.4; cursor: not-allowed; }
       #status { font-family: ui-monospace, Menlo, monospace; font-size: 0.825rem; color: var(--muted); padding: 0.5rem 0; min-height: 1.5em; }
+      .thought-container {
+        display: none;
+        background: #11141b;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        padding: 0.85rem 1rem;
+        margin-top: 0.6rem;
+      }
+      .thought-header {
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #60a5fa;
+        margin-bottom: 0.4rem;
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+      }
+      #thought {
+        white-space: pre-wrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8125rem;
+        line-height: 1.55;
+        color: #94a3b8;
+        font-style: italic;
+      }
       #out {
         white-space: pre-wrap;
         background: var(--surface);
@@ -117,6 +144,10 @@
       </div>
     </div>
     <div id="status">Loading wasm…</div>
+    <div id="thought-container" class="thought-container">
+      <div class="thought-header">🧠 Thinking Process</div>
+      <div id="thought"></div>
+    </div>
     <div id="out"></div>
 
     <script type="module">
@@ -124,6 +155,8 @@
 
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
+      const thoughtContainer = $("thought-container");
+      const thoughtEl = $("thought");
       const outEl = $("out");
       const runBtn = $("run");
       const setStatus = (m) => (statusEl.textContent = m);
@@ -216,22 +249,35 @@
         // nothing; fall back to 64 only for non-positive / unparseable input.
         const parsedMax = parseInt($("maxtok").value, 10);
         const maxTokens = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 64;
+        thoughtContainer.style.display = "none";
+        thoughtEl.textContent = "";
         outEl.textContent = prompt;
-        // Latches the model picker and KV dropdown too, so a rebuild can't free
+        // Latches the model picker and KV dropdown too, so a rebuild cannot free
         // this session while `generate` is still awaiting on it.
         setBusy(true);
         setStatus("Generating on GPU…");
         const t0 = performance.now();
         let n = 0;
         try {
-          // onToken streams each decoded piece as the GPU produces it. The
-          // four nulls are the sampling knobs; this page decodes greedily,
-          // which keeps it on the argmax-on-GPU path and so keeps the tok/s it
-          // reports comparable to what it reported before sampling existed.
-          await session.generate(prompt, maxTokens, 0, null, null, null, (piece) => {
-            outEl.textContent += piece;
-            n += 1;
-          });
+          // onToken streams each decoded piece as the GPU produces it.
+          // onThought streams reasoning chunks when model thinking is active.
+          await session.generate(
+            prompt,
+            maxTokens,
+            null,
+            null,
+            null,
+            null,
+            (piece) => {
+              outEl.textContent += piece;
+              n += 1;
+            },
+            null,
+            (thoughtPiece) => {
+              thoughtContainer.style.display = "block";
+              thoughtEl.textContent += thoughtPiece;
+            }
+          );
           const dt = (performance.now() - t0) / 1000;
           const tps = n > 0 ? (n / dt).toFixed(1) : "0";
           setStatus(`Done · ${n} tokens in ${dt.toFixed(1)}s (${tps} tok/s)`);

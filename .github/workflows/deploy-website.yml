@@ -1,0 +1,84 @@
+name: Deploy Website
+
+# Builds the official Cera website and deploys it to Cloudflare Pages
+# under project `cera-site`.
+#
+# The website hosts:
+# 1. Multiplatform SDK documentation (Rust, Web/JS, Flutter/Dart, Android/Kotlin, Apple/Swift, Python, CLI).
+# 2. Interactive in-browser WebGPU inference studio.
+# 3. LeapBundles model catalog and hardware benchmark matrices.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'website/**'
+      - '.github/workflows/deploy-website.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'website/**'
+      - '.github/workflows/deploy-website.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: website-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify TypeScript and build production assets
+        run: npm run build
+
+      - name: Verify build artifact integrity
+        run: |
+          test -f dist/index.html || { echo "::error::dist/index.html missing from build output"; exit 1; }
+          test -d dist/assets || { echo "::error::dist/assets missing from build output"; exit 1; }
+          echo "Website bundle verified successfully."
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          command: >-
+            pages deploy website/dist
+            --project-name=cera-site
+            --branch=${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
+      - name: Record deployment URL
+        if: always()
+        env:
+          PAGES_URL: ${{ steps.deploy.outputs.deployment-url }}
+        run: |
+          if [ -n "${PAGES_URL:-}" ]; then
+            echo "Successfully deployed Cera website to Cloudflare Pages: ${PAGES_URL}" >> $GITHUB_STEP_SUMMARY
+          fi

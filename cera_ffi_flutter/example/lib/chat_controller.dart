@@ -833,6 +833,16 @@ class ChatController extends ValueNotifier<ChatState> {
         formattedPrompt,
         maxTokens: 512,
         temperature: isTts ? 0.0 : null,
+        onThought: (thoughtPiece) {
+          if (_disposed || _generationId != generationId) return;
+          _updateLastTurn(
+            (t) => t.copyWith(
+              isGenerating: true,
+              statusText: () => null,
+              thought: (t.thought ?? '') + thoughtPiece,
+            ),
+          );
+        },
         onAudio: shouldStreamAudio
             ? (pcm, rate) {
                 if (rate <= 0 || _disposed || _generationId != generationId) {

@@ -578,6 +578,126 @@ class _NativeCera implements Cera {
     }
   }
 
+  UserMessage _toFfiUserMessage(CeraUserMessage msg) => UserMessage(
+    text: msg.text,
+    images: msg.images,
+    audio: msg.audio != null
+        ? AudioInput(pcm: msg.audio!.pcm, sampleRate: msg.audio!.sampleRate)
+        : null,
+  );
+
+  @override
+  Future<void> appendUserMessage(CeraUserMessage message) async {
+    _ensureOpen();
+    final ahead = _queue;
+    final mine = Completer<void>();
+    _queue = mine.future;
+    try {
+      try {
+        await ahead;
+      } catch (_) {}
+      _ensureOpen();
+      _session.sendMessage(_toFfiUserMessage(message));
+    } finally {
+      mine.complete();
+    }
+  }
+
+  @override
+  Stream<String> sendMessage(
+    CeraUserMessage message, {
+    int maxTokens = 256,
+    double? temperature,
+    double? topP,
+    int? topK,
+    int? seed,
+    void Function(String thought)? onThought,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
+  }) {
+    _ensureOpen();
+    final controller = StreamController<String>();
+    var opts = _session.defaultGenerateOpts().copyWith(
+      maxTokens: maxTokens,
+      flushEveryTokens: 1,
+    );
+    if (temperature != null) opts = opts.copyWith(temperature: temperature);
+    if (topP != null) opts = opts.copyWith(topP: topP);
+    if (topK != null) opts = opts.copyWith(topK: topK);
+
+    var finished = false;
+    var started = false;
+
+    controller.onCancel = () async {
+      if (started && !finished && !_closed) _session.cancel();
+    };
+
+    controller.onListen = () async {
+      final ahead = _queue;
+      final mine = Completer<void>();
+      _queue = mine.future;
+      try {
+        await ahead;
+      } catch (_) {}
+      if (_closed || !controller.hasListener) {
+        mine.complete();
+        if (_closed && controller.hasListener) {
+          controller.addError(StateError('this Cera engine is closed'));
+        }
+        if (!controller.isClosed) await controller.close();
+        return;
+      }
+      started = true;
+      final sink = _StreamingSink(
+        emit: (piece) {
+          if (!controller.isClosed) controller.add(piece);
+        },
+        onThought: onThought,
+        onAudio: onAudio,
+        isOpen: () => !_closed,
+        done: (error) {
+          finished = true;
+          _clearCancel();
+          if (!mine.isCompleted) mine.complete();
+          if (controller.isClosed) return;
+          if (error != null) controller.addError(error);
+          controller.close();
+        },
+      );
+      try {
+        if (seed != null && _session.position() == 0) {
+          final reseeded = _engine.newSession(
+            SessionConfig(
+              seed: seed,
+              kvCompression:
+                  _options.turboQuant
+                      ? const KvCompressionTurboQuant(
+                        seed: 0,
+                        keys: true,
+                        values: true,
+                      )
+                      : null,
+            ),
+          );
+          _session.close();
+          _session = reseeded;
+        }
+        _session.sendMessage(_toFfiUserMessage(message));
+        unawaited(
+          _session
+              .generateStreamingAsync(opts, sink)
+              .then((_) => sink.finish(), onError: sink.fail),
+        );
+      } on Object catch (e, st) {
+        finished = true;
+        _clearCancel();
+        if (!mine.isCompleted) mine.complete();
+        controller.addError(e, st);
+        controller.close();
+      }
+    };
+    return controller.stream;
+  }
+
   @override
   Future<void> reset() async {
     _ensureOpen();

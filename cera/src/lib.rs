@@ -65,8 +65,10 @@ pub use engine::{
 };
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
-    Session, SessionConfig, SpecDecode,
+    Session, SessionConfig, SpecDecode, StreamingThinkingParser, ThinkingState,
 };
+#[cfg(feature = "vl-preprocess")]
+pub use session::{ChatTemplateSegment, splice_image_markers};
 pub use sysmem::{available_memory_bytes, fits_in_available_memory};
 pub use vad::{SileroVad, SpeechTimestamp, VadConfig, VadEvent, VadIterator, VadSampleRate};
 

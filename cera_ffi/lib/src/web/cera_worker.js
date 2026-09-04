@@ -514,6 +514,53 @@ const OPS = {
   },
 
   /**
+   * Append a canonical multimodal UserMessage to the live session.
+   */
+  async appendUserMessage(req) {
+    const { text, images, audio } = req;
+    if (typeof wasm.UserMessage !== 'function') {
+      throw unsupported('UserMessage is not available in this wasm build');
+    }
+    const userMsg = wasm.UserMessage.fromText(text ?? '');
+    if (Array.isArray(images)) {
+      for (const img of images) {
+        const bytes = img.bytes
+          ? (img.bytes instanceof Uint8Array ? img.bytes : new Uint8Array(img.bytes))
+          : (img instanceof Uint8Array ? img : new Uint8Array(img));
+        userMsg.addImage(bytes, img.maxLongSize ?? undefined);
+      }
+    }
+    if (audio) {
+      const pcm = audio.pcm instanceof Float32Array ? audio.pcm : Float32Array.from(audio.pcm);
+      const audioInput = new wasm.AudioInput(pcm, audio.sampleRate ?? 16000);
+      userMsg.setAudio(audioInput);
+    }
+
+    try {
+      if (gpu) {
+        console.info('[cera:worker] appendUserMessage: appending multimodal message to WebGPU session...');
+        await gpu.session.appendUserMessage(userMsg);
+      } else if (cpu) {
+        console.info('[cera:worker] appendUserMessage: appending multimodal message to CPU session...');
+        cpu.session.appendUserMessage(userMsg);
+      } else {
+        throw unsupported('no model loaded');
+      }
+    } finally {
+      userMsg.free();
+    }
+    return null;
+  },
+
+  /**
+   * Append a multimodal user message and stream generation.
+   */
+  async sendMessage(req, post) {
+    await OPS.appendUserMessage(req);
+    return await OPS.generate(req, post);
+  },
+
+  /**
    * Feed an image into the live conversation.
    *
    * Queued to be spliced into the proper user-turn `<|image_start|>` envelope
@@ -744,7 +791,8 @@ const OPS = {
         } catch (_) {}
       }
     }
-    const { prompt, maxTokens } = req;
+    const prompt = req.prompt ?? '';
+    const { maxTokens } = req;
     const currentPos = position();
     console.info(
       `[cera:worker] generate: starting generation for "${currentModelLabel}" on "${backendLabel}" (context position: ${currentPos}, maxTokens: ${maxTokens})`,
@@ -858,6 +906,8 @@ const OPS = {
         ids.set(pendingSuffix, 0);
         ids.set(promptIds, pendingSuffix.length);
         console.info(`[cera:worker] generate: combined ${pendingSuffix.length} audio suffix tokens and ${promptIds.length} prompt tokens`);
+      } else if (!prompt || prompt.trim() === '') {
+        ids = new Uint32Array(0);
       } else {
         ids = encodePrompt(prompt, currentPos === 0);
         console.info(`[cera:worker] generate: prompt encoded into ${ids.length} tokens`);
@@ -930,6 +980,15 @@ const OPS = {
       // wasm side falls back to `SamplerConfig`'s default, which is the same
       // thing omitting them from `GenerateOpts` does on the CPU path, so the
       // two backends answer a bare `generate()` the same way.
+      const onThought = req.wantsThought
+        ? (thoughtPiece) => {
+            if (isCancelled || (cancelArray && Atomics.load(cancelArray, 0) === 1)) {
+              return;
+            }
+            post({ event: 'thought', text: thoughtPiece });
+          }
+        : null;
+
       await gpu.session.generateTokens(
         ids,
         maxTokens,
@@ -939,6 +998,7 @@ const OPS = {
         req.seed != null ? BigInt(req.seed) : null,
         onToken,
         onAudio,
+        onThought,
       );
     } else {
       const tk = cpu.tokenizer;
@@ -956,6 +1016,10 @@ const OPS = {
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       let uncommittedTokens = [];
+      let thinkingParser = null;
+      if (req.wantsThought && typeof wasm.StreamingThinkingParser === 'function') {
+        thinkingParser = new wasm.StreamingThinkingParser();
+      }
       try {
         console.info('[cera:worker] calling cpu.session.generate...');
         cpu.session.generate(
@@ -977,7 +1041,22 @@ const OPS = {
               return;
             }
             if (decoded.length > 0) {
-              onToken(decoded);
+              if (thinkingParser) {
+                const chunks = thinkingParser.feed(decoded);
+                for (let j = 0; j < chunks.length; j++) {
+                  const isThought = chunks[j][0];
+                  const chunkText = chunks[j][1];
+                  if (chunkText.length > 0) {
+                    if (isThought) {
+                      post({ event: 'thought', text: chunkText });
+                    } else {
+                      onToken(chunkText);
+                    }
+                  }
+                }
+              } else {
+                onToken(decoded);
+              }
               uncommittedTokens = [];
             }
           },
@@ -986,9 +1065,38 @@ const OPS = {
         if (uncommittedTokens.length > 0) {
           const remaining = tk.decode(Uint32Array.from(uncommittedTokens));
           if (remaining.length > 0) {
-            onToken(remaining);
+            if (thinkingParser) {
+              const chunks = thinkingParser.feed(remaining);
+              for (let j = 0; j < chunks.length; j++) {
+                const isThought = chunks[j][0];
+                const chunkText = chunks[j][1];
+                if (chunkText.length > 0) {
+                  if (isThought) {
+                    post({ event: 'thought', text: chunkText });
+                  } else {
+                    onToken(chunkText);
+                  }
+                }
+              }
+            } else {
+              onToken(remaining);
+            }
           }
           uncommittedTokens = [];
+        }
+        if (thinkingParser) {
+          const rem = thinkingParser.flush();
+          if (rem) {
+            const isThought = rem[0];
+            const chunkText = rem[1];
+            if (chunkText.length > 0) {
+              if (isThought) {
+                post({ event: 'thought', text: chunkText });
+              } else {
+                onToken(chunkText);
+              }
+            }
+          }
         }
       } catch (err) {
         if (
@@ -1001,6 +1109,7 @@ const OPS = {
           throw err;
         }
       } finally {
+        thinkingParser?.free();
         opts.free();
       }
     }

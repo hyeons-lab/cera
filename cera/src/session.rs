@@ -352,6 +352,111 @@ impl ModalityCapabilities {
     }
 }
 
+/// Open tags indicating the start of a reasoning or thought block.
+pub const OPEN_THOUGHT_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"];
+
+/// Close tags indicating the end of a reasoning or thought block.
+pub const CLOSE_THOUGHT_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
+
+/// Helper to find the earliest occurrence of any thought tag in `text`.
+pub fn find_thought_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|&tag| text.find(tag).map(|pos| (pos, tag)))
+        .min_by_key(|&(pos, _)| pos)
+}
+
+/// Helper to detect if a suffix of `text` partially matches the prefix of any tag.
+pub fn thought_partial_suffix_len(text: &str, tags: &[&str]) -> usize {
+    let max_tag_len = tags.iter().map(|t| t.len()).max().unwrap_or(0);
+    let max_check = (max_tag_len.saturating_sub(1)).min(text.len());
+    for len in (1..=max_check).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) {
+            let suffix = &text[start..];
+            if tags.iter().any(|t| t.starts_with(suffix)) {
+                return len;
+            }
+        }
+    }
+    0
+}
+
+/// State of reasoning or thought parsing during streaming generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingState {
+    #[default]
+    Content,
+    Thinking,
+}
+
+/// Streaming parser for isolating thinking and reasoning blocks from user-facing text.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingThinkingParser {
+    state: ThinkingState,
+    buffer: String,
+}
+
+impl StreamingThinkingParser {
+    pub fn new() -> Self {
+        Self {
+            state: ThinkingState::Content,
+            buffer: String::new(),
+        }
+    }
+
+    /// Feeds a chunk of text, emitting (is_thought, text) pairs.
+    pub fn feed(&mut self, chunk: &str) -> Vec<(bool, String)> {
+        self.buffer.push_str(chunk);
+        let mut emissions = Vec::new();
+
+        loop {
+            let (tags, is_thought, next_state) = match self.state {
+                ThinkingState::Content => (OPEN_THOUGHT_TAGS, false, ThinkingState::Thinking),
+                ThinkingState::Thinking => (CLOSE_THOUGHT_TAGS, true, ThinkingState::Content),
+            };
+
+            if let Some((pos, tag)) = find_thought_tag(&self.buffer, tags) {
+                if pos > 0 {
+                    let text = self.buffer[..pos].to_string();
+                    emissions.push((is_thought, text));
+                }
+                let tag_len = tag.len();
+                self.buffer.drain(..pos + tag_len);
+                self.state = next_state;
+                continue;
+            }
+
+            let hold = thought_partial_suffix_len(&self.buffer, tags);
+            let safe_len = self.buffer.len() - hold;
+            if safe_len > 0 {
+                let text = self.buffer[..safe_len].to_string();
+                self.buffer.drain(..safe_len);
+                emissions.push((is_thought, text));
+            }
+            break;
+        }
+
+        emissions
+    }
+
+    /// Flushes any remaining buffered text at end of stream.
+    pub fn flush(&mut self) -> Option<(bool, String)> {
+        if self.buffer.is_empty() {
+            None
+        } else {
+            let is_thought = self.state == ThinkingState::Thinking;
+            let text = std::mem::take(&mut self.buffer);
+            Some((is_thought, text))
+        }
+    }
+
+    /// Resets internal parser state.
+    pub fn reset(&mut self) {
+        self.state = ThinkingState::Content;
+        self.buffer.clear();
+    }
+}
+
 /// Error type for session operations. Upstream consumers using
 /// `anyhow::Error` can continue to use `?` because `thiserror` derives
 /// `std::error::Error` for this type, making it compatible with `anyhow`.
@@ -466,14 +571,14 @@ pub(crate) fn shift_token_history(history: &mut Vec<u32>, n_keep: usize, shift: 
 /// envelope at append time.
 ///
 /// `Copy` because every variant is either unit (`Image`) or
-/// composed of `usize` fields (`Text { start, end }`) — letting the
+/// composed of `usize` fields (`Text { start, end }`), letting the
 /// walk loop in [`Session::append_chat_with_images`] match on
 /// `*seg` without the borrow-checker friction.
 // Only `append_chat_with_images` (gated on `vl-preprocess`) consumes the splice
 // plan, so the segment type and its walker are dead without that feature.
 #[cfg(feature = "vl-preprocess")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChatTemplateSegment {
+pub enum ChatTemplateSegment {
     Text { start: usize, end: usize },
     Image,
 }
@@ -485,12 +590,12 @@ pub(crate) enum ChatTemplateSegment {
 ///
 /// Empty text runs (two adjacent markers, marker at start/end of
 /// stream) are elided so the segment list never carries
-/// zero-length text spans — the caller's `append_tokens(&[])`
+/// zero-length text spans: the caller's `append_tokens(&[])`
 /// would be a no-op anyway, but keeping the segment list tight
 /// makes the unit-test assertions cleaner and the walk loop
 /// branch-free on the empty case.
 #[cfg(feature = "vl-preprocess")]
-pub(crate) fn splice_image_markers(
+pub fn splice_image_markers(
     tokens: &[u32],
     image_marker_id: u32,
 ) -> Vec<ChatTemplateSegment> {
@@ -3112,5 +3217,42 @@ mod tests {
         assert_eq!(default_opts.top_k, 40);
         assert_eq!(default_opts.min_p, 0.05);
         assert_eq!(default_opts.repetition_penalty, 1.1);
+    }
+
+    #[test]
+    fn streaming_thinking_parser_splits_delimiters_across_chunks() {
+        let mut parser = StreamingThinkingParser::new();
+
+        // Chunk 1: regular text starting with partial open tag "<th"
+        let out1 = parser.feed("Intro text. <th");
+        assert_eq!(out1, vec![(false, "Intro text. ".to_string())]);
+
+        // Chunk 2: completes "<think>" and begins thought
+        let out2 = parser.feed("ink>Reasoning step 1. ");
+        assert_eq!(out2, vec![(true, "Reasoning step 1. ".to_string())]);
+
+        // Chunk 3: thought text with partial close tag "</th"
+        let out3 = parser.feed("Reasoning step 2. </th");
+        assert_eq!(out3, vec![(true, "Reasoning step 2. ".to_string())]);
+
+        // Chunk 4: completes "</think>" and gives final answer
+        let out4 = parser.feed("ink>Final answer.");
+        assert_eq!(out4, vec![(false, "Final answer.".to_string())]);
+
+        let flushed = parser.flush();
+        assert!(flushed.is_none());
+    }
+
+    #[test]
+    fn streaming_thinking_parser_handles_alternative_tags() {
+        let mut parser = StreamingThinkingParser::new();
+        let out1 = parser.feed("<|thought_start|>Internal analysis<|thought_end|>Result");
+        assert_eq!(
+            out1,
+            vec![
+                (true, "Internal analysis".to_string()),
+                (false, "Result".to_string()),
+            ]
+        );
     }
 }

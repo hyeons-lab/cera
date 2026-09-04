@@ -58,3 +58,7 @@ llama_time.txt
 bench_results.csv
 bench_log.txt
 __pycache__/
+
+# Website
+website/node_modules/
+website/dist/

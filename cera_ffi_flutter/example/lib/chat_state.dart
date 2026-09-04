@@ -32,6 +32,7 @@ class Turn {
   const Turn({
     required this.role,
     required this.text,
+    this.thought,
     this.modelName,
     this.imageBytes,
     this.imageName,
@@ -44,6 +45,7 @@ class Turn {
 
   final String role;
   final String text;
+  final String? thought;
   final String? modelName;
   final Uint8List? imageBytes;
   final String? imageName;
@@ -56,6 +58,7 @@ class Turn {
   Turn copyWith({
     String? role,
     String? text,
+    String? thought,
     String? modelName,
     Uint8List? imageBytes,
     String? imageName,
@@ -68,6 +71,7 @@ class Turn {
     return Turn(
       role: role ?? this.role,
       text: text ?? this.text,
+      thought: thought ?? this.thought,
       modelName: modelName ?? this.modelName,
       imageBytes: imageBytes ?? this.imageBytes,
       imageName: imageName ?? this.imageName,

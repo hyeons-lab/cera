@@ -483,6 +483,24 @@ abstract interface class Cera {
   /// `audioIn: false`.
   Future<String> transcribe(List<double> pcm, {required int sampleRate});
 
+  /// Appends a multimodal [message] to the session context, automatically
+  /// enforcing model-canonical media ordering, boundary token envelopes,
+  /// and sample rate normalization.
+  Future<void> appendUserMessage(CeraUserMessage message);
+
+  /// Appends a multimodal [message] and streams continuation text, isolating
+  /// any reasoning blocks via [onThought].
+  Stream<String> sendMessage(
+    CeraUserMessage message, {
+    int maxTokens = 256,
+    double? temperature,
+    double? topP,
+    int? topK,
+    int? seed,
+    void Function(String thought)? onThought,
+    void Function(List<double> pcm, int sampleRate)? onAudio,
+  });
+
   /// Clears the conversation, keeping the model loaded.
   ///
   /// Throws [UnsupportedError] on the web's GPU backend, whose KV cache lives
@@ -595,4 +613,55 @@ class CeraMessage {
 
   /// The turn's text.
   final String content;
+}
+
+/// Audio input for a multimodal user message.
+class CeraAudioInput {
+  /// Creates an audio input envelope.
+  const CeraAudioInput({
+    required this.pcm,
+    this.sampleRate = 16000,
+  });
+
+  /// Audio PCM samples normalized to roughly [-1.0, 1.0].
+  final List<double> pcm;
+
+  /// Audio sample rate in Hz (defaults to 16,000 Hz).
+  final int sampleRate;
+}
+
+/// A multimodal user turn to be fed into the conversation.
+class CeraUserMessage {
+  /// Creates a multimodal user message.
+  const CeraUserMessage({
+    this.text,
+    this.images = const [],
+    this.audio,
+  });
+
+  /// Creates a text-only user message.
+  factory CeraUserMessage.text(String text) => CeraUserMessage(text: text);
+
+  /// Creates an image-bearing user message with optional text prompt.
+  factory CeraUserMessage.image(Uint8List imageBytes, {String? text}) =>
+      CeraUserMessage(
+        text: text,
+        images: [imageBytes],
+      );
+
+  /// Creates an audio-bearing user message with optional text prompt.
+  factory CeraUserMessage.audio(List<double> pcm, {int sampleRate = 16000, String? text}) =>
+      CeraUserMessage(
+        text: text,
+        audio: CeraAudioInput(pcm: pcm, sampleRate: sampleRate),
+      );
+
+  /// Optional text prompt.
+  final String? text;
+
+  /// Encoded PNG or JPEG image bytes.
+  final List<Uint8List> images;
+
+  /// Optional audio input.
+  final CeraAudioInput? audio;
 }
