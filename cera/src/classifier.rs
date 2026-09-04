@@ -158,7 +158,7 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
             backpointer[t * num_classes + c] = best_prev;
         }
 
-        dp.copy_from_slice(&next_dp);
+        std::mem::swap(&mut dp, &mut next_dp);
     }
 
     // Final token: must end in O, E-*, or S-*
@@ -332,6 +332,15 @@ pub fn detect_pii(
     let (tokens, offsets) = tokenizer.encode_with_offsets(text);
     if tokens.is_empty() {
         return Ok(Vec::new());
+    }
+
+    let max_seq = model.config().max_seq_len;
+    if tokens.len() > max_seq {
+        return Err(CeraError::Backend(format!(
+            "sequence length {} exceeds maximum model sequence limit {}",
+            tokens.len(),
+            max_seq
+        )));
     }
 
     let logits = model.classify_tokens(&tokens, state)?;
@@ -788,5 +797,57 @@ mod tests {
         assert_eq!(spans[0].text, "Alice");
         assert_eq!(spans[1].text, "Bob");
         assert_eq!(spans[2].text, "user@example.com");
+    }
+
+    #[test]
+    fn test_detect_pii_sequence_length_exceeded() {
+        let labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "E-NAME".to_string(),
+            "S-NAME".to_string(),
+        ];
+        let model = MockClassifierModel {
+            labels: labels.clone(),
+            config: crate::model::ModelConfig {
+                architecture: "mock".to_string(),
+                n_layers: 1,
+                hidden_size: 4,
+                intermediate_size: 8,
+                n_heads: 1,
+                n_kv_heads: 1,
+                head_dim: 4,
+                vocab_size: 256,
+                max_seq_len: 2,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![crate::model::BlockType::Attention],
+                conv_kernel_size: None,
+                kv_heads_per_layer: vec![1],
+                scalars: crate::model::ScalarMultipliers::default(),
+                moe: None,
+                is_causal: false,
+                class_labels: labels,
+            },
+        };
+
+        let mut vocab_vec = Vec::new();
+        let mut token_to_id = std::collections::HashMap::new();
+        for b in 0u8..=255 {
+            vocab_vec.push(vec![b]);
+            token_to_id.insert(vec![b], b as u32);
+        }
+        let tokenizer =
+            BpeTokenizer::new_for_testing(vocab_vec, token_to_id, std::collections::HashMap::new());
+
+        let mut state = InferenceState::from_config(&model.config).unwrap();
+        let result = detect_pii(&model, &tokenizer, "ABCDE", &mut state);
+        assert!(result.is_err());
+        if let Err(CeraError::Backend(msg)) = result {
+            assert!(msg.contains("exceeds maximum model sequence limit"));
+        } else {
+            panic!("expected CeraError::Backend on sequence length exceeded");
+        }
     }
 }

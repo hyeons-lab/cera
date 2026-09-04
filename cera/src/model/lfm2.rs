@@ -3899,6 +3899,14 @@ impl Model for Lfm2Model {
         tokens: &[u32],
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, crate::CeraError> {
+        if tokens.len() > self.config.max_seq_len {
+            return Err(crate::CeraError::Backend(format!(
+                "sequence length {} exceeds maximum model sequence limit {}",
+                tokens.len(),
+                self.config.max_seq_len
+            )));
+        }
+
         let hidden = self.hidden_states(tokens, state);
 
         let (classifier_w, classifier_b) = if let Some(ref lora) = state.lora {
@@ -3928,6 +3936,8 @@ impl Model for Lfm2Model {
             let out_slice = &mut logits[j * num_classes..(j + 1) * num_classes];
             for c in 0..num_classes {
                 let w_row = &classifier_w[c * hs..(c + 1) * hs];
+                assert_eq!(h.len(), hs);
+                assert_eq!(w_row.len(), hs);
                 let mut dot = 0.0f32;
                 for d in 0..hs {
                     dot += h[d] * w_row[d];
