@@ -34,7 +34,7 @@ export const ModelCatalogView = () => {
             Supported Models & LeapBundles
           </h1>
           <p className="text-slate-300 text-sm sm:text-base leading-relaxed">
-            All models run natively in Cera with automatic Hugging Face downloading, manifest verification, and persistent local caching.
+            All models run natively in Cera with automatic Hugging Face downloading, manifest verification, and persistent local caching. Remote SafeTensors repositories can also be streamed and quantized on-the-fly directly to GGUF in memory with zero unquantized disk footprint.
           </p>
         </div>
 

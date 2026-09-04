@@ -154,9 +154,9 @@ export const ArchitectureDiagram: React.FC = () => {
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
               <div className="p-3 rounded-lg bg-[#141724] border border-[#222638]">
-                <span className="font-semibold text-slate-200 block mb-1">LeapBundles & GGUF</span>
+                <span className="font-semibold text-slate-200 block mb-1">Streaming SafeTensors & GGUF</span>
                 <span className="text-slate-400 text-[11px]">
-                  Q4_0, Q4_K, Q8_0, and F32 with streaming HTTP range download resumption.
+                  On-the-fly streaming quantization from Hugging Face SafeTensors to cached GGUF with zero unquantized disk footprint.
                 </span>
               </div>
               <div className="p-3 rounded-lg bg-[#141724] border border-[#222638]">

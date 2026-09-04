@@ -3,12 +3,11 @@ import { Navbar } from './components/Navbar';
 import { Hero } from './components/Hero';
 import { FeatureGrid } from './components/FeatureGrid';
 import { ArchitectureDiagram } from './components/ArchitectureDiagram';
-import { DemoStudio } from './components/DemoStudio';
 import { DocsView } from './components/DocsView';
 import { ModelCatalogView } from './components/ModelCatalogView';
 import { BenchmarkView } from './components/BenchmarkView';
 import { Footer } from './components/Footer';
-import { ArrowRight, Cpu } from 'lucide-react';
+import { Cpu, ExternalLink } from 'lucide-react';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<string>('overview');
@@ -20,10 +19,7 @@ export function App() {
       <main className="flex-1">
         {activeTab === 'overview' && (
           <>
-            <Hero
-              onOpenDemo={() => setActiveTab('demo')}
-              onOpenDocs={() => setActiveTab('docs')}
-            />
+            <Hero onOpenDocs={() => setActiveTab('docs')} />
             <FeatureGrid />
             <ArchitectureDiagram />
 
@@ -37,16 +33,18 @@ export function App() {
                   Run Neural Models Locally on Any Hardware
                 </h2>
                 <p className="text-slate-400 text-sm sm:text-base max-w-2xl mx-auto mb-8 leading-relaxed">
-                  Start building on-device AI applications with zero runtime dependencies. Deploy across desktop, mobile, and WebAssembly with a single portable engine.
+                  Start building on-device AI applications with zero runtime dependencies. Stream and quantize SafeTensors on-the-fly, and deploy across desktop, mobile, and WebAssembly with a single portable engine.
                 </p>
                 <div className="flex flex-wrap items-center justify-center gap-3">
-                  <button
-                    onClick={() => setActiveTab('demo')}
+                  <a
+                    href="https://cera-demo.pages.dev/"
+                    target="_blank"
+                    rel="noopener noreferrer"
                     className="flex items-center gap-2 px-6 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm shadow-lg shadow-blue-600/25 transition-all hover:scale-[1.02]"
                   >
-                    <span>Launch WebGPU Studio</span>
-                    <ArrowRight className="w-4 h-4" />
-                  </button>
+                    <span>Open Live WebGPU Demo</span>
+                    <ExternalLink className="w-4 h-4 opacity-75" />
+                  </a>
                   <button
                     onClick={() => setActiveTab('docs')}
                     className="px-6 py-3 rounded-lg border border-[#222638] bg-[#151824] hover:bg-[#1c2030] text-slate-200 font-semibold text-sm transition-all"
@@ -59,7 +57,6 @@ export function App() {
           </>
         )}
 
-        {activeTab === 'demo' && <DemoStudio />}
         {activeTab === 'docs' && <DocsView />}
         {activeTab === 'catalog' && <ModelCatalogView />}
         {activeTab === 'benchmarks' && <BenchmarkView />}

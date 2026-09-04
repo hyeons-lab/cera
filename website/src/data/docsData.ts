@@ -515,6 +515,54 @@ Cera inspects the model architecture, formats tools into the chat template, and 
           },
         ],
       },
+      {
+        id: 'streaming-quantization',
+        title: 'Hugging Face Streaming Quantization',
+        description: 'Automatic SafeTensors streaming, zero-disk on-the-fly quantization, and local caching',
+        badge: 'Zero-Disk',
+        sections: [
+          {
+            id: 'streaming-quant-overview',
+            title: 'Zero-Disk Remote Quantization & Caching',
+            content: `Cera can point directly at any remote Hugging Face repository containing SafeTensors weights. When no primary GGUF exists, Cera streams the tensors over HTTP range requests and converts them on-the-fly into quantized GGUF format:
+- Zero unquantized disk footprint: The remote 10-20 GB FP16/BF16 SafeTensors files are never saved to disk. Weights are quantized tensor-by-tensor directly in memory.
+- Resumable checkpoints: If a download or conversion is interrupted, Cera preserves a checkpoint (model.gguf.checkpoint.json) and resumes exactly at the interrupted tensor index via HTTP Range requests.
+- Automatic local caching: The final quantized GGUF is stored in ~/.cache/cera/huggingface.co/<owner>/<repo>/quantized/<quant>/. Subsequent runs load the model instantly from disk with zero network overhead.
+- Supported target formats: Q4_K_M (default), Q5_K_M, Q6_K, Q8_0, and Q4_0.`,
+            codeSnippets: {
+              cli: {
+                language: 'bash',
+                filename: 'terminal',
+                code: `# Stream remote SafeTensors from Hugging Face, quantize to Q4_K_M on-the-fly, and run:
+cera run --model meta-llama/Llama-3.2-1B --quant Q4_K_M
+
+# Pull and quantize ahead of time into local cache:
+cera pull Qwen/Qwen2.5-0.5B --quant Q8_0
+
+# Run directly from local cache (zero network calls):
+cera run --model meta-llama/Llama-3.2-1B`,
+              },
+              rust: {
+                language: 'rust',
+                filename: 'main.rs',
+                code: `use cera::{CeraConfig, CeraEngine, Session};
+
+// Point directly at a Hugging Face repository spec:
+// Cera checks the cache, downloads SafeTensors headers, streams & quantizes on-the-fly,
+// and saves the cached GGUF model automatically.
+let engine = CeraEngine::from_hf("meta-llama/Llama-3.2-1B", &CeraConfig::default())?;
+let mut session = Session::new(&engine)?;
+
+session.append_prompt("Explain quantum computing in one sentence.")?;
+session.generate(&Default::default(), |token_chunk| {
+    print!("{token_chunk}");
+    Ok(true)
+})?;`,
+              },
+            },
+          },
+        ],
+      },
     ],
   },
 ];

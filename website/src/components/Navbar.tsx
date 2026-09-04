@@ -46,17 +46,16 @@ export const Navbar = ({ activeTab, setActiveTab }: NavbarProps) => {
               <Terminal className="w-4 h-4" />
               Overview
             </button>
-            <button
-              onClick={() => setActiveTab('demo')}
-              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${
-                activeTab === 'demo'
-                  ? 'bg-blue-600/15 text-blue-400 border border-blue-500/30'
-                  : 'text-slate-300 hover:text-white hover:bg-slate-800/40'
-              }`}
+            <a
+              href="https://cera-demo.pages.dev/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-1.5 rounded-md text-sm font-medium text-blue-400 hover:text-blue-300 hover:bg-blue-600/10 transition-colors flex items-center gap-1.5"
             >
               <Cpu className="w-4 h-4" />
-              WebGPU Studio
-            </button>
+              <span>Live Demo</span>
+              <ExternalLink className="w-3 h-3 opacity-70" />
+            </a>
             <button
               onClick={() => setActiveTab('docs')}
               className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${
@@ -125,14 +124,15 @@ export const Navbar = ({ activeTab, setActiveTab }: NavbarProps) => {
         >
           Overview
         </button>
-        <button
-          onClick={() => setActiveTab('demo')}
-          className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${
-            activeTab === 'demo' ? 'bg-blue-600 text-white' : 'text-slate-400'
-          }`}
+        <a
+          href="https://cera-demo.pages.dev/"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="px-2.5 py-1 rounded text-xs font-medium shrink-0 text-blue-400 bg-blue-600/10 flex items-center gap-1"
         >
-          WebGPU Studio
-        </button>
+          <span>Live Demo</span>
+          <ExternalLink className="w-3 h-3" />
+        </a>
         <button
           onClick={() => setActiveTab('docs')}
           className={`px-2.5 py-1 rounded text-xs font-medium shrink-0 ${

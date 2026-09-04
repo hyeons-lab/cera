@@ -1,5 +1,5 @@
 import React from 'react';
-import { Cpu, Zap, Eye, Mic, Layers, Code, Shield, Sparkles } from 'lucide-react';
+import { Cpu, Zap, Eye, Mic, Layers, Code, Sparkles, HardDrive } from 'lucide-react';
 
 export const FeatureGrid: React.FC = () => {
   const features = [
@@ -46,10 +46,10 @@ export const FeatureGrid: React.FC = () => {
       tag: 'Speech',
     },
     {
-      icon: Shield,
-      title: 'LeapBundles & Hugging Face',
-      description: 'Automatic model downloading, manifest parsing, and local caching from Hugging Face repositories with resilient HTTP range resumption.',
-      tag: 'Ecosystem',
+      icon: HardDrive,
+      title: 'Streaming SafeTensors Quantization',
+      description: 'Stream remote Hugging Face SafeTensors repositories and quantize on-the-fly directly to GGUF in memory. Zero unquantized disk footprint, resumable HTTP range checkpoints, and automatic local caching.',
+      tag: 'Zero-Disk',
     },
   ];
 

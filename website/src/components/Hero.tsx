@@ -1,12 +1,12 @@
 import { useState } from 'react';
-import { Copy, Check, Sparkles, ArrowRight, Play, Cpu, ShieldCheck } from 'lucide-react';
+import { Copy, Check, Sparkles, ArrowRight, Play, Cpu, ShieldCheck, ExternalLink } from 'lucide-react';
 
 interface HeroProps {
-  onOpenDemo: () => void;
+  onOpenDemo?: () => void;
   onOpenDocs: () => void;
 }
 
-export const Hero = ({ onOpenDemo, onOpenDocs }: HeroProps) => {
+export const Hero = ({ onOpenDocs }: HeroProps) => {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
 
   const installCommands = [
@@ -34,7 +34,7 @@ export const Hero = ({ onOpenDemo, onOpenDocs }: HeroProps) => {
             <Sparkles className="w-3.5 h-3.5" />
             <span>Pure Rust On-Device AI Engine</span>
             <span className="w-1 h-1 rounded-full bg-blue-400" />
-            <span className="text-slate-300">TurboQuant & WebGPU Ready</span>
+            <span className="text-slate-300">Streaming SafeTensors & WebGPU Ready</span>
           </div>
 
           <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold text-white tracking-tight leading-[1.1] mb-6">
@@ -45,17 +45,20 @@ export const Hero = ({ onOpenDemo, onOpenDocs }: HeroProps) => {
           </h1>
 
           <p className="text-base sm:text-lg text-slate-300 leading-relaxed mb-8">
-            A high-performance, pure-Rust inference engine for GGUF and LeapBundles models. Run multimodal LLMs locally on Apple Silicon (Metal MSL), cross-platform GPUs (WebGPU / Vulkan / DX12), or CPU SIMD from a single portable codebase.
+            A high-performance, pure-Rust inference engine. Stream remote Hugging Face SafeTensors directly and quantize on-the-fly to GGUF with zero unquantized disk footprint. Run multimodal models across Apple Metal MSL, Vulkan/wgpu, Android, iOS, or WebGPU in the browser.
           </p>
 
           <div className="flex flex-wrap items-center justify-center gap-3">
-            <button
-              onClick={onOpenDemo}
+            <a
+              href="https://cera-demo.pages.dev/"
+              target="_blank"
+              rel="noopener noreferrer"
               className="flex items-center gap-2 px-5 py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm shadow-lg shadow-blue-600/25 transition-all hover:scale-[1.02] active:scale-[0.98]"
             >
               <Play className="w-4 h-4 fill-white" />
-              Launch WebGPU Studio
-            </button>
+              <span>Open Live WebGPU Demo</span>
+              <ExternalLink className="w-4 h-4 opacity-75" />
+            </a>
             <button
               onClick={onOpenDocs}
               className="flex items-center gap-2 px-5 py-3 rounded-lg border border-[#222638] bg-[#151824] hover:bg-[#1c2030] text-slate-200 font-semibold text-sm transition-all hover:border-slate-600"
