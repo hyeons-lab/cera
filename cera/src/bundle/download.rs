@@ -220,6 +220,12 @@ pub(crate) fn partial_path(dest: &Path) -> PathBuf {
 static ACTIVE_DOWNLOADS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+fn lock_active_downloads() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    ACTIVE_DOWNLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// RAII guard ensuring at most one active download to a given destination in this process.
 struct ActiveDownloadGuard {
     path: PathBuf,
@@ -227,20 +233,24 @@ struct ActiveDownloadGuard {
 
 impl ActiveDownloadGuard {
     fn acquire(path: &Path) -> Result<Self, CeraError> {
-        let canon = if path.exists() {
-            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-        } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let canon = if abs.exists() {
+            abs.canonicalize().unwrap_or(abs)
+        } else if let Some(parent) = abs.parent().filter(|p| p.exists()) {
             parent
                 .canonicalize()
-                .map(|p| p.join(path.file_name().unwrap_or_default()))
-                .unwrap_or_else(|_| path.to_path_buf())
+                .map(|p| p.join(abs.file_name().unwrap_or_default()))
+                .unwrap_or(abs)
         } else {
-            path.to_path_buf()
+            abs
         };
-        let mut active = match ACTIVE_DOWNLOADS.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut active = lock_active_downloads();
         if !active.insert(canon.clone()) {
             return Err(CeraError::Backend(format!(
                 "download for {} is already in progress in this process",
@@ -253,10 +263,7 @@ impl ActiveDownloadGuard {
 
 impl Drop for ActiveDownloadGuard {
     fn drop(&mut self) {
-        let mut active = match ACTIVE_DOWNLOADS.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut active = lock_active_downloads();
         active.remove(&self.path);
     }
 }
@@ -268,15 +275,26 @@ pub(crate) fn parse_content_range(
 ) -> Option<(u64, u64, Option<u64>)> {
     let header_val = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
     let trimmed = header_val.trim();
-    let bytes_spec = trimmed.strip_prefix("bytes ")?.trim();
-    let (range_part, total_part) = bytes_spec.split_once('/')?;
+    let (unit, rest) = trimmed.split_once(char::is_whitespace)?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (range_part, total_part) = rest.split_once('/')?;
     let (start_str, end_str) = range_part.split_once('-')?;
     let start = start_str.trim().parse::<u64>().ok()?;
     let end = end_str.trim().parse::<u64>().ok()?;
+    if start > end {
+        return None;
+    }
     let total = if total_part.trim() == "*" {
         None
     } else {
-        total_part.trim().parse::<u64>().ok()
+        let tot = total_part.trim().parse::<u64>().ok()?;
+        if end >= tot {
+            return None;
+        }
+        Some(tot)
     };
     Some((start, end, total))
 }
@@ -328,16 +346,16 @@ pub(crate) fn download_to(
                             break;
                         } else {
                             let _ = fs::remove_file(&partial);
-                            existing_len = 0;
                             last_err = format!(
                                 "HTTP 206 Content-Range start {start} != expected offset {existing_len}"
                             );
+                            existing_len = 0;
                             continue;
                         }
                     } else {
                         let _ = fs::remove_file(&partial);
-                        existing_len = 0;
                         last_err = "HTTP 206 without valid Content-Range header".to_string();
+                        existing_len = 0;
                         continue;
                     }
                 } else if status.is_success() {
@@ -349,8 +367,8 @@ pub(crate) fn download_to(
                     // Reset partial file and retry from byte 0.
                     let _ = fs::remove_file(&partial);
                     existing_len = 0;
-                    last_err =
-                        format!("HTTP {status} (Range Not Satisfiable, resetting partial file)");
+                    last_err = "HTTP 416 Range Not Satisfiable".to_string();
+                    continue;
                 } else if status == reqwest::StatusCode::REQUEST_TIMEOUT
                     || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
@@ -394,7 +412,7 @@ pub(crate) fn download_to(
         .map(|s| s.to_ascii_lowercase())
         .or(server_hash);
 
-    let copy_result: Result<String, CeraError> = {
+    let copy_result: Result<(String, u64), CeraError> = {
         let (mut file, hasher, initial_bytes) = if is_resuming && existing_len > 0 {
             // Hash the existing on-disk prefix so running SHA-256 covers the whole file.
             let prefix_file = fs::File::open(&partial)?;
@@ -441,16 +459,24 @@ pub(crate) fn download_to(
         }
         let digest = hashing.hasher.finalize();
         file.sync_all()?;
-        Ok(hex_encode(&digest))
+        Ok((hex_encode(&digest), final_bytes))
     };
 
-    let actual_hex = match copy_result {
-        Ok(h) => h,
+    let (actual_hex, bytes_received) = match copy_result {
+        Ok((h, b)) => (h, b),
         Err(e) => {
             // Do not delete partial file on mid-stream transport errors so future retries can resume.
             return Err(e);
         }
     };
+
+    if let Some(exp_total) = total_bytes
+        && bytes_received < exp_total
+    {
+        return Err(CeraError::Backend(format!(
+            "download incomplete for {url}: expected {exp_total} bytes, received {bytes_received}"
+        )));
+    }
 
     if let Some(exp) = expected.as_deref()
         && exp != actual_hex
@@ -954,5 +980,42 @@ mod tests {
         drop(guard1);
         let guard3 = ActiveDownloadGuard::acquire(&target);
         assert!(guard3.is_ok());
+    }
+
+    #[test]
+    fn test_parse_content_range_rfc_and_validation() {
+        use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+
+        // Standard bytes range
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-499/1000"));
+        assert_eq!(parse_content_range(&headers), Some((0, 499, Some(1000))));
+
+        // Case-insensitive unit
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_static("Bytes 500-999/1000"),
+        );
+        assert_eq!(parse_content_range(&headers), Some((500, 999, Some(1000))));
+
+        // Wildcard total
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 100-200/*"));
+        assert_eq!(parse_content_range(&headers), Some((100, 200, None)));
+
+        // Invalid: start > end
+        headers.insert(
+            CONTENT_RANGE,
+            HeaderValue::from_static("bytes 500-100/1000"),
+        );
+        assert_eq!(parse_content_range(&headers), None);
+
+        // Invalid: end >= total
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-1000/1000"));
+        assert_eq!(parse_content_range(&headers), None);
+
+        // Invalid unit
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("items 0-499/1000"));
+        assert_eq!(parse_content_range(&headers), None);
     }
 }

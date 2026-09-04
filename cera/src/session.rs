@@ -1854,100 +1854,145 @@ impl Session {
         if has_audio && !self.capabilities.audio_in {
             return Err(CeraError::UnsupportedModality);
         }
+        if has_images && has_audio {
+            return Err(CeraError::UnsupportedModality);
+        }
 
-        // 1. Audio input:
         if let Some(audio) = &message.audio {
-            if !has_images && self.tokenizer.chat_template().is_some() {
-                let (marker_id, marker_name) = crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
-                    .into_iter()
-                    .find_map(|name| self.tokenizer.special_token_id(name).map(|id| (id, name)))
-                    .ok_or_else(|| {
-                        CeraError::Backend(
-                            "no audio marker special token (<|reserved_4|>..7) in tokenizer"
-                                .to_string(),
-                        )
-                    })?;
-
-                let user_content = match text_content {
-                    Some(text) => format!("{marker_name}\n{text}"),
-                    None => marker_name.to_string(),
-                };
-
-                let rendered = crate::tokenizer::apply_chat_template(
-                    &self.tokenizer,
-                    &[crate::tokenizer::ChatMessage {
-                        role: "user".to_string(),
-                        content: user_content,
-                    }],
-                    true,
-                )
-                .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
-
-                let toks = self.tokenizer.encode(&rendered);
-                let split = crate::engine::CeraEngine::split_tokens_at_marker(
-                    &toks,
-                    marker_id,
-                    marker_name,
-                )?;
-
-                if split > 0 {
-                    self.append_tokens(&toks[..split])?;
-                }
-                self.append_audio(&audio.pcm, audio.sample_rate)?;
-                if split + 1 < toks.len() {
-                    self.append_tokens(&toks[split + 1..])?;
-                }
-                return Ok(());
-            } else {
-                self.append_audio(&audio.pcm, audio.sample_rate)?;
+            if audio.pcm.is_empty() {
+                return Err(CeraError::EmptyInput);
+            }
+            if !(1000..=192_000).contains(&audio.sample_rate) {
+                return Err(CeraError::Backend(format!(
+                    "unsupported audio sample rate: {} Hz",
+                    audio.sample_rate
+                )));
+            }
+            if self.audio_encoder.is_none() {
+                return Err(CeraError::Backend(
+                    "Session::append_user_message: no audio encoder attached".to_string(),
+                ));
             }
         }
 
-        // 2. Vision input:
-        if has_images {
-            let images_refs: Vec<&[u8]> = message.images.iter().map(|v| v.as_slice()).collect();
-            if self.tokenizer.chat_template().is_some() {
-                let mut content = Vec::with_capacity(message.images.len() + 1);
-                for _ in &message.images {
-                    content.push(crate::tokenizer::ContentItem::Image);
-                }
-                if let Some(text) = text_content {
-                    content.push(crate::tokenizer::ContentItem::Text {
-                        text: text.to_string(),
-                    });
-                }
-                let messages = [crate::tokenizer::ChatMessageMultimodal {
-                    role: "user".to_string(),
-                    content,
-                }];
-                return self.append_chat_with_images(&messages, &images_refs, true);
-            } else {
-                for img in &images_refs {
-                    self.append_image(img)?;
-                }
-                if let Some(text) = text_content {
-                    self.append_text(text)?;
-                }
-                return Ok(());
-            }
-        }
+        let initial_pos = self.current_pos;
+        let initial_history_len = self.token_history.len();
+        let initial_logits = self.last_logits.clone();
+        let initial_prefill_tokens = self.prefill_tokens;
+        let initial_prefill_elapsed = self.prefill_elapsed;
 
-        // 3. Text-only input:
-        if let Some(text) = text_content {
-            if self.tokenizer.chat_template().is_some() {
-                let rendered = crate::tokenizer::apply_chat_template(
-                    &self.tokenizer,
-                    &[crate::tokenizer::ChatMessage {
-                        role: "user".to_string(),
-                        content: text.to_string(),
-                    }],
-                    true,
-                )
-                .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
-                self.append_text(&rendered)?;
-            } else {
-                self.append_text(text)?;
+        let run_append = |this: &mut Self| -> Result<(), CeraError> {
+            // 1. Audio input:
+            if let Some(audio) = &message.audio {
+                if this.tokenizer.chat_template().is_some() {
+                    let (marker_id, marker_name) =
+                        crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
+                            .into_iter()
+                            .find_map(|name| {
+                                this.tokenizer.special_token_id(name).map(|id| (id, name))
+                            })
+                            .ok_or_else(|| {
+                                CeraError::Backend(
+                                "no audio marker special token (<|reserved_4|>..7) in tokenizer"
+                                    .to_string(),
+                            )
+                            })?;
+
+                    let user_content = match text_content {
+                        Some(text) => format!("{marker_name}\n{text}"),
+                        None => marker_name.to_string(),
+                    };
+
+                    let rendered = crate::tokenizer::apply_chat_template(
+                        &this.tokenizer,
+                        &[crate::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: user_content,
+                        }],
+                        true,
+                    )
+                    .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+
+                    let toks = this.tokenizer.encode(&rendered);
+                    let split = crate::engine::CeraEngine::split_tokens_at_marker(
+                        &toks,
+                        marker_id,
+                        marker_name,
+                    )?;
+
+                    if split > 0 {
+                        this.append_tokens(&toks[..split])?;
+                    }
+                    this.append_audio(&audio.pcm, audio.sample_rate)?;
+                    if split + 1 < toks.len() {
+                        this.append_tokens(&toks[split + 1..])?;
+                    }
+                    return Ok(());
+                } else {
+                    this.append_audio(&audio.pcm, audio.sample_rate)?;
+                }
             }
+
+            // 2. Vision input:
+            if has_images {
+                let images_refs: Vec<&[u8]> = message.images.iter().map(|v| v.as_slice()).collect();
+                if this.tokenizer.chat_template().is_some() {
+                    let mut content = Vec::with_capacity(message.images.len() + 1);
+                    for _ in &message.images {
+                        content.push(crate::tokenizer::ContentItem::Image);
+                    }
+                    if let Some(text) = text_content {
+                        content.push(crate::tokenizer::ContentItem::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    let messages = [crate::tokenizer::ChatMessageMultimodal {
+                        role: "user".to_string(),
+                        content,
+                    }];
+                    return this.append_chat_with_images(&messages, &images_refs, true);
+                } else {
+                    for img in &images_refs {
+                        this.append_image(img)?;
+                    }
+                    if let Some(text) = text_content {
+                        this.append_text(text)?;
+                    }
+                    return Ok(());
+                }
+            }
+
+            // 3. Text-only input:
+            if let Some(text) = text_content {
+                if this.tokenizer.chat_template().is_some() {
+                    let rendered = crate::tokenizer::apply_chat_template(
+                        &this.tokenizer,
+                        &[crate::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: text.to_string(),
+                        }],
+                        true,
+                    )
+                    .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+                    this.append_text(&rendered)?;
+                } else {
+                    this.append_text(text)?;
+                }
+            }
+
+            Ok(())
+        };
+
+        if let Err(err) = run_append(self) {
+            self.model.truncate_kv(&mut self.state, initial_pos);
+            self.current_pos = initial_pos;
+            self.position_atomic
+                .store(initial_pos as u32, std::sync::atomic::Ordering::Relaxed);
+            self.token_history.truncate(initial_history_len);
+            self.last_logits = initial_logits;
+            self.prefill_tokens = initial_prefill_tokens;
+            self.prefill_elapsed = initial_prefill_elapsed;
+            return Err(err);
         }
 
         Ok(())

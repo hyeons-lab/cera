@@ -1573,6 +1573,7 @@ pub struct GenerateOutput {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AudioInput {
     pub pcm: Vec<f32>,
+    #[uniffi(default = 16000)]
     pub sample_rate: u32,
 }
 
@@ -1588,8 +1589,11 @@ impl From<AudioInput> for cera::tokenizer::AudioInput {
 /// User-facing multimodal input envelope.
 #[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct UserMessage {
+    #[uniffi(default = None)]
     pub text: Option<String>,
+    #[uniffi(default = [])]
     pub images: Vec<Vec<u8>>,
+    #[uniffi(default = None)]
     pub audio: Option<AudioInput>,
 }
 
@@ -1651,38 +1655,24 @@ const OPEN_THOUGHT_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"
 const CLOSE_THOUGHT_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
 
 fn find_thought_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
-    let mut earliest: Option<(usize, &'a str)> = None;
-    for &tag in tags {
-        if let Some(pos) = text.find(tag) {
-            match earliest {
-                Some((min_pos, _)) if pos < min_pos => {
-                    earliest = Some((pos, tag));
-                }
-                None => {
-                    earliest = Some((pos, tag));
-                }
-                _ => {}
-            }
-        }
-    }
-    earliest
+    tags.iter()
+        .filter_map(|&tag| text.find(tag).map(|pos| (pos, tag)))
+        .min_by_key(|&(pos, _)| pos)
 }
 
 fn thought_partial_suffix_len(text: &str, tags: &[&str]) -> usize {
-    let mut max_len = 0;
-    let start = text.len().saturating_sub(32);
-    for (i, _) in text.char_indices() {
-        if i < start {
-            continue;
-        }
-        let suffix = &text[i..];
-        for &tag in tags {
-            if tag.starts_with(suffix) && suffix.len() < tag.len() {
-                max_len = max_len.max(suffix.len());
+    let max_tag_len = tags.iter().map(|t| t.len()).max().unwrap_or(0);
+    let max_check = (max_tag_len.saturating_sub(1)).min(text.len());
+    for len in (1..=max_check).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) {
+            let suffix = &text[start..];
+            if tags.iter().any(|t| t.starts_with(suffix)) {
+                return len;
             }
         }
     }
-    max_len
+    0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1759,9 +1749,21 @@ struct ForeignSinkAdapter {
     pending_bytes: Vec<u8>,
     parser: StreamingThinkingParser,
     done_called: bool,
+    done_reason: Option<FinishReason>,
 }
 
 impl ForeignSinkAdapter {
+    fn new(inner: Arc<dyn ModalitySink>, tokenizer: Arc<cera::tokenizer::BpeTokenizer>) -> Self {
+        Self {
+            inner,
+            tokenizer,
+            pending_bytes: Vec::new(),
+            parser: StreamingThinkingParser::new(),
+            done_called: false,
+            done_reason: None,
+        }
+    }
+
     fn emit_chunk(&self, is_thought: bool, text: String) {
         if !text.is_empty() {
             if is_thought {
@@ -1769,6 +1771,29 @@ impl ForeignSinkAdapter {
             } else {
                 self.inner.on_text_chunk(text);
             }
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending_bytes.is_empty() {
+            let piece = String::from_utf8_lossy(&self.pending_bytes);
+            if !piece.is_empty() {
+                for (is_thought, text) in self.parser.feed(&piece) {
+                    self.emit_chunk(is_thought, text);
+                }
+            }
+            self.pending_bytes.clear();
+        }
+        if let Some((is_thought, text)) = self.parser.flush() {
+            self.emit_chunk(is_thought, text);
+        }
+    }
+
+    fn notify_done(&mut self, fallback: Option<FinishReason>) {
+        if let Some(reason) = self.done_reason.take() {
+            self.inner.on_done(reason);
+        } else if let Some(fallback_reason) = fallback {
+            self.inner.on_done(fallback_reason);
         }
     }
 }
@@ -1816,20 +1841,9 @@ impl cera::ModalitySink for ForeignSinkAdapter {
         self.inner.on_audio_frames(pcm.to_vec(), sample_rate);
     }
     fn on_done(&mut self, reason: cera::FinishReason) {
-        if !self.pending_bytes.is_empty() {
-            let piece = String::from_utf8_lossy(&self.pending_bytes);
-            if !piece.is_empty() {
-                for (is_thought, text) in self.parser.feed(&piece) {
-                    self.emit_chunk(is_thought, text);
-                }
-            }
-            self.pending_bytes.clear();
-        }
-        if let Some((is_thought, text)) = self.parser.flush() {
-            self.emit_chunk(is_thought, text);
-        }
+        self.flush_pending();
         self.done_called = true;
-        self.inner.on_done(reason.into());
+        self.done_reason = Some(reason.into());
     }
 }
 
@@ -1950,6 +1964,17 @@ fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
         }
         bytes
     }
+}
+
+/// Collector sink: captures every token the decode loop emits.
+/// Used by synchronous `generate` and `send_message_and_generate`.
+struct TokenCollectSink(Vec<u32>);
+
+impl cera::ModalitySink for TokenCollectSink {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        self.0.extend_from_slice(tokens);
+    }
+    fn on_done(&mut self, _reason: cera::FinishReason) {}
 }
 
 #[uniffi::export]
@@ -2185,18 +2210,7 @@ impl Session {
     /// summary. Synchronous: the call blocks until the decode loop exits
     /// (`max_tokens`, EOS, `cancel()`, or error).
     pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError> {
-        // Collector sink: captures every token the decode loop emits.
-        // `on_done` is invoked once at the end regardless of exit
-        // reason; we read the Result from `session.generate` to see
-        // whether the run succeeded.
-        struct CollectSink(Vec<u32>);
-        impl cera::ModalitySink for CollectSink {
-            fn on_text_tokens(&mut self, tokens: &[u32]) {
-                self.0.extend_from_slice(tokens);
-            }
-            fn on_done(&mut self, _reason: cera::FinishReason) {}
-        }
-        let mut sink = CollectSink(Vec::new());
+        let mut sink = TokenCollectSink(Vec::new());
         // Compile the grammar (if any) before taking the session lock so a
         // malformed GBNF fails fast with `FfiError::GrammarParse`.
         let core: cera::GenerateOpts = opts.try_into()?;
@@ -2249,34 +2263,47 @@ impl Session {
         let outcome = match cera::GenerateOpts::try_from(opts) {
             Ok(core) => match self.lock_inner() {
                 Ok(mut guard) => {
-                    let mut adapter = ForeignSinkAdapter {
-                        inner: sink,
-                        tokenizer: guard.tokenizer_arc(),
-                        pending_bytes: Vec::new(),
-                        parser: StreamingThinkingParser::new(),
-                        done_called: false,
-                    };
+                    let mut adapter = ForeignSinkAdapter::new(sink, guard.tokenizer_arc());
                     let result = guard.generate(&core, &mut adapter).map_err(FfiError::from);
-                    (result, adapter.done_called, adapter.inner)
+                    drop(guard);
+                    (result, Some(adapter), None)
                 }
-                Err(e) => (Err(e), false, sink),
+                Err(e) => (Err(e), None, Some(sink)),
             },
-            Err(e) => (Err(e), false, sink),
+            Err(e) => (Err(e), None, Some(sink)),
         };
         match outcome {
-            (Ok(summary), _, _) => Ok(summary.into()),
-            (Err(err), done_called, inner) => {
-                if !done_called {
+            (Ok(summary), Some(mut adapter), _) => {
+                adapter.notify_done(None);
+                Ok(summary.into())
+            }
+            (Err(err), Some(mut adapter), _) => {
+                if !adapter.done_called {
+                    adapter.flush_pending();
                     let finish_reason = match &err {
                         FfiError::Cancelled => FinishReason::Cancelled,
                         _ => FinishReason::Error {
                             message: err.to_string(),
                         },
                     };
-                    inner.on_done(finish_reason);
+                    adapter.notify_done(Some(finish_reason));
+                } else {
+                    adapter.notify_done(None);
                 }
                 Err(err)
             }
+            (Err(err), None, Some(inner)) => {
+                let finish_reason = match &err {
+                    FfiError::Cancelled => FinishReason::Cancelled,
+                    _ => FinishReason::Error {
+                        message: err.to_string(),
+                    },
+                };
+                inner.on_done(finish_reason);
+                Err(err)
+            }
+            (Err(err), None, None) => Err(err),
+            (Ok(_), None, _) => unreachable!(),
         }
     }
 
@@ -2300,14 +2327,7 @@ impl Session {
         let mut guard = self.lock_inner()?;
         guard.append_user_message(&core_msg)?;
 
-        struct CollectSink(Vec<u32>);
-        impl cera::ModalitySink for CollectSink {
-            fn on_text_tokens(&mut self, tokens: &[u32]) {
-                self.0.extend_from_slice(tokens);
-            }
-            fn on_done(&mut self, _reason: cera::FinishReason) {}
-        }
-        let mut sink = CollectSink(Vec::new());
+        let mut sink = TokenCollectSink(Vec::new());
         let summary = guard.generate(&core_opts, &mut sink)?;
         let text = guard.tokenizer().decode(&sink.0);
         Ok(GenerateOutput {
@@ -2345,6 +2365,7 @@ impl Session {
             }
         };
         if let Err(err) = guard.append_user_message(&core_msg) {
+            drop(guard);
             let ffi_err = FfiError::from(err);
             let finish_reason = match &ffi_err {
                 FfiError::Cancelled => FinishReason::Cancelled,
@@ -2356,27 +2377,28 @@ impl Session {
             return Err(ffi_err);
         }
 
-        let mut adapter = ForeignSinkAdapter {
-            inner: sink,
-            tokenizer: guard.tokenizer_arc(),
-            pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
-            done_called: false,
-        };
+        let mut adapter = ForeignSinkAdapter::new(sink, guard.tokenizer_arc());
         let result = guard
             .generate(&core_opts, &mut adapter)
             .map_err(FfiError::from);
+        drop(guard);
         match result {
-            Ok(summary) => Ok(summary.into()),
+            Ok(summary) => {
+                adapter.notify_done(None);
+                Ok(summary.into())
+            }
             Err(err) => {
                 if !adapter.done_called {
+                    adapter.flush_pending();
                     let finish_reason = match &err {
                         FfiError::Cancelled => FinishReason::Cancelled,
                         _ => FinishReason::Error {
                             message: err.to_string(),
                         },
                     };
-                    adapter.inner.on_done(finish_reason);
+                    adapter.notify_done(Some(finish_reason));
+                } else {
+                    adapter.notify_done(None);
                 }
                 Err(err)
             }
@@ -3692,13 +3714,8 @@ mod tests {
         let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vocab));
 
         let recorder: Arc<Recorder> = Arc::new(Recorder::default());
-        let mut adapter = ForeignSinkAdapter {
-            inner: recorder.clone() as Arc<dyn ModalitySink>,
-            tokenizer,
-            pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
-            done_called: false,
-        };
+        let mut adapter =
+            ForeignSinkAdapter::new(recorder.clone() as Arc<dyn ModalitySink>, tokenizer);
 
         // Drive the adapter as cera's decode loop would.
         adapter.on_text_tokens(&[0, 1]);
@@ -3711,6 +3728,7 @@ mod tests {
 
         adapter.on_audio_frames(&[0.1, 0.2, 0.3], 24_000);
         adapter.on_done(cera::FinishReason::MaxTokens);
+        adapter.notify_done(None);
 
         let audio = recorder.audio.lock().unwrap();
         assert_eq!(audio.len(), 1);
@@ -3817,13 +3835,7 @@ mod tests {
 
         let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vec![]));
         let recorder: Arc<Recorder> = Arc::new(Recorder::default());
-        let adapter = ForeignSinkAdapter {
-            inner: recorder.clone() as Arc<dyn ModalitySink>,
-            tokenizer,
-            pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
-            done_called: false,
-        };
+        let adapter = ForeignSinkAdapter::new(recorder.clone() as Arc<dyn ModalitySink>, tokenizer);
 
         // Simulate the error-branch logic: never forwarded on_done,
         // so the wrapper should synthesize one.
@@ -3838,13 +3850,9 @@ mod tests {
         // And the double-fire guard: if done_called were already true,
         // the wrapper must skip synthesis.
         let tokenizer2 = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vec![]));
-        let adapter_already_done = ForeignSinkAdapter {
-            inner: recorder.clone() as Arc<dyn ModalitySink>,
-            tokenizer: tokenizer2,
-            pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
-            done_called: true,
-        };
+        let mut adapter_already_done =
+            ForeignSinkAdapter::new(recorder.clone() as Arc<dyn ModalitySink>, tokenizer2);
+        adapter_already_done.done_called = true;
         if !adapter_already_done.done_called {
             adapter_already_done
                 .inner

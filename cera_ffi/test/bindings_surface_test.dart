@@ -178,6 +178,17 @@ void Function(CeraEngine) get _surfaceGuard => (CeraEngine engine) {
   engine.toolFormat();
 };
 
+final class _TestModalitySink implements ModalitySink {
+  @override
+  void onThoughtChunk(String text) {}
+  @override
+  void onTextChunk(String text) {}
+  @override
+  void onAudioFrames(List<double> pcm, int sampleRate) {}
+  @override
+  void onDone(FinishReason reason) {}
+}
+
 /// The same guard for `Session`, which the RustBuffer regression hit just as
 /// hard as `CeraEngine`. The `hiddenStates*` trio is the reason this matters
 /// beyond "it throws": those three went from throwing to returning *corrupt*
@@ -187,10 +198,18 @@ void Function(Session) get _sessionSurfaceGuard => (Session session) {
   // Record returns.
   session.capabilities();
   session.generate(const GenerateOpts());
+  final sink = _TestModalitySink();
+  session.generateStreaming(const GenerateOpts(), sink);
+  session.generateStreamingAsync(const GenerateOpts(), sink);
   session.sendMessage(const UserMessage(text: '', images: [], audio: null));
   session.sendMessageAndGenerate(
     const UserMessage(text: '', images: [], audio: null),
     const GenerateOpts(),
+  );
+  session.sendMessageStreaming(
+    const UserMessage(text: '', images: [], audio: null),
+    const GenerateOpts(),
+    sink,
   );
   // `Vec<u8>` / `Vec<f32>` returns.
   session.hiddenStatesForText('');

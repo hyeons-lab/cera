@@ -7154,7 +7154,7 @@ public object FfiConverterTypeSession : FfiConverter<Session, Long> {
  */
 data class AudioInput(
     var `pcm`: List<kotlin.Float>,
-    var `sampleRate`: kotlin.UInt,
+    var `sampleRate`: kotlin.UInt = 16000u,
 ) {
     companion object
 }
@@ -7933,9 +7933,9 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
  * User-facing multimodal input envelope.
  */
 data class UserMessage(
-    var `text`: kotlin.String?,
-    var `images`: List<kotlin.ByteArray>,
-    var `audio`: AudioInput?,
+    var `text`: kotlin.String? = null,
+    var `images`: List<kotlin.ByteArray> = listOf(),
+    var `audio`: AudioInput? = null,
 ) {
     companion object
 }

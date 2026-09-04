@@ -9,7 +9,6 @@ import uniffi.cera_ffi.CeraEngine
 import uniffi.cera_ffi.DownloadProgressSink
 import uniffi.cera_ffi.EngineConfig
 import uniffi.cera_ffi.LeapBundleEntry
-import uniffi.cera_ffi.listLeapBundles
 import uniffi.cera_ffi.listLeapBundlesAsync
 
 /**
@@ -72,14 +71,12 @@ object AndroidBundleRepo {
     ): Boolean = withContext(Dispatchers.IO) {
         val root = java.io.File(storeDir)
         if (!root.exists() || !root.isDirectory) return@withContext false
-        val cleanQuant = quant.lowercase()
+        val cleanQuant = quant.split('+', ' ').first().trim().lowercase()
         val cleanId = bundleId.lowercase().substringAfterLast('/')
         root.walkTopDown().any { file ->
             file.isFile &&
                 file.name.endsWith(".gguf", ignoreCase = true) &&
-                file.length() >= 10 * 1024 * 1024L &&
-                !file.name.endsWith(".partial") &&
-                !file.name.endsWith(".sha256") &&
+                file.length() > 0L &&
                 file.absolutePath.lowercase().contains(cleanId) &&
                 file.name.lowercase().contains(cleanQuant)
         }

@@ -99,7 +99,7 @@ const _sentinel = Object();
 class AudioInput {
   const AudioInput({
     required this.pcm,
-    required this.sampleRate,
+    this.sampleRate = 16000,
   });
 
   final List<double> pcm;
@@ -115,7 +115,7 @@ class AudioInput {
   factory AudioInput.fromJson(Map<String, dynamic> json) {
     return AudioInput(
       pcm: (json['pcm'] as List).map((item) => (item as num).toDouble()).toList(),
-      sampleRate: (json['sampleRate'] as num).toInt(),
+      sampleRate: json.containsKey('sampleRate') ? (json['sampleRate'] as num).toInt() : 16000,
     );
   }
 
@@ -1132,9 +1132,9 @@ class ToolDef {
 /// User-facing multimodal input envelope.
 class UserMessage {
   const UserMessage({
-    required this.text,
-    required this.images,
-    required this.audio,
+    this.text = null,
+    this.images = const [],
+    this.audio = null,
   });
 
   final String? text;
@@ -1151,9 +1151,9 @@ class UserMessage {
 
   factory UserMessage.fromJson(Map<String, dynamic> json) {
     return UserMessage(
-      text: json['text'] == null ? null : json['text'] as String,
-      images: (json['images'] as List).map((item) => base64Decode(item as String)).toList(),
-      audio: json['audio'] == null ? null : (() { final __tmp = json['audio']; return AudioInput.fromJson(__tmp as Map<String, dynamic>); })(),
+      text: json.containsKey('text') ? json['text'] == null ? null : json['text'] as String : null,
+      images: json.containsKey('images') ? (json['images'] as List).map((item) => base64Decode(item as String)).toList() : const [],
+      audio: json.containsKey('audio') ? json['audio'] == null ? null : (() { final __tmp = json['audio']; return AudioInput.fromJson(__tmp as Map<String, dynamic>); })() : null,
     );
   }
 

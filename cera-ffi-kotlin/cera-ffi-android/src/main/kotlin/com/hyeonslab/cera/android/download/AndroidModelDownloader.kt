@@ -102,7 +102,7 @@ class AndroidModelDownloader(
                     is DownloadState.Error -> {
                         if (state.bundleId == bundleId) {
                             send(state)
-                            close(state.cause)
+                            close()
                         }
                     }
                     is DownloadState.Idle -> { }

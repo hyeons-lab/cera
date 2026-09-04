@@ -3948,7 +3948,7 @@ public struct AudioInput: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(pcm: [Float], sampleRate: UInt32) {
+    public init(pcm: [Float], sampleRate: UInt32 = UInt32(16000)) {
         self.pcm = pcm
         self.sampleRate = sampleRate
     }
@@ -5127,7 +5127,7 @@ public struct UserMessage: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(text: String?, images: [Data], audio: AudioInput?) {
+    public init(text: String? = nil, images: [Data] = [], audio: AudioInput? = nil) {
         self.text = text
         self.images = images
         self.audio = audio

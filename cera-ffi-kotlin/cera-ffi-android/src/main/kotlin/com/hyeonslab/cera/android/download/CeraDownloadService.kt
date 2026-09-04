@@ -14,12 +14,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.cera_ffi.BundleRepo
 import uniffi.cera_ffi.DownloadProgressSink
 
@@ -38,9 +40,14 @@ class CeraDownloadService : Service() {
         fun getService(): CeraDownloadService = this@CeraDownloadService
     }
 
+    private var activeBundleId: String? = null
+    private var activeQuant: String? = null
+    private var latestStartId: Int = 0
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId = startId
         val bundleId = intent?.getStringExtra(EXTRA_BUNDLE_ID)
         val quant = intent?.getStringExtra(EXTRA_QUANT) ?: "Q4_0"
         val storeDir = intent?.getStringExtra(EXTRA_STORE_DIR)
@@ -55,7 +62,14 @@ class CeraDownloadService : Service() {
     }
 
     private fun startModelDownload(bundleId: String, quant: String, storeDir: String, startId: Int) {
+        latestStartId = startId
+        if (downloadJob?.isActive == true && activeBundleId == bundleId && activeQuant == quant) {
+            return
+        }
         downloadJob?.cancel()
+        activeBundleId = bundleId
+        activeQuant = quant
+
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel(notificationManager)
 
@@ -66,25 +80,43 @@ class CeraDownloadService : Service() {
             indeterminate = true
         )
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                notificationConfig.notificationId,
-                initialNotification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    notificationConfig.notificationId,
+                    initialNotification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(notificationConfig.notificationId, initialNotification)
+            }
+        } catch (e: Exception) {
+            _downloadState.tryEmit(
+                DownloadState.Error(
+                    bundleId = bundleId,
+                    message = "Failed to start foreground service: ${e.message}",
+                    cause = e
+                )
             )
-        } else {
-            startForeground(notificationConfig.notificationId, initialNotification)
+            stopSelf(startId)
+            return
         }
 
         downloadJob = serviceScope.launch {
             try {
-                _downloadState.tryEmit(DownloadState.Connecting(bundleId, ""))
+                _downloadState.emit(DownloadState.Connecting(bundleId, ""))
 
                 val sink = object : DownloadProgressSink {
+                    private var lastUrl: String? = null
                     private var lastPercent: Int? = null
                     private var lastBytes: ULong = 0u
 
                     override fun onProgress(url: String, bytesDownloaded: ULong, totalBytes: ULong?) {
+                        if (url != lastUrl) {
+                            lastUrl = url
+                            lastPercent = null
+                            lastBytes = 0u
+                        }
                         val percent = totalBytes?.let {
                             if (it > 0u) ((bytesDownloaded * 100u) / it).toInt() else null
                         }
@@ -125,12 +157,15 @@ class CeraDownloadService : Service() {
                 // Download bundle files directly without allocating an engine
                 repo.downloadBundle(bundleId, quant)
 
-                _downloadState.tryEmit(DownloadState.Success(bundleId, quant, storeDir))
+                _downloadState.emit(DownloadState.Success(bundleId, quant, storeDir))
             } catch (t: Throwable) {
+                withContext(NonCancellable) {
+                    val message = if (t is CancellationException) "Download cancelled" else (t.message ?: "Download failed")
+                    _downloadState.emit(DownloadState.Error(bundleId, message, t))
+                }
                 if (t is CancellationException) {
                     throw t
                 }
-                _downloadState.tryEmit(DownloadState.Error(bundleId, t.message ?: "Download failed", t))
             } finally {
                 val thisJob = coroutineContext[Job]
                 if (thisJob?.isCancelled != true && downloadJob === thisJob) {
@@ -139,7 +174,7 @@ class CeraDownloadService : Service() {
                     } else {
                         stopForeground(STOP_FOREGROUND_DETACH)
                     }
-                    stopSelf(startId)
+                    stopSelf(latestStartId)
                 }
             }
         }
@@ -173,6 +208,8 @@ class CeraDownloadService : Service() {
 
     override fun onDestroy() {
         serviceScope.cancel()
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        notificationManager?.cancel(notificationConfig.notificationId)
         super.onDestroy()
     }
 
@@ -181,7 +218,8 @@ class CeraDownloadService : Service() {
 
         private val _downloadState = MutableSharedFlow<DownloadState>(
             replay = 0,
-            extraBufferCapacity = 64
+            extraBufferCapacity = 64,
+            onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
         )
         val downloadState: SharedFlow<DownloadState> = _downloadState.asSharedFlow()
 
