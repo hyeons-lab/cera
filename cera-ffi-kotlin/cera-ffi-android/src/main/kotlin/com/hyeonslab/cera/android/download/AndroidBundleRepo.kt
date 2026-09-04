@@ -75,7 +75,9 @@ object AndroidBundleRepo {
         val cleanQuant = quant.lowercase()
         val cleanId = bundleId.lowercase().substringAfterLast('/')
         root.walkTopDown().any { file ->
-            file.isFile && file.length() > 0L &&
+            file.isFile &&
+                file.name.endsWith(".gguf", ignoreCase = true) &&
+                file.length() >= 10 * 1024 * 1024L &&
                 !file.name.endsWith(".partial") &&
                 !file.name.endsWith(".sha256") &&
                 file.absolutePath.lowercase().contains(cleanId) &&

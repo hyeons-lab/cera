@@ -866,6 +866,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle(): Int
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(): Int
@@ -1057,6 +1059,13 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_bundlerepo_clear_cache(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(
+        `ptr`: Long,
+        `bundleId`: RustBuffer.ByValue,
+        `quant`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1830,6 +1839,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1998,10 +2010,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 1595) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 40181) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
@@ -2627,6 +2639,15 @@ public interface BundleRepoInterface {
     fun `clearCache`()
 
     /**
+     * Download all assets for a bundle ID and quantization to the local cache
+     * without loading model weights into memory or creating an engine.
+     */
+    fun `downloadBundle`(
+        `bundleId`: kotlin.String,
+        `quant`: kotlin.String,
+    )
+
+    /**
      * The directory this repo caches bundles under. Matches what was
      * passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
      * useful for log / telemetry.
@@ -2813,6 +2834,25 @@ open class BundleRepo :
                 )
             }
         }
+
+    /**
+     * Download all assets for a bundle ID and quantization to the local cache
+     * without loading model weights into memory or creating an engine.
+     */
+    @Throws(FfiException::class)
+    override fun `downloadBundle`(
+        `bundleId`: kotlin.String,
+        `quant`: kotlin.String,
+    ) = callWithHandle {
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(
+                it,
+                FfiConverterString.lower(`bundleId`),
+                FfiConverterString.lower(`quant`),
+                _status,
+            )
+        }
+    }
 
     /**
      * The directory this repo caches bundles under. Matches what was
@@ -6277,7 +6317,8 @@ public interface SessionInterface {
     fun `sendMessage`(`message`: UserMessage)
 
     /**
-     * Append a multimodal message and run generation synchronously.
+     * Append a multimodal message and run generation synchronously while holding
+     * the session lock continuously across prefill and decode.
      */
     fun `sendMessageAndGenerate`(
         `message`: UserMessage,
@@ -6285,7 +6326,8 @@ public interface SessionInterface {
     ): GenerateOutput
 
     /**
-     * Append a multimodal message and run streaming generation.
+     * Append a multimodal message and run streaming generation while holding
+     * the session lock continuously across prefill and decode.
      */
     fun `sendMessageStreaming`(
         `message`: UserMessage,
@@ -7014,7 +7056,8 @@ open class Session :
         }
 
     /**
-     * Append a multimodal message and run generation synchronously.
+     * Append a multimodal message and run generation synchronously while holding
+     * the session lock continuously across prefill and decode.
      */
     @Throws(FfiException::class)
     override fun `sendMessageAndGenerate`(
@@ -7035,7 +7078,8 @@ open class Session :
         )
 
     /**
-     * Append a multimodal message and run streaming generation.
+     * Append a multimodal message and run streaming generation while holding
+     * the session lock continuously across prefill and decode.
      */
     @Throws(FfiException::class)
     override fun `sendMessageStreaming`(

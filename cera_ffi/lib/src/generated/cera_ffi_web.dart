@@ -2692,6 +2692,10 @@ final class BundleRepo {
   /// action is user-driven.
   void clearCache() => _unsupportedOnWeb('BundleRepo.clearCache');
 
+  /// Download all assets for a bundle ID and quantization to the local cache
+  /// without loading model weights into memory or creating an engine.
+  void downloadBundle(String bundleId, String quant) => _unsupportedOnWeb('BundleRepo.downloadBundle');
+
   /// The directory this repo caches bundles under. Matches what was
   /// passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
   /// useful for log / telemetry.
@@ -3494,10 +3498,12 @@ final class Session {
   /// media ordering, boundary token envelopes, and sample rate normalization.
   void sendMessage(UserMessage message) => _unsupportedOnWeb('Session.sendMessage');
 
-  /// Append a multimodal message and run generation synchronously.
+  /// Append a multimodal message and run generation synchronously while holding
+  /// the session lock continuously across prefill and decode.
   GenerateOutput sendMessageAndGenerate(UserMessage message, GenerateOpts opts) => _unsupportedOnWeb('Session.sendMessageAndGenerate');
 
-  /// Append a multimodal message and run streaming generation.
+  /// Append a multimodal message and run streaming generation while holding
+  /// the session lock continuously across prefill and decode.
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended

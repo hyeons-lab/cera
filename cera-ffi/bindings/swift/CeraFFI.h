@@ -329,6 +329,11 @@ uint64_t uniffi_cera_ffi_fn_method_bundlerepo_cache_size(uint64_t ptr, RustCallS
 void uniffi_cera_ffi_fn_method_bundlerepo_clear_cache(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+void uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(uint64_t ptr, RustBuffer bundle_id, RustBuffer quant, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
 RustBuffer uniffi_cera_ffi_fn_method_bundlerepo_store_dir(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -1131,6 +1136,12 @@ uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CLEAR_CACHE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CLEAR_CACHE
 uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle(void
     
 );
 #endif

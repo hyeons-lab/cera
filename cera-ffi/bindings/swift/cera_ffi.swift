@@ -626,6 +626,12 @@ public protocol BundleRepoProtocol: AnyObject, Sendable {
     func clearCache() throws 
     
     /**
+     * Download all assets for a bundle ID and quantization to the local cache
+     * without loading model weights into memory or creating an engine.
+     */
+    func downloadBundle(bundleId: String, quant: String) throws 
+    
+    /**
      * The directory this repo caches bundles under. Matches what was
      * passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
      * useful for log / telemetry.
@@ -778,6 +784,19 @@ open func cacheSize()throws  -> UInt64  {
 open func clearCache()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_bundlerepo_clear_cache(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Download all assets for a bundle ID and quantization to the local cache
+     * without loading model weights into memory or creating an engine.
+     */
+open func downloadBundle(bundleId: String, quant: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(bundleId),
+        FfiConverterString.lower(quant),$0
     )
 }
 }
@@ -3242,12 +3261,14 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func sendMessage(message: UserMessage) throws 
     
     /**
-     * Append a multimodal message and run generation synchronously.
+     * Append a multimodal message and run generation synchronously while holding
+     * the session lock continuously across prefill and decode.
      */
     func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts) throws  -> GenerateOutput
     
     /**
-     * Append a multimodal message and run streaming generation.
+     * Append a multimodal message and run streaming generation while holding
+     * the session lock continuously across prefill and decode.
      */
     func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
     
@@ -3824,7 +3845,8 @@ open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiCo
 }
     
     /**
-     * Append a multimodal message and run generation synchronously.
+     * Append a multimodal message and run generation synchronously while holding
+     * the session lock continuously across prefill and decode.
      */
 open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -3837,7 +3859,8 @@ open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws
 }
     
     /**
-     * Append a multimodal message and run streaming generation.
+     * Append a multimodal message and run streaming generation while holding
+     * the session lock continuously across prefill and decode.
      */
 open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -6734,6 +6757,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6902,10 +6928,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 1595) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 40181) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {

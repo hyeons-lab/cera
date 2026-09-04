@@ -1857,7 +1857,50 @@ impl Session {
 
         // 1. Audio input:
         if let Some(audio) = &message.audio {
-            self.append_audio(&audio.pcm, audio.sample_rate)?;
+            if !has_images && self.tokenizer.chat_template().is_some() {
+                let (marker_id, marker_name) = crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
+                    .into_iter()
+                    .find_map(|name| self.tokenizer.special_token_id(name).map(|id| (id, name)))
+                    .ok_or_else(|| {
+                        CeraError::Backend(
+                            "no audio marker special token (<|reserved_4|>..7) in tokenizer"
+                                .to_string(),
+                        )
+                    })?;
+
+                let user_content = match text_content {
+                    Some(text) => format!("{marker_name}\n{text}"),
+                    None => marker_name.to_string(),
+                };
+
+                let rendered = crate::tokenizer::apply_chat_template(
+                    &self.tokenizer,
+                    &[crate::tokenizer::ChatMessage {
+                        role: "user".to_string(),
+                        content: user_content,
+                    }],
+                    true,
+                )
+                .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+
+                let toks = self.tokenizer.encode(&rendered);
+                let split = crate::engine::CeraEngine::split_tokens_at_marker(
+                    &toks,
+                    marker_id,
+                    marker_name,
+                )?;
+
+                if split > 0 {
+                    self.append_tokens(&toks[..split])?;
+                }
+                self.append_audio(&audio.pcm, audio.sample_rate)?;
+                if split + 1 < toks.len() {
+                    self.append_tokens(&toks[split + 1..])?;
+                }
+                return Ok(());
+            } else {
+                self.append_audio(&audio.pcm, audio.sample_rate)?;
+            }
         }
 
         // 2. Vision input:

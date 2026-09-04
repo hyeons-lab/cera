@@ -300,6 +300,7 @@ class _NativeCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     _ensureOpen();
@@ -374,6 +375,7 @@ class _NativeCera implements Cera {
         emit: (piece) {
           if (!controller.isClosed) controller.add(piece);
         },
+        onThought: onThought,
         onAudio: onAudio,
         isOpen: () => !_closed,
         done: (error) {
@@ -657,6 +659,7 @@ class _NativeCera implements Cera {
 class _StreamingSink implements ModalitySink {
   _StreamingSink({
     required this.emit,
+    this.onThought,
     this.onAudio,
     required this.isOpen,
     required this.done,
@@ -664,6 +667,9 @@ class _StreamingSink implements ModalitySink {
 
   /// Receives each new fragment of text.
   final void Function(String) emit;
+
+  /// Receives thinking tokens when available.
+  final void Function(String)? onThought;
 
   /// Receives raw Float32 PCM audio chunks when model is in audio mode.
   final void Function(List<double> pcm, int sampleRate)? onAudio;
@@ -677,7 +683,10 @@ class _StreamingSink implements ModalitySink {
   bool _finished = false;
 
   @override
-  void onThoughtChunk(String text) {}
+  void onThoughtChunk(String text) {
+    if (text.isEmpty || _finished || !isOpen()) return;
+    onThought?.call(text);
+  }
 
   @override
   void onTextChunk(String text) {

@@ -41,9 +41,11 @@
 //! multi-GB GGUFs). Missing or mismatched sidecars fall back to a full
 //! `sha256_file` pass, which also repairs the sidecar on success.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -215,11 +217,68 @@ pub(crate) fn partial_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Extract total file size from `Content-Range: bytes <start>-<end>/<total>`.
-fn extract_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+static ACTIVE_DOWNLOADS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// RAII guard ensuring at most one active download to a given destination in this process.
+struct ActiveDownloadGuard {
+    path: PathBuf,
+}
+
+impl ActiveDownloadGuard {
+    fn acquire(path: &Path) -> Result<Self, CeraError> {
+        let canon = if path.exists() {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
+            parent
+                .canonicalize()
+                .map(|p| p.join(path.file_name().unwrap_or_default()))
+                .unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
+        let mut active = match ACTIVE_DOWNLOADS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !active.insert(canon.clone()) {
+            return Err(CeraError::Backend(format!(
+                "download for {} is already in progress in this process",
+                path.display()
+            )));
+        }
+        Ok(Self { path: canon })
+    }
+}
+
+impl Drop for ActiveDownloadGuard {
+    fn drop(&mut self) {
+        let mut active = match ACTIVE_DOWNLOADS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        active.remove(&self.path);
+    }
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<total>`.
+/// Returns `Some((start, end, total))` where `total` is `None` for wildcard `*`.
+pub(crate) fn parse_content_range(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<(u64, u64, Option<u64>)> {
     let header_val = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
-    let total_str = header_val.split('/').nth(1)?;
-    total_str.trim().parse::<u64>().ok()
+    let trimmed = header_val.trim();
+    let bytes_spec = trimmed.strip_prefix("bytes ")?.trim();
+    let (range_part, total_part) = bytes_spec.split_once('/')?;
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start = start_str.trim().parse::<u64>().ok()?;
+    let end = end_str.trim().parse::<u64>().ok()?;
+    let total = if total_part.trim() == "*" {
+        None
+    } else {
+        total_part.trim().parse::<u64>().ok()
+    };
+    Some((start, end, total))
 }
 
 pub(crate) fn download_to(
@@ -233,6 +292,7 @@ pub(crate) fn download_to(
     const MAX_DOWNLOAD_RETRIES: u32 = 5;
     const BASE_RETRY_DELAY_MS: u64 = 1000;
 
+    let _download_guard = ActiveDownloadGuard::acquire(dest)?;
     let partial = partial_path(dest);
     let token = get_hf_auth_token_for_url(url);
 
@@ -261,9 +321,25 @@ pub(crate) fn download_to(
             Ok(r) => {
                 let status = r.status();
                 if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                    // 206 Partial Content: server accepted the Range header and is serving remaining bytes.
-                    response_and_resuming = Some((r, true));
-                    break;
+                    // 206 Partial Content: verify server range matches existing prefix offset.
+                    if let Some((start, _end, _total)) = parse_content_range(r.headers()) {
+                        if start == existing_len {
+                            response_and_resuming = Some((r, true));
+                            break;
+                        } else {
+                            let _ = fs::remove_file(&partial);
+                            existing_len = 0;
+                            last_err = format!(
+                                "HTTP 206 Content-Range start {start} != expected offset {existing_len}"
+                            );
+                            continue;
+                        }
+                    } else {
+                        let _ = fs::remove_file(&partial);
+                        existing_len = 0;
+                        last_err = "HTTP 206 without valid Content-Range header".to_string();
+                        continue;
+                    }
                 } else if status.is_success() {
                     // 200 OK: server sent the full file from byte 0 (Range ignored or not requested).
                     response_and_resuming = Some((r, false));
@@ -301,7 +377,8 @@ pub(crate) fn download_to(
 
     // Calculate total expected bytes across existing prefix and incoming response.
     let total_bytes = if is_resuming {
-        extract_content_range_total(resp.headers())
+        parse_content_range(resp.headers())
+            .and_then(|(_, _, total)| total)
             .or_else(|| {
                 resp.content_length()
                     .map(|rem| existing_len.saturating_add(rem))
@@ -320,17 +397,18 @@ pub(crate) fn download_to(
     let copy_result: Result<String, CeraError> = {
         let (mut file, hasher, initial_bytes) = if is_resuming && existing_len > 0 {
             // Hash the existing on-disk prefix so running SHA-256 covers the whole file.
-            let mut prefix_file = fs::File::open(&partial)?;
+            let prefix_file = fs::File::open(&partial)?;
+            let mut reader = io::BufReader::with_capacity(128 * 1024, prefix_file);
             let mut hasher = Sha256::new();
-            let copied = io::copy(&mut prefix_file, &mut hasher)?;
+            let copied = io::copy(&mut reader, &mut hasher)?;
             if copied != existing_len {
-                drop(prefix_file);
+                drop(reader);
                 let _ = fs::remove_file(&partial);
                 return Err(CeraError::Backend(format!(
                     "partial file size changed during resume for {url}"
                 )));
             }
-            drop(prefix_file);
+            drop(reader);
             let file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -661,25 +739,25 @@ mod tests {
     }
 
     #[test]
-    fn extract_content_range_total_parses_standard_header() {
+    fn parse_content_range_parses_standard_header() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_RANGE,
             "bytes 500-999/5000".parse().unwrap(),
         );
-        assert_eq!(extract_content_range_total(&headers), Some(5000));
+        assert_eq!(parse_content_range(&headers), Some((500, 999, Some(5000))));
 
         headers.insert(
             reqwest::header::CONTENT_RANGE,
             "bytes 0-100/1000".parse().unwrap(),
         );
-        assert_eq!(extract_content_range_total(&headers), Some(1000));
+        assert_eq!(parse_content_range(&headers), Some((0, 100, Some(1000))));
 
         headers.insert(
             reqwest::header::CONTENT_RANGE,
             "bytes 500-999/*".parse().unwrap(),
         );
-        assert_eq!(extract_content_range_total(&headers), None);
+        assert_eq!(parse_content_range(&headers), Some((500, 999, None)));
     }
 
     #[test]
@@ -756,7 +834,7 @@ mod tests {
             let n = stream.read(&mut req_buf).unwrap();
             let req_str = String::from_utf8_lossy(&req_buf[..n]);
 
-            if req_str.contains("Range: bytes=5-") {
+            if req_str.to_ascii_lowercase().contains("range: bytes=5-") {
                 let body = &full_content[5..];
                 let response = format!(
                     "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 5-{}/{}\r\nConnection: close\r\n\r\n",
@@ -799,5 +877,82 @@ mod tests {
             read_sidecar(&dest).as_deref(),
             Some(expected_sha256.as_str())
         );
+    }
+
+    #[test]
+    fn test_download_to_handles_206_offset_mismatch_by_resetting() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let full_content = b"hello beautiful world of cera!";
+        let mut hasher = Sha256::new();
+        hasher.update(full_content);
+        let expected_sha256 = hex_encode(&hasher.finalize());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            // First attempt: client sends Range: bytes=5-, server returns 206 with mismatched start=10
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = vec![0u8; 1024];
+                let n = stream.read(&mut req_buf).unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let req_lower = req_str.to_ascii_lowercase();
+                assert!(req_lower.contains("range: bytes=5-"));
+
+                let response = "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 10-19/31\r\nConnection: close\r\n\r\n0123456789";
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+
+            // Second attempt: client has reset partial and requests from byte 0
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = vec![0u8; 1024];
+                let n = stream.read(&mut req_buf).unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let req_lower = req_str.to_ascii_lowercase();
+                assert!(!req_lower.contains("range:"));
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    full_content.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(full_content).unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("mismatch_model.gguf");
+        let partial = partial_path(&dest);
+
+        // Pre-create partial file with 5 bytes
+        fs::write(&partial, &full_content[..5]).unwrap();
+
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{}/model.gguf", addr.port());
+
+        download_to(&client, &url, &dest, Some(&expected_sha256), None, None).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert!(!partial.exists());
+        assert!(dest.exists());
+        let downloaded = fs::read(&dest).unwrap();
+        assert_eq!(downloaded, full_content);
+    }
+
+    #[test]
+    fn active_download_guard_mutual_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.bin");
+        let guard1 = ActiveDownloadGuard::acquire(&target).unwrap();
+        let guard2 = ActiveDownloadGuard::acquire(&target);
+        assert!(guard2.is_err());
+        drop(guard1);
+        let guard3 = ActiveDownloadGuard::acquire(&target);
+        assert!(guard3.is_ok());
     }
 }

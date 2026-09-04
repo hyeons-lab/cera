@@ -819,6 +819,12 @@ impl BundleRepo {
     pub fn clear_cache(&self) -> Result<(), FfiError> {
         Ok(self.inner.clear_cache()?)
     }
+
+    /// Download all assets for a bundle ID and quantization to the local cache
+    /// without loading model weights into memory or creating an engine.
+    pub fn download_bundle(&self, bundle_id: String, quant: String) -> Result<(), FfiError> {
+        Ok(self.inner.download_bundle(&bundle_id, &quant)?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2282,34 +2288,99 @@ impl Session {
         guard.append_user_message(&core_msg).map_err(FfiError::from)
     }
 
-    /// Append a multimodal message and run generation synchronously.
+    /// Append a multimodal message and run generation synchronously while holding
+    /// the session lock continuously across prefill and decode.
     pub fn send_message_and_generate(
         &self,
         message: UserMessage,
         opts: GenerateOpts,
     ) -> Result<GenerateOutput, FfiError> {
-        self.send_message(message)?;
-        self.generate(opts)
+        let core_opts: cera::GenerateOpts = opts.try_into()?;
+        let core_msg: cera::tokenizer::UserMessage = message.into();
+        let mut guard = self.lock_inner()?;
+        guard.append_user_message(&core_msg)?;
+
+        struct CollectSink(Vec<u32>);
+        impl cera::ModalitySink for CollectSink {
+            fn on_text_tokens(&mut self, tokens: &[u32]) {
+                self.0.extend_from_slice(tokens);
+            }
+            fn on_done(&mut self, _reason: cera::FinishReason) {}
+        }
+        let mut sink = CollectSink(Vec::new());
+        let summary = guard.generate(&core_opts, &mut sink)?;
+        let text = guard.tokenizer().decode(&sink.0);
+        Ok(GenerateOutput {
+            text,
+            tokens: sink.0,
+            summary: summary.into(),
+        })
     }
 
-    /// Append a multimodal message and run streaming generation.
+    /// Append a multimodal message and run streaming generation while holding
+    /// the session lock continuously across prefill and decode.
     pub fn send_message_streaming(
         &self,
         message: UserMessage,
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        if let Err(err) = self.send_message(message) {
-            let finish_reason = match &err {
+        let core_opts: cera::GenerateOpts = match opts.try_into() {
+            Ok(o) => o,
+            Err(err) => {
+                sink.on_done(FinishReason::Error {
+                    message: err.to_string(),
+                });
+                return Err(err);
+            }
+        };
+        let core_msg: cera::tokenizer::UserMessage = message.into();
+        let mut guard = match self.lock_inner() {
+            Ok(g) => g,
+            Err(err) => {
+                sink.on_done(FinishReason::Error {
+                    message: err.to_string(),
+                });
+                return Err(err);
+            }
+        };
+        if let Err(err) = guard.append_user_message(&core_msg) {
+            let ffi_err = FfiError::from(err);
+            let finish_reason = match &ffi_err {
                 FfiError::Cancelled => FinishReason::Cancelled,
                 _ => FinishReason::Error {
-                    message: err.to_string(),
+                    message: ffi_err.to_string(),
                 },
             };
             sink.on_done(finish_reason);
-            return Err(err);
+            return Err(ffi_err);
         }
-        self.generate_streaming(opts, sink)
+
+        let mut adapter = ForeignSinkAdapter {
+            inner: sink,
+            tokenizer: guard.tokenizer_arc(),
+            pending_bytes: Vec::new(),
+            parser: StreamingThinkingParser::new(),
+            done_called: false,
+        };
+        let result = guard
+            .generate(&core_opts, &mut adapter)
+            .map_err(FfiError::from);
+        match result {
+            Ok(summary) => Ok(summary.into()),
+            Err(err) => {
+                if !adapter.done_called {
+                    let finish_reason = match &err {
+                        FfiError::Cancelled => FinishReason::Cancelled,
+                        _ => FinishReason::Error {
+                            message: err.to_string(),
+                        },
+                    };
+                    adapter.inner.on_done(finish_reason);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Current KV position — how many tokens live in the cache.

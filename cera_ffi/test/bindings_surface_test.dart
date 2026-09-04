@@ -108,6 +108,37 @@ void main() {
     expect(FfiVadSampleRate.values, contains(FfiVadSampleRate.rate16kHz));
     expect(FfiVadSampleRate.values, contains(FfiVadSampleRate.rate8kHz));
   });
+
+  test('GenerateSummary exposes throughput calculations', () {
+    const summary = GenerateSummary(
+      tokensGenerated: 100,
+      promptEvalTokens: 50,
+      promptEvalMs: 500,
+      decodeMs: 2000,
+      totalDurationMs: 2500,
+      decodeTokPerSec: 50.0,
+      promptEvalTokPerSec: 100.0,
+      finishReason: FinishReasonStop(),
+    );
+    expect(summary.totalDurationMs, 2500);
+    expect(summary.decodeTokPerSec, 50.0);
+    expect(summary.promptEvalTokPerSec, 100.0);
+  });
+
+  test('UserMessage and AudioInput types are exposed on the Dart surface', () {
+    const audio = AudioInput(pcm: [0.0, 0.5], sampleRate: 16000);
+    expect(audio.sampleRate, 16000);
+    expect(audio.pcm.length, 2);
+
+    const msg = UserMessage(
+      text: 'hello',
+      images: <Uint8List>[],
+      audio: audio,
+    );
+    expect(msg.text, 'hello');
+    expect(msg.images, isEmpty);
+    expect(msg.audio, isNotNull);
+  });
 }
 
 void Function(FfiSileroVad) get _vadSurfaceGuard => (FfiSileroVad vad) {
@@ -156,6 +187,11 @@ void Function(Session) get _sessionSurfaceGuard => (Session session) {
   // Record returns.
   session.capabilities();
   session.generate(const GenerateOpts());
+  session.sendMessage(const UserMessage(text: '', images: [], audio: null));
+  session.sendMessageAndGenerate(
+    const UserMessage(text: '', images: [], audio: null),
+    const GenerateOpts(),
+  );
   // `Vec<u8>` / `Vec<f32>` returns.
   session.hiddenStatesForText('');
   session.hiddenStatesForTokens(const <int>[]);
@@ -170,4 +206,5 @@ void Function(Session) get _sessionSurfaceGuard => (Session session) {
 void Function(BundleRepo) get _bundleRepoSurfaceGuard => (BundleRepo repo) {
   repo.storeDir();
   repo.cacheSize();
+  repo.downloadBundle('', '');
 };

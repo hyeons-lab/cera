@@ -33,7 +33,14 @@ class AndroidModelDownloader(
         quant: String = "Q4_0",
         useService: Boolean = true
     ): Flow<DownloadState> = callbackFlow {
-        if (!useService) {
+        // Fast path: if already cached locally, emit Success immediately.
+        if (AndroidBundleRepo.isCached(context, bundleId, quant, storeDir)) {
+            send(DownloadState.Success(bundleId, quant, storeDir))
+            close()
+            return@callbackFlow
+        }
+
+        suspend fun downloadDirectly() {
             trySend(DownloadState.Connecting(bundleId, ""))
 
             val sink = object : DownloadProgressSink {
@@ -55,13 +62,8 @@ class AndroidModelDownloader(
 
             try {
                 val repo = BundleRepo.withProgress(storeDir = storeDir, progress = sink)
-                val config = EngineConfig(
-                    contextSize = 0u,
-                    backend = BackendPreference.AUTO,
-                    bundleRepo = repo
-                )
                 withContext(Dispatchers.IO) {
-                    CeraEngine.fromBundleId(bundleId, quant, config).use { }
+                    repo.downloadBundle(bundleId, quant)
                 }
                 send(DownloadState.Success(bundleId, quant, storeDir))
                 close()
@@ -73,21 +75,15 @@ class AndroidModelDownloader(
                 send(DownloadState.Error(bundleId, t.message ?: "Download failed", t))
                 close()
             }
+        }
 
+        if (!useService) {
+            downloadDirectly()
             awaitClose { }
             return@callbackFlow
         }
 
-        // Fast path: if already cached locally, emit Success immediately.
-        if (AndroidBundleRepo.isCached(context, bundleId, quant, storeDir)) {
-            send(DownloadState.Success(bundleId, quant, storeDir))
-            close()
-            return@callbackFlow
-        }
-
-        // Start managed foreground service
-        CeraDownloadService.start(context, bundleId, quant, storeDir)
-
+        // Launch collector on SharedFlow before starting service to avoid missing early emissions.
         val job = launch {
             CeraDownloadService.downloadState.collect { state ->
                 when (state) {
@@ -112,6 +108,14 @@ class AndroidModelDownloader(
                     is DownloadState.Idle -> { }
                 }
             }
+        }
+
+        // Start managed foreground service. If background restrictions prevent service start,
+        // fall back transparently to in-coroutine download.
+        val started = CeraDownloadService.start(context, bundleId, quant, storeDir)
+        if (!started) {
+            job.cancel()
+            downloadDirectly()
         }
 
         awaitClose {

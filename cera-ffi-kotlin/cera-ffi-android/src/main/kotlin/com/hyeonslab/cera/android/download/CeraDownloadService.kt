@@ -16,15 +16,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
-import uniffi.cera_ffi.BackendPreference
 import uniffi.cera_ffi.BundleRepo
-import uniffi.cera_ffi.CeraEngine
 import uniffi.cera_ffi.DownloadProgressSink
-import uniffi.cera_ffi.EngineConfig
 
 /**
  * Foreground Service for running model downloads safely in the background on Android.
@@ -35,7 +32,7 @@ class CeraDownloadService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var downloadJob: Job? = null
 
-    val downloadState: StateFlow<DownloadState> get() = Companion.downloadState
+    val downloadState: SharedFlow<DownloadState> get() = Companion.downloadState
 
     inner class LocalBinder : Binder() {
         fun getService(): CeraDownloadService = this@CeraDownloadService
@@ -81,7 +78,7 @@ class CeraDownloadService : Service() {
 
         downloadJob = serviceScope.launch {
             try {
-                _downloadState.value = DownloadState.Connecting(bundleId, "")
+                _downloadState.tryEmit(DownloadState.Connecting(bundleId, ""))
 
                 val sink = object : DownloadProgressSink {
                     private var lastPercent: Int? = null
@@ -91,12 +88,14 @@ class CeraDownloadService : Service() {
                         val percent = totalBytes?.let {
                             if (it > 0u) ((bytesDownloaded * 100u) / it).toInt() else null
                         }
-                        _downloadState.value = DownloadState.Progress(
-                            bundleId = bundleId,
-                            url = url,
-                            bytesDownloaded = bytesDownloaded,
-                            totalBytes = totalBytes,
-                            percent = percent
+                        _downloadState.tryEmit(
+                            DownloadState.Progress(
+                                bundleId = bundleId,
+                                url = url,
+                                bytesDownloaded = bytesDownloaded,
+                                totalBytes = totalBytes,
+                                percent = percent
+                            )
                         )
 
                         // Rate-limit notification updates on integer percentage changes or ~1MB on indeterminate
@@ -123,21 +122,15 @@ class CeraDownloadService : Service() {
                 }
 
                 val repo = BundleRepo.withProgress(storeDir = storeDir, progress = sink)
-                val config = EngineConfig(
-                    contextSize = 0u,
-                    backend = BackendPreference.AUTO,
-                    bundleRepo = repo
-                )
+                // Download bundle files directly without allocating an engine
+                repo.downloadBundle(bundleId, quant)
 
-                // Blocking call offloaded to IO dispatcher
-                CeraEngine.fromBundleId(bundleId, quant, config).use { }
-
-                _downloadState.value = DownloadState.Success(bundleId, quant, storeDir)
+                _downloadState.tryEmit(DownloadState.Success(bundleId, quant, storeDir))
             } catch (t: Throwable) {
                 if (t is CancellationException) {
                     throw t
                 }
-                _downloadState.value = DownloadState.Error(bundleId, t.message ?: "Download failed", t)
+                _downloadState.tryEmit(DownloadState.Error(bundleId, t.message ?: "Download failed", t))
             } finally {
                 val thisJob = coroutineContext[Job]
                 if (thisJob?.isCancelled != true && downloadJob === thisJob) {
@@ -186,22 +179,35 @@ class CeraDownloadService : Service() {
     companion object {
         var notificationConfig = ModelDownloadNotificationConfig()
 
-        private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Idle)
-        val downloadState: StateFlow<DownloadState> = _downloadState.asStateFlow()
+        private val _downloadState = MutableSharedFlow<DownloadState>(
+            replay = 0,
+            extraBufferCapacity = 64
+        )
+        val downloadState: SharedFlow<DownloadState> = _downloadState.asSharedFlow()
 
         const val EXTRA_BUNDLE_ID = "com.hyeonslab.cera.EXTRA_BUNDLE_ID"
         const val EXTRA_QUANT = "com.hyeonslab.cera.EXTRA_QUANT"
         const val EXTRA_STORE_DIR = "com.hyeonslab.cera.EXTRA_STORE_DIR"
 
-        fun start(context: Context, bundleId: String, quant: String = "Q4_0", storeDir: String? = null) {
-            val intent = Intent(context, CeraDownloadService::class.java).apply {
-                putExtra(EXTRA_BUNDLE_ID, bundleId)
-                putExtra(EXTRA_QUANT, quant)
-                if (storeDir != null) {
-                    putExtra(EXTRA_STORE_DIR, storeDir)
+        fun start(
+            context: Context,
+            bundleId: String,
+            quant: String = "Q4_0",
+            storeDir: String? = null
+        ): Boolean {
+            return try {
+                val intent = Intent(context, CeraDownloadService::class.java).apply {
+                    putExtra(EXTRA_BUNDLE_ID, bundleId)
+                    putExtra(EXTRA_QUANT, quant)
+                    if (storeDir != null) {
+                        putExtra(EXTRA_STORE_DIR, storeDir)
+                    }
                 }
+                context.startForegroundService(intent)
+                true
+            } catch (e: Exception) {
+                false
             }
-            context.startForegroundService(intent)
         }
     }
 }
