@@ -75,7 +75,7 @@ pub(crate) struct HeadInfo {
 
 /// Sidecar filename for a given cache entry. `<dest>.sha256` holds the
 /// bare hex digest (64 chars, no newline). See module docs for the
-/// rationale — it turns a multi-GB rehash into a single small read on
+/// rationale: it turns a multi-GB rehash into a single small read on
 /// every cache hit.
 pub(crate) fn sidecar_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_owned();
@@ -84,7 +84,7 @@ pub(crate) fn sidecar_path(dest: &Path) -> PathBuf {
 }
 
 /// Read a previously-persisted sidecar hex digest, if any. Returns
-/// `None` on missing file, I/O error, or invalid content — callers
+/// `None` on missing file, I/O error, or invalid content; callers
 /// treat `None` as "full rehash required."
 pub(crate) fn read_sidecar(dest: &Path) -> Option<String> {
     let text = fs::read_to_string(sidecar_path(dest)).ok()?;
@@ -96,14 +96,14 @@ pub(crate) fn read_sidecar(dest: &Path) -> Option<String> {
     }
 }
 
-/// Persist `sha256_hex` alongside `dest` as a sidecar file. Best-effort
-/// — a failure to write just means the next cache hit pays a rehash.
+/// Persist `sha256_hex` alongside `dest` as a sidecar file. Best-effort:
+/// a failure to write just means the next cache hit pays a rehash.
 pub(crate) fn write_sidecar(dest: &Path, sha256_hex: &str) {
     let _ = fs::write(sidecar_path(dest), sha256_hex);
 }
 
 /// Issue a `HEAD` for `url` using `client` and extract size +
-/// linked-etag. Swallows network errors into `None` fields — the caller
+/// linked-etag. Swallows network errors into `None` fields: the caller
 /// decides how strict to be.
 ///
 /// **The `client` passed here MUST be configured with redirects
@@ -178,7 +178,7 @@ pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
 /// `expected_sha256` overrides any server-provided `X-Linked-Etag`.
 ///
 /// `progress`, when `Some`, is called periodically during the byte
-/// stream — at most once per ~256 KB written, plus one final
+/// stream: at most once per ~256 KB written, plus one final
 /// callback at end-of-stream with the total bytes written (skipped
 /// when the in-loop callback already reported the same value, which
 /// happens for files whose size is an exact multiple of 256 KB).
@@ -363,7 +363,29 @@ pub(crate) fn download_to(
                     response_and_resuming = Some((r, false));
                     break;
                 } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    // 416 Range Not Satisfiable: partial file exceeded remote size or remote changed.
+                    // 416 Range Not Satisfiable: partial file reached/exceeded remote size or remote changed.
+                    // If the existing partial file already matches expected sha256 (e.g. download finished
+                    // but process exited before rename), finalize it immediately instead of re-downloading.
+                    let expected_hash = expected_sha256
+                        .map(|s| s.to_ascii_lowercase())
+                        .or_else(|| extract_linked_sha256(r.headers()));
+                    if existing_len > 0
+                        && let Some(exp) = expected_hash.as_deref()
+                        && let Ok(actual_hex) = sha256_file(&partial)
+                        && actual_hex == exp
+                    {
+                        if let Some(p) = progress {
+                            p.on_progress(url, existing_len, Some(existing_len));
+                        }
+                        let _ = fs::remove_file(dest);
+                        if let Err(e) = fs::rename(&partial, dest) {
+                            let _ = fs::remove_file(&partial);
+                            return Err(e.into());
+                        }
+                        write_sidecar(dest, exp);
+                        return Ok(());
+                    }
+
                     // Reset partial file and retry from byte 0.
                     let _ = fs::remove_file(&partial);
                     existing_len = 0;
@@ -522,7 +544,7 @@ impl<W: io::Write> io::Write for HashingWriter<'_, W> {
 /// `io::copy(resp, ProgressingWriter -> HashingWriter -> File)`.
 ///
 /// Throttled at `PROGRESS_THROTTLE_BYTES` granularity to avoid
-/// hammering a UI's main thread on multi-MB downloads — callers
+/// hammering a UI's main thread on multi-MB downloads; callers
 /// targeting a progress bar typically can't repaint faster than
 /// ~30 Hz anyway, and a 256 KB step at 10 MB/s is ~25 callbacks
 /// per second, comfortably matched.
@@ -1017,5 +1039,120 @@ mod tests {
         // Invalid unit
         headers.insert(CONTENT_RANGE, HeaderValue::from_static("items 0-499/1000"));
         assert_eq!(parse_content_range(&headers), None);
+    }
+
+    #[test]
+    fn test_download_to_handles_416_with_valid_completed_partial() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let full_content = b"hello beautiful world of cera!";
+        let mut hasher = Sha256::new();
+        hasher.update(full_content);
+        let expected_sha256 = hex_encode(&hasher.finalize());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req_buf = vec![0u8; 1024];
+            let n = stream.read(&mut req_buf).unwrap();
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            let expected_range = format!("range: bytes={}-", full_content.len());
+            assert!(req_str.to_ascii_lowercase().contains(&expected_range));
+
+            let response = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
+                full_content.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("full_partial_model.gguf");
+        let partial = partial_path(&dest);
+
+        // Pre-create partial file with full bytes
+        fs::write(&partial, full_content).unwrap();
+
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{}/model.gguf", addr.port());
+
+        download_to(&client, &url, &dest, Some(&expected_sha256), None, None).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert!(!partial.exists());
+        assert!(dest.exists());
+        let downloaded = fs::read(&dest).unwrap();
+        assert_eq!(downloaded, full_content);
+        assert_eq!(
+            read_sidecar(&dest).as_deref(),
+            Some(expected_sha256.as_str())
+        );
+    }
+
+    #[test]
+    fn test_download_to_handles_416_with_corrupt_partial_by_resetting() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let full_content = b"hello beautiful world of cera!";
+        let mut hasher = Sha256::new();
+        hasher.update(full_content);
+        let expected_sha256 = hex_encode(&hasher.finalize());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            // First attempt: client sends range for 31 bytes, server returns 416
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = vec![0u8; 1024];
+                let n = stream.read(&mut req_buf).unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                assert!(req_str.to_ascii_lowercase().contains("range: bytes=31-"));
+
+                let response = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */31\r\nConnection: close\r\n\r\n";
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+
+            // Second attempt: partial was deleted because hash mismatched, requests from byte 0
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = vec![0u8; 1024];
+                let n = stream.read(&mut req_buf).unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                assert!(!req_str.to_ascii_lowercase().contains("range:"));
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    full_content.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(full_content).unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("corrupt_partial_model.gguf");
+        let partial = partial_path(&dest);
+
+        // Pre-create corrupt partial file with 31 bogus bytes
+        fs::write(&partial, b"corrupted partial content 12345").unwrap();
+
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{}/model.gguf", addr.port());
+
+        download_to(&client, &url, &dest, Some(&expected_sha256), None, None).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert!(!partial.exists());
+        assert!(dest.exists());
+        let downloaded = fs::read(&dest).unwrap();
+        assert_eq!(downloaded, full_content);
     }
 }

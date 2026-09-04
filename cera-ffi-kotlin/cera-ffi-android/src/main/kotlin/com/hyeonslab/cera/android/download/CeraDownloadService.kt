@@ -3,10 +3,12 @@ package com.hyeonslab.cera.android.download
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -48,6 +50,10 @@ class CeraDownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStartId = startId
+        if (intent?.action == ACTION_CANCEL) {
+            cancelActiveDownload()
+            return START_NOT_STICKY
+        }
         val bundleId = intent?.getStringExtra(EXTRA_BUNDLE_ID)
         val quant = intent?.getStringExtra(EXTRA_QUANT) ?: "Q4_0"
         val storeDir = intent?.getStringExtra(EXTRA_STORE_DIR)
@@ -59,6 +65,25 @@ class CeraDownloadService : Service() {
             stopSelf(startId)
         }
         return START_NOT_STICKY
+    }
+
+    private fun cancelActiveDownload() {
+        val bundleId = activeBundleId
+        downloadJob?.cancel()
+        downloadJob = null
+        activeBundleId = null
+        activeQuant = null
+        if (bundleId != null) {
+            _downloadState.tryEmit(
+                DownloadState.Error(
+                    bundleId = bundleId,
+                    message = "Download cancelled by user",
+                    cause = CancellationException("Download cancelled by user")
+                )
+            )
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf(latestStartId)
     }
 
     private fun startModelDownload(bundleId: String, quant: String, storeDir: String, startId: Int) {
@@ -197,12 +222,28 @@ class CeraDownloadService : Service() {
         progress: Int,
         indeterminate: Boolean
     ): Notification {
+        val cancelIntent = Intent(this, CeraDownloadService::class.java).apply {
+            action = ACTION_CANCEL
+        }
+        val pendingCancel = PendingIntent.getService(
+            this,
+            0,
+            cancelIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return Notification.Builder(this, notificationConfig.channelId)
             .setContentTitle(title)
             .setContentText(content)
             .setSmallIcon(notificationConfig.smallIconResId)
             .setOngoing(true)
             .setProgress(100, progress, indeterminate)
+            .addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                    "Cancel",
+                    pendingCancel
+                ).build()
+            )
             .build()
     }
 
@@ -223,9 +264,17 @@ class CeraDownloadService : Service() {
         )
         val downloadState: SharedFlow<DownloadState> = _downloadState.asSharedFlow()
 
+        const val ACTION_CANCEL = "com.hyeonslab.cera.ACTION_CANCEL"
         const val EXTRA_BUNDLE_ID = "com.hyeonslab.cera.EXTRA_BUNDLE_ID"
         const val EXTRA_QUANT = "com.hyeonslab.cera.EXTRA_QUANT"
         const val EXTRA_STORE_DIR = "com.hyeonslab.cera.EXTRA_STORE_DIR"
+
+        fun cancel(context: Context) {
+            val intent = Intent(context, CeraDownloadService::class.java).apply {
+                action = ACTION_CANCEL
+            }
+            context.startService(intent)
+        }
 
         fun start(
             context: Context,
