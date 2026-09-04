@@ -130,11 +130,7 @@ void main() {
     expect(audio.sampleRate, 16000);
     expect(audio.pcm.length, 2);
 
-    const msg = UserMessage(
-      text: 'hello',
-      images: <Uint8List>[],
-      audio: audio,
-    );
+    const msg = UserMessage(text: 'hello', images: <Uint8List>[], audio: audio);
     expect(msg.text, 'hello');
     expect(msg.images, isEmpty);
     expect(msg.audio, isNotNull);
