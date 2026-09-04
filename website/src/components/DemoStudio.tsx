@@ -92,6 +92,7 @@ impl<T, const N: usize> LockFreeRingBuffer<T, N> {
 export const DemoStudio = () => {
   const [hasWebGpu, setHasWebGpu] = useState<boolean | null>(null);
   const [gpuAdapterName, setGpuAdapterName] = useState<string>('');
+  const [webGpuReason, setWebGpuReason] = useState<string>('');
   const [selectedModel, setSelectedModel] = useState('LFM2.5-1.2B-Instruct');
   const [kvCompression, setKvCompression] = useState<'tq3' | 'none'>('tq3');
   const [prompt, setPrompt] = useState(PRESET_PROMPTS[0].prompt);
@@ -113,20 +114,65 @@ export const DemoStudio = () => {
 
   const abortControllerRef = useRef<boolean>(false);
 
-  // Check WebGPU availability on mount
+  // Check WebGPU availability and diagnostic reason on mount
   useEffect(() => {
     async function checkWebGpu() {
-      if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
-        try {
-          const adapter = await (navigator as any).gpu.requestAdapter();
-          if (adapter) {
-            setHasWebGpu(true);
-            setGpuAdapterName(adapter.info?.description || adapter.info?.device || 'WebGPU Device');
-            return;
-          }
-        } catch (_) {}
+      if (typeof window !== 'undefined' && !window.isSecureContext) {
+        setHasWebGpu(false);
+        setWebGpuReason(
+          'Insecure HTTP context detected. WebGPU is disabled by browsers on non-HTTPS origins. When connecting over local Wi-Fi (http://...), please switch to the HTTPS Cloudflare Tunnel URL or http://localhost.'
+        );
+        return;
       }
-      setHasWebGpu(false);
+      if (typeof navigator === 'undefined') {
+        setHasWebGpu(false);
+        setWebGpuReason('Navigator is undefined in this environment.');
+        return;
+      }
+      if (!('gpu' in navigator)) {
+        setHasWebGpu(false);
+        const ua = typeof window !== 'undefined' && window.navigator ? window.navigator.userAgent : '';
+        const isIOS = /iPad|iPhone|iPod/.test(ua);
+        const isFirefox = /Firefox/.test(ua);
+        if (isIOS) {
+          setWebGpuReason(
+            'iOS Safari requires enabling the WebGPU feature flag in Settings > Apps > Safari > Advanced > Feature Flags > WebGPU.'
+          );
+        } else if (isFirefox) {
+          setWebGpuReason(
+            'Firefox requires setting dom.webgpu.enabled to true in about:config.'
+          );
+        } else {
+          setWebGpuReason(
+            'WebGPU is not exposed by this browser. Use desktop Google Chrome 113+, Microsoft Edge 113+, or Safari 18+.'
+          );
+        }
+        return;
+      }
+
+      try {
+        const adapter = await (navigator as any).gpu.requestAdapter();
+        if (adapter) {
+          setHasWebGpu(true);
+          let name = 'WebGPU Device';
+          if (adapter.info) {
+            name = adapter.info.description || adapter.info.device || adapter.info.architecture || 'WebGPU Device';
+          } else if (typeof adapter.requestAdapterInfo === 'function') {
+            const info = await adapter.requestAdapterInfo();
+            name = info.description || info.device || 'WebGPU Device';
+          }
+          setGpuAdapterName(name);
+          return;
+        } else {
+          setHasWebGpu(false);
+          setWebGpuReason(
+            'WebGPU adapter request returned null. Hardware acceleration may be disabled in your browser settings.'
+          );
+        }
+      } catch (err: any) {
+        setHasWebGpu(false);
+        setWebGpuReason(err?.message || 'Failed to initialize WebGPU adapter.');
+      }
     }
     checkWebGpu();
   }, []);
@@ -152,8 +198,8 @@ export const DemoStudio = () => {
 
     // Match with a preset or synthesize response
     const matched = PRESET_PROMPTS.find((p) => p.prompt === prompt) || {
-      thought: `Analyzing prompt: "${prompt}"\nStructuring concise response using Cera WebGPU engine...\nEvaluating relevant parameters and synthesizing tokens...`,
-      response: `[Cera WebGPU Output]\n\nGenerated answer for: "${prompt}".\n\nInference executed locally via WebGPU compute shaders with ${kvCompression === 'tq3' ? 'TurboQuant 3-bit' : 'uncompressed FP32'} KV cache. Zero remote server calls were made.`,
+      thought: `Analyzing prompt: "${prompt}"\nEvaluating reasoning parameters and structuring output...\nExtracting thinking process via StreamingThinkingParser delimiters...`,
+      response: `[Cera Interactive Preview]\n\nPrompt: "${prompt}"\n\nThis preview demonstrates client-side thought extraction and streaming telemetry with ${kvCompression === 'tq3' ? 'TurboQuant 3-bit' : 'uncompressed FP32'} KV cache metrics.\n\nTo run actual GGUF weight files through WebGPU WGSL compute shaders, load cera-wasm/examples/webgpu/index.html with any supported GGUF model.`,
     };
 
     const startTime = performance.now();
@@ -210,11 +256,11 @@ export const DemoStudio = () => {
                 Cera WebGPU Studio
               </h1>
               <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-semibold border border-blue-500/30">
-                In-Browser
+                Interactive Preview
               </span>
             </div>
             <p className="text-slate-400 text-xs sm:text-sm">
-              Run neural inference locally in your browser. All weights, KV caches, and tokens stay private on your device.
+              Explore streaming thought extraction, TurboQuant KV cache metrics, and multi-turn prompt templates.
             </p>
           </div>
 
@@ -222,19 +268,31 @@ export const DemoStudio = () => {
           <div className="flex items-center gap-2 self-start md:self-auto px-3 py-1.5 rounded-lg border border-[#222638] bg-[#0f111a] text-xs font-mono">
             {hasWebGpu ? (
               <>
-                <CheckCircle className="w-4 h-4 text-emerald-400" />
+                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
                 <span className="text-slate-300">
-                  WebGPU Active {gpuAdapterName ? `· ${gpuAdapterName}` : ''}
+                  WebGPU Ready {gpuAdapterName ? `: ${gpuAdapterName}` : ''}
                 </span>
               </>
             ) : (
               <>
-                <AlertTriangle className="w-4 h-4 text-amber-400" />
-                <span className="text-slate-300">Emulation Mode (No WebGPU adapter detected)</span>
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span className="text-slate-300">WebGPU Inactive</span>
               </>
             )}
           </div>
         </div>
+
+        {/* Diagnostic Banner if WebGPU is unavailable */}
+        {!hasWebGpu && webGpuReason && (
+          <div className="mb-6 p-4 rounded-xl border border-amber-500/30 bg-amber-950/20 text-amber-200 text-xs flex items-start gap-3">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-amber-300 mb-1">WebGPU Hardware & Browser Diagnostic</div>
+              <p className="text-slate-300 leading-relaxed">{webGpuReason}</p>
+            </div>
+          </div>
+        )}
+
 
         {/* Main Grid: Settings & Execution */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -391,7 +449,7 @@ export const DemoStudio = () => {
 
               <div className="flex items-center justify-between pt-1">
                 <div className="text-[11px] text-slate-500 font-mono">
-                  Press Generate to invoke WebGPU shaders
+                  Interactive UI & Telemetry Preview
                 </div>
                 <div className="flex gap-2">
                   {isGenerating ? (
@@ -408,7 +466,7 @@ export const DemoStudio = () => {
                       className="flex items-center gap-1.5 px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs transition-colors shadow-lg shadow-blue-600/20"
                     >
                       <Play className="w-3.5 h-3.5 fill-white" />
-                      Generate on GPU
+                      Run Preview
                     </button>
                   )}
                 </div>
@@ -483,10 +541,10 @@ export const DemoStudio = () => {
             {/* Generated Response Box */}
             <div className="p-5 rounded-xl border border-[#222638] bg-[#0f111a] min-h-[14rem]">
               <div className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3 flex items-center justify-between">
-                <span>Model Output</span>
+                <span>Model Output (Preview)</span>
                 {isGenerating && (
                   <span className="text-[11px] text-emerald-400 font-mono animate-pulse">
-                    Streaming tokens on GPU...
+                    Streaming tokens...
                   </span>
                 )}
               </div>
@@ -498,7 +556,7 @@ export const DemoStudio = () => {
                   </>
                 ) : (
                   <span className="text-slate-500 italic">
-                    Output will stream here in real time as GPU decode steps complete.
+                    Output will stream here in real time to demonstrate token generation and thinking parser extraction.
                   </span>
                 )}
               </div>

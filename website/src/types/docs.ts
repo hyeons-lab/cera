@@ -59,4 +59,7 @@ export interface BenchmarkEntry {
   decodeTokPerSec: number;
   memoryMb: number;
   ttftMs: number;
+  commit?: string;
+  notes?: string;
 }
+

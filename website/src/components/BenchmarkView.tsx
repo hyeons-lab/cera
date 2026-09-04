@@ -5,7 +5,7 @@ import { Activity, Zap, HardDrive, Filter } from 'lucide-react';
 export const BenchmarkView = () => {
   const [filterBackend, setFilterBackend] = useState<string>('all');
 
-  const backends = ['all', 'Metal', 'WebGPU', 'CPU', 'wgpu'];
+  const backends = ['all', 'Metal', 'wgpu', 'CPU'];
 
   const filteredData = benchmarksData.filter((b) => {
     if (filterBackend === 'all') return true;
@@ -18,15 +18,15 @@ export const BenchmarkView = () => {
         <div className="max-w-3xl mb-10">
           <div className="flex items-center gap-2 mb-2">
             <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-              Hardware Matrix
+              Verified Hardware Matrix
             </span>
-            <span className="text-xs text-slate-400 font-mono">cera bench</span>
+            <span className="text-xs text-slate-400 font-mono">benchmarks/BASELINE.md</span>
           </div>
           <h1 className="text-3xl font-extrabold text-white tracking-tight mb-3">
             Inference Performance Benchmarks
           </h1>
           <p className="text-slate-300 text-sm sm:text-base leading-relaxed">
-            Real throughput (tokens/sec), latency to first token (TTFT), and memory footprint measured across desktop workstations, mobile phones, and browser WebGPU runtimes.
+            Empirical throughput (tokens/sec), latency to first token (TTFT), and memory footprint measured directly on physical hardware and documented in the repository baseline. Every row carries its exact model quant, backend, and commit SHA.
           </p>
         </div>
 
@@ -50,7 +50,7 @@ export const BenchmarkView = () => {
             ))}
           </div>
           <div className="text-xs text-slate-400 font-mono pr-2 hidden sm:block">
-            Target Model: Liquid LFM2.5 1.2B (Q4_0)
+            Sustained Equilibrium Protocols
           </div>
         </div>
 
@@ -60,22 +60,27 @@ export const BenchmarkView = () => {
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-[#222638] bg-[#12141f] text-slate-400 font-semibold uppercase tracking-wider">
+                  <th className="py-3 px-4">Model & Quant</th>
                   <th className="py-3 px-4">Device & Hardware</th>
-                  <th className="py-3 px-4">Chip</th>
                   <th className="py-3 px-4">Backend</th>
                   <th className="py-3 px-4 text-right">Prefill (tok/s)</th>
                   <th className="py-3 px-4 text-right">Decode (tok/s)</th>
                   <th className="py-3 px-4 text-right">TTFT (ms)</th>
-                  <th className="py-3 px-4 text-right">RAM (MB)</th>
+                  <th className="py-3 px-4">Commit</th>
+                  <th className="py-3 px-4">Measurement Notes</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1c2030] font-mono text-slate-300">
                 {filteredData.map((item, idx) => (
                   <tr key={idx} className="hover:bg-[#141724] transition-colors">
                     <td className="py-3 px-4 font-sans font-medium text-white">
-                      {item.device}
+                      <div>{item.model}</div>
+                      <div className="text-[10px] text-slate-400 font-mono">{item.quant}</div>
                     </td>
-                    <td className="py-3 px-4 text-slate-300">{item.chip}</td>
+                    <td className="py-3 px-4">
+                      <div className="text-slate-200 font-sans">{item.device}</div>
+                      <div className="text-[10px] text-slate-400">{item.chip}</div>
+                    </td>
                     <td className="py-3 px-4">
                       <span className="px-2 py-0.5 rounded text-[11px] bg-[#1a1d2c] border border-[#222638] text-blue-400">
                         {item.backend}
@@ -90,8 +95,11 @@ export const BenchmarkView = () => {
                     <td className="py-3 px-4 text-right text-slate-300">
                       {item.ttftMs.toFixed(1)}
                     </td>
-                    <td className="py-3 px-4 text-right text-blue-400">
-                      {item.memoryMb}
+                    <td className="py-3 px-4 text-slate-400">
+                      {item.commit ? <code>{item.commit}</code> : '-'}
+                    </td>
+                    <td className="py-3 px-4 text-[11px] font-sans text-slate-400 max-w-xs">
+                      {item.notes || '-'}
                     </td>
                   </tr>
                 ))}
