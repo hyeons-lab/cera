@@ -71,7 +71,12 @@ object AndroidBundleRepo {
     ): Boolean = withContext(Dispatchers.IO) {
         val root = java.io.File(storeDir)
         if (!root.exists() || !root.isDirectory) return@withContext false
-        val cleanQuant = quant.split('+', ' ').first().trim().lowercase()
+        val segments = quant.split('+', ' ').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        val cleanQuant = if (segments.firstOrNull() == "dspark" && segments.size > 1) {
+            segments[1]
+        } else {
+            segments.firstOrNull() ?: quant.trim().lowercase()
+        }
         val cleanId = bundleId.lowercase().substringAfterLast('/')
         root.walkTopDown().any { file ->
             file.isFile &&
