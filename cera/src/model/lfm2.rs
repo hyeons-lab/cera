@@ -319,10 +319,19 @@ impl Lfm2Model {
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
-        let intermediate_size = gguf
-            .get_u32(&format!("{prefix}.feed_forward_length"))
-            .with_context(|| format!("missing {prefix}.feed_forward_length"))?
-            as usize;
+        let intermediate_size = if let Some(info) = gguf.tensors.get("blk.0.ffn_gate.weight") {
+            if info.shape.len() > 1 {
+                info.shape[1]
+            } else {
+                gguf.get_u32(&format!("{prefix}.feed_forward_length"))
+                    .with_context(|| format!("missing {prefix}.feed_forward_length"))?
+                    as usize
+            }
+        } else {
+            gguf.get_u32(&format!("{prefix}.feed_forward_length"))
+                .with_context(|| format!("missing {prefix}.feed_forward_length"))?
+                as usize
+        };
         let n_heads = gguf
             .get_u32(&format!("{prefix}.attention.head_count"))
             .with_context(|| format!("missing {prefix}.attention.head_count"))?
@@ -2276,76 +2285,152 @@ impl Lfm2Model {
                         let (conv_w0, rest_w) = conv_wt.split_at(hs);
                         let (conv_w1, conv_w2) = rest_w.split_at(hs);
 
-                        for j in 0..n {
-                            let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
-                            let b_slice = &proj[..hs];
-                            let c_slice = &proj[hs..2 * hs];
-                            let x_slice = &proj[2 * hs..3 * hs];
+                        let is_causal = cfg.is_causal
+                            && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
 
-                            let LayerState::Conv { buffer, history } = &mut state.layers[layer]
-                            else {
-                                panic!("expected Conv state for layer {layer}");
-                            };
-
-                            let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
-                            let conv_scratch = &mut state.scratch.conv_scratch[..hs];
-
-                            #[cfg(target_arch = "aarch64")]
-                            unsafe {
-                                use core::arch::aarch64::*;
-                                let n_chunks = hs / 4;
-                                let b_ptr = b_slice.as_ptr();
-                                let x_ptr = x_slice.as_ptr();
-                                let c_ptr = c_slice.as_ptr();
-                                let b0_ptr = buffer.as_ptr();
-                                let b1_ptr = buffer.as_ptr().add(hs);
-                                let w0_ptr = conv_w0.as_ptr();
-                                let w1_ptr = conv_w1.as_ptr();
-                                let w2_ptr = conv_w2.as_ptr();
-                                let out_in_ptr = out_in.as_mut_ptr();
-                                let cs_ptr = conv_scratch.as_mut_ptr();
-
-                                for i in 0..n_chunks {
-                                    let b_v = vld1q_f32(b_ptr.add(i * 4));
-                                    let x_v = vld1q_f32(x_ptr.add(i * 4));
-                                    let bx_v = vmulq_f32(b_v, x_v);
-                                    vst1q_f32(cs_ptr.add(i * 4), bx_v);
-
-                                    let b0_v = vld1q_f32(b0_ptr.add(i * 4));
-                                    let b1_v = vld1q_f32(b1_ptr.add(i * 4));
-                                    let w0_v = vld1q_f32(w0_ptr.add(i * 4));
-                                    let w1_v = vld1q_f32(w1_ptr.add(i * 4));
-                                    let w2_v = vld1q_f32(w2_ptr.add(i * 4));
-
-                                    let out_v = vfmaq_f32(
-                                        vfmaq_f32(vmulq_f32(b0_v, w0_v), b1_v, w1_v),
-                                        bx_v,
-                                        w2_v,
-                                    );
-                                    let c_v = vld1q_f32(c_ptr.add(i * 4));
-                                    let final_v = vmulq_f32(c_v, out_v);
-                                    vst1q_f32(out_in_ptr.add(i * 4), final_v);
-                                }
-                            }
-
-                            #[cfg(not(target_arch = "aarch64"))]
-                            {
+                        if !is_causal {
+                            let mut bx_all = vec![0.0f32; n * hs];
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let b_slice = &proj[..hs];
+                                let x_slice = &proj[2 * hs..3 * hs];
+                                let bx_slice = &mut bx_all[j * hs..(j + 1) * hs];
                                 for i in 0..hs {
-                                    conv_scratch[i] = b_slice[i] * x_slice[i];
-                                    let conv_out = buffer[i] * conv_w0[i]
-                                        + buffer[hs + i] * conv_w1[i]
-                                        + conv_scratch[i] * conv_w2[i];
-                                    out_in[i] = c_slice[i] * conv_out;
+                                    bx_slice[i] = b_slice[i] * x_slice[i];
                                 }
                             }
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let c_slice = &proj[hs..2 * hs];
+                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
 
-                            if d_conv > 0 {
-                                if d_conv > 1 {
-                                    buffer.copy_within(hs.., 0);
+                                let prev_bx = if j > 0 { Some(&bx_all[(j - 1) * hs..j * hs]) } else { None };
+                                let curr_bx = &bx_all[j * hs..(j + 1) * hs];
+                                let next_bx = if j + 1 < n { Some(&bx_all[(j + 1) * hs..(j + 2) * hs]) } else { None };
+
+                                #[cfg(target_arch = "aarch64")]
+                                unsafe {
+                                    use core::arch::aarch64::*;
+                                    let n_chunks = hs / 4;
+                                    let c_ptr = c_slice.as_ptr();
+                                    let curr_ptr = curr_bx.as_ptr();
+                                    let w0_ptr = conv_w0.as_ptr();
+                                    let w1_ptr = conv_w1.as_ptr();
+                                    let w2_ptr = conv_w2.as_ptr();
+                                    let out_ptr = out_in.as_mut_ptr();
+
+                                    let prev_ptr = prev_bx.map(|p| p.as_ptr());
+                                    let next_ptr = next_bx.map(|p| p.as_ptr());
+
+                                    for i in 0..n_chunks {
+                                        let offset = i * 4;
+                                        let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                        let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                        let mut conv_v = vmulq_f32(curr_v, w1_v);
+
+                                        if let Some(pp) = prev_ptr {
+                                            let prev_v = vld1q_f32(pp.add(offset));
+                                            let w0_v = vld1q_f32(w0_ptr.add(offset));
+                                            conv_v = vfmaq_f32(conv_v, prev_v, w0_v);
+                                        }
+                                        if let Some(np) = next_ptr {
+                                            let next_v = vld1q_f32(np.add(offset));
+                                            let w2_v = vld1q_f32(w2_ptr.add(offset));
+                                            conv_v = vfmaq_f32(conv_v, next_v, w2_v);
+                                        }
+
+                                        let c_v = vld1q_f32(c_ptr.add(offset));
+                                        let final_v = vmulq_f32(c_v, conv_v);
+                                        vst1q_f32(out_ptr.add(offset), final_v);
+                                    }
                                 }
-                                let last_slot = (d_conv - 1) * hs;
-                                buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
-                                history.push(start_pos + j + 1, buffer);
+
+                                #[cfg(not(target_arch = "aarch64"))]
+                                {
+                                    for i in 0..hs {
+                                        let mut conv_val = curr_bx[i] * conv_w1[i];
+                                        if let Some(prev) = prev_bx {
+                                            conv_val += prev[i] * conv_w0[i];
+                                        }
+                                        if let Some(next) = next_bx {
+                                            conv_val += next[i] * conv_w2[i];
+                                        }
+                                        out_in[i] = c_slice[i] * conv_val;
+                                    }
+                                }
+                            }
+                        } else {
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let b_slice = &proj[..hs];
+                                let c_slice = &proj[hs..2 * hs];
+                                let x_slice = &proj[2 * hs..3 * hs];
+
+                                let LayerState::Conv { buffer, history } = &mut state.layers[layer]
+                                else {
+                                    panic!("expected Conv state for layer {layer}");
+                                };
+
+                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
+                                let conv_scratch = &mut state.scratch.conv_scratch[..hs];
+
+                                #[cfg(target_arch = "aarch64")]
+                                unsafe {
+                                    use core::arch::aarch64::*;
+                                    let n_chunks = hs / 4;
+                                    let b_ptr = b_slice.as_ptr();
+                                    let x_ptr = x_slice.as_ptr();
+                                    let c_ptr = c_slice.as_ptr();
+                                    let b0_ptr = buffer.as_ptr();
+                                    let b1_ptr = buffer.as_ptr().add(hs);
+                                    let w0_ptr = conv_w0.as_ptr();
+                                    let w1_ptr = conv_w1.as_ptr();
+                                    let w2_ptr = conv_w2.as_ptr();
+                                    let out_in_ptr = out_in.as_mut_ptr();
+                                    let cs_ptr = conv_scratch.as_mut_ptr();
+
+                                    for i in 0..n_chunks {
+                                        let b_v = vld1q_f32(b_ptr.add(i * 4));
+                                        let x_v = vld1q_f32(x_ptr.add(i * 4));
+                                        let bx_v = vmulq_f32(b_v, x_v);
+                                        vst1q_f32(cs_ptr.add(i * 4), bx_v);
+
+                                        let b0_v = vld1q_f32(b0_ptr.add(i * 4));
+                                        let b1_v = vld1q_f32(b1_ptr.add(i * 4));
+                                        let w0_v = vld1q_f32(w0_ptr.add(i * 4));
+                                        let w1_v = vld1q_f32(w1_ptr.add(i * 4));
+                                        let w2_v = vld1q_f32(w2_ptr.add(i * 4));
+
+                                        let out_v = vfmaq_f32(
+                                            vfmaq_f32(vmulq_f32(b0_v, w0_v), b1_v, w1_v),
+                                            bx_v,
+                                            w2_v,
+                                        );
+                                        let c_v = vld1q_f32(c_ptr.add(i * 4));
+                                        let final_v = vmulq_f32(c_v, out_v);
+                                        vst1q_f32(out_in_ptr.add(i * 4), final_v);
+                                    }
+                                }
+
+                                #[cfg(not(target_arch = "aarch64"))]
+                                {
+                                    for i in 0..hs {
+                                        conv_scratch[i] = b_slice[i] * x_slice[i];
+                                        let conv_out = buffer[i] * conv_w0[i]
+                                            + buffer[hs + i] * conv_w1[i]
+                                            + conv_scratch[i] * conv_w2[i];
+                                        out_in[i] = c_slice[i] * conv_out;
+                                    }
+                                }
+
+                                if d_conv > 0 {
+                                    if d_conv > 1 {
+                                        buffer.copy_within(hs.., 0);
+                                    }
+                                    let last_slot = (d_conv - 1) * hs;
+                                    buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                                    history.push(start_pos + j + 1, buffer);
+                                }
                             }
                         }
                         if profile_prefill {
@@ -3045,7 +3130,13 @@ impl Lfm2Model {
                             state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
-                                let seq_len = (start_pos + j + 1).min(k_cache.len() / kv_dim);
+                                let is_causal = cfg.is_causal
+                                    && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+                                let seq_len = if is_causal {
+                                    (start_pos + j + 1).min(k_cache.len() / kv_dim)
+                                } else {
+                                    (start_pos + n).min(k_cache.len() / kv_dim)
+                                };
                                 let q = &q_mat[j * hs..(j + 1) * hs];
                                 let attn_out = &mut out_proj_input[j * hs..(j + 1) * hs];
                                 let scores = &mut state.scratch.scores;

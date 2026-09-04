@@ -641,19 +641,18 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
                 tokenizer_path.display()
             ))
         })?;
-        if let Ok(tokenizer) = HfTokenizerJson::parse_from_bytes(&tok_bytes) {
-            let chat_template = dir
-                .join("tokenizer_config.json")
-                .exists()
-                .then(|| fs::read(dir.join("tokenizer_config.json")).ok())
-                .flatten()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| {
-                    v.get("chat_template")
-                        .and_then(|t| t.as_str().map(str::to_string))
-                });
-            tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
-        }
+        let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
+        let chat_template = dir
+            .join("tokenizer_config.json")
+            .exists()
+            .then(|| fs::read(dir.join("tokenizer_config.json")).ok())
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("chat_template")
+                    .and_then(|t| t.as_str().map(str::to_string))
+            });
+        tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
     }
 
     let mut safetensors_files = Vec::new();

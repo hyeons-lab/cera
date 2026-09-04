@@ -113,8 +113,12 @@ impl TargetQuant {
             _ => {}
         }
 
-        // 1D tensors (layer norms, bias vectors) are always kept in F32 for numerical stability.
-        if num_dims <= 1 || num_elements < 256 {
+        // 1D tensors (layer norms, bias vectors) and shortconv 3-token kernels are kept in F32.
+        if num_dims <= 1
+            || num_elements < 256
+            || tensor_name.contains("shortconv.conv")
+            || tensor_name.contains("conv.conv")
+        {
             return GGML_TYPE_F32;
         }
 

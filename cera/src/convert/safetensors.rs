@@ -159,12 +159,17 @@ fn map_whisper_block_sub(sub: &str) -> &str {
 pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
     // Direct global mappings
     if hf_name == "model.embed_tokens.weight"
+        || hf_name == "lfm2.embed_tokens.weight"
         || hf_name == "transformer.wte.weight"
         || hf_name == "embeddings.word_embeddings.weight"
     {
         return "token_embd.weight".to_string();
     }
+    if hf_name == "lfm2.embedding_norm.weight" {
+        return "token_embd_norm.weight".to_string();
+    }
     if hf_name == "model.norm.weight"
+        || hf_name == "lfm2.norm.weight"
         || hf_name == "transformer.ln_f.weight"
         || hf_name == "ln_f.weight"
     {
@@ -234,6 +239,7 @@ pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
     // Layer-level mappings
     let layer_rest = hf_name
         .strip_prefix("model.layers.")
+        .or_else(|| hf_name.strip_prefix("lfm2.layers."))
         .or_else(|| hf_name.strip_prefix("transformer.h."))
         .or_else(|| hf_name.strip_prefix("layers."));
     if let Some((layer_idx, sub_name)) = layer_rest.and_then(|r| r.split_once('.')) {
@@ -244,30 +250,30 @@ pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
             "self_attn.k_proj.bias" => "attn_k.bias",
             "self_attn.v_proj.weight" => "attn_v.weight",
             "self_attn.v_proj.bias" => "attn_v.bias",
-            "self_attn.o_proj.weight" => "attn_output.weight",
-            "self_attn.o_proj.bias" => "attn_output.bias",
+            "self_attn.o_proj.weight" | "self_attn.out_proj.weight" => "attn_output.weight",
+            "self_attn.o_proj.bias" | "self_attn.out_proj.bias" => "attn_output.bias",
             "self_attn.qkv_proj.weight" => "attn_qkv.weight",
             "self_attn.qkv_proj.bias" => "attn_qkv.bias",
-            "self_attn.q_norm.weight" => "attn_q_norm.weight",
-            "self_attn.q_norm.bias" => "attn_q_norm.bias",
-            "self_attn.k_norm.weight" => "attn_k_norm.weight",
-            "self_attn.k_norm.bias" => "attn_k_norm.bias",
-            "mlp.gate_proj.weight" => "ffn_gate.weight",
-            "mlp.gate_proj.bias" => "ffn_gate.bias",
-            "mlp.up_proj.weight" => "ffn_up.weight",
-            "mlp.up_proj.bias" => "ffn_up.bias",
-            "mlp.down_proj.weight" => "ffn_down.weight",
-            "mlp.down_proj.bias" => "ffn_down.bias",
-            "input_layernorm.weight" => "attn_norm.weight",
-            "input_layernorm.bias" => "attn_norm.bias",
+            "self_attn.q_norm.weight" | "self_attn.q_layernorm.weight" => "attn_q_norm.weight",
+            "self_attn.q_norm.bias" | "self_attn.q_layernorm.bias" => "attn_q_norm.bias",
+            "self_attn.k_norm.weight" | "self_attn.k_layernorm.weight" => "attn_k_norm.weight",
+            "self_attn.k_norm.bias" | "self_attn.k_layernorm.bias" => "attn_k_norm.bias",
+            "mlp.gate_proj.weight" | "feed_forward.w1.weight" => "ffn_gate.weight",
+            "mlp.gate_proj.bias" | "feed_forward.w1.bias" => "ffn_gate.bias",
+            "mlp.up_proj.weight" | "feed_forward.w3.weight" => "ffn_up.weight",
+            "mlp.up_proj.bias" | "feed_forward.w3.bias" => "ffn_up.bias",
+            "mlp.down_proj.weight" | "feed_forward.w2.weight" => "ffn_down.weight",
+            "mlp.down_proj.bias" | "feed_forward.w2.bias" => "ffn_down.bias",
+            "input_layernorm.weight" | "operator_norm.weight" => "attn_norm.weight",
+            "input_layernorm.bias" | "operator_norm.bias" => "attn_norm.bias",
             "post_attention_layernorm.weight" => "ffn_norm.weight",
             "post_attention_layernorm.bias" => "ffn_norm.bias",
-            "operator.conv.weight" => "shortconv.conv.weight",
-            "operator.conv.bias" => "shortconv.conv.bias",
-            "operator.in_proj.weight" => "shortconv.in_proj.weight",
-            "operator.in_proj.bias" => "shortconv.in_proj.bias",
-            "operator.out_proj.weight" => "shortconv.out_proj.weight",
-            "operator.out_proj.bias" => "shortconv.out_proj.bias",
+            "operator.conv.weight" | "conv.conv.weight" => "shortconv.conv.weight",
+            "operator.conv.bias" | "conv.conv.bias" => "shortconv.conv.bias",
+            "operator.in_proj.weight" | "conv.in_proj.weight" => "shortconv.in_proj.weight",
+            "operator.in_proj.bias" | "conv.in_proj.bias" => "shortconv.in_proj.bias",
+            "operator.out_proj.weight" | "conv.out_proj.weight" => "shortconv.out_proj.weight",
+            "operator.out_proj.bias" | "conv.out_proj.bias" => "shortconv.out_proj.bias",
             _ => sub_name,
         };
 

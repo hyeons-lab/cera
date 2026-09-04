@@ -249,15 +249,26 @@ pub fn extract_spans(
                     String::new()
                 };
                 let score = probs[i * num_classes + tags[i]];
-                spans.push(EntitySpan {
-                    entity_type: ent_type.to_string(),
-                    start_char,
-                    end_char,
-                    start_token: i,
-                    end_token: i + 1,
-                    text: span_text,
-                    score,
-                });
+                let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
+                let trailing_ws = span_text.chars().rev().take_while(|c| c.is_whitespace()).count();
+                let trimmed_start = start_char + leading_ws;
+                let trimmed_end = if end_char >= trailing_ws {
+                    end_char - trailing_ws
+                } else {
+                    end_char
+                };
+                let trimmed_text = span_text.trim().to_string();
+                if trimmed_start < trimmed_end && !trimmed_text.is_empty() {
+                    spans.push(EntitySpan {
+                        entity_type: ent_type.to_string(),
+                        start_char: trimmed_start,
+                        end_char: trimmed_end,
+                        start_token: i,
+                        end_token: i + 1,
+                        text: trimmed_text,
+                        score,
+                    });
+                }
                 i += 1;
             }
             BioesPrefix::B => {
@@ -297,15 +308,26 @@ pub fn extract_spans(
                     String::new()
                 };
 
-                spans.push(EntitySpan {
-                    entity_type: ent_type.to_string(),
-                    start_char,
-                    end_char,
-                    start_token,
-                    end_token,
-                    text: span_text,
-                    score: avg_score,
-                });
+                let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
+                let trailing_ws = span_text.chars().rev().take_while(|c| c.is_whitespace()).count();
+                let trimmed_start = start_char + leading_ws;
+                let trimmed_end = if end_char >= trailing_ws {
+                    end_char - trailing_ws
+                } else {
+                    end_char
+                };
+                let trimmed_text = span_text.trim().to_string();
+                if trimmed_start < trimmed_end && !trimmed_text.is_empty() {
+                    spans.push(EntitySpan {
+                        entity_type: ent_type.to_string(),
+                        start_char: trimmed_start,
+                        end_char: trimmed_end,
+                        start_token,
+                        end_token,
+                        text: trimmed_text,
+                        score: avg_score,
+                    });
+                }
 
                 i = end_token;
             }
@@ -329,7 +351,23 @@ pub fn detect_pii(
         return Ok(Vec::new());
     }
 
-    let (tokens, offsets) = tokenizer.encode_with_offsets(text);
+    let (tokens, offsets) = if let Some(bos) = tokenizer.bos_token() {
+        let (raw_tokens, raw_offsets) = tokenizer.encode_with_offsets(text);
+        let mut t = Vec::with_capacity(raw_tokens.len() + 1);
+        let mut o = Vec::with_capacity(raw_offsets.len() + 1);
+        t.push(bos);
+        o.push(TokenOffset {
+            char_start: 0,
+            char_end: 0,
+            byte_start: 0,
+            byte_end: 0,
+        });
+        t.extend(raw_tokens);
+        o.extend(raw_offsets);
+        (t, o)
+    } else {
+        tokenizer.encode_with_offsets(text)
+    };
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
@@ -850,4 +888,26 @@ mod tests {
             panic!("expected CeraError::Backend on sequence length exceeded");
         }
     }
+
+    #[test]
+    #[ignore]
+    fn test_real_model_pii_classification() {
+        let model_path = std::path::Path::new("/Users/dberrios/development/models/pii-detect-q8_0.gguf");
+        if !model_path.exists() {
+            return;
+        }
+        let engine = crate::engine::CeraEngine::from_path(
+            model_path.to_str().unwrap(),
+            crate::engine::EngineConfig::default(),
+        ).unwrap();
+
+        let text = "Hello, my name is Alice Smith and my email is alice.smith@example.com";
+        let spans = engine.detect_pii(text).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].entity_type, "identity.person_name");
+        assert_eq!(spans[0].text, "Alice Smith");
+        assert_eq!(spans[1].entity_type, "contact.email");
+        assert_eq!(spans[1].text, "alice.smith@example.com");
+    }
 }
+
