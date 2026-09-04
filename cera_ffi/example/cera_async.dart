@@ -90,7 +90,7 @@ Future<void> main(List<String> args) async {
     sink,
   );
   print(
-    'generateStreamingAsync done: ${sink.count} tokens, finish=${sink.finish}',
+    'generateStreamingAsync done: ${sink.count} chunks, finish=${sink.finish}',
   );
   exit(0);
 }
@@ -99,7 +99,9 @@ class _AsyncSink implements ModalitySink {
   int count = 0;
   FinishReason? finish;
   @override
-  void onTextTokens(List<int> t) => count += t.length;
+  void onThoughtChunk(String text) {}
+  @override
+  void onTextChunk(String text) => count += 1;
   @override
   void onAudioFrames(List<double> pcm, int sampleRate) {}
   @override

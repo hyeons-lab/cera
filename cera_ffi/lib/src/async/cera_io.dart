@@ -371,7 +371,6 @@ class _NativeCera implements Cera {
       }
       started = true;
       final sink = _StreamingSink(
-        engine: _engine,
         emit: (piece) {
           if (!controller.isClosed) controller.add(piece);
         },
@@ -654,28 +653,14 @@ class _NativeCera implements Cera {
   Future<void> terminate() => close();
 }
 
-/// Turns the binding's token-id callbacks into a stream of text.
-///
-/// The decode is incremental and has to stay UTF-8-safe. A multi-byte character
-/// can span several byte-fallback tokens, so detokenizing each chunk on its own
-/// splits it and yields U+FFFD in place of a perfectly good character. Instead
-/// every chunk re-decodes the whole prefix and emits the delta, holding back a
-/// trailing U+FFFD until the token that completes it arrives.
-///
-/// Re-decoding the prefix is quadratic in tokens generated. It is also one FFI
-/// call per emitted chunk over a buffer of a few hundred ids, against a decode
-/// step that just ran a whole transformer, so the cost does not register.
+/// Delivers streamed text chunks to the consumer.
 class _StreamingSink implements ModalitySink {
   _StreamingSink({
-    required this.engine,
     required this.emit,
     this.onAudio,
     required this.isOpen,
     required this.done,
   });
-
-  /// Detokenizer. The session's engine, so the vocabulary matches.
-  final CeraEngine engine;
 
   /// Receives each new fragment of text.
   final void Function(String) emit;
@@ -683,42 +668,21 @@ class _StreamingSink implements ModalitySink {
   /// Receives raw Float32 PCM audio chunks when model is in audio mode.
   final void Function(List<double> pcm, int sampleRate)? onAudio;
 
-  /// Whether the engine is still open.
-  ///
-  /// Checked before every `decodeTokens`. A `close()` during an in-flight
-  /// generate frees the engine handle while Rust is still delivering tokens,
-  /// and the generated bindings answer a call on a freed handle by throwing
-  /// from `_ensureOpen`. Thrown from here that error would escape into the
-  /// `unawaited` future, leaving the terminal callback unfired and the caller
-  /// awaiting a stream that never closes.
+  /// Whether the session is still open.
   final bool Function() isOpen;
 
   /// Called exactly once, with the error if the generation failed.
   final void Function(Object? error) done;
 
-  final List<int> _ids = [];
-  int _emitted = 0;
   bool _finished = false;
 
-  /// The replacement character, the signal that a decode ended mid-sequence.
-  static const _replacement = '\uFFFD';
+  @override
+  void onThoughtChunk(String text) {}
 
   @override
-  void onTextTokens(List<int> tokens) {
-    if (tokens.isEmpty || _finished || !isOpen()) return;
-    _ids.addAll(tokens);
-    final full = engine.decodeTokens(_ids);
-    // Hold back a trailing replacement char: it means the last token is half a
-    // character, and the next one completes it. A genuine U+FFFD in the model's
-    // output is merely delayed by one token.
-    final stable =
-        full.endsWith(_replacement)
-            ? full.substring(0, full.length - _replacement.length)
-            : full;
-    if (stable.length > _emitted) {
-      emit(stable.substring(_emitted));
-      _emitted = stable.length;
-    }
+  void onTextChunk(String text) {
+    if (text.isEmpty || _finished || !isOpen()) return;
+    emit(text);
   }
 
   @override
@@ -729,25 +693,17 @@ class _StreamingSink implements ModalitySink {
 
   @override
   void onDone(FinishReason reason) {
-    // Deliberately not the completion signal. `onDone` fires on the Rust
+    // Deliberately not the completion signal. onDone fires on the Rust
     // blocking worker before the future resolves, and closing the controller
-    // here would race the last `onTextTokens` delivery. `finish` runs when the
+    // here would race the last chunk delivery. finish runs when the
     // future completes, which orders after every callback.
   }
 
-  /// Flushes any held-back partial character and reports success. Idempotent.
+  /// Reports success. Idempotent.
   void finish() {
     if (_finished) return;
     _finished = true;
-    try {
-      if (_ids.isNotEmpty && isOpen()) {
-        final full = engine.decodeTokens(_ids);
-        if (full.length > _emitted) emit(full.substring(_emitted));
-      }
-      done(null);
-    } catch (e) {
-      done(e);
-    }
+    done(null);
   }
 
   /// Reports failure. Idempotent, and mutually exclusive with [finish].
