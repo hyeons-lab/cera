@@ -153,6 +153,29 @@ impl BpeTokenizer {
         })
     }
 
+    /// Construct a tokenizer from a raw vocabulary list.
+    pub fn from_vocab(vocab: Vec<Vec<u8>>) -> Self {
+        let mut token_to_id = HashMap::with_capacity(vocab.len());
+        for (id, token_bytes) in vocab.iter().enumerate() {
+            token_to_id.insert(token_bytes.clone(), id as u32);
+        }
+        BpeTokenizer {
+            vocab,
+            token_to_id,
+            merge_ranks: HashMap::new(),
+            special_tokens: HashMap::new(),
+            bos_id: None,
+            eos_id: None,
+            add_bos: false,
+            add_eos: false,
+            chat_template: None,
+            pretokenize_re: build_pretokenize_regex("gpt2"),
+            digits_split_bare: false,
+            byte_to_unicode: build_byte_to_unicode(),
+            unicode_to_byte: build_unicode_to_byte(),
+        }
+    }
+
     /// Encode text into token IDs using byte-level BPE with pretokenization.
     ///
     /// The text is first split into chunks using a regex pattern (matching
@@ -607,6 +630,21 @@ pub enum ContentItem {
 pub struct ChatMessageMultimodal {
     pub role: String,
     pub content: Vec<ContentItem>,
+}
+
+/// PCM audio input buffer.
+#[derive(Debug, Clone)]
+pub struct AudioInput {
+    pub pcm: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+/// User-facing multimodal input envelope.
+#[derive(Debug, Clone, Default)]
+pub struct UserMessage {
+    pub text: Option<String>,
+    pub images: Vec<Vec<u8>>,
+    pub audio: Option<AudioInput>,
 }
 
 /// Render a chat template using minijinja.

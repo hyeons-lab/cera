@@ -63,6 +63,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? storeDir,
     bool? turboQuant,
     bool? wantsAudio,
+    bool? wantsThought,
   });
 }
 
@@ -255,6 +256,9 @@ class _WorkerCera implements Cera {
   final _audioCallbacks =
       <int, void Function(List<double> pcm, int sampleRate)>{};
 
+  /// Callbacks for streaming thought chunks, by id.
+  final _thoughtCallbacks = <int, void Function(String thought)>{};
+
   JSInt32Array? _cancelArray;
 
   int _nextId = 0;
@@ -432,6 +436,10 @@ class _WorkerCera implements Cera {
       _streams[reply.id]?.add(reply.text ?? '');
       return;
     }
+    if (reply.event == 'thought') {
+      _thoughtCallbacks[reply.id]?.call(reply.text ?? '');
+      return;
+    }
     if (reply.event == 'audio') {
       final callback = _audioCallbacks[reply.id];
       final pcmJs = reply.pcm;
@@ -503,6 +511,7 @@ class _WorkerCera implements Cera {
     final pending = _pending.values.toList();
     _pending.clear();
     _audioCallbacks.clear();
+    _thoughtCallbacks.clear();
     for (final completer in pending) {
       if (!completer.isCompleted) completer.completeError(error);
     }
@@ -541,6 +550,7 @@ class _WorkerCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     if (_closed) {
@@ -584,6 +594,9 @@ class _WorkerCera implements Cera {
       started = true;
       final id = _newId();
       _streams[id] = controller;
+      if (onThought != null) {
+        _thoughtCallbacks[id] = onThought;
+      }
       if (onAudio != null) {
         _audioCallbacks[id] = onAudio;
       }
@@ -591,6 +604,7 @@ class _WorkerCera implements Cera {
         finished = true;
         _streams.remove(id);
         _audioCallbacks.remove(id);
+        _thoughtCallbacks.remove(id);
         if (!mine.isCompleted) mine.complete();
         if (controller.isClosed) return;
         if (error != null) controller.addError(error, stack);
@@ -610,6 +624,7 @@ class _WorkerCera implements Cera {
             topK: topK,
             seed: seed,
             wantsAudio: onAudio != null,
+            wantsThought: onThought != null,
           ),
         );
         unawaited(

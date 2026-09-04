@@ -27,6 +27,54 @@ Never _unsupportedOnWeb(String api) {
 
 const _sentinel = Object();
 
+/// PCM audio input buffer.
+class AudioInput {
+  const AudioInput({
+    required this.pcm,
+    this.sampleRate = 16000,
+  });
+
+  final List<double> pcm;
+  final int sampleRate;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'pcm': this.pcm,
+      'sampleRate': this.sampleRate,
+    };
+  }
+
+  factory AudioInput.fromJson(Map<String, dynamic> json) {
+    return AudioInput(
+      pcm: (json['pcm'] as List).map((item) => (item as num).toDouble()).toList(),
+      sampleRate: json.containsKey('sampleRate') ? (json['sampleRate'] as num).toInt() : 16000,
+    );
+  }
+
+  AudioInput copyWith({
+    List<double>? pcm,
+    int? sampleRate,
+  }) {
+    return AudioInput(
+      pcm: pcm ?? this.pcm,
+      sampleRate: sampleRate ?? this.sampleRate,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'AudioInput(pcm: $pcm, sampleRate: $sampleRate)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AudioInput && pcm == other.pcm && sampleRate == other.sampleRate;
+
+  @override
+  int get hashCode => Object.hash(pcm, sampleRate);
+}
+
 /// One message in a chat-template conversation. Mirrors
 /// [`cera::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
 /// [`CeraEngine::apply_chat_template`] to render the model's
@@ -450,28 +498,25 @@ class GenerateOpts {
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
-/// the generated token IDs plus the decode summary. The two are
-/// returned together so callers don't have to manage a separate
-/// callback channel; streaming (per-chunk delivery) lands in PR 4.
+/// the generated text string, token IDs, and decode summary.
 class GenerateOutput {
   const GenerateOutput({
-    /// Generated token IDs, in order, not including any prompt
-    /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-    /// Rust side, or with [`CeraEngine::decode_tokens`] from any
-    /// foreign binding.
+    /// Generated text (UTF-8 decoded).
+    required this.text,
+    /// Generated token IDs, in order, not including any prompt tokens.
     required this.tokens,
     required this.summary,
   });
 
-  /// Generated token IDs, in order, not including any prompt
-  /// tokens. Decode with [`cera::tokenizer::BpeTokenizer`] on the
-  /// Rust side, or with [`CeraEngine::decode_tokens`] from any
-  /// foreign binding.
+  /// Generated text (UTF-8 decoded).
+  final String text;
+  /// Generated token IDs, in order, not including any prompt tokens.
   final List<int> tokens;
   final GenerateSummary summary;
 
   Map<String, dynamic> toJson() {
     return {
+      'text': this.text,
       'tokens': this.tokens,
       'summary': this.summary.toJson(),
     };
@@ -479,16 +524,19 @@ class GenerateOutput {
 
   factory GenerateOutput.fromJson(Map<String, dynamic> json) {
     return GenerateOutput(
+      text: json['text'] as String,
       tokens: (json['tokens'] as List).map((item) => (item as num).toInt()).toList(),
       summary: GenerateSummary.fromJson(json['summary'] as Map<String, dynamic>),
     );
   }
 
   GenerateOutput copyWith({
+    String? text,
     List<int>? tokens,
     GenerateSummary? summary,
   }) {
     return GenerateOutput(
+      text: text ?? this.text,
       tokens: tokens ?? this.tokens,
       summary: summary ?? this.summary,
     );
@@ -496,16 +544,16 @@ class GenerateOutput {
 
   @override
   String toString() {
-    return 'GenerateOutput(tokens: $tokens, summary: $summary)';
+    return 'GenerateOutput(text: $text, tokens: $tokens, summary: $summary)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOutput && tokens == other.tokens && summary == other.summary;
+      other is GenerateOutput && text == other.text && tokens == other.tokens && summary == other.summary;
 
   @override
-  int get hashCode => Object.hash(tokens, summary);
+  int get hashCode => Object.hash(text, tokens, summary);
 }
 
 /// Decode-run metadata. Mirrors [`cera::GenerateSummary`].
@@ -515,6 +563,9 @@ class GenerateSummary {
     required this.promptEvalTokens,
     required this.promptEvalMs,
     required this.decodeMs,
+    required this.totalDurationMs,
+    required this.decodeTokPerSec,
+    required this.promptEvalTokPerSec,
     required this.finishReason,
   });
 
@@ -522,6 +573,9 @@ class GenerateSummary {
   final int promptEvalTokens;
   final int promptEvalMs;
   final int decodeMs;
+  final int totalDurationMs;
+  final double decodeTokPerSec;
+  final double promptEvalTokPerSec;
   final FinishReason finishReason;
 
   Map<String, dynamic> toJson() {
@@ -530,6 +584,9 @@ class GenerateSummary {
       'promptEvalTokens': this.promptEvalTokens,
       'promptEvalMs': this.promptEvalMs,
       'decodeMs': this.decodeMs,
+      'totalDurationMs': this.totalDurationMs,
+      'decodeTokPerSec': this.decodeTokPerSec,
+      'promptEvalTokPerSec': this.promptEvalTokPerSec,
       'finishReason': FinishReasonFfiCodec.encode(this.finishReason),
     };
   }
@@ -540,6 +597,9 @@ class GenerateSummary {
       promptEvalTokens: (json['promptEvalTokens'] as num).toInt(),
       promptEvalMs: (json['promptEvalMs'] as num).toInt(),
       decodeMs: (json['decodeMs'] as num).toInt(),
+      totalDurationMs: (json['totalDurationMs'] as num).toInt(),
+      decodeTokPerSec: (json['decodeTokPerSec'] as num).toDouble(),
+      promptEvalTokPerSec: (json['promptEvalTokPerSec'] as num).toDouble(),
       finishReason: FinishReasonFfiCodec.decode(json['finishReason'] as String),
     );
   }
@@ -549,6 +609,9 @@ class GenerateSummary {
     int? promptEvalTokens,
     int? promptEvalMs,
     int? decodeMs,
+    int? totalDurationMs,
+    double? decodeTokPerSec,
+    double? promptEvalTokPerSec,
     FinishReason? finishReason,
   }) {
     return GenerateSummary(
@@ -556,22 +619,25 @@ class GenerateSummary {
       promptEvalTokens: promptEvalTokens ?? this.promptEvalTokens,
       promptEvalMs: promptEvalMs ?? this.promptEvalMs,
       decodeMs: decodeMs ?? this.decodeMs,
+      totalDurationMs: totalDurationMs ?? this.totalDurationMs,
+      decodeTokPerSec: decodeTokPerSec ?? this.decodeTokPerSec,
+      promptEvalTokPerSec: promptEvalTokPerSec ?? this.promptEvalTokPerSec,
       finishReason: finishReason ?? this.finishReason,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateSummary(tokensGenerated: $tokensGenerated, promptEvalTokens: $promptEvalTokens, promptEvalMs: $promptEvalMs, decodeMs: $decodeMs, finishReason: $finishReason)';
+    return 'GenerateSummary(tokensGenerated: $tokensGenerated, promptEvalTokens: $promptEvalTokens, promptEvalMs: $promptEvalMs, decodeMs: $decodeMs, totalDurationMs: $totalDurationMs, decodeTokPerSec: $decodeTokPerSec, promptEvalTokPerSec: $promptEvalTokPerSec, finishReason: $finishReason)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateSummary && tokensGenerated == other.tokensGenerated && promptEvalTokens == other.promptEvalTokens && promptEvalMs == other.promptEvalMs && decodeMs == other.decodeMs && finishReason == other.finishReason;
+      other is GenerateSummary && tokensGenerated == other.tokensGenerated && promptEvalTokens == other.promptEvalTokens && promptEvalMs == other.promptEvalMs && decodeMs == other.decodeMs && totalDurationMs == other.totalDurationMs && decodeTokPerSec == other.decodeTokPerSec && promptEvalTokPerSec == other.promptEvalTokPerSec && finishReason == other.finishReason;
 
   @override
-  int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, finishReason);
+  int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, totalDurationMs, decodeTokPerSec, promptEvalTokPerSec, finishReason);
 }
 
 /// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
@@ -993,6 +1059,60 @@ class ToolDef {
 
   @override
   int get hashCode => Object.hash(name, description, parametersJson);
+}
+
+/// User-facing multimodal input envelope.
+class UserMessage {
+  const UserMessage({
+    this.text = null,
+    this.images = const [],
+    this.audio = null,
+  });
+
+  final String? text;
+  final List<Uint8List> images;
+  final AudioInput? audio;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'text': this.text,
+      'images': this.images.map((item) => base64Encode(item)).toList(),
+      'audio': this.audio == null ? null : (() { final __tmp = this.audio!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory UserMessage.fromJson(Map<String, dynamic> json) {
+    return UserMessage(
+      text: json.containsKey('text') ? json['text'] == null ? null : json['text'] as String : null,
+      images: json.containsKey('images') ? (json['images'] as List).map((item) => base64Decode(item as String)).toList() : const [],
+      audio: json.containsKey('audio') ? json['audio'] == null ? null : (() { final __tmp = json['audio']; return AudioInput.fromJson(__tmp as Map<String, dynamic>); })() : null,
+    );
+  }
+
+  UserMessage copyWith({
+    Object? text = _sentinel,
+    List<Uint8List>? images,
+    Object? audio = _sentinel,
+  }) {
+    return UserMessage(
+      text: text == _sentinel ? this.text : text as String?,
+      images: images ?? this.images,
+      audio: audio == _sentinel ? this.audio : audio as AudioInput?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'UserMessage(text: $text, images: $images, audio: $audio)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is UserMessage && text == other.text && images == other.images && audio == other.audio;
+
+  @override
+  int get hashCode => Object.hash(text, images, audio);
 }
 
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
@@ -2572,6 +2692,10 @@ final class BundleRepo {
   /// action is user-driven.
   void clearCache() => _unsupportedOnWeb('BundleRepo.clearCache');
 
+  /// Download all assets for a bundle ID and quantization to the local cache
+  /// without loading model weights into memory or creating an engine.
+  void downloadBundle(String bundleId, String quant) => _unsupportedOnWeb('BundleRepo.downloadBundle');
+
   /// The directory this repo caches bundles under. Matches what was
   /// passed to [`BundleRepo::new`] / [`BundleRepo::with_progress`],
   /// useful for log / telemetry.
@@ -3023,21 +3147,24 @@ final class LoraAdaptersFfiCodec {
 /// Streaming sink for decode output. Foreign callers implement this
 /// trait (Kotlin class, Swift class, Python subclass) and pass an
 /// `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
-/// receive tokens + audio frames + the finish reason as they happen.
+/// receive text chunks + thought chunks + audio frames + the finish reason
+/// as they happen.
 ///
-/// All methods are required from foreign implementations (UniFFI 0.28
+/// All methods are required from foreign implementations (UniFFI 0.31
 /// foreign traits don't carry Rust's default-impl fallbacks). Callers
 /// that don't care about a modality can provide an empty body.
 ///
 /// Threading: every method is invoked on the same Rust thread running
-/// `generate` — the decode thread. If the foreign runtime requires
+/// `generate` (the decode thread). If the foreign runtime requires
 /// marshalling onto a different thread (e.g. Swift's `@MainActor`) it
 /// is the implementer's responsibility to dispatch the call there.
 abstract interface class ModalitySink {
-  /// Called with each chunk of generated token IDs. Ownership of the
-  /// `Vec<u32>` is transferred to the callback, so implementations
-  /// may retain or store it directly if needed — no clone required.
-  void onTextTokens(List<int> tokens);
+  /// Called with each chunk of reasoning or chain-of-thought text
+  /// extracted from thinking delimiters (<think>...</think>).
+  void onThoughtChunk(String text);
+  /// Called with each chunk of generated user-facing text
+  /// as soon as valid characters are produced.
+  void onTextChunk(String text);
   /// Called with each chunk of generated PCM audio samples. Not
   /// called for text-only models; LFM2-Audio-class models emit here.
   /// The `sample_rate` is the model's native output rate (typically
@@ -3226,12 +3353,9 @@ final class Session {
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
 
-  /// Run autoregressive decode and return all emitted tokens +
-  /// a summary. Synchronous — the call blocks until the decode
-  /// loop exits (`max_tokens`, EOS, `cancel()`, or error).
-  ///
-  /// For streaming (per-chunk delivery) and async, see the PR 4 /
-  /// PR 5 follow-ups in `cera-ffi/README.md`.
+  /// Run autoregressive decode and return all emitted text, tokens, and
+  /// summary. Synchronous: the call blocks until the decode loop exits
+  /// (`max_tokens`, EOS, `cancel()`, or error).
   GenerateOutput generate(GenerateOpts opts) => _unsupportedOnWeb('Session.generate');
 
   /// Async variant of [`Session::generate`] — runs buffered decode
@@ -3257,17 +3381,17 @@ final class Session {
   /// diagnostic prefix.
   Future<GenerateOutput> generateAsync(GenerateOpts opts) => _unsupportedOnWeb('Session.generateAsync');
 
-  /// Run autoregressive decode, streaming every token (and audio
+  /// Run autoregressive decode, streaming every text chunk (and audio
   /// frame, for audio-capable models) to a foreign [`ModalitySink`]
-  /// as soon as it's produced. Returns only a [`GenerateSummary`] —
-  /// token IDs are delivered through `sink.on_text_tokens`, not a
+  /// as soon as it is produced. Returns only a [`GenerateSummary`]:
+  /// text chunks are delivered through `sink.on_text_chunk`, not a
   /// return value.
   ///
   /// Synchronous: the call blocks on the decode thread and each
   /// `sink` method runs on that same thread before decoding
-  /// continues. For async, see PR 5 in `cera-ffi/README.md`.
+  /// continues.
   ///
-  /// **Callback reentrancy — deadlock hazard.** The session mutex is
+  /// **Callback reentrancy: deadlock hazard.** The session mutex is
   /// held for the entire call, and sink callbacks run while that
   /// lock is held. Calling back into methods that also take the
   /// mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -3369,6 +3493,18 @@ final class Session {
   /// Returns `Result` so a poisoned-mutex case surfaces as an error
   /// instead of panicking across the FFI boundary.
   void reset() => _unsupportedOnWeb('Session.reset');
+
+  /// Append a multimodal message, automatically enforcing model-canonical
+  /// media ordering, boundary token envelopes, and sample rate normalization.
+  void sendMessage(UserMessage message) => _unsupportedOnWeb('Session.sendMessage');
+
+  /// Append a multimodal message and run generation synchronously while holding
+  /// the session lock continuously across prefill and decode.
+  GenerateOutput sendMessageAndGenerate(UserMessage message, GenerateOpts opts) => _unsupportedOnWeb('Session.sendMessageAndGenerate');
+
+  /// Append a multimodal message and run streaming generation while holding
+  /// the session lock continuously across prefill and decode.
+  GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended
   /// image, in pixels (`None` = no cap). Unlike the per-call

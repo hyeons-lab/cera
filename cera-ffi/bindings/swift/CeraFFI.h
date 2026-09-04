@@ -259,14 +259,21 @@ typedef void (*UniffiCallbackInterfaceModalitySinkMethod0)(uint64_t, RustBuffer,
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD1
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD1
-typedef void (*UniffiCallbackInterfaceModalitySinkMethod1)(uint64_t, RustBuffer, uint32_t, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceModalitySinkMethod1)(uint64_t, RustBuffer, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
 #endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD2
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD2
-typedef void (*UniffiCallbackInterfaceModalitySinkMethod2)(uint64_t, RustBuffer, void* _Nonnull, 
+typedef void (*UniffiCallbackInterfaceModalitySinkMethod2)(uint64_t, RustBuffer, uint32_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD3
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_MODALITY_SINK_METHOD3
+typedef void (*UniffiCallbackInterfaceModalitySinkMethod3)(uint64_t, RustBuffer, void* _Nonnull, 
         RustCallStatus *_Nonnull uniffiCallStatus
     );
 
@@ -285,9 +292,10 @@ typedef struct UniffiVTableCallbackInterfaceDownloadProgressSink {
 typedef struct UniffiVTableCallbackInterfaceModalitySink {
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
     UniffiCallbackInterfaceClone _Nonnull uniffiClone;
-    UniffiCallbackInterfaceModalitySinkMethod0 _Nonnull onTextTokens;
-    UniffiCallbackInterfaceModalitySinkMethod1 _Nonnull onAudioFrames;
-    UniffiCallbackInterfaceModalitySinkMethod2 _Nonnull onDone;
+    UniffiCallbackInterfaceModalitySinkMethod0 _Nonnull onThoughtChunk;
+    UniffiCallbackInterfaceModalitySinkMethod1 _Nonnull onTextChunk;
+    UniffiCallbackInterfaceModalitySinkMethod2 _Nonnull onAudioFrames;
+    UniffiCallbackInterfaceModalitySinkMethod3 _Nonnull onDone;
 } UniffiVTableCallbackInterfaceModalitySink;
 
 #endif
@@ -319,6 +327,11 @@ uint64_t uniffi_cera_ffi_fn_method_bundlerepo_cache_size(uint64_t ptr, RustCallS
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_CLEAR_CACHE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_CLEAR_CACHE
 void uniffi_cera_ffi_fn_method_bundlerepo_clear_cache(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+void uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(uint64_t ptr, RustBuffer bundle_id, RustBuffer quant, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_BUNDLEREPO_STORE_DIR
@@ -606,9 +619,14 @@ void uniffi_cera_ffi_fn_free_modalitysink(uint64_t handle, RustCallStatus *_Nonn
 void uniffi_cera_ffi_fn_init_callback_vtable_modalitysink(const UniffiVTableCallbackInterfaceModalitySink* _Nonnull vtable
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_TEXT_TOKENS
-#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_TEXT_TOKENS
-void uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_THOUGHT_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_THOUGHT_CHUNK
+void uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_TEXT_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_TEXT_CHUNK
+void uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODALITYSINK_ON_AUDIO_FRAMES
@@ -734,6 +752,21 @@ void uniffi_cera_ffi_fn_method_session_remove_lora(uint64_t ptr, RustCallStatus 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RESET
 void uniffi_cera_ffi_fn_method_session_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE
+void uniffi_cera_ffi_fn_method_session_send_message(uint64_t ptr, RustBuffer message, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE_AND_GENERATE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE_AND_GENERATE
+RustBuffer uniffi_cera_ffi_fn_method_session_send_message_and_generate(uint64_t ptr, RustBuffer message, RustBuffer opts, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SEND_MESSAGE_STREAMING
+RustBuffer uniffi_cera_ffi_fn_method_session_send_message_streaming(uint64_t ptr, RustBuffer message, RustBuffer opts, uint64_t sink, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_SET_IMAGE_MAX_LONG_SIZE
@@ -1106,6 +1139,12 @@ uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_DOWNLOAD_BUNDLE
+uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_STORE_DIR
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_STORE_DIR
 uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_store_dir(void
@@ -1286,9 +1325,15 @@ uint16_t uniffi_cera_ffi_checksum_method_loraadapters_target_count(void
     
 );
 #endif
-#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
-#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_TOKENS
-uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens(void
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_THOUGHT_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_THOUGHT_CHUNK
+uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODALITYSINK_ON_TEXT_CHUNK
+uint16_t uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk(void
     
 );
 #endif
@@ -1427,6 +1472,24 @@ uint16_t uniffi_cera_ffi_checksum_method_session_remove_lora(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RESET
 uint16_t uniffi_cera_ffi_checksum_method_session_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE
+uint16_t uniffi_cera_ffi_checksum_method_session_send_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE_AND_GENERATE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE_AND_GENERATE
+uint16_t uniffi_cera_ffi_checksum_method_session_send_message_and_generate(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_SEND_MESSAGE_STREAMING
+uint16_t uniffi_cera_ffi_checksum_method_session_send_message_streaming(void
     
 );
 #endif

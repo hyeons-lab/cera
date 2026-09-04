@@ -321,6 +321,63 @@ impl BundleRepo {
         Ok(dest)
     }
 
+    /// Download all assets for a bundle ID and quantization to the local cache
+    /// without loading model weights into memory or creating an engine.
+    pub fn download_bundle(&self, bundle_id: &str, quant: &str) -> Result<(), CeraError> {
+        let want_dspark = quant.to_ascii_lowercase().contains("dspark");
+        let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+        let mut manifest = if let Some(known) =
+            crate::bundle::known_bundle_manifest(bundle_id, clean_quant)
+        {
+            known
+        } else {
+            let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, clean_quant)?;
+            let manifest_path = self.resolve_url(&manifest_url, None)?;
+            crate::manifest::Manifest::from_file(&manifest_path).map_err(|e| {
+                CeraError::Backend(format!(
+                    "parsing manifest `{}`: {e}",
+                    manifest_path.display()
+                ))
+            })?
+        };
+
+        if want_dspark
+            && manifest.files.draft_model.is_none()
+            && let Some(draft_url) =
+                crate::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
+        {
+            manifest.files.draft_model = Some(draft_url);
+        }
+
+        let is_remote = |s: &str| {
+            let lower = s.to_ascii_lowercase();
+            lower.starts_with("http://") || lower.starts_with("https://")
+        };
+
+        if is_remote(&manifest.files.model) {
+            self.resolve_url(&manifest.files.model, None)?;
+        }
+        for url in [
+            manifest.files.multimodal_projector.as_deref(),
+            manifest.files.audio_decoder.as_deref(),
+            manifest.files.audio_tokenizer.as_deref(),
+            manifest.files.draft_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if is_remote(url) {
+                self.resolve_url(url, None)?;
+            }
+        }
+        for url in manifest.files.extras.values() {
+            if is_remote(url) {
+                self.resolve_url(url, None)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Decide whether an existing cached entry at `dest` is still
     /// valid. Verification prefers caller-supplied hash, then etag via
     /// sidecar, then etag via full rehash, then size, then reuse-on-

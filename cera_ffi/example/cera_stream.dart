@@ -10,17 +10,25 @@ import 'dart:io' show exit;
 
 import 'package:cera_ffi/cera_ffi.dart';
 
-/// Collects streamed tokens as Rust pushes them across the FFI boundary.
+/// Collects streamed chunks as Rust pushes them across the FFI boundary.
 class _CollectingSink implements ModalitySink {
-  final List<int> tokens = <int>[];
+  final StringBuffer textBuffer = StringBuffer();
+  final StringBuffer thoughtBuffer = StringBuffer();
   int batches = 0;
   FinishReason? finish;
 
   @override
-  void onTextTokens(List<int> t) {
+  void onThoughtChunk(String text) {
     batches++;
-    tokens.addAll(t);
-    print('  ← onTextTokens batch #$batches: ${t.length} token(s)');
+    thoughtBuffer.write(text);
+    print('  ← onThoughtChunk batch #$batches: "$text"');
+  }
+
+  @override
+  void onTextChunk(String text) {
+    batches++;
+    textBuffer.write(text);
+    print('  ← onTextChunk batch #$batches: "$text"');
   }
 
   @override
@@ -96,7 +104,7 @@ Future<void> main(List<String> args) async {
   }
 
   print(
-    'done: ${sink.tokens.length} tokens over ${sink.batches} callback batches, '
+    'done: ${sink.textBuffer.length} characters over ${sink.batches} callback batches, '
     'finish=${sink.finish}, decode=${summary.decodeMs}ms',
   );
 

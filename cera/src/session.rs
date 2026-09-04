@@ -233,6 +233,31 @@ pub struct GenerateSummary {
     pub finish_reason: FinishReason,
 }
 
+impl GenerateSummary {
+    /// Total elapsed wall-clock time (`prompt_eval_ms + decode_ms`) in milliseconds.
+    pub fn total_duration_ms(&self) -> u32 {
+        self.prompt_eval_ms.saturating_add(self.decode_ms)
+    }
+
+    /// Autoregressive decode speed in tokens per second.
+    pub fn decode_tok_per_sec(&self) -> f64 {
+        if self.decode_ms > 0 {
+            (self.tokens_generated as f64 * 1000.0) / (self.decode_ms as f64)
+        } else {
+            0.0
+        }
+    }
+
+    /// Prompt evaluation throughput in tokens per second.
+    pub fn prompt_eval_tok_per_sec(&self) -> f64 {
+        if self.prompt_eval_ms > 0 {
+            (self.prompt_eval_tokens as f64 * 1000.0) / (self.prompt_eval_ms as f64)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Why a decode loop ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
@@ -889,6 +914,11 @@ impl Session {
     /// without threading the tokenizer through separately.
     pub fn tokenizer(&self) -> &BpeTokenizer {
         self.tokenizer.as_ref()
+    }
+
+    /// Clone the Arc-wrapped tokenizer the session was constructed with.
+    pub fn tokenizer_arc(&self) -> Arc<BpeTokenizer> {
+        Arc::clone(&self.tokenizer)
     }
 
     /// Borrow the model the session was constructed with. Primarily
@@ -1800,6 +1830,172 @@ impl Session {
         _add_generation_prompt: bool,
     ) -> Result<(), CeraError> {
         Err(CeraError::UnsupportedModality)
+    }
+
+    /// Append a user multimodal message to the session's context,
+    /// automatically placing media in the model's canonical order.
+    pub fn append_user_message(
+        &mut self,
+        message: &crate::tokenizer::UserMessage,
+    ) -> Result<(), CeraError> {
+        let text_content = message.text.as_deref().filter(|s| !s.is_empty());
+        let has_text = text_content.is_some();
+        let has_images = !message.images.is_empty();
+        let has_audio = message.audio.is_some();
+
+        if !has_text && !has_images && !has_audio {
+            return Err(CeraError::EmptyInput);
+        }
+
+        // Validate modality support upfront before mutating session state:
+        if has_images && !self.capabilities.image_in {
+            return Err(CeraError::UnsupportedModality);
+        }
+        if has_audio && !self.capabilities.audio_in {
+            return Err(CeraError::UnsupportedModality);
+        }
+        if has_images && has_audio {
+            return Err(CeraError::UnsupportedModality);
+        }
+
+        if let Some(audio) = &message.audio {
+            if audio.pcm.is_empty() {
+                return Err(CeraError::EmptyInput);
+            }
+            if !(1000..=192_000).contains(&audio.sample_rate) {
+                return Err(CeraError::Backend(format!(
+                    "unsupported audio sample rate: {} Hz",
+                    audio.sample_rate
+                )));
+            }
+            if self.audio_encoder.is_none() {
+                return Err(CeraError::Backend(
+                    "Session::append_user_message: no audio encoder attached".to_string(),
+                ));
+            }
+        }
+
+        let initial_pos = self.current_pos;
+        let initial_history_len = self.token_history.len();
+        let initial_logits = self.last_logits.clone();
+        let initial_prefill_tokens = self.prefill_tokens;
+        let initial_prefill_elapsed = self.prefill_elapsed;
+
+        let run_append = |this: &mut Self| -> Result<(), CeraError> {
+            // 1. Audio input:
+            if let Some(audio) = &message.audio {
+                if this.tokenizer.chat_template().is_some() {
+                    let (marker_id, marker_name) =
+                        crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
+                            .into_iter()
+                            .find_map(|name| {
+                                this.tokenizer.special_token_id(name).map(|id| (id, name))
+                            })
+                            .ok_or_else(|| {
+                                CeraError::Backend(
+                                "no audio marker special token (<|reserved_4|>..7) in tokenizer"
+                                    .to_string(),
+                            )
+                            })?;
+
+                    let user_content = match text_content {
+                        Some(text) => format!("{marker_name}\n{text}"),
+                        None => marker_name.to_string(),
+                    };
+
+                    let rendered = crate::tokenizer::apply_chat_template(
+                        &this.tokenizer,
+                        &[crate::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: user_content,
+                        }],
+                        true,
+                    )
+                    .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+
+                    let toks = this.tokenizer.encode(&rendered);
+                    let split = crate::engine::CeraEngine::split_tokens_at_marker(
+                        &toks,
+                        marker_id,
+                        marker_name,
+                    )?;
+
+                    if split > 0 {
+                        this.append_tokens(&toks[..split])?;
+                    }
+                    this.append_audio(&audio.pcm, audio.sample_rate)?;
+                    if split + 1 < toks.len() {
+                        this.append_tokens(&toks[split + 1..])?;
+                    }
+                    return Ok(());
+                } else {
+                    this.append_audio(&audio.pcm, audio.sample_rate)?;
+                }
+            }
+
+            // 2. Vision input:
+            if has_images {
+                let images_refs: Vec<&[u8]> = message.images.iter().map(|v| v.as_slice()).collect();
+                if this.tokenizer.chat_template().is_some() {
+                    let mut content = Vec::with_capacity(message.images.len() + 1);
+                    for _ in &message.images {
+                        content.push(crate::tokenizer::ContentItem::Image);
+                    }
+                    if let Some(text) = text_content {
+                        content.push(crate::tokenizer::ContentItem::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    let messages = [crate::tokenizer::ChatMessageMultimodal {
+                        role: "user".to_string(),
+                        content,
+                    }];
+                    return this.append_chat_with_images(&messages, &images_refs, true);
+                } else {
+                    for img in &images_refs {
+                        this.append_image(img)?;
+                    }
+                    if let Some(text) = text_content {
+                        this.append_text(text)?;
+                    }
+                    return Ok(());
+                }
+            }
+
+            // 3. Text-only input:
+            if let Some(text) = text_content {
+                if this.tokenizer.chat_template().is_some() {
+                    let rendered = crate::tokenizer::apply_chat_template(
+                        &this.tokenizer,
+                        &[crate::tokenizer::ChatMessage {
+                            role: "user".to_string(),
+                            content: text.to_string(),
+                        }],
+                        true,
+                    )
+                    .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+                    this.append_text(&rendered)?;
+                } else {
+                    this.append_text(text)?;
+                }
+            }
+
+            Ok(())
+        };
+
+        if let Err(err) = run_append(self) {
+            self.model.truncate_kv(&mut self.state, initial_pos);
+            self.current_pos = initial_pos;
+            self.position_atomic
+                .store(initial_pos as u32, std::sync::atomic::Ordering::Relaxed);
+            self.token_history.truncate(initial_history_len);
+            self.last_logits = initial_logits;
+            self.prefill_tokens = initial_prefill_tokens;
+            self.prefill_elapsed = initial_prefill_elapsed;
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// Run autoregressive decode, emitting token chunks through the sink.
