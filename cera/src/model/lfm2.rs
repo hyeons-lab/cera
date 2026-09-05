@@ -2289,7 +2289,9 @@ impl Lfm2Model {
                             && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
 
                         if !is_causal {
-                            let mut bx_all = vec![0.0f32; n * hs];
+                            // Reuse pre-allocated ffn_input as scratch for bx_all;
+                            // ffn_input is completely idle during the conv phase.
+                            let bx_all = &mut ffn_input[..n * hs];
                             for j in 0..n {
                                 let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
                                 let b_slice = &proj[..hs];

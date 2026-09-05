@@ -89,6 +89,9 @@ pub fn is_valid_transition(
 /// Decode the most likely tag sequence under BIOES grammatical constraints
 /// using the Viterbi dynamic programming algorithm.
 pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String]) -> Vec<usize> {
+    if num_classes == 0 || logits.is_empty() || class_labels.len() < num_classes {
+        return Vec::new();
+    }
     let n_tokens = logits.len() / num_classes;
     if n_tokens == 0 {
         return Vec::new();
@@ -99,25 +102,9 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
         .map(|s| parse_bioes(s.as_str()))
         .collect();
 
-    // Log-softmax normalization per token position
-    let mut log_probs = vec![0.0f32; logits.len()];
-    for t in 0..n_tokens {
-        let row = &logits[t * num_classes..(t + 1) * num_classes];
-        let out_row = &mut log_probs[t * num_classes..(t + 1) * num_classes];
-        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum_exp = 0.0f32;
-        for c in 0..num_classes {
-            let e = (row[c] - max_val).exp();
-            out_row[c] = e;
-            sum_exp += e;
-        }
-        let log_sum = sum_exp.ln();
-        for c in 0..num_classes {
-            out_row[c] = (row[c] - max_val) - log_sum;
-        }
-    }
-
-    // dp[c] = max log probability of path ending at class c
+    // dp[c] = max score of path ending at class c.
+    // Dynamic programming transitions are invariant to per-token uniform log-softmax offsets,
+    // so scoring directly with raw logits saves heap allocations and exp/ln calculations.
     let mut dp = vec![f32::NEG_INFINITY; num_classes];
     let mut backpointer = vec![0usize; n_tokens * num_classes];
 
@@ -125,7 +112,7 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
     for c in 0..num_classes {
         let (prefix, _) = parsed_labels[c];
         if matches!(prefix, BioesPrefix::O | BioesPrefix::B | BioesPrefix::S) {
-            dp[c] = log_probs[c];
+            dp[c] = logits[c];
         }
     }
 
@@ -133,7 +120,7 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
 
     for t in 1..n_tokens {
         next_dp.fill(f32::NEG_INFINITY);
-        let curr_log_probs = &log_probs[t * num_classes..(t + 1) * num_classes];
+        let curr_logits = &logits[t * num_classes..(t + 1) * num_classes];
 
         for c in 0..num_classes {
             let (curr_prefix, curr_type) = parsed_labels[c];
@@ -146,7 +133,7 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
                 }
                 let (prev_prefix, prev_type) = parsed_labels[p];
                 if is_valid_transition(prev_prefix, prev_type, curr_prefix, curr_type) {
-                    let score = dp[p] + curr_log_probs[c];
+                    let score = dp[p] + curr_logits[c];
                     if score > best_score {
                         best_score = score;
                         best_prev = p;
@@ -197,6 +184,17 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
     path
 }
 
+fn char_slice(text: &str, start_char: usize, end_char: usize, total_chars: usize) -> String {
+    if start_char < end_char && end_char <= total_chars {
+        text.chars()
+            .skip(start_char)
+            .take(end_char - start_char)
+            .collect()
+    } else {
+        String::new()
+    }
+}
+
 /// Extract entity spans from decoded tag indices and token character offsets.
 pub fn extract_spans(
     tags: &[usize],
@@ -208,7 +206,12 @@ pub fn extract_spans(
 ) -> Vec<EntitySpan> {
     let mut spans = Vec::new();
     let n = tags.len();
-    if n == 0 || offsets.len() < n {
+    if n == 0
+        || offsets.len() < n
+        || num_classes == 0
+        || logits.len() < n * num_classes
+        || class_labels.len() < num_classes
+    {
         return spans;
     }
 
@@ -216,6 +219,12 @@ pub fn extract_spans(
         .iter()
         .map(|s| parse_bioes(s.as_str()))
         .collect();
+
+    if tags.iter().any(|&t| t >= parsed_labels.len()) {
+        return spans;
+    }
+
+    let total_chars = text.chars().count();
 
     // Softmax probabilities for scoring
     let mut probs = vec![0.0f32; logits.len()];
@@ -241,13 +250,7 @@ pub fn extract_spans(
             BioesPrefix::S => {
                 let start_char = offsets[i].char_start;
                 let end_char = offsets[i].char_end;
-                let b_start = offsets[i].byte_start;
-                let b_end = offsets[i].byte_end;
-                let span_text = if b_start < b_end && b_end <= text.len() {
-                    text[b_start..b_end].to_string()
-                } else {
-                    String::new()
-                };
+                let span_text = char_slice(text, start_char, end_char, total_chars);
                 let score = probs[i * num_classes + tags[i]];
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
                 let trailing_ws = span_text
@@ -304,13 +307,7 @@ pub fn extract_spans(
                 let end_char = offsets[end_token - 1].char_end;
                 let span_len = end_token - start_token;
                 let avg_score = sum_score / (span_len as f32);
-                let b_start = offsets[start_token].byte_start;
-                let b_end = offsets[end_token - 1].byte_end;
-                let span_text = if b_start < b_end && b_end <= text.len() {
-                    text[b_start..b_end].to_string()
-                } else {
-                    String::new()
-                };
+                let span_text = char_slice(text, start_char, end_char, total_chars);
 
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
                 let trailing_ws = span_text
@@ -918,5 +915,66 @@ mod tests {
         assert_eq!(spans[0].text, "Alice Smith");
         assert_eq!(spans[1].entity_type, "contact.email");
         assert_eq!(spans[1].text, "alice.smith@example.com");
+    }
+
+    #[test]
+    fn test_viterbi_decode_zero_or_mismatched_inputs() {
+        let labels = vec!["O".to_string(), "B-PER".to_string(), "I-PER".to_string()];
+        // Zero num_classes must safely return empty vec without division-by-zero panic
+        assert!(viterbi_decode(&[1.0, 2.0], 0, &labels).is_empty());
+        // Empty logits must return empty vec
+        assert!(viterbi_decode(&[], 3, &labels).is_empty());
+        // Fewer labels than num_classes must safely return empty vec without indexing out of bounds
+        assert!(viterbi_decode(&[1.0, 2.0, 3.0], 5, &labels).is_empty());
+    }
+
+    #[test]
+    fn test_extract_spans_multibyte_utf8() {
+        // Multi-byte Unicode characters (emoji: 4 bytes, cafe: acute accent 2 bytes)
+        let text = "Hello ☕ Alice, welcome to café!";
+        let labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "E-NAME".to_string(),
+            "S-NAME".to_string(),
+        ];
+        let offsets = vec![
+            TokenOffset {
+                char_start: 0,
+                char_end: 6,
+                byte_start: 0,
+                byte_end: 6,
+            },
+            TokenOffset {
+                char_start: 6,
+                char_end: 8,
+                byte_start: 6,
+                byte_end: 11,
+            },
+            TokenOffset {
+                char_start: 8,
+                char_end: 13,
+                byte_start: 11,
+                byte_end: 16,
+            },
+            TokenOffset {
+                char_start: 13,
+                char_end: 31,
+                byte_start: 16,
+                byte_end: 36,
+            },
+        ];
+        let tags = vec![0, 0, 4, 0]; // S-NAME at token 2
+        let num_classes = labels.len();
+        let mut logits = vec![0.0f32; 4 * num_classes];
+        logits[2 * num_classes + 4] = 10.0; // High logit for S-NAME
+
+        let spans = extract_spans(&tags, &labels, &offsets, text, &logits, num_classes);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "NAME");
+        assert_eq!(spans[0].text, "Alice");
+        assert_eq!(spans[0].start_char, 8);
+        assert_eq!(spans[0].end_char, 13);
     }
 }
