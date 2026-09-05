@@ -424,6 +424,11 @@ pub mod shaders {
     /// portable-tree fallback. `tests/slang_multitarget_parity.rs` pins it
     /// against the CPU reference.
     pub const SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.metal"));
+    /// FlashAttention-2 style tiled attention for BERT and ModernBERT, generated from
+    /// `shaders/slang/bert_flash_attention.slang` by build.rs and shared with
+    /// the wgpu backend's `wgpu::shaders::BERT_FLASH_ATTENTION`.
+    pub const BERT_FLASH_ATTENTION: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/bert_flash_attention.metal"));
     /// Capability probe, not a kernel: nothing dispatches this. Pins that Slang
     /// reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`,
     /// which is what decides whether the eight hand-tuned `simdgroup_matrix`

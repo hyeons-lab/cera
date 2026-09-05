@@ -742,8 +742,8 @@ impl Model for BertModel {
                             let v_slice =
                                 &v_mat[k_idx * d + h * head_dim..k_idx * d + (h + 1) * head_dim];
                             assert_eq!(v_slice.len(), head_dim);
-                            for dim_idx in 0..head_dim {
-                                out_slot[dim_idx] += s * v_slice[dim_idx];
+                            for (out_elem, v_elem) in out_slot.iter_mut().zip(v_slice.iter()) {
+                                *out_elem += s * *v_elem;
                             }
                         }
                     }

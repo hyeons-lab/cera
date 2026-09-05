@@ -290,8 +290,10 @@ impl DynamicSpanHeadWeights {
                 assert_eq!(diff_slice.len(), d);
                 assert_eq!(h_start.len(), d);
                 assert_eq!(h_end.len(), d);
-                for j in 0..d {
-                    diff_slice[j] = h_end[j] - h_start[j];
+                for (diff, (end, start)) in
+                    diff_slice.iter_mut().zip(h_end.iter().zip(h_start.iter()))
+                {
+                    *diff = *end - *start;
                 }
                 let size_idx = cs.length.min(self.max_span_length);
                 let size_emb = &self.span_size_embedding[size_idx * s_dim..(size_idx + 1) * s_dim];
