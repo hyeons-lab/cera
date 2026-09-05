@@ -24,7 +24,10 @@
 //!   cargo test -p cera --release --test lfm2_batched_prefill_parity -- --ignored --nocapture
 //! ```
 
-#![cfg(any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas"))]
+#![cfg(all(
+    feature = "mmap",
+    any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")
+))]
 
 use std::path::PathBuf;
 

@@ -32,7 +32,7 @@
 //! itself. Storing the factors quantized would change the apply path on every
 //! backend, so it is deliberately not done here.
 
-#[cfg(any(feature = "mmap", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -533,17 +533,30 @@ impl LoraAdapterWeights {
     // ── GGUF ────────────────────────────────────────────────────────────────
 
     /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
-    /// a file. Tensors are named `blk.{N}.{stem}.weight.lora_a` / `.lora_b`;
+    /// a file using memory mapping.
+    ///
+    /// Tensors are named `blk.{N}.{stem}.weight.lora_a` / `.lora_b`;
     /// `alpha` is read from the `adapter.lora.alpha` metadata (falling back to
-    /// `rank`, i.e. `scale = 1`). Requires the `mmap` feature (for
-    /// `GgufFile::open`); otherwise use [`Self::from_gguf_bytes`].
-    #[cfg(feature = "mmap")]
+    /// `rank`, i.e. `scale = 1`). Memory-maps the file via [`GgufFile::open`].
+    /// Available on native targets when the `mmap` feature is enabled.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn from_gguf(path: &Path) -> Result<Arc<Self>> {
         let gguf = GgufFile::open(path).with_context(|| format!("open adapter {path:?}"))?;
         Self::from_gguf_file(&gguf)
     }
 
-    /// Load a GGUF adapter from in-memory bytes (no filesystem — WASM).
+    /// Load a llama.cpp-format GGUF adapter from a file without memory mapping.
+    ///
+    /// Reads file bytes into heap memory via [`std::fs::read`] and parses them
+    /// using [`Self::from_gguf_bytes`]. Used as the native fallback when the
+    /// `mmap` feature is disabled.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_gguf(path: &Path) -> Result<Arc<Self>> {
+        let bytes = std::fs::read(path).with_context(|| format!("read adapter {path:?}"))?;
+        Self::from_gguf_bytes(Arc::from(bytes.into_boxed_slice()))
+    }
+
+    /// Load a GGUF adapter from in-memory bytes (no filesystem, such as WASM).
     pub fn from_gguf_bytes(bytes: Arc<[u8]>) -> Result<Arc<Self>> {
         let gguf = GgufFile::from_bytes(bytes).context("parse adapter GGUF bytes")?;
         Self::from_gguf_file(&gguf)
@@ -2134,5 +2147,31 @@ mod tests {
             ..cfg
         };
         assert!(adapter.validate_dims(&bad_cfg).is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_from_path_gguf_auto_detects() {
+        use std::io::Write;
+        let buf = synth_expert_gguf(1, 2, 4, 3);
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&buf).unwrap();
+        let adapter = LoraAdapterWeights::load_from_path(temp.path()).unwrap();
+        assert_eq!(adapter.target_count(), 1);
+        let t = adapter.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
+        assert_eq!((t.rank, t.k, t.d), (2, 4, 3));
+
+        let direct = LoraAdapterWeights::from_gguf(temp.path()).unwrap();
+        assert_eq!(direct.target_count(), 1);
+    }
+
+    #[test]
+    fn gguf_from_bytes_matches_synth_dimensions() {
+        let buf = synth_expert_gguf(1, 2, 4, 3);
+        let bytes = Arc::from(buf.into_boxed_slice());
+        let adapter = LoraAdapterWeights::from_gguf_bytes(bytes).unwrap();
+        assert_eq!(adapter.target_count(), 1);
+        let t = adapter.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
+        assert_eq!((t.rank, t.k, t.d), (2, 4, 3));
     }
 }

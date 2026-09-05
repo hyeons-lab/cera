@@ -10,6 +10,8 @@
 //!   CERA_LORA_PARITY=1 CERA_LFM2_MODEL=... cargo test -p cera --release \
 //!     --test lora_parity -- --ignored --nocapture
 
+#![cfg(feature = "mmap")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

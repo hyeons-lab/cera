@@ -73,6 +73,7 @@ fn cfg() -> EngineConfig {
 /// 64x64 rather than 2x2 because the preprocessor aligns to patch blocks and
 /// a sub-patch image is a degenerate case; this asserts the plumbing, not the
 /// edge handling.
+#[cfg(feature = "vl-preprocess")]
 fn solid_png() -> Vec<u8> {
     let img = image::RgbImage::from_pixel(64, 64, image::Rgb([220u8, 30, 30]));
     let mut out = std::io::Cursor::new(Vec::new());

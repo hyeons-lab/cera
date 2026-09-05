@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.4
+
+### Fixed
+
+- **Model and Adapter Loading**: Added fallback path loaders for LoRA adapters, Silero VAD, and Hybrid PII models when `cera` is compiled without default features (`mmap` disabled) on native targets.
+
+### Changed
+
+- **Version Alignment**: Bumped workspace patch version to 0.5.4 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.3
 
 ### Added

@@ -23,6 +23,8 @@
 //!   CERA_MOE_LORA_PARITY=1 CERA_LFM2MOE_MODEL=... cargo test -p cera --release \
 //!     --test moe_lora_parity -- --ignored --nocapture
 
+#![cfg(feature = "mmap")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

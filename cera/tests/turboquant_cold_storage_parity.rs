@@ -5,6 +5,8 @@
 //! 2. Deserialization restores exact compressed buffers with anchor checkpoints.
 //! 3. Cache clearing and memory pressure eviction flush memory and disk tiers safely.
 
+#![cfg(feature = "disk-cache")]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

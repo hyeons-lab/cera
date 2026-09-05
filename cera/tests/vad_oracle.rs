@@ -1,4 +1,4 @@
-#![cfg(feature = "mmap")]
+#![cfg(all(feature = "mmap", not(target_arch = "wasm32")))]
 
 use anyhow::Result;
 use cera::vad::{SileroVad, VadConfig, VadSampleRate};
