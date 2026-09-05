@@ -14,7 +14,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::Model;
 use crate::model::bert::BertModel;
-use crate::tokenizer::BpeTokenizer;
+use crate::tokenizer::{BpeTokenizer, TokenOffset};
 
 /// Compute matrix-matrix multiplication C = A * B^T + bias with optional BLAS acceleration.
 ///
@@ -482,20 +482,18 @@ impl HybridPiiModel {
             ]
         };
 
-        // Project label queries (if pre-embedded labels exist in GGUF)
-        let projected_labels = if let Ok(t) = gguf.get_tensor("hybrid_pii.label_embeddings") {
-            let embs = t.to_f32_vec();
-            if embs.len() == labels.len() * hidden_dim {
-                span_head.project_labels(&embs, labels.len())
-            } else {
-                tracing::warn!(
-                    "hybrid_pii.label_embeddings size mismatch, falling back to zero embeddings"
-                );
-                vec![0.0f32; labels.len() * hidden_dim]
-            }
-        } else {
-            vec![0.0f32; labels.len() * hidden_dim]
-        };
+        // Project label queries from GGUF
+        let label_tensor = gguf
+            .get_tensor("hybrid_pii.label_embeddings")
+            .context("missing required tensor hybrid_pii.label_embeddings")?;
+        let embs = label_tensor.to_f32_vec();
+        ensure!(
+            embs.len() == labels.len() * hidden_dim,
+            "hybrid_pii.label_embeddings dimension mismatch: expected {}, got {}",
+            labels.len() * hidden_dim,
+            embs.len()
+        );
+        let projected_labels = span_head.project_labels(&embs, labels.len());
 
         Ok(Self {
             backbone,
@@ -534,7 +532,26 @@ impl SlidingWindowScanner {
         let stride = self.stride.max(1);
         let window_size = self.window_size.max(1);
 
-        let (tokens, offsets) = self.tokenizer.encode_with_offsets(text);
+        let (tokens, offsets) = if self.tokenizer.add_bos_token() || self.tokenizer.add_eos_token()
+        {
+            self.tokenizer.encode_special_with_offsets(text, true)
+        } else if let Some(bos) = self.tokenizer.bos_token() {
+            let (raw_tokens, raw_offsets) = self.tokenizer.encode_with_offsets(text);
+            let mut t = Vec::with_capacity(raw_tokens.len() + 1);
+            let mut o = Vec::with_capacity(raw_offsets.len() + 1);
+            t.push(bos);
+            o.push(TokenOffset {
+                char_start: 0,
+                char_end: 0,
+                byte_start: 0,
+                byte_end: 0,
+            });
+            t.extend(raw_tokens);
+            o.extend(raw_offsets);
+            (t, o)
+        } else {
+            self.tokenizer.encode_with_offsets(text)
+        };
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -842,5 +859,64 @@ mod tests {
         let unaligned_end = 12;
         let span_opt = text.get(unaligned_start..unaligned_end);
         assert!(span_opt.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Bias dimension mismatch")]
+    fn test_matmul_nt_f32_bias_length_mismatch_panics() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0];
+        let wrong_bias = vec![1.0, 2.0]; // expected length 1 for n=1
+        let mut c = vec![0.0];
+        matmul_nt_f32(1, 1, 2, &a, &b, Some(&wrong_bias), &mut c);
+    }
+
+    #[test]
+    fn test_sliding_window_scanner_special_tokens_alignment() {
+        let text = "Contact alice@example.com";
+        let vocab = vec![
+            b"<bos>".to_vec(),
+            b"Contact".to_vec(),
+            b" alice".to_vec(),
+            b"@".to_vec(),
+            b"example".to_vec(),
+            b".com".to_vec(),
+        ];
+        let tok = BpeTokenizer::from_vocab(vocab).with_special_tokens_for_testing(
+            Some(0),
+            None,
+            true,
+            false,
+        );
+        assert_eq!(tok.bos_token(), Some(0));
+
+        let (tokens, offsets) = if tok.add_bos_token() || tok.add_eos_token() {
+            tok.encode_special_with_offsets(text, true)
+        } else if let Some(bos) = tok.bos_token() {
+            let (raw_tokens, raw_offsets) = tok.encode_with_offsets(text);
+            let mut t = Vec::with_capacity(raw_tokens.len() + 1);
+            let mut o = Vec::with_capacity(raw_offsets.len() + 1);
+            t.push(bos);
+            o.push(TokenOffset {
+                char_start: 0,
+                char_end: 0,
+                byte_start: 0,
+                byte_end: 0,
+            });
+            t.extend(raw_tokens);
+            o.extend(raw_offsets);
+            (t, o)
+        } else {
+            tok.encode_with_offsets(text)
+        };
+
+        // BOS should be at index 0 with empty offsets (0, 0)
+        assert_eq!(tokens[0], 0);
+        assert_eq!(offsets[0].byte_start, 0);
+        assert_eq!(offsets[0].byte_end, 0);
+        // Following tokens must map to valid character boundaries in text
+        assert!(offsets[1].byte_end <= text.len());
+        assert!(text.is_char_boundary(offsets[1].byte_start));
+        assert!(text.is_char_boundary(offsets[1].byte_end));
     }
 }

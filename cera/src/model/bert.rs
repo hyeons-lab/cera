@@ -110,6 +110,11 @@ impl BertModel {
             .with_context(|| format!("missing {prefix}.attention.head_count"))?
             as usize;
 
+        ensure!(n_heads > 0, "n_heads must be > 0");
+        ensure!(
+            hidden_size.is_multiple_of(n_heads),
+            "hidden_size ({hidden_size}) must be divisible by n_heads ({n_heads})"
+        );
         let head_dim = hidden_size / n_heads;
         ensure!(head_dim > 0, "head_dim must be > 0");
 
@@ -611,5 +616,16 @@ mod tests {
         assert!((q - 165).abs() > half_window);
         // Key at pos 35 -> diff 65 > 64 -> masked out
         assert!((q - 35).abs() > half_window);
+    }
+
+    #[test]
+    fn test_head_dim_divisibility_logic() {
+        let hidden_size = 768usize;
+        let n_heads = 12usize;
+        assert!(hidden_size.is_multiple_of(n_heads));
+        assert_eq!(hidden_size / n_heads, 64);
+
+        let indivisible_n_heads = 13usize;
+        assert!(!hidden_size.is_multiple_of(indivisible_n_heads));
     }
 }

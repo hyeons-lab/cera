@@ -1903,6 +1903,9 @@ fn inference_type_for_arch(arch: &str) -> InferenceType {
         "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
+        "bert" | "modernbert" => {
+            InferenceType::Unknown(format!("encoder-only architecture: {arch}"))
+        }
         // Unknown arch → assume text. Callers who need a different
         // mapping can set `ModelFiles::inference_type` explicitly.
         _ => InferenceType::LlamaCppTextToText,
