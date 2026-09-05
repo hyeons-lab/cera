@@ -4025,6 +4025,12 @@ fn bert_flash_attention_entry_points_reach_every_enabled_target() {
             wgsl.contains("bert_flash_attention"),
             "bert_flash_attention.wgsl is missing entry point bert_flash_attention"
         );
+        for i in 0..5 {
+            assert!(
+                wgsl.contains(&format!("@binding({i})")),
+                "generated WGSL for bert_flash_attention is missing binding {i}"
+            );
+        }
     }
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
@@ -4034,6 +4040,12 @@ fn bert_flash_attention_entry_points_reach_every_enabled_target() {
             msl.contains("bert_flash_attention"),
             "bert_flash_attention.metal is missing entry point bert_flash_attention"
         );
+        for i in 0..5 {
+            assert!(
+                msl.contains(&format!("[[buffer({i})]]")),
+                "generated MSL for bert_flash_attention is missing buffer({i})"
+            );
+        }
     }
     assert!(
         checked > 0,

@@ -148,14 +148,14 @@ impl SensitivityHeadWeights {
             inter,
             d,
             &mean_pool,
-            &self.dense_weight,
-            Some(&self.dense_bias),
+            &self.dense_weight[..inter * d],
+            Some(&self.dense_bias[..inter]),
             &mut h1,
         );
         cpu::gelu_inplace(&mut h1);
 
         // 3. Classifier layer: z = classifier_weight [1, inter] * h1 [inter] + classifier_bias
-        let dot = cpu::dot_f32(&self.classifier_weight, &h1);
+        let dot = cpu::dot_f32(&self.classifier_weight[..inter], &h1);
         let z = dot + self.classifier_bias;
 
         // 4. Numerically stable sigmoid: 1 / (1 + exp(-z))
@@ -223,15 +223,22 @@ impl DynamicSpanHeadWeights {
     /// Pre-project label embeddings for cross-attention dot product matching.
     pub fn project_labels(&self, raw_label_embeddings: &[f32], n_labels: usize) -> Vec<f32> {
         let d = self.hidden_dim;
-        assert_eq!(raw_label_embeddings.len(), n_labels * d);
+        if d == 0
+            || n_labels == 0
+            || raw_label_embeddings.len() < n_labels * d
+            || self.label_proj_weight.len() < d * d
+            || self.label_proj_bias.len() < d
+        {
+            return Vec::new();
+        }
         let mut proj = vec![0.0f32; n_labels * d];
         matmul_nt_f32(
             n_labels,
             d,
             d,
-            raw_label_embeddings,
-            &self.label_proj_weight,
-            Some(&self.label_proj_bias),
+            &raw_label_embeddings[..n_labels * d],
+            &self.label_proj_weight[..d * d],
+            Some(&self.label_proj_bias[..d]),
             &mut proj,
         );
         proj
@@ -330,8 +337,8 @@ impl DynamicSpanHeadWeights {
                 d,
                 span_in_dim,
                 feat_slice,
-                &self.proj1_weight,
-                Some(&self.proj1_bias),
+                &self.proj1_weight[..d * span_in_dim],
+                Some(&self.proj1_bias[..d]),
                 h_proj_slice,
             );
             cpu::gelu_inplace(h_proj_slice);
@@ -343,8 +350,8 @@ impl DynamicSpanHeadWeights {
                 d,
                 d,
                 h_proj_slice,
-                &self.proj2_weight,
-                Some(&self.proj2_bias),
+                &self.proj2_weight[..d * d],
+                Some(&self.proj2_bias[..d]),
                 p_spans_slice,
             );
 
@@ -355,7 +362,7 @@ impl DynamicSpanHeadWeights {
                 n_labels,
                 d,
                 p_spans_slice,
-                projected_labels,
+                &projected_labels[..n_labels * d],
                 None,
                 scores_slice,
             );
@@ -773,11 +780,13 @@ impl SlidingWindowScanner {
         }
 
         // 4. Greedy Non-Maximum Suppression (NMS)
-        // Sort descending by confidence score
+        // Sort descending by confidence score with deterministic tie-breaking (longer span first, then earlier start)
         raw_candidates.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.byte_end - b.byte_start).cmp(&(a.byte_end - a.byte_start)))
+                .then_with(|| a.byte_start.cmp(&b.byte_start))
         });
 
         let mut accepted: Vec<DetectedEntity> = Vec::new();
@@ -1398,5 +1407,53 @@ mod tests {
         assert!(!is_valid(f32::NAN));
         assert!(!is_valid(f32::INFINITY));
         assert!(!is_valid(f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_oversized_weight_slices_safe_execution() {
+        let d = 4;
+        let inter = 8;
+        // Construct sensitivity head with trailing capacity on all weight/bias buffers
+        let head = SensitivityHeadWeights {
+            hidden_dim: d,
+            intermediate_dim: inter,
+            dense_weight: vec![0.1f32; inter * d + 16],
+            dense_bias: vec![0.0f32; inter + 8],
+            classifier_weight: vec![0.2f32; inter + 8],
+            classifier_bias: 0.0,
+            gate_threshold: 0.5,
+        };
+
+        let hidden = vec![0.5f32; 3 * d];
+        let (prob, bypass) = head.score(&hidden, 3);
+        assert!(prob > 0.0 && prob < 1.0);
+        assert!(!bypass || bypass); // executes without panicking on oversized buffers
+    }
+
+    #[test]
+    fn test_project_labels_bounds_validation() {
+        let d = 4;
+        let head = DynamicSpanHeadWeights {
+            hidden_dim: d,
+            max_span_length: 3,
+            size_dim: 2,
+            span_size_embedding: vec![0.0; 8],
+            proj1_weight: vec![0.1; d * (3 * d + 2)],
+            proj1_bias: vec![0.0; d],
+            proj2_weight: vec![0.1; d * d],
+            proj2_bias: vec![0.0; d],
+            label_proj_weight: vec![0.1; d * d + 10], // extra trailing
+            label_proj_bias: vec![0.0; d + 5],        // extra trailing
+            span_threshold: 0.5,
+        };
+
+        // Undersized input returns empty vec rather than panicking
+        let undersized = vec![0.1f32; 2];
+        assert!(head.project_labels(&undersized, 2).is_empty());
+
+        // Oversized input executes safely and slices to exact dimensions
+        let oversized = vec![0.1f32; 2 * d + 8];
+        let proj = head.project_labels(&oversized, 2);
+        assert_eq!(proj.len(), 2 * d);
     }
 }

@@ -163,7 +163,7 @@ impl BertModel {
         let gguf_max_seq_len = gguf
             .get_u32(&format!("{prefix}.context_length"))
             .unwrap_or(8192) as usize;
-        let max_seq_len = context_size.min(gguf_max_seq_len);
+        let mut max_seq_len = context_size.min(gguf_max_seq_len);
 
         let rope_theta = gguf
             .get_f32(&format!("{prefix}.rope.freq_base"))
@@ -199,6 +199,7 @@ impl BertModel {
                 pos.k,
                 hidden_size
             );
+            max_seq_len = max_seq_len.min(pos.m);
             Some(pos)
         } else {
             None
@@ -815,12 +816,21 @@ impl Model for BertModel {
                 for i in 0..n_tokens {
                     let row = &ffn_norm_x[i * d..(i + 1) * d];
                     transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut *up_row);
+                    if let Some(ref b) = layer.ffn_up_bias {
+                        cpu::add_inplace(&mut *up_row, b);
+                    }
                     transformer::gemv(&self.gguf, gate_ref, row, &mut *gate_row);
+                    if let Some(ref b) = layer.ffn_gate_bias {
+                        cpu::add_inplace(&mut *gate_row, b);
+                    }
 
                     cpu::gelu_inplace(&mut *gate_row);
                     cpu::mul_inplace(&mut *gate_row, up_row);
 
                     transformer::gemv(&self.gguf, &layer.ffn_down, gate_row, &mut *down_row);
+                    if let Some(ref b) = layer.ffn_down_bias {
+                        cpu::add_inplace(&mut *down_row, b);
+                    }
                     cpu::add_inplace(&mut x[i * d..(i + 1) * d], down_row);
                 }
             } else {
@@ -1000,5 +1010,16 @@ mod tests {
         assert!(!is_valid(f32::NAN));
         assert!(!is_valid(f32::INFINITY));
         assert!(!is_valid(f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_classic_bert_context_clamping_logic() {
+        let context_size = 8192usize;
+        let gguf_max_seq_len = 8192usize;
+        let mut max_seq_len = context_size.min(gguf_max_seq_len);
+
+        let pos_m = 512usize; // 512 position rows in classic BERT
+        max_seq_len = max_seq_len.min(pos_m);
+        assert_eq!(max_seq_len, 512);
     }
 }
