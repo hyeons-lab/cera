@@ -966,6 +966,17 @@ mod tests {
     }
 
     #[test]
+    fn test_viterbi_decode_all_neg_infinity_logits() {
+        let labels = vec!["O".to_string(), "B-PER".to_string(), "I-PER".to_string()];
+        let num_classes = labels.len();
+        // 3 tokens with all logits -inf
+        let logits = vec![f32::NEG_INFINITY; 3 * num_classes];
+        let path = viterbi_decode(&logits, num_classes, &labels);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path, vec![0, 0, 0]);
+    }
+
+    #[test]
     fn test_extract_spans_multibyte_utf8() {
         // Multi-byte Unicode characters (emoji: 4 bytes, cafe: acute accent 2 bytes)
         let text = "Hello 🦀 Alice, welcome to café!";
@@ -1022,6 +1033,55 @@ mod tests {
         let text = "🦀";
         let slice = safe_span_slice(text, 1, 3, 0, 1);
         assert_eq!(slice, "🦀");
+    }
+
+    #[test]
+    fn test_extract_spans_special_token_empty_offset_filtered() {
+        let labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "E-NAME".to_string(),
+            "S-NAME".to_string(),
+        ];
+        let offsets = vec![
+            // BOS token has 0-length offset
+            TokenOffset {
+                char_start: 0,
+                char_end: 0,
+                byte_start: 0,
+                byte_end: 0,
+            },
+            // Content token "Alice"
+            TokenOffset {
+                char_start: 0,
+                char_end: 5,
+                byte_start: 0,
+                byte_end: 5,
+            },
+            // EOS token has 0-length offset
+            TokenOffset {
+                char_start: 5,
+                char_end: 5,
+                byte_start: 5,
+                byte_end: 5,
+            },
+        ];
+        // Suppose the classifier marks both BOS and EOS as S-NAME (tag 4) as well as Alice
+        let tags = vec![4, 4, 4];
+        let num_classes = labels.len();
+        let mut logits = vec![0.0f32; 3 * num_classes];
+        for t in 0..3 {
+            logits[t * num_classes + 4] = 10.0;
+        }
+        let text = "Alice";
+        let spans = extract_spans(&tags, &labels, &offsets, text, &logits, num_classes);
+        // Only "Alice" should be extracted because BOS and EOS have empty spans (trimmed_start >= trimmed_end)
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "NAME");
+        assert_eq!(spans[0].text, "Alice");
+        assert_eq!(spans[0].start_char, 0);
+        assert_eq!(spans[0].end_char, 5);
     }
 
     #[test]

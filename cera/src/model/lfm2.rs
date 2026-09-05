@@ -643,6 +643,11 @@ impl Lfm2Model {
                     hs,
                     kernel_size
                 );
+                #[cfg(target_arch = "aarch64")]
+                ensure!(
+                    hs.is_multiple_of(4),
+                    "blk.{i}.shortconv: hidden_size ({hs}) must be a multiple of 4 to support vectorized AArch64 NEON convolution ops",
+                );
                 // In GGUF, ne[0] is kernel_size and ne[1] is hidden_size, so `w` is channel-first:
                 // `w[col * kernel_size + row]` is tap `row` of channel `col`.
                 // `conv_weights_transposed` stores channel-first layout [hs, kernel_size].
@@ -4149,10 +4154,7 @@ impl Model for Lfm2Model {
                 let w_row = &classifier_w[c * hs..(c + 1) * hs];
                 assert_eq!(h.len(), hs);
                 assert_eq!(w_row.len(), hs);
-                let mut dot = 0.0f32;
-                for d in 0..hs {
-                    dot += h[d] * w_row[d];
-                }
+                let mut dot = crate::backend::cpu::dot_f32(h, w_row);
                 if let Some(bias) = classifier_b {
                     dot += bias[c];
                 }
