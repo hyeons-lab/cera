@@ -502,13 +502,14 @@ impl LoraAdapterWeights {
             }
         }
         if let Some(ref w) = self.classifier_weight {
+            let hs = config.hidden_size;
             ensure!(
-                w.len() % config.hidden_size == 0,
+                hs > 0 && w.len().is_multiple_of(hs),
                 "classifier weight length {} is not a multiple of hidden_size {}",
                 w.len(),
-                config.hidden_size
+                hs
             );
-            let num_classes = w.len() / config.hidden_size;
+            let num_classes = w.len() / hs;
             if let Some(ref b) = self.classifier_bias {
                 ensure!(
                     b.len() == num_classes,

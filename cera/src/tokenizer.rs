@@ -245,6 +245,21 @@ impl BpeTokenizer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_special_tokens_for_testing(
+        mut self,
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Self {
+        self.bos_id = bos_id;
+        self.eos_id = eos_id;
+        self.add_bos = add_bos;
+        self.add_eos = add_eos;
+        self
+    }
+
     /// Encode text, optionally adding the model's special BOS/EOS markers —
     /// the analog of llama.cpp's `llama_tokenize(..., add_special)`.
     ///

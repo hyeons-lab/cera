@@ -2347,43 +2347,119 @@ impl Lfm2Model {
                                     let w2_ptr = conv_w2.as_ptr();
                                     let out_ptr = out_in.as_mut_ptr();
 
-                                    let prev_ptr = prev_bx.map(|p| p.as_ptr());
-                                    let next_ptr = next_bx.map(|p| p.as_ptr());
+                                    match (prev_bx, next_bx) {
+                                        (Some(prev), Some(next)) => {
+                                            let prev_ptr = prev.as_ptr();
+                                            let next_ptr = next.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let prev_v = vld1q_f32(prev_ptr.add(offset));
+                                                let w0_v = vld1q_f32(w0_ptr.add(offset));
+                                                let next_v = vld1q_f32(next_ptr.add(offset));
+                                                let w2_v = vld1q_f32(w2_ptr.add(offset));
 
-                                    for i in 0..n_chunks {
-                                        let offset = i * 4;
-                                        let curr_v = vld1q_f32(curr_ptr.add(offset));
-                                        let w1_v = vld1q_f32(w1_ptr.add(offset));
-                                        let mut conv_v = vmulq_f32(curr_v, w1_v);
-
-                                        if let Some(pp) = prev_ptr {
-                                            let prev_v = vld1q_f32(pp.add(offset));
-                                            let w0_v = vld1q_f32(w0_ptr.add(offset));
-                                            conv_v = vfmaq_f32(conv_v, prev_v, w0_v);
+                                                let conv_v = vfmaq_f32(
+                                                    vfmaq_f32(
+                                                        vmulq_f32(curr_v, w1_v),
+                                                        prev_v,
+                                                        w0_v,
+                                                    ),
+                                                    next_v,
+                                                    w2_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
                                         }
-                                        if let Some(np) = next_ptr {
-                                            let next_v = vld1q_f32(np.add(offset));
-                                            let w2_v = vld1q_f32(w2_ptr.add(offset));
-                                            conv_v = vfmaq_f32(conv_v, next_v, w2_v);
-                                        }
+                                        (None, Some(next)) => {
+                                            let next_ptr = next.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let next_v = vld1q_f32(next_ptr.add(offset));
+                                                let w2_v = vld1q_f32(w2_ptr.add(offset));
 
-                                        let c_v = vld1q_f32(c_ptr.add(offset));
-                                        let final_v = vmulq_f32(c_v, conv_v);
-                                        vst1q_f32(out_ptr.add(offset), final_v);
+                                                let conv_v = vfmaq_f32(
+                                                    vmulq_f32(curr_v, w1_v),
+                                                    next_v,
+                                                    w2_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                        (Some(prev), None) => {
+                                            let prev_ptr = prev.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let prev_v = vld1q_f32(prev_ptr.add(offset));
+                                                let w0_v = vld1q_f32(w0_ptr.add(offset));
+
+                                                let conv_v = vfmaq_f32(
+                                                    vmulq_f32(curr_v, w1_v),
+                                                    prev_v,
+                                                    w0_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                        (None, None) => {
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let conv_v = vmulq_f32(curr_v, w1_v);
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
 
                                 #[cfg(not(target_arch = "aarch64"))]
-                                {
-                                    for i in 0..hs {
-                                        let mut conv_val = curr_bx[i] * conv_w1[i];
-                                        if let Some(prev) = prev_bx {
-                                            conv_val += prev[i] * conv_w0[i];
+                                match (prev_bx, next_bx) {
+                                    (Some(prev), Some(next)) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i]
+                                                    + prev[i] * conv_w0[i]
+                                                    + next[i] * conv_w2[i]);
                                         }
-                                        if let Some(next) = next_bx {
-                                            conv_val += next[i] * conv_w2[i];
+                                    }
+                                    (None, Some(next)) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i] + next[i] * conv_w2[i]);
                                         }
-                                        out_in[i] = c_slice[i] * conv_val;
+                                    }
+                                    (Some(prev), None) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i] + prev[i] * conv_w0[i]);
+                                        }
+                                    }
+                                    (None, None) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i] * (curr_bx[i] * conv_w1[i]);
+                                        }
                                     }
                                 }
                             }

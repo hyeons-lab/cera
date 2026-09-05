@@ -29,7 +29,7 @@
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
 
-console.info('[cera:worker:version] v0.5.1 (build: 2026-09-02-rev22-local-models-webgpu)');
+console.info('[cera:worker:version] v0.5.2 (build: 2026-09-02-rev22-local-models-webgpu)');
 
 'use strict';
 

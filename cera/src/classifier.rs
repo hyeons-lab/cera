@@ -193,8 +193,8 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
     path
 }
 
-fn char_slice(text: &str, start_char: usize, end_char: usize, total_chars: usize) -> String {
-    if start_char < end_char && end_char <= total_chars {
+fn char_slice(text: &str, start_char: usize, end_char: usize) -> String {
+    if start_char < end_char {
         text.chars()
             .skip(start_char)
             .take(end_char - start_char)
@@ -202,6 +202,22 @@ fn char_slice(text: &str, start_char: usize, end_char: usize, total_chars: usize
     } else {
         String::new()
     }
+}
+
+fn safe_span_slice<'a>(
+    text: &'a str,
+    byte_start: usize,
+    byte_end: usize,
+    char_start: usize,
+    char_end: usize,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(slice) = (byte_start <= byte_end)
+        .then(|| text.get(byte_start..byte_end))
+        .flatten()
+    {
+        return std::borrow::Cow::Borrowed(slice);
+    }
+    std::borrow::Cow::Owned(char_slice(text, char_start, char_end))
 }
 
 /// Extract entity spans from decoded tag indices and token character offsets.
@@ -233,8 +249,6 @@ pub fn extract_spans(
         return spans;
     }
 
-    let total_chars = text.chars().count();
-
     // Softmax probabilities for scoring
     let mut probs = vec![0.0f32; logits.len()];
     for t in 0..n {
@@ -259,7 +273,13 @@ pub fn extract_spans(
             BioesPrefix::S => {
                 let start_char = offsets[i].char_start;
                 let end_char = offsets[i].char_end;
-                let span_text = char_slice(text, start_char, end_char, total_chars);
+                let span_text = safe_span_slice(
+                    text,
+                    offsets[i].byte_start,
+                    offsets[i].byte_end,
+                    start_char,
+                    end_char,
+                );
                 let score = probs[i * num_classes + tags[i]];
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
                 let trailing_ws = span_text
@@ -316,7 +336,13 @@ pub fn extract_spans(
                 let end_char = offsets[end_token - 1].char_end;
                 let span_len = end_token - start_token;
                 let avg_score = sum_score / (span_len as f32);
-                let span_text = char_slice(text, start_char, end_char, total_chars);
+                let span_text = safe_span_slice(
+                    text,
+                    offsets[start_token].byte_start,
+                    offsets[end_token - 1].byte_end,
+                    start_char,
+                    end_char,
+                );
 
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
                 let trailing_ws = span_text
@@ -365,7 +391,9 @@ pub fn detect_pii(
         return Ok(Vec::new());
     }
 
-    let (tokens, offsets) = if let Some(bos) = tokenizer.bos_token() {
+    let (tokens, offsets) = if tokenizer.add_bos_token() || tokenizer.add_eos_token() {
+        tokenizer.encode_special_with_offsets(text, true)
+    } else if let Some(bos) = tokenizer.bos_token() {
         let (raw_tokens, raw_offsets) = tokenizer.encode_with_offsets(text);
         let mut t = Vec::with_capacity(raw_tokens.len() + 1);
         let mut o = Vec::with_capacity(raw_offsets.len() + 1);
@@ -940,7 +968,7 @@ mod tests {
     #[test]
     fn test_extract_spans_multibyte_utf8() {
         // Multi-byte Unicode characters (emoji: 4 bytes, cafe: acute accent 2 bytes)
-        let text = "Hello ☕ Alice, welcome to café!";
+        let text = "Hello 🦀 Alice, welcome to café!";
         let labels = vec![
             "O".to_string(),
             "B-NAME".to_string(),
@@ -971,7 +999,7 @@ mod tests {
                 char_start: 13,
                 char_end: 31,
                 byte_start: 16,
-                byte_end: 36,
+                byte_end: 35,
             },
         ];
         let tags = vec![0, 0, 4, 0]; // S-NAME at token 2
@@ -985,5 +1013,115 @@ mod tests {
         assert_eq!(spans[0].text, "Alice");
         assert_eq!(spans[0].start_char, 8);
         assert_eq!(spans[0].end_char, 13);
+    }
+
+    #[test]
+    fn test_safe_span_slice_split_code_point_fallback() {
+        // "🦀" is 4 bytes: byte index 1 is not a character boundary.
+        // safe_span_slice must fallback to char_slice without panicking.
+        let text = "🦀";
+        let slice = safe_span_slice(text, 1, 3, 0, 1);
+        assert_eq!(slice, "🦀");
+    }
+
+    #[test]
+    fn test_detect_pii_with_configured_special_tokens() {
+        let labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "E-NAME".to_string(),
+            "S-EMAIL".to_string(),
+        ];
+        struct SpecialTokenMockModel {
+            labels: Vec<String>,
+            config: crate::model::ModelConfig,
+        }
+        impl Model for SpecialTokenMockModel {
+            fn forward(
+                &self,
+                _tokens: &[u32],
+                _pos: usize,
+                _state: &mut InferenceState,
+            ) -> Vec<f32> {
+                Vec::new()
+            }
+            fn config(&self) -> &crate::model::ModelConfig {
+                &self.config
+            }
+            fn is_classifier(&self) -> bool {
+                true
+            }
+            fn num_classes(&self) -> usize {
+                self.labels.len()
+            }
+            fn class_labels(&self) -> &[String] {
+                &self.labels
+            }
+            fn classify_tokens(
+                &self,
+                tokens: &[u32],
+                _state: &mut InferenceState,
+            ) -> Result<Vec<f32>, CeraError> {
+                let n = tokens.len();
+                let k = self.labels.len();
+                let mut logits = vec![0.0f32; n * k];
+                for t in 0..n {
+                    logits[t * k] = 5.0; // O by default
+                }
+                // Tokens: [BOS (100), 'A' (65), 'B' (66), EOS (101)]
+                assert_eq!(tokens.first().copied(), Some(100));
+                assert_eq!(tokens.last().copied(), Some(101));
+                if n >= 4 {
+                    logits[k] = -5.0;
+                    logits[k + 1] = 10.0; // B-NAME
+                    logits[2 * k] = -5.0;
+                    logits[2 * k + 3] = 10.0; // E-NAME
+                }
+                Ok(logits)
+            }
+        }
+        let model = SpecialTokenMockModel {
+            labels: labels.clone(),
+            config: crate::model::ModelConfig {
+                architecture: "mock".into(),
+                n_layers: 1,
+                hidden_size: 4,
+                intermediate_size: 8,
+                n_heads: 1,
+                n_kv_heads: 1,
+                head_dim: 4,
+                vocab_size: 256,
+                max_seq_len: 64,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![crate::model::BlockType::Attention],
+                conv_kernel_size: None,
+                kv_heads_per_layer: vec![1],
+                scalars: crate::model::ScalarMultipliers::default(),
+                moe: None,
+                is_causal: false,
+                class_labels: labels,
+            },
+        };
+
+        let mut vocab_vec = Vec::new();
+        let mut token_to_id = std::collections::HashMap::new();
+        for b in 0u8..=255 {
+            vocab_vec.push(vec![b]);
+            token_to_id.insert(vec![b], b as u32);
+        }
+        let tokenizer =
+            BpeTokenizer::new_for_testing(vocab_vec, token_to_id, std::collections::HashMap::new())
+                .with_special_tokens_for_testing(Some(100), Some(101), true, true);
+
+        let mut state = InferenceState::from_config(&model.config).unwrap();
+        let spans = detect_pii(&model, &tokenizer, "AB", &mut state).unwrap();
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].entity_type, "NAME");
+        assert_eq!(spans[0].text, "AB");
+        assert_eq!(spans[0].start_char, 0);
+        assert_eq!(spans[0].end_char, 2);
     }
 }

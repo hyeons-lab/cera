@@ -1,7 +1,7 @@
 # Resolve `cera_ffi` from the working tree, matching the path dependency the app
 # already declares on `cera_ffi_flutter`.
 #
-# Without this, the plugin's hosted pin (`cera_ffi: 0.5.1`) would send pub to
+# Without this, the plugin's hosted pin (`cera_ffi: 0.5.2`) would send pub to
 # pub.dev for the Dart half while the native half comes from `../`, so the app
 # would build against a released API and a working-tree library. Overrides are
 # not transitive: an override in the plugin's own pubspec_overrides.yaml applies
