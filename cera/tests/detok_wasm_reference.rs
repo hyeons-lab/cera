@@ -23,6 +23,8 @@
 //! `.json` carries the shape and the codes so the browser does not have to be
 //! told them separately.
 
+#![cfg(feature = "mmap")]
+
 use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights};
 
 /// A fixed, arbitrary code sequence. Values are in range for the 2049-entry

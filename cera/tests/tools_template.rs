@@ -5,6 +5,8 @@
 //! paths (the repo-root `models/` dir). Absent → the test skips, so CI (which
 //! has no models) stays green.
 
+#![cfg(feature = "mmap")]
+
 use std::path::PathBuf;
 
 use cera::gguf::GgufFile;

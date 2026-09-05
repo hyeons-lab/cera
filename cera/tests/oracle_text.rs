@@ -31,6 +31,8 @@
 //! Gated behind `CERA_ORACLE=1` and `#[ignore]`. Run:
 //!   CERA_ORACLE=1 cargo test -p cera --release --test oracle_text -- --ignored --nocapture
 
+#![cfg(feature = "mmap")]
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 

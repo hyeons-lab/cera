@@ -12,6 +12,8 @@
 //! If `CERA_MODEL` is unset or the file is missing, each test skips with a
 //! message rather than failing.
 
+#![cfg(feature = "mmap")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

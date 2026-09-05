@@ -51,6 +51,8 @@
 //! turns a missing fixture into a hard failure rather than a silent skip.
 //!
 
+#![cfg(feature = "mmap")]
+
 mod common;
 
 use std::time::Instant;

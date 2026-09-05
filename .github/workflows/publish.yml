@@ -160,7 +160,10 @@ jobs:
       # crates (their `cera` dep isn't on the index yet), so this is what
       # actually guarantees every crate still builds.
       - name: Verify workspace compiles
-        run: cargo check --workspace
+        run: |
+          cargo check --workspace
+          cargo check -p cera --no-default-features --all-targets
+          cargo check -p cera-wasm
 
       - name: Publish crates
         env:

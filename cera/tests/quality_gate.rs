@@ -16,6 +16,8 @@
 //! Gated behind `CERA_QUALITY_GATE=1` so it only runs intentionally (it
 //! requires the LFM2 model file on disk and takes a few seconds).
 
+#![cfg(feature = "mmap")]
+
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::Model;

@@ -6,17 +6,20 @@
 //! 3. Cold-tier FlatBuffers v2 serialization, atomic `.tmp` persistence, and graceful fallback on corrupted/legacy files.
 //! 4. Parity of attention and conv buffer rollback across semantic anchor restores.
 
+#[cfg(feature = "disk-cache")]
 use std::path::PathBuf;
+#[cfg(feature = "disk-cache")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cera::kv_cache::{
-    InferenceState, KvCacheConfig, KvPrefixCache, LayerSnapshot, LayerState, SemanticBoundaryKind,
-    StateSnapshot,
+    InferenceState, KvCacheConfig, KvPrefixCache, LayerState, SemanticBoundaryKind, StateSnapshot,
 };
 use cera::model::{BlockType, ModelConfig, ScalarMultipliers};
 
+#[cfg(feature = "disk-cache")]
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
+#[cfg(feature = "disk-cache")]
 fn unique_temp_dir(label: &str) -> PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("cera_test_{label}_{}_{}", std::process::id(), id));
@@ -220,6 +223,8 @@ fn visual_token_anchor_pinning() {
 #[cfg(feature = "disk-cache")]
 #[test]
 fn cold_tier_flatbuffers_v2_and_graceful_fallback() {
+    use cera::kv_cache::LayerSnapshot;
+
     let cfg = make_test_config(2, 16);
     let dir = unique_temp_dir("cold_v2");
     let mut cache = KvPrefixCache::new(

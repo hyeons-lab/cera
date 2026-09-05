@@ -13,6 +13,8 @@
 //!
 //! Run: `cargo test -p cera --release --test spec_decode_logits -- --ignored --nocapture`
 
+#![cfg(feature = "mmap")]
+
 mod common;
 
 use common::dense_model_or_skip;

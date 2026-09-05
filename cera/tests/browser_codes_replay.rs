@@ -14,6 +14,8 @@
 //! Fixture: `CERA_BROWSER_CODES` points at a file of
 //! `c0,..,c7|browser_absmax` lines. Skips when unset.
 
+#![cfg(feature = "mmap")]
+
 use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights};
 
 /// The vocoder has to be the same quant the capture ran on, so this is an
