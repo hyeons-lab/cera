@@ -3,7 +3,7 @@ name: cera_ffi_flutter
 description: >-
   Flutter FFI plugin for the Cera on-device inference engine. Ships prebuilt
   native libraries for Android, iOS, macOS, Linux and Windows.
-version: 0.5.3
+version: 0.5.4
 repository: https://github.com/hyeons-lab/cera
 issue_tracker: https://github.com/hyeons-lab/cera/issues
 documentation: https://github.com/hyeons-lab/cera/blob/main/cera_ffi_flutter/README.md
@@ -38,7 +38,7 @@ dependencies:
   # from that same surface. A mismatched pair fails loudly at startup, so there
   # is no version of `cera_ffi` other than this one that can work with the
   # native library shipped alongside it. Kept in step by scripts/bump-version.sh.
-  cera_ffi: 0.5.3
+  cera_ffi: 0.5.4
   flutter:
     sdk: flutter
   flutter_web_plugins:

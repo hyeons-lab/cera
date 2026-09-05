@@ -933,6 +933,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[cfg(feature = "mmap")]
     fn test_real_model_pii_classification() {
         let model_path =
             std::path::Path::new("/Users/dberrios/development/models/pii-detect-q8_0.gguf");

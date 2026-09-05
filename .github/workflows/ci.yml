@@ -50,6 +50,10 @@ jobs:
         # clippy skips those compile targets, so lints living in test modules
         # (e.g. `needless_update`, `items_after_test_module`) slip through CI.
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check cera without default features
+        run: cargo check -p cera --no-default-features
+      - name: Check cera-wasm on host
+        run: cargo check -p cera-wasm
       - name: Python unit tests
         run: python3 tests/test_format_review_comment.py
 
