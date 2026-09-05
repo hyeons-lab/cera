@@ -5,6 +5,8 @@
 //! 2. `DynamicSpanHead`: Vectorized GLiNER span representations with runtime label cross-attention.
 //! 3. `SlidingWindowScanner`: 1024-token stride windowing with greedy non-maximum suppression (NMS).
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, ensure};
 
 use crate::CeraError;
@@ -80,6 +82,17 @@ pub fn matmul_nt_f32(
     }
 }
 
+/// Numerically stable sigmoid calculation avoiding overflow for extreme negative inputs.
+#[inline]
+pub fn sigmoid(z: f32) -> f32 {
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let e = z.exp();
+        e / (1.0 + e)
+    }
+}
+
 /// Configuration and weights for the conversation-level sensitivity gate.
 #[derive(Debug, Clone)]
 pub struct SensitivityHeadWeights {
@@ -110,16 +123,22 @@ impl SensitivityHeadWeights {
         }
         let d = self.hidden_dim;
         let inter = self.intermediate_dim;
+        if self.dense_weight.len() < inter * d
+            || self.dense_bias.len() < inter
+            || self.classifier_weight.len() < inter
+        {
+            return (0.0, true);
+        }
 
-        // 1. Mean pool token representations across sequence
+        // 1. Mean pooling over sequence: [d]
         let mut mean_pool = vec![0.0f32; d];
-        for t in 0..n_tokens {
-            let row = &hidden_states[t * d..(t + 1) * d];
+        for i in 0..n_tokens {
+            let row = &hidden_states[i * d..(i + 1) * d];
             cpu::add_inplace(&mut mean_pool, row);
         }
-        let inv_t = 1.0 / (n_tokens as f32);
-        for m in &mut mean_pool {
-            *m *= inv_t;
+        let inv_n = 1.0 / (n_tokens as f32);
+        for v in mean_pool.iter_mut() {
+            *v *= inv_n;
         }
 
         // 2. Dense layer: inter = dense_weight [inter, d] * mean_pool [d] + dense_bias [inter]
@@ -140,7 +159,7 @@ impl SensitivityHeadWeights {
         let z = dot + self.classifier_bias;
 
         // 4. Numerically stable sigmoid: 1 / (1 + exp(-z))
-        let prob = 1.0 / (1.0 + (-z).exp());
+        let prob = sigmoid(z);
         let bypass = prob < self.gate_threshold;
         (prob, bypass)
     }
@@ -180,7 +199,8 @@ pub struct CandidateSpan {
 impl DynamicSpanHeadWeights {
     /// Generate all candidate span tuples up to max_span_length.
     pub fn candidate_spans(&self, n_tokens: usize) -> Vec<CandidateSpan> {
-        let mut spans = Vec::new();
+        let estimated_spans = n_tokens.saturating_mul(self.max_span_length);
+        let mut spans = Vec::with_capacity(estimated_spans);
         for start in 0..n_tokens {
             let max_len = (self.max_span_length + 1).min(n_tokens - start + 1);
             for length in 1..max_len {
@@ -218,16 +238,22 @@ impl DynamicSpanHeadWeights {
         projected_labels: &[f32],
         n_labels: usize,
     ) -> Vec<(CandidateSpan, usize, f32)> {
-        if n_tokens == 0
-            || n_labels == 0
-            || self.hidden_dim == 0
-            || hidden_states.len() < n_tokens * self.hidden_dim
-        {
-            return Vec::new();
-        }
         let d = self.hidden_dim;
         let s_dim = self.size_dim;
         let span_in_dim = 3 * d + s_dim;
+        if n_tokens == 0
+            || n_labels == 0
+            || d == 0
+            || hidden_states.len() < n_tokens * d
+            || projected_labels.len() < n_labels * d
+            || self.span_size_embedding.len() < (self.max_span_length + 1) * s_dim
+            || self.proj1_weight.len() < d * span_in_dim
+            || self.proj1_bias.len() < d
+            || self.proj2_weight.len() < d * d
+            || self.proj2_bias.len() < d
+        {
+            return Vec::new();
+        }
 
         let candidates = self.candidate_spans(n_tokens);
         let n_spans = candidates.len();
@@ -316,7 +342,7 @@ impl DynamicSpanHeadWeights {
                     .enumerate()
                 {
                     if raw_score >= logit_thresh {
-                        let prob = 1.0 / (1.0 + (-raw_score).exp());
+                        let prob = sigmoid(raw_score);
                         detections.push((cs, l_idx, prob));
                     }
                 }
@@ -359,6 +385,19 @@ pub struct HybridPiiModel {
 }
 
 impl HybridPiiModel {
+    /// Load Hybrid PII model directly from a file path.
+    #[cfg(feature = "mmap")]
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let gguf = GgufFile::open(path.as_ref())?;
+        Self::from_gguf(gguf)
+    }
+
+    /// Load Hybrid PII model directly from in-memory GGUF bytes.
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let gguf = GgufFile::from_bytes(bytes.into())?;
+        Self::from_gguf(gguf)
+    }
+
     /// Load Hybrid PII model directly from a GGUF file containing both backbone and heads.
     pub fn from_gguf(gguf: GgufFile) -> Result<Self> {
         let backbone =
@@ -395,6 +434,10 @@ impl HybridPiiModel {
         );
         let intermediate_dim = sens_dense_w.len() / hidden_dim;
         ensure!(
+            intermediate_dim > 0,
+            "sensitivity_head intermediate_dim must be > 0"
+        );
+        ensure!(
             sens_dense_b.len() == intermediate_dim,
             "sens_dense_b length mismatch"
         );
@@ -416,6 +459,10 @@ impl HybridPiiModel {
 
         // Parse span head weights
         let max_span_length = gguf.get_u32("hybrid_pii.max_span_length").unwrap_or(24) as usize;
+        ensure!(
+            max_span_length > 0,
+            "hybrid_pii.max_span_length must be > 0"
+        );
         let span_threshold = gguf.get_f32("hybrid_pii.span_threshold").unwrap_or(0.45);
 
         let span_size_emb = gguf
@@ -427,6 +474,7 @@ impl HybridPiiModel {
             "span_size_embedding shape mismatch"
         );
         let size_dim = span_size_emb.len() / (max_span_length + 1);
+        ensure!(size_dim > 0, "span_size_embedding size_dim must be > 0");
         let span_in_dim = 3 * hidden_dim + size_dim;
 
         let proj1_w = gguf
@@ -711,7 +759,11 @@ impl SlidingWindowScanner {
         let mut redacted = text.to_string();
         // Redact in reverse byte order to keep prior offsets valid
         for ent in entities.into_iter().rev() {
-            if text.is_char_boundary(ent.byte_start) && text.is_char_boundary(ent.byte_end) {
+            if ent.byte_start <= ent.byte_end
+                && ent.byte_end <= text.len()
+                && text.is_char_boundary(ent.byte_start)
+                && text.is_char_boundary(ent.byte_end)
+            {
                 let tag = format!("[REDACTED_{}]", ent.label.to_uppercase().replace('.', "_"));
                 redacted.replace_range(ent.byte_start..ent.byte_end, &tag);
             }
@@ -1124,6 +1176,41 @@ mod tests {
         // Expecting 8 elements for n_tokens = 2, but passed only 3
         let detections = span_head.score_spans(&[1.0, 2.0, 3.0], 2, &[1.0, 2.0, 3.0, 4.0], 1);
         assert!(detections.is_empty());
+
+        // Expecting 4 elements for n_labels = 1 (hidden_dim = 4), but passed only 2
+        let detections_undersized_labels = span_head.score_spans(&[1.0; 8], 2, &[1.0, 2.0], 1);
+        assert!(detections_undersized_labels.is_empty());
+
+        // Numerically stable sigmoid edge cases
+        let (prob_neg, bypass_neg) = sens_head.score(&[-1000.0, -1000.0, -1000.0, -1000.0], 1);
+        assert_eq!(prob_neg, 0.5); // weights are 0, so classifier_bias = 0, prob = 0.5
+        assert!(!bypass_neg);
+
+        let sens_head_bias = SensitivityHeadWeights {
+            hidden_dim: 4,
+            intermediate_dim: 2,
+            dense_weight: vec![0.0; 8],
+            dense_bias: vec![0.0; 2],
+            classifier_weight: vec![0.0; 2],
+            classifier_bias: -100.0, // Large negative logit
+            gate_threshold: 0.5,
+        };
+        let (prob_large_neg, bypass_large_neg) = sens_head_bias.score(&[1.0; 4], 1);
+        assert!(prob_large_neg < 1e-10);
+        assert!(bypass_large_neg);
+
+        let sens_head_pos_bias = SensitivityHeadWeights {
+            hidden_dim: 4,
+            intermediate_dim: 2,
+            dense_weight: vec![0.0; 8],
+            dense_bias: vec![0.0; 2],
+            classifier_weight: vec![0.0; 2],
+            classifier_bias: 100.0, // Large positive logit
+            gate_threshold: 0.5,
+        };
+        let (prob_large_pos, bypass_large_pos) = sens_head_pos_bias.score(&[1.0; 4], 1);
+        assert!((prob_large_pos - 1.0).abs() < 1e-10);
+        assert!(!bypass_large_pos);
     }
 
     #[test]
@@ -1146,5 +1233,14 @@ mod tests {
             assert_eq!(c[row * n], 8.5);
             assert_eq!(c[row * n + 1], 9.5);
         }
+    }
+
+    #[test]
+    fn test_sigmoid_numerical_stability() {
+        assert_eq!(sigmoid(0.0), 0.5);
+        assert!((sigmoid(100.0) - 1.0).abs() < 1e-10);
+        assert!(sigmoid(-100.0) < 1e-10);
+        assert!(sigmoid(-1000.0) >= 0.0 && sigmoid(-1000.0) < 1e-10);
+        assert!(sigmoid(1000.0) <= 1.0 && (sigmoid(1000.0) - 1.0).abs() < 1e-10);
     }
 }

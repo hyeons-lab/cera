@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result, ensure};
 
-use crate::backend::cpu::{self, RopeType};
+use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::transformer::{self, WeightRef};
@@ -74,14 +74,13 @@ pub struct BertModel {
     head_dim: usize,
     is_modernbert: bool,
     global_rope_theta: f32,
-    #[allow(dead_code)]
-    rope_type: RopeType,
+    half_window: usize,
     embd_ref: WeightRef,
     pos_embd_ref: Option<WeightRef>,
     embd_norm_weight: Option<Vec<f32>>,
     embd_norm_bias: Option<Vec<f32>>,
     layer_refs: Vec<BertLayerWeightRefs>,
-    output_norm_weight: Vec<f32>,
+    output_norm_weight: Option<Vec<f32>>,
     output_norm_bias: Option<Vec<f32>>,
     #[allow(dead_code)]
     model_id: String,
@@ -107,12 +106,6 @@ impl BertModel {
 
         let is_modernbert =
             prefix == "modernbert" || gguf.tensors.contains_key("blk.0.ffn_gate.weight");
-
-        let rope_type = if is_modernbert {
-            RopeType::Neox
-        } else {
-            RopeType::Norm
-        };
 
         let n_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
@@ -152,9 +145,20 @@ impl BertModel {
                     .tensors
                     .get("token_embd.weight")
                     .context("missing token_embd.weight")?;
-                info.shape[1]
+                info.shape.get(1).copied().with_context(|| {
+                    format!(
+                        "token_embd.weight shape has fewer than 2 dimensions: {:?}",
+                        info.shape
+                    )
+                })?
             }
         };
+
+        let sliding_window_size = gguf
+            .get_u32(&format!("{prefix}.sliding_window"))
+            .or_else(|| gguf.get_u32("modernbert.sliding_window"))
+            .unwrap_or(128) as usize;
+        let half_window = sliding_window_size / 2;
 
         let gguf_max_seq_len = gguf
             .get_u32(&format!("{prefix}.context_length"))
@@ -212,54 +216,157 @@ impl BertModel {
             .get_tensor("token_embd_norm.bias")
             .map(|t| t.to_f32_vec())
             .ok();
+        if let Some(ref b) = embd_norm_bias {
+            ensure!(
+                b.len() == hidden_size,
+                "token_embd_norm.bias len ({}) != hidden_size ({})",
+                b.len(),
+                hidden_size
+            );
+        }
 
-        let output_norm_weight = if let Ok(t) = gguf.get_tensor("output_norm.weight") {
-            t.to_f32_vec()
-        } else if let Ok(t) = gguf.get_tensor(&format!("blk.{}.attn_norm.weight", n_layers - 1)) {
-            t.to_f32_vec()
+        let (output_norm_weight, output_norm_bias) = if is_modernbert {
+            let w = if let Ok(t) = gguf.get_tensor("output_norm.weight") {
+                t.to_f32_vec()
+            } else {
+                vec![1.0; hidden_size]
+            };
+            ensure!(
+                w.len() == hidden_size,
+                "output_norm.weight len ({}) != hidden_size ({})",
+                w.len(),
+                hidden_size
+            );
+            let b = gguf
+                .get_tensor("output_norm.bias")
+                .map(|t| t.to_f32_vec())
+                .ok();
+            if let Some(ref b) = b {
+                ensure!(
+                    b.len() == hidden_size,
+                    "output_norm.bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
+            (Some(w), b)
+        } else if let Ok(t) = gguf.get_tensor("output_norm.weight") {
+            let w = t.to_f32_vec();
+            ensure!(
+                w.len() == hidden_size,
+                "output_norm.weight len ({}) != hidden_size ({})",
+                w.len(),
+                hidden_size
+            );
+            let b = gguf
+                .get_tensor("output_norm.bias")
+                .map(|t| t.to_f32_vec())
+                .ok();
+            if let Some(ref b) = b {
+                ensure!(
+                    b.len() == hidden_size,
+                    "output_norm.bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
+            (Some(w), b)
         } else {
-            vec![1.0; hidden_size]
+            (None, None)
         };
-        ensure!(
-            output_norm_weight.len() == hidden_size,
-            "output_norm_weight len ({}) != hidden_size ({})",
-            output_norm_weight.len(),
-            hidden_size
-        );
-
-        let output_norm_bias = gguf
-            .get_tensor("output_norm.bias")
-            .map(|t| t.to_f32_vec())
-            .ok();
 
         let mut layer_refs = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let attn_q = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
                 .with_repack(&gguf);
+            ensure!(
+                attn_q.k == hidden_size && attn_q.m == hidden_size,
+                "layer {i} attn_q dimensions mismatch: [{}, {}] != [{}, {}]",
+                attn_q.m,
+                attn_q.k,
+                hidden_size,
+                hidden_size
+            );
             let attn_k = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
                 .with_repack(&gguf);
+            ensure!(
+                attn_k.k == hidden_size && attn_k.m == hidden_size,
+                "layer {i} attn_k dimensions mismatch: [{}, {}] != [{}, {}]",
+                attn_k.m,
+                attn_k.k,
+                hidden_size,
+                hidden_size
+            );
             let attn_v = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?
                 .with_repack(&gguf);
+            ensure!(
+                attn_v.k == hidden_size && attn_v.m == hidden_size,
+                "layer {i} attn_v dimensions mismatch: [{}, {}] != [{}, {}]",
+                attn_v.m,
+                attn_v.k,
+                hidden_size,
+                hidden_size
+            );
             let attn_output =
                 transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_output.weight"))?
                     .with_repack(&gguf);
+            ensure!(
+                attn_output.k == hidden_size && attn_output.m == hidden_size,
+                "layer {i} attn_output dimensions mismatch: [{}, {}] != [{}, {}]",
+                attn_output.m,
+                attn_output.k,
+                hidden_size,
+                hidden_size
+            );
 
             let attn_q_bias = gguf
                 .get_tensor(&format!("blk.{i}.attn_q.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = attn_q_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} attn_q_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
             let attn_k_bias = gguf
                 .get_tensor(&format!("blk.{i}.attn_k.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = attn_k_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} attn_k_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
             let attn_v_bias = gguf
                 .get_tensor(&format!("blk.{i}.attn_v.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = attn_v_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} attn_v_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
             let attn_output_bias = gguf
                 .get_tensor(&format!("blk.{i}.attn_output.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = attn_output_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} attn_output_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
 
             let attn_norm_weight =
                 if let Ok(t) = gguf.get_tensor(&format!("blk.{i}.attn_norm.weight")) {
@@ -288,26 +395,65 @@ impl BertModel {
 
             let ffn_up = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?
                 .with_repack(&gguf);
+            ensure!(
+                ffn_up.k == hidden_size && ffn_up.m == intermediate_size,
+                "layer {i} ffn_up dimensions mismatch: [{}, {}] != [{}, {}]",
+                ffn_up.m,
+                ffn_up.k,
+                intermediate_size,
+                hidden_size
+            );
             let ffn_up_bias = gguf
                 .get_tensor(&format!("blk.{i}.ffn_up.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = ffn_up_bias {
+                ensure!(
+                    b.len() == intermediate_size,
+                    "layer {i} ffn_up_bias len ({}) != intermediate_size ({})",
+                    b.len(),
+                    intermediate_size
+                );
+            }
 
             let ffn_down = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
                 .with_repack(&gguf);
+            ensure!(
+                ffn_down.k == intermediate_size && ffn_down.m == hidden_size,
+                "layer {i} ffn_down dimensions mismatch: [{}, {}] != [{}, {}]",
+                ffn_down.m,
+                ffn_down.k,
+                hidden_size,
+                intermediate_size
+            );
             let ffn_down_bias = gguf
                 .get_tensor(&format!("blk.{i}.ffn_down.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = ffn_down_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} ffn_down_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
 
             let ffn_gate = if gguf
                 .tensors
                 .contains_key(&format!("blk.{i}.ffn_gate.weight"))
             {
-                Some(
-                    transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                        .with_repack(&gguf),
-                )
+                let gate = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
+                    .with_repack(&gguf);
+                ensure!(
+                    gate.k == hidden_size && gate.m == intermediate_size,
+                    "layer {i} ffn_gate dimensions mismatch: [{}, {}] != [{}, {}]",
+                    gate.m,
+                    gate.k,
+                    intermediate_size,
+                    hidden_size
+                );
+                Some(gate)
             } else {
                 None
             };
@@ -315,6 +461,14 @@ impl BertModel {
                 .get_tensor(&format!("blk.{i}.ffn_gate.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = ffn_gate_bias {
+                ensure!(
+                    b.len() == intermediate_size,
+                    "layer {i} ffn_gate_bias len ({}) != intermediate_size ({})",
+                    b.len(),
+                    intermediate_size
+                );
+            }
 
             let ffn_norm_weight =
                 if let Ok(t) = gguf.get_tensor(&format!("blk.{i}.ffn_norm.weight")) {
@@ -395,7 +549,7 @@ impl BertModel {
             head_dim,
             is_modernbert,
             global_rope_theta,
-            rope_type,
+            half_window,
             embd_ref,
             pos_embd_ref,
             embd_norm_weight,
@@ -418,10 +572,20 @@ impl Model for BertModel {
     }
 
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
-        let n_tokens = tokens.len();
+        let n_tokens = if self.config.max_seq_len > 0 && tokens.len() > self.config.max_seq_len {
+            tracing::warn!(
+                "BertModel::hidden_states received {} tokens exceeding max_seq_len {}; truncating",
+                tokens.len(),
+                self.config.max_seq_len
+            );
+            self.config.max_seq_len
+        } else {
+            tokens.len()
+        };
         if n_tokens == 0 {
             return Vec::new();
         }
+        let tokens = &tokens[..n_tokens];
         let d = self.config.hidden_size;
         let n_heads = self.config.n_heads;
         let head_dim = self.head_dim;
@@ -532,7 +696,10 @@ impl Model for BertModel {
 
                     // Compute dot product scores with keys within sliding window
                     let (k_start, k_end) = if layer.is_sliding {
-                        (q_idx.saturating_sub(64), (q_idx + 65).min(n_tokens))
+                        (
+                            q_idx.saturating_sub(self.half_window),
+                            (q_idx + self.half_window + 1).min(n_tokens),
+                        )
                     } else {
                         (0, n_tokens)
                     };
@@ -673,12 +840,14 @@ impl Model for BertModel {
         }
 
         // 3. Final Norm
-        for i in 0..n_tokens {
-            let row = &mut x[i * d..(i + 1) * d];
-            if let Some(ref b) = self.output_norm_bias {
-                cpu::layer_norm_inplace(row, &self.output_norm_weight, b, self.config.rms_norm_eps);
-            } else {
-                layer_norm_no_bias_inplace(row, &self.output_norm_weight, self.config.rms_norm_eps);
+        if let Some(ref w) = self.output_norm_weight {
+            for i in 0..n_tokens {
+                let row = &mut x[i * d..(i + 1) * d];
+                if let Some(ref b) = self.output_norm_bias {
+                    cpu::layer_norm_inplace(row, w, b, self.config.rms_norm_eps);
+                } else {
+                    layer_norm_no_bias_inplace(row, w, self.config.rms_norm_eps);
+                }
             }
         }
 
@@ -756,5 +925,45 @@ mod tests {
         assert!(sum.abs() < 1e-5); // Mean must be 0
         assert!((x[0] - (-1.34164)).abs() < 1e-4);
         assert!((x[3] - 1.34164).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_sliding_window_half_window_bounds() {
+        let half_window = 32usize;
+        let n_tokens = 100usize;
+
+        // Query at pos 10: k_start = 0, k_end = 43
+        let q_idx = 10usize;
+        let k_start = q_idx.saturating_sub(half_window);
+        let k_end = (q_idx + half_window + 1).min(n_tokens);
+        assert_eq!(k_start, 0);
+        assert_eq!(k_end, 43);
+
+        // Query at pos 50: k_start = 18, k_end = 83
+        let q_idx = 50usize;
+        let k_start = q_idx.saturating_sub(half_window);
+        let k_end = (q_idx + half_window + 1).min(n_tokens);
+        assert_eq!(k_start, 18);
+        assert_eq!(k_end, 83);
+
+        // Query at pos 95: k_start = 63, k_end = 100
+        let q_idx = 95usize;
+        let k_start = q_idx.saturating_sub(half_window);
+        let k_end = (q_idx + half_window + 1).min(n_tokens);
+        assert_eq!(k_start, 63);
+        assert_eq!(k_end, 100);
+    }
+
+    #[test]
+    fn test_max_seq_len_clamping_logic() {
+        let max_seq_len = 128usize;
+        let tokens = vec![1u32; 256];
+        let n_tokens = if max_seq_len > 0 && tokens.len() > max_seq_len {
+            max_seq_len
+        } else {
+            tokens.len()
+        };
+        assert_eq!(n_tokens, 128);
+        assert_eq!(tokens[..n_tokens].len(), 128);
     }
 }
