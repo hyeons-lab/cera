@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.3
+
+### Added
+
+- **Streaming Text Chunks**: Added `generateStreamChunks` API for streaming multi-token text chunks, reducing cross-boundary messaging overhead.
+- **Multimodal Envelopes**: Added `MultimodalEnvelope`, `ImageInput`, and `AudioInput` types for structured multimodal prompt delivery.
+- **Android Download Service**: Added support for background model asset downloading via `AndroidDownloadService`.
+- **Whisper ASR Integration**: Added native bindings for OpenAI Whisper speech recognition models.
+
 ## 0.5.2
 
 ### Changed

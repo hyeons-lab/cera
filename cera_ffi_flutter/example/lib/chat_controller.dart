@@ -18,7 +18,7 @@ class ChatController extends ValueNotifier<ChatState> {
       super(const ChatState()) {
     const kAppRevisionBadge = 'rev22-local-models-webgpu';
     debugPrint(
-      '[cera:chat:version] ChatController v0.5.2 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.5.3 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }

@@ -22,7 +22,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'cera_ffi_flutter'
-  s.version          = '0.5.2'
+  s.version          = '0.5.3'
   s.summary          = 'On-device LLM inference for Flutter, powered by the Cera engine.'
   s.description      = <<-DESC
 Flutter FFI bindings for the Cera inference engine. Runs GGUF models on-device
