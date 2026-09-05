@@ -164,6 +164,7 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "ffn_swiglu_q4_0",
     "gemv_q4_0_fast",
     "gemv_q4_0_qkv",
+    "bert_flash_attention",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled

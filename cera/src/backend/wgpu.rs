@@ -1403,6 +1403,11 @@ pub mod shaders {
     /// binding 1 = params). `tests/slang_multitarget_parity.rs` pins it against
     /// the CPU reference, as it does the generated MSL twin.
     pub const SOFTMAX: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax.wgsl"));
+    /// FlashAttention-2 style tiled attention for BERT and ModernBERT, generated from
+    /// `shaders/slang/bert_flash_attention.slang` by build.rs and shared with
+    /// the Metal backend's `metal::shaders::BERT_FLASH_ATTENTION`.
+    pub const BERT_FLASH_ATTENTION: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/bert_flash_attention.wgsl"));
     /// Capability probe, not a kernel: nothing dispatches this. Pins that a
     /// `__target_switch` metal branch using `linalg::CoopMat` is eliminated
     /// before entry-point validation, so the same source still emits valid WGSL

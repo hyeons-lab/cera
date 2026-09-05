@@ -4009,6 +4009,50 @@ fn audio_kernel_entry_points_reach_every_enabled_target() {
     );
 }
 
+/// BERT and ModernBERT flash attention kernel entry point check across enabled targets.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+#[test]
+fn bert_flash_attention_entry_points_reach_every_enabled_target() {
+    let mut checked = 0usize;
+    #[cfg(feature = "gpu")]
+    {
+        checked += 1;
+        let wgsl = cera::backend::wgpu::shaders::BERT_FLASH_ATTENTION;
+        assert!(
+            wgsl.contains("bert_flash_attention"),
+            "bert_flash_attention.wgsl is missing entry point bert_flash_attention"
+        );
+        for i in 0..5 {
+            assert!(
+                wgsl.contains(&format!("@binding({i})")),
+                "generated WGSL for bert_flash_attention is missing binding {i}"
+            );
+        }
+    }
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    {
+        checked += 1;
+        let msl = cera::backend::metal::shaders::BERT_FLASH_ATTENTION;
+        assert!(
+            msl.contains("bert_flash_attention"),
+            "bert_flash_attention.metal is missing entry point bert_flash_attention"
+        );
+        for i in 0..5 {
+            assert!(
+                msl.contains(&format!("[[buffer({i})]]")),
+                "generated MSL for bert_flash_attention is missing buffer({i})"
+            );
+        }
+    }
+    assert!(
+        checked > 0,
+        "neither GPU target was enabled to test bert_flash_attention"
+    );
+}
+
 /// The conv tier is the first clean single-body port since Phase 1a: one body,
 /// no `__target_switch`, and all three kernels on the same five-slot binding
 /// contract. That only holds because the Metal `conv1d_fused` twin was first
