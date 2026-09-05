@@ -102,6 +102,19 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
         .map(|s| parse_bioes(s.as_str()))
         .collect();
 
+    // Pre-compute allowed transition predecessors for each class c.
+    // Because BIOES grammar is sparse (most transitions are forbidden),
+    // traversing only valid predecessors reduces per-token transition checks from O(C^2) to O(C).
+    let mut allowed_predecessors = vec![Vec::new(); num_classes];
+    for c in 0..num_classes {
+        let (curr_prefix, curr_type) = parsed_labels[c];
+        for (p, &(prev_prefix, prev_type)) in parsed_labels.iter().enumerate().take(num_classes) {
+            if is_valid_transition(prev_prefix, prev_type, curr_prefix, curr_type) {
+                allowed_predecessors[c].push(p);
+            }
+        }
+    }
+
     // dp[c] = max score of path ending at class c.
     // Dynamic programming transitions are invariant to per-token uniform log-softmax offsets,
     // so scoring directly with raw logits saves heap allocations and exp/ln calculations.
@@ -123,21 +136,17 @@ pub fn viterbi_decode(logits: &[f32], num_classes: usize, class_labels: &[String
         let curr_logits = &logits[t * num_classes..(t + 1) * num_classes];
 
         for c in 0..num_classes {
-            let (curr_prefix, curr_type) = parsed_labels[c];
             let mut best_score = f32::NEG_INFINITY;
             let mut best_prev = 0usize;
 
-            for p in 0..num_classes {
+            for &p in &allowed_predecessors[c] {
                 if dp[p] <= f32::NEG_INFINITY {
                     continue;
                 }
-                let (prev_prefix, prev_type) = parsed_labels[p];
-                if is_valid_transition(prev_prefix, prev_type, curr_prefix, curr_type) {
-                    let score = dp[p] + curr_logits[c];
-                    if score > best_score {
-                        best_score = score;
-                        best_prev = p;
-                    }
+                let score = dp[p] + curr_logits[c];
+                if score > best_score {
+                    best_score = score;
+                    best_prev = p;
                 }
             }
 

@@ -673,6 +673,24 @@ impl Lfm2Model {
                 .get_tensor("classifier.bias")
                 .ok()
                 .map(|t| t.to_f32_vec());
+            let hs = config.hidden_size;
+            if hs == 0 || !w.len().is_multiple_of(hs) {
+                bail!(
+                    "classifier.weight length {} is not a multiple of hidden_size {}",
+                    w.len(),
+                    hs
+                );
+            }
+            if let Some(ref bias) = b {
+                let implied_classes = w.len() / hs;
+                if bias.len() != implied_classes {
+                    bail!(
+                        "classifier.bias length {} does not match implied num_classes {}",
+                        bias.len(),
+                        implied_classes
+                    );
+                }
+            }
             (Some(w), b)
         } else {
             (None, None)
@@ -4028,7 +4046,23 @@ impl Model for Lfm2Model {
             ));
         };
         let hs = self.config.hidden_size;
+        if hs == 0 || !classifier_w.len().is_multiple_of(hs) {
+            return Err(crate::CeraError::Backend(format!(
+                "classifier.weight length {} is not a multiple of hidden_size {}",
+                classifier_w.len(),
+                hs
+            )));
+        }
         let num_classes = classifier_w.len() / hs;
+        if let Some(bias) = classifier_b
+            && bias.len() != num_classes
+        {
+            return Err(crate::CeraError::Backend(format!(
+                "classifier.bias length {} does not match num_classes {}",
+                bias.len(),
+                num_classes
+            )));
+        }
         let n = tokens.len();
 
         let mut logits = vec![0.0f32; n * num_classes];
