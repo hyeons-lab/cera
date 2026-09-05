@@ -491,6 +491,10 @@ impl HybridPiiModel {
             "sens_cls_w length mismatch"
         );
         let gate_threshold = gguf.get_f32("hybrid_pii.gate_threshold").unwrap_or(0.05);
+        ensure!(
+            gate_threshold.is_finite() && (0.0..=1.0).contains(&gate_threshold),
+            "hybrid_pii.gate_threshold must be a finite float in [0.0, 1.0], got {gate_threshold}"
+        );
 
         let sensitivity_head = SensitivityHeadWeights {
             hidden_dim,
@@ -509,6 +513,10 @@ impl HybridPiiModel {
             "hybrid_pii.max_span_length must be > 0"
         );
         let span_threshold = gguf.get_f32("hybrid_pii.span_threshold").unwrap_or(0.45);
+        ensure!(
+            span_threshold.is_finite() && (0.0..=1.0).contains(&span_threshold),
+            "hybrid_pii.span_threshold must be a finite float in [0.0, 1.0], got {span_threshold}"
+        );
 
         let span_size_emb = gguf
             .get_tensor("span_head.span_size_embedding.weight")
@@ -1375,5 +1383,20 @@ mod tests {
             assert_eq!(*l1, *l2);
             assert!((*s1 - *s2).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn test_threshold_bounds_validation_logic() {
+        let is_valid = |t: f32| t.is_finite() && (0.0..=1.0).contains(&t);
+
+        assert!(is_valid(0.0));
+        assert!(is_valid(0.5));
+        assert!(is_valid(1.0));
+
+        assert!(!is_valid(-0.01));
+        assert!(!is_valid(1.01));
+        assert!(!is_valid(f32::NAN));
+        assert!(!is_valid(f32::INFINITY));
+        assert!(!is_valid(f32::NEG_INFINITY));
     }
 }

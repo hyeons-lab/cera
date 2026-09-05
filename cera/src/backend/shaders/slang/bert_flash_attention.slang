@@ -22,6 +22,9 @@ static const uint K_TILE = 32u;
 static const uint MAX_HEAD_DIM = 64u;
 static const float NEG_INF = -3.402823466e+38f;
 
+// Tile dimensions: K_TILE * MAX_HEAD_DIM = 32 * 64 = 2048 floats per tile.
+// Both k_tile and v_tile together consume 4096 * 4 B = 16384 B (16 KB) shared memory,
+// precisely matching WebGPU's minimum guaranteed maxComputeWorkgroupStorageSize limit.
 groupshared float k_tile[K_TILE * MAX_HEAD_DIM];
 groupshared float v_tile[K_TILE * MAX_HEAD_DIM];
 

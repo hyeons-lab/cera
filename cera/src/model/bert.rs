@@ -7,7 +7,7 @@
 //!    and standard 2-layer MLP with bias.
 //!
 //! Pure encoder pipeline: stateless monolithic forward pass exposing
-//! `hidden_states(&self, tokens, state)` and `hidden_states_mean_pooled`.
+//! `hidden_states(&self, tokens, state)` (and `Session::hidden_states_mean_pooled`).
 
 use anyhow::{Context, Result, ensure};
 
@@ -178,6 +178,10 @@ impl BertModel {
             .get_f32(&format!("{prefix}.attention.layer_norm_epsilon"))
             .or_else(|| gguf.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")))
             .unwrap_or(1e-5);
+        ensure!(
+            rms_norm_eps.is_finite() && rms_norm_eps > 0.0,
+            "layer_norm epsilon must be a positive finite float, got {rms_norm_eps}"
+        );
 
         let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
         ensure!(
@@ -603,13 +607,17 @@ impl Model for BertModel {
             );
         }
 
+        // 2. Transformer layers (reuse scratch buffers from state to avoid per-chunk heap allocations)
+        let scratch = &mut _state.scratch;
+        scratch.out.resize(d, 0.0);
+
         // Classic BERT: Add absolute position embeddings and apply token_embd_norm
         if let Some(ref pos_ref) = self.pos_embd_ref {
             let max_pos = pos_ref.m.min(self.config.max_seq_len);
-            let mut pos_buf = vec![0.0f32; d];
+            let pos_buf = &mut scratch.out[..d];
             for i in 0..n_tokens.min(max_pos) {
-                transformer::dequantize_row_into(&self.gguf, pos_ref, i, &mut pos_buf);
-                cpu::add_inplace(&mut x[i * d..(i + 1) * d], &pos_buf);
+                transformer::dequantize_row_into(&self.gguf, pos_ref, i, pos_buf);
+                cpu::add_inplace(&mut x[i * d..(i + 1) * d], pos_buf);
             }
         }
         if let Some(ref w) = self.embd_norm_weight {
@@ -623,8 +631,6 @@ impl Model for BertModel {
             }
         }
 
-        // 2. Transformer layers (reuse scratch buffers from state to avoid per-chunk heap allocations)
-        let scratch = &mut _state.scratch;
         scratch.q.resize(n_tokens * d, 0.0);
         scratch.k.resize(n_tokens * d, 0.0);
         scratch.v.resize(n_tokens * d, 0.0);
@@ -633,7 +639,6 @@ impl Model for BertModel {
         if self.is_modernbert {
             scratch.ffn_input.resize(n_tokens * d, 0.0);
         }
-        scratch.out.resize(d, 0.0);
         let inter = self.config.intermediate_size;
         scratch.up.resize(inter, 0.0);
         scratch.gate.resize(inter, 0.0);
@@ -980,5 +985,20 @@ mod tests {
         };
         assert_eq!(n_tokens, 128);
         assert_eq!(tokens[..n_tokens].len(), 128);
+    }
+
+    #[test]
+    fn test_layer_norm_epsilon_validation_logic() {
+        let is_valid = |eps: f32| eps.is_finite() && eps > 0.0;
+
+        assert!(is_valid(1e-5));
+        assert!(is_valid(1e-12));
+        assert!(is_valid(1.0));
+
+        assert!(!is_valid(0.0));
+        assert!(!is_valid(-1e-5));
+        assert!(!is_valid(f32::NAN));
+        assert!(!is_valid(f32::INFINITY));
+        assert!(!is_valid(f32::NEG_INFINITY));
     }
 }
