@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **LoRA Adapter Loading**: Added fallback `from_gguf` path loader when `cera` is compiled without default features (`mmap` disabled) on native targets.
+- **Model and Adapter Loading**: Added fallback path loaders for LoRA adapters, Silero VAD, and Hybrid PII models when `cera` is compiled without default features (`mmap` disabled) on native targets.
 
 ### Changed
 

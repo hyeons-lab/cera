@@ -5,6 +5,8 @@
 //! points at a real GGUF — CI has none, so it stays green. Greedy decode
 //! (`temperature = 0`) keeps it deterministic.
 
+#![cfg(feature = "mmap")]
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;

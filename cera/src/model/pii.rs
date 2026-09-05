@@ -443,11 +443,19 @@ pub struct HybridPiiModel {
 }
 
 impl HybridPiiModel {
-    /// Load Hybrid PII model directly from a file path.
-    #[cfg(feature = "mmap")]
+    /// Load Hybrid PII model directly from a file path using memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let gguf = GgufFile::open(path.as_ref())?;
         Self::from_gguf(gguf)
+    }
+
+    /// Load Hybrid PII model directly from a file path without memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("read PII model {:?}", path.as_ref()))?;
+        Self::from_bytes(bytes)
     }
 
     /// Load Hybrid PII model directly from in-memory GGUF bytes.
@@ -994,6 +1002,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs a real GGUF via HYBRID_PII_ADAPTER_GGUF; run with --ignored"]
+    #[cfg(feature = "mmap")]
     fn test_load_hybrid_pii_adapter_gguf() {
         let Some(adapter_path) = std::env::var_os("HYBRID_PII_ADAPTER_GGUF") else {
             return;
@@ -1543,5 +1552,12 @@ mod tests {
         assert_eq!(accepted[0].score, 0.92);
         assert_eq!(accepted[1].text, "jsmith@cera.dev");
         assert_eq!(accepted[1].score, 0.88);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_hybrid_pii_from_file_missing_path_returns_error() {
+        let res = HybridPiiModel::from_file(std::path::Path::new("nonexistent_pii_model.gguf"));
+        assert!(res.is_err());
     }
 }

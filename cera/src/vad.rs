@@ -17,7 +17,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
-#[cfg(feature = "mmap")]
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -389,11 +389,19 @@ impl SileroVad {
         })
     }
 
-    /// Load a Silero VAD model from a `.gguf` file path.
-    #[cfg(feature = "mmap")]
+    /// Load a Silero VAD model from a `.gguf` file path using memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let gguf = GgufFile::open(path.as_ref())?;
         Self::from_gguf(&gguf)
+    }
+
+    /// Load a Silero VAD model from a `.gguf` file path without memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("read VAD model {:?}", path.as_ref()))?;
+        Self::from_bytes(bytes)
     }
 
     /// Load a Silero VAD model from in-memory GGUF bytes.
@@ -873,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mmap")]
+    #[cfg(not(target_arch = "wasm32"))]
     fn test_vad_init_and_reset() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let candidates = [
@@ -924,5 +932,12 @@ mod tests {
             )
             .unwrap();
         assert!(timestamps.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_vad_from_file_missing_path_returns_error() {
+        let res = SileroVad::from_file(std::path::Path::new("nonexistent_vad_model.gguf"));
+        assert!(res.is_err());
     }
 }

@@ -5,6 +5,8 @@
 //! 2. `forward_from_embedding` applies output RMSNorm before the LM head projection.
 //! 3. Audio synthesis produces natural acoustic spectral envelopes without DC saturation or clipping.
 
+#![cfg(feature = "mmap")]
+
 use cera::kv_cache::InferenceState;
 use cera::model::Model;
 #[cfg(feature = "gpu")]

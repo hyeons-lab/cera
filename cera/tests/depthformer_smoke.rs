@@ -1,3 +1,5 @@
+#![cfg(feature = "mmap")]
+
 #[test]
 fn depthformer_forward_smoke() {
     let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))

@@ -1,3 +1,5 @@
+#![cfg(feature = "mmap")]
+
 #[test]
 fn load_vocoder_gguf() {
     let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))

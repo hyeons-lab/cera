@@ -6,6 +6,8 @@
 //! and gated on the `CERA_TEST_MODEL` env var so CI and offline
 //! developers aren't blocked. This mirrors `session_chain.rs`.
 
+#![cfg(feature = "mmap")]
+
 use std::path::{Path, PathBuf};
 
 use cera::manifest::InferenceType;

@@ -1,3 +1,5 @@
+#![cfg(feature = "mmap")]
+
 #[test]
 fn sample_audio_frame_smoke() {
     let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))

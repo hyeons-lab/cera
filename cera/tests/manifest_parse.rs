@@ -7,6 +7,8 @@
 //! schema should require zero parser changes for the shapes already
 //! recognized — any new required field is a red flag.
 
+#![cfg(feature = "std-fs")]
+
 use std::path::PathBuf;
 
 use cera::manifest::{GenerationDefaults, InferenceType, Manifest};

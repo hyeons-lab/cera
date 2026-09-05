@@ -1,3 +1,5 @@
+#![cfg(feature = "mmap")]
+
 #[test]
 fn detokenize_smoke() {
     let path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))

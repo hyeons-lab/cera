@@ -163,7 +163,11 @@ pub fn dense_model_or_skip() -> Option<std::path::PathBuf> {
 /// meaningful: the head check alone would approve an LFM2 GGUF, which has a
 /// `token_embd.weight` but never reaches this code, and the dense check alone
 /// would approve a Q5_K head that silently takes the per-row path.
-#[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
+#[cfg(all(
+    feature = "mmap",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(has_blas)
+))]
 pub fn dense_gemm_head_fixture(path: &std::path::Path) -> (Box<dyn cera::model::Model>, String) {
     let gguf = cera::gguf::GgufFile::open(path).unwrap();
     let model =

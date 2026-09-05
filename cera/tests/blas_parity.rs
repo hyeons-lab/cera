@@ -28,7 +28,7 @@
 //! cargo test -p cera --release --test blas_parity -- --ignored --nocapture
 //! ```
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(all(target_arch = "aarch64", feature = "mmap"))]
 
 use std::path::PathBuf;
 
