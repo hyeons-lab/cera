@@ -78,6 +78,16 @@ pub struct MmapWeight {
     pub cols: usize,
 }
 
+impl std::fmt::Debug for MmapWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmapWeight")
+            .field("dtype", &self.dtype)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .finish()
+    }
+}
+
 impl MmapWeight {
     /// Construct a handle to the tensor named `name` inside `gguf`.
     /// Validates the tensor exists, captures its byte range, and

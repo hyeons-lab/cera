@@ -161,10 +161,13 @@ impl HfModelConfig {
             "gemma" | "gemma2" => "gemma",
             "phi3" | "phi" => "phi3",
             "lfm" | "lfm2" | "lfm2.5" | "liquid" => "lfm2",
+            "whisper" => "whisper",
             _ => {
                 if let Some(first_arch) = self.architectures.first() {
                     let arch_lower = first_arch.to_ascii_lowercase();
-                    if arch_lower.contains("lfm") || arch_lower.contains("liquid") {
+                    if arch_lower.contains("whisper") {
+                        "whisper"
+                    } else if arch_lower.contains("lfm") || arch_lower.contains("liquid") {
                         "lfm2"
                     } else if arch_lower.contains("qwen2") || arch_lower.contains("qwen") {
                         "qwen2"
@@ -188,6 +191,92 @@ impl HfModelConfig {
 
         writer.add_string("general.architecture", arch);
         writer.add_string("general.name", model_name);
+
+        if arch == "whisper" {
+            writer.add_u32("whisper.sampling_rate", 16000);
+            let d_model = self
+                .extra
+                .get("d_model")
+                .and_then(|v| v.as_u64())
+                .or(self.hidden_size.map(|h| h as u64))
+                .unwrap_or(384) as u32;
+            writer.add_u32("whisper.audio.embedding_length", d_model);
+            writer.add_u32("whisper.text.embedding_length", d_model);
+
+            let enc_heads = self
+                .extra
+                .get("encoder_attention_heads")
+                .and_then(|v| v.as_u64())
+                .or(self.num_attention_heads.map(|h| h as u64))
+                .unwrap_or(6) as u32;
+            let dec_heads = self
+                .extra
+                .get("decoder_attention_heads")
+                .and_then(|v| v.as_u64())
+                .or(self.num_attention_heads.map(|h| h as u64))
+                .unwrap_or(6) as u32;
+            writer.add_u32("whisper.audio.attention.head_count", enc_heads);
+            writer.add_u32("whisper.text.attention.head_count", dec_heads);
+            writer.add_u32("whisper.audio.head_count", enc_heads);
+            writer.add_u32("whisper.text.head_count", dec_heads);
+
+            let enc_layers = self
+                .extra
+                .get("encoder_layers")
+                .and_then(|v| v.as_u64())
+                .or(self.num_hidden_layers.map(|l| l as u64))
+                .unwrap_or(4) as u32;
+            let dec_layers = self
+                .extra
+                .get("decoder_layers")
+                .and_then(|v| v.as_u64())
+                .or(self.num_hidden_layers.map(|l| l as u64))
+                .unwrap_or(4) as u32;
+            writer.add_u32("whisper.audio.block_count", enc_layers);
+            writer.add_u32("whisper.text.block_count", dec_layers);
+            writer.add_u32("whisper.audio.layer_count", enc_layers);
+            writer.add_u32("whisper.text.layer_count", dec_layers);
+
+            let num_mel_bins = self
+                .extra
+                .get("num_mel_bins")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80) as u32;
+            writer.add_u32("whisper.audio.num_mel_bins", num_mel_bins);
+            writer.add_u32("whisper.audio.n_mel", num_mel_bins);
+
+            let src_ctx = self
+                .extra
+                .get("max_source_positions")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1500) as u32;
+            let tgt_ctx = self
+                .extra
+                .get("max_target_positions")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(448) as u32;
+            writer.add_u32("whisper.audio.context_length", src_ctx);
+            writer.add_u32("whisper.text.context_length", tgt_ctx);
+            writer.add_u32("whisper.audio.ctx", src_ctx);
+            writer.add_u32("whisper.text.ctx", tgt_ctx);
+
+            if let Some(v) = self.vocab_size {
+                writer.add_u32("whisper.vocab_size", v as u32);
+            }
+            if let Some(bos) = self.bos_token_id {
+                writer.add_u32("tokenizer.ggml.bos_token_id", bos);
+                writer.add_u32("general.bos_token_id", bos);
+            }
+            if let Some(eos) = self.eos_token_id {
+                writer.add_u32("tokenizer.ggml.eos_token_id", eos);
+                writer.add_u32("general.eos_token_id", eos);
+            }
+            if let Some(pad) = self.pad_token_id {
+                writer.add_u32("tokenizer.ggml.padding_token_id", pad);
+                writer.add_u32("general.pad_token_id", pad);
+            }
+            return;
+        }
 
         if let Some(v) = self.vocab_size {
             writer.add_u32(format!("{arch}.vocab_size"), v as u32);

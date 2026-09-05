@@ -1088,6 +1088,49 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Transcribe speech in audio using Whisper or LFM2-Audio ASR.
+    Transcribe {
+        /// Path or catalog alias for the ASR model (e.g. `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `lfm2-audio`, or a path to a `.gguf` file).
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Path to the input WAV audio file.
+        #[arg(short, long)]
+        audio: Option<String>,
+
+        /// Language code (e.g. `en`, `es`, `fr`, `de`, or `auto`). Defaults to auto-detection.
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// Translate speech into English instead of transcribing in source language.
+        #[arg(long)]
+        translate: bool,
+
+        /// Output segment timestamps.
+        #[arg(long)]
+        timestamps: bool,
+
+        /// Maximum new tokens to decode (default: 448).
+        #[arg(long, default_value_t = 448)]
+        max_tokens: usize,
+
+        /// Sampling temperature (0.0 = greedy).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// List available Whisper and Liquid ASR models in the catalog and exit.
+        #[arg(long)]
+        list_models: bool,
+
+        /// Download and cache the specified model without transcribing audio.
+        #[arg(long)]
+        download_model: bool,
+
+        /// Cache directory for downloaded models (defaults to ~/.cache/cera).
+        #[arg(long)]
+        cache_dir: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1877,7 +1920,7 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
                 buf.len()
             );
         }
-        Ok(u16::from_le_bytes(buf[o..end].try_into().unwrap()))
+        Ok(u16::from_le_bytes([buf[o], buf[o + 1]]))
     };
     let read_u32 = |o: usize| -> Result<u32> {
         let end = o.checked_add(4).ok_or_else(|| anyhow!("offset overflow"))?;
@@ -1887,7 +1930,12 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
                 buf.len()
             );
         }
-        Ok(u32::from_le_bytes(buf[o..end].try_into().unwrap()))
+        Ok(u32::from_le_bytes([
+            buf[o],
+            buf[o + 1],
+            buf[o + 2],
+            buf[o + 3],
+        ]))
     };
 
     if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
@@ -1942,6 +1990,9 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
     }
     if channels == 0 {
         bail!("WAV `{path}`: channels=0 in fmt header (must be >= 1)");
+    }
+    if sample_rate == 0 {
+        bail!("WAV `{path}`: sample_rate=0 in fmt header (must be >= 1)");
     }
     if bits != 16 {
         bail!("WAV `{path}`: {bits} bits/sample (expected 16). Re-encode as 16-bit PCM.");
@@ -2018,6 +2069,197 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
 /// have to special-case them.
 fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
     cera::model::audio_encoder::resample_linear(samples, sr_in, sr_out)
+}
+
+enum AsrResolvedModel {
+    Whisper(PathBuf, Option<Arc<cera::gguf::GgufFile>>),
+    Liquid(Box<CeraEngine>),
+}
+
+fn whisper_catalog_cached_path(
+    cache_dir: &Path,
+    entry: &cera::WhisperModelCatalogEntry,
+) -> Option<PathBuf> {
+    let candidates = [
+        cache_dir.join(entry.gguf_filename),
+        cache_dir.join("whisper").join(entry.gguf_filename),
+        cache_dir
+            .join("huggingface.co")
+            .join(entry.gguf_repo)
+            .join("resolve")
+            .join("main")
+            .join(entry.gguf_filename),
+        cache_dir
+            .join("huggingface.co")
+            .join(entry.gguf_repo)
+            .join(entry.gguf_filename),
+        cache_dir
+            .join("huggingface.co")
+            .join(entry.hf_repo)
+            .join("quantized")
+            .join("Q4_K_M")
+            .join("model.gguf"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn print_asr_catalog(cache_dir: &Path) {
+    println!("Available ASR Models in Cera Catalog:");
+    println!("{:-<100}", "");
+    println!(
+        "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
+        "ALIAS", "PARAMETERS", "DISK SIZE", "LANGUAGES", "STATUS", "SOURCE REPO"
+    );
+    println!("{:-<100}", "");
+
+    for entry in cera::WHISPER_CATALOG {
+        let is_cached = whisper_catalog_cached_path(cache_dir, entry).is_some();
+        let status = if is_cached { "[cached]" } else { "-" };
+        println!(
+            "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
+            entry.alias, entry.parameters, entry.disk_size, entry.languages, status, entry.hf_repo
+        );
+    }
+
+    let lfm_cached = cache_dir.join("bundles").join("lfm2-audio").exists()
+        || cache_dir
+            .join("bundles")
+            .join("LiquidAI--LFM2-Audio-1.5B")
+            .exists()
+        || cache_dir
+            .join("huggingface.co")
+            .join("LiquidAI")
+            .join("LFM2-Audio-1.5B")
+            .exists()
+        || cache_dir
+            .join("huggingface.co")
+            .join("LiquidAI")
+            .join("LFM2.5-Audio-1.5B")
+            .exists();
+    let lfm_status = if lfm_cached { "[cached]" } else { "-" };
+    println!(
+        "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
+        "lfm2-audio", "1.5B", "~900 MB", "multilingual", lfm_status, "LiquidAI/LFM2-Audio-1.5B"
+    );
+
+    println!("{:-<100}", "");
+    println!("Examples:");
+    println!("  cera transcribe --model tiny --audio speech.wav");
+    println!("  cera transcribe --model lfm2-audio --audio speech.wav");
+    println!("  cera transcribe --model openai/whisper-tiny --audio speech.wav");
+    println!("  cera transcribe --model tiny --download-model");
+}
+
+fn resolve_asr_model(
+    model_str: &str,
+    cache_dir: &Path,
+    repo: &cera::bundle::BundleRepo,
+    progress: &Arc<CliDownloadProgress>,
+) -> Result<AsrResolvedModel> {
+    // Check if it is a Liquid LFM2-Audio model
+    if model_str.eq_ignore_ascii_case("lfm2-audio")
+        || model_str.eq_ignore_ascii_case("liquid")
+        || model_str.contains("LFM2-Audio")
+    {
+        let bundle_id = if model_str.eq_ignore_ascii_case("lfm2-audio")
+            || model_str.eq_ignore_ascii_case("liquid")
+        {
+            "LiquidAI/LFM2-Audio-1.5B"
+        } else {
+            model_str
+        };
+        eprintln!(
+            "Resolving Liquid LFM2-Audio model `{bundle_id}` into `{}`...",
+            cache_dir.display()
+        );
+        let engine = CeraEngine::from_hf_with_strategy(
+            bundle_id,
+            None,
+            None,
+            EngineConfig {
+                context_size: 2048,
+                backend: BackendPreference::Auto,
+                draft_model: None,
+                bundle_repo: Some(repo.clone()),
+            },
+        )?;
+        progress.finish_line();
+        return Ok(AsrResolvedModel::Liquid(Box::new(engine)));
+    }
+
+    // Check Whisper catalog by alias or repo
+    if let Some(entry) = cera::find_whisper_catalog_entry(model_str) {
+        if let Some(cached) = whisper_catalog_cached_path(cache_dir, entry) {
+            return Ok(AsrResolvedModel::Whisper(cached, None));
+        }
+
+        // If user explicitly specified openai/whisper-*, fall through to streaming conversion
+        if !model_str.starts_with("openai/whisper") {
+            // Cache miss: download from community GGUF repository
+            let url = format!(
+                "https://huggingface.co/{}/resolve/main/{}",
+                entry.gguf_repo, entry.gguf_filename
+            );
+            eprintln!(
+                "Downloading Whisper model `{}` ({} {}) into `{}`...",
+                entry.alias,
+                entry.parameters,
+                entry.disk_size,
+                cache_dir.display()
+            );
+            let downloaded = repo
+                .resolve_url(&url, None)
+                .with_context(|| format!("failed to download Whisper model `{url}`"))?;
+            progress.finish_line();
+            return Ok(AsrResolvedModel::Whisper(downloaded, None));
+        }
+    }
+
+    // Check if user requested streaming official OpenAI SafeTensors
+    if model_str.starts_with("openai/whisper") {
+        eprintln!(
+            "Streaming official OpenAI SafeTensors `{model_str}` and quantizing to GGUF in `{}`...",
+            cache_dir.display()
+        );
+        let spec = cera::bundle::HfSpec::parse(model_str)?;
+        let manifest = cera::convert::stream_quantize_hf_repo(
+            &spec,
+            cera::convert::QuantizeOptions {
+                target_quant: cera::convert::TargetQuant::Q4_K_M,
+                strategy: cera::convert::QuantStrategy::Auto,
+                cache_dir: cache_dir.to_path_buf(),
+                auth_token: cera::bundle::hf::get_hf_auth_token(),
+                progress: Some(progress.clone() as Arc<dyn cera::bundle::DownloadProgress>),
+                cancel: None,
+            },
+        )?;
+        progress.finish_line();
+        return Ok(AsrResolvedModel::Whisper(
+            PathBuf::from(manifest.files.model),
+            None,
+        ));
+    }
+
+    // Check if user specified a local file path
+    let path = Path::new(model_str);
+    if path.exists() {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            let gguf = Arc::new(cera::gguf::GgufFile::open(path)?);
+            if cera::is_whisper_gguf(&gguf) {
+                return Ok(AsrResolvedModel::Whisper(path.to_path_buf(), Some(gguf)));
+            }
+        }
+        let engine = CeraEngine::from_path(path, EngineConfig::default())?;
+        return Ok(AsrResolvedModel::Liquid(Box::new(engine)));
+    }
+
+    anyhow::bail!(
+        "model `{model_str}` not found locally and not in Whisper/Liquid catalog. \
+         Run `cera transcribe --list-models` to see available models."
+    )
 }
 
 /// Pick a vocab-resident special token to use as the audio
@@ -3499,6 +3741,153 @@ fn main() -> Result<()> {
                         ts.start_sample,
                         ts.end_sample
                     );
+                }
+            }
+        }
+        Command::Transcribe {
+            model,
+            audio,
+            language,
+            translate,
+            timestamps,
+            max_tokens,
+            temperature,
+            list_models,
+            download_model,
+            cache_dir,
+        } => {
+            let cache_path = cache_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(default_cache_dir);
+
+            if list_models {
+                print_asr_catalog(&cache_path);
+                return Ok(());
+            }
+
+            if !temperature.is_finite() || temperature < 0.0 {
+                anyhow::bail!(
+                    "--temperature must be a finite non-negative number, got {temperature}"
+                );
+            }
+
+            let model_str = model.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing required argument `--model <ALIAS_OR_PATH>` (or run `cera transcribe --list-models` to view catalog)"
+                )
+            })?;
+
+            if !download_model && audio.is_none() {
+                anyhow::bail!(
+                    "missing required argument `--audio <PATH_TO_WAV>` (or use `--download-model` to download weights without transcribing)"
+                );
+            }
+
+            let progress = Arc::new(CliDownloadProgress::default());
+            let repo = cera::bundle::BundleRepo::with_progress(
+                &cache_path,
+                progress.clone() as Arc<dyn cera::bundle::DownloadProgress>,
+            );
+
+            let resolved = resolve_asr_model(&model_str, &cache_path, &repo, &progress)?;
+
+            if download_model {
+                match resolved {
+                    AsrResolvedModel::Whisper(p, _) => {
+                        println!("Whisper model is cached and ready: {}", p.display());
+                    }
+                    AsrResolvedModel::Liquid(_) => {
+                        println!(
+                            "Liquid model is cached and ready in {}",
+                            cache_path.display()
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
+            let audio_path = audio.ok_or_else(|| {
+                anyhow::anyhow!("missing required argument `--audio <PATH_TO_WAV>`")
+            })?;
+
+            let (pcm_in, sr_in) = read_wav_pcm16_mono(&audio_path)?;
+            anyhow::ensure!(sr_in > 0, "sample rate must be > 0 in WAV file");
+            anyhow::ensure!(
+                (1000..=192_000).contains(&sr_in),
+                "unsupported sample rate {sr_in} Hz; expected 1000..=192000 Hz"
+            );
+            const TARGET_SR: u32 = 16_000;
+            let (pcm, _sr) = if sr_in == TARGET_SR {
+                (pcm_in, sr_in)
+            } else {
+                eprintln!(
+                    "note: resampling {sr_in} Hz -> {TARGET_SR} Hz \
+                     ({} -> {} samples, linear interpolation). \
+                     For best quality pass 16 kHz mono WAV directly.",
+                    pcm_in.len(),
+                    (pcm_in.len() as f64 * TARGET_SR as f64 / sr_in as f64) as usize
+                );
+                let resampled = resample_linear(&pcm_in, sr_in, TARGET_SR);
+                (resampled, TARGET_SR)
+            };
+
+            match resolved {
+                AsrResolvedModel::Whisper(gguf_path, cached_gguf) => {
+                    if pcm.len() > 30 * TARGET_SR as usize {
+                        eprintln!(
+                            "cera: warning: audio duration ({:.1}s) exceeds the standard 30s Whisper window; audio will be truncated to the first 30 seconds",
+                            pcm.len() as f64 / TARGET_SR as f64
+                        );
+                    }
+                    let gguf = match cached_gguf {
+                        Some(g) => g,
+                        None => Arc::new(cera::gguf::GgufFile::open(&gguf_path)?),
+                    };
+                    let tokenizer = BpeTokenizer::from_gguf(&gguf).context(
+                        "failed to parse tokenizer from Whisper GGUF; ensure tokenizer.ggml.tokens metadata is present",
+                    )?;
+                    let whisper = cera::WhisperModel::from_gguf(&gguf, Some(&tokenizer))?;
+
+                    let opts = cera::WhisperTranscribeOpts {
+                        language,
+                        translate,
+                        timestamps,
+                        max_tokens,
+                        temperature,
+                        cancel: None,
+                    };
+
+                    let text = whisper.transcribe(&tokenizer, &pcm, &opts)?;
+                    println!("{text}");
+                }
+                AsrResolvedModel::Liquid(engine) => {
+                    if translate {
+                        eprintln!(
+                            "cera: warning: --translate is not supported for Liquid ASR models; transcribing as-is"
+                        );
+                    }
+                    if timestamps {
+                        eprintln!(
+                            "cera: warning: --timestamps is not supported for Liquid ASR models"
+                        );
+                    }
+                    if let Some(ref l) = language {
+                        eprintln!(
+                            "cera: warning: explicit --language ({l}) is not supported for Liquid ASR models; language is auto-detected"
+                        );
+                    }
+                    if max_tokens != 448 {
+                        eprintln!(
+                            "cera: warning: --max-tokens is not supported for Liquid ASR models"
+                        );
+                    }
+                    if temperature > 0.0 {
+                        eprintln!(
+                            "cera: warning: --temperature is not supported for Liquid ASR models"
+                        );
+                    }
+                    let text = engine.transcribe(&pcm, TARGET_SR)?;
+                    println!("{text}");
                 }
             }
         }
@@ -5886,6 +6275,79 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Vad command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_command_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "transcribe",
+            "--model",
+            "models/whisper_base.gguf",
+            "--audio",
+            "test.wav",
+            "--language",
+            "es",
+            "--translate",
+            "--timestamps",
+            "--max-tokens",
+            "128",
+            "--temperature",
+            "0.2",
+        ])
+        .expect("transcribe subcommand should parse");
+
+        match cli.command {
+            Command::Transcribe {
+                model,
+                audio,
+                language,
+                translate,
+                timestamps,
+                max_tokens,
+                temperature,
+                list_models,
+                download_model,
+                cache_dir,
+            } => {
+                assert_eq!(model.as_deref(), Some("models/whisper_base.gguf"));
+                assert_eq!(audio.as_deref(), Some("test.wav"));
+                assert_eq!(language.as_deref(), Some("es"));
+                assert!(translate);
+                assert!(timestamps);
+                assert_eq!(max_tokens, 128);
+                assert!((temperature - 0.2).abs() < 1e-6);
+                assert!(!list_models);
+                assert!(!download_model);
+                assert!(cache_dir.is_none());
+            }
+            _ => panic!("expected Transcribe command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_command_parses_catalog_flags() {
+        let cli = Cli::try_parse_from(["cera", "transcribe", "--list-models"])
+            .expect("transcribe --list-models should parse");
+        match cli.command {
+            Command::Transcribe { list_models, .. } => assert!(list_models),
+            _ => panic!("expected Transcribe command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["cera", "transcribe", "--model", "tiny", "--download-model"])
+                .expect("transcribe --download-model should parse");
+        match cli.command {
+            Command::Transcribe {
+                model,
+                download_model,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("tiny"));
+                assert!(download_model);
+            }
+            _ => panic!("expected Transcribe command"),
         }
     }
 

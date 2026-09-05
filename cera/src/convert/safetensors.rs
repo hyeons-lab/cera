@@ -123,6 +123,38 @@ impl SafeTensorsHeader {
     }
 }
 
+fn map_whisper_block_sub(sub: &str) -> &str {
+    match sub {
+        "self_attn.q_proj.weight" => "attn.query.weight",
+        "self_attn.q_proj.bias" => "attn.query.bias",
+        "self_attn.k_proj.weight" => "attn.key.weight",
+        "self_attn.k_proj.bias" => "attn.key.bias",
+        "self_attn.v_proj.weight" => "attn.value.weight",
+        "self_attn.v_proj.bias" => "attn.value.bias",
+        "self_attn.out_proj.weight" => "attn.out.weight",
+        "self_attn.out_proj.bias" => "attn.out.bias",
+        "self_attn_layer_norm.weight" => "attn_ln.weight",
+        "self_attn_layer_norm.bias" => "attn_ln.bias",
+        "encoder_attn.q_proj.weight" => "cross_attn.query.weight",
+        "encoder_attn.q_proj.bias" => "cross_attn.query.bias",
+        "encoder_attn.k_proj.weight" => "cross_attn.key.weight",
+        "encoder_attn.k_proj.bias" => "cross_attn.key.bias",
+        "encoder_attn.v_proj.weight" => "cross_attn.value.weight",
+        "encoder_attn.v_proj.bias" => "cross_attn.value.bias",
+        "encoder_attn.out_proj.weight" => "cross_attn.out.weight",
+        "encoder_attn.out_proj.bias" => "cross_attn.out.bias",
+        "encoder_attn_layer_norm.weight" => "cross_attn_ln.weight",
+        "encoder_attn_layer_norm.bias" => "cross_attn_ln.bias",
+        "fc1.weight" => "mlp.0.weight",
+        "fc1.bias" => "mlp.0.bias",
+        "fc2.weight" => "mlp.2.weight",
+        "fc2.bias" => "mlp.2.bias",
+        "final_layer_norm.weight" => "mlp_ln.weight",
+        "final_layer_norm.bias" => "mlp_ln.bias",
+        _ => sub,
+    }
+}
+
 /// Translate Hugging Face standard tensor names to standard GGUF tensor names.
 pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
     // Direct global mappings
@@ -138,8 +170,65 @@ pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
     {
         return "output_norm.weight".to_string();
     }
-    if hf_name == "lm_head.weight" {
+    if hf_name == "lm_head.weight" || hf_name == "proj_out.weight" {
         return "output.weight".to_string();
+    }
+
+    // Whisper encoder mappings
+    if let Some(rest) = hf_name
+        .strip_prefix("model.encoder.")
+        .or_else(|| hf_name.strip_prefix("encoder."))
+    {
+        match rest {
+            "conv1.weight" => return "encoder.conv1.weight".to_string(),
+            "conv1.bias" => return "encoder.conv1.bias".to_string(),
+            "conv2.weight" => return "encoder.conv2.weight".to_string(),
+            "conv2.bias" => return "encoder.conv2.bias".to_string(),
+            "embed_positions.weight" | "positional_embedding" => {
+                return "encoder.positional_embedding".to_string();
+            }
+            "layer_norm.weight" | "ln_post.weight" => {
+                return "encoder.ln_post.weight".to_string();
+            }
+            "layer_norm.bias" | "ln_post.bias" => {
+                return "encoder.ln_post.bias".to_string();
+            }
+            _ => {}
+        }
+        if let Some(stripped) = rest.strip_prefix("layers.")
+            && let Some((idx, sub)) = stripped.split_once('.')
+        {
+            let suffix = map_whisper_block_sub(sub);
+            return format!("encoder.blocks.{idx}.{suffix}");
+        }
+    }
+
+    // Whisper decoder mappings
+    if let Some(rest) = hf_name
+        .strip_prefix("model.decoder.")
+        .or_else(|| hf_name.strip_prefix("decoder."))
+    {
+        match rest {
+            "embed_tokens.weight" | "token_embeddings.weight" => {
+                return "decoder.token_embeddings.weight".to_string();
+            }
+            "embed_positions.weight" | "positional_embedding" => {
+                return "decoder.positional_embedding".to_string();
+            }
+            "layer_norm.weight" | "ln.weight" | "ln_post.weight" => {
+                return "decoder.ln_post.weight".to_string();
+            }
+            "layer_norm.bias" | "ln.bias" | "ln_post.bias" => {
+                return "decoder.ln_post.bias".to_string();
+            }
+            _ => {}
+        }
+        if let Some(stripped) = rest.strip_prefix("layers.")
+            && let Some((idx, sub)) = stripped.split_once('.')
+        {
+            let suffix = map_whisper_block_sub(sub);
+            return format!("decoder.blocks.{idx}.{suffix}");
+        }
     }
 
     // Layer-level mappings
@@ -319,6 +408,32 @@ mod tests {
         assert_eq!(
             translate_hf_to_gguf_tensor_name("model.layers.15.mlp.down_proj.weight"),
             "blk.15.ffn_down.weight"
+        );
+
+        // Whisper mappings
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("model.encoder.conv1.weight"),
+            "encoder.conv1.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("model.encoder.layers.2.self_attn.k_proj.weight"),
+            "encoder.blocks.2.attn.key.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("model.decoder.layers.3.encoder_attn.q_proj.weight"),
+            "decoder.blocks.3.cross_attn.query.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("model.decoder.embed_tokens.weight"),
+            "decoder.token_embeddings.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("proj_out.weight"),
+            "output.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name("model.decoder.layer_norm.weight"),
+            "decoder.ln_post.weight"
         );
     }
 }
