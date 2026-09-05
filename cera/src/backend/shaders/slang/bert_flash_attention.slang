@@ -69,24 +69,20 @@ void bert_flash_attention(
         acc[d] = 0.0f;
     }
 
-    // Determine key range for sliding window if active
-    uint k_start_token = 0u;
-    uint k_end_token = tokens;
-    if (window_size > 0u && valid_q) {
-        k_start_token = (q_idx > half_window) ? (q_idx - half_window) : 0u;
-        k_end_token = min(tokens, q_idx + half_window + 1u);
-    }
+    // Compute uniform workgroup query boundaries for safe cooperative skipping
+    uint wg_q_min = wid.x * Q_TILE;
+    uint wg_q_max = min(tokens, wg_q_min + Q_TILE);
+    uint wg_k_start = (window_size > 0u && wg_q_min > half_window) ? (wg_q_min - half_window) : 0u;
+    uint wg_k_end = (window_size > 0u) ? min(tokens, wg_q_max + half_window) : tokens;
 
     // Loop over Key/Value blocks
     uint num_k_tiles = (tokens + K_TILE - 1u) / K_TILE;
     for (uint kt = 0u; kt < num_k_tiles; kt++) {
         uint k_base = kt * K_TILE;
 
-        // Skip entire key tile if outside sliding window bounds
-        if (window_size > 0u) {
-            if (k_base + K_TILE <= k_start_token || k_base >= k_end_token) {
-                continue;
-            }
+        // Uniform workgroup skip: only skip if ALL threads in the workgroup are out of range
+        if (window_size > 0u && (k_base + K_TILE <= wg_k_start || k_base >= wg_k_end)) {
+            continue;
         }
 
         // Cooperatively load K and V blocks into shared memory

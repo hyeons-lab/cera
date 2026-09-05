@@ -5,7 +5,7 @@
 //! 2. `DynamicSpanHead`: Vectorized GLiNER span representations with runtime label cross-attention.
 //! 3. `SlidingWindowScanner`: 1024-token stride windowing with greedy non-maximum suppression (NMS).
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 #[cfg(has_blas)]
 use crate::backend::blas;
@@ -35,6 +35,9 @@ pub fn matmul_nt_f32(
     assert_eq!(a.len(), m * k, "A dimension mismatch");
     assert_eq!(b.len(), n * k, "B dimension mismatch");
     assert_eq!(c.len(), m * n, "C dimension mismatch");
+    if let Some(bias_vec) = bias {
+        assert_eq!(bias_vec.len(), n, "Bias dimension mismatch");
+    }
 
     #[cfg(has_blas)]
     {
@@ -220,69 +223,80 @@ impl DynamicSpanHeadWeights {
             return Vec::new();
         }
 
-        // 1. Construct span feature vectors: [h_start, h_end, h_end - h_start, size_emb]
-        let mut span_features = vec![0.0f32; n_spans * span_in_dim];
-        for (i, cs) in candidates.iter().enumerate() {
-            let out_slice = &mut span_features[i * span_in_dim..(i + 1) * span_in_dim];
-            let h_start = &hidden_states[cs.start * d..(cs.start + 1) * d];
-            let h_end = &hidden_states[cs.end * d..(cs.end + 1) * d];
-
-            out_slice[..d].copy_from_slice(h_start);
-            out_slice[d..2 * d].copy_from_slice(h_end);
-            let diff_slice = &mut out_slice[2 * d..3 * d];
-            for j in 0..d {
-                diff_slice[j] = h_end[j] - h_start[j];
-            }
-            let size_idx = cs.length.min(self.max_span_length);
-            let size_emb = &self.span_size_embedding[size_idx * s_dim..(size_idx + 1) * s_dim];
-            out_slice[3 * d..span_in_dim].copy_from_slice(size_emb);
-        }
-
-        // 2. Project spans: MLP 1 [n_spans, span_in_dim] * [d, span_in_dim]^T -> [n_spans, d]
-        let mut h_proj = vec![0.0f32; n_spans * d];
-        matmul_nt_f32(
-            n_spans,
-            d,
-            span_in_dim,
-            &span_features,
-            &self.proj1_weight,
-            Some(&self.proj1_bias),
-            &mut h_proj,
-        );
-        cpu::gelu_inplace(&mut h_proj);
-
-        // 3. Project spans: MLP 2 [n_spans, d] * [d, d]^T -> [n_spans, d]
-        let mut p_spans = vec![0.0f32; n_spans * d];
-        matmul_nt_f32(
-            n_spans,
-            d,
-            d,
-            &h_proj,
-            &self.proj2_weight,
-            Some(&self.proj2_bias),
-            &mut p_spans,
-        );
-
-        // 4. Dot product cross-attention scoring: [n_spans, d] * [n_labels, d]^T -> [n_spans, n_labels]
-        let mut scores = vec![0.0f32; n_spans * n_labels];
-        matmul_nt_f32(
-            n_spans,
-            n_labels,
-            d,
-            &p_spans,
-            projected_labels,
-            None,
-            &mut scores,
-        );
-
-        // 5. Apply sigmoid and collect thresholded candidates
         let mut detections = Vec::new();
-        for (i, &cs) in candidates.iter().enumerate() {
-            let row = &scores[i * n_labels..(i + 1) * n_labels];
-            for (l_idx, &raw_score) in row.iter().enumerate() {
-                let prob = 1.0 / (1.0 + (-raw_score).exp());
-                if prob >= self.span_threshold {
-                    detections.push((cs, l_idx, prob));
+        const CHUNK_SIZE: usize = 1024;
+        let mut chunk_features = vec![0.0f32; CHUNK_SIZE * span_in_dim];
+        let mut chunk_h_proj = vec![0.0f32; CHUNK_SIZE * d];
+        let mut chunk_p_spans = vec![0.0f32; CHUNK_SIZE * d];
+        let mut chunk_scores = vec![0.0f32; CHUNK_SIZE * n_labels];
+
+        // Process candidate spans in bounded chunks to prevent large transient heap spikes
+        for chunk in candidates.chunks(CHUNK_SIZE) {
+            let n_chunk = chunk.len();
+            let feat_slice = &mut chunk_features[..n_chunk * span_in_dim];
+            for (i, cs) in chunk.iter().enumerate() {
+                let out_slice = &mut feat_slice[i * span_in_dim..(i + 1) * span_in_dim];
+                let h_start = &hidden_states[cs.start * d..(cs.start + 1) * d];
+                let h_end = &hidden_states[cs.end * d..(cs.end + 1) * d];
+
+                out_slice[..d].copy_from_slice(h_start);
+                out_slice[d..2 * d].copy_from_slice(h_end);
+                let diff_slice = &mut out_slice[2 * d..3 * d];
+                for j in 0..d {
+                    diff_slice[j] = h_end[j] - h_start[j];
+                }
+                let size_idx = cs.length.min(self.max_span_length);
+                let size_emb = &self.span_size_embedding[size_idx * s_dim..(size_idx + 1) * s_dim];
+                out_slice[3 * d..span_in_dim].copy_from_slice(size_emb);
+            }
+
+            // 1. Project spans: MLP 1 [n_chunk, span_in_dim] * [d, span_in_dim]^T -> [n_chunk, d]
+            let h_proj_slice = &mut chunk_h_proj[..n_chunk * d];
+            matmul_nt_f32(
+                n_chunk,
+                d,
+                span_in_dim,
+                feat_slice,
+                &self.proj1_weight,
+                Some(&self.proj1_bias),
+                h_proj_slice,
+            );
+            cpu::gelu_inplace(h_proj_slice);
+
+            // 2. Project spans: MLP 2 [n_chunk, d] * [d, d]^T -> [n_chunk, d]
+            let p_spans_slice = &mut chunk_p_spans[..n_chunk * d];
+            matmul_nt_f32(
+                n_chunk,
+                d,
+                d,
+                h_proj_slice,
+                &self.proj2_weight,
+                Some(&self.proj2_bias),
+                p_spans_slice,
+            );
+
+            // 3. Dot product cross-attention scoring: [n_chunk, d] * [n_labels, d]^T -> [n_chunk, n_labels]
+            let scores_slice = &mut chunk_scores[..n_chunk * n_labels];
+            matmul_nt_f32(
+                n_chunk,
+                n_labels,
+                d,
+                p_spans_slice,
+                projected_labels,
+                None,
+                scores_slice,
+            );
+
+            // 4. Apply sigmoid and collect thresholded candidates
+            for (i, &cs) in chunk.iter().enumerate() {
+                for (l_idx, &raw_score) in scores_slice[i * n_labels..(i + 1) * n_labels]
+                    .iter()
+                    .enumerate()
+                {
+                    let prob = 1.0 / (1.0 + (-raw_score).exp());
+                    if prob >= self.span_threshold {
+                        detections.push((cs, l_idx, prob));
+                    }
                 }
             }
         }
@@ -347,9 +361,25 @@ impl HybridPiiModel {
         let sens_cls_b = gguf
             .get_tensor("sensitivity_head.classifier.bias")
             .context("missing sensitivity_head.classifier.bias")?
-            .to_f32_vec()[0];
+            .to_f32_vec()
+            .first()
+            .copied()
+            .context("empty sensitivity_head.classifier.bias")?;
 
+        ensure!(hidden_dim > 0, "hidden_dim must be positive");
+        ensure!(
+            sens_dense_w.len() % hidden_dim == 0,
+            "sens_dense_w shape mismatch"
+        );
         let intermediate_dim = sens_dense_w.len() / hidden_dim;
+        ensure!(
+            sens_dense_b.len() == intermediate_dim,
+            "sens_dense_b length mismatch"
+        );
+        ensure!(
+            sens_cls_w.len() == intermediate_dim,
+            "sens_cls_w length mismatch"
+        );
         let gate_threshold = gguf.get_f32("hybrid_pii.gate_threshold").unwrap_or(0.05);
 
         let sensitivity_head = SensitivityHeadWeights {
@@ -370,7 +400,12 @@ impl HybridPiiModel {
             .get_tensor("span_head.span_size_embedding.weight")
             .context("missing span_head.span_size_embedding.weight")?
             .to_f32_vec();
+        ensure!(
+            span_size_emb.len() % (max_span_length + 1) == 0,
+            "span_size_embedding shape mismatch"
+        );
         let size_dim = span_size_emb.len() / (max_span_length + 1);
+        let span_in_dim = 3 * hidden_dim + size_dim;
 
         let proj1_w = gguf
             .get_tensor("span_head.span_projector.0.weight")
@@ -397,6 +432,25 @@ impl HybridPiiModel {
             .get_tensor("span_head.label_projector.bias")
             .context("missing span_head.label_projector.bias")?
             .to_f32_vec();
+
+        ensure!(
+            proj1_w.len() == hidden_dim * span_in_dim,
+            "proj1_w dimension mismatch"
+        );
+        ensure!(proj1_b.len() == hidden_dim, "proj1_b dimension mismatch");
+        ensure!(
+            proj2_w.len() == hidden_dim * hidden_dim,
+            "proj2_w dimension mismatch"
+        );
+        ensure!(proj2_b.len() == hidden_dim, "proj2_b dimension mismatch");
+        ensure!(
+            label_proj_w.len() == hidden_dim * hidden_dim,
+            "label_proj_w dimension mismatch"
+        );
+        ensure!(
+            label_proj_b.len() == hidden_dim,
+            "label_proj_b dimension mismatch"
+        );
 
         let span_head = DynamicSpanHeadWeights {
             hidden_dim,
@@ -431,7 +485,14 @@ impl HybridPiiModel {
         // Project label queries (if pre-embedded labels exist in GGUF)
         let projected_labels = if let Ok(t) = gguf.get_tensor("hybrid_pii.label_embeddings") {
             let embs = t.to_f32_vec();
-            span_head.project_labels(&embs, labels.len())
+            if embs.len() == labels.len() * hidden_dim {
+                span_head.project_labels(&embs, labels.len())
+            } else {
+                tracing::warn!(
+                    "hybrid_pii.label_embeddings size mismatch, falling back to zero embeddings"
+                );
+                vec![0.0f32; labels.len() * hidden_dim]
+            }
         } else {
             vec![0.0f32; labels.len() * hidden_dim]
         };
@@ -470,6 +531,8 @@ impl SlidingWindowScanner {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let stride = self.stride.max(1);
+        let window_size = self.window_size.max(1);
 
         let (tokens, offsets) = self.tokenizer.encode_with_offsets(text);
         if tokens.is_empty() {
@@ -483,7 +546,7 @@ impl SlidingWindowScanner {
         // Process overlapping sliding windows
         let mut win_start = 0;
         while win_start < n_tokens {
-            let win_end = (win_start + self.window_size).min(n_tokens);
+            let win_end = (win_start + window_size).min(n_tokens);
             let win_tokens = &tokens[win_start..win_end];
             let win_len = win_tokens.len();
 
@@ -513,8 +576,9 @@ impl SlidingWindowScanner {
                     let byte_start = off_start.byte_start;
                     let byte_end = off_end.byte_end;
 
-                    if byte_start < byte_end && byte_end <= text.len() {
-                        let span_text = &text[byte_start..byte_end];
+                    if byte_start < byte_end
+                        && let Some(span_text) = text.get(byte_start..byte_end)
+                    {
                         raw_candidates.push(DetectedEntity {
                             label: self.model.labels[l_idx].clone(),
                             score,
@@ -533,7 +597,7 @@ impl SlidingWindowScanner {
             if win_end == n_tokens {
                 break;
             }
-            win_start += self.stride;
+            win_start += stride;
         }
 
         // 4. Greedy Non-Maximum Suppression (NMS)
@@ -729,10 +793,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a real GGUF via HYBRID_PII_ADAPTER_GGUF; run with --ignored"]
     fn test_load_hybrid_pii_adapter_gguf() {
-        let adapter_path = "/Users/dberrios/development/hybrid-pii-modernbert-classifier/checkpoints/modernbert_pii_adapter.gguf";
-        let path = std::path::Path::new(adapter_path);
-        if !path.exists() {
+        let Some(adapter_path) = std::env::var_os("HYBRID_PII_ADAPTER_GGUF") else {
+            return;
+        };
+        let path = std::path::Path::new(&adapter_path);
+        if !path.is_file() {
             return;
         }
         let gguf = GgufFile::open(path).expect("failed to open GGUF adapter");
@@ -758,5 +825,22 @@ mod tests {
             .get_tensor("span_head.span_size_embedding.weight")
             .expect("missing size_emb");
         assert_eq!(span_emb.shape(), &[64, 25]);
+    }
+
+    #[test]
+    fn test_multibyte_utf8_slicing_safety() {
+        let text = "User 🦀 alice@example.com reported issue in 東京";
+        // Emoji '🦀' is 4 bytes: [5..9]
+        // Byte 6 is inside the emoji codepoint
+        assert!(!text.is_char_boundary(6));
+        assert!(text.get(5..6).is_none());
+        assert!(text.get(5..9).is_some());
+        assert_eq!(text.get(5..9).unwrap(), "🦀");
+
+        // Unaligned byte slice must safely return None rather than panicking
+        let unaligned_start = 6;
+        let unaligned_end = 12;
+        let span_opt = text.get(unaligned_start..unaligned_end);
+        assert!(span_opt.is_none());
     }
 }

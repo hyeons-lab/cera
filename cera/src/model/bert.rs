@@ -326,7 +326,9 @@ impl Model for BertModel {
 
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
         let n_tokens = tokens.len();
-        assert!(n_tokens > 0, "hidden_states requires at least one token");
+        if n_tokens == 0 {
+            return Vec::new();
+        }
         let d = self.config.hidden_size;
         let n_heads = self.config.n_heads;
         let head_dim = self.head_dim;
@@ -360,8 +362,17 @@ impl Model for BertModel {
         let mut v_mat = vec![0.0f32; n_tokens * d];
         let mut attn_out = vec![0.0f32; n_tokens * d];
 
+        let mut norm_x = vec![0.0f32; n_tokens * d];
+        let mut ffn_norm_x = vec![0.0f32; n_tokens * d];
+        let mut proj_out = vec![0.0f32; d];
+        let inter = self.config.intermediate_size;
+        let mut up_row = vec![0.0f32; inter];
+        let mut gate_row = vec![0.0f32; inter];
+        let mut down_row = vec![0.0f32; d];
+        let mut scores = vec![f32::NEG_INFINITY; n_tokens];
+
         for layer in &self.layer_refs {
-            let mut norm_x = x.clone();
+            norm_x.copy_from_slice(&x);
 
             // Pre-LN for ModernBERT; for Classic BERT, normalization is post-residual
             if self.is_modernbert {
@@ -420,7 +431,7 @@ impl Model for BertModel {
                     let q_vec = &q_mat[q_idx * d + h * head_dim..q_idx * d + (h + 1) * head_dim];
 
                     // Compute dot product scores with keys
-                    let mut scores = vec![f32::NEG_INFINITY; n_tokens];
+                    scores.fill(f32::NEG_INFINITY);
                     let mut max_score = f32::NEG_INFINITY;
 
                     for k_idx in 0..n_tokens {
@@ -432,11 +443,7 @@ impl Model for BertModel {
                         }
                         let k_vec =
                             &k_mat[k_idx * d + h * head_dim..k_idx * d + (h + 1) * head_dim];
-                        let mut dot = 0.0f32;
-                        for dim_idx in 0..head_dim {
-                            dot += q_vec[dim_idx] * k_vec[dim_idx];
-                        }
-                        let s = dot * scale;
+                        let s = cpu::dot_f32(q_vec, k_vec) * scale;
                         scores[k_idx] = s;
                         if s > max_score {
                             max_score = s;
@@ -473,7 +480,6 @@ impl Model for BertModel {
             }
 
             // Attention Output Projection & Residual
-            let mut proj_out = vec![0.0f32; d];
             for i in 0..n_tokens {
                 let row = &attn_out[i * d..(i + 1) * d];
                 transformer::gemv(&self.gguf, &layer.attn_output, row, &mut proj_out);
@@ -496,7 +502,7 @@ impl Model for BertModel {
             }
 
             // Feed-Forward Network (FFN)
-            let mut ffn_norm_x = x.clone();
+            ffn_norm_x.copy_from_slice(&x);
             if self.is_modernbert {
                 for i in 0..n_tokens {
                     cpu::rmsnorm(
@@ -509,11 +515,6 @@ impl Model for BertModel {
 
             if let Some(ref gate_ref) = layer.ffn_gate {
                 // ModernBERT GeGLU path: ffn_down(gelu(ffn_gate(x)) * ffn_up(x))
-                let inter = self.config.intermediate_size;
-                let mut up_row = vec![0.0f32; inter];
-                let mut gate_row = vec![0.0f32; inter];
-                let mut down_row = vec![0.0f32; d];
-
                 for i in 0..n_tokens {
                     let row = &ffn_norm_x[i * d..(i + 1) * d];
                     transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut up_row);
@@ -527,10 +528,6 @@ impl Model for BertModel {
                 }
             } else {
                 // Classic BERT MLP path: ffn_down(gelu(ffn_up(x) + bias)) + bias
-                let inter = self.config.intermediate_size;
-                let mut up_row = vec![0.0f32; inter];
-                let mut down_row = vec![0.0f32; d];
-
                 for i in 0..n_tokens {
                     let row = &x[i * d..(i + 1) * d];
                     transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut up_row);
@@ -573,7 +570,8 @@ impl Model for BertModel {
     }
 
     fn forward(&self, _tokens: &[u32], _pos: usize, _state: &mut InferenceState) -> Vec<f32> {
-        panic!("BertModel is an encoder-only model; use hidden_states(&tokens, &mut state)");
+        tracing::warn!("BertModel is an encoder-only model; forward() returning empty logits");
+        Vec::new()
     }
 }
 

@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 107 "cera/src/backend/shaders/slang/bert_flash_attention.slang"
+#line 103 "cera/src/backend/shaders/slang/bert_flash_attention.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;
@@ -65,7 +65,10 @@ struct KernelContext_0
     uint h_0 = wid_0.y;
     uint dim_0 = _S1.y * head_dim_0;
 
-    uint q_idx_0 = wid_0.x * 64U + tid_0;
+    uint _S3 = wid_0.x * 64U;
+
+#line 48
+    uint q_idx_0 = _S3 + tid_0;
     bool valid_q_0 = q_idx_0 < tokens_0;
 
 
@@ -77,7 +80,7 @@ struct KernelContext_0
     {
 
 #line 54
-        uint _S3 = q_idx_0 * dim_0 + h_0 * head_dim_0;
+        uint _S4 = q_idx_0 * dim_0 + h_0 * head_dim_0;
 
 #line 54
         d_0 = 0U;
@@ -96,7 +99,7 @@ struct KernelContext_0
             }
 
 #line 56
-            q_reg_0[d_0] = (&kernelContext_0)->q_buf_0[_S3 + d_0];
+            q_reg_0[d_0] = (&kernelContext_0)->q_buf_0[_S4 + d_0];
 
 #line 55
             d_0 = d_0 + 1U;
@@ -167,18 +170,19 @@ struct KernelContext_0
 #line 68
     }
 
-#line 75
-    bool _S4 = window_size_0 > 0U;
+#line 74
+    uint _S5 = min(tokens_0, _S3 + 64U);
+    bool _S6 = window_size_0 > 0U;
 
 #line 75
-    bool _S5;
+    bool _S7;
 
 #line 75
-    if(_S4)
+    if(_S6)
     {
 
 #line 75
-        _S5 = valid_q_0;
+        _S7 = _S3 > half_window_0;
 
 #line 75
     }
@@ -186,45 +190,17 @@ struct KernelContext_0
     {
 
 #line 75
-        _S5 = false;
+        _S7 = false;
 
 #line 75
     }
 
 #line 75
-    uint k_start_token_0;
-
-#line 75
-    uint k_end_token_0;
-
-#line 75
-    if(_S5)
+    if(_S7)
     {
 
-#line 76
-        if(q_idx_0 > half_window_0)
-        {
-
-#line 76
-            d_0 = q_idx_0 - half_window_0;
-
-#line 76
-        }
-        else
-        {
-
-#line 76
-            d_0 = 0U;
-
-#line 76
-        }
-        uint _S6 = min(tokens_0, q_idx_0 + half_window_0 + 1U);
-
-#line 77
-        k_start_token_0 = d_0;
-
-#line 77
-        k_end_token_0 = _S6;
+#line 75
+        d_0 = _S3 - half_window_0;
 
 #line 75
     }
@@ -232,122 +208,146 @@ struct KernelContext_0
     {
 
 #line 75
-        k_start_token_0 = 0U;
-
-#line 75
-        k_end_token_0 = tokens_0;
+        d_0 = 0U;
 
 #line 75
     }
 
-#line 81
-    uint _S7 = (tokens_0 + 32U - 1U) / 32U;
+#line 75
+    uint _S8;
+    if(_S6)
+    {
 
-#line 81
+#line 76
+        _S8 = min(tokens_0, _S5 + half_window_0);
+
+#line 76
+    }
+    else
+    {
+
+#line 76
+        _S8 = tokens_0;
+
+#line 76
+    }
+
+
+    uint _S9 = (tokens_0 + 32U - 1U) / 32U;
+
+#line 79
     float m_prev_0 = -3.4028234663852886e+38f;
 
-#line 81
+#line 79
     float l_prev_0 = 0.0f;
 
-#line 81
+#line 79
     uint kt_0 = 0U;
     for(;;)
     {
 
-#line 82
-        if(kt_0 < _S7)
+#line 80
+        if(kt_0 < _S9)
         {
         }
         else
         {
 
-#line 82
+#line 80
             break;
         }
 
-#line 83
+#line 81
         uint k_base_0 = kt_0 * 32U;
 
-#line 83
-        float m_prev_1;
 
-#line 83
-        float l_prev_1;
-
-
-        if(_S4)
+        if(_S6)
         {
 
-#line 87
-            if((k_base_0 + 32U) <= k_start_token_0)
+#line 84
+            if((k_base_0 + 32U) <= d_0)
             {
 
-#line 87
-                _S5 = true;
+#line 84
+                _S7 = true;
 
-#line 87
+#line 84
             }
             else
             {
 
-#line 87
-                _S5 = k_base_0 >= k_end_token_0;
+#line 84
+                _S7 = k_base_0 >= _S8;
 
-#line 87
+#line 84
             }
 
-#line 87
-            if(_S5)
-            {
+#line 84
+        }
+        else
+        {
 
-#line 87
-                m_prev_1 = m_prev_0;
+#line 84
+            _S7 = false;
 
-#line 87
-                l_prev_1 = l_prev_0;
-
-#line 82
-                uint _S8 = kt_0 + 1U;
-
-#line 82
-                m_prev_0 = m_prev_1;
-
-#line 82
-                l_prev_0 = l_prev_1;
-
-#line 82
-                kt_0 = _S8;
-
-#line 82
-                continue;
-            }
-
-
+#line 84
         }
 
-#line 96
-        uint elems_per_thread_0 = 32U * head_dim_0 / 64U;
-        uint _S9 = tid_0 * elems_per_thread_0;
+#line 84
+        float m_prev_1;
 
-#line 97
+#line 84
+        float l_prev_1;
+
+#line 84
+        if(_S7)
+        {
+
+#line 84
+            m_prev_1 = m_prev_0;
+
+#line 84
+            l_prev_1 = l_prev_0;
+
+#line 80
+            uint _S10 = kt_0 + 1U;
+
+#line 80
+            m_prev_0 = m_prev_1;
+
+#line 80
+            l_prev_0 = l_prev_1;
+
+#line 80
+            kt_0 = _S10;
+
+#line 80
+            continue;
+        }
+
+#line 92
+        uint elems_per_thread_0 = 32U * head_dim_0 / 64U;
+        uint _S11 = tid_0 * elems_per_thread_0;
+
+#line 93
         uint i_0 = 0U;
 
         for(;;)
         {
 
-#line 99
+#line 95
             if(i_0 < elems_per_thread_0)
             {
             }
             else
             {
 
-#line 99
+#line 95
                 break;
             }
 
-#line 100
-            uint elem_idx_0 = _S9 + i_0;
+#line 96
+            uint elem_idx_0 = _S11 + i_0;
             uint k_row_0 = elem_idx_0 / head_dim_0;
             uint k_col_0 = elem_idx_0 % head_dim_0;
             uint global_k_token_0 = k_base_0 + k_row_0;
@@ -355,12 +355,12 @@ struct KernelContext_0
             if(global_k_token_0 < tokens_0)
             {
 
-#line 106
+#line 102
                 uint g_off_0 = global_k_token_0 * dim_0 + h_0 * head_dim_0 + k_col_0;
                 (*(&kernelContext_0)->k_tile_0)[elem_idx_0] = (&kernelContext_0)->k_buf_0[g_off_0];
                 (*(&kernelContext_0)->v_tile_0)[elem_idx_0] = (&kernelContext_0)->v_buf_0[g_off_0];
 
-#line 105
+#line 101
             }
             else
             {
@@ -369,255 +369,255 @@ struct KernelContext_0
                 (*(&kernelContext_0)->k_tile_0)[elem_idx_0] = 0.0f;
                 (*(&kernelContext_0)->v_tile_0)[elem_idx_0] = 0.0f;
 
-#line 105
+#line 101
             }
 
-#line 99
+#line 95
             i_0 = i_0 + 1U;
 
-#line 99
+#line 95
         }
 
-#line 115
+#line 111
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
 
         if(valid_q_0)
         {
 
-#line 119
-            uint _S10 = min(32U, tokens_0 - k_base_0);
+#line 115
+            uint _S12 = min(32U, tokens_0 - k_base_0);
 
-#line 119
+#line 115
             m_prev_1 = m_prev_0;
 
-#line 119
+#line 115
             l_prev_1 = l_prev_0;
 
-#line 119
+#line 115
             uint k_pos_0 = 0U;
             for(;;)
             {
 
-#line 120
-                if(k_pos_0 < _S10)
+#line 116
+                if(k_pos_0 < _S12)
                 {
                 }
                 else
                 {
 
-#line 120
+#line 116
                     break;
                 }
 
-#line 121
+#line 117
                 uint global_k_0 = k_base_0 + k_pos_0;
 
-#line 121
+#line 117
                 uint d_1;
 
 
-                if(_S4)
+                if(_S6)
                 {
 
-#line 125
+#line 121
                     if(q_idx_0 >= global_k_0)
                     {
 
-#line 125
+#line 121
                         d_1 = q_idx_0 - global_k_0;
 
-#line 125
+#line 121
                     }
                     else
                     {
 
-#line 125
+#line 121
                         d_1 = global_k_0 - q_idx_0;
 
-#line 125
+#line 121
                     }
                     if(d_1 > half_window_0)
                     {
 
-#line 127
+#line 123
                         k_pos_0 = k_pos_0 + 1U;
 
-#line 120
+#line 116
                         continue;
                     }
 
 
                 }
 
-#line 133
-                uint _S11 = k_pos_0 * head_dim_0;
+#line 129
+                uint _S13 = k_pos_0 * head_dim_0;
 
-#line 133
-                d_0 = 0U;
+#line 129
+                d_1 = 0U;
 
-#line 133
+#line 129
                 float score_0 = 0.0f;
                 for(;;)
                 {
 
-#line 134
-                    if(d_0 < head_dim_0)
-                    {
-                    }
-                    else
-                    {
-
-#line 134
-                        break;
-                    }
-
-#line 135
-                    float score_1 = score_0 + q_reg_0[d_0] * (*(&kernelContext_0)->k_tile_0)[_S11 + d_0];
-
-#line 134
-                    d_0 = d_0 + 1U;
-
-#line 134
-                    score_0 = score_1;
-
-#line 134
-                }
-
-
-                float score_2 = score_0 * _S2;
-
-#line 143
-                float _S12 = max(m_prev_1, score_2);
-                float alpha_0 = exp(m_prev_1 - _S12);
-                float beta_0 = exp(score_2 - _S12);
-
-                float _S13 = l_prev_1 * alpha_0 + beta_0;
-
-#line 147
-                d_1 = 0U;
-
-
-
-                for(;;)
-                {
-
-#line 151
+#line 130
                     if(d_1 < head_dim_0)
                     {
                     }
                     else
                     {
 
-#line 151
+#line 130
                         break;
                     }
 
-#line 152
-                    acc_0[d_1] = acc_0[d_1] * alpha_0 + beta_0 * (*(&kernelContext_0)->v_tile_0)[_S11 + d_1];
+#line 131
+                    float score_1 = score_0 + q_reg_0[d_1] * (*(&kernelContext_0)->k_tile_0)[_S13 + d_1];
 
-#line 151
+#line 130
                     d_1 = d_1 + 1U;
 
-#line 151
+#line 130
+                    score_0 = score_1;
+
+#line 130
                 }
 
-#line 151
-                m_prev_1 = _S12;
 
-#line 151
-                l_prev_1 = _S13;
+                float score_2 = score_0 * _S2;
 
-#line 120
+#line 139
+                float _S14 = max(m_prev_1, score_2);
+                float alpha_0 = exp(m_prev_1 - _S14);
+                float beta_0 = exp(score_2 - _S14);
+
+                float _S15 = l_prev_1 * alpha_0 + beta_0;
+
+#line 143
+                uint d_2 = 0U;
+
+
+
+                for(;;)
+                {
+
+#line 147
+                    if(d_2 < head_dim_0)
+                    {
+                    }
+                    else
+                    {
+
+#line 147
+                        break;
+                    }
+
+#line 148
+                    acc_0[d_2] = acc_0[d_2] * alpha_0 + beta_0 * (*(&kernelContext_0)->v_tile_0)[_S13 + d_2];
+
+#line 147
+                    d_2 = d_2 + 1U;
+
+#line 147
+                }
+
+#line 147
+                m_prev_1 = _S14;
+
+#line 147
+                l_prev_1 = _S15;
+
+#line 116
                 k_pos_0 = k_pos_0 + 1U;
 
-#line 120
+#line 116
             }
 
-#line 118
+#line 114
         }
         else
         {
 
-#line 118
+#line 114
             m_prev_1 = m_prev_0;
 
-#line 118
+#line 114
             l_prev_1 = l_prev_0;
 
-#line 118
+#line 114
         }
 
-#line 157
+#line 153
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-#line 82
-        uint _S8 = kt_0 + 1U;
+#line 80
+        uint _S10 = kt_0 + 1U;
 
-#line 82
+#line 80
         m_prev_0 = m_prev_1;
 
-#line 82
+#line 80
         l_prev_0 = l_prev_1;
 
-#line 82
-        kt_0 = _S8;
+#line 80
+        kt_0 = _S10;
 
-#line 82
+#line 80
     }
 
-#line 161
+#line 157
     if(valid_q_0)
     {
 
-#line 162
+#line 158
         if(l_prev_0 > 0.0f)
         {
 
-#line 162
+#line 158
             m_prev_0 = 1.0f / l_prev_0;
 
-#line 162
+#line 158
         }
         else
         {
 
-#line 162
+#line 158
             m_prev_0 = 0.0f;
 
-#line 162
+#line 158
         }
-        uint _S14 = q_idx_0 * dim_0 + h_0 * head_dim_0;
+        uint _S16 = q_idx_0 * dim_0 + h_0 * head_dim_0;
 
-#line 163
+#line 159
         d_0 = 0U;
         for(;;)
         {
 
-#line 164
+#line 160
             if(d_0 < head_dim_0)
             {
             }
             else
             {
 
-#line 164
+#line 160
                 break;
             }
 
-#line 165
-            *((&kernelContext_0)->out_buf_0+(_S14 + d_0)) = acc_0[d_0] * m_prev_0;
+#line 161
+            *((&kernelContext_0)->out_buf_0+(_S16 + d_0)) = acc_0[d_0] * m_prev_0;
 
-#line 164
+#line 160
             d_0 = d_0 + 1U;
 
-#line 164
+#line 160
         }
 
-#line 161
+#line 157
     }
 
-#line 168
+#line 164
     return;
 }
 
