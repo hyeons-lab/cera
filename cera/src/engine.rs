@@ -1903,6 +1903,9 @@ fn inference_type_for_arch(arch: &str) -> InferenceType {
         "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
+        "bert" | "modernbert" => {
+            InferenceType::Unknown(format!("encoder-only architecture: {arch}"))
+        }
         // Unknown arch → assume text. Callers who need a different
         // mapping can set `ModelFiles::inference_type` explicitly.
         _ => InferenceType::LlamaCppTextToText,
@@ -2491,5 +2494,17 @@ mod tests {
             m.raw["load_time_parameters"]["model"].as_str(),
             Some("/m/model.gguf")
         );
+    }
+
+    #[test]
+    fn test_encoder_architecture_inference_type_unknown() {
+        assert!(matches!(
+            inference_type_for_arch("bert"),
+            InferenceType::Unknown(_)
+        ));
+        assert!(matches!(
+            inference_type_for_arch("modernbert"),
+            InferenceType::Unknown(_)
+        ));
     }
 }

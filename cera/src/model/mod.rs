@@ -1,9 +1,13 @@
+pub mod bert;
 pub mod dspark;
 pub mod lfm2;
 pub mod llama;
+pub mod pii;
 pub mod transformer;
 pub mod whisper;
 pub mod whisper_preprocessor;
+
+pub use pii::{DetectedEntity, HybridPiiModel, SlidingWindowScanner};
 
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;
@@ -691,6 +695,11 @@ pub fn load_model(
             "qwen2" | "qwen3" | "llama" | "granite" => Box::new(
                 llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
             ),
+            "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
             other => bail!("unsupported architecture: {other}"),
         };
 
