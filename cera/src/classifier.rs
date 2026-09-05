@@ -250,7 +250,11 @@ pub fn extract_spans(
                 };
                 let score = probs[i * num_classes + tags[i]];
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
-                let trailing_ws = span_text.chars().rev().take_while(|c| c.is_whitespace()).count();
+                let trailing_ws = span_text
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
                 let trimmed_start = start_char + leading_ws;
                 let trimmed_end = if end_char >= trailing_ws {
                     end_char - trailing_ws
@@ -309,7 +313,11 @@ pub fn extract_spans(
                 };
 
                 let leading_ws = span_text.chars().take_while(|c| c.is_whitespace()).count();
-                let trailing_ws = span_text.chars().rev().take_while(|c| c.is_whitespace()).count();
+                let trailing_ws = span_text
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
                 let trimmed_start = start_char + leading_ws;
                 let trimmed_end = if end_char >= trailing_ws {
                     end_char - trailing_ws
@@ -892,14 +900,16 @@ mod tests {
     #[test]
     #[ignore]
     fn test_real_model_pii_classification() {
-        let model_path = std::path::Path::new("/Users/dberrios/development/models/pii-detect-q8_0.gguf");
+        let model_path =
+            std::path::Path::new("/Users/dberrios/development/models/pii-detect-q8_0.gguf");
         if !model_path.exists() {
             return;
         }
         let engine = crate::engine::CeraEngine::from_path(
             model_path.to_str().unwrap(),
             crate::engine::EngineConfig::default(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let text = "Hello, my name is Alice Smith and my email is alice.smith@example.com";
         let spans = engine.detect_pii(text).unwrap();
@@ -910,4 +920,3 @@ mod tests {
         assert_eq!(spans[1].text, "alice.smith@example.com");
     }
 }
-

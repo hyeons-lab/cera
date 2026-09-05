@@ -2304,9 +2304,17 @@ impl Lfm2Model {
                                 let c_slice = &proj[hs..2 * hs];
                                 let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
 
-                                let prev_bx = if j > 0 { Some(&bx_all[(j - 1) * hs..j * hs]) } else { None };
+                                let prev_bx = if j > 0 {
+                                    Some(&bx_all[(j - 1) * hs..j * hs])
+                                } else {
+                                    None
+                                };
                                 let curr_bx = &bx_all[j * hs..(j + 1) * hs];
-                                let next_bx = if j + 1 < n { Some(&bx_all[(j + 1) * hs..(j + 2) * hs]) } else { None };
+                                let next_bx = if j + 1 < n {
+                                    Some(&bx_all[(j + 1) * hs..(j + 2) * hs])
+                                } else {
+                                    None
+                                };
 
                                 #[cfg(target_arch = "aarch64")]
                                 unsafe {
