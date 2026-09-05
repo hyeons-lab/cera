@@ -159,6 +159,10 @@ bindings:
         --library {{CERA_FFI_DYLIB}} \
         --language swift \
         --out-dir cera-ffi/bindings/swift
+    cargo run -q -p cera-ffi --bin uniffi-bindgen --features bindgen -- generate \
+        --library {{CERA_FFI_DYLIB}} \
+        --language python \
+        --out-dir cera-ffi/bindings/python
     # The root SwiftPM package's `Cera` target needs the wrapper *inside* the
     # target directory (a `.package(url:)` consumer never has the Rust tree), so
     # it holds a committed copy. Syncing it here rather than in a recipe someone

@@ -173,6 +173,8 @@ pub struct Lfm2Model {
     /// stay consistent because configuration is first-call-wins. See
     /// `configure_kv_compression`.
     kv_cache_tag: Mutex<Option<String>>,
+    classifier_weight: Option<Vec<f32>>,
+    classifier_bias: Option<Vec<f32>>,
 }
 
 /// Choose the top-`n_used` experts and their combining weights.
@@ -317,10 +319,19 @@ impl Lfm2Model {
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
-        let intermediate_size = gguf
-            .get_u32(&format!("{prefix}.feed_forward_length"))
-            .with_context(|| format!("missing {prefix}.feed_forward_length"))?
-            as usize;
+        let intermediate_size = if let Some(info) = gguf.tensors.get("blk.0.ffn_gate.weight") {
+            if info.shape.len() > 1 {
+                info.shape[1]
+            } else {
+                gguf.get_u32(&format!("{prefix}.feed_forward_length"))
+                    .with_context(|| format!("missing {prefix}.feed_forward_length"))?
+                    as usize
+            }
+        } else {
+            gguf.get_u32(&format!("{prefix}.feed_forward_length"))
+                .with_context(|| format!("missing {prefix}.feed_forward_length"))?
+                as usize
+        };
         let n_heads = gguf
             .get_u32(&format!("{prefix}.attention.head_count"))
             .with_context(|| format!("missing {prefix}.attention.head_count"))?
@@ -424,6 +435,20 @@ impl Lfm2Model {
             None
         };
 
+        let is_causal = if let Some(causal) = gguf.get_bool(&format!("{prefix}.is_causal")) {
+            causal
+        } else if gguf.get_tensor("classifier.weight").is_ok() {
+            // Token classification models default to bidirectional attention
+            false
+        } else {
+            true
+        };
+
+        let class_labels: Vec<String> = gguf
+            .get_string_array("token_classifier.labels")
+            .map(|arr| arr.into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
         Ok(ModelConfig {
             architecture: arch,
             n_layers,
@@ -441,6 +466,8 @@ impl Lfm2Model {
             kv_heads_per_layer,
             scalars: ScalarMultipliers::default(),
             moe,
+            is_causal,
+            class_labels,
         })
     }
 
@@ -640,6 +667,35 @@ impl Lfm2Model {
             &format!("cpu:{model_id}"),
         ));
 
+        let (classifier_weight, classifier_bias) = if gguf.get_tensor("classifier.weight").is_ok() {
+            let w = gguf.get_tensor("classifier.weight")?.to_f32_vec();
+            let b = gguf
+                .get_tensor("classifier.bias")
+                .ok()
+                .map(|t| t.to_f32_vec());
+            let hs = config.hidden_size;
+            if hs == 0 || !w.len().is_multiple_of(hs) {
+                bail!(
+                    "classifier.weight length {} is not a multiple of hidden_size {}",
+                    w.len(),
+                    hs
+                );
+            }
+            if let Some(ref bias) = b {
+                let implied_classes = w.len() / hs;
+                if bias.len() != implied_classes {
+                    bail!(
+                        "classifier.bias length {} does not match implied num_classes {}",
+                        bias.len(),
+                        implied_classes
+                    );
+                }
+            }
+            (Some(w), b)
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             gguf,
             config,
@@ -655,6 +711,8 @@ impl Lfm2Model {
             model_id,
             prefix_cache,
             kv_cache_tag: Mutex::new(None),
+            classifier_weight,
+            classifier_bias,
         })
     }
 
@@ -2245,76 +2303,238 @@ impl Lfm2Model {
                         let (conv_w0, rest_w) = conv_wt.split_at(hs);
                         let (conv_w1, conv_w2) = rest_w.split_at(hs);
 
-                        for j in 0..n {
-                            let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
-                            let b_slice = &proj[..hs];
-                            let c_slice = &proj[hs..2 * hs];
-                            let x_slice = &proj[2 * hs..3 * hs];
+                        let is_causal = cfg.is_causal
+                            && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
 
-                            let LayerState::Conv { buffer, history } = &mut state.layers[layer]
-                            else {
-                                panic!("expected Conv state for layer {layer}");
-                            };
-
-                            let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
-                            let conv_scratch = &mut state.scratch.conv_scratch[..hs];
-
-                            #[cfg(target_arch = "aarch64")]
-                            unsafe {
-                                use core::arch::aarch64::*;
-                                let n_chunks = hs / 4;
-                                let b_ptr = b_slice.as_ptr();
-                                let x_ptr = x_slice.as_ptr();
-                                let c_ptr = c_slice.as_ptr();
-                                let b0_ptr = buffer.as_ptr();
-                                let b1_ptr = buffer.as_ptr().add(hs);
-                                let w0_ptr = conv_w0.as_ptr();
-                                let w1_ptr = conv_w1.as_ptr();
-                                let w2_ptr = conv_w2.as_ptr();
-                                let out_in_ptr = out_in.as_mut_ptr();
-                                let cs_ptr = conv_scratch.as_mut_ptr();
-
-                                for i in 0..n_chunks {
-                                    let b_v = vld1q_f32(b_ptr.add(i * 4));
-                                    let x_v = vld1q_f32(x_ptr.add(i * 4));
-                                    let bx_v = vmulq_f32(b_v, x_v);
-                                    vst1q_f32(cs_ptr.add(i * 4), bx_v);
-
-                                    let b0_v = vld1q_f32(b0_ptr.add(i * 4));
-                                    let b1_v = vld1q_f32(b1_ptr.add(i * 4));
-                                    let w0_v = vld1q_f32(w0_ptr.add(i * 4));
-                                    let w1_v = vld1q_f32(w1_ptr.add(i * 4));
-                                    let w2_v = vld1q_f32(w2_ptr.add(i * 4));
-
-                                    let out_v = vfmaq_f32(
-                                        vfmaq_f32(vmulq_f32(b0_v, w0_v), b1_v, w1_v),
-                                        bx_v,
-                                        w2_v,
-                                    );
-                                    let c_v = vld1q_f32(c_ptr.add(i * 4));
-                                    let final_v = vmulq_f32(c_v, out_v);
-                                    vst1q_f32(out_in_ptr.add(i * 4), final_v);
-                                }
-                            }
-
-                            #[cfg(not(target_arch = "aarch64"))]
-                            {
+                        if !is_causal {
+                            // Reuse pre-allocated ffn_input as scratch for bx_all;
+                            // ffn_input is completely idle during the conv phase.
+                            let bx_all = &mut ffn_input[..n * hs];
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let b_slice = &proj[..hs];
+                                let x_slice = &proj[2 * hs..3 * hs];
+                                let bx_slice = &mut bx_all[j * hs..(j + 1) * hs];
                                 for i in 0..hs {
-                                    conv_scratch[i] = b_slice[i] * x_slice[i];
-                                    let conv_out = buffer[i] * conv_w0[i]
-                                        + buffer[hs + i] * conv_w1[i]
-                                        + conv_scratch[i] * conv_w2[i];
-                                    out_in[i] = c_slice[i] * conv_out;
+                                    bx_slice[i] = b_slice[i] * x_slice[i];
                                 }
                             }
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let c_slice = &proj[hs..2 * hs];
+                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
 
-                            if d_conv > 0 {
-                                if d_conv > 1 {
-                                    buffer.copy_within(hs.., 0);
+                                let prev_bx = if j > 0 {
+                                    Some(&bx_all[(j - 1) * hs..j * hs])
+                                } else {
+                                    None
+                                };
+                                let curr_bx = &bx_all[j * hs..(j + 1) * hs];
+                                let next_bx = if j + 1 < n {
+                                    Some(&bx_all[(j + 1) * hs..(j + 2) * hs])
+                                } else {
+                                    None
+                                };
+
+                                #[cfg(target_arch = "aarch64")]
+                                unsafe {
+                                    use core::arch::aarch64::*;
+                                    let n_chunks = hs / 4;
+                                    let c_ptr = c_slice.as_ptr();
+                                    let curr_ptr = curr_bx.as_ptr();
+                                    let w0_ptr = conv_w0.as_ptr();
+                                    let w1_ptr = conv_w1.as_ptr();
+                                    let w2_ptr = conv_w2.as_ptr();
+                                    let out_ptr = out_in.as_mut_ptr();
+
+                                    match (prev_bx, next_bx) {
+                                        (Some(prev), Some(next)) => {
+                                            let prev_ptr = prev.as_ptr();
+                                            let next_ptr = next.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let prev_v = vld1q_f32(prev_ptr.add(offset));
+                                                let w0_v = vld1q_f32(w0_ptr.add(offset));
+                                                let next_v = vld1q_f32(next_ptr.add(offset));
+                                                let w2_v = vld1q_f32(w2_ptr.add(offset));
+
+                                                let conv_v = vfmaq_f32(
+                                                    vfmaq_f32(
+                                                        vmulq_f32(curr_v, w1_v),
+                                                        prev_v,
+                                                        w0_v,
+                                                    ),
+                                                    next_v,
+                                                    w2_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                        (None, Some(next)) => {
+                                            let next_ptr = next.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let next_v = vld1q_f32(next_ptr.add(offset));
+                                                let w2_v = vld1q_f32(w2_ptr.add(offset));
+
+                                                let conv_v = vfmaq_f32(
+                                                    vmulq_f32(curr_v, w1_v),
+                                                    next_v,
+                                                    w2_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                        (Some(prev), None) => {
+                                            let prev_ptr = prev.as_ptr();
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let prev_v = vld1q_f32(prev_ptr.add(offset));
+                                                let w0_v = vld1q_f32(w0_ptr.add(offset));
+
+                                                let conv_v = vfmaq_f32(
+                                                    vmulq_f32(curr_v, w1_v),
+                                                    prev_v,
+                                                    w0_v,
+                                                );
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                        (None, None) => {
+                                            for i in 0..n_chunks {
+                                                let offset = i * 4;
+                                                let curr_v = vld1q_f32(curr_ptr.add(offset));
+                                                let w1_v = vld1q_f32(w1_ptr.add(offset));
+                                                let conv_v = vmulq_f32(curr_v, w1_v);
+                                                let c_v = vld1q_f32(c_ptr.add(offset));
+                                                vst1q_f32(
+                                                    out_ptr.add(offset),
+                                                    vmulq_f32(c_v, conv_v),
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                                let last_slot = (d_conv - 1) * hs;
-                                buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
-                                history.push(start_pos + j + 1, buffer);
+
+                                #[cfg(not(target_arch = "aarch64"))]
+                                match (prev_bx, next_bx) {
+                                    (Some(prev), Some(next)) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i]
+                                                    + prev[i] * conv_w0[i]
+                                                    + next[i] * conv_w2[i]);
+                                        }
+                                    }
+                                    (None, Some(next)) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i] + next[i] * conv_w2[i]);
+                                        }
+                                    }
+                                    (Some(prev), None) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i]
+                                                * (curr_bx[i] * conv_w1[i] + prev[i] * conv_w0[i]);
+                                        }
+                                    }
+                                    (None, None) => {
+                                        for i in 0..hs {
+                                            out_in[i] = c_slice[i] * (curr_bx[i] * conv_w1[i]);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let b_slice = &proj[..hs];
+                                let c_slice = &proj[hs..2 * hs];
+                                let x_slice = &proj[2 * hs..3 * hs];
+
+                                let LayerState::Conv { buffer, history } = &mut state.layers[layer]
+                                else {
+                                    panic!("expected Conv state for layer {layer}");
+                                };
+
+                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
+                                let conv_scratch = &mut state.scratch.conv_scratch[..hs];
+
+                                #[cfg(target_arch = "aarch64")]
+                                unsafe {
+                                    use core::arch::aarch64::*;
+                                    let n_chunks = hs / 4;
+                                    let b_ptr = b_slice.as_ptr();
+                                    let x_ptr = x_slice.as_ptr();
+                                    let c_ptr = c_slice.as_ptr();
+                                    let b0_ptr = buffer.as_ptr();
+                                    let b1_ptr = buffer.as_ptr().add(hs);
+                                    let w0_ptr = conv_w0.as_ptr();
+                                    let w1_ptr = conv_w1.as_ptr();
+                                    let w2_ptr = conv_w2.as_ptr();
+                                    let out_in_ptr = out_in.as_mut_ptr();
+                                    let cs_ptr = conv_scratch.as_mut_ptr();
+
+                                    for i in 0..n_chunks {
+                                        let b_v = vld1q_f32(b_ptr.add(i * 4));
+                                        let x_v = vld1q_f32(x_ptr.add(i * 4));
+                                        let bx_v = vmulq_f32(b_v, x_v);
+                                        vst1q_f32(cs_ptr.add(i * 4), bx_v);
+
+                                        let b0_v = vld1q_f32(b0_ptr.add(i * 4));
+                                        let b1_v = vld1q_f32(b1_ptr.add(i * 4));
+                                        let w0_v = vld1q_f32(w0_ptr.add(i * 4));
+                                        let w1_v = vld1q_f32(w1_ptr.add(i * 4));
+                                        let w2_v = vld1q_f32(w2_ptr.add(i * 4));
+
+                                        let out_v = vfmaq_f32(
+                                            vfmaq_f32(vmulq_f32(b0_v, w0_v), b1_v, w1_v),
+                                            bx_v,
+                                            w2_v,
+                                        );
+                                        let c_v = vld1q_f32(c_ptr.add(i * 4));
+                                        let final_v = vmulq_f32(c_v, out_v);
+                                        vst1q_f32(out_in_ptr.add(i * 4), final_v);
+                                    }
+                                }
+
+                                #[cfg(not(target_arch = "aarch64"))]
+                                {
+                                    for i in 0..hs {
+                                        conv_scratch[i] = b_slice[i] * x_slice[i];
+                                        let conv_out = buffer[i] * conv_w0[i]
+                                            + buffer[hs + i] * conv_w1[i]
+                                            + conv_scratch[i] * conv_w2[i];
+                                        out_in[i] = c_slice[i] * conv_out;
+                                    }
+                                }
+
+                                if d_conv > 0 {
+                                    if d_conv > 1 {
+                                        buffer.copy_within(hs.., 0);
+                                    }
+                                    let last_slot = (d_conv - 1) * hs;
+                                    buffer[last_slot..last_slot + hs].copy_from_slice(conv_scratch);
+                                    history.push(start_pos + j + 1, buffer);
+                                }
                             }
                         }
                         if profile_prefill {
@@ -2846,9 +3066,11 @@ impl Lfm2Model {
                             }
                             let q_ref = &q_col[..hs * n];
 
+                            let is_causal = cfg.is_causal
+                                && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
                             cpu::par_rows_n_chunked(flash_buf, head_chunk, 1, 1, |(h, chunk)| {
                                 let kv_h = h / group_size;
-                                cpu::flash_attention_gqa_cpu(
+                                cpu::flash_attention_gqa_cpu_opt(
                                     q_ref,
                                     k_cache,
                                     v_cache,
@@ -2862,6 +3084,7 @@ impl Lfm2Model {
                                     head_dim,
                                     scale,
                                     start_pos,
+                                    is_causal,
                                 );
                             });
 
@@ -3011,7 +3234,13 @@ impl Lfm2Model {
                             state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
-                                let seq_len = (start_pos + j + 1).min(k_cache.len() / kv_dim);
+                                let is_causal = cfg.is_causal
+                                    && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+                                let seq_len = if is_causal {
+                                    (start_pos + j + 1).min(k_cache.len() / kv_dim)
+                                } else {
+                                    (start_pos + n).min(k_cache.len() / kv_dim)
+                                };
                                 let q = &q_mat[j * hs..(j + 1) * hs];
                                 let attn_out = &mut out_proj_input[j * hs..(j + 1) * hs];
                                 let scores = &mut state.scratch.scores;
@@ -3796,6 +4025,35 @@ impl Model for Lfm2Model {
         );
         let cfg = &self.config;
         let hs = cfg.hidden_size;
+
+        let is_causal = cfg.is_causal && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+        if !is_causal {
+            let n = tokens.len();
+            let mut hidden = vec![0.0f32; n * hs];
+            for (i, &token) in tokens.iter().enumerate() {
+                let token_id = token as usize;
+                assert!(
+                    token_id < cfg.vocab_size,
+                    "token_id {token_id} out of range (vocab_size={})",
+                    cfg.vocab_size
+                );
+                self.dequantize_row_into(
+                    &self.embd_ref,
+                    token_id,
+                    &mut hidden[i * hs..(i + 1) * hs],
+                );
+            }
+            self.prefill_layers_loop(&mut hidden, n, 0, state);
+            for j in 0..n {
+                cpu::rmsnorm(
+                    &mut hidden[j * hs..(j + 1) * hs],
+                    &self.output_norm_weight,
+                    cfg.rms_norm_eps,
+                );
+            }
+            return hidden;
+        }
+
         let mut out = Vec::with_capacity(tokens.len() * hs);
         // Reuse one embedding buffer across tokens instead of a per-token Vec.
         let mut hidden = vec![0.0f32; hs];
@@ -3814,6 +4072,94 @@ impl Model for Lfm2Model {
             out.extend_from_slice(&hidden);
         }
         out
+    }
+
+    fn is_classifier(&self) -> bool {
+        self.classifier_weight.is_some()
+    }
+
+    fn num_classes(&self) -> usize {
+        self.classifier_weight
+            .as_ref()
+            .map(|w| w.len() / self.config.hidden_size)
+            .unwrap_or(0)
+    }
+
+    fn class_labels(&self) -> &[String] {
+        &self.config.class_labels
+    }
+
+    fn classify_tokens(
+        &self,
+        tokens: &[u32],
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, crate::CeraError> {
+        if tokens.len() > self.config.max_seq_len {
+            return Err(crate::CeraError::Backend(format!(
+                "sequence length {} exceeds maximum model sequence limit {}",
+                tokens.len(),
+                self.config.max_seq_len
+            )));
+        }
+
+        let hidden = self.hidden_states(tokens, state);
+
+        let (classifier_w, classifier_b) = if let Some(ref lora) = state.lora {
+            if let Some(ref w) = lora.classifier_weight {
+                (w.as_slice(), lora.classifier_bias.as_deref())
+            } else if let Some(ref w) = self.classifier_weight {
+                (w.as_slice(), self.classifier_bias.as_deref())
+            } else {
+                return Err(crate::CeraError::Backend(
+                    "neither model nor attached LoRA adapter has a classifier head".into(),
+                ));
+            }
+        } else if let Some(ref w) = self.classifier_weight {
+            (w.as_slice(), self.classifier_bias.as_deref())
+        } else {
+            return Err(crate::CeraError::Backend(
+                "model has no classifier head".into(),
+            ));
+        };
+        let hs = self.config.hidden_size;
+        if hs == 0 || !classifier_w.len().is_multiple_of(hs) {
+            return Err(crate::CeraError::Backend(format!(
+                "classifier.weight length {} is not a multiple of hidden_size {}",
+                classifier_w.len(),
+                hs
+            )));
+        }
+        let num_classes = classifier_w.len() / hs;
+        if let Some(bias) = classifier_b
+            && bias.len() != num_classes
+        {
+            return Err(crate::CeraError::Backend(format!(
+                "classifier.bias length {} does not match num_classes {}",
+                bias.len(),
+                num_classes
+            )));
+        }
+        let n = tokens.len();
+
+        let mut logits = vec![0.0f32; n * num_classes];
+        for j in 0..n {
+            let h = &hidden[j * hs..(j + 1) * hs];
+            let out_slice = &mut logits[j * num_classes..(j + 1) * num_classes];
+            for c in 0..num_classes {
+                let w_row = &classifier_w[c * hs..(c + 1) * hs];
+                assert_eq!(h.len(), hs);
+                assert_eq!(w_row.len(), hs);
+                let mut dot = 0.0f32;
+                for d in 0..hs {
+                    dot += h[d] * w_row[d];
+                }
+                if let Some(bias) = classifier_b {
+                    dot += bias[c];
+                }
+                out_slice[c] = dot;
+            }
+        }
+        Ok(logits)
     }
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {

@@ -66,6 +66,35 @@ impl HfVocab {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum HfMerges {
+    Strings(Vec<String>),
+    Pairs(Vec<Vec<String>>),
+}
+
+impl Default for HfMerges {
+    fn default() -> Self {
+        Self::Strings(Vec::new())
+    }
+}
+
+impl HfMerges {
+    pub fn to_string_vec(&self) -> Vec<String> {
+        match self {
+            Self::Strings(s) => s.clone(),
+            Self::Pairs(pairs) => pairs.iter().map(|p| p.join(" ")).collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Strings(s) => s.is_empty(),
+            Self::Pairs(p) => p.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HfTokenizerModel {
     #[serde(rename = "type", default)]
@@ -73,7 +102,7 @@ pub struct HfTokenizerModel {
     #[serde(default)]
     pub vocab: HfVocab,
     #[serde(default)]
-    pub merges: Vec<String>,
+    pub merges: HfMerges,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +152,11 @@ impl HfTokenizerJson {
             "chatglm"
         } else if pre_str.contains("tekken") {
             "tekken"
+        } else if pre_str.contains("(?i:'s|'t|'re")
+            || pre_str.contains("\\p{l}\\p{n}")
+            || pre_str.contains("lfm")
+        {
+            "lfm2"
         } else {
             match self.model.model_type.to_ascii_lowercase().as_str() {
                 "unigram" | "spm" => "default",
@@ -174,7 +208,7 @@ impl HfTokenizerJson {
         writer.add_i32_array("tokenizer.ggml.token_type", token_types);
 
         if !self.model.merges.is_empty() {
-            writer.add_string_array("tokenizer.ggml.merges", self.model.merges.clone());
+            writer.add_string_array("tokenizer.ggml.merges", self.model.merges.to_string_vec());
         }
 
         if let Some(tmpl) = chat_template {

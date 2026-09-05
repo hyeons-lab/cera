@@ -327,5 +327,62 @@ impl HfModelConfig {
             writer.add_u32("tokenizer.ggml.padding_token_id", pad);
             writer.add_u32("general.pad_token_id", pad);
         }
+
+        // Token classification labels (e.g. LiquidAI/pii-detect)
+        if let Some(Value::Object(id2label)) = self.extra.get("id2label") {
+            let mut label_pairs: Vec<(usize, String)> = Vec::new();
+            for (k, v) in id2label {
+                if let (Ok(idx), Some(s)) = (k.parse::<usize>(), v.as_str()) {
+                    label_pairs.push((idx, s.to_string()));
+                }
+            }
+            label_pairs.sort_by_key(|p| p.0);
+            let labels: Vec<String> = label_pairs.into_iter().map(|p| p.1).collect();
+            if !labels.is_empty() {
+                writer.add_u32("token_classifier.num_labels", labels.len() as u32);
+                writer.add_string_array("token_classifier.labels", labels);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::writer::MetadataValue;
+
+    #[test]
+    fn test_token_classifier_id2label_metadata() {
+        let json_data = r#"{
+            "model_type": "lfm2",
+            "architectures": ["Lfm2BidirP2ForTokenClassification"],
+            "hidden_size": 1024,
+            "num_hidden_layers": 16,
+            "id2label": {
+                "0": "O",
+                "1": "B-NAME",
+                "2": "I-NAME",
+                "3": "S-NAME"
+            }
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "pii-detect");
+
+        assert_eq!(
+            writer.get_metadata("token_classifier.num_labels"),
+            Some(&MetadataValue::Uint32(4))
+        );
+        let expected_labels = vec![
+            "O".to_string(),
+            "B-NAME".to_string(),
+            "I-NAME".to_string(),
+            "S-NAME".to_string(),
+        ];
+        assert_eq!(
+            writer.get_metadata("token_classifier.labels"),
+            Some(&MetadataValue::StringArray(expected_labels))
+        );
     }
 }

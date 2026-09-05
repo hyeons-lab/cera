@@ -188,6 +188,7 @@ impl LoraTarget {
 }
 
 /// One target's low-rank factors, pre-dequantized to f32 (row-major).
+#[derive(Clone)]
 pub struct LoraTargetWeights {
     /// Down-projection `A`, `[rank × k]` row-major.
     pub a: Vec<f32>,
@@ -199,7 +200,7 @@ pub struct LoraTargetWeights {
     pub k: usize,
     /// Output width (base projection's output dim).
     pub d: usize,
-    /// `alpha / rank` — folded into the apply.
+    /// `alpha / rank` (folded into the apply).
     pub scale: f32,
 }
 
@@ -220,7 +221,7 @@ impl LoraTargetWeights {
         ensure!(rank_a > 0 && k > 0 && d > 0, "LoRA dims must be non-zero");
         // Cap the rank so backends can size fixed rank-width scratch (e.g. the
         // Metal `lora_tmp` buffer) without an out-of-bounds risk. Real adapters
-        // are rank ≤ ~64; this bound is generous.
+        // are rank <= ~64; this bound is generous.
         ensure!(
             rank_a <= MAX_LORA_RANK,
             "LoRA rank {rank_a} exceeds the supported maximum ({MAX_LORA_RANK})"
@@ -243,13 +244,7 @@ impl LoraTargetWeights {
 }
 
 /// One target's delta: a single low-rank pair, or one pair per expert.
-///
-/// A mixture-of-experts projection is `n_expert` independent matrices stacked
-/// into one tensor, and llama.cpp's `build_lora_mm_id` indexes the adapter's
-/// factors with the *same* expert ids as the base weight, so the delta is
-/// per-expert too. Modelled as a sum type rather than a `Vec` that dense
-/// targets would fill with one element, so that "an expert target is never read
-/// as if it were dense" is a `match`, not a convention.
+#[derive(Clone)]
 enum TargetDelta {
     Dense(LoraTargetWeights),
     /// One entry per expert, index-aligned with the base weight's expert slices.
@@ -257,18 +252,78 @@ enum TargetDelta {
 }
 
 /// The (up to [`LORA_TARGET_COUNT`]) target deltas for one transformer layer.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LoraLayer {
     targets: [Option<TargetDelta>; LORA_TARGET_COUNT],
 }
 
-/// A loaded LoRA adapter: per-layer low-rank deltas plus scaling.
+/// A loaded LoRA adapter: per-layer low-rank deltas plus scaling, with optional classifier head.
 pub struct LoraAdapterWeights {
     layers: Vec<LoraLayer>,
     default_scale: f32,
+    /// Classification head weight matrix if this adapter includes a token classification head.
+    pub classifier_weight: Option<Vec<f32>>,
+    /// Classification head bias vector if this adapter includes a token classification head.
+    pub classifier_bias: Option<Vec<f32>>,
+    /// Classification class label strings in index order.
+    pub class_labels: Vec<String>,
+    /// Number of token classification classes (0 if not a classifier).
+    pub num_classes: usize,
 }
 
 impl LoraAdapterWeights {
+    /// Whether this adapter includes a token classification head.
+    pub fn is_classifier(&self) -> bool {
+        self.classifier_weight.is_some()
+    }
+
+    /// Number of token classification classes (0 if not a classifier).
+    pub fn num_classes(&self) -> usize {
+        self.num_classes
+    }
+
+    /// Attach or replace class labels on an Arc-wrapped adapter.
+    pub fn with_class_labels(mut self: Arc<Self>, labels: Vec<String>) -> Arc<Self> {
+        let n_cls = labels.len();
+        if let Some(s) = Arc::get_mut(&mut self) {
+            s.num_classes = n_cls;
+            s.class_labels = labels;
+            self
+        } else {
+            Arc::new(Self {
+                layers: self.layers.clone(),
+                default_scale: self.default_scale,
+                classifier_weight: self.classifier_weight.clone(),
+                classifier_bias: self.classifier_bias.clone(),
+                class_labels: labels,
+                num_classes: n_cls,
+            })
+        }
+    }
+
+    /// Construct a classifier adapter instance for testing.
+    #[cfg(test)]
+    pub fn new_classifier_for_testing(
+        classifier_weight: Vec<f32>,
+        classifier_bias: Option<Vec<f32>>,
+        class_labels: Vec<String>,
+    ) -> Arc<Self> {
+        let num_classes = if !class_labels.is_empty() {
+            class_labels.len()
+        } else if let Some(ref b) = classifier_bias {
+            b.len()
+        } else {
+            0
+        };
+        Arc::new(Self {
+            layers: Vec::new(),
+            default_scale: 1.0,
+            classifier_weight: Some(classifier_weight),
+            classifier_bias,
+            class_labels,
+            num_classes,
+        })
+    }
     /// The delta for `(layer, target)`, or `None` if the adapter doesn't touch it.
     ///
     /// Always `None` for an expert target ([`LoraTarget::is_expert`]), whose
@@ -446,6 +501,32 @@ impl LoraAdapterWeights {
                 }
             }
         }
+        if let Some(ref w) = self.classifier_weight {
+            let hs = config.hidden_size;
+            ensure!(
+                hs > 0 && w.len().is_multiple_of(hs),
+                "classifier weight length {} is not a multiple of hidden_size {}",
+                w.len(),
+                hs
+            );
+            let num_classes = w.len() / hs;
+            if let Some(ref b) = self.classifier_bias {
+                ensure!(
+                    b.len() == num_classes,
+                    "classifier bias length {} does not match num_classes {}",
+                    b.len(),
+                    num_classes
+                );
+            }
+            if !self.class_labels.is_empty() {
+                ensure!(
+                    self.class_labels.len() == num_classes,
+                    "class_labels count {} does not match num_classes {}",
+                    self.class_labels.len(),
+                    num_classes
+                );
+            }
+        }
         Ok(())
     }
 
@@ -499,7 +580,34 @@ impl LoraAdapterWeights {
                 .with_context(|| format!("LoRA tensor {name}"))?;
             builder.add_factor(layer, target, is_a, factor);
         }
-        builder.finish(alpha_meta)
+
+        let (classifier_weight, classifier_bias, num_classes) =
+            if let Ok(tensor) = gguf.get_tensor("classifier.weight") {
+                let w = tensor.to_f32_vec();
+                let b = gguf
+                    .get_tensor("classifier.bias")
+                    .ok()
+                    .map(|t| t.to_f32_vec());
+                let n_cls = b
+                    .as_ref()
+                    .map(|v| v.len())
+                    .unwrap_or_else(|| tensor.shape().get(1).copied().unwrap_or(0));
+                (Some(w), b, n_cls)
+            } else {
+                (None, None, 0)
+            };
+        let class_labels = gguf
+            .get_string_array("token_classifier.labels")
+            .map(|arr| arr.into_iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        builder.finish(
+            alpha_meta,
+            classifier_weight,
+            classifier_bias,
+            class_labels,
+            num_classes,
+        )
     }
 
     // ── safetensors (PEFT) ────────────────────────────────────────────────────
@@ -507,19 +615,76 @@ impl LoraAdapterWeights {
     /// Load a PEFT `.safetensors` adapter from a file. Tensors are named
     /// `base_model.model.model.layers.{N}.{module}.lora_A.weight` /
     /// `lora_B.weight`. PEFT stores `alpha` in a sibling `adapter_config.json`,
-    /// not in the tensor file — pass it via `alpha` (`None` ⇒ `scale = 1`).
-    /// Native only — WASM uses [`Self::from_safetensors_bytes`].
+    /// not in the tensor file (pass it via `alpha`, `None` defaults to scale 1).
+    /// Native only (WASM uses [`Self::from_safetensors_bytes`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_safetensors(path: &Path, alpha: Option<f32>) -> Result<Arc<Self>> {
         let bytes = std::fs::read(path).with_context(|| format!("read adapter {path:?}"))?;
-        Self::from_safetensors_bytes(&bytes, alpha)
+        let alpha = alpha.or_else(|| {
+            path.parent().and_then(|dir| {
+                let p = dir.join("adapter_config.json");
+                let content = std::fs::read_to_string(p).ok()?;
+                let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+                val.get("lora_alpha")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32)
+            })
+        });
+
+        let mut adapter = Self::from_safetensors_bytes(&bytes, alpha)?;
+
+        if let Some(parent) = path
+            .parent()
+            .filter(|_| adapter.is_classifier() && adapter.class_labels.is_empty())
+        {
+            let labels = load_labels_from_dir(parent);
+            if !labels.is_empty() {
+                adapter = adapter.with_class_labels(labels);
+            }
+        }
+        Ok(adapter)
+    }
+
+    /// Load an adapter from a file path (auto-detecting GGUF vs SafeTensors).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_from_path(path: &Path) -> Result<Arc<Self>> {
+        let is_gguf = if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::Read;
+            let mut magic = [0u8; 4];
+            f.read_exact(&mut magic).is_ok() && &magic == b"GGUF"
+        } else {
+            false
+        };
+        if is_gguf {
+            Self::from_gguf(path)
+        } else {
+            Self::from_safetensors(path, None)
+        }
     }
 
     /// Load a PEFT safetensors adapter from in-memory bytes.
     pub fn from_safetensors_bytes(bytes: &[u8], alpha: Option<f32>) -> Result<Arc<Self>> {
         let st = SafeTensors::parse(bytes)?;
         let mut builder = AdapterBuilder::new();
+        let mut classifier_weight = None;
+        let mut classifier_bias = None;
+        let mut num_classes = 0;
+
         for (name, entry) in st.tensors() {
+            if name.ends_with("classifier.weight") {
+                if let Ok((rows, _cols)) = entry.shape2() {
+                    num_classes = rows;
+                }
+                classifier_weight = Some(st.dequantize(entry, bytes)?);
+                continue;
+            }
+            if name.ends_with("classifier.bias") {
+                let b = st.dequantize(entry, bytes)?;
+                num_classes = b.len();
+                classifier_bias = Some(b);
+                continue;
+            }
+
             // Mixture-of-experts deltas are only read from GGUF, where the
             // per-expert factors arrive stacked into one tensor with a known
             // layout. PEFT stores them as one module per expert under a naming
@@ -539,7 +704,7 @@ impl LoraAdapterWeights {
                 continue;
             };
             // PEFT weights are row-major `[out, in]`: `lora_A` is `[rank, k]`,
-            // `lora_B` is `[d, rank]` — same (rows, cols) convention as GGUF.
+            // `lora_B` is `[d, rank]` (same (rows, cols) convention as GGUF).
             let (rows, cols) = entry
                 .shape2()
                 .with_context(|| format!("tensor {name} not 2-D"))?;
@@ -551,8 +716,64 @@ impl LoraAdapterWeights {
             builder.add_factor(layer, target, is_a, factor);
         }
         // PEFT keeps alpha out-of-band; default to alpha == rank (scale 1).
-        builder.finish(alpha)
+        builder.finish(
+            alpha,
+            classifier_weight,
+            classifier_bias,
+            Vec::new(),
+            num_classes,
+        )
     }
+}
+
+/// Helper to load class labels from sibling JSON files in a directory.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_labels_from_dir(dir: &Path) -> Vec<String> {
+    // 1. Try label_schema.json (BIOES entity types schema)
+    let schema_path = dir.join("label_schema.json");
+    if let Ok(content) = std::fs::read_to_string(&schema_path) {
+        let val_opt = serde_json::from_str::<serde_json::Value>(&content).ok();
+        if let Some(types) = val_opt
+            .as_ref()
+            .and_then(|v| v.get("types_in_order")?.as_array())
+        {
+            let mut labels = vec!["O".to_string()];
+            for item in types {
+                if let Some(t_str) = item.as_str() {
+                    labels.push(format!("B-{t_str}"));
+                    labels.push(format!("I-{t_str}"));
+                    labels.push(format!("E-{t_str}"));
+                    labels.push(format!("S-{t_str}"));
+                }
+            }
+            return labels;
+        }
+    }
+
+    // 2. Try config.json or adapter_config.json for "id2label"
+    for filename in &["config.json", "adapter_config.json"] {
+        let p = dir.join(filename);
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            let val_opt = serde_json::from_str::<serde_json::Value>(&content).ok();
+            if let Some(id2label) = val_opt
+                .as_ref()
+                .and_then(|v| v.get("id2label")?.as_object())
+            {
+                let mut pairs = Vec::new();
+                for (k, v) in id2label {
+                    if let (Ok(idx), Some(lbl)) = (k.parse::<usize>(), v.as_str()) {
+                        pairs.push((idx, lbl.to_string()));
+                    }
+                }
+                if !pairs.is_empty() {
+                    pairs.sort_by_key(|&(idx, _)| idx);
+                    return pairs.into_iter().map(|(_, l)| l).collect();
+                }
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 /// Sanity cap on an adapter's layer index — real models have well under this
@@ -658,8 +879,35 @@ impl AdapterBuilder {
         }
     }
 
-    fn finish(self, alpha: Option<f32>) -> Result<Arc<LoraAdapterWeights>> {
-        ensure!(!self.factors.is_empty(), "adapter contains no LoRA tensors");
+    fn finish(
+        self,
+        alpha: Option<f32>,
+        classifier_weight: Option<Vec<f32>>,
+        classifier_bias: Option<Vec<f32>>,
+        class_labels: Vec<String>,
+        num_classes: usize,
+    ) -> Result<Arc<LoraAdapterWeights>> {
+        ensure!(
+            !self.factors.is_empty() || classifier_weight.is_some(),
+            "adapter contains no LoRA or classifier tensors"
+        );
+        let n_cls = if !class_labels.is_empty() {
+            class_labels.len()
+        } else if let Some(ref b) = classifier_bias {
+            b.len()
+        } else {
+            num_classes
+        };
+        if self.factors.is_empty() {
+            return Ok(Arc::new(LoraAdapterWeights {
+                layers: Vec::new(),
+                default_scale: 1.0,
+                classifier_weight,
+                classifier_bias,
+                class_labels,
+                num_classes: n_cls,
+            }));
+        }
         // Reject an absurd layer index from a malformed/hostile name before it
         // sizes the `layers` Vec — otherwise `blk.9999999999...` would try to
         // allocate ~10^10 entries and OOM-abort instead of erroring.
@@ -748,6 +996,10 @@ impl AdapterBuilder {
         Ok(Arc::new(LoraAdapterWeights {
             layers,
             default_scale,
+            classifier_weight,
+            classifier_bias,
+            class_labels,
+            num_classes: n_cls,
         }))
     }
 }
@@ -1660,6 +1912,8 @@ mod tests {
                 expert_ff_len: 16,
                 is_moe_layer: vec![false, false, true, true],
             }),
+            is_causal: true,
+            class_labels: Vec::new(),
         }
     }
 
@@ -1815,5 +2069,70 @@ mod tests {
             4,
         );
         assert!(LoraAdapterWeights::from_safetensors_bytes(&buf, None).is_err());
+    }
+
+    #[test]
+    fn peft_classifier_adapter_loads_and_validates() {
+        // 3 classes, hidden_size 8: weight [3, 8] = 24 floats = 96 bytes, bias [3] = 3 floats = 12 bytes
+        let w_bytes = 24 * 4;
+        let b_bytes = 3 * 4;
+        let total_bytes = w_bytes + b_bytes;
+
+        let buf = st_buf(
+            serde_json::json!({
+                "base_model.model.classifier.weight": {
+                    "dtype": "F32",
+                    "shape": [3, 8],
+                    "data_offsets": [0, w_bytes]
+                },
+                "base_model.model.classifier.bias": {
+                    "dtype": "F32",
+                    "shape": [3],
+                    "data_offsets": [w_bytes, total_bytes]
+                }
+            }),
+            total_bytes,
+        );
+
+        let adapter = LoraAdapterWeights::from_safetensors_bytes(&buf, None).unwrap();
+        assert!(adapter.is_classifier());
+        assert_eq!(adapter.num_classes(), 3); // parsed from classifier.weight shape and bias length
+
+        let labels = vec![
+            "O".to_string(),
+            "B-EMAIL".to_string(),
+            "I-EMAIL".to_string(),
+        ];
+        let adapter = adapter.with_class_labels(labels);
+        assert_eq!(adapter.num_classes(), 3);
+
+        let cfg = crate::model::ModelConfig {
+            architecture: "lfm2".to_string(),
+            n_layers: 2,
+            hidden_size: 8,
+            intermediate_size: 32,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 4,
+            vocab_size: 16,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            block_types: vec![crate::model::BlockType::Attention; 2],
+            conv_kernel_size: None,
+            kv_heads_per_layer: vec![2; 2],
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        assert!(adapter.validate_dims(&cfg).is_ok());
+
+        // Mismatched hidden size should fail validation
+        let bad_cfg = crate::model::ModelConfig {
+            hidden_size: 16,
+            ..cfg
+        };
+        assert!(adapter.validate_dims(&bad_cfg).is_err());
     }
 }

@@ -219,6 +219,98 @@ class EngineConfig {
   int get hashCode => Object.hash(contextSize, backend, bundleRepo, draftModel);
 }
 
+/// An identified PII entity span in source text.
+class FfiEntitySpan {
+  const FfiEntitySpan({
+    /// Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+    required this.entityType,
+    /// UTF-8 character start index in source text (inclusive).
+    required this.startChar,
+    /// UTF-8 character end index in source text (exclusive).
+    required this.endChar,
+    /// Token start index in sequence (inclusive).
+    required this.startToken,
+    /// Token end index in sequence (exclusive).
+    required this.endToken,
+    /// Extracted text slice.
+    required this.text,
+    /// Mean classification confidence score across the span tokens [0.0..1.0].
+    required this.score,
+  });
+
+  /// Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+  final String entityType;
+  /// UTF-8 character start index in source text (inclusive).
+  final int startChar;
+  /// UTF-8 character end index in source text (exclusive).
+  final int endChar;
+  /// Token start index in sequence (inclusive).
+  final int startToken;
+  /// Token end index in sequence (exclusive).
+  final int endToken;
+  /// Extracted text slice.
+  final String text;
+  /// Mean classification confidence score across the span tokens [0.0..1.0].
+  final double score;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'entityType': this.entityType,
+      'startChar': this.startChar,
+      'endChar': this.endChar,
+      'startToken': this.startToken,
+      'endToken': this.endToken,
+      'text': this.text,
+      'score': this.score,
+    };
+  }
+
+  factory FfiEntitySpan.fromJson(Map<String, dynamic> json) {
+    return FfiEntitySpan(
+      entityType: json['entityType'] as String,
+      startChar: (json['startChar'] as num).toInt(),
+      endChar: (json['endChar'] as num).toInt(),
+      startToken: (json['startToken'] as num).toInt(),
+      endToken: (json['endToken'] as num).toInt(),
+      text: json['text'] as String,
+      score: (json['score'] as num).toDouble(),
+    );
+  }
+
+  FfiEntitySpan copyWith({
+    String? entityType,
+    int? startChar,
+    int? endChar,
+    int? startToken,
+    int? endToken,
+    String? text,
+    double? score,
+  }) {
+    return FfiEntitySpan(
+      entityType: entityType ?? this.entityType,
+      startChar: startChar ?? this.startChar,
+      endChar: endChar ?? this.endChar,
+      startToken: startToken ?? this.startToken,
+      endToken: endToken ?? this.endToken,
+      text: text ?? this.text,
+      score: score ?? this.score,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiEntitySpan(entityType: $entityType, startChar: $startChar, endChar: $endChar, startToken: $startToken, endToken: $endToken, text: $text, score: $score)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiEntitySpan && entityType == other.entityType && startChar == other.startChar && endChar == other.endChar && startToken == other.startToken && endToken == other.endToken && text == other.text && score == other.score;
+
+  @override
+  int get hashCode => Object.hash(entityType, startChar, endChar, startToken, endToken, text, score);
+}
+
 /// A detected speech segment with sample and millisecond boundaries.
 class FfiSpeechTimestamp {
   const FfiSpeechTimestamp({
@@ -2937,6 +3029,9 @@ final class CeraEngine {
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('CeraEngine.defaultGenerateOpts');
 
+  /// Detect PII entity spans in text using the loaded token classification model.
+  List<FfiEntitySpan> detectPii(String text) => _unsupportedOnWeb('CeraEngine.detectPii');
+
   /// Encode `text` into token IDs using the model's BPE tokenizer.
   /// Empty input returns an empty vec.
   List<int> encodeText(String text) => _unsupportedOnWeb('CeraEngine.encodeText');
@@ -3183,6 +3278,29 @@ abstract interface class ModalitySink {
 final class ModalitySinkFfiCodec {
   static int lower(ModalitySink value) => _unsupportedOnWeb('ModalitySinkFfiCodec.lower');
   static ModalitySink lift(int handle) => _unsupportedOnWeb('ModalitySinkFfiCodec.lift');
+}
+
+/// Zero-dependency PII Classifier for named entity recognition.
+final class PiiClassifier {
+  PiiClassifier._();
+
+  bool get isClosed => _unsupportedOnWeb('PiiClassifier.isClosed');
+
+  void close() => _unsupportedOnWeb('PiiClassifier.close');
+
+  /// Load a base model with a separate LoRA classifier adapter.
+  static PiiClassifier fromBaseAndAdapter(String basePath, String adapterPath) => _unsupportedOnWeb('PiiClassifier.fromBaseAndAdapter');
+
+  /// Load a PII classification model from a local GGUF path.
+  static PiiClassifier fromPath(String path) => _unsupportedOnWeb('PiiClassifier.fromPath');
+
+  /// Detect PII entities in the input text.
+  List<FfiEntitySpan> detect(String text) => _unsupportedOnWeb('PiiClassifier.detect');
+}
+
+final class PiiClassifierFfiCodec {
+  static int lower(PiiClassifier value) => _unsupportedOnWeb('PiiClassifierFfiCodec.lower');
+  static PiiClassifier lift(int handle) => _unsupportedOnWeb('PiiClassifierFfiCodec.lift');
 }
 
 /// Stateful inference handle. Wraps [`cera::Session`] behind a

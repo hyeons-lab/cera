@@ -32,6 +32,27 @@ pub enum TargetQuant {
     F32,
 }
 
+/// Match a glob or wildcard pattern like "classifier.*", "*.bias", or exact "token_embd.weight".
+pub fn matches_tensor_pattern(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return name.ends_with(suffix);
+    }
+    pattern == name
+}
+
+/// Parse a key-value override like "classifier.*=F16" or "output.weight=Q8_0".
+pub fn parse_tensor_override(s: &str) -> Option<(String, TargetQuant)> {
+    let (pattern, quant_str) = s.split_once('=')?;
+    let quant = TargetQuant::parse_str(quant_str.trim())?;
+    Some((pattern.trim().to_string(), quant))
+}
+
 impl TargetQuant {
     /// Parse string representation (e.g. "q4_k_m", "Q4_0", "f16").
     pub fn parse_str(s: &str) -> Option<Self> {
@@ -60,6 +81,30 @@ impl TargetQuant {
         }
     }
 
+    /// Select the appropriate GGML type for a tensor, checking per-tensor overrides first.
+    pub fn select_ggml_type_with_overrides(
+        &self,
+        tensor_name: &str,
+        num_dims: usize,
+        num_elements: usize,
+        overrides: &[(String, TargetQuant)],
+    ) -> u32 {
+        for (pattern, target) in overrides {
+            if matches_tensor_pattern(pattern, tensor_name) {
+                return match target {
+                    TargetQuant::F32 => GGML_TYPE_F32,
+                    TargetQuant::F16 => GGML_TYPE_F16,
+                    TargetQuant::Q8_0 => GGML_TYPE_Q8_0,
+                    TargetQuant::Q4_0 => GGML_TYPE_Q4_0,
+                    TargetQuant::Q6_K => GGML_TYPE_Q6_K,
+                    TargetQuant::Q5_K_M => GGML_TYPE_Q5_K,
+                    TargetQuant::Q4_K_M => GGML_TYPE_Q4_K,
+                };
+            }
+        }
+        self.select_ggml_type(tensor_name, num_dims, num_elements)
+    }
+
     /// Select the appropriate GGML type for a tensor given its name and rank.
     pub fn select_ggml_type(&self, tensor_name: &str, num_dims: usize, num_elements: usize) -> u32 {
         match self {
@@ -68,8 +113,12 @@ impl TargetQuant {
             _ => {}
         }
 
-        // 1D tensors (layer norms, bias vectors) are always kept in F32 for numerical stability.
-        if num_dims <= 1 || num_elements < 256 {
+        // 1D tensors (layer norms, bias vectors) and shortconv 3-token kernels are kept in F32.
+        if num_dims <= 1
+            || num_elements < 256
+            || tensor_name.contains("shortconv.conv")
+            || tensor_name.contains("conv.conv")
+        {
             return GGML_TYPE_F32;
         }
 
@@ -1294,5 +1343,65 @@ mod tests {
             let back = f16_to_f32(half);
             assert!((back - orig).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn test_tensor_overrides_matching() {
+        assert!(matches_tensor_pattern("*", "anything"));
+        assert!(matches_tensor_pattern("classifier.*", "classifier.weight"));
+        assert!(matches_tensor_pattern("classifier.*", "classifier.bias"));
+        assert!(!matches_tensor_pattern("classifier.*", "token_embd.weight"));
+        assert!(matches_tensor_pattern("*.bias", "blk.0.attn_q.bias"));
+        assert!(!matches_tensor_pattern("*.bias", "blk.0.attn_q.weight"));
+        assert!(matches_tensor_pattern("output.weight", "output.weight"));
+        assert!(!matches_tensor_pattern(
+            "output.weight",
+            "output_norm.weight"
+        ));
+
+        let (pat, q) = parse_tensor_override("classifier.*=F16").unwrap();
+        assert_eq!(pat, "classifier.*");
+        assert_eq!(q, TargetQuant::F16);
+
+        let (pat2, q2) = parse_tensor_override("blk.0.*=Q8_0").unwrap();
+        assert_eq!(pat2, "blk.0.*");
+        assert_eq!(q2, TargetQuant::Q8_0);
+
+        let default_quant = TargetQuant::Q4_K_M;
+        let overrides = vec![
+            ("classifier.*".to_string(), TargetQuant::F16),
+            ("output.weight".to_string(), TargetQuant::Q8_0),
+        ];
+
+        // Classifier head is overridden to F16 even though base quant is Q4_K_M
+        let t_type = default_quant.select_ggml_type_with_overrides(
+            "classifier.weight",
+            2,
+            1024 * 161,
+            &overrides,
+        );
+        assert_eq!(t_type, GGML_TYPE_F16);
+
+        let b_type =
+            default_quant.select_ggml_type_with_overrides("classifier.bias", 1, 161, &overrides);
+        assert_eq!(b_type, GGML_TYPE_F16);
+
+        // Output weight is overridden to Q8_0
+        let out_type = default_quant.select_ggml_type_with_overrides(
+            "output.weight",
+            2,
+            1024 * 32000,
+            &overrides,
+        );
+        assert_eq!(out_type, GGML_TYPE_Q8_0);
+
+        // Non-matching tensor uses default Q4_K_M
+        let attn_type = default_quant.select_ggml_type_with_overrides(
+            "blk.0.attn_q.weight",
+            2,
+            1024 * 1024,
+            &overrides,
+        );
+        assert_eq!(attn_type, GGML_TYPE_Q4_K);
     }
 }

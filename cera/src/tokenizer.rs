@@ -5,10 +5,23 @@ use regex::Regex;
 
 use crate::gguf::{GgufFile, GgufValue};
 
-/// A segment of text split at special token boundaries.
+/// Token offset containing both Unicode code-point offsets and UTF-8 byte offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenOffset {
+    /// Start index in Unicode code points (0-indexed, inclusive).
+    pub char_start: usize,
+    /// End index in Unicode code points (0-indexed, exclusive).
+    pub char_end: usize,
+    /// Start index in UTF-8 bytes (0-indexed, inclusive).
+    pub byte_start: usize,
+    /// End index in UTF-8 bytes (0-indexed, exclusive).
+    pub byte_end: usize,
+}
+
+/// A segment of text split at special token boundaries with byte offsets.
 enum Segment<'a> {
-    Text(&'a str),
-    Special(u32),
+    Text(&'a str, usize),
+    Special(u32, usize, usize),
 }
 
 /// A minimal byte-level BPE tokenizer.
@@ -192,9 +205,9 @@ impl BpeTokenizer {
         let segments = self.split_special_tokens(text);
         let mut result = Vec::new();
         for segment in &segments {
-            match segment {
-                Segment::Special(id) => result.push(*id),
-                Segment::Text(s) => {
+            match *segment {
+                Segment::Special(id, _, _) => result.push(id),
+                Segment::Text(s, _) => {
                     for chunk in self.pretokenize(s) {
                         result.extend(self.bpe_encode_chunk(chunk));
                     }
@@ -202,6 +215,49 @@ impl BpeTokenizer {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_testing(
+        vocab: Vec<Vec<u8>>,
+        token_to_id: HashMap<Vec<u8>, u32>,
+        merge_ranks: HashMap<(Vec<u8>, Vec<u8>), usize>,
+    ) -> Self {
+        let b2u = build_byte_to_unicode();
+        let mut u2b = HashMap::new();
+        for (b, &c) in b2u.iter().enumerate() {
+            u2b.insert(c, b as u8);
+        }
+        Self {
+            vocab,
+            token_to_id,
+            merge_ranks,
+            special_tokens: HashMap::new(),
+            bos_id: None,
+            eos_id: None,
+            add_bos: false,
+            add_eos: false,
+            chat_template: None,
+            pretokenize_re: build_pretokenize_regex("default"),
+            digits_split_bare: false,
+            byte_to_unicode: b2u,
+            unicode_to_byte: u2b,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_special_tokens_for_testing(
+        mut self,
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+        add_bos: bool,
+        add_eos: bool,
+    ) -> Self {
+        self.bos_id = bos_id;
+        self.eos_id = eos_id;
+        self.add_bos = add_bos;
+        self.add_eos = add_eos;
+        self
     }
 
     /// Encode text, optionally adding the model's special BOS/EOS markers —
@@ -244,22 +300,129 @@ impl BpeTokenizer {
         result
     }
 
+    /// Encode text into token IDs and token offsets.
+    ///
+    /// Offsets provide both Unicode code-point boundaries (for string slicing)
+    /// and UTF-8 byte boundaries (for byte slice safety).
+    pub fn encode_with_offsets(&self, text: &str) -> (Vec<u32>, Vec<TokenOffset>) {
+        if text.is_empty() {
+            return (vec![], vec![]);
+        }
+
+        // Build monotonic byte -> char mapping tables for start and end boundaries
+        let total_chars = text.chars().count();
+        let mut byte_start_to_char = vec![0usize; text.len() + 1];
+        let mut byte_end_to_char = vec![0usize; text.len() + 1];
+
+        for (char_idx, (byte_pos, ch)) in text.char_indices().enumerate() {
+            let ch_len = ch.len_utf8();
+            for b in 0..ch_len {
+                byte_start_to_char[byte_pos + b] = char_idx;
+                byte_end_to_char[byte_pos + b + 1] = char_idx + 1;
+            }
+        }
+        byte_start_to_char[text.len()] = total_chars;
+        byte_end_to_char[text.len()] = total_chars;
+
+        let segments = self.split_special_tokens(text);
+        let mut token_ids = Vec::new();
+        let mut offsets = Vec::new();
+
+        for segment in &segments {
+            match *segment {
+                Segment::Special(id, b_start, b_end) => {
+                    token_ids.push(id);
+                    offsets.push(TokenOffset {
+                        char_start: byte_start_to_char[b_start],
+                        char_end: byte_end_to_char[b_end],
+                        byte_start: b_start,
+                        byte_end: b_end,
+                    });
+                }
+                Segment::Text(s, seg_b_start) => {
+                    for (chunk, chunk_b_start, _) in self.pretokenize_ranges(s) {
+                        let (chunk_ids, byte_lens) = self.bpe_encode_chunk_with_byte_lens(chunk);
+                        let mut curr_byte = seg_b_start + chunk_b_start;
+                        for (tok_id, b_len) in chunk_ids.into_iter().zip(byte_lens) {
+                            let next_byte = curr_byte + b_len;
+                            token_ids.push(tok_id);
+                            offsets.push(TokenOffset {
+                                char_start: byte_start_to_char[curr_byte],
+                                char_end: byte_end_to_char[next_byte],
+                                byte_start: curr_byte,
+                                byte_end: next_byte,
+                            });
+                            curr_byte = next_byte;
+                        }
+                    }
+                }
+            }
+        }
+
+        (token_ids, offsets)
+    }
+
+    /// Like `encode_with_offsets`, but optionally prepends BOS or appends EOS.
+    ///
+    /// Special marker tokens receive zero-length offsets: (0, 0) for BOS
+    /// and (len, len) for EOS.
+    pub fn encode_special_with_offsets(
+        &self,
+        text: &str,
+        add_special: bool,
+    ) -> (Vec<u32>, Vec<TokenOffset>) {
+        let (tokens, offsets) = self.encode_with_offsets(text);
+        let bos = if add_special && self.add_bos {
+            self.bos_id
+        } else {
+            None
+        };
+        let eos = if add_special && self.add_eos {
+            self.eos_id
+        } else {
+            None
+        };
+
+        if bos.is_none() && eos.is_none() {
+            return (tokens, offsets);
+        }
+
+        let cap = tokens.len() + bos.is_some() as usize + eos.is_some() as usize;
+        let mut out_tokens = Vec::with_capacity(cap);
+        let mut out_offsets = Vec::with_capacity(cap);
+
+        if let Some(b) = bos {
+            out_tokens.push(b);
+            out_offsets.push(TokenOffset {
+                char_start: 0,
+                char_end: 0,
+                byte_start: 0,
+                byte_end: 0,
+            });
+        }
+
+        out_tokens.extend(tokens);
+        out_offsets.extend(offsets);
+
+        if let Some(e) = eos {
+            let total_chars = text.chars().count();
+            let total_bytes = text.len();
+            out_tokens.push(e);
+            out_offsets.push(TokenOffset {
+                char_start: total_chars,
+                char_end: total_chars,
+                byte_start: total_bytes,
+                byte_end: total_bytes,
+            });
+        }
+
+        (out_tokens, out_offsets)
+    }
+
     /// Pretokenize a text segment into chunks, applying the regex split plus the
     /// `\s+(?!\S)` whitespace-donation the `regex` crate can't express directly.
-    ///
-    /// In the GPT-2/LLAMA3/Qwen2 pretokenizers a whitespace run *followed by* a
-    /// non-whitespace char yields its LAST whitespace char to the following
-    /// chunk — e.g. `"\n    return"` → `"\n   "` + `" return"`, not `"\n    "` +
-    /// `"return"`. Without this, indented/multi-space text (notably code)
-    /// tokenizes differently from llama.cpp.
-    ///
-    /// REFACT-family pretokenizers (`digits_split_bare`) split digits as a bare
-    /// `\p{N}` with no leading space, so a whitespace run before a digit keeps
-    /// its trailing space (llama.cpp leaves the digit bare). Only `gpt2` uses
-    /// ` ?\p{N}+`, where the digit does absorb the space; see
-    /// [`BpeTokenizer::digits_split_bare`] for why the other arms that also lack
-    /// a leading ` ?` still do not set the flag.
-    fn pretokenize<'a>(&self, s: &'a str) -> Vec<&'a str> {
+    /// Returns the chunk slice and its [start, end) byte offsets relative to `s`.
+    fn pretokenize_ranges<'a>(&self, s: &'a str) -> Vec<(&'a str, usize, usize)> {
         let mut ranges: Vec<(usize, usize)> = self
             .pretokenize_re
             .find_iter(s)
@@ -293,18 +456,26 @@ impl BpeTokenizer {
                 ranges[i + 1].0 = b - 1;
             }
         }
-        ranges.iter().map(|&(a, b)| &s[a..b]).collect()
+        ranges.into_iter().map(|(a, b)| (&s[a..b], a, b)).collect()
+    }
+
+    fn pretokenize<'a>(&self, s: &'a str) -> Vec<&'a str> {
+        self.pretokenize_ranges(s)
+            .into_iter()
+            .map(|(chunk, _, _)| chunk)
+            .collect()
     }
 
     /// Split text at special token boundaries, returning alternating
-    /// text segments and special token IDs.
+    /// text segments and special token IDs with their byte offsets.
     fn split_special_tokens<'a>(&self, text: &'a str) -> Vec<Segment<'a>> {
         if self.special_tokens.is_empty() {
-            return vec![Segment::Text(text)];
+            return vec![Segment::Text(text, 0)];
         }
 
         let mut segments = Vec::new();
         let mut remaining = text;
+        let mut current_offset = 0;
 
         while !remaining.is_empty() {
             // Find the earliest special token in the remaining text.
@@ -324,13 +495,18 @@ impl BpeTokenizer {
             match best {
                 Some((start, end, id)) => {
                     if start > 0 {
-                        segments.push(Segment::Text(&remaining[..start]));
+                        segments.push(Segment::Text(&remaining[..start], current_offset));
                     }
-                    segments.push(Segment::Special(id));
+                    segments.push(Segment::Special(
+                        id,
+                        current_offset + start,
+                        current_offset + end,
+                    ));
+                    current_offset += end;
                     remaining = &remaining[end..];
                 }
                 None => {
-                    segments.push(Segment::Text(remaining));
+                    segments.push(Segment::Text(remaining, current_offset));
                     break;
                 }
             }
@@ -339,10 +515,11 @@ impl BpeTokenizer {
         segments
     }
 
-    /// Apply BPE to a single pretokenized chunk.
-    fn bpe_encode_chunk(&self, chunk: &str) -> Vec<u32> {
+    /// Apply BPE to a single pretokenized chunk, returning token IDs and
+    /// the original UTF-8 byte width of each token in `chunk`.
+    fn bpe_encode_chunk_with_byte_lens(&self, chunk: &str) -> (Vec<u32>, Vec<usize>) {
         if chunk.is_empty() {
-            return vec![];
+            return (vec![], vec![]);
         }
 
         // Convert each raw byte through the GPT-2 byte-to-unicode mapping,
@@ -351,7 +528,8 @@ impl BpeTokenizer {
         let unicode_str = bytes_to_gpt2_unicode(chunk.as_bytes(), &self.byte_to_unicode);
 
         // Each mapped unicode character becomes an initial BPE symbol.
-        // Characters may be multi-byte in UTF-8 (e.g., Ġ = \xC4\xA0).
+        // Because bytes_to_gpt2_unicode maps 1 byte -> 1 char, each initial
+        // token corresponds to exactly 1 byte in chunk.as_bytes().
         let mut tokens: Vec<Vec<u8>> = unicode_str
             .chars()
             .map(|c| {
@@ -360,6 +538,8 @@ impl BpeTokenizer {
                 s.as_bytes().to_vec()
             })
             .collect();
+
+        let mut token_byte_lens = vec![1usize; tokens.len()];
 
         // Repeatedly merge the highest-priority pair
         loop {
@@ -387,13 +567,23 @@ impl BpeTokenizer {
             let merged = [tokens[best_idx].as_slice(), tokens[best_idx + 1].as_slice()].concat();
             tokens[best_idx] = merged;
             tokens.remove(best_idx + 1);
+
+            token_byte_lens[best_idx] += token_byte_lens[best_idx + 1];
+            token_byte_lens.remove(best_idx + 1);
         }
 
         // Convert token byte sequences to IDs
-        tokens
+        let ids = tokens
             .iter()
             .map(|t| self.token_to_id.get(t).copied().unwrap_or(0))
-            .collect()
+            .collect();
+
+        (ids, token_byte_lens)
+    }
+
+    /// Apply BPE to a single pretokenized chunk.
+    fn bpe_encode_chunk(&self, chunk: &str) -> Vec<u32> {
+        self.bpe_encode_chunk_with_byte_lens(chunk).0
     }
 
     /// Decode token IDs back to a string.
@@ -1609,5 +1799,94 @@ mod tests {
         assert_eq!(anchors[1], (7, SemanticBoundaryKind::ToolCall));
         assert_eq!(anchors[2], (9, SemanticBoundaryKind::Thinking));
         assert_eq!(anchors[3], (10, SemanticBoundaryKind::ImageTokens));
+    }
+
+    #[test]
+    fn test_encode_with_offsets_ascii_and_unicode() {
+        let tok = make_gpt2_style_tokenizer();
+
+        // 1. Basic ASCII test
+        let text = "Hi world";
+        let (tokens, offsets) = tok.encode_with_offsets(text);
+        assert_eq!(tokens, tok.encode(text));
+        assert_eq!(tokens.len(), offsets.len());
+        for off in &offsets {
+            assert!(off.byte_start < off.byte_end);
+            assert!(off.char_start < off.char_end);
+            let slice = &text[off.byte_start..off.byte_end];
+            assert!(!slice.is_empty());
+        }
+        // First token is "Hi" (bytes 0..2, chars 0..2)
+        assert_eq!(offsets[0].byte_start, 0);
+        assert_eq!(offsets[0].byte_end, 2);
+        assert_eq!(offsets[0].char_start, 0);
+        assert_eq!(offsets[0].char_end, 2);
+        assert_eq!(&text[offsets[0].byte_start..offsets[0].byte_end], "Hi");
+
+        // Second token is " world" (bytes 2..8, chars 2..8)
+        assert_eq!(offsets[1].byte_start, 2);
+        assert_eq!(offsets[1].byte_end, 8);
+        assert_eq!(offsets[1].char_start, 2);
+        assert_eq!(offsets[1].char_end, 8);
+        assert_eq!(&text[offsets[1].byte_start..offsets[1].byte_end], " world");
+
+        // 2. Multi-byte Unicode test with accents and emojis
+        // In UTF-8: 'é' is 2 bytes (1 char), '☕' is 3 bytes (1 char)
+        let uni_text = "café ☕ Hi";
+        let (uni_tokens, uni_offsets) = tok.encode_with_offsets(uni_text);
+        assert_eq!(uni_tokens, tok.encode(uni_text));
+        assert_eq!(uni_tokens.len(), uni_offsets.len());
+
+        let mut reconstructed_bytes = Vec::new();
+        for off in &uni_offsets {
+            assert!(off.byte_start < off.byte_end);
+            assert!(off.char_start < off.char_end);
+            let byte_slice = &uni_text.as_bytes()[off.byte_start..off.byte_end];
+            assert!(!byte_slice.is_empty());
+            reconstructed_bytes.extend_from_slice(byte_slice);
+
+            // If the token starts and ends on valid char boundaries, string slicing must match
+            if uni_text.is_char_boundary(off.byte_start) && uni_text.is_char_boundary(off.byte_end)
+            {
+                let char_slice: String = uni_text
+                    .chars()
+                    .skip(off.char_start)
+                    .take(off.char_end - off.char_start)
+                    .collect();
+                assert_eq!(&uni_text[off.byte_start..off.byte_end], char_slice);
+            }
+        }
+        assert_eq!(reconstructed_bytes, uni_text.as_bytes());
+
+        // 3. Special tokens with BOS
+        let mut special_tok = tok;
+        special_tok.bos_id = Some(100);
+        special_tok.eos_id = Some(101);
+        special_tok.add_bos = true;
+        special_tok.add_eos = true;
+
+        let (spec_tokens, spec_offsets) = special_tok.encode_special_with_offsets(text, true);
+        assert_eq!(spec_tokens.len(), tokens.len() + 2);
+        assert_eq!(spec_tokens[0], 100);
+        assert_eq!(
+            spec_offsets[0],
+            TokenOffset {
+                char_start: 0,
+                char_end: 0,
+                byte_start: 0,
+                byte_end: 0
+            }
+        );
+        let last_idx = spec_tokens.len() - 1;
+        assert_eq!(spec_tokens[last_idx], 101);
+        assert_eq!(
+            spec_offsets[last_idx],
+            TokenOffset {
+                char_start: text.chars().count(),
+                char_end: text.chars().count(),
+                byte_start: text.len(),
+                byte_end: text.len()
+            }
+        );
     }
 }

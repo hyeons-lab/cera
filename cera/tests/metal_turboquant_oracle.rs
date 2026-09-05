@@ -583,6 +583,8 @@ fn host_config(head_dim: usize) -> ModelConfig {
         kv_heads_per_layer: vec![N_KV_HEADS; n_layers],
         scalars: ScalarMultipliers::default(),
         moe: None,
+        is_causal: true,
+        class_labels: Vec::new(),
     }
 }
 

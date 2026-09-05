@@ -45,6 +45,8 @@ fn make_test_config(n_layers: usize, hidden_size: usize) -> ModelConfig {
         kv_heads_per_layer: vec![0, 2],
         scalars: ScalarMultipliers::default(),
         moe: None,
+        is_causal: true,
+        class_labels: Vec::new(),
     }
 }
 

@@ -2231,6 +2231,7 @@ fn resolve_asr_model(
                 auth_token: cera::bundle::hf::get_hf_auth_token(),
                 progress: Some(progress.clone() as Arc<dyn cera::bundle::DownloadProgress>),
                 cancel: None,
+                tensor_overrides: Vec::new(),
             },
         )?;
         progress.finish_line();

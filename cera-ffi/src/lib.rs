@@ -1263,6 +1263,12 @@ impl CeraEngine {
     pub fn wipe_all_prefix_caches(&self) {
         self.inner.clear_cache();
     }
+
+    /// Detect PII entity spans in text using the loaded token classification model.
+    pub fn detect_pii(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
+        let spans = self.inner.detect_pii(&text)?;
+        Ok(spans.into_iter().map(Into::into).collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3167,6 +3173,91 @@ impl FfiVadIterator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PII Classification types
+// ---------------------------------------------------------------------------
+
+/// An identified PII entity span in source text.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FfiEntitySpan {
+    /// Entity label type (e.g. "NAME", "EMAIL", "PHONE_NUMBER", "STREET_ADDRESS").
+    pub entity_type: String,
+    /// UTF-8 character start index in source text (inclusive).
+    pub start_char: u64,
+    /// UTF-8 character end index in source text (exclusive).
+    pub end_char: u64,
+    /// Token start index in sequence (inclusive).
+    pub start_token: u64,
+    /// Token end index in sequence (exclusive).
+    pub end_token: u64,
+    /// Extracted text slice.
+    pub text: String,
+    /// Mean classification confidence score across the span tokens [0.0..1.0].
+    pub score: f32,
+}
+
+impl From<cera::EntitySpan> for FfiEntitySpan {
+    fn from(s: cera::EntitySpan) -> Self {
+        Self {
+            entity_type: s.entity_type,
+            start_char: s.start_char as u64,
+            end_char: s.end_char as u64,
+            start_token: s.start_token as u64,
+            end_token: s.end_token as u64,
+            text: s.text,
+            score: s.score,
+        }
+    }
+}
+
+/// Zero-dependency PII Classifier for named entity recognition.
+#[derive(uniffi::Object)]
+pub struct PiiClassifier {
+    engine: Arc<CeraEngine>,
+    adapter: Option<Arc<cera::lora::LoraAdapterWeights>>,
+}
+
+#[uniffi::export]
+impl PiiClassifier {
+    /// Load a PII classification model from a local GGUF path.
+    #[uniffi::constructor]
+    pub fn from_path(path: String) -> Result<Arc<Self>, FfiError> {
+        let engine = CeraEngine::from_path(path, EngineConfig::default())?;
+        Ok(Arc::new(Self {
+            engine,
+            adapter: None,
+        }))
+    }
+
+    /// Load a base model with a separate LoRA classifier adapter.
+    #[uniffi::constructor]
+    pub fn from_base_and_adapter(
+        base_path: String,
+        adapter_path: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        let engine = CeraEngine::from_path(base_path, EngineConfig::default())?;
+        let adapter =
+            cera::lora::LoraAdapterWeights::load_from_path(std::path::Path::new(&adapter_path))
+                .map_err(|e| FfiError::Backend {
+                    detail: format!("load adapter {adapter_path}: {e}"),
+                })?;
+        Ok(Arc::new(Self {
+            engine,
+            adapter: Some(adapter),
+        }))
+    }
+
+    /// Detect PII entities in the input text.
+    pub fn detect(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
+        let spans = self
+            .engine
+            .inner
+            .detect_pii_with_lora(&text, self.adapter.clone())
+            .map_err(FfiError::from)?;
+        Ok(spans.into_iter().map(Into::into).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4072,5 +4163,26 @@ mod tests {
         assert_eq!(opts.top_k, core.top_k);
         assert_eq!(opts.min_p, core.min_p);
         assert_eq!(opts.repetition_penalty, core.repetition_penalty);
+    }
+
+    #[test]
+    fn entity_span_ffi_conversion() {
+        let span = cera::EntitySpan {
+            entity_type: "NAME".into(),
+            start_char: 5,
+            end_char: 15,
+            start_token: 2,
+            end_token: 4,
+            text: "Alice Smith".into(),
+            score: 0.98,
+        };
+        let ffi_span: FfiEntitySpan = span.clone().into();
+        assert_eq!(ffi_span.entity_type, span.entity_type);
+        assert_eq!(ffi_span.start_char, 5);
+        assert_eq!(ffi_span.end_char, 15);
+        assert_eq!(ffi_span.start_token, 2);
+        assert_eq!(ffi_span.end_token, 4);
+        assert_eq!(ffi_span.text, "Alice Smith");
+        assert_eq!(ffi_span.score, 0.98);
     }
 }

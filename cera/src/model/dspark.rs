@@ -183,6 +183,8 @@ impl DSparkConfig {
             kv_heads_per_layer: vec![self.num_kv_heads; self.num_layers],
             scalars: ScalarMultipliers::default(),
             moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
         }
     }
 }

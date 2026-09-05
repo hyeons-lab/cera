@@ -26,6 +26,7 @@ pub struct QuantizeOptions {
     pub auth_token: Option<String>,
     pub progress: Option<Arc<dyn DownloadProgress>>,
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub tensor_overrides: Vec<(String, TargetQuant)>,
 }
 
 impl Default for QuantizeOptions {
@@ -37,6 +38,7 @@ impl Default for QuantizeOptions {
             auth_token: crate::bundle::hf::get_hf_auth_token(),
             progress: None,
             cancel: None,
+            tensor_overrides: Vec::new(),
         }
     }
 }
@@ -264,10 +266,11 @@ pub fn stream_quantize_hf_repo(
                 .ok_or_else(|| {
                     CeraError::Backend(format!("tensor shape overflow for `{tensor_name}`"))
                 })?;
-            let ggml_type = opts.target_quant.select_ggml_type(
+            let ggml_type = opts.target_quant.select_ggml_type_with_overrides(
                 &gguf_name,
                 tensor_info.shape.len(),
                 num_elements,
+                &opts.tensor_overrides,
             );
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
 
@@ -586,6 +589,16 @@ pub fn quantize_safetensors_to_gguf(
     output_gguf_path: &Path,
     quant: TargetQuant,
 ) -> Result<(), CeraError> {
+    quantize_safetensors_to_gguf_with_overrides(input_path, output_gguf_path, quant, &[])
+}
+
+/// Quantize a local SafeTensors directory or file to GGUF with per-tensor quantization overrides.
+pub fn quantize_safetensors_to_gguf_with_overrides(
+    input_path: &Path,
+    output_gguf_path: &Path,
+    quant: TargetQuant,
+    overrides: &[(String, TargetQuant)],
+) -> Result<(), CeraError> {
     if !input_path.exists() {
         return Err(CeraError::Backend(format!(
             "input path `{}` does not exist",
@@ -628,19 +641,18 @@ pub fn quantize_safetensors_to_gguf(
                 tokenizer_path.display()
             ))
         })?;
-        if let Ok(tokenizer) = HfTokenizerJson::parse_from_bytes(&tok_bytes) {
-            let chat_template = dir
-                .join("tokenizer_config.json")
-                .exists()
-                .then(|| fs::read(dir.join("tokenizer_config.json")).ok())
-                .flatten()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| {
-                    v.get("chat_template")
-                        .and_then(|t| t.as_str().map(str::to_string))
-                });
-            tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
-        }
+        let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
+        let chat_template = dir
+            .join("tokenizer_config.json")
+            .exists()
+            .then(|| fs::read(dir.join("tokenizer_config.json")).ok())
+            .flatten()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("chat_template")
+                    .and_then(|t| t.as_str().map(str::to_string))
+            });
+        tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
     }
 
     let mut safetensors_files = Vec::new();
@@ -694,8 +706,12 @@ pub fn quantize_safetensors_to_gguf(
                 .ok_or_else(|| {
                     CeraError::Backend(format!("tensor shape overflow for `{raw_name}`"))
                 })?;
-            let ggml_type =
-                quant.select_ggml_type(&gguf_name, tensor_info.shape.len(), num_elements);
+            let ggml_type = quant.select_ggml_type_with_overrides(
+                &gguf_name,
+                tensor_info.shape.len(),
+                num_elements,
+                overrides,
+            );
 
             let dims: Vec<u64> = tensor_info.shape.iter().rev().map(|&d| d as u64).collect();
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);

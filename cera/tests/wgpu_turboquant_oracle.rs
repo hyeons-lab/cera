@@ -652,6 +652,8 @@ fn check_snapshot_roundtrip(ctx: &GpuContext, head_dim: usize) {
         kv_heads_per_layer: vec![N_KV_HEADS; n_layers],
         scalars: ScalarMultipliers::default(),
         moe: None,
+        is_causal: true,
+        class_labels: Vec::new(),
     };
     let tq = TqGpuCache::new(ctx, &config, MAX_SEQ, SEQ_LEN, TqMode { seed: SEED })
         .expect("TqGpuCache allocation");

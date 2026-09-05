@@ -116,6 +116,11 @@ impl GgufWriter {
         self.alignment
     }
 
+    /// Get a reference to a metadata value by key.
+    pub fn get_metadata(&self, key: &str) -> Option<&MetadataValue> {
+        self.metadata.get(key)
+    }
+
     /// Add a string metadata key-value pair.
     pub fn add_string(&mut self, key: impl Into<String>, val: impl Into<String>) {
         self.metadata
