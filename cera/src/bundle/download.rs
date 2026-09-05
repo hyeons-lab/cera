@@ -240,6 +240,9 @@ impl ActiveDownloadGuard {
                 .map(|cwd| cwd.join(path))
                 .unwrap_or_else(|_| path.to_path_buf())
         };
+        if let Some(parent) = abs.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let canon = if abs.exists() {
             abs.canonicalize().unwrap_or(abs)
         } else if let Some(parent) = abs.parent().filter(|p| p.exists()) {

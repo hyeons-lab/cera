@@ -16,7 +16,7 @@ class ChatController extends ValueNotifier<ChatState> {
   ChatController({Future<String?> Function()? defaultStoreDir})
     : _defaultStoreDir = defaultStoreDir ?? (() async => null),
       super(const ChatState()) {
-    const kAppRevisionBadge = 'rev22-local-models-webgpu';
+    const kAppRevisionBadge = 'rev23-local-models-webgpu';
     debugPrint(
       '[cera:chat:version] ChatController v0.5.3 (build: $kAppRevisionBadge)',
     );
