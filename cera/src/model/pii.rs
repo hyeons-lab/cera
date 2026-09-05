@@ -188,6 +188,15 @@ pub struct DynamicSpanHeadWeights {
     pub span_threshold: f32,
 }
 
+/// Pre-allocated scratch buffers for span head scoring to eliminate allocations in sliding window loops.
+#[derive(Debug, Default, Clone)]
+pub struct SpanHeadScratch {
+    pub features: Vec<f32>,
+    pub h_proj: Vec<f32>,
+    pub p_spans: Vec<f32>,
+    pub scores: Vec<f32>,
+}
+
 /// Candidate span representation index.
 #[derive(Debug, Clone, Copy)]
 pub struct CandidateSpan {
@@ -228,15 +237,16 @@ impl DynamicSpanHeadWeights {
         proj
     }
 
-    /// Run vectorized span extraction and scoring against projected label queries.
+    /// Run vectorized span extraction and scoring against projected label queries using pre-allocated scratch buffers.
     ///
     /// Returns a list of detected (span_index, label_index, confidence_score).
-    pub fn score_spans(
+    pub fn score_spans_with_scratch(
         &self,
         hidden_states: &[f32],
         n_tokens: usize,
         projected_labels: &[f32],
         n_labels: usize,
+        scratch: &mut SpanHeadScratch,
     ) -> Vec<(CandidateSpan, usize, f32)> {
         let d = self.hidden_dim;
         let s_dim = self.size_dim;
@@ -270,15 +280,28 @@ impl DynamicSpanHeadWeights {
             (self.span_threshold / (1.0 - self.span_threshold)).ln()
         };
         const CHUNK_SIZE: usize = 1024;
-        let mut chunk_features = vec![0.0f32; CHUNK_SIZE * span_in_dim];
-        let mut chunk_h_proj = vec![0.0f32; CHUNK_SIZE * d];
-        let mut chunk_p_spans = vec![0.0f32; CHUNK_SIZE * d];
-        let mut chunk_scores = vec![0.0f32; CHUNK_SIZE * n_labels];
+        let feat_needed = CHUNK_SIZE * span_in_dim;
+        let h_proj_needed = CHUNK_SIZE * d;
+        let p_spans_needed = CHUNK_SIZE * d;
+        let scores_needed = CHUNK_SIZE * n_labels;
+
+        if scratch.features.len() < feat_needed {
+            scratch.features.resize(feat_needed, 0.0);
+        }
+        if scratch.h_proj.len() < h_proj_needed {
+            scratch.h_proj.resize(h_proj_needed, 0.0);
+        }
+        if scratch.p_spans.len() < p_spans_needed {
+            scratch.p_spans.resize(p_spans_needed, 0.0);
+        }
+        if scratch.scores.len() < scores_needed {
+            scratch.scores.resize(scores_needed, 0.0);
+        }
 
         // Process candidate spans in bounded chunks to prevent large transient heap spikes
         for chunk in candidates.chunks(CHUNK_SIZE) {
             let n_chunk = chunk.len();
-            let feat_slice = &mut chunk_features[..n_chunk * span_in_dim];
+            let feat_slice = &mut scratch.features[..n_chunk * span_in_dim];
             for (i, cs) in chunk.iter().enumerate() {
                 let out_slice = &mut feat_slice[i * span_in_dim..(i + 1) * span_in_dim];
                 let h_start = &hidden_states[cs.start * d..(cs.start + 1) * d];
@@ -301,7 +324,7 @@ impl DynamicSpanHeadWeights {
             }
 
             // 1. Project spans: MLP 1 [n_chunk, span_in_dim] * [d, span_in_dim]^T -> [n_chunk, d]
-            let h_proj_slice = &mut chunk_h_proj[..n_chunk * d];
+            let h_proj_slice = &mut scratch.h_proj[..n_chunk * d];
             matmul_nt_f32(
                 n_chunk,
                 d,
@@ -314,7 +337,7 @@ impl DynamicSpanHeadWeights {
             cpu::gelu_inplace(h_proj_slice);
 
             // 2. Project spans: MLP 2 [n_chunk, d] * [d, d]^T -> [n_chunk, d]
-            let p_spans_slice = &mut chunk_p_spans[..n_chunk * d];
+            let p_spans_slice = &mut scratch.p_spans[..n_chunk * d];
             matmul_nt_f32(
                 n_chunk,
                 d,
@@ -326,7 +349,7 @@ impl DynamicSpanHeadWeights {
             );
 
             // 3. Dot product cross-attention scoring: [n_chunk, d] * [n_labels, d]^T -> [n_chunk, n_labels]
-            let scores_slice = &mut chunk_scores[..n_chunk * n_labels];
+            let scores_slice = &mut scratch.scores[..n_chunk * n_labels];
             matmul_nt_f32(
                 n_chunk,
                 n_labels,
@@ -351,6 +374,26 @@ impl DynamicSpanHeadWeights {
             }
         }
         detections
+    }
+
+    /// Run vectorized span extraction and scoring against projected label queries.
+    ///
+    /// Returns a list of detected (span_index, label_index, confidence_score).
+    pub fn score_spans(
+        &self,
+        hidden_states: &[f32],
+        n_tokens: usize,
+        projected_labels: &[f32],
+        n_labels: usize,
+    ) -> Vec<(CandidateSpan, usize, f32)> {
+        let mut scratch = SpanHeadScratch::default();
+        self.score_spans_with_scratch(
+            hidden_states,
+            n_tokens,
+            projected_labels,
+            n_labels,
+            &mut scratch,
+        )
     }
 }
 
@@ -637,6 +680,7 @@ impl SlidingWindowScanner {
         let n_tokens = tokens.len();
         let mut raw_candidates: Vec<DetectedEntity> = Vec::new();
         let mut state = InferenceState::new(self.model.backbone.config().n_layers);
+        let mut span_scratch = SpanHeadScratch::default();
 
         // Process overlapping sliding windows
         let mut win_start = 0;
@@ -655,11 +699,12 @@ impl SlidingWindowScanner {
             let (_prob, bypass) = self.model.sensitivity_head.score(&hidden_states, win_len);
             if !bypass {
                 // 3. Dynamic span head scoring
-                let win_detections = self.model.span_head.score_spans(
+                let win_detections = self.model.span_head.score_spans_with_scratch(
                     &hidden_states,
                     win_len,
                     &self.model.projected_labels,
                     self.model.labels.len(),
+                    &mut span_scratch,
                 );
 
                 for (cs, l_idx, score) in win_detections {
@@ -1138,12 +1183,26 @@ mod tests {
     #[test]
     fn test_scan_with_cancel_atomic_flag_logic() {
         let cancel = std::sync::atomic::AtomicBool::new(true);
-        let flag_loaded = cancel.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(flag_loaded);
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
 
-        // Reset semantics
+        // When cancel is true, scan_with_cancel returns Err(CeraError::Cancelled)
+        let check_cancel = |c: Option<&std::sync::atomic::AtomicBool>| -> Result<()> {
+            if c.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(CeraError::Cancelled.into());
+            }
+            Ok(())
+        };
+        assert!(matches!(
+            check_cancel(Some(&cancel))
+                .unwrap_err()
+                .downcast_ref::<CeraError>(),
+            Some(CeraError::Cancelled)
+        ));
+
+        // Reset semantics: after clearing, cancellation guard passes
         cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(check_cancel(Some(&cancel)).is_ok());
     }
 
     #[test]
@@ -1244,5 +1303,77 @@ mod tests {
         assert!(sigmoid(-100.0) < 1e-10);
         assert!(sigmoid(-1000.0) >= 0.0 && sigmoid(-1000.0) < 1e-10);
         assert!(sigmoid(1000.0) <= 1.0 && (sigmoid(1000.0) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_score_spans_with_scratch_parity_and_reuse() {
+        let hidden_dim = 4;
+        let max_span_length = 2;
+        let size_dim = 2;
+        let span_in_dim = 3 * hidden_dim + size_dim;
+        let n_labels = 1;
+
+        let span_head = DynamicSpanHeadWeights {
+            hidden_dim,
+            max_span_length,
+            size_dim,
+            span_size_embedding: vec![0.1; (max_span_length + 1) * size_dim],
+            proj1_weight: vec![0.05; hidden_dim * span_in_dim],
+            proj1_bias: vec![0.0; hidden_dim],
+            proj2_weight: vec![0.05; hidden_dim * hidden_dim],
+            proj2_bias: vec![0.0; hidden_dim],
+            label_proj_weight: vec![0.1; hidden_dim * hidden_dim],
+            label_proj_bias: vec![0.0; hidden_dim],
+            span_threshold: 0.1,
+        };
+
+        let n_tokens = 3;
+        let hidden_states = vec![0.2; n_tokens * hidden_dim];
+        let projected_labels = vec![0.3; n_labels * hidden_dim];
+
+        // 1. Without external scratch
+        let detections_default =
+            span_head.score_spans(&hidden_states, n_tokens, &projected_labels, n_labels);
+
+        // 2. With fresh scratch
+        let mut scratch = SpanHeadScratch::default();
+        let detections_scratch = span_head.score_spans_with_scratch(
+            &hidden_states,
+            n_tokens,
+            &projected_labels,
+            n_labels,
+            &mut scratch,
+        );
+
+        assert_eq!(detections_default.len(), detections_scratch.len());
+        for ((cs1, l1, s1), (cs2, l2, s2)) in
+            detections_default.iter().zip(detections_scratch.iter())
+        {
+            assert_eq!(cs1.start, cs2.start);
+            assert_eq!(cs1.end, cs2.end);
+            assert_eq!(cs1.length, cs2.length);
+            assert_eq!(*l1, *l2);
+            assert!((*s1 - *s2).abs() < 1e-6);
+        }
+
+        // 3. Reuse the existing scratch buffer (simulating subsequent window iterations)
+        let detections_scratch_reuse = span_head.score_spans_with_scratch(
+            &hidden_states,
+            n_tokens,
+            &projected_labels,
+            n_labels,
+            &mut scratch,
+        );
+        assert_eq!(detections_scratch.len(), detections_scratch_reuse.len());
+        for ((cs1, l1, s1), (cs2, l2, s2)) in detections_scratch
+            .iter()
+            .zip(detections_scratch_reuse.iter())
+        {
+            assert_eq!(cs1.start, cs2.start);
+            assert_eq!(cs1.end, cs2.end);
+            assert_eq!(cs1.length, cs2.length);
+            assert_eq!(*l1, *l2);
+            assert!((*s1 - *s2).abs() < 1e-6);
+        }
     }
 }

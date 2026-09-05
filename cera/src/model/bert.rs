@@ -623,20 +623,35 @@ impl Model for BertModel {
             }
         }
 
-        // 2. Transformer layers
-        let mut q_mat = vec![0.0f32; n_tokens * d];
-        let mut k_mat = vec![0.0f32; n_tokens * d];
-        let mut v_mat = vec![0.0f32; n_tokens * d];
-        let mut attn_out = vec![0.0f32; n_tokens * d];
-
-        let mut norm_x = vec![0.0f32; n_tokens * d];
-        let mut ffn_norm_x = vec![0.0f32; n_tokens * d];
-        let mut proj_out = vec![0.0f32; d];
+        // 2. Transformer layers (reuse scratch buffers from state to avoid per-chunk heap allocations)
+        let scratch = &mut _state.scratch;
+        scratch.q.resize(n_tokens * d, 0.0);
+        scratch.k.resize(n_tokens * d, 0.0);
+        scratch.v.resize(n_tokens * d, 0.0);
+        scratch.attn_out.resize(n_tokens * d, 0.0);
+        scratch.normed.resize(n_tokens * d, 0.0);
+        if self.is_modernbert {
+            scratch.ffn_input.resize(n_tokens * d, 0.0);
+        }
+        scratch.out.resize(d, 0.0);
         let inter = self.config.intermediate_size;
-        let mut up_row = vec![0.0f32; inter];
-        let mut gate_row = vec![0.0f32; inter];
-        let mut down_row = vec![0.0f32; d];
-        let mut scores = vec![f32::NEG_INFINITY; n_tokens];
+        scratch.up.resize(inter, 0.0);
+        scratch.gate.resize(inter, 0.0);
+        scratch.conv_proj.resize(d, 0.0);
+        scratch.scores.resize(n_tokens, f32::NEG_INFINITY);
+
+        let q_mat = &mut scratch.q[..n_tokens * d];
+        let k_mat = &mut scratch.k[..n_tokens * d];
+        let v_mat = &mut scratch.v[..n_tokens * d];
+        let attn_out = &mut scratch.attn_out[..n_tokens * d];
+        let norm_x = &mut scratch.normed[..n_tokens * d];
+        let ffn_norm_x =
+            &mut scratch.ffn_input[..if self.is_modernbert { n_tokens * d } else { 0 }];
+        let proj_out = &mut scratch.out[..d];
+        let up_row = &mut scratch.up[..inter];
+        let gate_row = &mut scratch.gate[..inter];
+        let down_row = &mut scratch.conv_proj[..d];
+        let scores = &mut scratch.scores[..n_tokens];
 
         for layer in &self.layer_refs {
             norm_x.copy_from_slice(&x);
@@ -753,11 +768,11 @@ impl Model for BertModel {
             // Attention Output Projection & Residual
             for i in 0..n_tokens {
                 let row = &attn_out[i * d..(i + 1) * d];
-                transformer::gemv(&self.gguf, &layer.attn_output, row, &mut proj_out);
+                transformer::gemv(&self.gguf, &layer.attn_output, row, &mut *proj_out);
                 if let Some(ref b) = layer.attn_output_bias {
-                    cpu::add_inplace(&mut proj_out, b);
+                    cpu::add_inplace(&mut *proj_out, b);
                 }
-                cpu::add_inplace(&mut x[i * d..(i + 1) * d], &proj_out);
+                cpu::add_inplace(&mut x[i * d..(i + 1) * d], proj_out);
 
                 // Post-LN for Classic BERT
                 if !self.is_modernbert {
@@ -779,8 +794,8 @@ impl Model for BertModel {
             }
 
             // Feed-Forward Network (FFN)
-            ffn_norm_x.copy_from_slice(&x);
             if self.is_modernbert {
+                ffn_norm_x.copy_from_slice(&x);
                 for i in 0..n_tokens {
                     layer_norm_no_bias_inplace(
                         &mut ffn_norm_x[i * d..(i + 1) * d],
@@ -794,32 +809,32 @@ impl Model for BertModel {
                 // ModernBERT GeGLU path: ffn_down(gelu(ffn_gate(x)) * ffn_up(x))
                 for i in 0..n_tokens {
                     let row = &ffn_norm_x[i * d..(i + 1) * d];
-                    transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut up_row);
-                    transformer::gemv(&self.gguf, gate_ref, row, &mut gate_row);
+                    transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut *up_row);
+                    transformer::gemv(&self.gguf, gate_ref, row, &mut *gate_row);
 
-                    cpu::gelu_inplace(&mut gate_row);
-                    cpu::mul_inplace(&mut gate_row, &up_row);
+                    cpu::gelu_inplace(&mut *gate_row);
+                    cpu::mul_inplace(&mut *gate_row, up_row);
 
-                    transformer::gemv(&self.gguf, &layer.ffn_down, &gate_row, &mut down_row);
-                    cpu::add_inplace(&mut x[i * d..(i + 1) * d], &down_row);
+                    transformer::gemv(&self.gguf, &layer.ffn_down, gate_row, &mut *down_row);
+                    cpu::add_inplace(&mut x[i * d..(i + 1) * d], down_row);
                 }
             } else {
                 // Classic BERT MLP path: ffn_down(gelu(ffn_up(x) + bias)) + bias
                 for i in 0..n_tokens {
                     let row = &x[i * d..(i + 1) * d];
-                    transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut up_row);
+                    transformer::gemv(&self.gguf, &layer.ffn_up, row, &mut *up_row);
                     if let Some(ref b) = layer.ffn_up_bias {
-                        cpu::add_inplace(&mut up_row, b);
+                        cpu::add_inplace(&mut *up_row, b);
                     }
 
-                    cpu::gelu_inplace(&mut up_row);
+                    cpu::gelu_inplace(&mut *up_row);
 
-                    transformer::gemv(&self.gguf, &layer.ffn_down, &up_row, &mut down_row);
+                    transformer::gemv(&self.gguf, &layer.ffn_down, up_row, &mut *down_row);
                     if let Some(ref b) = layer.ffn_down_bias {
-                        cpu::add_inplace(&mut down_row, b);
+                        cpu::add_inplace(&mut *down_row, b);
                     }
 
-                    cpu::add_inplace(&mut x[i * d..(i + 1) * d], &down_row);
+                    cpu::add_inplace(&mut x[i * d..(i + 1) * d], down_row);
 
                     if let Some(ref b) = layer.ffn_norm_bias {
                         cpu::layer_norm_inplace(
