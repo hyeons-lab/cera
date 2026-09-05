@@ -503,6 +503,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717:
@@ -591,11 +593,13 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens() != 50332:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 54889:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 2908:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -621,11 +625,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate() != 57005:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 58489:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 43707:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -644,6 +648,12 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1020,10 +1030,13 @@ _UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink.restype 
 _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint32,ctypes.c_void_p,
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint32,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK = ctypes.CFUNCTYPE(ctypes.c_uint64,ctypes.c_uint64,
@@ -1034,9 +1047,10 @@ class _UniffiVTableCallbackInterfaceCeraFfiModalitySink(ctypes.Structure):
     _fields_ = [
         ("uniffi_free", _UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_MODALITY_SINK),
         ("uniffi_clone", _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK),
-        ("on_text_tokens", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0),
-        ("on_audio_frames", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1),
-        ("on_done", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2),
+        ("on_thought_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0),
+        ("on_text_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1),
+        ("on_audio_frames", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2),
+        ("on_done", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3),
     ]
 _UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.argtypes = (
     ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiModalitySink),
@@ -1099,6 +1113,13 @@ _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_clear_cache.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_clear_cache.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_download_bundle.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_download_bundle.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_store_dir.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1357,12 +1378,18 @@ _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.restype = ctypes.c_uint32
-_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_audio_frames.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1512,6 +1539,27 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_and_generate.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_and_generate.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_streaming.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_streaming.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1557,6 +1605,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size.restype = ctype
 _UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.restype = ctypes.c_uint16
@@ -1689,9 +1740,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors.re
 _UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens.argtypes = (
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.argtypes = (
 )
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_tokens.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.restype = ctypes.c_uint16
@@ -1770,6 +1824,15 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.restype = ctypes.
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.restype = ctypes.c_uint16
@@ -1843,6 +1906,90 @@ async def _uniffi_rust_call_async(rust_future, ffi_poll, ffi_complete, ffi_free,
 
 # Public interface members begin here.
 
+
+class _UniffiFfiConverterFloat32(_UniffiConverterPrimitiveFloat):
+    @staticmethod
+    def read(buf):
+        return buf.read_float()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_float(value)
+
+class _UniffiFfiConverterSequenceFloat32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterFloat32.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterFloat32.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterFloat32.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u32"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**32
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u32()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u32(value)
+
+@dataclass
+class AudioInput:
+    """
+    PCM audio input buffer.
+"""
+    def __init__(self, *, pcm:typing.List[float], sample_rate:int = 16000):
+        self.pcm = pcm
+        self.sample_rate = sample_rate
+        
+        
+
+    
+    def __str__(self):
+        return "AudioInput(pcm={}, sample_rate={})".format(self.pcm, self.sample_rate)
+    def __eq__(self, other):
+        if self.pcm != other.pcm:
+            return False
+        if self.sample_rate != other.sample_rate:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeAudioInput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return AudioInput(
+            pcm=_UniffiFfiConverterSequenceFloat32.read(buf),
+            sample_rate=_UniffiFfiConverterUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterSequenceFloat32.check_lower(value.pcm)
+        _UniffiFfiConverterUInt32.check_lower(value.sample_rate)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterSequenceFloat32.write(value.pcm, buf)
+        _UniffiFfiConverterUInt32.write(value.sample_rate, buf)
 
 class _UniffiFfiConverterString:
     @staticmethod
@@ -2010,19 +2157,6 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             buf.write_i32(4)
 
 
-
-class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u32"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**32
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u32()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u32(value)
 
 
 
@@ -2560,6 +2694,12 @@ class BundleRepoProtocol(typing.Protocol):
         action is user-driven.
 """
         raise NotImplementedError
+    def download_bundle(self, bundle_id: str,quant: str) -> None:
+        """
+        Download all assets for a bundle ID and quantization to the local cache
+        without loading model weights into memory or creating an engine.
+"""
+        raise NotImplementedError
     def store_dir(self, ) -> str:
         """
         The directory this repo caches bundles under. Matches what was
@@ -2706,6 +2846,28 @@ class BundleRepo(BundleRepoProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_clear_cache,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def download_bundle(self, bundle_id: str,quant: str) -> None:
+        """
+        Download all assets for a bundle ID and quantization to the local cache
+        without loading model weights into memory or creating an engine.
+"""
+        
+        _UniffiFfiConverterString.check_lower(bundle_id)
+
+        _UniffiFfiConverterString.check_lower(quant)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(bundle_id),
+            _UniffiFfiConverterString.lower(quant),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_download_bundle,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -2863,15 +3025,6 @@ class _UniffiFfiConverterTypeEngineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeBackendPreference.write(value.backend, buf)
         _UniffiFfiConverterOptionalTypeBundleRepo.write(value.bundle_repo, buf)
         _UniffiFfiConverterOptionalString.write(value.draft_model, buf)
-
-class _UniffiFfiConverterFloat32(_UniffiConverterPrimitiveFloat):
-    @staticmethod
-    def read(buf):
-        return buf.read_float()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_float(value)
 
 @dataclass
 class FfiEntitySpan:
@@ -3208,6 +3361,15 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.flush_every_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.flush_every_ms, buf)
 
+class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
+    @staticmethod
+    def read(buf):
+        return buf.read_double()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_double(value)
+
 
 
 
@@ -3453,18 +3615,21 @@ class GenerateSummary:
     """
     Decode-run metadata. Mirrors [`cera::GenerateSummary`].
 """
-    def __init__(self, *, tokens_generated:int, prompt_eval_tokens:int, prompt_eval_ms:int, decode_ms:int, finish_reason:FinishReason):
+    def __init__(self, *, tokens_generated:int, prompt_eval_tokens:int, prompt_eval_ms:int, decode_ms:int, total_duration_ms:int, decode_tok_per_sec:float, prompt_eval_tok_per_sec:float, finish_reason:FinishReason):
         self.tokens_generated = tokens_generated
         self.prompt_eval_tokens = prompt_eval_tokens
         self.prompt_eval_ms = prompt_eval_ms
         self.decode_ms = decode_ms
+        self.total_duration_ms = total_duration_ms
+        self.decode_tok_per_sec = decode_tok_per_sec
+        self.prompt_eval_tok_per_sec = prompt_eval_tok_per_sec
         self.finish_reason = finish_reason
         
         
 
     
     def __str__(self):
-        return "GenerateSummary(tokens_generated={}, prompt_eval_tokens={}, prompt_eval_ms={}, decode_ms={}, finish_reason={})".format(self.tokens_generated, self.prompt_eval_tokens, self.prompt_eval_ms, self.decode_ms, self.finish_reason)
+        return "GenerateSummary(tokens_generated={}, prompt_eval_tokens={}, prompt_eval_ms={}, decode_ms={}, total_duration_ms={}, decode_tok_per_sec={}, prompt_eval_tok_per_sec={}, finish_reason={})".format(self.tokens_generated, self.prompt_eval_tokens, self.prompt_eval_ms, self.decode_ms, self.total_duration_ms, self.decode_tok_per_sec, self.prompt_eval_tok_per_sec, self.finish_reason)
     def __eq__(self, other):
         if self.tokens_generated != other.tokens_generated:
             return False
@@ -3473,6 +3638,12 @@ class GenerateSummary:
         if self.prompt_eval_ms != other.prompt_eval_ms:
             return False
         if self.decode_ms != other.decode_ms:
+            return False
+        if self.total_duration_ms != other.total_duration_ms:
+            return False
+        if self.decode_tok_per_sec != other.decode_tok_per_sec:
+            return False
+        if self.prompt_eval_tok_per_sec != other.prompt_eval_tok_per_sec:
             return False
         if self.finish_reason != other.finish_reason:
             return False
@@ -3486,6 +3657,9 @@ class _UniffiFfiConverterTypeGenerateSummary(_UniffiConverterRustBuffer):
             prompt_eval_tokens=_UniffiFfiConverterUInt32.read(buf),
             prompt_eval_ms=_UniffiFfiConverterUInt32.read(buf),
             decode_ms=_UniffiFfiConverterUInt32.read(buf),
+            total_duration_ms=_UniffiFfiConverterUInt32.read(buf),
+            decode_tok_per_sec=_UniffiFfiConverterFloat64.read(buf),
+            prompt_eval_tok_per_sec=_UniffiFfiConverterFloat64.read(buf),
             finish_reason=_UniffiFfiConverterTypeFinishReason.read(buf),
         )
 
@@ -3495,6 +3669,9 @@ class _UniffiFfiConverterTypeGenerateSummary(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.prompt_eval_tokens)
         _UniffiFfiConverterUInt32.check_lower(value.prompt_eval_ms)
         _UniffiFfiConverterUInt32.check_lower(value.decode_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.total_duration_ms)
+        _UniffiFfiConverterFloat64.check_lower(value.decode_tok_per_sec)
+        _UniffiFfiConverterFloat64.check_lower(value.prompt_eval_tok_per_sec)
         _UniffiFfiConverterTypeFinishReason.check_lower(value.finish_reason)
 
     @staticmethod
@@ -3503,17 +3680,19 @@ class _UniffiFfiConverterTypeGenerateSummary(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.prompt_eval_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.prompt_eval_ms, buf)
         _UniffiFfiConverterUInt32.write(value.decode_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.total_duration_ms, buf)
+        _UniffiFfiConverterFloat64.write(value.decode_tok_per_sec, buf)
+        _UniffiFfiConverterFloat64.write(value.prompt_eval_tok_per_sec, buf)
         _UniffiFfiConverterTypeFinishReason.write(value.finish_reason, buf)
 
 @dataclass
 class GenerateOutput:
     """
     Bundle of everything a synchronous `generate` call produces:
-    the generated token IDs plus the decode summary. The two are
-    returned together so callers don't have to manage a separate
-    callback channel; streaming (per-chunk delivery) lands in PR 4.
+    the generated text string, token IDs, and decode summary.
 """
-    def __init__(self, *, tokens:typing.List[int], summary:GenerateSummary):
+    def __init__(self, *, text:str, tokens:typing.List[int], summary:GenerateSummary):
+        self.text = text
         self.tokens = tokens
         self.summary = summary
         
@@ -3521,8 +3700,10 @@ class GenerateOutput:
 
     
     def __str__(self):
-        return "GenerateOutput(tokens={}, summary={})".format(self.tokens, self.summary)
+        return "GenerateOutput(text={}, tokens={}, summary={})".format(self.text, self.tokens, self.summary)
     def __eq__(self, other):
+        if self.text != other.text:
+            return False
         if self.tokens != other.tokens:
             return False
         if self.summary != other.summary:
@@ -3533,17 +3714,20 @@ class _UniffiFfiConverterTypeGenerateOutput(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return GenerateOutput(
+            text=_UniffiFfiConverterString.read(buf),
             tokens=_UniffiFfiConverterSequenceUInt32.read(buf),
             summary=_UniffiFfiConverterTypeGenerateSummary.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.text)
         _UniffiFfiConverterSequenceUInt32.check_lower(value.tokens)
         _UniffiFfiConverterTypeGenerateSummary.check_lower(value.summary)
 
     @staticmethod
     def write(value, buf):
+        _UniffiFfiConverterString.write(value.text, buf)
         _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
         _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
 
@@ -4155,6 +4339,128 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.description, buf)
         _UniffiFfiConverterString.write(value.parameters_json, buf)
 
+class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative byte string length")
+        return buf.read(size)
+
+    @staticmethod
+    def check_lower(value):
+        try:
+            memoryview(value)
+        except TypeError:
+            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i32(len(value))
+        buf.write(value)
+
+class _UniffiFfiConverterSequenceBytes(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterBytes.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterBytes.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterBytes.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalTypeAudioInput(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeAudioInput.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeAudioInput.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeAudioInput.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class UserMessage:
+    """
+    User-facing multimodal input envelope.
+"""
+    def __init__(self, *, text:typing.Optional[str] = _DEFAULT, images:typing.List[bytes] = _DEFAULT, audio:typing.Optional[AudioInput] = _DEFAULT):
+        if text is _DEFAULT:
+            self.text = None
+        else:
+            self.text = text
+        if images is _DEFAULT:
+            self.images = []
+        else:
+            self.images = images
+        if audio is _DEFAULT:
+            self.audio = None
+        else:
+            self.audio = audio
+        
+        
+
+    
+    def __str__(self):
+        return "UserMessage(text={}, images={}, audio={})".format(self.text, self.images, self.audio)
+    def __eq__(self, other):
+        if self.text != other.text:
+            return False
+        if self.images != other.images:
+            return False
+        if self.audio != other.audio:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeUserMessage(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return UserMessage(
+            text=_UniffiFfiConverterOptionalString.read(buf),
+            images=_UniffiFfiConverterSequenceBytes.read(buf),
+            audio=_UniffiFfiConverterOptionalTypeAudioInput.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+        _UniffiFfiConverterSequenceBytes.check_lower(value.images)
+        _UniffiFfiConverterOptionalTypeAudioInput.check_lower(value.audio)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+        _UniffiFfiConverterSequenceBytes.write(value.images, buf)
+        _UniffiFfiConverterOptionalTypeAudioInput.write(value.audio, buf)
+
 
 
 
@@ -4472,49 +4778,6 @@ class _UniffiFfiConverterSequenceTypeFfiEntitySpan(_UniffiConverterRustBuffer):
             _UniffiFfiConverterTypeFfiEntitySpan.read(buf) for i in range(count)
         ]
 
-class _UniffiFfiConverterSequenceFloat32(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterFloat32.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterFloat32.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterFloat32.read(buf) for i in range(count)
-        ]
-
-class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative byte string length")
-        return buf.read(size)
-
-    @staticmethod
-    def check_lower(value):
-        try:
-            memoryview(value)
-        except TypeError:
-            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_i32(len(value))
-        buf.write(value)
-
 
 class LoraAdaptersProtocol(typing.Protocol):
     """
@@ -4656,23 +4919,29 @@ class ModalitySink():
     Streaming sink for decode output. Foreign callers implement this
     trait (Kotlin class, Swift class, Python subclass) and pass an
     `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
-    receive tokens + audio frames + the finish reason as they happen.
+    receive text chunks + thought chunks + audio frames + the finish reason
+    as they happen.
 
-    All methods are required from foreign implementations (UniFFI 0.28
+    All methods are required from foreign implementations (UniFFI 0.31
     foreign traits don't carry Rust's default-impl fallbacks). Callers
     that don't care about a modality can provide an empty body.
 
     Threading: every method is invoked on the same Rust thread running
-    `generate` — the decode thread. If the foreign runtime requires
+    `generate` (the decode thread). If the foreign runtime requires
     marshalling onto a different thread (e.g. Swift's `@MainActor`) it
     is the implementer's responsibility to dispatch the call there.
 """
     
-    def on_text_tokens(self, tokens: typing.List[int]) -> None:
+    def on_thought_chunk(self, text: str) -> None:
         """
-        Called with each chunk of generated token IDs. Ownership of the
-        `Vec<u32>` is transferred to the callback, so implementations
-        may retain or store it directly if needed — no clone required.
+        Called with each chunk of reasoning or chain-of-thought text
+        extracted from thinking delimiters (<think>...</think>).
+"""
+        raise NotImplementedError
+    def on_text_chunk(self, text: str) -> None:
+        """
+        Called with each chunk of generated user-facing text
+        as soon as valid characters are produced.
 """
         raise NotImplementedError
     def on_audio_frames(self, pcm: typing.List[float],sample_rate: int) -> None:
@@ -4700,14 +4969,15 @@ class ModalitySinkImpl(ModalitySink):
     Streaming sink for decode output. Foreign callers implement this
     trait (Kotlin class, Swift class, Python subclass) and pass an
     `Arc<dyn ModalitySink>` to [`Session::generate_streaming`] to
-    receive tokens + audio frames + the finish reason as they happen.
+    receive text chunks + thought chunks + audio frames + the finish reason
+    as they happen.
 
-    All methods are required from foreign implementations (UniFFI 0.28
+    All methods are required from foreign implementations (UniFFI 0.31
     foreign traits don't carry Rust's default-impl fallbacks). Callers
     that don't care about a modality can provide an empty body.
 
     Threading: every method is invoked on the same Rust thread running
-    `generate` — the decode thread. If the foreign runtime requires
+    `generate` (the decode thread). If the foreign runtime requires
     marshalling onto a different thread (e.g. Swift's `@MainActor`) it
     is the implementer's responsibility to dispatch the call there.
 """
@@ -4734,23 +5004,41 @@ class ModalitySinkImpl(ModalitySink):
         inst = cls.__new__(cls)
         inst._handle = handle
         return inst
-    def on_text_tokens(self, tokens: typing.List[int]) -> None:
+    def on_thought_chunk(self, text: str) -> None:
         """
-        Called with each chunk of generated token IDs. Ownership of the
-        `Vec<u32>` is transferred to the callback, so implementations
-        may retain or store it directly if needed — no clone required.
+        Called with each chunk of reasoning or chain-of-thought text
+        extracted from thinking delimiters (<think>...</think>).
 """
         
-        _UniffiFfiConverterSequenceUInt32.check_lower(tokens)
+        _UniffiFfiConverterString.check_lower(text)
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
-            _UniffiFfiConverterSequenceUInt32.lower(tokens),
+            _UniffiFfiConverterString.lower(text),
         )
         _uniffi_lift_return = lambda val: None
         _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_tokens,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def on_text_chunk(self, text: str) -> None:
+        """
+        Called with each chunk of generated user-facing text
+        as soon as valid characters are produced.
+"""
+        
+        _UniffiFfiConverterString.check_lower(text)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(text),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -4811,16 +5099,16 @@ class _UniffiTraitImplModalitySinkImpl:
     # For each method, generate a callback function to pass to Rust
 
     @_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0
-    def on_text_tokens(
+    def on_thought_chunk(
             uniffi_handle,
-            tokens,
+            text,
             uniffi_out_return,
             uniffi_call_status_ptr,
         ):
         uniffi_obj = _UniffiFfiConverterTypeModalitySink._handle_map.get(uniffi_handle)
         def make_call():
-            uniffi_args = (_UniffiFfiConverterSequenceUInt32.lift(tokens), )
-            uniffi_method = uniffi_obj.on_text_tokens
+            uniffi_args = (_UniffiFfiConverterString.lift(text), )
+            uniffi_method = uniffi_obj.on_thought_chunk
             return uniffi_method(*uniffi_args)
         write_return_value = lambda v: None
         _uniffi_trait_interface_call(
@@ -4830,6 +5118,25 @@ class _UniffiTraitImplModalitySinkImpl:
         )
 
     @_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1
+    def on_text_chunk(
+            uniffi_handle,
+            text,
+            uniffi_out_return,
+            uniffi_call_status_ptr,
+        ):
+        uniffi_obj = _UniffiFfiConverterTypeModalitySink._handle_map.get(uniffi_handle)
+        def make_call():
+            uniffi_args = (_UniffiFfiConverterString.lift(text), )
+            uniffi_method = uniffi_obj.on_text_chunk
+            return uniffi_method(*uniffi_args)
+        write_return_value = lambda v: None
+        _uniffi_trait_interface_call(
+                uniffi_call_status_ptr.contents,
+                make_call,
+                write_return_value,
+        )
+
+    @_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2
     def on_audio_frames(
             uniffi_handle,
             pcm,
@@ -4849,7 +5156,7 @@ class _UniffiTraitImplModalitySinkImpl:
                 write_return_value,
         )
 
-    @_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2
+    @_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3
     def on_done(
             uniffi_handle,
             reason,
@@ -4880,7 +5187,8 @@ class _UniffiTraitImplModalitySinkImpl:
     _uniffi_vtable = _UniffiVTableCallbackInterfaceCeraFfiModalitySink(
         _uniffi_free,
         _uniffi_clone,
-        on_text_tokens,
+        on_thought_chunk,
+        on_text_chunk,
         on_audio_frames,
         on_done,
     )
@@ -5112,12 +5420,9 @@ class SessionProtocol(typing.Protocol):
         raise NotImplementedError
     def generate(self, opts: GenerateOpts) -> GenerateOutput:
         """
-        Run autoregressive decode and return all emitted tokens +
-        a summary. Synchronous — the call blocks until the decode
-        loop exits (`max_tokens`, EOS, `cancel()`, or error).
-
-        For streaming (per-chunk delivery) and async, see the PR 4 /
-        PR 5 follow-ups in `cera-ffi/README.md`.
+        Run autoregressive decode and return all emitted text, tokens, and
+        summary. Synchronous: the call blocks until the decode loop exits
+        (`max_tokens`, EOS, `cancel()`, or error).
 """
         raise NotImplementedError
     async def generate_async(self, opts: GenerateOpts) -> GenerateOutput:
@@ -5147,17 +5452,17 @@ class SessionProtocol(typing.Protocol):
         raise NotImplementedError
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
-        Run autoregressive decode, streaming every token (and audio
+        Run autoregressive decode, streaming every text chunk (and audio
         frame, for audio-capable models) to a foreign [`ModalitySink`]
-        as soon as it's produced. Returns only a [`GenerateSummary`] —
-        token IDs are delivered through `sink.on_text_tokens`, not a
+        as soon as it is produced. Returns only a [`GenerateSummary`]:
+        text chunks are delivered through `sink.on_text_chunk`, not a
         return value.
 
         Synchronous: the call blocks on the decode thread and each
         `sink` method runs on that same thread before decoding
-        continues. For async, see PR 5 in `cera-ffi/README.md`.
+        continues.
 
-        **Callback reentrancy — deadlock hazard.** The session mutex is
+        **Callback reentrancy: deadlock hazard.** The session mutex is
         held for the entire call, and sink callbacks run while that
         lock is held. Calling back into methods that also take the
         mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -5276,6 +5581,24 @@ class SessionProtocol(typing.Protocol):
 
         Returns `Result` so a poisoned-mutex case surfaces as an error
         instead of panicking across the FFI boundary.
+"""
+        raise NotImplementedError
+    def send_message(self, message: UserMessage) -> None:
+        """
+        Append a multimodal message, automatically enforcing model-canonical
+        media ordering, boundary token envelopes, and sample rate normalization.
+"""
+        raise NotImplementedError
+    def send_message_and_generate(self, message: UserMessage,opts: GenerateOpts) -> GenerateOutput:
+        """
+        Append a multimodal message and run generation synchronously while holding
+        the session lock continuously across prefill and decode.
+"""
+        raise NotImplementedError
+    def send_message_streaming(self, message: UserMessage,opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Append a multimodal message and run streaming generation while holding
+        the session lock continuously across prefill and decode.
 """
         raise NotImplementedError
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
@@ -5609,12 +5932,9 @@ class Session(SessionProtocol):
         return _uniffi_lift_return(_uniffi_ffi_result)
     def generate(self, opts: GenerateOpts) -> GenerateOutput:
         """
-        Run autoregressive decode and return all emitted tokens +
-        a summary. Synchronous — the call blocks until the decode
-        loop exits (`max_tokens`, EOS, `cancel()`, or error).
-
-        For streaming (per-chunk delivery) and async, see the PR 4 /
-        PR 5 follow-ups in `cera-ffi/README.md`.
+        Run autoregressive decode and return all emitted text, tokens, and
+        summary. Synchronous: the call blocks until the decode loop exits
+        (`max_tokens`, EOS, `cancel()`, or error).
 """
         
         _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
@@ -5672,17 +5992,17 @@ class Session(SessionProtocol):
         )
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
-        Run autoregressive decode, streaming every token (and audio
+        Run autoregressive decode, streaming every text chunk (and audio
         frame, for audio-capable models) to a foreign [`ModalitySink`]
-        as soon as it's produced. Returns only a [`GenerateSummary`] —
-        token IDs are delivered through `sink.on_text_tokens`, not a
+        as soon as it is produced. Returns only a [`GenerateSummary`]:
+        text chunks are delivered through `sink.on_text_chunk`, not a
         return value.
 
         Synchronous: the call blocks on the decode thread and each
         `sink` method runs on that same thread before decoding
-        continues. For async, see PR 5 in `cera-ffi/README.md`.
+        continues.
 
-        **Callback reentrancy — deadlock hazard.** The session mutex is
+        **Callback reentrancy: deadlock hazard.** The session mutex is
         held for the entire call, and sink callbacks run while that
         lock is held. Calling back into methods that also take the
         mutex ([`Session::append_text`], [`Session::append_tokens`],
@@ -5923,6 +6243,72 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def send_message(self, message: UserMessage) -> None:
+        """
+        Append a multimodal message, automatically enforcing model-canonical
+        media ordering, boundary token envelopes, and sample rate normalization.
+"""
+        
+        _UniffiFfiConverterTypeUserMessage.check_lower(message)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeUserMessage.lower(message),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_send_message,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def send_message_and_generate(self, message: UserMessage,opts: GenerateOpts) -> GenerateOutput:
+        """
+        Append a multimodal message and run generation synchronously while holding
+        the session lock continuously across prefill and decode.
+"""
+        
+        _UniffiFfiConverterTypeUserMessage.check_lower(message)
+
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeUserMessage.lower(message),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateOutput.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_and_generate,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def send_message_streaming(self, message: UserMessage,opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Append a multimodal message and run streaming generation while holding
+        the session lock continuously across prefill and decode.
+"""
+        
+        _UniffiFfiConverterTypeUserMessage.check_lower(message)
+
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterTypeModalitySink.check_lower(sink)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeUserMessage.lower(message),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterTypeModalitySink.lower(sink),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_send_message_streaming,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -8049,6 +8435,7 @@ __all__ = [
     "FfiVadEvent",
     "FfiVadSampleRate",
     "ToolFormat",
+    "AudioInput",
     "ChatMessage",
     "EngineConfig",
     "FfiEntitySpan",
@@ -8063,6 +8450,7 @@ __all__ = [
     "SessionConfig",
     "ToolCall",
     "ToolDef",
+    "UserMessage",
     "cera_ffi_version",
     "cpu_backend_report",
     "detect_tool_format",
