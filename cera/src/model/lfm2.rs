@@ -643,10 +643,10 @@ impl Lfm2Model {
                     hs,
                     kernel_size
                 );
+                #[cfg(target_arch = "aarch64")]
                 ensure!(
                     hs.is_multiple_of(4),
-                    "hidden_size ({}) must be a multiple of 4 to support vectorized convolution ops",
-                    hs
+                    "blk.{i}.shortconv: hidden_size ({hs}) must be a multiple of 4 to support vectorized AArch64 NEON convolution ops",
                 );
                 // In GGUF, ne[0] is kernel_size and ne[1] is hidden_size, so `w` is channel-first:
                 // `w[col * kernel_size + row]` is tap `row` of channel `col`.
