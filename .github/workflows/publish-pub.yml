@@ -357,17 +357,17 @@ jobs:
             cd cera_ffi_flutter
             rm -f pubspec_overrides.yaml
             resolved=false
-            for attempt in $(seq 1 12); do
+            for attempt in $(seq 1 18); do
               rm -rf .dart_tool pubspec.lock
               if flutter pub get; then
                 resolved=true
                 break
               fi
-              echo "flutter pub get failed (attempt ${attempt}/12), waiting 10s for pub.dev dependency cache to propagate..."
-              sleep 10
+              echo "flutter pub get failed (attempt ${attempt}/18), waiting 20s for pub.dev dependency cache to propagate..."
+              sleep 20
             done
             if [ "$resolved" = "false" ]; then
-              echo "::error::flutter pub get failed to resolve dependencies after 12 attempts" >&2
+              echo "::error::flutter pub get failed to resolve dependencies after 18 attempts (360s)" >&2
               exit 1
             fi
             flutter analyze
