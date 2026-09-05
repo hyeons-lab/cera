@@ -1,3 +1,4 @@
+#[cfg(feature = "mmap")]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ fn test_dspark_config_defaults_and_fallbacks() {
 }
 
 #[test]
+#[cfg(feature = "mmap")]
 fn test_dspark_sidecar_checkpoint_if_present() {
     let candidate_paths = [
         "training/checkpoints/lfm2.5-vl-450m-dspark.gguf",

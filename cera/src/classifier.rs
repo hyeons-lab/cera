@@ -935,13 +935,15 @@ mod tests {
     #[ignore]
     #[cfg(feature = "mmap")]
     fn test_real_model_pii_classification() {
-        let model_path =
-            std::path::Path::new("/Users/dberrios/development/models/pii-detect-q8_0.gguf");
+        let Some(path_str) = std::env::var_os("PII_MODEL_PATH") else {
+            return;
+        };
+        let model_path = std::path::Path::new(&path_str);
         if !model_path.exists() {
             return;
         }
         let engine = crate::engine::CeraEngine::from_path(
-            model_path.to_str().unwrap(),
+            model_path,
             crate::engine::EngineConfig::default(),
         )
         .unwrap();

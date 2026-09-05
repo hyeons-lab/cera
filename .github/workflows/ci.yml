@@ -50,8 +50,12 @@ jobs:
         # clippy skips those compile targets, so lints living in test modules
         # (e.g. `needless_update`, `items_after_test_module`) slip through CI.
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Host-side compilation checks without default features. Because workspace
+      # checks unify features across all crates, `cargo check --workspace` never
+      # verifies `cera` with `default-features = false`. Checking `cera-wasm` on
+      # host mirrors what `cargo publish` executes when packaging for crates.io.
       - name: Check cera without default features
-        run: cargo check -p cera --no-default-features
+        run: cargo check -p cera --no-default-features --all-targets
       - name: Check cera-wasm on host
         run: cargo check -p cera-wasm
       - name: Python unit tests

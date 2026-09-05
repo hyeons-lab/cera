@@ -32,7 +32,7 @@
 //! itself. Storing the factors quantized would change the apply path on every
 //! backend, so it is deliberately not done here.
 
-#[cfg(any(feature = "mmap", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -535,9 +535,8 @@ impl LoraAdapterWeights {
     /// Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
     /// a file. Tensors are named `blk.{N}.{stem}.weight.lora_a` / `.lora_b`;
     /// `alpha` is read from the `adapter.lora.alpha` metadata (falling back to
-    /// `rank`, i.e. `scale = 1`). Uses memory mapping when the `mmap` feature
-    /// is enabled; falls back to reading bytes otherwise.
-    #[cfg(feature = "mmap")]
+    /// `rank`, i.e. `scale = 1`). Memory-maps the file via [`GgufFile::open`].
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
     pub fn from_gguf(path: &Path) -> Result<Arc<Self>> {
         let gguf = GgufFile::open(path).with_context(|| format!("open adapter {path:?}"))?;
         Self::from_gguf_file(&gguf)
@@ -2151,6 +2150,19 @@ mod tests {
         let mut temp = tempfile::NamedTempFile::new().unwrap();
         temp.write_all(&buf).unwrap();
         let adapter = LoraAdapterWeights::load_from_path(temp.path()).unwrap();
+        assert_eq!(adapter.target_count(), 1);
+        let t = adapter.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
+        assert_eq!((t.rank, t.k, t.d), (2, 4, 3));
+
+        let direct = LoraAdapterWeights::from_gguf(temp.path()).unwrap();
+        assert_eq!(direct.target_count(), 1);
+    }
+
+    #[test]
+    fn gguf_from_bytes_matches_synth_dimensions() {
+        let buf = synth_expert_gguf(1, 2, 4, 3);
+        let bytes = Arc::from(buf.into_boxed_slice());
+        let adapter = LoraAdapterWeights::from_gguf_bytes(bytes).unwrap();
         assert_eq!(adapter.target_count(), 1);
         let t = adapter.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
         assert_eq!((t.rank, t.k, t.d), (2, 4, 3));

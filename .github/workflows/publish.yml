@@ -162,7 +162,7 @@ jobs:
       - name: Verify workspace compiles
         run: |
           cargo check --workspace
-          cargo check -p cera --no-default-features
+          cargo check -p cera --no-default-features --all-targets
           cargo check -p cera-wasm
 
       - name: Publish crates
