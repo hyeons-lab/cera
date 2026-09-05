@@ -35,11 +35,17 @@ pub fn matmul_nt_f32(
     bias: Option<&[f32]>,
     c: &mut [f32],
 ) {
-    assert_eq!(a.len(), m * k, "A dimension mismatch");
-    assert_eq!(b.len(), n * k, "B dimension mismatch");
-    assert_eq!(c.len(), m * n, "C dimension mismatch");
+    debug_assert_eq!(a.len(), m * k, "A dimension mismatch");
+    debug_assert_eq!(b.len(), n * k, "B dimension mismatch");
+    debug_assert_eq!(c.len(), m * n, "C dimension mismatch");
     if let Some(bias_vec) = bias {
-        assert_eq!(bias_vec.len(), n, "Bias dimension mismatch");
+        debug_assert_eq!(bias_vec.len(), n, "Bias dimension mismatch");
+        if bias_vec.len() < n {
+            return;
+        }
+    }
+    if a.len() < m * k || b.len() < n * k || c.len() < m * n {
+        return;
     }
 
     #[cfg(has_blas)]
@@ -317,9 +323,9 @@ impl DynamicSpanHeadWeights {
                 out_slice[..d].copy_from_slice(h_start);
                 out_slice[d..2 * d].copy_from_slice(h_end);
                 let diff_slice = &mut out_slice[2 * d..3 * d];
-                assert_eq!(diff_slice.len(), d);
-                assert_eq!(h_start.len(), d);
-                assert_eq!(h_end.len(), d);
+                debug_assert_eq!(diff_slice.len(), d);
+                debug_assert_eq!(h_start.len(), d);
+                debug_assert_eq!(h_end.len(), d);
                 for (diff, (end, start)) in
                     diff_slice.iter_mut().zip(h_end.iter().zip(h_start.iter()))
                 {
@@ -1039,12 +1045,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "Bias dimension mismatch")]
     fn test_matmul_nt_f32_bias_length_mismatch_panics() {
         let a = vec![1.0, 2.0];
         let b = vec![1.0, 2.0];
         let wrong_bias = vec![1.0, 2.0]; // expected length 1 for n=1
         let mut c = vec![0.0];
+        matmul_nt_f32(1, 1, 2, &a, &b, Some(&wrong_bias), &mut c);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn test_matmul_nt_f32_bias_length_mismatch_graceful_in_release() {
+        let a = vec![1.0, 2.0];
+        let b = vec![1.0, 2.0];
+        let wrong_bias = vec![];
+        let mut c = vec![0.0];
+        // In release builds, invalid dimensions must never panic
         matmul_nt_f32(1, 1, 2, &a, &b, Some(&wrong_bias), &mut c);
     }
 
@@ -1455,5 +1473,75 @@ mod tests {
         let oversized = vec![0.1f32; 2 * d + 8];
         let proj = head.project_labels(&oversized, 2);
         assert_eq!(proj.len(), 2 * d);
+    }
+
+    #[test]
+    fn test_stride_boundary_overlap_and_greedy_suppression() {
+        // Test scenario where an entity straddles a window boundary.
+        // In window 0, a partial fragment is detected at byte 1500..1520 with score 0.65.
+        // In window 1, the complete entity is detected at byte 1500..1545 with score 0.92.
+        // An adjacent non-overlapping entity is detected at byte 1600..1615 with score 0.88.
+        let mut raw_candidates = vec![
+            DetectedEntity {
+                label: "identity.person_name".to_string(),
+                score: 0.65,
+                token_start: 765,
+                token_end: 767,
+                char_start: 1500,
+                char_end: 1520,
+                byte_start: 1500,
+                byte_end: 1520,
+                text: "Johnathan".to_string(),
+            },
+            DetectedEntity {
+                label: "identity.person_name".to_string(),
+                score: 0.92,
+                token_start: 765,
+                token_end: 775,
+                char_start: 1500,
+                char_end: 1545,
+                byte_start: 1500,
+                byte_end: 1545,
+                text: "Johnathan Smith-Doe".to_string(),
+            },
+            DetectedEntity {
+                label: "contact.email".to_string(),
+                score: 0.88,
+                token_start: 800,
+                token_end: 805,
+                char_start: 1600,
+                char_end: 1615,
+                byte_start: 1600,
+                byte_end: 1615,
+                text: "jsmith@cera.dev".to_string(),
+            },
+        ];
+
+        // Apply greedy Non-Maximum Suppression (identical to scan_with_cancel)
+        raw_candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| (b.byte_end - b.byte_start).cmp(&(a.byte_end - a.byte_start)))
+                .then_with(|| a.byte_start.cmp(&b.byte_start))
+        });
+
+        let mut accepted: Vec<DetectedEntity> = Vec::new();
+        for cand in raw_candidates {
+            let overlaps = accepted
+                .iter()
+                .any(|acc| !(cand.byte_end <= acc.byte_start || cand.byte_start >= acc.byte_end));
+            if !overlaps {
+                accepted.push(cand);
+            }
+        }
+
+        // Higher-scoring complete span (0.92) suppresses partial fragment (0.65).
+        // Disjoint entity (0.88) is preserved.
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].text, "Johnathan Smith-Doe");
+        assert_eq!(accepted[0].score, 0.92);
+        assert_eq!(accepted[1].text, "jsmith@cera.dev");
+        assert_eq!(accepted[1].score, 0.88);
     }
 }

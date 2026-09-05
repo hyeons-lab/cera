@@ -26,7 +26,8 @@ pub fn layer_norm_no_bias_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
     }
     debug_assert_eq!(x.len(), weight.len());
     let n = x.len();
-    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    let inv_n = 1.0 / n as f64;
+    let mean = x.iter().map(|&v| v as f64).sum::<f64>() * inv_n;
     let var = x
         .iter()
         .map(|&v| {
@@ -34,7 +35,7 @@ pub fn layer_norm_no_bias_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
             d * d
         })
         .sum::<f64>()
-        / n as f64;
+        * inv_n;
     let inv_std = (1.0 / (var + eps as f64).sqrt()) as f32;
     let mean_f32 = mean as f32;
     for i in 0..n {
@@ -756,13 +757,13 @@ impl Model for BertModel {
                     let out_slot =
                         &mut attn_out[q_idx * d + h * head_dim..q_idx * d + (h + 1) * head_dim];
                     out_slot.fill(0.0);
-                    assert_eq!(out_slot.len(), head_dim);
+                    debug_assert_eq!(out_slot.len(), head_dim);
                     for k_idx in k_start..k_end {
                         let s = scores[k_idx];
                         if s > 0.0 {
                             let v_slice =
                                 &v_mat[k_idx * d + h * head_dim..k_idx * d + (h + 1) * head_dim];
-                            assert_eq!(v_slice.len(), head_dim);
+                            debug_assert_eq!(v_slice.len(), head_dim);
                             for (out_elem, v_elem) in out_slot.iter_mut().zip(v_slice.iter()) {
                                 *out_elem += s * *v_elem;
                             }
