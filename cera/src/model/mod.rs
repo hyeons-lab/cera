@@ -2,6 +2,8 @@ pub mod dspark;
 pub mod lfm2;
 pub mod llama;
 pub mod transformer;
+pub mod whisper;
+pub mod whisper_preprocessor;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_lfm2;

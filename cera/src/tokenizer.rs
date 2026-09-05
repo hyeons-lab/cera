@@ -477,6 +477,14 @@ impl BpeTokenizer {
         self.special_tokens.get(name).copied()
     }
 
+    /// Look up a token ID by its exact text representation in vocabulary or special tokens.
+    pub fn token_to_id(&self, text: &str) -> Option<u32> {
+        self.special_tokens
+            .get(text)
+            .copied()
+            .or_else(|| self.token_to_id.get(text.as_bytes()).copied())
+    }
+
     /// Check if a token ID is a special/control token.
     pub fn is_special_token(&self, id: u32) -> bool {
         self.special_tokens.values().any(|&v| v == id)
@@ -914,6 +922,27 @@ fn unescape_token(s: &str) -> Vec<u8> {
     let s = s.replace('▁', " ");
 
     s.into_bytes()
+}
+
+#[cfg(test)]
+impl BpeTokenizer {
+    pub fn empty_for_test() -> Self {
+        Self {
+            vocab: Vec::new(),
+            token_to_id: HashMap::new(),
+            merge_ranks: HashMap::new(),
+            special_tokens: HashMap::new(),
+            bos_id: None,
+            eos_id: None,
+            add_bos: false,
+            add_eos: false,
+            chat_template: None,
+            pretokenize_re: build_pretokenize_regex("gpt2"),
+            digits_split_bare: false,
+            byte_to_unicode: build_byte_to_unicode(),
+            unicode_to_byte: build_unicode_to_byte(),
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
