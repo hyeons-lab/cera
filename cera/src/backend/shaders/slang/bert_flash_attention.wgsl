@@ -28,6 +28,10 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
     var _S2 : u32 = wid_0.x * u32(64);
     var q_idx_0 : u32 = _S2 + tid_0;
     var valid_q_0 : bool = q_idx_0 < tokens_0;
+    if(head_dim_0 > u32(64))
+    {
+        return;
+    }
     var q_reg_0 : array<f32, i32(64)>;
     var d_0 : u32;
     if(valid_q_0)
@@ -146,19 +150,17 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
             kt_0 = _S9;
             continue;
         }
-        var elems_per_thread_0 : u32 = u32(32) * head_dim_0 / u32(64);
-        var _S10 : u32 = tid_0 * elems_per_thread_0;
-        var i_0 : u32 = u32(0);
+        var _S10 : u32 = u32(32) * head_dim_0;
+        var elem_idx_0 : u32 = tid_0;
         for(;;)
         {
-            if(i_0 < elems_per_thread_0)
+            if(elem_idx_0 < _S10)
             {
             }
             else
             {
                 break;
             }
-            var elem_idx_0 : u32 = _S10 + i_0;
             var k_row_0 : u32 = elem_idx_0 / head_dim_0;
             var k_col_0 : u32 = elem_idx_0 % head_dim_0;
             var global_k_token_0 : u32 = k_base_0 + k_row_0;
@@ -173,7 +175,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
                 k_tile_0[elem_idx_0] = 0.0f;
                 v_tile_0[elem_idx_0] = 0.0f;
             }
-            i_0 = i_0 + u32(1);
+            elem_idx_0 = elem_idx_0 + u32(64);
         }
         workgroupBarrier();
         if(valid_q_0)
@@ -227,7 +229,15 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
                 }
                 var score_2 : f32 = score_0 * _S1;
                 var _S13 : f32 = max(m_prev_1, score_2);
-                var alpha_0 : f32 = exp(m_prev_1 - _S13);
+                var alpha_0 : f32;
+                if(m_prev_1 > -1.00000001504746622e+30f)
+                {
+                    alpha_0 = exp(m_prev_1 - _S13);
+                }
+                else
+                {
+                    alpha_0 = 0.0f;
+                }
                 var beta_0 : f32 = exp(score_2 - _S13);
                 var _S14 : f32 = l_prev_1 * alpha_0 + beta_0;
                 var d_2 : u32 = u32(0);

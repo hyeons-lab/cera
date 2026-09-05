@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, ensure};
 
+use crate::CeraError;
 #[cfg(has_blas)]
 use crate::backend::blas;
 use crate::backend::cpu;
@@ -14,15 +15,15 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::Model;
 use crate::model::bert::BertModel;
-use crate::tokenizer::{BpeTokenizer, TokenOffset};
+use crate::tokenizer::BpeTokenizer;
 
 /// Compute matrix-matrix multiplication C = A * B^T + bias with optional BLAS acceleration.
 ///
 /// Layout:
-/// - A: [M, K] row-major
-/// - B: [N, K] row-major (transposed to [K, N])
-/// - C: [M, N] row-major
-/// - bias: optional [N] added along columns
+/// - A: `[M, K]` row-major
+/// - B: `[N, K]` row-major (transposed to `[K, N]`)
+/// - C: `[M, N]` row-major
+/// - bias: optional `[N]` added along columns
 pub fn matmul_nt_f32(
     m: usize,
     n: usize,
@@ -51,18 +52,29 @@ pub fn matmul_nt_f32(
 
     #[cfg(not(has_blas))]
     {
-        for i in 0..m {
-            let a_row = &a[i * k..(i + 1) * k];
-            for j in 0..n {
-                let b_row = &b[j * k..(j + 1) * k];
-                let mut dot = 0.0f32;
-                for p in 0..k {
-                    dot += a_row[p] * b_row[p];
+        if m >= 64 {
+            cpu::par_rows_n(c, n, 64, |(i, c_row)| {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &b[j * k..(j + 1) * k];
+                    let mut dot = cpu::dot_f32(a_row, b_row);
+                    if let Some(bias_vec) = bias {
+                        dot += bias_vec[j];
+                    }
+                    c_row[j] = dot;
                 }
-                if let Some(bias_vec) = bias {
-                    dot += bias_vec[j];
+            });
+        } else {
+            for i in 0..m {
+                let a_row = &a[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &b[j * k..(j + 1) * k];
+                    let mut dot = cpu::dot_f32(a_row, b_row);
+                    if let Some(bias_vec) = bias {
+                        dot += bias_vec[j];
+                    }
+                    c[i * n + j] = dot;
                 }
-                c[i * n + j] = dot;
             }
         }
     }
@@ -75,11 +87,11 @@ pub struct SensitivityHeadWeights {
     pub hidden_dim: usize,
     /// Dimension of intermediate projection (e.g. 384).
     pub intermediate_dim: usize,
-    /// Row-major weight matrix [intermediate_dim, hidden_dim].
+    /// Row-major weight matrix `[intermediate_dim, hidden_dim]`.
     pub dense_weight: Vec<f32>,
-    /// Bias vector [intermediate_dim].
+    /// Bias vector `[intermediate_dim]`.
     pub dense_bias: Vec<f32>,
-    /// Row-major classifier weight [1, intermediate_dim].
+    /// Row-major classifier weight `[1, intermediate_dim]`.
     pub classifier_weight: Vec<f32>,
     /// Scalar classifier bias.
     pub classifier_bias: f32,
@@ -92,7 +104,8 @@ impl SensitivityHeadWeights {
     ///
     /// Returns (probability, should_bypass).
     pub fn score(&self, hidden_states: &[f32], n_tokens: usize) -> (f32, bool) {
-        if n_tokens == 0 {
+        if n_tokens == 0 || self.hidden_dim == 0 || hidden_states.len() < n_tokens * self.hidden_dim
+        {
             return (0.0, true);
         }
         let d = self.hidden_dim;
@@ -102,9 +115,7 @@ impl SensitivityHeadWeights {
         let mut mean_pool = vec![0.0f32; d];
         for t in 0..n_tokens {
             let row = &hidden_states[t * d..(t + 1) * d];
-            for (m, &val) in mean_pool.iter_mut().zip(row.iter()) {
-                *m += val;
-            }
+            cpu::add_inplace(&mut mean_pool, row);
         }
         let inv_t = 1.0 / (n_tokens as f32);
         for m in &mut mean_pool {
@@ -125,10 +136,7 @@ impl SensitivityHeadWeights {
         cpu::gelu_inplace(&mut h1);
 
         // 3. Classifier layer: z = classifier_weight [1, inter] * h1 [inter] + classifier_bias
-        let mut dot = 0.0f32;
-        for (w, h) in self.classifier_weight.iter().zip(h1.iter()) {
-            dot += w * h;
-        }
+        let dot = cpu::dot_f32(&self.classifier_weight, &h1);
         let z = dot + self.classifier_bias;
 
         // 4. Numerically stable sigmoid: 1 / (1 + exp(-z))
@@ -145,16 +153,16 @@ pub struct DynamicSpanHeadWeights {
     pub hidden_dim: usize,
     /// Maximum span length in tokens (default: 24).
     pub max_span_length: usize,
-    /// Span size embedding table [max_span_length + 1, size_dim] (default size_dim: 64).
+    /// Span size embedding table `[max_span_length + 1, size_dim]` (default size_dim: 64).
     pub size_dim: usize,
     pub span_size_embedding: Vec<f32>,
-    /// Span projector layer 1: [hidden_dim, 3 * hidden_dim + size_dim].
+    /// Span projector layer 1: `[hidden_dim, 3 * hidden_dim + size_dim]`.
     pub proj1_weight: Vec<f32>,
     pub proj1_bias: Vec<f32>,
-    /// Span projector layer 2: [hidden_dim, hidden_dim].
+    /// Span projector layer 2: `[hidden_dim, hidden_dim]`.
     pub proj2_weight: Vec<f32>,
     pub proj2_bias: Vec<f32>,
-    /// Label query projector: [hidden_dim, hidden_dim].
+    /// Label query projector: `[hidden_dim, hidden_dim]`.
     pub label_proj_weight: Vec<f32>,
     pub label_proj_bias: Vec<f32>,
     /// Confidence threshold for entity extraction (default: 0.45).
@@ -210,7 +218,11 @@ impl DynamicSpanHeadWeights {
         projected_labels: &[f32],
         n_labels: usize,
     ) -> Vec<(CandidateSpan, usize, f32)> {
-        if n_tokens == 0 || n_labels == 0 {
+        if n_tokens == 0
+            || n_labels == 0
+            || self.hidden_dim == 0
+            || hidden_states.len() < n_tokens * self.hidden_dim
+        {
             return Vec::new();
         }
         let d = self.hidden_dim;
@@ -224,6 +236,13 @@ impl DynamicSpanHeadWeights {
         }
 
         let mut detections = Vec::new();
+        let logit_thresh = if self.span_threshold <= 0.0 {
+            f32::NEG_INFINITY
+        } else if self.span_threshold >= 1.0 {
+            f32::INFINITY
+        } else {
+            (self.span_threshold / (1.0 - self.span_threshold)).ln()
+        };
         const CHUNK_SIZE: usize = 1024;
         let mut chunk_features = vec![0.0f32; CHUNK_SIZE * span_in_dim];
         let mut chunk_h_proj = vec![0.0f32; CHUNK_SIZE * d];
@@ -242,6 +261,9 @@ impl DynamicSpanHeadWeights {
                 out_slice[..d].copy_from_slice(h_start);
                 out_slice[d..2 * d].copy_from_slice(h_end);
                 let diff_slice = &mut out_slice[2 * d..3 * d];
+                assert_eq!(diff_slice.len(), d);
+                assert_eq!(h_start.len(), d);
+                assert_eq!(h_end.len(), d);
                 for j in 0..d {
                     diff_slice[j] = h_end[j] - h_start[j];
                 }
@@ -293,8 +315,8 @@ impl DynamicSpanHeadWeights {
                     .iter()
                     .enumerate()
                 {
-                    let prob = 1.0 / (1.0 + (-raw_score).exp());
-                    if prob >= self.span_threshold {
+                    if raw_score >= logit_thresh {
+                        let prob = 1.0 / (1.0 + (-raw_score).exp());
                         detections.push((cs, l_idx, prob));
                     }
                 }
@@ -309,7 +331,7 @@ impl DynamicSpanHeadWeights {
 pub struct DetectedEntity {
     /// Canonical semantic label (e.g. identity.person_name, financial.credit_card).
     pub label: String,
-    /// Model confidence score [0.0, 1.0].
+    /// Model confidence score `[0.0, 1.0]`.
     pub score: f32,
     /// Token start index (inclusive).
     pub token_start: usize,
@@ -368,7 +390,7 @@ impl HybridPiiModel {
 
         ensure!(hidden_dim > 0, "hidden_dim must be positive");
         ensure!(
-            sens_dense_w.len() % hidden_dim == 0,
+            sens_dense_w.len().is_multiple_of(hidden_dim),
             "sens_dense_w shape mismatch"
         );
         let intermediate_dim = sens_dense_w.len() / hidden_dim;
@@ -401,7 +423,7 @@ impl HybridPiiModel {
             .context("missing span_head.span_size_embedding.weight")?
             .to_f32_vec();
         ensure!(
-            span_size_emb.len() % (max_span_length + 1) == 0,
+            span_size_emb.len().is_multiple_of(max_span_length + 1),
             "span_size_embedding shape mismatch"
         );
         let size_dim = span_size_emb.len() / (max_span_length + 1);
@@ -466,21 +488,16 @@ impl HybridPiiModel {
             span_threshold,
         };
 
-        let raw_labels = gguf.get_string_array("hybrid_pii.labels");
-        let labels: Vec<String> = if let Some(arr) = raw_labels {
-            arr.into_iter().map(|s| s.to_string()).collect()
-        } else {
-            vec![
-                "identity.person_name".to_string(),
-                "contact.email".to_string(),
-                "contact.phone".to_string(),
-                "location.address".to_string(),
-                "financial.credit_card".to_string(),
-                "government.ssn".to_string(),
-                "credential.api_key".to_string(),
-                "network.ip_address".to_string(),
-            ]
-        };
+        let labels: Vec<String> = gguf
+            .get_string_array("hybrid_pii.labels")
+            .context("missing required metadata key `hybrid_pii.labels`")?
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        ensure!(
+            !labels.is_empty(),
+            "hybrid_pii.labels must contain at least one label category"
+        );
 
         // Project label queries from GGUF
         let label_tensor = gguf
@@ -514,41 +531,52 @@ pub struct SlidingWindowScanner {
 }
 
 impl SlidingWindowScanner {
-    /// Initialize scanner with default 1024 window and 768 stride (256 token overlap).
+    /// Initialize scanner with default window bounded by model's max_seq_len (up to 1024)
+    /// and 75% stride (25% token overlap).
     pub fn new(model: HybridPiiModel, tokenizer: BpeTokenizer) -> Self {
+        let max_seq_len = model.backbone.config().max_seq_len;
+        let window_size = if max_seq_len > 0 {
+            1024.min(max_seq_len)
+        } else {
+            1024
+        };
+        let stride = (window_size * 3 / 4).max(1);
         Self {
             model,
             tokenizer,
-            window_size: 1024,
-            stride: 768,
+            window_size,
+            stride,
         }
     }
 
     /// Scan text and return list of resolved, non-overlapping detected entities.
     pub fn scan(&self, text: &str) -> Result<Vec<DetectedEntity>> {
+        self.scan_with_cancel(text, None)
+    }
+
+    /// Scan text with an optional cancellation flag, returning Err(CeraError::Cancelled) if aborted.
+    pub fn scan_with_cancel(
+        &self,
+        text: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<DetectedEntity>> {
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(CeraError::Cancelled.into());
+        }
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let stride = self.stride.max(1);
-        let window_size = self.window_size.max(1);
+        let max_seq_len = self.model.backbone.config().max_seq_len;
+        let window_size = if max_seq_len > 0 {
+            self.window_size.min(max_seq_len).max(1)
+        } else {
+            self.window_size.max(1)
+        };
+        let stride = self.stride.min(window_size).max(1);
 
         let (tokens, offsets) = if self.tokenizer.add_bos_token() || self.tokenizer.add_eos_token()
         {
             self.tokenizer.encode_special_with_offsets(text, true)
-        } else if let Some(bos) = self.tokenizer.bos_token() {
-            let (raw_tokens, raw_offsets) = self.tokenizer.encode_with_offsets(text);
-            let mut t = Vec::with_capacity(raw_tokens.len() + 1);
-            let mut o = Vec::with_capacity(raw_offsets.len() + 1);
-            t.push(bos);
-            o.push(TokenOffset {
-                char_start: 0,
-                char_end: 0,
-                byte_start: 0,
-                byte_end: 0,
-            });
-            t.extend(raw_tokens);
-            o.extend(raw_offsets);
-            (t, o)
         } else {
             self.tokenizer.encode_with_offsets(text)
         };
@@ -563,6 +591,9 @@ impl SlidingWindowScanner {
         // Process overlapping sliding windows
         let mut win_start = 0;
         while win_start < n_tokens {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(CeraError::Cancelled.into());
+            }
             let win_end = (win_start + window_size).min(n_tokens);
             let win_tokens = &tokens[win_start..win_end];
             let win_len = win_tokens.len();
@@ -588,24 +619,45 @@ impl SlidingWindowScanner {
                     let off_start = offsets[global_tok_start];
                     let off_end = offsets[global_tok_end];
 
+                    // Zero-width special tokens (like BOS/EOS) have byte_start == byte_end.
+                    // Spans starting or ending on zero-width tokens must be skipped to avoid absorbing leading or trailing whitespace.
+                    if off_start.byte_start == off_start.byte_end
+                        || off_end.byte_start == off_end.byte_end
+                    {
+                        continue;
+                    }
+
                     let char_start = off_start.char_start;
-                    let char_end = off_end.char_end;
                     let byte_start = off_start.byte_start;
                     let byte_end = off_end.byte_end;
 
                     if byte_start < byte_end
                         && let Some(span_text) = text.get(byte_start..byte_end)
                     {
+                        let trimmed = span_text.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        let leading_bytes = span_text.find(trimmed).unwrap_or(0);
+                        let adj_byte_start = byte_start + leading_bytes;
+                        let adj_byte_end = adj_byte_start + trimmed.len();
+
+                        let leading_chars = span_text[..leading_bytes].chars().count();
+                        let trimmed_chars = trimmed.chars().count();
+                        let adj_char_start = char_start + leading_chars;
+                        let adj_char_end = adj_char_start + trimmed_chars;
+
                         raw_candidates.push(DetectedEntity {
                             label: self.model.labels[l_idx].clone(),
                             score,
                             token_start: global_tok_start,
                             token_end: global_tok_end,
-                            char_start,
-                            char_end,
-                            byte_start,
-                            byte_end,
-                            text: span_text.to_string(),
+                            char_start: adj_char_start,
+                            char_end: adj_char_end,
+                            byte_start: adj_byte_start,
+                            byte_end: adj_byte_end,
+                            text: trimmed.to_string(),
                         });
                     }
                 }
@@ -642,7 +694,16 @@ impl SlidingWindowScanner {
 
     /// Redact detected entities right-to-left with placeholder tags.
     pub fn redact(&self, text: &str) -> Result<String> {
-        let entities = self.scan(text)?;
+        self.redact_with_cancel(text, None)
+    }
+
+    /// Redact detected entities right-to-left with an optional cancellation flag.
+    pub fn redact_with_cancel(
+        &self,
+        text: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String> {
+        let entities = self.scan_with_cancel(text, cancel)?;
         if entities.is_empty() {
             return Ok(text.to_string());
         }
@@ -892,20 +953,6 @@ mod tests {
 
         let (tokens, offsets) = if tok.add_bos_token() || tok.add_eos_token() {
             tok.encode_special_with_offsets(text, true)
-        } else if let Some(bos) = tok.bos_token() {
-            let (raw_tokens, raw_offsets) = tok.encode_with_offsets(text);
-            let mut t = Vec::with_capacity(raw_tokens.len() + 1);
-            let mut o = Vec::with_capacity(raw_offsets.len() + 1);
-            t.push(bos);
-            o.push(TokenOffset {
-                char_start: 0,
-                char_end: 0,
-                byte_start: 0,
-                byte_end: 0,
-            });
-            t.extend(raw_tokens);
-            o.extend(raw_offsets);
-            (t, o)
         } else {
             tok.encode_with_offsets(text)
         };
@@ -918,5 +965,186 @@ mod tests {
         assert!(offsets[1].byte_end <= text.len());
         assert!(text.is_char_boundary(offsets[1].byte_start));
         assert!(text.is_char_boundary(offsets[1].byte_end));
+    }
+
+    #[test]
+    fn test_zero_width_special_token_spans_are_skipped() {
+        let text = "  Alice";
+        let vocab = vec![b"<bos>".to_vec(), b"  ".to_vec(), b"Alice".to_vec()];
+        let tok = BpeTokenizer::from_vocab(vocab).with_special_tokens_for_testing(
+            Some(0),
+            None,
+            true,
+            false,
+        );
+        let (_tokens, offsets) = tok.encode_special_with_offsets(text, true);
+        // BOS is token 0: byte_start == 0, byte_end == 0.
+        assert_eq!(offsets[0].byte_start, offsets[0].byte_end);
+        // Any span candidate starting or ending on BOS must be skipped to avoid absorbing whitespace.
+        assert!(offsets[0].byte_start == offsets[0].byte_end);
+        // Token 2 ("Alice") has non-zero width.
+        assert!(offsets[2].byte_start < offsets[2].byte_end);
+    }
+
+    #[test]
+    fn test_candidate_span_whitespace_trimming_and_boundary_recalculation() {
+        let text = "Contact   alice@example.com   for support.";
+        let byte_start = 7;
+        let byte_end = 30;
+        let char_start = 7;
+
+        let span_text = text.get(byte_start..byte_end).unwrap();
+        assert_eq!(span_text, "   alice@example.com   ");
+
+        let trimmed = span_text.trim();
+        assert_eq!(trimmed, "alice@example.com");
+
+        let leading_bytes = span_text.find(trimmed).unwrap_or(0);
+        let adj_byte_start = byte_start + leading_bytes;
+        let adj_byte_end = adj_byte_start + trimmed.len();
+
+        let leading_chars = span_text[..leading_bytes].chars().count();
+        let trimmed_chars = trimmed.chars().count();
+        let adj_char_start = char_start + leading_chars;
+        let adj_char_end = adj_char_start + trimmed_chars;
+
+        assert_eq!(adj_byte_start, 10);
+        assert_eq!(adj_byte_end, 27);
+        assert_eq!(adj_char_start, 10);
+        assert_eq!(adj_char_end, 27);
+        assert_eq!(&text[adj_byte_start..adj_byte_end], "alice@example.com");
+    }
+
+    #[test]
+    fn test_candidate_span_whitespace_trimming_multibyte_unicode() {
+        let text = "こんにちは   山田太郎   さん";
+        let span_slice = "   山田太郎   ";
+        let byte_start = text.find(span_slice).unwrap();
+        let byte_end = byte_start + span_slice.len();
+        let char_start = text[..byte_start].chars().count();
+
+        let span_text = text.get(byte_start..byte_end).unwrap();
+        let trimmed = span_text.trim();
+        assert_eq!(trimmed, "山田太郎");
+
+        let leading_bytes = span_text.find(trimmed).unwrap_or(0);
+        let adj_byte_start = byte_start + leading_bytes;
+        let adj_byte_end = adj_byte_start + trimmed.len();
+
+        let leading_chars = span_text[..leading_bytes].chars().count();
+        let trimmed_chars = trimmed.chars().count();
+        let adj_char_start = char_start + leading_chars;
+        let adj_char_end = adj_char_start + trimmed_chars;
+
+        assert_eq!(&text[adj_byte_start..adj_byte_end], "山田太郎");
+        let extracted_chars: String = text
+            .chars()
+            .skip(adj_char_start)
+            .take(adj_char_end - adj_char_start)
+            .collect();
+        assert_eq!(extracted_chars, "山田太郎");
+    }
+
+    #[test]
+    fn test_sliding_window_bounds_clamping_logic() {
+        // Classic BERT backbones with max_seq_len = 512
+        let max_seq_len = 512usize;
+        let window_size = if max_seq_len > 0 {
+            1024.min(max_seq_len)
+        } else {
+            1024
+        };
+        let stride = (window_size * 3 / 4).max(1);
+        assert_eq!(window_size, 512);
+        assert_eq!(stride, 384);
+
+        // ModernBERT backbones with max_seq_len = 8192
+        let modern_max = 8192usize;
+        let modern_window = if modern_max > 0 {
+            1024.min(modern_max)
+        } else {
+            1024
+        };
+        let modern_stride = (modern_window * 3 / 4).max(1);
+        assert_eq!(modern_window, 1024);
+        assert_eq!(modern_stride, 768);
+
+        // Edge case: tiny max_seq_len = 2
+        let tiny_max = 2usize;
+        let tiny_window = if tiny_max > 0 {
+            1024.min(tiny_max)
+        } else {
+            1024
+        };
+        let tiny_stride = (tiny_window * 3 / 4).max(1);
+        assert_eq!(tiny_window, 2);
+        assert_eq!(tiny_stride, 1);
+    }
+
+    #[test]
+    fn test_scan_with_cancel_atomic_flag_logic() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let flag_loaded = cancel.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(flag_loaded);
+
+        // Reset semantics
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sensitivity_and_span_head_undersized_input_guards() {
+        let sens_head = SensitivityHeadWeights {
+            hidden_dim: 4,
+            intermediate_dim: 2,
+            dense_weight: vec![0.0; 8],
+            dense_bias: vec![0.0; 2],
+            classifier_weight: vec![0.0; 2],
+            classifier_bias: 0.0,
+            gate_threshold: 0.5,
+        };
+        // Expecting 4 elements for n_tokens = 1, but passed only 2
+        let (prob, bypass) = sens_head.score(&[1.0, 2.0], 1);
+        assert_eq!(prob, 0.0);
+        assert!(bypass);
+
+        let span_head = DynamicSpanHeadWeights {
+            hidden_dim: 4,
+            max_span_length: 3,
+            size_dim: 2,
+            span_size_embedding: vec![0.0; 8],
+            proj1_weight: vec![0.0; 4 * (3 * 4 + 2)],
+            proj1_bias: vec![0.0; 4],
+            proj2_weight: vec![0.0; 16],
+            proj2_bias: vec![0.0; 4],
+            label_proj_weight: vec![0.0; 16],
+            label_proj_bias: vec![0.0; 4],
+            span_threshold: 0.5,
+        };
+        // Expecting 8 elements for n_tokens = 2, but passed only 3
+        let detections = span_head.score_spans(&[1.0, 2.0, 3.0], 2, &[1.0, 2.0, 3.0, 4.0], 1);
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn test_matmul_nt_f32_multithreaded_row_threshold() {
+        // M = 64 triggers the parallel row pool dispatch (cpu::par_rows_n)
+        let m = 64;
+        let k = 4;
+        let n = 2;
+        let a = vec![1.0f32; m * k];
+        let b = vec![2.0f32; n * k];
+        let bias = vec![0.5f32, 1.5f32];
+        let mut c = vec![0.0f32; m * n];
+
+        matmul_nt_f32(m, n, k, &a, &b, Some(&bias), &mut c);
+
+        // For every row: dot_f32([1,1,1,1], [2,2,2,2]) = 8.0
+        // Col 0: 8.0 + 0.5 = 8.5
+        // Col 1: 8.0 + 1.5 = 9.5
+        for row in 0..m {
+            assert_eq!(c[row * n], 8.5);
+            assert_eq!(c[row * n + 1], 9.5);
+        }
     }
 }

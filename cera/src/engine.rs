@@ -2495,4 +2495,16 @@ mod tests {
             Some("/m/model.gguf")
         );
     }
+
+    #[test]
+    fn test_encoder_architecture_inference_type_unknown() {
+        assert!(matches!(
+            inference_type_for_arch("bert"),
+            InferenceType::Unknown(_)
+        ));
+        assert!(matches!(
+            inference_type_for_arch("modernbert"),
+            InferenceType::Unknown(_)
+        ));
+    }
 }

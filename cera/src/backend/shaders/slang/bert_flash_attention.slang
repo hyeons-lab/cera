@@ -48,6 +48,11 @@ void bert_flash_attention(
     uint q_idx = wid.x * Q_TILE + tid;
     bool valid_q = q_idx < tokens;
 
+    // Guard against unsupported head dimensions exceeding static shared memory tile allocation
+    if (head_dim > MAX_HEAD_DIM) {
+        return;
+    }
+
     // Load query vector for this thread into local registers
     float q_reg[MAX_HEAD_DIM];
     if (valid_q) {
@@ -85,15 +90,9 @@ void bert_flash_attention(
             continue;
         }
 
-        // Cooperatively load K and V blocks into shared memory
-        // Total elements per tile: K_TILE * head_dim (32 * 64 = 2048)
-        // With Q_TILE = 64 threads, each thread loads 2048 / 64 = 32 elements
+        // Cooperatively load K and V blocks into shared memory via coalesced cyclic distribution
         uint total_elems = K_TILE * head_dim;
-        uint elems_per_thread = total_elems / Q_TILE;
-        uint thread_load_base = tid * elems_per_thread;
-
-        for (uint i = 0u; i < elems_per_thread; i++) {
-            uint elem_idx = thread_load_base + i;
+        for (uint elem_idx = tid; elem_idx < total_elems; elem_idx += Q_TILE) {
             uint k_row = elem_idx / head_dim;
             uint k_col = elem_idx % head_dim;
             uint global_k_token = k_base + k_row;
@@ -137,7 +136,7 @@ void bert_flash_attention(
                 // l_new = l_prev * exp(m_prev - m_new) + exp(score - m_new)
                 // acc = acc * exp(m_prev - m_new) + exp(score - m_new) * V
                 float m_new = max(m_prev, score);
-                float alpha = exp(m_prev - m_new);
+                float alpha = (m_prev > -1.0e30f) ? exp(m_prev - m_new) : 0.0f;
                 float beta = exp(score - m_new);
 
                 l_prev = l_prev * alpha + beta;

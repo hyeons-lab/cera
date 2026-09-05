@@ -17,6 +17,31 @@ use crate::kv_cache::InferenceState;
 use crate::model::transformer::{self, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 
+/// LayerNorm without bias term (e.g. ModernBERT pre-LN and output-LN).
+/// Subtracts the mean (unlike RMSNorm) and multiplies by weight.
+#[inline]
+pub fn layer_norm_no_bias_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
+    if x.len() != weight.len() || x.is_empty() {
+        return;
+    }
+    debug_assert_eq!(x.len(), weight.len());
+    let n = x.len();
+    let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    let var = x
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n as f64;
+    let inv_std = (1.0 / (var + eps as f64).sqrt()) as f32;
+    let mean_f32 = mean as f32;
+    for i in 0..n {
+        x[i] = (x[i] - mean_f32) * inv_std * weight[i];
+    }
+}
+
 /// Per-layer weight references for one BERT / ModernBERT encoder layer.
 pub struct BertLayerWeightRefs {
     pub attn_q: WeightRef,
@@ -48,6 +73,7 @@ pub struct BertModel {
     config: ModelConfig,
     head_dim: usize,
     is_modernbert: bool,
+    global_rope_theta: f32,
     #[allow(dead_code)]
     rope_type: RopeType,
     embd_ref: WeightRef,
@@ -92,6 +118,7 @@ impl BertModel {
             gguf.get_u32(&format!("{prefix}.block_count"))
                 .or_else(|| gguf.get_u32("bert.block_count"))
                 .with_context(|| format!("missing {prefix}.block_count"))? as usize;
+        ensure!(n_layers > 0, "n_layers must be > 0");
 
         let hidden_size = gguf
             .get_u32(&format!("{prefix}.embedding_length"))
@@ -138,15 +165,33 @@ impl BertModel {
             .get_f32(&format!("{prefix}.rope.freq_base"))
             .unwrap_or(10_000.0);
 
+        let global_rope_theta = gguf
+            .get_f32(&format!("{prefix}.rope.global_freq_base"))
+            .or_else(|| gguf.get_f32("modernbert.global_rope_theta"))
+            .unwrap_or(160_000.0);
+
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_epsilon"))
             .or_else(|| gguf.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")))
             .unwrap_or(1e-5);
 
         let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
+        ensure!(
+            embd_ref.k == hidden_size,
+            "token_embd.weight k ({}) != hidden_size ({})",
+            embd_ref.k,
+            hidden_size
+        );
 
         let pos_embd_ref = if gguf.tensors.contains_key("position_embd.weight") {
-            Some(transformer::resolve_weight(&gguf, "position_embd.weight")?)
+            let pos = transformer::resolve_weight(&gguf, "position_embd.weight")?;
+            ensure!(
+                pos.k == hidden_size,
+                "position_embd.weight k ({}) != hidden_size ({})",
+                pos.k,
+                hidden_size
+            );
+            Some(pos)
         } else {
             None
         };
@@ -155,6 +200,14 @@ impl BertModel {
             .get_tensor("token_embd_norm.weight")
             .map(|t| t.to_f32_vec())
             .ok();
+        if let Some(ref w) = embd_norm_weight {
+            ensure!(
+                w.len() == hidden_size,
+                "token_embd_norm.weight len ({}) != hidden_size ({})",
+                w.len(),
+                hidden_size
+            );
+        }
         let embd_norm_bias = gguf
             .get_tensor("token_embd_norm.bias")
             .map(|t| t.to_f32_vec())
@@ -167,6 +220,12 @@ impl BertModel {
         } else {
             vec![1.0; hidden_size]
         };
+        ensure!(
+            output_norm_weight.len() == hidden_size,
+            "output_norm_weight len ({}) != hidden_size ({})",
+            output_norm_weight.len(),
+            hidden_size
+        );
 
         let output_norm_bias = gguf
             .get_tensor("output_norm.bias")
@@ -208,10 +267,24 @@ impl BertModel {
                 } else {
                     vec![1.0; hidden_size]
                 };
+            ensure!(
+                attn_norm_weight.len() == hidden_size,
+                "layer {i} attn_norm_weight len ({}) != hidden_size ({})",
+                attn_norm_weight.len(),
+                hidden_size
+            );
             let attn_norm_bias = gguf
                 .get_tensor(&format!("blk.{i}.attn_norm.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = attn_norm_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} attn_norm_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
 
             let ffn_up = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?
                 .with_repack(&gguf);
@@ -249,10 +322,24 @@ impl BertModel {
                 } else {
                     vec![1.0; hidden_size]
                 };
+            ensure!(
+                ffn_norm_weight.len() == hidden_size,
+                "layer {i} ffn_norm_weight len ({}) != hidden_size ({})",
+                ffn_norm_weight.len(),
+                hidden_size
+            );
             let ffn_norm_bias = gguf
                 .get_tensor(&format!("blk.{i}.ffn_norm.bias"))
                 .map(|t| t.to_f32_vec())
                 .ok();
+            if let Some(ref b) = ffn_norm_bias {
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} ffn_norm_bias len ({}) != hidden_size ({})",
+                    b.len(),
+                    hidden_size
+                );
+            }
 
             // ModernBERT: layers 0, 1, 3, 4, 6, 7 are sliding window (128 toks);
             // every 3rd layer (2, 5, 8...) is global attention.
@@ -307,6 +394,7 @@ impl BertModel {
             config,
             head_dim,
             is_modernbert,
+            global_rope_theta,
             rope_type,
             embd_ref,
             pos_embd_ref,
@@ -342,22 +430,32 @@ impl Model for BertModel {
         // 1. Embedding lookup: [n_tokens, d] row-major
         let mut x = vec![0.0f32; n_tokens * d];
         for (i, &tok) in tokens.iter().enumerate() {
-            let row = transformer::dequantize_row(&self.gguf, &self.embd_ref, tok as usize);
-            x[i * d..(i + 1) * d].copy_from_slice(&row[..d]);
+            let row_idx = (tok as usize).min(self.embd_ref.m.saturating_sub(1));
+            transformer::dequantize_row_into(
+                &self.gguf,
+                &self.embd_ref,
+                row_idx,
+                &mut x[i * d..(i + 1) * d],
+            );
         }
 
         // Classic BERT: Add absolute position embeddings and apply token_embd_norm
         if let Some(ref pos_ref) = self.pos_embd_ref {
-            for i in 0..n_tokens {
-                if i < self.config.max_seq_len {
-                    let pos_row = transformer::dequantize_row(&self.gguf, pos_ref, i);
-                    cpu::add_inplace(&mut x[i * d..(i + 1) * d], &pos_row[..d]);
-                }
+            let max_pos = pos_ref.m.min(self.config.max_seq_len);
+            let mut pos_buf = vec![0.0f32; d];
+            for i in 0..n_tokens.min(max_pos) {
+                transformer::dequantize_row_into(&self.gguf, pos_ref, i, &mut pos_buf);
+                cpu::add_inplace(&mut x[i * d..(i + 1) * d], &pos_buf);
             }
         }
-        if let (Some(w), Some(b)) = (&self.embd_norm_weight, &self.embd_norm_bias) {
+        if let Some(ref w) = self.embd_norm_weight {
             for i in 0..n_tokens {
-                cpu::layer_norm_inplace(&mut x[i * d..(i + 1) * d], w, b, self.config.rms_norm_eps);
+                let row = &mut x[i * d..(i + 1) * d];
+                if let Some(ref b) = self.embd_norm_bias {
+                    cpu::layer_norm_inplace(row, w, b, self.config.rms_norm_eps);
+                } else {
+                    layer_norm_no_bias_inplace(row, w, self.config.rms_norm_eps);
+                }
             }
         }
 
@@ -382,7 +480,7 @@ impl Model for BertModel {
             // Pre-LN for ModernBERT; for Classic BERT, normalization is post-residual
             if self.is_modernbert {
                 for i in 0..n_tokens {
-                    cpu::rmsnorm(
+                    layer_norm_no_bias_inplace(
                         &mut norm_x[i * d..(i + 1) * d],
                         &layer.attn_norm_weight,
                         self.config.rms_norm_eps,
@@ -414,18 +512,15 @@ impl Model for BertModel {
 
             // Apply RoPE for ModernBERT (Neox layout per head)
             if self.is_modernbert {
+                let layer_theta = if layer.is_sliding {
+                    self.config.rope_theta
+                } else {
+                    self.global_rope_theta
+                };
                 for i in 0..n_tokens {
                     let q_tok = &mut q_mat[i * d..(i + 1) * d];
                     let k_tok = &mut k_mat[i * d..(i + 1) * d];
-                    cpu::rope(
-                        q_tok,
-                        k_tok,
-                        i,
-                        n_heads,
-                        n_heads,
-                        head_dim,
-                        self.config.rope_theta,
-                    );
+                    cpu::rope(q_tok, k_tok, i, n_heads, n_heads, head_dim, layer_theta);
                 }
             }
 
@@ -435,17 +530,15 @@ impl Model for BertModel {
                 for q_idx in 0..n_tokens {
                     let q_vec = &q_mat[q_idx * d + h * head_dim..q_idx * d + (h + 1) * head_dim];
 
-                    // Compute dot product scores with keys
-                    scores.fill(f32::NEG_INFINITY);
-                    let mut max_score = f32::NEG_INFINITY;
+                    // Compute dot product scores with keys within sliding window
+                    let (k_start, k_end) = if layer.is_sliding {
+                        (q_idx.saturating_sub(64), (q_idx + 65).min(n_tokens))
+                    } else {
+                        (0, n_tokens)
+                    };
 
-                    for k_idx in 0..n_tokens {
-                        if layer.is_sliding {
-                            let diff = (q_idx as isize - k_idx as isize).abs();
-                            if diff > 64 {
-                                continue;
-                            }
-                        }
+                    let mut max_score = f32::NEG_INFINITY;
+                    for k_idx in k_start..k_end {
                         let k_vec =
                             &k_mat[k_idx * d + h * head_dim..k_idx * d + (h + 1) * head_dim];
                         let s = cpu::dot_f32(q_vec, k_vec) * scale;
@@ -457,7 +550,7 @@ impl Model for BertModel {
 
                     // Softmax
                     let mut sum_exp = 0.0f32;
-                    for score in scores.iter_mut().take(n_tokens) {
+                    for score in &mut scores[k_start..k_end] {
                         if *score > f32::NEG_INFINITY {
                             let e = (*score - max_score).exp();
                             *score = e;
@@ -467,19 +560,25 @@ impl Model for BertModel {
                         }
                     }
                     let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+                    for score in &mut scores[k_start..k_end] {
+                        *score *= inv_sum;
+                    }
 
-                    // Multiply by V
+                    // Multiply by V (sequential memory access across head_dim)
                     let out_slot =
                         &mut attn_out[q_idx * d + h * head_dim..q_idx * d + (h + 1) * head_dim];
-                    for dim_idx in 0..head_dim {
-                        let mut acc = 0.0f32;
-                        for k_idx in 0..n_tokens {
-                            if scores[k_idx] > 0.0 {
-                                let v_val = v_mat[k_idx * d + h * head_dim + dim_idx];
-                                acc += scores[k_idx] * inv_sum * v_val;
+                    out_slot.fill(0.0);
+                    assert_eq!(out_slot.len(), head_dim);
+                    for k_idx in k_start..k_end {
+                        let s = scores[k_idx];
+                        if s > 0.0 {
+                            let v_slice =
+                                &v_mat[k_idx * d + h * head_dim..k_idx * d + (h + 1) * head_dim];
+                            assert_eq!(v_slice.len(), head_dim);
+                            for dim_idx in 0..head_dim {
+                                out_slot[dim_idx] += s * v_slice[dim_idx];
                             }
                         }
-                        out_slot[dim_idx] = acc;
                     }
                 }
             }
@@ -494,15 +593,21 @@ impl Model for BertModel {
                 cpu::add_inplace(&mut x[i * d..(i + 1) * d], &proj_out);
 
                 // Post-LN for Classic BERT
-                if !self.is_modernbert
-                    && let Some(ref b) = layer.attn_norm_bias
-                {
-                    cpu::layer_norm_inplace(
-                        &mut x[i * d..(i + 1) * d],
-                        &layer.attn_norm_weight,
-                        b,
-                        self.config.rms_norm_eps,
-                    );
+                if !self.is_modernbert {
+                    if let Some(ref b) = layer.attn_norm_bias {
+                        cpu::layer_norm_inplace(
+                            &mut x[i * d..(i + 1) * d],
+                            &layer.attn_norm_weight,
+                            b,
+                            self.config.rms_norm_eps,
+                        );
+                    } else {
+                        layer_norm_no_bias_inplace(
+                            &mut x[i * d..(i + 1) * d],
+                            &layer.attn_norm_weight,
+                            self.config.rms_norm_eps,
+                        );
+                    }
                 }
             }
 
@@ -510,7 +615,7 @@ impl Model for BertModel {
             ffn_norm_x.copy_from_slice(&x);
             if self.is_modernbert {
                 for i in 0..n_tokens {
-                    cpu::rmsnorm(
+                    layer_norm_no_bias_inplace(
                         &mut ffn_norm_x[i * d..(i + 1) * d],
                         &layer.ffn_norm_weight,
                         self.config.rms_norm_eps,
@@ -556,6 +661,12 @@ impl Model for BertModel {
                             b,
                             self.config.rms_norm_eps,
                         );
+                    } else {
+                        layer_norm_no_bias_inplace(
+                            &mut x[i * d..(i + 1) * d],
+                            &layer.ffn_norm_weight,
+                            self.config.rms_norm_eps,
+                        );
                     }
                 }
             }
@@ -567,7 +678,7 @@ impl Model for BertModel {
             if let Some(ref b) = self.output_norm_bias {
                 cpu::layer_norm_inplace(row, &self.output_norm_weight, b, self.config.rms_norm_eps);
             } else {
-                cpu::rmsnorm(row, &self.output_norm_weight, self.config.rms_norm_eps);
+                layer_norm_no_bias_inplace(row, &self.output_norm_weight, self.config.rms_norm_eps);
             }
         }
 
@@ -582,6 +693,8 @@ impl Model for BertModel {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn modernbert_alternating_schedule_is_correct() {
         let n_layers = 22;
@@ -627,5 +740,21 @@ mod tests {
 
         let indivisible_n_heads = 13usize;
         assert!(!hidden_size.is_multiple_of(indivisible_n_heads));
+    }
+
+    #[test]
+    fn test_layer_norm_no_bias_inplace() {
+        let mut x = vec![2.0, 4.0, 6.0, 8.0];
+        let weight = vec![1.0, 1.0, 1.0, 1.0];
+        layer_norm_no_bias_inplace(&mut x, &weight, 1e-5);
+
+        // Mean of [2, 4, 6, 8] is 5.0
+        // Variance is ((9 + 1 + 1 + 9) / 4) = 20 / 4 = 5.0
+        // inv_std is 1 / sqrt(5.0 + 1e-5) ~ 0.447213
+        // Centered: [-3, -1, 1, 3] * 0.447213 ~ [-1.34164, -0.44721, 0.44721, 1.34164]
+        let sum: f32 = x.iter().sum();
+        assert!(sum.abs() < 1e-5); // Mean must be 0
+        assert!((x[0] - (-1.34164)).abs() < 1e-4);
+        assert!((x[3] - 1.34164).abs() < 1e-4);
     }
 }
