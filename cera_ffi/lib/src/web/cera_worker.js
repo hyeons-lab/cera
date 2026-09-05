@@ -29,9 +29,9 @@
 // Every request gets exactly one reply, and `id` correlates them. Streaming
 // events carry the same `id` and always precede that request's reply.
 
-console.info('[cera:worker:version] v0.5.2 (build: 2026-09-02-rev22-local-models-webgpu)');
-
 'use strict';
+
+console.info('[cera:worker:version] v0.5.3 (build: 2026-09-04-rev23-local-models-webgpu)');
 
 const LOCAL_MODELS_DIR = '/models-local';
 

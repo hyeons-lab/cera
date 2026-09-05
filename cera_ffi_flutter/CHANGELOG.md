@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.3
+
+### Added
+
+- **Streaming Text Chunks**: Re-exported `generateStreamChunks` for batched token streaming in Flutter UI pipelines.
+- **Multimodal Envelopes**: Re-exported `MultimodalEnvelope`, `ImageInput`, and `AudioInput` for multimodal inference.
+- **Android Model Download Service**: Android background service integration for downloading model assets.
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.5.3` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.5.2
 
 ### Added
