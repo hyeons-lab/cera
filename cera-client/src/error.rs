@@ -31,24 +31,44 @@ fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, 
 where
     D: Deserializer<'de>,
 {
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(opt.and_then(|val| match val {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }))
+}
+
+fn deserialize_api_error_payload<'de, D>(deserializer: D) -> Result<ApiErrorPayload, D::Error>
+where
+    D: Deserializer<'de>,
+{
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum StringOrInt {
+    enum ErrorPayloadOrString {
+        Payload(ApiErrorPayload),
         String(String),
-        Int(i64),
     }
 
-    let opt = Option::<StringOrInt>::deserialize(deserializer)?;
-    Ok(opt.map(|val| match val {
-        StringOrInt::String(s) => s,
-        StringOrInt::Int(i) => i.to_string(),
-    }))
+    let val = ErrorPayloadOrString::deserialize(deserializer)?;
+    Ok(match val {
+        ErrorPayloadOrString::Payload(p) => p,
+        ErrorPayloadOrString::String(s) => ApiErrorPayload {
+            message: s,
+            error_type: None,
+            param: None,
+            code: None,
+        },
+    })
 }
 
 /// JSON envelope containing the API error payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiErrorEnvelope {
     /// Inner error payload.
+    #[serde(deserialize_with = "deserialize_api_error_payload")]
     pub error: ApiErrorPayload,
 }
 
@@ -75,8 +95,17 @@ pub enum ClientError {
     },
 
     /// JSON serialization or deserialization failure.
-    #[error("JSON serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error(
+        "JSON serialization error: {source}{}",
+        .raw_payload.as_deref().map(|p| format!(" (raw payload: {p})")).unwrap_or_default()
+    )]
+    Serialization {
+        /// Underlying serde_json error.
+        #[source]
+        source: serde_json::Error,
+        /// Raw unparsed payload if available for diagnostics.
+        raw_payload: Option<String>,
+    },
 
     /// Server-Sent Events streaming error or protocol violation.
     #[error("Stream error: {0}")]
@@ -93,6 +122,15 @@ pub enum ClientError {
     /// An HTTP header value contains invalid characters.
     #[error("Invalid HTTP header: {0}")]
     InvalidHeader(String),
+}
+
+impl From<serde_json::Error> for ClientError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Serialization {
+            source,
+            raw_payload: None,
+        }
+    }
 }
 
 impl ClientError {
@@ -271,5 +309,50 @@ mod tests {
         let env_missing: ApiErrorEnvelope = serde_json::from_str(json_missing).unwrap();
         assert_eq!(env_missing.error.message, "");
         assert_eq!(env_missing.error.code.as_deref(), Some("503"));
+    }
+
+    #[test]
+    fn test_parse_bare_string_error_message() {
+        let json_str = r#"{"error": "model is currently overloaded, please try again"}"#;
+        let env: ApiErrorEnvelope = serde_json::from_str(json_str).unwrap();
+        assert_eq!(
+            env.error.message,
+            "model is currently overloaded, please try again"
+        );
+        assert_eq!(env.error.code, None);
+        assert_eq!(env.error.error_type, None);
+    }
+
+    #[test]
+    fn test_parse_various_error_codes() {
+        let json_float = r#"{"error": {"message": "Rate limit", "code": 429.5}}"#;
+        let env_float: ApiErrorEnvelope = serde_json::from_str(json_float).unwrap();
+        assert_eq!(env_float.error.code.as_deref(), Some("429.5"));
+
+        let json_bool = r#"{"error": {"message": "Invalid", "code": true}}"#;
+        let env_bool: ApiErrorEnvelope = serde_json::from_str(json_bool).unwrap();
+        assert_eq!(env_bool.error.code.as_deref(), Some("true"));
+
+        let json_null_code = r#"{"error": {"message": "Error", "code": null}}"#;
+        let env_null_code: ApiErrorEnvelope = serde_json::from_str(json_null_code).unwrap();
+        assert_eq!(env_null_code.error.code, None);
+    }
+
+    #[test]
+    fn test_serialization_error_display_with_and_without_raw_payload() {
+        let err_no_payload: ClientError =
+            serde_json::from_str::<serde_json::Value>("invalid json{")
+                .unwrap_err()
+                .into();
+        let display_no_payload = err_no_payload.to_string();
+        assert!(display_no_payload.starts_with("JSON serialization error:"));
+        assert!(!display_no_payload.contains("raw payload"));
+
+        let err_with_payload = ClientError::Serialization {
+            source: serde_json::from_str::<serde_json::Value>("invalid json{").unwrap_err(),
+            raw_payload: Some("data: {malformed}".to_string()),
+        };
+        let display_with_payload = err_with_payload.to_string();
+        assert!(display_with_payload.contains("raw payload: data: {malformed}"));
     }
 }

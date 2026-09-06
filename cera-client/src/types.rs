@@ -170,6 +170,28 @@ impl ChatMessage {
         self.refusal = Some(refusal.into());
         self
     }
+
+    /// Set the text content for the message.
+    pub fn content(mut self, content: impl Into<String>) -> Self {
+        self.content = Some(content.into());
+        self
+    }
+
+    /// Set reasoning content (thinking tokens) for the message.
+    pub fn reasoning_content(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
+    }
+
+    /// Attach tool calls to the message.
+    pub fn tool_calls(mut self, tool_calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        };
+        self
+    }
 }
 
 /// A tool call invoked by the model.
@@ -440,9 +462,9 @@ impl ChatCompletionRequest {
         self
     }
 
-    /// Attach tool definitions.
+    /// Attach tool definitions, omitting the parameter if empty.
     pub fn tools(mut self, tools: Vec<ToolDefinition>) -> Self {
-        self.tools = Some(tools);
+        self.tools = if tools.is_empty() { None } else { Some(tools) };
         self
     }
 
@@ -684,6 +706,18 @@ impl From<Vec<String>> for EmbeddingInput {
     }
 }
 
+impl From<Vec<&str>> for EmbeddingInput {
+    fn from(v: Vec<&str>) -> Self {
+        Self::Multiple(v.into_iter().map(String::from).collect())
+    }
+}
+
+impl From<&[&str]> for EmbeddingInput {
+    fn from(s: &[&str]) -> Self {
+        Self::Multiple(s.iter().copied().map(String::from).collect())
+    }
+}
+
 impl Serialize for EmbeddingInput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -840,6 +874,15 @@ mod tests {
         let refusal_json = serde_json::to_string(&assistant_refusal).unwrap();
         assert!(refusal_json.contains("\"name\":\"safety_agent\""));
         assert!(refusal_json.contains("\"refusal\":\"I cannot assist with that request.\""));
+
+        let chained_assistant = ChatMessage::assistant("Here is the tool invocation:")
+            .reasoning_content("Let me check the weather.")
+            .tool_calls(vec![ToolCall::function("call_1", "get_weather", "{}")]);
+        assert_eq!(
+            chained_assistant.reasoning_content.as_deref(),
+            Some("Let me check the weather.")
+        );
+        assert_eq!(chained_assistant.tool_calls.as_ref().unwrap().len(), 1);
     }
 
     #[test]
@@ -874,6 +917,12 @@ mod tests {
         assert_eq!(json["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(json["response_format"]["type"], "json_object");
         assert_eq!(json["stop"][0], "\n");
+
+        let empty_tools_req =
+            ChatCompletionRequest::new("gpt-4o-mini", vec![ChatMessage::user("Hi")])
+                .tools(Vec::new());
+        let empty_json = serde_json::to_value(&empty_tools_req).unwrap();
+        assert!(empty_json.get("tools").is_none());
     }
 
     #[test]
@@ -947,6 +996,18 @@ mod tests {
         let val_multi = serde_json::to_value(&req_multi).unwrap();
         assert_eq!(val_multi["input"][0], "item1");
         assert_eq!(val_multi["input"][1], "item2");
+
+        let req_slice_vec =
+            EmbeddingRequest::new("text-embedding-3-small", vec!["slice1", "slice2"]);
+        let val_slice_vec = serde_json::to_value(&req_slice_vec).unwrap();
+        assert_eq!(val_slice_vec["input"][0], "slice1");
+        assert_eq!(val_slice_vec["input"][1], "slice2");
+
+        let items: &[&str] = &["item_a", "item_b"];
+        let req_slice = EmbeddingRequest::new("text-embedding-3-small", items);
+        let val_slice = serde_json::to_value(&req_slice).unwrap();
+        assert_eq!(val_slice["input"][0], "item_a");
+        assert_eq!(val_slice["input"][1], "item_b");
 
         let raw_res = r#"{
             "object": "list",

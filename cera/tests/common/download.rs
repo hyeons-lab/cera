@@ -60,7 +60,9 @@ pub fn cache_dir() -> PathBuf {
 /// that call this are already gated on `CERA_TEST_DOWNLOAD=1`, so a
 /// panic here is the correct failure mode.
 pub fn ensure_cached(url: &str, _filename: &str) -> PathBuf {
-    let _guard = ENSURE_CACHED_LOCK.lock().unwrap();
+    let _guard = ENSURE_CACHED_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo = BundleRepo::new(cache_dir());
     repo.resolve_url(url, None)
         .unwrap_or_else(|e| panic!("resolve {url}: {e}"))

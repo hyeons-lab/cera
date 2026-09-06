@@ -14,12 +14,23 @@ use crate::types::{
 };
 
 /// Builder for constructing a configured [`Client`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBuilder {
     provider: Provider,
     api_key: Option<String>,
     timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -29,7 +40,7 @@ impl ClientBuilder {
             provider,
             api_key: None,
             timeout: Some(Duration::from_secs(60)),
-            connect_timeout: None,
+            connect_timeout: Some(Duration::from_secs(10)),
         }
     }
 
@@ -45,9 +56,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Disable request timeout.
+    pub fn no_timeout(mut self) -> Self {
+        self.timeout = None;
+        self
+    }
+
     /// Set socket connection timeout.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable socket connection timeout.
+    pub fn no_connect_timeout(mut self) -> Self {
+        self.connect_timeout = None;
         self
     }
 
@@ -75,13 +98,24 @@ impl ClientBuilder {
 }
 
 /// Asynchronous API client for querying OpenAI and OpenRouter endpoints.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     provider: Provider,
     api_key: Option<String>,
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("http", &self.http)
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Client {
@@ -202,6 +236,14 @@ impl Client {
     /// The request handshake awaits HTTP response headers. Once headers arrive and status is
     /// validated, the connection remains open for streaming tokens. Total request timeout is omitted
     /// to support long generations; connection timeout is governed by [`ClientBuilder::connect_timeout`].
+    ///
+    /// # Stalls and Inactivity Timeouts
+    ///
+    /// Because total request timeouts are omitted during streaming to permit long generations,
+    /// a network disruption or hung server connection mid-stream may not terminate automatically.
+    /// Callers in production environments should wrap stream consumption in an inactivity or idle
+    /// timeout (for example, using `tokio::time::timeout` between successive chunk yields) so that
+    /// mid-stream stalls can be detected and recovered from.
     pub async fn chat_stream(
         &self,
         mut request: ChatCompletionRequest,
@@ -411,5 +453,12 @@ mod tests {
             }
             _ => panic!("expected OpenRouter provider"),
         }
+
+        let unbounded_client = Client::builder(Provider::OpenAi)
+            .no_timeout()
+            .no_connect_timeout()
+            .build()
+            .unwrap();
+        assert_eq!(unbounded_client.provider(), &Provider::OpenAi);
     }
 }

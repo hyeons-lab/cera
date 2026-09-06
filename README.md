@@ -114,7 +114,8 @@ One Rust core, consumed from many places:
 
 | Target | Crate / package | Consumers |
 |--------|-----------------|-----------|
-| **Rust** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
+| **Rust (Engine)** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
+| **Rust (API client)** | [`cera-client`](cera-client/) | any Rust project (`cargo add cera-client`); OpenAI and OpenRouter endpoints |
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |

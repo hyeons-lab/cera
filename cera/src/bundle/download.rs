@@ -260,6 +260,8 @@ pub(crate) fn wait_for_active_download(path: &Path) {
     }
 }
 
+pub(crate) const ALREADY_IN_PROGRESS_MSG: &str = "is already in progress in this process";
+
 /// RAII guard ensuring at most one active download to a given destination in this process.
 struct ActiveDownloadGuard {
     path: PathBuf,
@@ -271,7 +273,7 @@ impl ActiveDownloadGuard {
         let mut active = lock_active_downloads();
         if !active.insert(canon.clone()) {
             return Err(CeraError::Backend(format!(
-                "download for {} is already in progress in this process",
+                "download for {} {ALREADY_IN_PROGRESS_MSG}",
                 path.display()
             )));
         }

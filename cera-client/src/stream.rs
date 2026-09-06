@@ -93,7 +93,13 @@ impl<S> ChatCompletionStream<S> {
                             true,
                         )
                     } else {
-                        (Some(Err(ClientError::Serialization(err))), false)
+                        (
+                            Some(Err(ClientError::Serialization {
+                                source: err,
+                                raw_payload: Some(data.to_string()),
+                            })),
+                            false,
+                        )
                     }
                 }
             }
@@ -279,6 +285,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sse_stream_handles_four_byte_emoji_split_across_chunks() {
+        // "🦀" is UTF-8: [0xF0, 0x9F, 0xA6, 0x80]
+        let prefix = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
+        let suffix = "\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+
+        let mut chunk1_bytes = prefix.as_bytes().to_vec();
+        chunk1_bytes.push(0xF0);
+        chunk1_bytes.push(0x9F); // Split mid 4-byte sequence
+
+        let mut chunk2_bytes = vec![0xA6, 0x80];
+        chunk2_bytes.extend_from_slice(suffix.as_bytes());
+
+        let byte_stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from(chunk1_bytes)),
+            Ok::<Bytes, reqwest::Error>(Bytes::from(chunk2_bytes)),
+        ]);
+
+        let mut sse_stream = ChatCompletionStream::new(byte_stream);
+        let item = sse_stream.next().await.expect("item 1").unwrap();
+        assert_eq!(item.choices[0].delta.content.as_deref(), Some("🦀"));
+        assert!(sse_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_sse_stream_handles_midstream_api_error() {
         let payload = "data: {\"error\":{\"message\":\"Model overloaded\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n";
         let byte_stream =
@@ -290,6 +320,23 @@ mod tests {
             ClientError::Api { message, code, .. } => {
                 assert_eq!(message, "Model overloaded");
                 assert_eq!(code.as_deref(), Some("server_error"));
+            }
+            other => panic!("expected Api error, got: {other:?}"),
+        }
+        assert!(sse_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_handles_bare_string_api_error() {
+        let payload = "data: {\"error\":\"rate limit reached, please slow down\"}\n\n";
+        let byte_stream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(payload))]);
+        let mut sse_stream = ChatCompletionStream::new(byte_stream);
+
+        let err = sse_stream.next().await.expect("item").unwrap_err();
+        match err {
+            ClientError::Api { message, .. } => {
+                assert_eq!(message, "rate limit reached, please slow down");
             }
             other => panic!("expected Api error, got: {other:?}"),
         }
@@ -335,5 +382,27 @@ mod tests {
         assert!(boxed_stream.is_terminated());
         // FusedStream guarantees subsequent polls return None without panicking
         assert!(boxed_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_handles_serialization_error_with_raw_payload() {
+        let payload = "data: {\"not_valid_json_chunk\": true}\n\n";
+        let byte_stream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(payload))]);
+        let mut sse_stream = ChatCompletionStream::new(byte_stream);
+
+        let err = sse_stream.next().await.expect("item").unwrap_err();
+        match err {
+            ClientError::Serialization {
+                source: _,
+                raw_payload,
+            } => {
+                assert_eq!(
+                    raw_payload.as_deref(),
+                    Some("{\"not_valid_json_chunk\": true}")
+                );
+            }
+            other => panic!("expected Serialization error, got: {other:?}"),
+        }
     }
 }

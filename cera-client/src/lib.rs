@@ -12,7 +12,7 @@ pub mod types;
 pub use client::{Client, ClientBuilder};
 pub use error::{ApiErrorEnvelope, ApiErrorPayload, ClientError};
 pub use provider::{
-    OPENAI_API_KEY_ENV, OPENAI_DEFAULT_BASE_URL, OPENROUTER_API_KEY_ENV,
+    OPENAI_API_KEY_ENV, OPENAI_BASE_URL_ENV, OPENAI_DEFAULT_BASE_URL, OPENROUTER_API_KEY_ENV,
     OPENROUTER_DEFAULT_BASE_URL, Provider,
 };
 pub use reqwest::StatusCode;

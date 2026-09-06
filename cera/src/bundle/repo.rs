@@ -320,9 +320,7 @@ impl BundleRepo {
                 self.progress.as_deref(),
             ) {
                 Ok(()) => return Ok(dest),
-                Err(CeraError::Backend(msg))
-                    if msg.contains("is already in progress in this process") =>
-                {
+                Err(CeraError::Backend(msg)) if msg.contains(download::ALREADY_IN_PROGRESS_MSG) => {
                     download::wait_for_active_download(&dest);
                     continue;
                 }

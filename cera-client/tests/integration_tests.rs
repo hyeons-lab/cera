@@ -374,3 +374,88 @@ fn test_multi_turn_tool_calling_sequence() {
     assert_eq!(serialized["messages"][2]["role"], "tool");
     assert_eq!(serialized["messages"][2]["tool_call_id"], "call_abc123");
 }
+
+#[test]
+fn test_debug_redacts_api_key_on_client_and_builder() {
+    use cera_client::Provider;
+
+    let key = "sk-super-secret-key-that-must-never-leak";
+    let builder = cera_client::ClientBuilder::new(Provider::OpenAi).api_key(key);
+    let builder_debug = format!("{builder:?}");
+    assert!(
+        !builder_debug.contains(key),
+        "ClientBuilder Debug output leaked plaintext api_key: {builder_debug}"
+    );
+    assert!(
+        builder_debug.contains("[REDACTED]"),
+        "ClientBuilder Debug output missing [REDACTED]: {builder_debug}"
+    );
+
+    let client = builder.build().unwrap();
+    let client_debug = format!("{client:?}");
+    assert!(
+        !client_debug.contains(key),
+        "Client Debug output leaked plaintext api_key: {client_debug}"
+    );
+    assert!(
+        client_debug.contains("[REDACTED]"),
+        "Client Debug output missing [REDACTED]: {client_debug}"
+    );
+
+    let no_key_builder = cera_client::ClientBuilder::new(Provider::Custom {
+        base_url: "http://localhost:8000".to_string(),
+    });
+    let no_key_builder_debug = format!("{no_key_builder:?}");
+    assert!(
+        no_key_builder_debug.contains("api_key: None"),
+        "Expected api_key: None in {no_key_builder_debug}"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_chat_stream_empty_body() {
+    let (addr, handle) = spawn_mock_server(
+        "POST /chat/completions",
+        "Content-Type: text/event-stream\r\n",
+        "",
+    )
+    .await;
+
+    let client = Client::custom(format!("http://{addr}"), Some("key".to_string())).unwrap();
+    let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hi")]);
+
+    let mut stream = client.chat_stream(request).await.unwrap();
+    let next_chunk = stream.next().await;
+    assert!(
+        next_chunk.is_none(),
+        "Expected stream to terminate cleanly on empty body"
+    );
+
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mock_chat_stream_html_error() {
+    let html_body = "<html><body>502 Bad Gateway: upstream connect error</body></html>";
+    let (addr, handle) = spawn_mock_server(
+        "POST /chat/completions",
+        "Content-Type: text/html\r\n",
+        html_body,
+    )
+    .await;
+
+    let client = Client::custom(format!("http://{addr}"), Some("key".to_string())).unwrap();
+    let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hi")]);
+
+    let err = client.chat_stream(request).await.unwrap_err();
+    match err {
+        ClientError::Stream(msg) => {
+            assert!(msg.contains("Expected text/event-stream"));
+            assert!(msg.contains("text/html"));
+            assert!(msg.contains("502 Bad Gateway"));
+        }
+        other => panic!("expected ClientError::Stream, got: {other:?}"),
+    }
+
+    handle.await.unwrap();
+}
