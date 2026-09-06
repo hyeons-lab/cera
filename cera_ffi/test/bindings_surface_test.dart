@@ -24,7 +24,7 @@ import 'package:test/test.dart';
 /// Referencing the symbols means the package stops compiling if they vanish.
 void main() {
   test('GenerateOpts carries every field the Rust record declares', () {
-    // 12 fields as of cera-ffi/src/lib.rs. `grammarTriggerTokens`,
+    // 13 fields as of cera-ffi/src/lib.rs (including spec). `grammarTriggerTokens`,
     // `flushEveryTokens`, and `flushEveryMs` are the three that went missing.
     const opts = GenerateOpts(
       maxTokens: 1,
@@ -39,13 +39,48 @@ void main() {
       grammarTriggerTokens: <int>[],
       flushEveryTokens: 0,
       flushEveryMs: 0,
+      spec: SpecDecodeConfig(ngram: 3, k: 5),
     );
 
     expect(opts.maxTokens, 1);
     expect(opts.grammarTriggerTokens, isEmpty);
     expect(opts.flushEveryTokens, 0);
     expect(opts.flushEveryMs, 0);
+    expect(opts.spec?.ngram, 3);
+    expect(opts.spec?.k, 5);
   });
+
+  test(
+    'CeraOptions carries kvCompression, ubatchSize, and effectiveKvCompression',
+    () {
+      const optsDefault = CeraOptions();
+      expect(optsDefault.ubatchSize, 512);
+      expect(optsDefault.turboQuant, isFalse);
+      expect(optsDefault.kvCompression, isNull);
+      expect(optsDefault.effectiveKvCompression, CeraKvCompression.none);
+
+      const optsTurboQuant = CeraOptions(turboQuant: true);
+      expect(
+        optsTurboQuant.effectiveKvCompression,
+        CeraKvCompression.turboQuant,
+      );
+
+      const optsF16 = CeraOptions(kvCompression: CeraKvCompression.f16);
+      expect(optsF16.effectiveKvCompression, CeraKvCompression.f16);
+
+      const optsF16Override = CeraOptions(
+        turboQuant: true,
+        kvCompression: CeraKvCompression.f16,
+        ubatchSize: 256,
+      );
+      expect(optsF16Override.ubatchSize, 256);
+      expect(optsF16Override.effectiveKvCompression, CeraKvCompression.f16);
+
+      const spec = CeraSpecDecode(ngram: 4, k: 10);
+      expect(spec.ngram, 4);
+      expect(spec.k, 10);
+    },
+  );
 
   test('the RustBuffer-returning methods are declared on CeraEngine', () {
     // The guard is `_surfaceGuard` below, which is resolved at compile time.

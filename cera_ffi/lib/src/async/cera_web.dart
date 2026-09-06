@@ -550,6 +550,7 @@ class _WorkerCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    CeraSpecDecode? spec,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {

@@ -208,6 +208,7 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         grammar_trigger_tokens: Vec::new(),
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
+        spec: None,
     }
 }
 

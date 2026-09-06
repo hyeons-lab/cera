@@ -676,6 +676,16 @@ pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
     }
 }
 
+#[cfg(has_blas)]
+fn blas_cache_weights_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CERA_BLAS_CACHE_WEIGHTS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
+    })
+}
+
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
 /// then SGEMM `out[m, n] = weight[m, k] @ b[k, n]` in row-major (`b`/`out` are
 /// row-major `[k|m, n]`, stride `n`). Returns `true` for the supported dtypes;
@@ -690,15 +700,13 @@ pub(crate) fn try_blas_prefill_gemm(
     m: usize,
     n: usize,
     k: usize,
-    _dequant_scratch: &mut Vec<f32>,
+    dequant_scratch: &mut Vec<f32>,
 ) -> bool {
     debug_assert_eq!(wref.m, m, "try_blas_prefill_gemm: weight m mismatch");
     debug_assert_eq!(wref.k, k, "try_blas_prefill_gemm: weight k mismatch");
 
     // Optional persistent caching via environment variable for memory-unconstrained microbenchmarks.
-    let should_cache = std::env::var("CERA_BLAS_CACHE_WEIGHTS")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
+    let should_cache = blas_cache_weights_enabled();
     if should_cache {
         let dequant = wref.cached_f32.get_or_init(|| {
             let data = weight_data(gguf, wref);
@@ -721,9 +729,12 @@ pub(crate) fn try_blas_prefill_gemm(
     // Default zero-leak on-demand streaming dequantization (drops CPU RAM from 17.6GB -> 2.8GB):
     let data = weight_data(gguf, wref);
     if let Some(dequantize) = blas_dequantizer(wref.dtype) {
-        let mut row_buf = vec![0.0f32; m * k];
-        dequantize(data, m, k, &mut row_buf);
-        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, &row_buf, b, out);
+        if dequant_scratch.len() < m * k {
+            dequant_scratch.resize(m * k, 0.0);
+        }
+        let row_buf = &mut dequant_scratch[..m * k];
+        dequantize(data, m, k, row_buf);
+        crate::backend::blas::sgemm_rowmajor_nn(m, n, k, row_buf, b, out);
         true
     } else {
         report_uncomputed_gemm("try_blas_prefill_gemm", wref.dtype, k);
@@ -768,6 +779,7 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
     n: usize,
     m: usize,
     k: usize,
+    dequant_scratch: &mut Vec<f32>,
 ) -> bool {
     debug_assert_eq!(
         wref.m, m,
@@ -778,9 +790,7 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
         "try_blas_prefill_gemm_rowmajor: weight k mismatch"
     );
 
-    let should_cache = std::env::var("CERA_BLAS_CACHE_WEIGHTS")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
+    let should_cache = blas_cache_weights_enabled();
     if should_cache {
         let dequant = get_dequantized_f32(gguf, wref);
         if dequant.is_empty() {
@@ -794,9 +804,12 @@ pub(crate) fn try_blas_prefill_gemm_rowmajor(
     // Default zero-leak on-demand streaming dequantization with native BLAS transpose:
     let data = weight_data(gguf, wref);
     if let Some(dequantize) = blas_dequantizer(wref.dtype) {
-        let mut row_buf = vec![0.0f32; m * k];
-        dequantize(data, m, k, &mut row_buf);
-        crate::backend::blas::sgemm_rowmajor_nt_parallel(n, m, k, b, &row_buf, out);
+        if dequant_scratch.len() < m * k {
+            dequant_scratch.resize(m * k, 0.0);
+        }
+        let row_buf = &mut dequant_scratch[..m * k];
+        dequantize(data, m, k, row_buf);
+        crate::backend::blas::sgemm_rowmajor_nt_parallel(n, m, k, b, row_buf, out);
         true
     } else {
         report_uncomputed_gemm("try_blas_prefill_gemm_rowmajor", wref.dtype, k);

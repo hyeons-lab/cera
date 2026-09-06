@@ -1387,10 +1387,45 @@ impl From<SessionConfig> for cera::SessionConfig {
     }
 }
 
+/// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct SpecDecodeConfig {
+    /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+    #[uniffi(default = 2)]
+    pub ngram: u32,
+    /// Maximum draft length verified per round (speculation depth). Defaults to 6.
+    #[uniffi(default = 6)]
+    pub k: u32,
+}
+
+impl Default for SpecDecodeConfig {
+    fn default() -> Self {
+        Self { ngram: 2, k: 6 }
+    }
+}
+
+impl From<cera::SpecDecode> for SpecDecodeConfig {
+    fn from(sd: cera::SpecDecode) -> Self {
+        Self {
+            ngram: sd.ngram as u32,
+            k: sd.k as u32,
+        }
+    }
+}
+
+impl From<SpecDecodeConfig> for cera::SpecDecode {
+    fn from(c: SpecDecodeConfig) -> Self {
+        Self {
+            ngram: c.ngram as usize,
+            k: c.k as usize,
+        }
+    }
+}
+
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
-/// effect under the synchronous [`Session::generate`] — they're
+/// effect under the synchronous [`Session::generate`], they are
 /// meaningful once streaming (foreign-trait `ModalitySink`) lands
 /// in a follow-up PR. Including them in the record now keeps the FFI
 /// surface stable across that transition.
@@ -1430,7 +1465,7 @@ pub struct GenerateOpts {
     /// `grammar` is set, the grammar stays inactive until the model emits one
     /// of these tokens (e.g. the tool-call start marker from
     /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
-    /// deactivates on completion. Empty → `grammar` is active from the start.
+    /// deactivates on completion. Empty -> `grammar` is active from the start.
     #[uniffi(default = [])]
     pub grammar_trigger_tokens: Vec<u32>,
     /// Ignored under synchronous generate; reserved for streaming.
@@ -1439,6 +1474,10 @@ pub struct GenerateOpts {
     /// Ignored under synchronous generate; reserved for streaming.
     #[uniffi(default = 50)]
     pub flush_every_ms: u32,
+    /// Optional speculative decoding configuration (prompt-lookup drafting).
+    /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+    #[uniffi(default = None)]
+    pub spec: Option<SpecDecodeConfig>,
 }
 
 impl From<&cera::GenerateOpts> for GenerateOpts {
@@ -1458,6 +1497,7 @@ impl From<&cera::GenerateOpts> for GenerateOpts {
             grammar_trigger_tokens: core.grammar_trigger_tokens.clone(),
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
+            spec: core.spec.map(SpecDecodeConfig::from),
         }
     }
 }
@@ -1477,7 +1517,7 @@ impl Default for GenerateOpts {
 impl TryFrom<GenerateOpts> for cera::GenerateOpts {
     type Error = FfiError;
 
-    /// Fallible because the GBNF `grammar` source is compiled here — a malformed
+    /// Fallible because the GBNF `grammar` source is compiled here: a malformed
     /// grammar becomes [`FfiError::GrammarParse`] rather than silently decoding
     /// unconstrained.
     fn try_from(o: GenerateOpts) -> Result<Self, FfiError> {
@@ -1502,14 +1542,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             grammar_trigger_tokens: o.grammar_trigger_tokens,
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
-            // Not exposed over FFI yet. Speculative decoding is dense-CPU only in
-            // this phase, while the mobile bindings' usual target is LFM2 on
-            // Metal, so there is nothing to opt into here. Listed explicitly
-            // rather than filled from `..Default::default()` on purpose: this
-            // mirror enumerates every field so that adding one to the core struct
-            // breaks the FFI build loudly — a stable ABI surface should not
-            // silently inherit a new default.
-            spec: None,
+            spec: o.spec.map(cera::SpecDecode::from),
         })
     }
 }
@@ -3725,6 +3758,22 @@ mod tests {
         assert!(core.grammar.is_none());
         assert_eq!(core.flush_every_tokens, default_core.flush_every_tokens);
         assert_eq!(core.flush_every_ms, default_core.flush_every_ms);
+        assert_eq!(
+            core.spec.map(|s| (s.ngram, s.k)),
+            default_core.spec.map(|s| (s.ngram, s.k))
+        );
+    }
+
+    #[test]
+    fn generate_opts_spec_decode_roundtrip() {
+        let ffi = GenerateOpts {
+            spec: Some(SpecDecodeConfig { ngram: 3, k: 8 }),
+            ..GenerateOpts::default()
+        };
+        let core: cera::GenerateOpts = ffi.clone().try_into().expect("valid spec decode config");
+        assert_eq!(core.spec.as_ref().map(|s| (s.ngram, s.k)), Some((3, 8)));
+        let back = GenerateOpts::from(&core);
+        assert_eq!(back.spec, Some(SpecDecodeConfig { ngram: 3, k: 8 }));
     }
 
     #[test]

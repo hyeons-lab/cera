@@ -73,6 +73,33 @@ class CeraWebAssets {
   final String moduleUrl;
 }
 
+/// KV-cache compression modes supported by Cera.
+enum CeraKvCompression {
+  /// Uncompressed FP32 KV-cache (standard precision).
+  none,
+
+  /// Half-precision FP16 KV-cache (roughly 50% KV memory savings with near-lossless precision).
+  f16,
+
+  /// TurboQuant KV-cache compression (extreme memory reduction).
+  turboQuant,
+}
+
+/// Speculative decoding options for prompt-lookup drafting.
+class CeraSpecDecode {
+  /// Creates speculative decoding options.
+  const CeraSpecDecode({this.ngram = 2, this.k = 6});
+
+  /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+  final int ngram;
+
+  /// Maximum draft length verified per round (speculation depth). Defaults to 6.
+  final int k;
+
+  @override
+  String toString() => 'CeraSpecDecode(ngram: $ngram, k: $k)';
+}
+
 /// Knobs fixed for the lifetime of an engine.
 class CeraOptions {
   /// Creates an option set. Every field has a usable default.
@@ -80,6 +107,8 @@ class CeraOptions {
     this.contextSize = 4096,
     this.backend = CeraBackend.auto,
     this.turboQuant = false,
+    this.kvCompression,
+    this.ubatchSize = 512,
     this.gpuDepthformer = false,
     this.web = const CeraWebAssets(),
   });
@@ -90,8 +119,26 @@ class CeraOptions {
   /// Which compute backend to run on.
   final CeraBackend backend;
 
-  /// Whether to enable TurboQuant KV-cache compression. Defaults to false (cera default).
+  /// Whether to enable TurboQuant KV-cache compression. Defaults to false.
+  ///
+  /// Deprecated in favor of [kvCompression]. If [kvCompression] is not specified,
+  /// setting [turboQuant] to true uses [CeraKvCompression.turboQuant].
   final bool turboQuant;
+
+  /// KV-cache compression mode: none, f16, or turboQuant.
+  ///
+  /// Takes precedence over [turboQuant]. Defaults to [CeraKvCompression.none]
+  /// unless [turboQuant] is true.
+  final CeraKvCompression? kvCompression;
+
+  /// Effective KV-cache compression mode.
+  CeraKvCompression get effectiveKvCompression {
+    if (kvCompression != null) return kvCompression!;
+    return turboQuant ? CeraKvCompression.turboQuant : CeraKvCompression.none;
+  }
+
+  /// Micro-batch size for prompt prefill chunking. Defaults to 512.
+  final int ubatchSize;
 
   /// Whether to prefer GPU depthformer for audio generation when available.
   final bool gpuDepthformer;
@@ -411,6 +458,7 @@ abstract interface class Cera {
     double? topP,
     int? topK,
     int? seed,
+    CeraSpecDecode? spec,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   });

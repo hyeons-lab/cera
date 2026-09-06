@@ -3254,17 +3254,81 @@ class _UniffiFfiConverterSequenceUInt32(_UniffiConverterRustBuffer):
         ]
 
 @dataclass
+class SpecDecodeConfig:
+    """
+    Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+"""
+    def __init__(self, *, ngram:int = 2, k:int = 6):
+        self.ngram = ngram
+        self.k = k
+        
+        
+
+    
+    def __str__(self):
+        return "SpecDecodeConfig(ngram={}, k={})".format(self.ngram, self.k)
+    def __eq__(self, other):
+        if self.ngram != other.ngram:
+            return False
+        if self.k != other.k:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSpecDecodeConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SpecDecodeConfig(
+            ngram=_UniffiFfiConverterUInt32.read(buf),
+            k=_UniffiFfiConverterUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt32.check_lower(value.ngram)
+        _UniffiFfiConverterUInt32.check_lower(value.k)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt32.write(value.ngram, buf)
+        _UniffiFfiConverterUInt32.write(value.k, buf)
+
+class _UniffiFfiConverterOptionalTypeSpecDecodeConfig(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeSpecDecodeConfig.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeSpecDecodeConfig.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeSpecDecodeConfig.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
 class GenerateOpts:
     """
     Per-call decode options. Mirrors [`cera::GenerateOpts`].
 
     `flush_every_tokens` / `flush_every_ms` are accepted but have no
-    effect under the synchronous [`Session::generate`] — they're
+    effect under the synchronous [`Session::generate`], they are
     meaningful once streaming (foreign-trait `ModalitySink`) lands
     in a follow-up PR. Including them in the record now keeps the FFI
     surface stable across that transition.
 """
-    def __init__(self, *, max_tokens:int = 256, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50):
+    def __init__(self, *, max_tokens:int = 256, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT):
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -3286,12 +3350,16 @@ class GenerateOpts:
             self.grammar_trigger_tokens = grammar_trigger_tokens
         self.flush_every_tokens = flush_every_tokens
         self.flush_every_ms = flush_every_ms
+        if spec is _DEFAULT:
+            self.spec = None
+        else:
+            self.spec = spec
         
         
 
     
     def __str__(self):
-        return "GenerateOpts(max_tokens={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={})".format(self.max_tokens, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms)
+        return "GenerateOpts(max_tokens={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={})".format(self.max_tokens, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec)
     def __eq__(self, other):
         if self.max_tokens != other.max_tokens:
             return False
@@ -3317,6 +3385,8 @@ class GenerateOpts:
             return False
         if self.flush_every_ms != other.flush_every_ms:
             return False
+        if self.spec != other.spec:
+            return False
         return True
 
 class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
@@ -3335,6 +3405,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
             grammar_trigger_tokens=_UniffiFfiConverterSequenceUInt32.read(buf),
             flush_every_tokens=_UniffiFfiConverterUInt32.read(buf),
             flush_every_ms=_UniffiFfiConverterUInt32.read(buf),
+            spec=_UniffiFfiConverterOptionalTypeSpecDecodeConfig.read(buf),
         )
 
     @staticmethod
@@ -3351,6 +3422,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceUInt32.check_lower(value.grammar_trigger_tokens)
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_tokens)
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_ms)
+        _UniffiFfiConverterOptionalTypeSpecDecodeConfig.check_lower(value.spec)
 
     @staticmethod
     def write(value, buf):
@@ -3366,6 +3438,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceUInt32.write(value.grammar_trigger_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.flush_every_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.flush_every_ms, buf)
+        _UniffiFfiConverterOptionalTypeSpecDecodeConfig.write(value.spec, buf)
 
 class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
     @staticmethod
@@ -8453,6 +8526,7 @@ __all__ = [
     "FfiEntitySpan",
     "FfiSpeechTimestamp",
     "FfiVadConfig",
+    "SpecDecodeConfig",
     "GenerateOpts",
     "GenerateSummary",
     "GenerateOutput",

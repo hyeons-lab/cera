@@ -1001,6 +1001,7 @@ impl Lfm2Model {
                 n,
                 n_expert,
                 hs,
+                &mut state.scratch.dequant_weight_scratch,
             );
         }
         #[cfg(not(has_blas))]
@@ -1094,6 +1095,7 @@ impl Lfm2Model {
                         cpu::silu_mul_inplace(gate_slice, u_src);
                     }
 
+                    let mut exp_down_scratch = Vec::new();
                     transformer::try_blas_prefill_gemm_rowmajor(
                         &self.gguf,
                         &moe.down[e],
@@ -1102,6 +1104,7 @@ impl Lfm2Model {
                         k_e,
                         hs,
                         ff,
+                        &mut exp_down_scratch,
                     );
 
                     (e, exp_down)
@@ -2058,6 +2061,16 @@ impl Lfm2Model {
     /// `hidden` layout). The two entry points differ only in how they
     /// fill `hidden`; everything from the first RMSnorm onward is
     /// identical and lives here.
+    fn debug_hidden_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("CERA_DEBUG_HIDDEN").as_deref() == Ok("1"))
+    }
+
+    fn profile_prefill_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some())
+    }
+
     /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.
     fn prefill_layers_loop(
         &self,
@@ -2077,14 +2090,9 @@ impl Lfm2Model {
         // to print the last token's RMS at each layer entry, after
         // attn/conv (post 1st residual), and after FFN (post 2nd
         // residual). Used to find the layer where cera's hidden
-        // states diverge from llama.cpp's reference. Off in
-        // production: a missing-env-var check is one syscall per
-        // call, gated above every loop body to keep the hot path
-        // cold. Any non-`"1"` value (including unset, empty, or
-        // `"0"`) leaves diagnostics off — this matches the
-        // documented `=1` setter and avoids a stray
-        // `CERA_DEBUG_HIDDEN=0` accidentally enabling logging.
-        let debug_hidden = std::env::var("CERA_DEBUG_HIDDEN").as_deref() == Ok("1");
+        // states diverge from llama.cpp's reference. Cached in a
+        // OnceLock so hot-path prefill performs zero syscalls.
+        let debug_hidden = Self::debug_hidden_enabled();
         let log_rms = |label: &str, hidden: &[f32]| {
             if !debug_hidden {
                 return;
@@ -2176,7 +2184,7 @@ impl Lfm2Model {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         let mut kv_widen_v: Vec<f32> = Vec::new();
 
-        let profile_prefill = std::env::var_os("CERA_PROFILE_PREFILL").is_some();
+        let profile_prefill = Self::profile_prefill_enabled();
         #[allow(unused_mut)]
         let mut t_norm = Duration::ZERO;
         #[allow(unused_mut)]
@@ -2280,6 +2288,7 @@ impl Lfm2Model {
                                 n,
                                 3 * hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_conv_in += t.elapsed();
@@ -2582,6 +2591,7 @@ impl Lfm2Model {
                                 n,
                                 hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_conv_out += t_o.elapsed();
@@ -3314,6 +3324,7 @@ impl Lfm2Model {
                                 n,
                                 hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_attn_out += t_ao.elapsed();

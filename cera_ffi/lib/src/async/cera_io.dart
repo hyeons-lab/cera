@@ -197,21 +197,28 @@ class _ProgressSink implements DownloadProgressSink {
   }
 }
 
+KvCompression? _kvCompressionOf(CeraKvCompression compression) =>
+    switch (compression) {
+      CeraKvCompression.none => null,
+      CeraKvCompression.f16 => const KvCompressionF16(),
+      CeraKvCompression.turboQuant => const KvCompressionTurboQuant(
+        seed: 0,
+        keys: true,
+        values: true,
+      ),
+    };
+
+SessionConfig _sessionConfigOf(CeraOptions options, {int? seed}) =>
+    SessionConfig(
+      seed: seed,
+      ubatchSize: options.ubatchSize,
+      gpuDepthformer: options.gpuDepthformer,
+      kvCompression: _kvCompressionOf(options.effectiveKvCompression),
+    );
+
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
-    : _session = _engine.newSession(
-        SessionConfig(
-          gpuDepthformer: _options.gpuDepthformer,
-          kvCompression:
-              _options.turboQuant
-                  ? const KvCompressionTurboQuant(
-                    seed: 0,
-                    keys: true,
-                    values: true,
-                  )
-                  : null,
-        ),
-      ),
+    : _session = _engine.newSession(_sessionConfigOf(_options)),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
@@ -300,6 +307,7 @@ class _NativeCera implements Cera {
     double? topP,
     int? topK,
     int? seed,
+    CeraSpecDecode? spec,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
@@ -319,6 +327,11 @@ class _NativeCera implements Cera {
     if (temperature != null) opts = opts.copyWith(temperature: temperature);
     if (topP != null) opts = opts.copyWith(topP: topP);
     if (topK != null) opts = opts.copyWith(topK: topK);
+    if (spec != null) {
+      opts = opts.copyWith(
+        spec: SpecDecodeConfig(ngram: spec.ngram, k: spec.k),
+      );
+    }
 
     // Whether this generation has already produced its terminal event.
     //
@@ -400,18 +413,7 @@ class _NativeCera implements Cera {
           // skips `_engine.close()`: the model weights, the largest allocation
           // in the app, would leak until the finalizer ran.
           final reseeded = _engine.newSession(
-            SessionConfig(
-              seed: seed,
-              gpuDepthformer: _options.gpuDepthformer,
-              kvCompression:
-                  _options.turboQuant
-                      ? const KvCompressionTurboQuant(
-                        seed: 0,
-                        keys: true,
-                        values: true,
-                      )
-                      : null,
-            ),
+            _sessionConfigOf(_options, seed: seed),
           );
           _session.close();
           _session = reseeded;
