@@ -225,6 +225,8 @@ struct AuxWeights {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Parsed detokenizer, for audio-out bundles.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    /// Parsed GPU audio decoder backend, for audio-out bundles.
+    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
     /// Pre-parsed speculative decoding drafter (e.g. from in-memory bytes).
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
@@ -301,6 +303,11 @@ pub struct CeraEngine {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Detokenizer weights for audio output generation.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    /// Cached GPU audio decoder backend, built at construction when vocoder
+    /// weights are present and `cfg.backend` selects a GPU backend (and the device
+    /// is available). Shared into every session via `create_session`; sessions
+    /// fall back to CPU detokenization when this is `None`.
+    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
     /// Optional speculative decoding drafter (e.g. DSpark sidecar draft model).
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
@@ -462,7 +469,7 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let (audio_decoder, detok_weights) = {
+        let (audio_decoder, detok_weights, gpu_audio_decoder) = {
             let voc_arc = parts
                 .audio_decoder
                 .and_then(|b| GgufFile::from_bytes(b).ok())
@@ -518,7 +525,15 @@ impl CeraEngine {
                         .map(Arc::new)
                 });
 
-            (dec, detok)
+            let gpu_dec = if dec.is_some() && detok.is_some() {
+                voc_arc.as_ref().and_then(|g| {
+                    crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend)
+                })
+            } else {
+                None
+            };
+
+            (dec, detok, gpu_dec)
         };
 
         let mut aux = match (&inference_type, mmproj) {
@@ -527,6 +542,7 @@ impl CeraEngine {
                 audio_encoder: None,
                 audio_decoder: None,
                 detok_weights: None,
+                gpu_audio_decoder: None,
                 drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
@@ -534,12 +550,14 @@ impl CeraEngine {
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
+                gpu_audio_decoder: None,
                 drafter: None,
             },
             _ => AuxWeights::default(),
         };
         aux.audio_decoder = audio_decoder;
         aux.detok_weights = detok_weights;
+        aux.gpu_audio_decoder = gpu_audio_decoder;
         aux.drafter = parts
             .draft_model
             .as_ref()
@@ -835,11 +853,11 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
-        let (eager_audio_decoder, eager_detok_weights) =
+        let (eager_audio_decoder, eager_detok_weights, eager_gpu_audio_decoder) =
             if path.is_some() && aux.audio_decoder.is_none() {
-                try_load_audio_decoder_and_detok(&manifest)
+                try_load_audio_decoder_and_detok(&manifest, cfg.backend)
             } else {
-                (aux.audio_decoder, aux.detok_weights)
+                (aux.audio_decoder, aux.detok_weights, aux.gpu_audio_decoder)
             };
 
         let audio_decoder = eager_audio_decoder.filter(|dec| {
@@ -854,10 +872,10 @@ impl CeraEngine {
                 true
             }
         });
-        let detok_weights = if audio_decoder.is_some() {
-            eager_detok_weights
+        let (detok_weights, gpu_audio_decoder) = if audio_decoder.is_some() {
+            (eager_detok_weights, eager_gpu_audio_decoder)
         } else {
-            None
+            (None, None)
         };
         Ok(Self {
             manifest,
@@ -872,6 +890,7 @@ impl CeraEngine {
             vision_encoder,
             gpu_vision_encoder,
             gpu_audio_encoder,
+            gpu_audio_decoder,
             drafter,
         })
     }
@@ -956,6 +975,10 @@ impl CeraEngine {
         // Auto-attach vocoder for audio output generation when present.
         if let (Some(decoder), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
             session.attach_vocoder(Arc::clone(decoder), Arc::clone(detok));
+        }
+        // GPU audio decoder (if one was built); the session prefers it over CPU detokenization.
+        if let Some(gpu) = &self.gpu_audio_decoder {
+            session.attach_gpu_audio_decoder(Arc::clone(gpu));
         }
         // Auto-attach speculative decoding drafter when present.
         if let Some(drafter) = &self.drafter {
@@ -1117,6 +1140,15 @@ impl CeraEngine {
     /// path.
     pub fn has_gpu_audio_encoder(&self) -> bool {
         self.gpu_audio_encoder.is_some()
+    }
+
+    /// Whether a GPU audio decoder was built at construction (true when vocoder
+    /// weights loaded, `cfg.backend` selected a supported GPU backend, and the
+    /// device was available). When false, audio synthesis falls back to the CPU
+    /// detokenizer. Primarily for tests/diagnostics; sessions auto-select the GPU
+    /// path.
+    pub fn has_gpu_audio_decoder(&self) -> bool {
+        self.gpu_audio_decoder.is_some()
     }
 
     /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.
@@ -1622,16 +1654,20 @@ fn parse_aux_gguf(bytes: &Arc<[u8]>, kind: &str) -> Option<Arc<GgufFile>> {
     }
 }
 
+type LoadedAudioDecoderParts = (
+    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
+    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
+    Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
+);
+
 /// Eager audio decoder & detokenizer GGUF loader for audio-out bundles.
 #[cfg(feature = "mmap")]
 fn try_load_audio_decoder_and_detok(
     manifest: &Manifest,
-) -> (
-    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
-    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-) {
+    backend: crate::engine::BackendPreference,
+) -> LoadedAudioDecoderParts {
     if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
-        return (None, None);
+        return (None, None, None);
     }
     let voc_path = manifest.files.audio_decoder.as_deref().map(Path::new);
     let tok_path = manifest.files.audio_tokenizer.as_deref().map(Path::new);
@@ -1676,17 +1712,23 @@ fn try_load_audio_decoder_and_detok(
                 .map(Arc::new)
         });
 
-    (dec, detok)
+    let gpu_dec = if dec.is_some() && detok.is_some() {
+        voc_gguf
+            .as_ref()
+            .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, backend))
+    } else {
+        None
+    };
+
+    (dec, detok, gpu_dec)
 }
 
 #[cfg(not(feature = "mmap"))]
 fn try_load_audio_decoder_and_detok(
     _manifest: &Manifest,
-) -> (
-    Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
-    Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-) {
-    (None, None)
+    _backend: crate::engine::BackendPreference,
+) -> LoadedAudioDecoderParts {
+    (None, None, None)
 }
 
 #[cfg(not(feature = "mmap"))]

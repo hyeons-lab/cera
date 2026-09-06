@@ -79,6 +79,72 @@ pub trait AudioGpu: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
         Box::pin(async move { Ok(self.istft_to_pcm(spectrum, n_fft, hop_length)) })
     }
+
+    /// Attempt to acquire an exclusive session lease for multi-frame generation.
+    /// Returns true if acquired, or false if another session is actively generating audio.
+    fn try_acquire_session(&self) -> bool {
+        true
+    }
+
+    /// Release the exclusive session lease acquired by [`Self::try_acquire_session`].
+    fn release_session(&self) {}
+}
+
+/// Try to construct a GPU audio decoder backend for the given vocoder GGUF file.
+///
+/// Returns `None` for `Cpu`, when the chosen backend's feature is not compiled,
+/// or when the device/context cannot be created.
+pub fn build_gpu_audio_decoder(
+    gguf: &Arc<GgufFile>,
+    backend: crate::engine::BackendPreference,
+) -> Option<Arc<dyn AudioGpu>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Cpu => None,
+        BP::Metal => try_metal_audio_decoder(gguf),
+        BP::Gpu => try_wgpu_audio_decoder(gguf),
+        BP::Auto => try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf)),
+    }
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    let dummy_path = std::path::Path::new("");
+    match crate::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(gguf, dummy_path) {
+        Ok(d) => {
+            tracing::info!("audio decoder: using native Metal backend");
+            Some(Arc::new(d))
+        }
+        Err(e) => {
+            tracing::warn!("audio decoder: Metal backend unavailable: {e:#}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+fn try_metal_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    None
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    let dummy_path = std::path::Path::new("");
+    match crate::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(gguf, dummy_path) {
+        Ok(d) => {
+            tracing::info!("audio decoder: using WGPU backend");
+            Some(Arc::new(d))
+        }
+        Err(e) => {
+            tracing::warn!("audio decoder: WGPU backend unavailable: {e:#}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    None
 }
 
 /// Configuration for the depthformer (small transformer inside the decoder).
@@ -1687,5 +1753,76 @@ mod tests {
                 "Sample mismatch at {idx}: batch={b}, stream={s}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_gpu_audio_decoder_empty_gguf_graceful_none() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        let bytes: Arc<[u8]> = Arc::from(data.into_boxed_slice());
+        let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
+
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Cpu).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Metal).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Gpu).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Auto).is_none());
+    }
+
+    struct MockAudioGpu {
+        active: std::sync::atomic::AtomicBool,
+    }
+
+    impl AudioGpu for MockAudioGpu {
+        fn supports_depthformer(&self) -> bool {
+            false
+        }
+        fn sample_audio_frame(
+            &self,
+            _embedding: &[f32],
+            _temperature: f32,
+            _top_k: usize,
+        ) -> [i32; 8] {
+            [0; 8]
+        }
+        fn detokenize_to_spectrum(
+            &self,
+            _cpu_weights: &DetokenizerWeights,
+            _codes: &[i32],
+        ) -> Vec<f32> {
+            vec![]
+        }
+        fn reset_depthformer(&self) {}
+        fn reset_detokenizer(&self) {}
+        fn try_acquire_session(&self) -> bool {
+            self.active
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        }
+        fn release_session(&self) {
+            self.active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn test_audio_gpu_session_lease_lifecycle() {
+        let gpu = MockAudioGpu {
+            active: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(gpu.try_acquire_session());
+        // Second concurrent acquisition fails while active.
+        assert!(!gpu.try_acquire_session());
+        gpu.release_session();
+        // Subsequent acquisition succeeds.
+        assert!(gpu.try_acquire_session());
+        gpu.release_session();
     }
 }

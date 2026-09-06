@@ -11,8 +11,8 @@
 //! consumers override just `on_text_tokens` + `on_done`.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -283,6 +283,13 @@ pub enum FinishReason {
 /// value. Saturating keeps the metric monotonic instead.
 fn duration_ms_u32(d: Duration) -> u32 {
     d.as_millis().min(u32::MAX as u128) as u32
+}
+
+/// Whether GPU depthformer is enabled via `CERA_GPU_DF`. Cached in a
+/// `OnceLock` so the check on the generation path is a single atomic load.
+fn gpu_depthformer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CERA_GPU_DF").as_deref() == Ok("1"))
 }
 
 /// Streaming output sink. Default-empty methods let text-only consumers
@@ -583,6 +590,10 @@ pub struct Session {
     /// (and still backs the capability/dimension checks). Attached via
     /// [`Self::attach_gpu_audio_encoder`].
     gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
+    /// Optional cached GPU audio decoder. When present, [`Self::generate`]
+    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
+    /// the GPU rather than CPU. Attached via [`Self::attach_gpu_audio_decoder`].
+    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
     /// Vision encoder weights, if attached. None for non-VL
     /// sessions; populated via [`Self::attach_vision_encoder`]
     /// before [`Self::append_image`] is called. Held by `Arc`
@@ -740,6 +751,7 @@ impl Session {
             audio_decoder: None,
             detok_weights: None,
             gpu_audio_encoder: None,
+            gpu_audio_decoder: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
             image_max_long_size: None,
@@ -775,6 +787,22 @@ impl Session {
     ) {
         self.audio_decoder = Some(decoder);
         self.detok_weights = Some(detok);
+    }
+
+    /// Attach a GPU audio decoder backend. When present, [`Self::generate`]
+    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
+    /// the GPU. The CPU vocoder weights must still be attached via
+    /// [`Self::attach_vocoder`]. Preserved across `reset()`.
+    pub fn attach_gpu_audio_decoder(
+        &mut self,
+        decoder: Arc<dyn crate::model::audio_decoder::AudioGpu>,
+    ) {
+        self.gpu_audio_decoder = Some(decoder);
+    }
+
+    /// Whether a GPU audio decoder backend is attached to this session.
+    pub fn has_gpu_audio_decoder(&self) -> bool {
+        self.gpu_audio_decoder.is_some()
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -2231,8 +2259,14 @@ impl Session {
         // two `generate(N/2)` calls with the same seed.
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                let gpu_ref = self.gpu_audio_decoder.as_deref();
                 Some(crate::audio_engine::AudioOutputDecoder::new(
-                    dec, detok, None, 0.7, 40, false,
+                    dec,
+                    detok,
+                    gpu_ref,
+                    0.7,
+                    40,
+                    gpu_depthformer_enabled(),
                 ))
             } else {
                 None
@@ -3112,5 +3146,12 @@ mod tests {
         assert_eq!(default_opts.top_k, 40);
         assert_eq!(default_opts.min_p, 0.05);
         assert_eq!(default_opts.repetition_penalty, 1.1);
+    }
+
+    #[test]
+    fn test_gpu_depthformer_env_helper() {
+        let val1 = gpu_depthformer_enabled();
+        let val2 = gpu_depthformer_enabled();
+        assert_eq!(val1, val2);
     }
 }
