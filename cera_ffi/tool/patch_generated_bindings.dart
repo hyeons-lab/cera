@@ -185,6 +185,39 @@ void main(List<String> args) {
       "    writer.writeI8(1);\n"
       "    writer.writeString(value.draftModel!);\n"
       "  }\n"
+      "  writer.writeBool(value.gpuDepthformer);\n"
+      "}";
+  const oldWriteImpl =
+      "void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {\n"
+      "  writer.writeU64(value.contextSize);\n"
+      "  _uniffiWriteBackendPreference(value.backend, writer);\n"
+      "  if (value.bundleRepo == null) {\n"
+      "    writer.writeI8(0);\n"
+      "  } else {\n"
+      "    writer.writeI8(1);\n"
+      "    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
+      "    try {\n"
+      "      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
+      "      cloneStatusPtr.ref.errorBuf\n"
+      "        ..capacity = 0\n"
+      "        ..len = 0\n"
+      "        ..data = ffi.nullptr;\n"
+      "      final clonedHandle = _bindings()._bundleRepoClone(\n"
+      "          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);\n"
+      "      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
+      "        throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
+      "      }\n"
+      "      writer.writeU64(clonedHandle);\n"
+      "    } finally {\n"
+      "      calloc.free(cloneStatusPtr);\n"
+      "    }\n"
+      "  }\n"
+      "  if (value.draftModel == null) {\n"
+      "    writer.writeI8(0);\n"
+      "  } else {\n"
+      "    writer.writeI8(1);\n"
+      "    writer.writeString(value.draftModel!);\n"
+      "  }\n"
       "}";
   if (src.contains(writeStub)) {
     src = src.replaceAll(writeStub, writeImpl);
@@ -192,6 +225,10 @@ void main(List<String> args) {
     stdout.writeln(
       '  implemented _uniffiWriteEngineConfig (record with handle field)',
     );
+  } else if (src.contains(oldWriteImpl)) {
+    src = src.replaceAll(oldWriteImpl, writeImpl);
+    applied += 1;
+    stdout.writeln('  updated _uniffiWriteEngineConfig with gpuDepthformer');
   }
   const encodeStub =
       "Uint8List _uniffiEncodeEngineConfig(EngineConfig value) {\n"
@@ -279,5 +316,13 @@ void main(List<String> args) {
   if (applied == 0) {
     stdout.writeln('  no patches needed (already patched or upstream fixed).');
   }
+
+  if (!src.contains('writer.writeBool(value.gpuDepthformer);')) {
+    stderr.writeln(
+      'patch_generated_bindings error: _uniffiWriteEngineConfig missing gpuDepthformer serialization',
+    );
+    exit(1);
+  }
+
   file.writeAsStringSync(src);
 }

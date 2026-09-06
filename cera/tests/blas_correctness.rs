@@ -90,6 +90,7 @@ fn blas_prefill_matches_aarch64_reference() {
             context_size: CTX,
             backend: BackendPreference::Cpu,
             draft_model: None,
+            gpu_depthformer: false,
             bundle_repo: Some(repo),
         },
     )

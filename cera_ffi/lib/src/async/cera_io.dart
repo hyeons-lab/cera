@@ -24,15 +24,13 @@ import '../generated/cera_ffi.dart';
 import 'cera.dart';
 
 /// Maps the portable backend choice onto the native one.
-///
-/// [CeraBackend.gpu] becomes [BackendPreference.auto] rather than
-/// [BackendPreference.gpu]: natively "the GPU" is two different backends, Metal
-/// on Apple platforms and `wgpu` elsewhere, and `auto` is the only value that
-/// probes for whichever exists. Requesting `gpu` on macOS would skip the faster
-/// Metal path to insist on `wgpu`, which is not what the caller meant.
 BackendPreference _backendOf(CeraBackend backend) => switch (backend) {
   CeraBackend.cpu => BackendPreference.cpu,
-  CeraBackend.auto || CeraBackend.gpu => BackendPreference.auto,
+  CeraBackend.gpu =>
+    (Platform.isMacOS || Platform.isIOS)
+        ? BackendPreference.metal
+        : BackendPreference.auto,
+  CeraBackend.auto => BackendPreference.auto,
 };
 
 EngineConfig _configOf(CeraOptions options, [BundleRepo? repo]) => EngineConfig(
@@ -40,6 +38,7 @@ EngineConfig _configOf(CeraOptions options, [BundleRepo? repo]) => EngineConfig(
   backend: _backendOf(options.backend),
   bundleRepo: repo,
   draftModel: null,
+  gpuDepthformer: options.gpuDepthformer,
 );
 
 /// Maps the generated capability record onto the portable one.
@@ -202,6 +201,7 @@ class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
     : _session = _engine.newSession(
         SessionConfig(
+          gpuDepthformer: _options.gpuDepthformer,
           kvCompression:
               _options.turboQuant
                   ? const KvCompressionTurboQuant(
@@ -402,6 +402,7 @@ class _NativeCera implements Cera {
           final reseeded = _engine.newSession(
             SessionConfig(
               seed: seed,
+              gpuDepthformer: _options.gpuDepthformer,
               kvCompression:
                   _options.turboQuant
                       ? const KvCompressionTurboQuant(

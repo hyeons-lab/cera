@@ -75,10 +75,9 @@ pub trait GpuWeightSource {
     // mmap buffer, so it needs neither the byte slice nor a full dequantize.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]>;
-    // The metal loader references weights via mmap byte offsets and never
-    // dequantizes a full matrix, so this accessor is dead under `metal` alone
-    // (live under `gpu`, where non-kernel dtypes are uploaded as F32).
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    // The metal loader references weights via mmap byte offsets, or dequantizes
+    // non-native quant dtypes to F32 buffers during upload.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
     fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32>;
 
     // ── Per-layer / global weight refs ─────────────────────────────────────

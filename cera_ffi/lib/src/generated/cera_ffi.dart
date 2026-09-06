@@ -223,6 +223,8 @@ class EngineConfig {
     this.bundleRepo = null,
     /// Optional path to a DSpark speculative draft model GGUF file.
     this.draftModel = null,
+    /// Whether to prefer GPU depthformer for audio decoder generation.
+    this.gpuDepthformer = false,
   });
 
   /// KV-cache capacity in tokens. Capped by the model's own
@@ -240,6 +242,8 @@ class EngineConfig {
   final BundleRepo? bundleRepo;
   /// Optional path to a DSpark speculative draft model GGUF file.
   final String? draftModel;
+  /// Whether to prefer GPU depthformer for audio decoder generation.
+  final bool gpuDepthformer;
 
   Map<String, dynamic> toJson() {
     return {
@@ -247,6 +251,7 @@ class EngineConfig {
       'backend': BackendPreferenceFfiCodec.encode(this.backend),
       'bundleRepo': this.bundleRepo == null ? null : (() { final __tmp = this.bundleRepo!; return BundleRepoFfiCodec.lower(__tmp); })(),
       'draftModel': this.draftModel,
+      'gpuDepthformer': this.gpuDepthformer,
     };
   }
 
@@ -256,6 +261,7 @@ class EngineConfig {
       backend: BackendPreferenceFfiCodec.decode(json['backend'] as String),
       bundleRepo: json.containsKey('bundleRepo') ? json['bundleRepo'] == null ? null : (() { final __tmp = json['bundleRepo']; return BundleRepoFfiCodec.lift((__tmp as num).toInt()); })() : null,
       draftModel: json.containsKey('draftModel') ? json['draftModel'] == null ? null : json['draftModel'] as String : null,
+      gpuDepthformer: json.containsKey('gpuDepthformer') ? json['gpuDepthformer'] as bool : false,
     );
   }
 
@@ -264,27 +270,29 @@ class EngineConfig {
     BackendPreference? backend,
     Object? bundleRepo = _sentinel,
     Object? draftModel = _sentinel,
+    bool? gpuDepthformer,
   }) {
     return EngineConfig(
       contextSize: contextSize ?? this.contextSize,
       backend: backend ?? this.backend,
       bundleRepo: bundleRepo == _sentinel ? this.bundleRepo : bundleRepo as BundleRepo?,
       draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
+      gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
     );
   }
 
   @override
   String toString() {
-    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo, draftModel: $draftModel)';
+    return 'EngineConfig(contextSize: $contextSize, backend: $backend, bundleRepo: $bundleRepo, draftModel: $draftModel, gpuDepthformer: $gpuDepthformer)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo && draftModel == other.draftModel;
+      other is EngineConfig && contextSize == other.contextSize && backend == other.backend && bundleRepo == other.bundleRepo && draftModel == other.draftModel && gpuDepthformer == other.gpuDepthformer;
 
   @override
-  int get hashCode => Object.hash(contextSize, backend, bundleRepo, draftModel);
+  int get hashCode => Object.hash(contextSize, backend, bundleRepo, draftModel, gpuDepthformer);
 }
 
 /// An identified PII entity span in source text.
@@ -1040,6 +1048,8 @@ class SessionConfig {
     this.seed = null,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     this.ubatchSize = 512,
+    /// Whether to prefer GPU depthformer for audio decoder generation.
+    this.gpuDepthformer = false,
   });
 
   /// Cap on total tokens held in KV. `None` → model's default
@@ -1054,6 +1064,8 @@ class SessionConfig {
   final int? seed;
   /// Chunked-prefill ubatch size. `0` = monolithic prefill.
   final int ubatchSize;
+  /// Whether to prefer GPU depthformer for audio decoder generation.
+  final bool gpuDepthformer;
 
   Map<String, dynamic> toJson() {
     return {
@@ -1062,6 +1074,7 @@ class SessionConfig {
       'nKeep': this.nKeep,
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
+      'gpuDepthformer': this.gpuDepthformer,
     };
   }
 
@@ -1072,6 +1085,7 @@ class SessionConfig {
       nKeep: json.containsKey('nKeep') ? (json['nKeep'] as num).toInt() : 0,
       seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
       ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
+      gpuDepthformer: json.containsKey('gpuDepthformer') ? json['gpuDepthformer'] as bool : false,
     );
   }
 
@@ -1081,6 +1095,7 @@ class SessionConfig {
     int? nKeep,
     Object? seed = _sentinel,
     int? ubatchSize,
+    bool? gpuDepthformer,
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
@@ -1088,21 +1103,22 @@ class SessionConfig {
       nKeep: nKeep ?? this.nKeep,
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
+      gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
     );
   }
 
   @override
   String toString() {
-    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize)';
+    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize;
+      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer;
 
   @override
-  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize);
+  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer);
 }
 
 /// A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
@@ -3028,6 +3044,7 @@ void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {
     writer.writeI8(1);
     writer.writeString(value.draftModel!);
   }
+  writer.writeBool(value.gpuDepthformer);
 }
 
 Uint8List _uniffiEncodeEngineConfig(EngineConfig value) {
@@ -3397,6 +3414,7 @@ void _uniffiWriteSessionConfig(SessionConfig value, _UniFfiBinaryWriter writer) 
     writer.writeU64(value.seed!);
   }
   writer.writeU32(value.ubatchSize);
+  writer.writeBool(value.gpuDepthformer);
 }
 
 Uint8List _uniffiEncodeSessionConfig(SessionConfig value) {
@@ -3412,6 +3430,7 @@ SessionConfig _uniffiReadSessionConfig(_UniFfiBinaryReader reader) {
     nKeep: reader.readU32(),
     seed: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU64(); })(),
     ubatchSize: reader.readU32(),
+    gpuDepthformer: reader.readBool(),
   );
 }
 

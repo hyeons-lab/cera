@@ -706,6 +706,15 @@ impl GgufFile {
         self.data.as_slice()
     }
 
+    /// If backed by an owned in-memory byte buffer, return a clone of the Arc.
+    pub fn owned_bytes(&self) -> Option<Arc<[u8]>> {
+        match &self._backing {
+            Backing::Owned(b) => Some(Arc::clone(b)),
+            #[cfg(feature = "mmap")]
+            Backing::Mmap(_) => None,
+        }
+    }
+
     /// Get the offset where tensor data begins in the backing buffer
     /// (mmap or owned bytes — same semantics either way).
     pub fn data_offset(&self) -> usize {

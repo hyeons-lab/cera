@@ -42,6 +42,7 @@ fn from_bundle_id_loads_lfm2_q4_0() {
             context_size: 128,
             backend: BackendPreference::Cpu,
             draft_model: None,
+            gpu_depthformer: false,
             bundle_repo: Some(repo),
         },
     )
@@ -50,7 +51,7 @@ fn from_bundle_id_loads_lfm2_q4_0() {
     let meta = engine.metadata();
     assert!(
         meta.max_seq_len > 0,
-        "engine metadata missing max_seq_len — model parse failed silently"
+        "engine metadata missing max_seq_len: model parse failed silently"
     );
     assert!(
         !meta.architecture.is_empty(),
@@ -60,7 +61,7 @@ fn from_bundle_id_loads_lfm2_q4_0() {
 
 #[test]
 fn from_bundle_id_fails_without_bundle_repo() {
-    // Fast negative test — no network, no feature gate needed at
+    // Fast negative test: no network, no feature gate needed at
     // runtime. Catches the "did we remember to require bundle_repo?"
     // regression cheaply.
     // Can't use `.expect_err()` because `CeraEngine` holds a
@@ -72,6 +73,7 @@ fn from_bundle_id_fails_without_bundle_repo() {
             context_size: 128,
             backend: BackendPreference::Cpu,
             draft_model: None,
+            gpu_depthformer: false,
             bundle_repo: None,
         },
     );

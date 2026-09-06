@@ -44,12 +44,10 @@ enum CeraBackend {
   /// silent CPU fallback [auto] would give. Choose it when a 40x quiet
   /// slowdown would be worse than a failure.
   ///
-  /// **Natively this behaves as [auto].** "The GPU" is two backends there,
-  /// Metal on Apple platforms and wgpu elsewhere, and the engine's own `auto`
-  /// is the only setting that probes for whichever exists; pinning wgpu would
-  /// skip the faster Metal path on macOS, which is not what asking for the GPU
-  /// means. A native GPU request therefore still falls back to the CPU rather
-  /// than failing.
+  /// **Natively**, requesting [gpu] prefers native hardware acceleration:
+  /// on Apple platforms (macOS/iOS) it selects the native Metal backend,
+  /// while on other platforms it attempts GPU acceleration with automatic
+  /// CPU fallback if GPU features are omitted from the native binary.
   gpu,
 }
 
@@ -82,6 +80,7 @@ class CeraOptions {
     this.contextSize = 4096,
     this.backend = CeraBackend.auto,
     this.turboQuant = false,
+    this.gpuDepthformer = false,
     this.web = const CeraWebAssets(),
   });
 
@@ -93,6 +92,9 @@ class CeraOptions {
 
   /// Whether to enable TurboQuant KV-cache compression. Defaults to false (cera default).
   final bool turboQuant;
+
+  /// Whether to prefer GPU depthformer for audio generation when available.
+  final bool gpuDepthformer;
 
   /// Web asset locations. Ignored on native targets.
   final CeraWebAssets web;

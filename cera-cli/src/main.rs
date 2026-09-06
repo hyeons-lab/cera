@@ -1570,6 +1570,7 @@ fn load_engine_from_spec(
                     context_size,
                     backend,
                     draft_model: draft_buf,
+                    gpu_depthformer: false,
                     bundle_repo: Some(repo),
                 },
             )?
@@ -1598,6 +1599,7 @@ fn load_engine_from_spec(
                     context_size,
                     backend,
                     draft_model: draft_buf,
+                    gpu_depthformer: false,
                     bundle_repo: Some(repo),
                 },
             )?;
@@ -1630,6 +1632,7 @@ fn load_engine_from_spec(
                     context_size,
                     backend,
                     draft_model: draft_buf,
+                    gpu_depthformer: false,
                     bundle_repo: Some(repo),
                 },
             )?;
@@ -2180,6 +2183,7 @@ fn resolve_asr_model(
                 context_size: 2048,
                 backend: BackendPreference::Auto,
                 draft_model: None,
+                gpu_depthformer: false,
                 bundle_repo: Some(repo.clone()),
             },
         )?;

@@ -421,7 +421,8 @@ apple-xcframework:
     # symbols the Swift side needs are all present. The trampolines are
     # thin wrappers over the same scaffolding, so carrying them costs
     # almost nothing and Swift consumers never look at them.
-    FEATURES=metal,ffi-buffer
+    # Apple Accelerate BLAS (blas feature) is enabled by default for CPU prefill.
+    FEATURES=metal,blas,ffi-buffer
     RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios --release --features "$FEATURES"
     RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-ios-sim --release --features "$FEATURES"
     RUSTFLAGS="" cargo build -p cera-ffi --target aarch64-apple-darwin --release --features "$FEATURES"

@@ -320,7 +320,7 @@ fn check_metal_batched_vs_pertoken(
     }
     tokens.extend(tokenizer.encode(prompt));
 
-    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), &mp, 8192) {
+    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), Some(&mp), 8192) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("skipping {model_file}: Metal unavailable ({e})");
@@ -381,7 +381,7 @@ fn check_metal_matches_cpu(
     tokens.extend(tokenizer.encode(prompt));
 
     let cpu = load_model(GgufFile::open(&mp).expect("open gguf"), None, 8192).expect("cpu load");
-    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), &mp, 8192) {
+    let metal = match load_model_metal(GgufFile::open(&mp).expect("open gguf"), Some(&mp), 8192) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("skipping {model_file}: Metal unavailable ({e})");
@@ -438,14 +438,15 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
 
     // Separate model instances so the second prefill can't restore the first's
     // prefix cache instead of recomputing.
-    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), &mp, 8192) {
+    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("skipping {model_file}: Metal unavailable ({e})");
             return None;
         }
     };
-    let prof = MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), &mp, 8192)
+    let prof = MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
         .expect("metal load (profiled)");
 
     let cfg = prod.config();

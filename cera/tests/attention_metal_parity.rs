@@ -45,7 +45,7 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
     let gguf = cera::gguf::GgufFile::open(model_path).unwrap();
     let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
     let model: Arc<dyn Model> =
-        Arc::new(MetalLfm2Model::from_gguf(gguf, model_path, 4096).unwrap());
+        Arc::new(MetalLfm2Model::from_gguf(gguf, Some(model_path), 4096).unwrap());
     let prompt_toks = tokenizer.encode(prompt);
 
     struct CollectSink(Vec<u32>);

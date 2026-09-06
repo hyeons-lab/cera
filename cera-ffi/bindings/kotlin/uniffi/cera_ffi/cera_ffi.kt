@@ -7610,6 +7610,10 @@ data class EngineConfig(
      * Optional path to a DSpark speculative draft model GGUF file.
      */
     var `draftModel`: kotlin.String? = null,
+    /**
+     * Whether to prefer GPU depthformer for audio decoder generation.
+     */
+    var `gpuDepthformer`: kotlin.Boolean = false,
 ) : Disposable {
     @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
     override fun destroy() {
@@ -7618,6 +7622,7 @@ data class EngineConfig(
             this.`backend`,
             this.`bundleRepo`,
             this.`draftModel`,
+            this.`gpuDepthformer`,
         )
     }
 
@@ -7634,6 +7639,7 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
             FfiConverterTypeBackendPreference.read(buf),
             FfiConverterOptionalTypeBundleRepo.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: EngineConfig) =
@@ -7641,7 +7647,8 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
             FfiConverterULong.allocationSize(value.`contextSize`) +
                 FfiConverterTypeBackendPreference.allocationSize(value.`backend`) +
                 FfiConverterOptionalTypeBundleRepo.allocationSize(value.`bundleRepo`) +
-                FfiConverterOptionalString.allocationSize(value.`draftModel`)
+                FfiConverterOptionalString.allocationSize(value.`draftModel`) +
+                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`)
         )
 
     override fun write(
@@ -7652,6 +7659,7 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
         FfiConverterTypeBackendPreference.write(value.`backend`, buf)
         FfiConverterOptionalTypeBundleRepo.write(value.`bundleRepo`, buf)
         FfiConverterOptionalString.write(value.`draftModel`, buf)
+        FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
     }
 }
 
@@ -8232,6 +8240,10 @@ data class SessionConfig(
      * Chunked-prefill ubatch size. `0` = monolithic prefill.
      */
     var `ubatchSize`: kotlin.UInt = 512u,
+    /**
+     * Whether to prefer GPU depthformer for audio decoder generation.
+     */
+    var `gpuDepthformer`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -8247,6 +8259,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
             FfiConverterUInt.read(buf),
             FfiConverterOptionalULong.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: SessionConfig) =
@@ -8255,7 +8268,8 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
                 FfiConverterOptionalTypeKvCompression.allocationSize(value.`kvCompression`) +
                 FfiConverterUInt.allocationSize(value.`nKeep`) +
                 FfiConverterOptionalULong.allocationSize(value.`seed`) +
-                FfiConverterUInt.allocationSize(value.`ubatchSize`)
+                FfiConverterUInt.allocationSize(value.`ubatchSize`) +
+                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`)
         )
 
     override fun write(
@@ -8267,6 +8281,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterUInt.write(value.`nKeep`, buf)
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
+        FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
     }
 }
 

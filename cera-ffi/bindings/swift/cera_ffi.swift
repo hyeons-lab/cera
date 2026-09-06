@@ -4261,6 +4261,10 @@ public struct EngineConfig {
      * Optional path to a DSpark speculative draft model GGUF file.
      */
     public var draftModel: String?
+    /**
+     * Whether to prefer GPU depthformer for audio decoder generation.
+     */
+    public var gpuDepthformer: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4281,11 +4285,15 @@ public struct EngineConfig {
          */bundleRepo: BundleRepo? = nil, 
         /**
          * Optional path to a DSpark speculative draft model GGUF file.
-         */draftModel: String? = nil) {
+         */draftModel: String? = nil, 
+        /**
+         * Whether to prefer GPU depthformer for audio decoder generation.
+         */gpuDepthformer: Bool = false) {
         self.contextSize = contextSize
         self.backend = backend
         self.bundleRepo = bundleRepo
         self.draftModel = draftModel
+        self.gpuDepthformer = gpuDepthformer
     }
 
     
@@ -4307,7 +4315,8 @@ public struct FfiConverterTypeEngineConfig: FfiConverterRustBuffer {
                 contextSize: FfiConverterUInt64.read(from: &buf), 
                 backend: FfiConverterTypeBackendPreference.read(from: &buf), 
                 bundleRepo: FfiConverterOptionTypeBundleRepo.read(from: &buf), 
-                draftModel: FfiConverterOptionString.read(from: &buf)
+                draftModel: FfiConverterOptionString.read(from: &buf), 
+                gpuDepthformer: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -4316,6 +4325,7 @@ public struct FfiConverterTypeEngineConfig: FfiConverterRustBuffer {
         FfiConverterTypeBackendPreference.write(value.backend, into: &buf)
         FfiConverterOptionTypeBundleRepo.write(value.bundleRepo, into: &buf)
         FfiConverterOptionString.write(value.draftModel, into: &buf)
+        FfiConverterBool.write(value.gpuDepthformer, into: &buf)
     }
 }
 
@@ -5188,6 +5198,10 @@ public struct SessionConfig: Equatable, Hashable {
      * Chunked-prefill ubatch size. `0` = monolithic prefill.
      */
     public var ubatchSize: UInt32
+    /**
+     * Whether to prefer GPU depthformer for audio decoder generation.
+     */
+    public var gpuDepthformer: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5208,12 +5222,16 @@ public struct SessionConfig: Equatable, Hashable {
          */seed: UInt64? = nil, 
         /**
          * Chunked-prefill ubatch size. `0` = monolithic prefill.
-         */ubatchSize: UInt32 = UInt32(512)) {
+         */ubatchSize: UInt32 = UInt32(512), 
+        /**
+         * Whether to prefer GPU depthformer for audio decoder generation.
+         */gpuDepthformer: Bool = false) {
         self.maxSeqLen = maxSeqLen
         self.kvCompression = kvCompression
         self.nKeep = nKeep
         self.seed = seed
         self.ubatchSize = ubatchSize
+        self.gpuDepthformer = gpuDepthformer
     }
 
     
@@ -5236,7 +5254,8 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
                 kvCompression: FfiConverterOptionTypeKvCompression.read(from: &buf), 
                 nKeep: FfiConverterUInt32.read(from: &buf), 
                 seed: FfiConverterOptionUInt64.read(from: &buf), 
-                ubatchSize: FfiConverterUInt32.read(from: &buf)
+                ubatchSize: FfiConverterUInt32.read(from: &buf), 
+                gpuDepthformer: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -5246,6 +5265,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.nKeep, into: &buf)
         FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterUInt32.write(value.ubatchSize, into: &buf)
+        FfiConverterBool.write(value.gpuDepthformer, into: &buf)
     }
 }
 

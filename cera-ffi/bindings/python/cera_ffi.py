@@ -2968,13 +2968,34 @@ class _UniffiFfiConverterOptionalString(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterBoolean:
+    @classmethod
+    def check_lower(cls, value):
+        return not not value
+
+    @classmethod
+    def lower(cls, value):
+        return 1 if value else 0
+
+    @staticmethod
+    def lift(value):
+        return value != 0
+
+    @classmethod
+    def read(cls, buf):
+        return cls.lift(buf.read_u8())
+
+    @classmethod
+    def write(cls, value, buf):
+        buf.write_u8(value)
+
 @dataclass
 class EngineConfig:
     """
     Per-engine configuration at load time. Mirrors [`cera::EngineConfig`]
     with `u64` fields (UniFFI doesn't marshal `usize`).
 """
-    def __init__(self, *, context_size:int = 4096, backend:BackendPreference, bundle_repo:typing.Optional[BundleRepo] = _DEFAULT, draft_model:typing.Optional[str] = _DEFAULT):
+    def __init__(self, *, context_size:int = 4096, backend:BackendPreference, bundle_repo:typing.Optional[BundleRepo] = _DEFAULT, draft_model:typing.Optional[str] = _DEFAULT, gpu_depthformer:bool = False):
         self.context_size = context_size
         self.backend = backend
         if bundle_repo is _DEFAULT:
@@ -2985,12 +3006,13 @@ class EngineConfig:
             self.draft_model = None
         else:
             self.draft_model = draft_model
+        self.gpu_depthformer = gpu_depthformer
         
         
 
     
     def __str__(self):
-        return "EngineConfig(context_size={}, backend={}, bundle_repo={}, draft_model={})".format(self.context_size, self.backend, self.bundle_repo, self.draft_model)
+        return "EngineConfig(context_size={}, backend={}, bundle_repo={}, draft_model={}, gpu_depthformer={})".format(self.context_size, self.backend, self.bundle_repo, self.draft_model, self.gpu_depthformer)
     def __eq__(self, other):
         if self.context_size != other.context_size:
             return False
@@ -2999,6 +3021,8 @@ class EngineConfig:
         if self.bundle_repo != other.bundle_repo:
             return False
         if self.draft_model != other.draft_model:
+            return False
+        if self.gpu_depthformer != other.gpu_depthformer:
             return False
         return True
 
@@ -3010,6 +3034,7 @@ class _UniffiFfiConverterTypeEngineConfig(_UniffiConverterRustBuffer):
             backend=_UniffiFfiConverterTypeBackendPreference.read(buf),
             bundle_repo=_UniffiFfiConverterOptionalTypeBundleRepo.read(buf),
             draft_model=_UniffiFfiConverterOptionalString.read(buf),
+            gpu_depthformer=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -3018,6 +3043,7 @@ class _UniffiFfiConverterTypeEngineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeBackendPreference.check_lower(value.backend)
         _UniffiFfiConverterOptionalTypeBundleRepo.check_lower(value.bundle_repo)
         _UniffiFfiConverterOptionalString.check_lower(value.draft_model)
+        _UniffiFfiConverterBoolean.check_lower(value.gpu_depthformer)
 
     @staticmethod
     def write(value, buf):
@@ -3025,6 +3051,7 @@ class _UniffiFfiConverterTypeEngineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeBackendPreference.write(value.backend, buf)
         _UniffiFfiConverterOptionalTypeBundleRepo.write(value.bundle_repo, buf)
         _UniffiFfiConverterOptionalString.write(value.draft_model, buf)
+        _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
 
 @dataclass
 class FfiEntitySpan:
@@ -3225,27 +3252,6 @@ class _UniffiFfiConverterSequenceUInt32(_UniffiConverterRustBuffer):
         return [
             _UniffiFfiConverterUInt32.read(buf) for i in range(count)
         ]
-
-class _UniffiFfiConverterBoolean:
-    @classmethod
-    def check_lower(cls, value):
-        return not not value
-
-    @classmethod
-    def lower(cls, value):
-        return 1 if value else 0
-
-    @staticmethod
-    def lift(value):
-        return value != 0
-
-    @classmethod
-    def read(cls, buf):
-        return cls.lift(buf.read_u8())
-
-    @classmethod
-    def write(cls, value, buf):
-        buf.write_u8(value)
 
 @dataclass
 class GenerateOpts:
@@ -4190,7 +4196,7 @@ class SessionConfig:
     """
     Per-session configuration. Mirrors [`cera::SessionConfig`].
 """
-    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512):
+    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512, gpu_depthformer:bool = False):
         if max_seq_len is _DEFAULT:
             self.max_seq_len = None
         else:
@@ -4205,12 +4211,13 @@ class SessionConfig:
         else:
             self.seed = seed
         self.ubatch_size = ubatch_size
+        self.gpu_depthformer = gpu_depthformer
         
         
 
     
     def __str__(self):
-        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size)
+        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={}, gpu_depthformer={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size, self.gpu_depthformer)
     def __eq__(self, other):
         if self.max_seq_len != other.max_seq_len:
             return False
@@ -4221,6 +4228,8 @@ class SessionConfig:
         if self.seed != other.seed:
             return False
         if self.ubatch_size != other.ubatch_size:
+            return False
+        if self.gpu_depthformer != other.gpu_depthformer:
             return False
         return True
 
@@ -4233,6 +4242,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
             n_keep=_UniffiFfiConverterUInt32.read(buf),
             seed=_UniffiFfiConverterOptionalUInt64.read(buf),
             ubatch_size=_UniffiFfiConverterUInt32.read(buf),
+            gpu_depthformer=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -4242,6 +4252,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.n_keep)
         _UniffiFfiConverterOptionalUInt64.check_lower(value.seed)
         _UniffiFfiConverterUInt32.check_lower(value.ubatch_size)
+        _UniffiFfiConverterBoolean.check_lower(value.gpu_depthformer)
 
     @staticmethod
     def write(value, buf):
@@ -4250,6 +4261,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.n_keep, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.seed, buf)
         _UniffiFfiConverterUInt32.write(value.ubatch_size, buf)
+        _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
 
 @dataclass
 class ToolCall:
