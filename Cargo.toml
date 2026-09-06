@@ -1,5 +1,5 @@
 [workspace]
-members = ["cera", "cera-cli", "cera-ffi", "cera-parity", "cera-wasm"]
+members = ["cera", "cera-cli", "cera-client", "cera-ffi", "cera-parity", "cera-wasm"]
 resolver = "3"
 
 [workspace.package]

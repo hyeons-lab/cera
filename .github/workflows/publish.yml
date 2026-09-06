@@ -180,7 +180,7 @@ jobs:
             # Downstream crates depend on `cera = "0.1.x"`, which is not on the
             # index during a dry run — point the dep back at the local path and
             # skip the verify build's registry resolution.
-            for c in cera-ffi cera-cli cera-wasm; do
+            for c in cera-ffi cera-cli cera-wasm cera-client; do
               echo "--- packaging $c ---"
               cargo package -p "$c" --no-verify \
                 --config "patch.crates-io.cera.path='cera'"
@@ -268,7 +268,7 @@ jobs:
             return 0
           }
 
-          for c in cera cera-ffi cera-cli cera-wasm; do
+          for c in cera cera-ffi cera-cli cera-wasm cera-client; do
             publish_one "$c" || exit 1
           done
           echo "All crates published (or already present)."

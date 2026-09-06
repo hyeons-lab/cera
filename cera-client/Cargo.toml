@@ -1,0 +1,25 @@
+[package]
+name = "cera-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Asynchronous client for OpenAI and OpenRouter API endpoints"
+readme = "README.md"
+keywords = ["openai", "openrouter", "client", "llm", "api"]
+categories = ["api-bindings", "web-programming::http-client"]
+
+[dependencies]
+reqwest = { workspace = true, features = ["stream", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+bytes = "1"
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
