@@ -3,7 +3,8 @@ import 'package:flutter/foundation.dart';
 
 import 'audio_player_stub.dart'
     if (dart.library.js_interop) 'audio_player_web.dart'
-    as web_player;
+    if (dart.library.io) 'audio_player_native.dart'
+    as audio_backend;
 
 /// Cross-platform audio player service for streaming and playing back model audio output.
 class AudioPlayerService extends ChangeNotifier {
@@ -15,8 +16,7 @@ class AudioPlayerService extends ChangeNotifier {
   Object? get activeAudioSource => _activeAudioSource;
 
   /// Whether real-time audio playback is supported on the active platform.
-  /// Web uses the Web Audio API; native platform players are planned.
-  bool get isSupported => kIsWeb;
+  bool get isSupported => audio_backend.isAudioPlaybackSupported;
 
   /// Whether a specific audio source (e.g. sample buffer) is currently playing.
   bool isSourcePlaying(Object? source) {
@@ -35,7 +35,7 @@ class AudioPlayerService extends ChangeNotifier {
   }) async {
     if (samples.isEmpty) return;
     debugPrint(
-      '[cera:audio_player_service] playPcm called with ${samples.length} samples at $sampleRate Hz (kIsWeb=$kIsWeb)',
+      '[cera:audio_player_service] playPcm called with ${samples.length} samples at $sampleRate Hz',
     );
     stop();
     final playId = ++_currentPlayId;
@@ -45,9 +45,7 @@ class AudioPlayerService extends ChangeNotifier {
 
     try {
       final floatList = Float32List.fromList(samples);
-      if (kIsWeb) {
-        await web_player.playAudioPcm(floatList, sampleRate);
-      }
+      await audio_backend.playAudioPcm(floatList, sampleRate);
     } finally {
       if (_currentPlayId == playId) {
         _isPlaying = false;
@@ -60,30 +58,26 @@ class AudioPlayerService extends ChangeNotifier {
   /// Begins an audio streaming session.
   void startStream({int sampleRate = 24000}) {
     debugPrint(
-      '[cera:audio_player_service] startStream called (sampleRate=$sampleRate, kIsWeb=$kIsWeb)',
+      '[cera:audio_player_service] startStream called (sampleRate=$sampleRate)',
     );
     stop();
     _currentPlayId++;
     _isPlaying = true;
     _activeAudioSource = this;
     _notifySafely();
-    if (kIsWeb) {
-      web_player.startAudioStream(sampleRate);
-    }
+    audio_backend.startAudioStream(sampleRate);
   }
 
   /// Appends an audio PCM chunk to the live stream.
   void appendChunk(List<double> chunk) {
     debugPrint(
-      '[cera:audio_player_service] appendChunk called with ${chunk.length} samples (isPlaying=$_isPlaying, kIsWeb=$kIsWeb)',
+      '[cera:audio_player_service] appendChunk called with ${chunk.length} samples (isPlaying=$_isPlaying)',
     );
     if (chunk.isEmpty || !_isPlaying || !identical(_activeAudioSource, this)) {
       return;
     }
     final floatList = Float32List.fromList(chunk);
-    if (kIsWeb) {
-      web_player.appendAudioStreamChunk(floatList);
-    }
+    audio_backend.appendAudioStreamChunk(floatList);
   }
 
   bool _disposed = false;
@@ -96,21 +90,17 @@ class AudioPlayerService extends ChangeNotifier {
 
   /// Flushes remaining buffered chunks when stream generation completes.
   void finishStream() {
-    debugPrint(
-      '[cera:audio_player_service] finishStream called (kIsWeb=$kIsWeb)',
-    );
+    debugPrint('[cera:audio_player_service] finishStream called');
     if (!identical(_activeAudioSource, this)) return;
     _isPlaying = false;
     _activeAudioSource = null;
     _notifySafely();
-    if (kIsWeb) {
-      web_player.finishAudioStream();
-    }
+    audio_backend.finishAudioStream();
   }
 
   /// Stops streaming and ends audio playback.
   void stop() {
-    debugPrint('[cera:audio_player_service] stop called (kIsWeb=$kIsWeb)');
+    debugPrint('[cera:audio_player_service] stop called');
     _currentPlayId++;
     final wasPlaying = _isPlaying || _activeAudioSource != null;
     _isPlaying = false;
@@ -118,10 +108,8 @@ class AudioPlayerService extends ChangeNotifier {
     if (wasPlaying) {
       _notifySafely();
     }
-    if (kIsWeb) {
-      web_player.stopAudioStream();
-      web_player.stopAudioPlayback();
-    }
+    audio_backend.stopAudioStream();
+    audio_backend.stopAudioPlayback();
   }
 
   @override

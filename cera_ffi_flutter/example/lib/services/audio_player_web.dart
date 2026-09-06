@@ -23,6 +23,9 @@ external void _ceraFinishAudioStream();
 @JS('ceraStopAudioStream')
 external void _ceraStopAudioStream();
 
+/// Whether audio playback is supported in the browser via Web Audio API.
+bool get isAudioPlaybackSupported => true;
+
 /// Plays a single audio PCM buffer using the browser Web Audio API.
 Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
   if (samples.isEmpty) return;
