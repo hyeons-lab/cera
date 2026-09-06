@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 const MethodChannel _audioChannel = MethodChannel('cera/audio_player');
 
+int _playbackSequence = 0;
 Process? _activeProcess;
 File? _currentTempFile;
 
@@ -13,7 +14,9 @@ int _streamSampleRate = 24000;
 
 /// Whether audio playback is supported natively on this platform.
 bool get isAudioPlaybackSupported =>
-    Platform.isMacOS || Platform.isIOS || Platform.isLinux;
+    defaultTargetPlatform == TargetPlatform.macOS ||
+    defaultTargetPlatform == TargetPlatform.iOS ||
+    defaultTargetPlatform == TargetPlatform.linux;
 
 /// Converts Float32 PCM samples to 16-bit mono RIFF/WAVE bytes.
 Uint8List _pcmToWav(
@@ -36,7 +39,7 @@ Uint8List _pcmToWav(
 
   // fmt subchunk
   byteData.setUint8(12, 0x66); // 'f'
-  byteData.setUint8(13, 0x6d); // 'm'
+  byteData.setUint8(13, 0x6d); // 't'
   byteData.setUint8(14, 0x74); // 't'
   byteData.setUint8(15, 0x20); // ' '
   byteData.setUint32(16, 16, Endian.little); // Subchunk1Size (16 for PCM)
@@ -63,9 +66,7 @@ Uint8List _pcmToWav(
     final sample = samples[i];
     final valid = sample.isFinite ? sample : 0.0;
     final clamped = valid.clamp(-1.0, 1.0);
-    final s16 = (clamped < 0 ? clamped * 32768.0 : clamped * 32767.0)
-        .round()
-        .clamp(-32768, 32767);
+    final s16 = (clamped * 32767.0).round().clamp(-32768, 32767);
     byteData.setInt16(offset, s16, Endian.little);
     offset += 2;
   }
@@ -90,36 +91,57 @@ Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
   if (samples.isEmpty) return;
   stopAudioPlayback();
 
+  final seq = ++_playbackSequence;
+
   try {
     final wavBytes = _pcmToWav(samples, sampleRate);
-    if (Platform.isMacOS || Platform.isIOS) {
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
       await _audioChannel.invokeMethod('play', {'data': wavBytes});
       return;
     }
 
-    if (Platform.isLinux) {
+    if (defaultTargetPlatform == TargetPlatform.linux) {
       final tempDir = Directory.systemTemp;
       final tempFile = File(
         '${tempDir.path}/cera_audio_${DateTime.now().microsecondsSinceEpoch}.wav',
       );
       await tempFile.writeAsBytes(wavBytes, flush: true);
+
+      if (seq != _playbackSequence) {
+        try {
+          if (tempFile.existsSync()) tempFile.deleteSync();
+        } catch (_) {}
+        return;
+      }
       _currentTempFile = tempFile;
 
       final process = await Process.start('aplay', [tempFile.path]);
+
+      if (seq != _playbackSequence) {
+        process.kill(ProcessSignal.sigterm);
+        _cleanTempFile();
+        return;
+      }
+
       _activeProcess = process;
       await process.exitCode;
     }
   } catch (err) {
     debugPrint('[cera:audio_player_native] playAudioPcm failed: $err');
   } finally {
-    _cleanTempFile();
-    _activeProcess = null;
+    if (seq == _playbackSequence) {
+      _cleanTempFile();
+      _activeProcess = null;
+    }
   }
 }
 
 /// Stops any active audio playback.
 void stopAudioPlayback() {
-  if (Platform.isMacOS || Platform.isIOS) {
+  _playbackSequence++;
+  if (defaultTargetPlatform == TargetPlatform.macOS ||
+      defaultTargetPlatform == TargetPlatform.iOS) {
     try {
       unawaited(_audioChannel.invokeMethod('stop').catchError((_) => null));
     } catch (_) {}

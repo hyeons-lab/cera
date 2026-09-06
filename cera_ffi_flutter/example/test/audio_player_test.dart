@@ -1,5 +1,5 @@
-import 'dart:io';
 import 'package:cera_ffi_flutter_example/services/audio_player_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -8,12 +8,11 @@ void main() {
 
   setUp(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(
-          const MethodChannel('cera/audio_player'),
-          (call) async {
-            return null;
-          },
-        );
+        .setMockMethodCallHandler(const MethodChannel('cera/audio_player'), (
+          call,
+        ) async {
+          return null;
+        });
   });
 
   tearDown(() {
@@ -25,12 +24,22 @@ void main() {
   });
 
   group('AudioPlayerService', () {
-
     test('isSupported reflects active platform capabilities', () {
       final player = AudioPlayerService();
-      // On macOS native and Web, audio playback is supported.
-      if (Platform.isMacOS) {
+      if (kIsWeb) {
         expect(player.isSupported, isTrue);
+      } else {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        expect(player.isSupported, isTrue);
+        debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+        expect(player.isSupported, isTrue);
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        expect(player.isSupported, isTrue);
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        expect(player.isSupported, isFalse);
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        expect(player.isSupported, isFalse);
+        debugDefaultTargetPlatformOverride = null;
       }
       player.dispose();
     });
@@ -43,18 +52,21 @@ void main() {
       player.dispose();
     });
 
-    test('playPcm handles empty samples gracefully without setting state', () async {
-      final player = AudioPlayerService();
-      bool listenerCalled = false;
-      player.addListener(() {
-        listenerCalled = true;
-      });
+    test(
+      'playPcm handles empty samples gracefully without setting state',
+      () async {
+        final player = AudioPlayerService();
+        bool listenerCalled = false;
+        player.addListener(() {
+          listenerCalled = true;
+        });
 
-      await player.playPcm([], sampleRate: 24000);
-      expect(player.isPlaying, isFalse);
-      expect(listenerCalled, isFalse);
-      player.dispose();
-    });
+        await player.playPcm([], sampleRate: 24000);
+        expect(player.isPlaying, isFalse);
+        expect(listenerCalled, isFalse);
+        player.dispose();
+      },
+    );
 
     test('startStream, appendChunk, and stop lifecycle', () {
       final player = AudioPlayerService();
@@ -81,6 +93,17 @@ void main() {
       expect(player.isPlaying, isTrue);
 
       player.finishStream();
+      expect(player.isPlaying, isFalse);
+      expect(player.activeAudioSource, isNull);
+
+      player.dispose();
+    });
+
+    test('playPcm followed immediately by stop resets state cleanly', () async {
+      final player = AudioPlayerService();
+      final future = player.playPcm([0.1, -0.1, 0.2], sampleRate: 24000);
+      player.stop();
+      await future;
       expect(player.isPlaying, isFalse);
       expect(player.activeAudioSource, isNull);
 
