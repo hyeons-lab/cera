@@ -3288,7 +3288,8 @@ mod tests {
         let core: cera::EngineConfig = ffi.try_into().unwrap();
         assert_eq!(core.context_size, 4096);
         assert_eq!(core.backend, cera::BackendPreference::Auto);
-        // bundle_repo defaults to None — foreign callers opt in by
+        assert!(!core.gpu_depthformer);
+        // bundle_repo defaults to None: foreign callers opt in by
         // attaching a BundleRepo before the try_into.
         assert!(core.bundle_repo.is_none());
     }
@@ -3679,6 +3680,7 @@ mod tests {
         assert_eq!(core.n_keep, default_core.n_keep);
         assert_eq!(core.seed, default_core.seed);
         assert_eq!(core.ubatch_size, default_core.ubatch_size);
+        assert_eq!(core.gpu_depthformer, default_core.gpu_depthformer);
     }
 
     #[test]

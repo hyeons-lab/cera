@@ -169,12 +169,10 @@ wasm-bindgen-test = { workspace = true }
 # Feature deps:
 #   mmap        ⇒ std-fs  (memory-mapping a file needs a filesystem path)
 #   disk-cache  ⇒ std-fs  (writing the cold KV tier needs std::fs)
-#   gpu         — wgpu compute. Independent of `mmap` after PR 4.1 — the
+#   gpu         : wgpu compute. Independent of `mmap` after PR 4.1: the
 #                 model loader accepts an already-parsed `GgufFile`
 #                 regardless of whether the bytes came from `open` (mmap)
-#                 or `from_bytes` (in-memory, e.g. wasm). Auto-dispatch
-#                 backend retry still requires `mmap` (re-opens the file
-#                 between backends) — see `clone_gguf_like` cfg gate.
+#                 or `from_bytes` (in-memory, e.g. wasm).
 #   metal       ⇒ mmap    (re-opens GGUF via mmap)
 #   blas        — unchanged; opt-in GEMM accelerator
 #   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)

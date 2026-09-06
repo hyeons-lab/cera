@@ -50,18 +50,7 @@ const MAX_ALL_LOGITS_TOKENS: usize = 64;
 enum MetalBacking {
     #[cfg(feature = "mmap")]
     Mmap(memmap2::Mmap),
-    Bytes(Arc<[u8]>),
-}
-
-impl std::ops::Deref for MetalBacking {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            #[cfg(feature = "mmap")]
-            MetalBacking::Mmap(m) => m.as_ref(),
-            MetalBacking::Bytes(b) => b.as_ref(),
-        }
-    }
+    Bytes,
 }
 
 /// A weight matrix on GPU: references the shared mmap buffer via byte offset,
@@ -874,16 +863,18 @@ impl MetalLfm2Model {
                 (MetalBacking::Mmap(mmap), buf)
             }
             _ => {
-                let owned = src
-                    .gguf()
-                    .owned_bytes()
-                    .unwrap_or_else(|| Arc::from(src.gguf().mmap_data()));
+                let (ptr, len) = if let Some(owned) = src.gguf().owned_bytes() {
+                    (owned.as_ptr(), owned.len())
+                } else {
+                    let data = src.gguf().mmap_data();
+                    (data.as_ptr(), data.len())
+                };
                 let buf = ctx.device.new_buffer_with_data(
-                    owned.as_ptr() as *const _,
-                    owned.len() as u64,
+                    ptr as *const _,
+                    len as u64,
                     MTLResourceOptions::StorageModeShared,
                 );
-                (MetalBacking::Bytes(owned), buf)
+                (MetalBacking::Bytes, buf)
             }
         };
 
@@ -943,6 +934,11 @@ impl MetalLfm2Model {
                 ) {
                     (Some(wref.start), None, wref.dtype)
                 } else {
+                    anyhow::ensure!(
+                        matches!(wref.dtype, DType::F16 | DType::BF16 | DType::Q4_1),
+                        "Metal backend cannot dequantize output.weight with unsupported dtype {:?}",
+                        wref.dtype,
+                    );
                     let f32_data = src.dequantize_weight(wref);
                     let buf = ctx.upload_f32(&f32_data);
                     (None, Some(buf), DType::F32)
@@ -955,6 +951,10 @@ impl MetalLfm2Model {
                 ) {
                     (None, None, embedding_dtype)
                 } else {
+                    anyhow::ensure!(
+                        matches!(embedding_dtype, DType::F16 | DType::BF16 | DType::Q4_1),
+                        "Metal backend cannot dequantize embedding with unsupported dtype {embedding_dtype:?}",
+                    );
                     let emb_wref = WeightRef::new(
                         embedding_offset,
                         emb_data.len(),
@@ -1006,7 +1006,12 @@ impl MetalLfm2Model {
                 );
                 (wref.start, None, wref.dtype)
             } else {
-                // Dequantize non-native quant formats (F16, BF16, Q2_K, Q3_K, etc.) to F32
+                anyhow::ensure!(
+                    matches!(wref.dtype, DType::F16 | DType::BF16 | DType::Q4_1),
+                    "Metal backend cannot dequantize layer weight with unsupported dtype {:?}",
+                    wref.dtype,
+                );
+                // Dequantize non-native quant formats (F16, BF16, Q4_1) to F32
                 // on CPU during upload into a dedicated buffer so they execute via gemv_f32.
                 let f32_data = src.dequantize_weight(wref);
                 let buf = ctx.upload_f32(&f32_data);
@@ -1227,7 +1232,14 @@ impl MetalLfm2Model {
         // half-width data as f32.
         let model_id = path
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "in-memory".to_string());
+            .unwrap_or_else(|| {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                let sample_len = emb_data.len().min(8192);
+                hasher.update(&emb_data[..sample_len]);
+                let hash = hasher.finalize();
+                format!("in-memory:{:x}", &hash[..8])
+            });
         let prefix_cache = Mutex::new(KvPrefixCache::new(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
@@ -1594,15 +1606,27 @@ impl Drop for LoraGuard<'_> {
 }
 
 impl MetalLfm2Model {
-    /// Dequantize one embedding row into `dst`. Handles Q6_K, Q8_0, Q4_0, Q4_K,
-    /// Q5_K, F16, BF16, and F32.
+    /// Dequantize one embedding row into `dst`. Handles Q6_K, Q8_0, Q4_0, Q4_1,
+    /// Q4_K, Q5_K, F16, BF16, and F32.
     fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
+        assert!(
+            token_id < self.config.vocab_size,
+            "token_id {token_id} out of bounds (vocab_size {})",
+            self.config.vocab_size
+        );
         let hs = self.state.embedding_hidden_size;
         debug_assert_eq!(dst.len(), hs);
         let dt = self.embedding_dtype;
         let row_bytes = hs / dt.block_size() * dt.block_bytes();
         let mmap_start = self.embedding_offset as usize + token_id * row_bytes;
-        let row_data = &self.backing[mmap_start..mmap_start + row_bytes];
+        let row_data: &[u8] = match &self.backing {
+            #[cfg(feature = "mmap")]
+            MetalBacking::Mmap(m) => &m[mmap_start..mmap_start + row_bytes],
+            MetalBacking::Bytes => unsafe {
+                let ptr = self.mmap_buf.contents() as *const u8;
+                std::slice::from_raw_parts(ptr.add(mmap_start), row_bytes)
+            },
+        };
         crate::model::transformer::dequantize_row_slice(self.embedding_dtype, row_data, dst);
         // Granite scales embeddings right after the token lookup (identity for
         // every other arch, so this is a no-op for LFM2). Matches the CPU oracle

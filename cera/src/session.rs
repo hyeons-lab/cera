@@ -1278,7 +1278,8 @@ impl Session {
     /// Prefill runs through [`Model::forward_prefill_chunked`] with
     /// `SessionConfig::ubatch_size` so long prompts can be cancelled
     /// mid-flight. Returns `CeraError::Cancelled` when cancel fires
-    /// before the full slice is consumed.
+    /// before the full slice is consumed, or `CeraError::InvalidToken`
+    /// if any token ID is `>= vocab_size`.
     ///
     /// On cancellation:
     /// - Tokens already fed through the kernel stay in KV; `position()`
@@ -1304,6 +1305,13 @@ impl Session {
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
+        }
+        let vocab_size = self.model.config().vocab_size;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab_size) {
+            return Err(CeraError::InvalidToken {
+                id: bad,
+                vocab_size: vocab_size as u32,
+            });
         }
         let new_end = self
             .current_pos
@@ -2276,7 +2284,7 @@ impl Session {
                     gpu_ref,
                     0.7,
                     40,
-                    self.config.gpu_depthformer || gpu_depthformer_enabled(),
+                    self.config.gpu_depthformer,
                 ))
             } else {
                 None
@@ -3163,5 +3171,67 @@ mod tests {
         let val1 = gpu_depthformer_enabled();
         let val2 = gpu_depthformer_enabled();
         assert_eq!(val1, val2);
+    }
+
+    struct MockTestModel {
+        config: crate::model::ModelConfig,
+    }
+
+    impl crate::model::Model for MockTestModel {
+        fn forward(
+            &self,
+            _tokens: &[u32],
+            _pos: usize,
+            _state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            vec![0.0; self.config.vocab_size]
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.config
+        }
+    }
+
+    #[test]
+    fn append_tokens_rejects_out_of_bounds_token() {
+        let config = crate::model::ModelConfig {
+            architecture: "mock".into(),
+            n_layers: 0,
+            hidden_size: 0,
+            intermediate_size: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: 100,
+            max_seq_len: 1024,
+            rope_theta: 0.0,
+            rms_norm_eps: 0.0,
+            block_types: Vec::new(),
+            conv_kernel_size: None,
+            kv_heads_per_layer: Vec::new(),
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let model = Arc::new(MockTestModel { config });
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let mut session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+
+        assert!(session.append_tokens(&[0, 50, 99]).is_ok());
+
+        let err = session.append_tokens(&[100]).unwrap_err();
+        match err {
+            CeraError::InvalidToken { id, vocab_size } => {
+                assert_eq!(id, 100);
+                assert_eq!(vocab_size, 100);
+            }
+            other => panic!("expected InvalidToken, got {other:?}"),
+        }
     }
 }

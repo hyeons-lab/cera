@@ -945,8 +945,7 @@ impl CeraEngine {
     /// `&self`; the engine keeps the originals live for every session
     /// it handed out. The session's [`ModalityCapabilities`] is derived
     /// from the manifest's `inference_type`.
-    pub fn new_session(&self, cfg: SessionConfig) -> Result<Session, CeraError> {
-        let mut cfg = cfg;
+    pub fn new_session(&self, mut cfg: SessionConfig) -> Result<Session, CeraError> {
         if !cfg.gpu_depthformer && self.config.gpu_depthformer {
             cfg.gpu_depthformer = true;
         }
@@ -2006,7 +2005,7 @@ fn load_text_model_auto(
     // Metal -> wgpu -> CPU. Mirrors the CLI's previous `load_model_auto`.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
-        let gguf_for_metal = clone_gguf_like(&gguf, path)?;
+        let gguf_for_metal = gguf.clone();
         match model::load_model_metal(gguf_for_metal, path, context_size) {
             Ok(m) => {
                 tracing::debug!("cera::engine: using native Metal backend (auto)");
@@ -2018,65 +2017,23 @@ fn load_text_model_auto(
         }
     }
 
-    // Auto-dispatch's gpu retry needs `mmap` to re-open the GGUF
-    // between attempts. With gpu enabled but mmap disabled (e.g. the
-    // wasm wgpu build), the auto path skips gpu and falls through to
-    // CPU; users wanting gpu must opt in via `BackendPreference::Gpu`,
-    // which doesn't need the re-open helper.
-    #[cfg(all(feature = "gpu", feature = "mmap"))]
+    #[cfg(feature = "gpu")]
     {
-        if let Some(p) = path {
-            let gguf_for_gpu = clone_gguf_like(&gguf, path)?;
-            match model::load_model_gpu(gguf_for_gpu, Some(p), context_size) {
-                Ok(m) => {
-                    tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
-                    return Ok(m);
-                }
-                Err(e) => {
-                    tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
-                }
+        let gguf_for_gpu = gguf.clone();
+        match model::load_model_gpu(gguf_for_gpu, path, context_size) {
+            Ok(m) => {
+                tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
+                return Ok(m);
             }
-            // Re-open the file for CPU: original `gguf` may have been
-            // consumed by the Metal attempt above.
-            let gguf_for_cpu = GgufFile::open(p).map_err(|e| {
-                CeraError::Backend(format!("reopening `{}` for CPU fallback: {e}", p.display()))
-            })?;
-            return model::load_model(gguf_for_cpu, Some(p), context_size)
-                .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")));
-        } else {
-            return model::load_model(gguf, path, context_size)
-                .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")));
+            Err(e) => {
+                tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
+            }
         }
     }
 
-    #[cfg(not(all(feature = "gpu", feature = "mmap")))]
-    {
-        tracing::debug!("cera::engine: using CPU backend (auto)");
-        model::load_model(gguf, path, context_size)
-            .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
-    }
-}
-
-/// Re-open or clone a GGUF for backend retry attempts. The Metal and wgpu
-/// loaders consume `GgufFile` by value, so the auto-dispatch path needs
-/// an independent handle for each backend it tries.
-#[cfg(any(
-    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
-    all(feature = "gpu", feature = "mmap")
-))]
-fn clone_gguf_like(gguf: &GgufFile, path: Option<&Path>) -> Result<GgufFile, CeraError> {
-    if let Some(p) = path {
-        #[cfg(feature = "mmap")]
-        {
-            return GgufFile::open(p)
-                .map_err(|e| CeraError::Backend(format!("reopening `{}`: {e}", p.display())));
-        }
-        #[cfg(not(feature = "mmap"))]
-        {
-            let _ = p;
-        }
-    }
-    Ok(gguf.clone())
+    tracing::debug!("cera::engine: using CPU backend (auto)");
+    model::load_model(gguf, path, context_size)
+        .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
 }
 
 fn build_metadata(

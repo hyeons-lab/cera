@@ -44,8 +44,10 @@ enum CeraBackend {
   /// silent CPU fallback [auto] would give. Choose it when a 40x quiet
   /// slowdown would be worse than a failure.
   ///
-  /// **Natively**, requesting [gpu] targets the explicit GPU backend (`wgpu`).
-  /// To use Apple-optimized native Metal with automatic fallback, use [auto].
+  /// **Natively**, requesting [gpu] prefers native hardware acceleration:
+  /// on Apple platforms (macOS/iOS) it selects the native Metal backend,
+  /// while on other platforms it attempts GPU acceleration with automatic
+  /// CPU fallback if GPU features are omitted from the native binary.
   gpu,
 }
 

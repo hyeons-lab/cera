@@ -26,7 +26,10 @@ import 'cera.dart';
 /// Maps the portable backend choice onto the native one.
 BackendPreference _backendOf(CeraBackend backend) => switch (backend) {
   CeraBackend.cpu => BackendPreference.cpu,
-  CeraBackend.gpu => BackendPreference.gpu,
+  CeraBackend.gpu =>
+    (Platform.isMacOS || Platform.isIOS)
+        ? BackendPreference.metal
+        : BackendPreference.auto,
   CeraBackend.auto => BackendPreference.auto,
 };
 
@@ -198,6 +201,7 @@ class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
     : _session = _engine.newSession(
         SessionConfig(
+          gpuDepthformer: _options.gpuDepthformer,
           kvCompression:
               _options.turboQuant
                   ? const KvCompressionTurboQuant(
@@ -398,6 +402,7 @@ class _NativeCera implements Cera {
           final reseeded = _engine.newSession(
             SessionConfig(
               seed: seed,
+              gpuDepthformer: _options.gpuDepthformer,
               kvCompression:
                   _options.turboQuant
                       ? const KvCompressionTurboQuant(
