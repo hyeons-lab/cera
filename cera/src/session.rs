@@ -11,8 +11,8 @@
 //! consumers override just `on_text_tokens` + `on_done`.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -290,8 +290,9 @@ fn duration_ms_u32(d: Duration) -> u32 {
 
 /// Whether GPU depthformer is enabled via `CERA_GPU_DF`. Cached in a
 /// `OnceLock` so the check on the generation path is a single atomic load.
+#[cfg(not(target_arch = "wasm32"))]
 fn gpu_depthformer_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("CERA_GPU_DF").as_deref() == Ok("1"))
 }
 
@@ -3167,6 +3168,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn test_gpu_depthformer_env_helper() {
         let val1 = gpu_depthformer_enabled();
         let val2 = gpu_depthformer_enabled();

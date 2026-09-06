@@ -1233,12 +1233,11 @@ impl MetalLfm2Model {
         let model_id = path
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 let sample_len = emb_data.len().min(8192);
-                hasher.update(&emb_data[..sample_len]);
-                let hash = hasher.finalize();
-                format!("in-memory:{:x}", &hash[..8])
+                emb_data[..sample_len].hash(&mut hasher);
+                format!("in-memory:{:016x}", hasher.finish())
             });
         let prefix_cache = Mutex::new(KvPrefixCache::new(
             crate::kv_cache::KvCacheConfig::default(),
