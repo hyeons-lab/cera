@@ -289,11 +289,7 @@ fn duration_ms_u32(d: Duration) -> u32 {
 /// `OnceLock` so the check on the generation path is a single atomic load.
 fn gpu_depthformer_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CERA_GPU_DF")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| std::env::var("CERA_GPU_DF").as_deref() == Ok("1"))
 }
 
 /// Streaming output sink. Default-empty methods let text-only consumers
