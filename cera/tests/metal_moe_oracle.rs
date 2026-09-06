@@ -138,7 +138,7 @@ fn both() -> Option<Pair> {
     let path = model_path()?;
     let open = || GgufFile::open(&path).expect("model_path checked this opens");
     let cpu = load_model(open(), Some(&path), 4096).expect("lfm2moe loads on the CPU backend");
-    let metal = load_model_metal(open(), &path, 4096).expect("lfm2moe loads on the Metal backend");
+    let metal = load_model_metal(open(), Some(&path), 4096).expect("lfm2moe loads on the Metal backend");
     let hs = cpu.config().hidden_size;
     assert!(
         cpu.config().moe.is_some(),
@@ -265,7 +265,7 @@ fn batched_prefill_agrees_with_decode_and_cpu() {
         let path = model_path().expect("both() already resolved it");
         let fresh = load_model_metal(
             GgufFile::open(&path).expect("model_path checked this opens"),
-            &path,
+            Some(&path),
             4096,
         )
         .expect("lfm2moe loads on the Metal backend");
@@ -334,7 +334,7 @@ fn metal_session_rejects_a_router_lora() {
     let gguf = GgufFile::open(&path).expect("model_path checked this opens");
     let tokenizer = BpeTokenizer::from_gguf(&gguf).expect("lfm2moe carries a tokenizer");
     let model: Arc<dyn Model> =
-        Arc::from(load_model_metal(gguf, &path, 512).expect("lfm2moe loads on Metal"));
+        Arc::from(load_model_metal(gguf, Some(&path), 512).expect("lfm2moe loads on Metal"));
     let (hidden_size, n_expert, routed_layer) = {
         let cfg = model.config();
         let moe = cfg.moe.as_ref().expect("lfm2moe has MoE params");
@@ -437,7 +437,7 @@ fn a_routed_adapter_on_the_state_is_dropped_whole() {
     let load = || {
         load_model_metal(
             GgufFile::open(&path).expect("model_path checked this opens"),
-            &path,
+            Some(&path),
             512,
         )
         .expect("lfm2moe loads on the Metal backend")

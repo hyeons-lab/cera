@@ -29,7 +29,7 @@ fn bench_decode(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
     use cera::model::metal_lfm2::MetalLfm2Model;
 
     let gguf = cera::gguf::GgufFile::open(model_path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, model_path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(model_path), 8192).unwrap();
     let cfg = model.config();
     let mut state = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
 
@@ -68,7 +68,7 @@ fn bench_prefill(model_path: &Path, n_tokens: usize, runs: usize) -> f64 {
     use cera::model::metal_lfm2::MetalLfm2Model;
 
     let gguf = cera::gguf::GgufFile::open(model_path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, model_path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(model_path), 8192).unwrap();
     let cfg = model.config();
 
     // Warmup with unique tokens (offset 9999 to avoid cache collisions with runs).
@@ -173,7 +173,7 @@ fn test_prefill_scaling_profile() {
     };
     eprintln!("=== Prefill scaling profile ===");
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     for &n in &[1, 4, 8, 16, 32, 64, 128, 256, 512] {
@@ -209,7 +209,7 @@ fn test_gpu_memory_budget() {
     // 1.6B Q4_0 budget.
     if let Some(path) = find_model("LFM2.5-VL-1.6B-Q4_0") {
         let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-        let model = MetalLfm2Model::from_gguf(gguf, &path, 4096).unwrap();
+        let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 4096).unwrap();
         let gpu_mb = model.gpu_memory_bytes() as f64 / 1_048_576.0;
         eprintln!("1.6B Q4_0 GPU memory: {gpu_mb:.0} MB");
         assert!(
@@ -221,7 +221,7 @@ fn test_gpu_memory_budget() {
     // 450M Q4_0 budget.
     if let Some(path) = find_model("LFM2.5-VL-450M-Q4_0") {
         let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-        let model = MetalLfm2Model::from_gguf(gguf, &path, 4096).unwrap();
+        let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 4096).unwrap();
         let gpu_mb = model.gpu_memory_bytes() as f64 / 1_048_576.0;
         eprintln!("450M Q4_0 GPU memory: {gpu_mb:.0} MB");
         assert!(
@@ -250,7 +250,7 @@ fn test_batched_prefill_logits_match_sequential() {
 
     // Sequential: forward() one token at a time.
     let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
-    let model_seq = MetalLfm2Model::from_gguf(gguf_seq, &path, 8192).unwrap();
+    let model_seq = MetalLfm2Model::from_gguf(gguf_seq, Some(&path), 8192).unwrap();
     let cfg = model_seq.config();
     let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let mut logits_seq = Vec::new();
@@ -260,7 +260,7 @@ fn test_batched_prefill_logits_match_sequential() {
 
     // Prefill: forward_prefill() all tokens at once.
     let gguf_pf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model_pf = MetalLfm2Model::from_gguf(gguf_pf, &path, 8192).unwrap();
+    let model_pf = MetalLfm2Model::from_gguf(gguf_pf, Some(&path), 8192).unwrap();
     let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
     let logits_pf = model_pf.forward_prefill(&tokens, 0, &mut state_pf);
 
@@ -333,7 +333,7 @@ fn test_batched_prefill_partial_last_chunk() {
         let tokens: Vec<u32> = (0..n_tokens as u32).map(|i| i % 1000 + 1).collect();
 
         let gguf_seq = cera::gguf::GgufFile::open(&path).unwrap();
-        let model_seq = MetalLfm2Model::from_gguf(gguf_seq, &path, 8192).unwrap();
+        let model_seq = MetalLfm2Model::from_gguf(gguf_seq, Some(&path), 8192).unwrap();
         let cfg = model_seq.config();
         let mut state_seq = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let mut logits_seq = Vec::new();
@@ -342,7 +342,7 @@ fn test_batched_prefill_partial_last_chunk() {
         }
 
         let gguf_pf = cera::gguf::GgufFile::open(&path).unwrap();
-        let model_pf = MetalLfm2Model::from_gguf(gguf_pf, &path, 8192).unwrap();
+        let model_pf = MetalLfm2Model::from_gguf(gguf_pf, Some(&path), 8192).unwrap();
         let mut state_pf = cera::kv_cache::InferenceState::from_config(cfg).unwrap();
         let logits_pf = model_pf.forward_prefill(&tokens, 0, &mut state_pf);
 
@@ -386,7 +386,7 @@ fn test_gemm_crossover() {
     };
     eprintln!("=== GEMM crossover ===");
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     for &n in &[4, 8, 12, 16, 24, 32] {
@@ -421,7 +421,7 @@ fn test_gemm_microbench() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     // Run full prefill to warm up, then measure with different n
@@ -467,7 +467,7 @@ fn test_gemm_isolation() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     // Measure full forward_prefill
@@ -540,7 +540,7 @@ fn test_prefill_phase_profile() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     let n = 128;
@@ -599,7 +599,7 @@ fn test_env_prefill_phase_profile() {
 
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
     let ctx = 8192usize.max(2 * n);
-    let model = MetalLfm2Model::from_gguf(gguf, &path, ctx).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), ctx).unwrap();
     let cfg = model.config();
 
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
@@ -671,7 +671,7 @@ fn test_prefix_cache_correctness() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     let tokens: Vec<u32> = (0..64u32).map(|i| i % 1000 + 1).collect();
@@ -730,7 +730,7 @@ fn test_prefix_cache_cold_roundtrip() {
 
     // First model: prefill and cache to disk.
     let gguf1 = cera::gguf::GgufFile::open(&path).unwrap();
-    let model1 = MetalLfm2Model::from_gguf(gguf1, &path, 8192).unwrap();
+    let model1 = MetalLfm2Model::from_gguf(gguf1, Some(&path), 8192).unwrap();
     let cfg = model1.config();
 
     let tokens: Vec<u32> = (0..64u32).map(|i| i % 1000 + 1).collect();
@@ -759,7 +759,7 @@ fn test_prefix_cache_cold_roundtrip() {
 
     // Second model: fresh instance, load from cold cache.
     let gguf2 = cera::gguf::GgufFile::open(&path).unwrap();
-    let model2 = MetalLfm2Model::from_gguf(gguf2, &path, 8192).unwrap();
+    let model2 = MetalLfm2Model::from_gguf(gguf2, Some(&path), 8192).unwrap();
     {
         let mut cache = model2
             .prefix_cache
@@ -803,7 +803,7 @@ fn test_q8_0_gemv_parity() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     let cfg = model.config();
 
     // Run a single forward pass.
@@ -863,7 +863,7 @@ fn test_q8_0_prefill_parity() {
 
     // Metal prefill
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     model.configure_cache(cera::kv_cache::KvCacheConfig {
         cache_dir: None,
         max_warm_entries: 0,
@@ -1038,7 +1038,7 @@ fn test_450m_prefill_phase_profile() {
         return;
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = MetalLfm2Model::from_gguf(gguf, &path, 8192).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), 8192).unwrap();
     model.configure_cache(cera::kv_cache::KvCacheConfig {
         cache_dir: None,
         max_warm_entries: 0,
@@ -1177,7 +1177,7 @@ fn profile_longctx_run(model_name: &str, n: usize) {
     };
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
     let ctx = 8192usize.max(2 * n);
-    let model = MetalLfm2Model::from_gguf(gguf, &path, ctx).unwrap();
+    let model = MetalLfm2Model::from_gguf(gguf, Some(&path), ctx).unwrap();
     let cfg = model.config();
 
     let tokens: Vec<u32> = (0..n as u32).map(|i| i % 1000 + 1).collect();
@@ -1252,8 +1252,8 @@ fn bench_prefill_from_embeddings(model_path: &Path, n_frames: usize) -> (f64, f6
 
     let gguf_a = cera::gguf::GgufFile::open(model_path).unwrap();
     let gguf_b = cera::gguf::GgufFile::open(model_path).unwrap();
-    let model_a = MetalLfm2Model::from_gguf(gguf_a, model_path, 8192).unwrap();
-    let model_b = MetalLfm2Model::from_gguf(gguf_b, model_path, 8192).unwrap();
+    let model_a = MetalLfm2Model::from_gguf(gguf_a, Some(model_path), 8192).unwrap();
+    let model_b = MetalLfm2Model::from_gguf(gguf_b, Some(model_path), 8192).unwrap();
     let cfg = model_a.config();
     let hidden_size = cfg.hidden_size;
 

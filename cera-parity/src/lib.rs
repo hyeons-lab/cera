@@ -219,6 +219,7 @@ fn engine_config_with_repo(cache_dir: &Path) -> cera::EngineConfig {
         context_size: settings::CONTEXT_SIZE as usize,
         backend: cera::BackendPreference::Cpu,
         draft_model: None,
+        gpu_depthformer: false,
         bundle_repo: Some(cera::bundle::BundleRepo::new(cache_dir)),
     }
 }
@@ -290,6 +291,7 @@ pub fn run_ffi(args: &RunArgs<'_>) -> Result<(Vec<u32>, Option<u64>)> {
         backend: cera_ffi::BackendPreference::Cpu,
         bundle_repo: Some(repo),
         draft_model: None,
+        gpu_depthformer: false,
     };
     let engine =
         cera_ffi::CeraEngine::from_bundle_id(args.bundle.to_string(), args.quant.to_string(), cfg)

@@ -44,6 +44,13 @@ bindgen = ["uniffi/cli"]
 # must not enable it.
 metal = ["cera/metal"]
 
+# Light up Apple Accelerate BLAS (cblas SGEMM via AMX) for CPU prompt prefill.
+# Only valid on Apple targets (macOS/iOS). Matches llama.cpp's Accelerate default.
+blas = ["cera/blas"]
+
+# Light up cera's wgpu GPU backend in the built cdylib/staticlib.
+gpu = ["cera/gpu"]
+
 # Opt-in feature for the Dart/Flutter bindings (cera_ffi_flutter). The Dart
 # generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
 # extra scaffolding functions that pass args/returns through an FfiBuffer —

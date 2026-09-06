@@ -668,8 +668,8 @@ fn metal_forward_prefill_from_embeddings_matches_per_frame_loop() {
 
     let gguf_a = cera::gguf::GgufFile::open(&model_path).unwrap();
     let gguf_b = cera::gguf::GgufFile::open(&model_path).unwrap();
-    let model_a = MetalLfm2Model::from_gguf(gguf_a, &model_path, 4096).unwrap();
-    let model_b = MetalLfm2Model::from_gguf(gguf_b, &model_path, 4096).unwrap();
+    let model_a = MetalLfm2Model::from_gguf(gguf_a, Some(&model_path), 4096).unwrap();
+    let model_b = MetalLfm2Model::from_gguf(gguf_b, Some(&model_path), 4096).unwrap();
     let cfg = model_a.config().clone();
     let hidden_size = cfg.hidden_size;
 
@@ -760,7 +760,7 @@ fn metal_concurrent_forward_prefill_does_not_corrupt() {
     // One shared model for the parallel run.
     let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
     let shared_model: Arc<MetalLfm2Model> =
-        Arc::new(MetalLfm2Model::from_gguf(gguf, &model_path, 4096).unwrap());
+        Arc::new(MetalLfm2Model::from_gguf(gguf, Some(&model_path), 4096).unwrap());
     let cfg = shared_model.config().clone();
 
     // Two distinct prompts so we can verify outputs aren't crossed.
@@ -817,6 +817,102 @@ fn metal_concurrent_forward_prefill_does_not_corrupt() {
     );
 
     eprintln!("concurrent forward_prefill: both threads produced finite logits");
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore]
+fn metal_in_memory_loading_matches_mmap_parity() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available: skipping");
+        return;
+    };
+
+    use cera::model::metal_lfm2::MetalLfm2Model;
+
+    let bytes = std::fs::read(&model_path).unwrap();
+    let arc_bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+
+    let gguf_mmap = cera::gguf::GgufFile::open(&model_path).unwrap();
+    let gguf_mem = cera::gguf::GgufFile::from_bytes(Arc::clone(&arc_bytes)).unwrap();
+
+    let model_mmap = MetalLfm2Model::from_gguf(gguf_mmap, Some(&model_path), 2048).unwrap();
+    let model_mem = MetalLfm2Model::from_gguf(gguf_mem, None, 2048).unwrap();
+
+    let prompt: Vec<u32> = vec![1, 15, 32, 105, 400];
+    let mut state_mmap = cera::kv_cache::InferenceState::from_config(model_mmap.config()).unwrap();
+    let mut state_mem = cera::kv_cache::InferenceState::from_config(model_mem.config()).unwrap();
+
+    let logits_mmap = model_mmap.forward_prefill(&prompt, 0, &mut state_mmap);
+    let logits_mem = model_mem.forward_prefill(&prompt, 0, &mut state_mem);
+
+    assert_eq!(logits_mmap.len(), logits_mem.len());
+    for (i, (&a, &b)) in logits_mmap.iter().zip(logits_mem.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "logits mismatch at index {i}: mmap={a}, mem={b}"
+        );
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore]
+fn engine_from_bytes_with_metal_backend_runs_on_metal() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available: skipping");
+        return;
+    };
+
+    let bytes = std::fs::read(&model_path).unwrap();
+    let cfg = cera::EngineConfig {
+        context_size: 2048,
+        backend: cera::BackendPreference::Metal,
+        ..Default::default()
+    };
+    let engine = cera::CeraEngine::from_bytes(bytes, cfg).expect("engine loads from bytes on Metal");
+    let mut session = engine.new_session(SessionConfig::default()).unwrap();
+    let prompt: Vec<u32> = vec![1, 15, 32];
+    session.append_tokens(&prompt).unwrap();
+
+    let opts = GenerateOpts {
+        max_tokens: 3,
+        ..Default::default()
+    };
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).unwrap();
+    assert_eq!(summary.tokens_generated, 3);
+    assert_eq!(sink.0.len(), 3);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+#[ignore]
+fn engine_from_bytes_with_auto_backend_selects_metal() {
+    let Some(model_path) = find_model() else {
+        eprintln!("no model available: skipping");
+        return;
+    };
+
+    let bytes = std::fs::read(&model_path).unwrap();
+    let cfg = cera::EngineConfig {
+        context_size: 2048,
+        backend: cera::BackendPreference::Auto,
+        ..Default::default()
+    };
+    let engine = cera::CeraEngine::from_bytes(bytes, cfg).expect("engine loads from bytes on Auto");
+    let mut session = engine.new_session(SessionConfig::default()).unwrap();
+    let prompt: Vec<u32> = vec![1, 15, 32];
+    session.append_tokens(&prompt).unwrap();
+
+    let opts = GenerateOpts {
+        max_tokens: 3,
+        ..Default::default()
+    };
+    let mut sink = CollectSink(Vec::new());
+    let summary = session.generate(&opts, &mut sink).unwrap();
+    assert_eq!(summary.tokens_generated, 3);
+    assert_eq!(sink.0.len(), 3);
 }
 
 // ---------------------------------------------------------------------------

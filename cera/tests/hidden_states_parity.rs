@@ -136,7 +136,7 @@ fn check_gpu_matches_cpu(gpu: &dyn Model, path: &Path, label: &str) {
 fn metal_hidden_states_matches_cpu() {
     let Some(path) = gated_model() else { return };
     let metal =
-        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), &path, 8192)
+        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), Some(&path), 8192)
         {
             Ok(m) => m,
             Err(e) => {

@@ -131,7 +131,7 @@ fn metal_lora_matches_cpu_and_noop() {
 
     // Metal model.
     let metal =
-        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), &path, 8192)
+        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), Some(&path), 8192)
         {
             Ok(m) => m,
             Err(e) => {
@@ -251,7 +251,7 @@ fn metal_batched_lora_matches_cpu_prefill() {
     let vocab = cfg.vocab_size;
 
     let metal =
-        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), &path, 8192)
+        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), Some(&path), 8192)
         {
             Ok(m) => m,
             Err(e) => {
@@ -445,7 +445,7 @@ fn metal_batched_vs_pertoken_isolates_f16() {
     let q_dim = cfg.n_heads * head_dim;
     // Two fresh Metal instances: one for the batched path, one for per-token
     // (each owns its GPU KV, so neither run pollutes the other).
-    let mk = || cera::model::load_model_metal(GgufFile::open(&path).expect("open"), &path, 8192);
+    let mk = || cera::model::load_model_metal(GgufFile::open(&path).expect("open"), Some(&path), 8192);
     let (metal_b, metal_p) = match (mk(), mk()) {
         (Ok(a), Ok(b)) => (a, b),
         _ => {

@@ -128,6 +128,7 @@ fn run_shift_through_real_model(backend: BackendPreference) {
             context_size: CTX,
             backend,
             draft_model: None,
+            gpu_depthformer: false,
             bundle_repo: Some(repo),
         },
     )
@@ -137,6 +138,7 @@ fn run_shift_through_real_model(backend: BackendPreference) {
         max_seq_len: Some(CTX as u32),
         n_keep: 32,
         seed: Some(0),
+        gpu_depthformer: false,
         // Exercise chunked prefill (PR #33). The repeated prompt and
         // follow-up are sized to span multiple 64-token prefill chunks
         // (the follow-up still has to fit `max_seq_len - n_keep = 224`

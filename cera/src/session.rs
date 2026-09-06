@@ -41,6 +41,8 @@ pub struct SessionConfig {
     pub seed: Option<u64>,
     /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
+    /// Whether to prefer GPU depthformer for audio decoder generation.
+    pub gpu_depthformer: bool,
 }
 
 impl Default for SessionConfig {
@@ -51,6 +53,7 @@ impl Default for SessionConfig {
             n_keep: 0,
             seed: None,
             ubatch_size: 512,
+            gpu_depthformer: false,
         }
     }
 }
@@ -2266,7 +2269,7 @@ impl Session {
                     gpu_ref,
                     0.7,
                     40,
-                    gpu_depthformer_enabled(),
+                    self.config.gpu_depthformer || gpu_depthformer_enabled(),
                 ))
             } else {
                 None

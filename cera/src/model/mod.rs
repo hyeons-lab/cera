@@ -761,7 +761,7 @@ pub fn load_model_gpu(
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub fn load_model_metal(
     gguf: GgufFile,
-    path: &std::path::Path,
+    path: Option<&std::path::Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>> {
     let arch = gguf

@@ -356,6 +356,9 @@ pub struct EngineConfig {
     /// Optional path to a DSpark speculative draft model GGUF file.
     #[uniffi(default = None)]
     pub draft_model: Option<String>,
+    /// Whether to prefer GPU depthformer for audio decoder generation.
+    #[uniffi(default = false)]
+    pub gpu_depthformer: bool,
 }
 
 impl Default for EngineConfig {
@@ -373,6 +376,7 @@ impl Default for EngineConfig {
             // config to `CeraEngine::from_path` / `from_bundle_id`.
             bundle_repo: None,
             draft_model: core.draft_model.map(|p| p.to_string_lossy().to_string()),
+            gpu_depthformer: core.gpu_depthformer,
         }
     }
 }
@@ -407,6 +411,7 @@ impl TryFrom<EngineConfig> for cera::EngineConfig {
             context_size,
             backend: c.backend.into(),
             draft_model: c.draft_model.map(std::path::PathBuf::from),
+            gpu_depthformer: c.gpu_depthformer,
             bundle_repo: c.bundle_repo.map(|r| r.inner.clone()),
         })
     }
@@ -1342,6 +1347,9 @@ pub struct SessionConfig {
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     #[uniffi(default = 512)]
     pub ubatch_size: u32,
+    /// Whether to prefer GPU depthformer for audio decoder generation.
+    #[uniffi(default = false)]
+    pub gpu_depthformer: bool,
 }
 
 impl Default for SessionConfig {
@@ -1359,6 +1367,7 @@ impl Default for SessionConfig {
             n_keep: core.n_keep,
             seed: core.seed,
             ubatch_size: core.ubatch_size,
+            gpu_depthformer: core.gpu_depthformer,
         }
     }
 }
@@ -1373,6 +1382,7 @@ impl From<SessionConfig> for cera::SessionConfig {
             n_keep: c.n_keep,
             seed: c.seed,
             ubatch_size: c.ubatch_size,
+            gpu_depthformer: c.gpu_depthformer,
         }
     }
 }
@@ -3381,6 +3391,7 @@ mod tests {
             backend: BackendPreference::Cpu,
             bundle_repo: Some(repo.clone()),
             draft_model: None,
+            gpu_depthformer: false,
         };
         let core: cera::EngineConfig = ffi.try_into().unwrap();
         let core_repo = core.bundle_repo.expect("bundle_repo must be Some");
@@ -3436,6 +3447,7 @@ mod tests {
             backend: BackendPreference::Cpu,
             bundle_repo: None,
             draft_model: None,
+            gpu_depthformer: false,
         };
         let core: cera::EngineConfig = ffi.try_into().unwrap();
         assert_eq!(core.context_size, usize::MAX);
@@ -3446,7 +3458,7 @@ mod tests {
         // On 32-bit targets, `u64::MAX` exceeds `usize::MAX` and the
         // checked conversion must surface an error rather than
         // silently truncating. On 64-bit targets `usize::MAX ==
-        // u64::MAX`, so the conversion succeeds — skip the assert
+        // u64::MAX`, so the conversion succeeds: skip the assert
         // there. This test proves the error path compiles + is
         // reachable under the narrow condition where it matters.
         let ffi = EngineConfig {
@@ -3454,6 +3466,7 @@ mod tests {
             backend: BackendPreference::Cpu,
             bundle_repo: None,
             draft_model: None,
+            gpu_depthformer: false,
         };
         let result: Result<cera::EngineConfig, FfiError> = ffi.try_into();
         #[cfg(target_pointer_width = "32")]

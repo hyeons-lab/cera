@@ -12,7 +12,7 @@ fn embedding_roundtrip() {
     }
 
     let gguf = cera::gguf::GgufFile::open(&path).unwrap();
-    let model = cera::model::load_model_metal(gguf, &path, 1024).unwrap();
+    let model = cera::model::load_model_metal(gguf, Some(&path), 1024).unwrap();
     let cfg = model.config().clone();
 
     // Path A: normal forward for 2 tokens
