@@ -4,16 +4,29 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use futures_core::Stream;
+use futures_core::stream::{FusedStream, Stream};
 
 use crate::error::{ApiErrorEnvelope, ClientError};
 use crate::types::ChatCompletionChunk;
+
+/// A pinned, heap-allocated stream yielding incremental [`ChatCompletionChunk`] updates.
+pub type BoxChatCompletionStream =
+    ChatCompletionStream<Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>>;
 
 /// Asynchronous stream yielding incremental [`ChatCompletionChunk`] updates from an SSE stream.
 pub struct ChatCompletionStream<S> {
     inner: S,
     buffer: BytesMut,
     done: bool,
+}
+
+impl<S> std::fmt::Debug for ChatCompletionStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatCompletionStream")
+            .field("buffered_bytes", &self.buffer.len())
+            .field("done", &self.done)
+            .finish()
+    }
 }
 
 impl<S> ChatCompletionStream<S> {
@@ -25,7 +38,23 @@ impl<S> ChatCompletionStream<S> {
             done: false,
         }
     }
+}
 
+impl<S> ChatCompletionStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    /// Pin and box this stream into a [`BoxChatCompletionStream`].
+    pub fn boxed(self) -> BoxChatCompletionStream {
+        ChatCompletionStream {
+            inner: Box::pin(self.inner),
+            buffer: self.buffer,
+            done: self.done,
+        }
+    }
+}
+
+impl<S> ChatCompletionStream<S> {
     /// Helper to process a single decoded line.
     ///
     /// Returns:
@@ -183,6 +212,15 @@ where
     }
 }
 
+impl<S> FusedStream for ChatCompletionStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    fn is_terminated(&self) -> bool {
+        self.done
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +319,21 @@ mod tests {
         let item = sse_stream.next().await.expect("item").unwrap();
         assert_eq!(item.choices[0].delta.content.as_deref(), Some("ok"));
         assert!(sse_stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fused_stream_and_boxed() {
+        let stream_text = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"test\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let byte_stream =
+            futures_util::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(stream_text))]);
+        let mut boxed_stream = ChatCompletionStream::new(byte_stream).boxed();
+
+        assert!(!boxed_stream.is_terminated());
+        let item = boxed_stream.next().await.expect("item").unwrap();
+        assert_eq!(item.choices[0].delta.content.as_deref(), Some("test"));
+        assert!(boxed_stream.next().await.is_none());
+        assert!(boxed_stream.is_terminated());
+        // FusedStream guarantees subsequent polls return None without panicking
+        assert!(boxed_stream.next().await.is_none());
     }
 }

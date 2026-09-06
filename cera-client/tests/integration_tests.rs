@@ -294,3 +294,83 @@ async fn test_mock_models_without_object() {
 
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_mock_chat_stream_non_sse_content_type() {
+    let error_body = r#"{"error":{"message":"Proxy error: backends unreachable"}}"#;
+    let (addr, handle) = spawn_mock_server(
+        "POST /chat/completions",
+        "Content-Type: application/json\r\n",
+        error_body,
+    )
+    .await;
+
+    let client = Client::custom(format!("http://{addr}"), Some("key".to_string())).unwrap();
+    let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hi")]);
+
+    let err = client.chat_stream(request).await.unwrap_err();
+    match err {
+        ClientError::Api {
+            message, status, ..
+        } => {
+            assert_eq!(status, Some(reqwest::StatusCode::OK));
+            assert_eq!(message, "Proxy error: backends unreachable");
+        }
+        ClientError::Stream(msg) => {
+            assert!(msg.contains("Expected text/event-stream"));
+        }
+        other => panic!("expected Api or Stream error, got: {other:?}"),
+    }
+
+    handle.await.unwrap();
+}
+
+#[test]
+fn test_authorization_header_is_sensitive() {
+    use reqwest::header::HeaderMap;
+    let provider = cera_client::Provider::OpenAi;
+    let mut headers = HeaderMap::new();
+    provider
+        .apply_headers(&mut headers, Some("secret_api_key_12345"))
+        .unwrap();
+
+    let auth_val = headers
+        .get(reqwest::header::AUTHORIZATION)
+        .expect("auth header");
+    assert!(
+        auth_val.is_sensitive(),
+        "Authorization header must be marked sensitive"
+    );
+}
+
+#[test]
+fn test_multi_turn_tool_calling_sequence() {
+    let tool_call = cera_client::ToolCall {
+        id: "call_abc123".to_string(),
+        call_type: "function".to_string(),
+        function: cera_client::FunctionCall {
+            name: "get_temperature".to_string(),
+            arguments: r#"{"location":"San Francisco"}"#.to_string(),
+        },
+    };
+
+    let assistant_msg = cera_client::ChatMessage::assistant_tool_calls(vec![tool_call]);
+    let tool_reply = cera_client::ChatMessage::tool("call_abc123", r#"{"temperature": 68}"#);
+
+    let messages = vec![
+        cera_client::ChatMessage::user("What is the weather in SF?"),
+        assistant_msg,
+        tool_reply,
+    ];
+
+    let req = cera_client::ChatCompletionRequest::new("gpt-4o", messages);
+    let serialized = serde_json::to_value(&req).unwrap();
+
+    assert_eq!(serialized["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        serialized["messages"][1]["tool_calls"][0]["id"],
+        "call_abc123"
+    );
+    assert_eq!(serialized["messages"][2]["role"], "tool");
+    assert_eq!(serialized["messages"][2]["tool_call_id"], "call_abc123");
+}

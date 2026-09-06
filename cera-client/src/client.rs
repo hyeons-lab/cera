@@ -56,8 +56,12 @@ impl ClientBuilder {
         #[allow(unused_mut)]
         let mut http_builder = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ct) = self.connect_timeout {
-            http_builder = http_builder.connect_timeout(ct);
+        {
+            if let Some(ct) = self.connect_timeout {
+                http_builder = http_builder.connect_timeout(ct);
+            }
+            http_builder =
+                http_builder.user_agent(concat!("cera-client/", env!("CARGO_PKG_VERSION")));
         }
 
         let http = http_builder.build()?;
@@ -194,6 +198,10 @@ impl Client {
     }
 
     /// Sends a streaming chat completion request to `/chat/completions`, returning an SSE chunk stream.
+    ///
+    /// The request handshake awaits HTTP response headers. Once headers arrive and status is
+    /// validated, the connection remains open for streaming tokens. Total request timeout is omitted
+    /// to support long generations; connection timeout is governed by [`ClientBuilder::connect_timeout`].
     pub async fn chat_stream(
         &self,
         mut request: ChatCompletionRequest,
@@ -226,6 +234,62 @@ impl Client {
             .await?;
 
         let checked = Self::check_response(response).await?;
+        let content_type = checked
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|ct| ct.to_str().ok())
+            .map(|s| s.trim().to_lowercase());
+
+        if let Some(ct_lower) = content_type
+            && !ct_lower.starts_with("text/event-stream")
+            && !ct_lower.starts_with("application/x-ndjson")
+        {
+            let status = checked.status();
+            #[cfg(not(target_arch = "wasm32"))]
+            let text = {
+                // Read at most 64 KB to avoid unbounded memory usage on unexpected non-SSE streams
+                let mut body_bytes = Vec::new();
+                let mut checked = checked;
+                while let Ok(Some(chunk)) = checked.chunk().await {
+                    let remaining = 64 * 1024 - body_bytes.len();
+                    if chunk.len() <= remaining {
+                        body_bytes.extend_from_slice(&chunk);
+                    } else {
+                        body_bytes.extend_from_slice(&chunk[..remaining]);
+                        break;
+                    }
+                    if body_bytes.len() >= 64 * 1024 {
+                        break;
+                    }
+                }
+                String::from_utf8(body_bytes)
+                    .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+            };
+            #[cfg(target_arch = "wasm32")]
+            let text = checked.text().await.unwrap_or_default();
+            if let Ok(envelope) = serde_json::from_str::<ApiErrorEnvelope>(&text) {
+                return Err(ClientError::Api {
+                    status: Some(status),
+                    message: envelope.error.message,
+                    error_type: envelope.error.error_type,
+                    code: envelope.error.code,
+                    param: envelope.error.param,
+                });
+            }
+            let preview = if text.len() > 512 {
+                let mut end = 512;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}... [truncated]", &text[..end])
+            } else {
+                text
+            };
+            return Err(ClientError::Stream(format!(
+                "Expected text/event-stream content type, received {ct_lower}: {preview}"
+            )));
+        }
+
         let stream = checked.bytes_stream();
         Ok(ChatCompletionStream::new(stream))
     }

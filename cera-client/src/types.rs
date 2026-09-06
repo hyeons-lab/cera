@@ -30,6 +30,10 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
+    /// Reasoning or chain-of-thought tokens from reasoning models (e.g. DeepSeek-R1, o1/o3).
+    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+
     /// Refusal message if the model refused to respond.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
@@ -53,6 +57,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: Some(content.into()),
+            reasoning_content: None,
             refusal: None,
             name: None,
             tool_calls: None,
@@ -65,6 +70,7 @@ impl ChatMessage {
         Self {
             role: Role::Developer,
             content: Some(content.into()),
+            reasoning_content: None,
             refusal: None,
             name: None,
             tool_calls: None,
@@ -77,6 +83,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: Some(content.into()),
+            reasoning_content: None,
             refusal: None,
             name: None,
             tool_calls: None,
@@ -89,6 +96,23 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: Some(content.into()),
+            reasoning_content: None,
+            refusal: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Construct a new assistant message containing reasoning content.
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        reasoning: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Some(content.into()),
+            reasoning_content: Some(reasoning.into()),
             refusal: None,
             name: None,
             tool_calls: None,
@@ -101,6 +125,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: None,
+            reasoning_content: None,
             refusal: None,
             name: None,
             tool_calls: Some(tool_calls),
@@ -113,6 +138,7 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            reasoning_content: None,
             refusal: None,
             name: None,
             tool_calls: None,
@@ -125,11 +151,24 @@ impl ChatMessage {
         Self {
             role: Role::Function,
             content: Some(content.into()),
+            reasoning_content: None,
             refusal: None,
             name: Some(name.into()),
             tool_calls: None,
             tool_call_id: None,
         }
+    }
+
+    /// Set an optional participant name for the message.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Set an optional refusal message for an assistant reply.
+    pub fn refusal(mut self, refusal: impl Into<String>) -> Self {
+        self.refusal = Some(refusal.into());
+        self
     }
 }
 
@@ -147,6 +186,21 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+impl ToolCall {
+    /// Construct a function tool call.
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_type: "function".to_string(),
+            function: FunctionCall::new(name, arguments),
+        }
+    }
+}
+
 /// Function invocation details in a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionCall {
@@ -155,6 +209,16 @@ pub struct FunctionCall {
 
     /// JSON string representing the arguments passed to the function.
     pub arguments: String,
+}
+
+impl FunctionCall {
+    /// Construct a new function call with name and arguments string.
+    pub fn new(name: impl Into<String>, arguments: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
 }
 
 /// Specification of a tool the model can call.
@@ -283,6 +347,10 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
 
+    /// Whether to enable parallel function calling during tool use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
     /// Tool choice policy (`none`, `auto`, `required`, or specific function).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
@@ -325,6 +393,7 @@ impl ChatCompletionRequest {
             stream_options: None,
             stream: None,
             tools: None,
+            parallel_tool_calls: None,
             tool_choice: None,
             response_format: None,
             stop: None,
@@ -377,15 +446,65 @@ impl ChatCompletionRequest {
         self
     }
 
+    /// Set whether parallel function calling is allowed during tool execution.
+    pub fn parallel_tool_calls(mut self, parallel: bool) -> Self {
+        self.parallel_tool_calls = Some(parallel);
+        self
+    }
+
     /// Set stop sequences.
     pub fn stop(mut self, stop: Vec<String>) -> Self {
         self.stop = Some(stop);
         self
     }
 
+    /// Append a single stop sequence to the request.
+    pub fn stop_sequence(mut self, stop: impl Into<String>) -> Self {
+        let mut seqs = self.stop.unwrap_or_default();
+        seqs.push(stop.into());
+        self.stop = Some(seqs);
+        self
+    }
+
     /// Set response format to JSON object (`{"type": "json_object"}`).
     pub fn json_mode(mut self) -> Self {
         self.response_format = Some(serde_json::json!({ "type": "json_object" }));
+        self
+    }
+
+    /// Set presence penalty between -2.0 and 2.0.
+    pub fn presence_penalty(mut self, presence_penalty: f32) -> Self {
+        self.presence_penalty = Some(presence_penalty);
+        self
+    }
+
+    /// Set frequency penalty between -2.0 and 2.0.
+    pub fn frequency_penalty(mut self, frequency_penalty: f32) -> Self {
+        self.frequency_penalty = Some(frequency_penalty);
+        self
+    }
+
+    /// Set random seed for deterministic sampling.
+    pub fn seed(mut self, seed: i64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Set end-user identifier.
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
+        self
+    }
+
+    /// Set tool choice policy (`none`, `auto`, `required`, or specific function).
+    pub fn tool_choice(mut self, tool_choice: serde_json::Value) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Set arbitrary response format requirement.
+    pub fn response_format(mut self, response_format: serde_json::Value) -> Self {
+        self.response_format = Some(response_format);
         self
     }
 }
@@ -452,6 +571,10 @@ pub struct ChatChunkDelta {
     #[serde(default)]
     pub content: Option<String>,
 
+    /// Incremental reasoning or thinking tokens emitted by reasoning models.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
+
     /// Incremental refusal message if model refused to answer.
     #[serde(default)]
     pub refusal: Option<String>,
@@ -499,6 +622,7 @@ pub struct ChatChunkChoice {
     pub index: u32,
 
     /// Incremental delta for this choice.
+    #[serde(default)]
     pub delta: ChatChunkDelta,
 
     /// Reason generation stopped on the final chunk.
@@ -517,12 +641,15 @@ pub struct ChatCompletionChunk {
     pub object: Option<String>,
 
     /// Unix timestamp of chunk creation.
+    #[serde(default)]
     pub created: u64,
 
     /// Model name.
+    #[serde(default)]
     pub model: String,
 
     /// Array of choice deltas.
+    #[serde(default)]
     pub choices: Vec<ChatChunkChoice>,
 
     /// Token usage metrics if stream_options requested them.
@@ -701,6 +828,18 @@ mod tests {
         let tool_msg = ChatMessage::tool("call_123", "{\"result\": 42}");
         assert_eq!(tool_msg.role, Role::Tool);
         assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_123"));
+
+        let assistant_refusal = ChatMessage::assistant("Cannot comply")
+            .name("safety_agent")
+            .refusal("I cannot assist with that request.");
+        assert_eq!(assistant_refusal.name.as_deref(), Some("safety_agent"));
+        assert_eq!(
+            assistant_refusal.refusal.as_deref(),
+            Some("I cannot assist with that request.")
+        );
+        let refusal_json = serde_json::to_string(&assistant_refusal).unwrap();
+        assert!(refusal_json.contains("\"name\":\"safety_agent\""));
+        assert!(refusal_json.contains("\"refusal\":\"I cannot assist with that request.\""));
     }
 
     #[test]
@@ -870,5 +1009,93 @@ mod tests {
         assert_eq!(val_tool["type"], "function");
         assert_eq!(val_tool["function"]["name"], "get_weather");
         assert_eq!(val_tool["function"]["strict"], true);
+    }
+
+    #[test]
+    fn test_reasoning_content_and_request_builder_methods() {
+        let msg = ChatMessage::assistant_with_reasoning("The answer is 42", "Let me compute 6 * 7");
+        let val = serde_json::to_value(&msg).unwrap();
+        assert_eq!(val["role"], "assistant");
+        assert_eq!(val["content"], "The answer is 42");
+        assert_eq!(val["reasoning_content"], "Let me compute 6 * 7");
+
+        let raw_chunk = r#"{
+            "id": "chunk-r1",
+            "created": 12345,
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": null,
+                    "reasoning": "step 1"
+                }
+            }]
+        }"#;
+        let chunk: ChatCompletionChunk = serde_json::from_str(raw_chunk).unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("step 1")
+        );
+
+        let raw_non_streaming_reasoning = r#"{
+            "role": "assistant",
+            "content": "Result",
+            "reasoning": "thought process"
+        }"#;
+        let non_streaming_msg: ChatMessage =
+            serde_json::from_str(raw_non_streaming_reasoning).unwrap();
+        assert_eq!(
+            non_streaming_msg.reasoning_content.as_deref(),
+            Some("thought process")
+        );
+
+        let raw_chunk_omitted_delta = r#"{
+            "id": "chunk-term",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let chunk_term: ChatCompletionChunk =
+            serde_json::from_str(raw_chunk_omitted_delta).unwrap();
+        assert_eq!(chunk_term.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunk_term.choices[0].delta.content, None);
+        assert_eq!(chunk_term.model, "");
+
+        let raw_chunk_usage_only = r#"{
+            "id": "chunk-usage",
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 10,
+                "total_tokens": 15
+            }
+        }"#;
+        let chunk_usage: ChatCompletionChunk = serde_json::from_str(raw_chunk_usage_only).unwrap();
+        assert!(chunk_usage.choices.is_empty());
+        assert_eq!(chunk_usage.usage.unwrap().total_tokens, 15);
+
+        let tool_call = ToolCall::function("call_1", "get_stock", r#"{"symbol":"AAPL"}"#);
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(tool_call.call_type, "function");
+        assert_eq!(tool_call.function.name, "get_stock");
+
+        let req = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hello")])
+            .presence_penalty(0.5)
+            .frequency_penalty(-0.2)
+            .seed(42)
+            .user("user_123")
+            .parallel_tool_calls(true)
+            .stop_sequence("END")
+            .tool_choice(serde_json::json!("auto"))
+            .response_format(serde_json::json!({ "type": "text" }));
+        let val_req = serde_json::to_value(&req).unwrap();
+        assert_eq!(val_req["presence_penalty"], 0.5);
+        assert!((val_req["frequency_penalty"].as_f64().unwrap() - -0.2).abs() < 1e-6);
+        assert_eq!(val_req["seed"], 42);
+        assert_eq!(val_req["user"], "user_123");
+        assert_eq!(val_req["parallel_tool_calls"], true);
+        assert_eq!(val_req["stop"][0], "END");
+        assert_eq!(val_req["tool_choice"], "auto");
+        assert_eq!(val_req["response_format"]["type"], "text");
     }
 }

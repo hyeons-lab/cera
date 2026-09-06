@@ -15,7 +15,8 @@ pub use provider::{
     OPENAI_API_KEY_ENV, OPENAI_DEFAULT_BASE_URL, OPENROUTER_API_KEY_ENV,
     OPENROUTER_DEFAULT_BASE_URL, Provider,
 };
-pub use stream::ChatCompletionStream;
+pub use reqwest::StatusCode;
+pub use stream::{BoxChatCompletionStream, ChatCompletionStream};
 pub use types::{
     ChatChoice, ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, ChatCompletionRequest,
     ChatCompletionResponse, ChatMessage, ChunkFunctionCall, ChunkToolCall, EmbeddingData,

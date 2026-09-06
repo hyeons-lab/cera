@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiErrorPayload {
     /// Human-readable description of the error.
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub message: String,
     /// Error category or classification (e.g. `invalid_request_error`).
     #[serde(rename = "type", default)]
@@ -16,6 +17,14 @@ pub struct ApiErrorPayload {
     /// Machine-readable error code (e.g. `rate_limit_exceeded` or OpenRouter numeric codes).
     #[serde(default, deserialize_with = "deserialize_string_or_int")]
     pub code: Option<String>,
+}
+
+fn deserialize_null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -109,12 +118,39 @@ impl ClientError {
         false
     }
 
-    /// Returns true if the error is a transient server failure (HTTP 5xx or connection error).
+    /// Returns true if the error is a transient server failure (HTTP 5xx, 408, or connection error).
     pub fn is_transient(&self) -> bool {
         if let Some(status) = self.status()
-            && status.is_server_error()
+            && (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT)
         {
             return true;
+        }
+        if let Self::Api {
+            code, error_type, ..
+        } = self
+        {
+            if let Some(c) = code.as_deref()
+                && matches!(
+                    c,
+                    "500"
+                        | "502"
+                        | "503"
+                        | "504"
+                        | "server_error"
+                        | "overloaded"
+                        | "timeout"
+                        | "service_unavailable"
+                        | "gateway_timeout"
+                        | "engine_overloaded"
+                )
+            {
+                return true;
+            }
+            if let Some(t) = error_type.as_deref()
+                && (t == "server_error" || t == "timeout" || t == "service_unavailable")
+            {
+                return true;
+            }
         }
         if let Self::Http(err) = self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -186,5 +222,54 @@ mod tests {
         );
         assert!(!err500.is_rate_limited());
         assert!(err500.is_transient());
+
+        let err_in_band_503 = ClientError::Api {
+            status: None,
+            message: "Model overloaded".to_string(),
+            error_type: Some("server_error".to_string()),
+            code: Some("503".to_string()),
+            param: None,
+        };
+        assert!(err_in_band_503.is_transient());
+
+        let err408 = ClientError::Api {
+            status: Some(reqwest::StatusCode::REQUEST_TIMEOUT),
+            message: "Timeout".to_string(),
+            error_type: None,
+            code: None,
+            param: None,
+        };
+        assert!(err408.is_transient());
+
+        let err_service_unavailable = ClientError::Api {
+            status: None,
+            message: "Service unavailable".to_string(),
+            error_type: Some("service_unavailable".to_string()),
+            code: Some("service_unavailable".to_string()),
+            param: None,
+        };
+        assert!(err_service_unavailable.is_transient());
+
+        let err_gateway_timeout = ClientError::Api {
+            status: None,
+            message: "Gateway timeout".to_string(),
+            error_type: None,
+            code: Some("gateway_timeout".to_string()),
+            param: None,
+        };
+        assert!(err_gateway_timeout.is_transient());
+    }
+
+    #[test]
+    fn test_parse_null_or_missing_error_message() {
+        let json_null = r#"{"error": {"message": null, "code": 500}}"#;
+        let env_null: ApiErrorEnvelope = serde_json::from_str(json_null).unwrap();
+        assert_eq!(env_null.error.message, "");
+        assert_eq!(env_null.error.code.as_deref(), Some("500"));
+
+        let json_missing = r#"{"error": {"code": 503}}"#;
+        let env_missing: ApiErrorEnvelope = serde_json::from_str(json_missing).unwrap();
+        assert_eq!(env_missing.error.message, "");
+        assert_eq!(env_missing.error.code.as_deref(), Some("503"));
     }
 }
