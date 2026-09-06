@@ -45,7 +45,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -217,14 +217,47 @@ pub(crate) fn partial_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-static ACTIVE_DOWNLOADS: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static ACTIVE_DOWNLOADS: LazyLock<(Mutex<HashSet<PathBuf>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
 
 fn lock_active_downloads() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
     ACTIVE_DOWNLOADS
+        .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+pub(crate) fn canonicalize_dest(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    if abs.exists() {
+        abs.canonicalize().unwrap_or(abs)
+    } else if let Some(parent) = abs.parent().filter(|p| p.exists()) {
+        parent
+            .canonicalize()
+            .map(|p| p.join(abs.file_name().unwrap_or_default()))
+            .unwrap_or(abs)
+    } else {
+        abs
+    }
+}
+
+/// Wait until an active in-process download for `path` completes.
+pub(crate) fn wait_for_active_download(path: &Path) {
+    let canon = canonicalize_dest(path);
+    let (lock, cvar) = &*ACTIVE_DOWNLOADS;
+    let mut active = lock.lock().unwrap_or_else(|p| p.into_inner());
+    while active.contains(&canon) {
+        active = cvar.wait(active).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+pub(crate) const ALREADY_IN_PROGRESS_MSG: &str = "is already in progress in this process";
 
 /// RAII guard ensuring at most one active download to a given destination in this process.
 struct ActiveDownloadGuard {
@@ -233,30 +266,14 @@ struct ActiveDownloadGuard {
 
 impl ActiveDownloadGuard {
     fn acquire(path: &Path) -> Result<Self, CeraError> {
-        let abs = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        };
-        if let Some(parent) = abs.parent() {
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let canon = if abs.exists() {
-            abs.canonicalize().unwrap_or(abs)
-        } else if let Some(parent) = abs.parent().filter(|p| p.exists()) {
-            parent
-                .canonicalize()
-                .map(|p| p.join(abs.file_name().unwrap_or_default()))
-                .unwrap_or(abs)
-        } else {
-            abs
-        };
+        let canon = canonicalize_dest(path);
         let mut active = lock_active_downloads();
         if !active.insert(canon.clone()) {
             return Err(CeraError::Backend(format!(
-                "download for {} is already in progress in this process",
+                "download for {} {ALREADY_IN_PROGRESS_MSG}",
                 path.display()
             )));
         }
@@ -266,8 +283,10 @@ impl ActiveDownloadGuard {
 
 impl Drop for ActiveDownloadGuard {
     fn drop(&mut self) {
-        let mut active = lock_active_downloads();
+        let (lock, cvar) = &*ACTIVE_DOWNLOADS;
+        let mut active = lock.lock().unwrap_or_else(|p| p.into_inner());
         active.remove(&self.path);
+        cvar.notify_all();
     }
 }
 
@@ -1005,6 +1024,35 @@ mod tests {
         drop(guard1);
         let guard3 = ActiveDownloadGuard::acquire(&target);
         assert!(guard3.is_ok());
+    }
+
+    #[test]
+    fn test_active_download_guard_concurrent_distinct_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target1 = dir.path().join("model1.bin");
+        let target2 = dir.path().join("model2.bin");
+        let guard1 = ActiveDownloadGuard::acquire(&target1).unwrap();
+        let guard2 = ActiveDownloadGuard::acquire(&target2).unwrap();
+        drop(guard1);
+        drop(guard2);
+    }
+
+    #[test]
+    fn test_active_download_guard_wait_and_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model_wait.bin");
+        let guard = ActiveDownloadGuard::acquire(&target).unwrap();
+
+        let target_clone = target.clone();
+        let handle = std::thread::spawn(move || {
+            wait_for_active_download(&target_clone);
+            let next_guard = ActiveDownloadGuard::acquire(&target_clone);
+            assert!(next_guard.is_ok());
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        drop(guard);
+        handle.join().unwrap();
     }
 
     #[test]

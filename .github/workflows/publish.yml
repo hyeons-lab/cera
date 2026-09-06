@@ -47,7 +47,7 @@ on:
         required: true
         default: true
       crates:
-        description: 'crates.io (cera, cera-ffi, cera-cli, cera-wasm)'
+        description: 'crates.io (cera, cera-ffi, cera-cli, cera-wasm, cera-client)'
         type: boolean
         default: true
       cli:
@@ -170,17 +170,18 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          # Topological order: `cera` (no internal deps) first, then the three
-          # crates that depend only on `cera`. `cera-parity` is publish=false
+          # Topological order: `cera` (no internal deps) first, then downstream
+          # crates (`cera-ffi`, `cera-cli`, `cera-wasm` depending on `cera`, and
+          # `cera-client` with no internal deps). `cera-parity` is publish=false
           # (internal cross-language parity harness) and is excluded.
 
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "=== DRY RUN: packaging only, no upload ==="
             cargo package -p cera
             # Downstream crates depend on `cera = "0.1.x"`, which is not on the
-            # index during a dry run — point the dep back at the local path and
+            # index during a dry run; point the dep back at the local path and
             # skip the verify build's registry resolution.
-            for c in cera-ffi cera-cli cera-wasm; do
+            for c in cera-ffi cera-cli cera-wasm cera-client; do
               echo "--- packaging $c ---"
               cargo package -p "$c" --no-verify \
                 --config "patch.crates-io.cera.path='cera'"
@@ -268,7 +269,7 @@ jobs:
             return 0
           }
 
-          for c in cera cera-ffi cera-cli cera-wasm; do
+          for c in cera cera-ffi cera-cli cera-wasm cera-client; do
             publish_one "$c" || exit 1
           done
           echo "All crates published (or already present)."
