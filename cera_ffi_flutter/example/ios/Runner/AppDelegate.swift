@@ -67,12 +67,22 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
       if !player.play() {
         self.currentPlayer = nil
         self.pendingResult = nil
+        deactivateAudioSession()
         result(FlutterError(code: "PLAY_FAILED", message: "AVAudioPlayer.play() returned false", details: nil))
       }
     } catch {
       self.currentPlayer = nil
       self.pendingResult = nil
+      deactivateAudioSession()
       result(FlutterError(code: "DECODE_ERROR", message: error.localizedDescription, details: nil))
+    }
+  }
+
+  private func deactivateAudioSession() {
+    do {
+      try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    } catch {
+      // Deactivation may throw if already deactivated or in background.
     }
   }
 
@@ -80,6 +90,7 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
     if let player = currentPlayer {
       player.stop()
       currentPlayer = nil
+      deactivateAudioSession()
     }
     if let result = pendingResult {
       pendingResult = nil
@@ -90,6 +101,7 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
   func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
     if player == currentPlayer {
       currentPlayer = nil
+      deactivateAudioSession()
       let result = pendingResult
       pendingResult = nil
       result?(flag)

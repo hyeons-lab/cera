@@ -8,15 +8,20 @@ import 'audio_player_stub.dart'
 
 /// Cross-platform audio player service for streaming and playing back model audio output.
 class AudioPlayerService extends ChangeNotifier {
+  final audio_backend.AudioPlayerBackend _backend;
   bool _isPlaying = false;
   Object? _activeAudioSource;
   int _currentPlayId = 0;
+  bool _disposed = false;
+
+  AudioPlayerService({audio_backend.AudioPlayerBackend? backend})
+    : _backend = backend ?? audio_backend.AudioPlayerBackend();
 
   bool get isPlaying => _isPlaying;
   Object? get activeAudioSource => _activeAudioSource;
 
   /// Whether real-time audio playback is supported on the active platform.
-  bool get isSupported => audio_backend.isAudioPlaybackSupported;
+  bool get isSupported => _backend.isSupported;
 
   /// Whether a specific audio source (e.g. sample buffer) is currently playing.
   bool isSourcePlaying(Object? source) {
@@ -33,7 +38,7 @@ class AudioPlayerService extends ChangeNotifier {
     int sampleRate = 24000,
     Object? source,
   }) async {
-    if (samples.isEmpty) return;
+    if (samples.isEmpty || _disposed) return;
     debugPrint(
       '[cera:audio_player_service] playPcm called with ${samples.length} samples at $sampleRate Hz',
     );
@@ -45,7 +50,7 @@ class AudioPlayerService extends ChangeNotifier {
 
     try {
       final floatList = Float32List.fromList(samples);
-      await audio_backend.playAudioPcm(floatList, sampleRate);
+      await _backend.playPcm(floatList, sampleRate);
     } finally {
       if (_currentPlayId == playId) {
         _isPlaying = false;
@@ -57,6 +62,7 @@ class AudioPlayerService extends ChangeNotifier {
 
   /// Begins an audio streaming session.
   void startStream({int sampleRate = 24000}) {
+    if (_disposed) return;
     debugPrint(
       '[cera:audio_player_service] startStream called (sampleRate=$sampleRate)',
     );
@@ -65,22 +71,20 @@ class AudioPlayerService extends ChangeNotifier {
     _isPlaying = true;
     _activeAudioSource = this;
     _notifySafely();
-    audio_backend.startAudioStream(sampleRate);
+    _backend.startStream(sampleRate);
   }
 
   /// Appends an audio PCM chunk to the live stream.
   void appendChunk(List<double> chunk) {
-    debugPrint(
-      '[cera:audio_player_service] appendChunk called with ${chunk.length} samples (isPlaying=$_isPlaying)',
-    );
-    if (chunk.isEmpty || !_isPlaying || !identical(_activeAudioSource, this)) {
+    if (chunk.isEmpty ||
+        _disposed ||
+        !_isPlaying ||
+        !identical(_activeAudioSource, this)) {
       return;
     }
     final floatList = Float32List.fromList(chunk);
-    audio_backend.appendAudioStreamChunk(floatList);
+    _backend.appendStreamChunk(floatList);
   }
-
-  bool _disposed = false;
 
   void _notifySafely() {
     if (!_disposed) {
@@ -91,11 +95,11 @@ class AudioPlayerService extends ChangeNotifier {
   /// Flushes remaining buffered chunks when stream generation completes.
   void finishStream() {
     debugPrint('[cera:audio_player_service] finishStream called');
-    if (!identical(_activeAudioSource, this)) return;
+    if (_disposed || !identical(_activeAudioSource, this)) return;
     _isPlaying = false;
     _activeAudioSource = null;
     _notifySafely();
-    audio_backend.finishAudioStream();
+    _backend.finishStream();
   }
 
   /// Stops streaming and ends audio playback.
@@ -108,14 +112,15 @@ class AudioPlayerService extends ChangeNotifier {
     if (wasPlaying) {
       _notifySafely();
     }
-    audio_backend.stopAudioStream();
-    audio_backend.stopAudioPlayback();
+    _backend.stopStream();
+    _backend.stopPlayback();
   }
 
   @override
   void dispose() {
     _disposed = true;
     stop();
+    _backend.dispose();
     super.dispose();
   }
 }

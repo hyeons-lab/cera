@@ -1,3 +1,4 @@
+import AVFoundation
 import Cocoa
 import FlutterMacOS
 
@@ -17,9 +18,9 @@ class MainFlutterWindow: NSWindow {
   }
 }
 
-class NativeAudioPlayer: NSObject, NSSoundDelegate {
+class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
   private let channel: FlutterMethodChannel
-  private var currentSound: NSSound?
+  private var currentPlayer: AVAudioPlayer?
   private var pendingResult: FlutterResult?
 
   init(messenger: FlutterBinaryMessenger) {
@@ -51,25 +52,28 @@ class NativeAudioPlayer: NSObject, NSSoundDelegate {
 
   private func play(data: Data, result: @escaping FlutterResult) {
     stop()
-    guard let sound = NSSound(data: data) else {
-      result(FlutterError(code: "DECODE_ERROR", message: "Failed to parse audio data with NSSound", details: nil))
-      return
-    }
-    sound.delegate = self
-    self.currentSound = sound
-    self.pendingResult = result
+    do {
+      let player = try AVAudioPlayer(data: data)
+      player.delegate = self
+      self.currentPlayer = player
+      self.pendingResult = result
 
-    if !sound.play() {
-      self.currentSound = nil
+      if !player.play() {
+        self.currentPlayer = nil
+        self.pendingResult = nil
+        result(FlutterError(code: "PLAY_FAILED", message: "AVAudioPlayer.play() returned false", details: nil))
+      }
+    } catch {
+      self.currentPlayer = nil
       self.pendingResult = nil
-      result(FlutterError(code: "PLAY_FAILED", message: "NSSound.play() returned false", details: nil))
+      result(FlutterError(code: "DECODE_ERROR", message: error.localizedDescription, details: nil))
     }
   }
 
   private func stop() {
-    if let sound = currentSound {
-      sound.stop()
-      currentSound = nil
+    if let player = currentPlayer {
+      player.stop()
+      currentPlayer = nil
     }
     if let result = pendingResult {
       pendingResult = nil
@@ -77,13 +81,12 @@ class NativeAudioPlayer: NSObject, NSSoundDelegate {
     }
   }
 
-  func sound(_ sound: NSSound, didFinishPlaying flag: Bool) {
-    if sound == currentSound {
-      currentSound = nil
+  func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    if player == currentPlayer {
+      currentPlayer = nil
       let result = pendingResult
       pendingResult = nil
       result?(flag)
     }
   }
 }
-
