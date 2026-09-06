@@ -852,7 +852,12 @@ impl MetalLfm2Model {
                 let mmap = unsafe { memmap2::Mmap::map(&mmap_file)? };
                 let mmap_len = mmap.len() as u64;
                 // Page-align the buffer length for Metal's newBufferWithBytesNoCopy.
-                let page_size = 16384u64; // Apple Silicon uses 16KB pages
+                // Apple Silicon uses 16KB pages while Intel macOS uses 4KB pages.
+                let page_size = if cfg!(target_arch = "aarch64") {
+                    16384u64
+                } else {
+                    4096u64
+                };
                 let aligned_len = (mmap_len + page_size - 1) & !(page_size - 1);
                 // SAFETY:
                 // - mmap pointer is page-aligned (OS mmap guarantee)
@@ -2666,7 +2671,15 @@ impl MetalLfm2Model {
                 w.m.div_ceil(4),
                 64u64,
             ),
-            _ => (&self.pipelines.gemv_f32, w.m, 32u64),
+            _ => (
+                if accumulate {
+                    &self.pipelines.gemv_f32_accum
+                } else {
+                    &self.pipelines.gemv_f32
+                },
+                w.m,
+                32u64,
+            ),
         };
         let grid = sz2d(groups.min(65535) as u64, groups.div_ceil(65535) as u64);
         enc.set_compute_pipeline_state(pipeline);

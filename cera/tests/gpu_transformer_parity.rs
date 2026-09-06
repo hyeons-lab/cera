@@ -438,7 +438,8 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
 
     // Separate model instances so the second prefill can't restore the first's
     // prefix cache instead of recomputing.
-    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192) {
+    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("skipping {model_file}: Metal unavailable ({e})");

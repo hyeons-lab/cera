@@ -656,6 +656,12 @@ impl Session {
         capabilities: ModalityCapabilities,
         config: SessionConfig,
     ) -> Result<Self, CeraError> {
+        let mut config = config;
+        #[cfg(not(target_arch = "wasm32"))]
+        if !config.gpu_depthformer && gpu_depthformer_enabled() {
+            config.gpu_depthformer = true;
+        }
+
         let model_cfg = model.config();
         let max_seq_len = config
             .max_seq_len

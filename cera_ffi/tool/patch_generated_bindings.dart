@@ -318,5 +318,13 @@ void main(List<String> args) {
   if (applied == 0) {
     stdout.writeln('  no patches needed (already patched or upstream fixed).');
   }
+
+  if (!src.contains('writer.writeBool(value.gpuDepthformer);')) {
+    stderr.writeln(
+      'patch_generated_bindings error: _uniffiWriteEngineConfig missing gpuDepthformer serialization',
+    );
+    exit(1);
+  }
+
   file.writeAsStringSync(src);
 }

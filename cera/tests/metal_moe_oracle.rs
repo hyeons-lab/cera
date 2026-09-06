@@ -138,7 +138,8 @@ fn both() -> Option<Pair> {
     let path = model_path()?;
     let open = || GgufFile::open(&path).expect("model_path checked this opens");
     let cpu = load_model(open(), Some(&path), 4096).expect("lfm2moe loads on the CPU backend");
-    let metal = load_model_metal(open(), Some(&path), 4096).expect("lfm2moe loads on the Metal backend");
+    let metal =
+        load_model_metal(open(), Some(&path), 4096).expect("lfm2moe loads on the Metal backend");
     let hs = cpu.config().hidden_size;
     assert!(
         cpu.config().moe.is_some(),

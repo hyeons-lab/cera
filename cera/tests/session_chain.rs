@@ -870,7 +870,8 @@ fn engine_from_bytes_with_metal_backend_runs_on_metal() {
         backend: cera::BackendPreference::Metal,
         ..Default::default()
     };
-    let engine = cera::CeraEngine::from_bytes(bytes, cfg).expect("engine loads from bytes on Metal");
+    let engine =
+        cera::CeraEngine::from_bytes(bytes, cfg).expect("engine loads from bytes on Metal");
     let mut session = engine.new_session(SessionConfig::default()).unwrap();
     let prompt: Vec<u32> = vec![1, 15, 32];
     session.append_tokens(&prompt).unwrap();

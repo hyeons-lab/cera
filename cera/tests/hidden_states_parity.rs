@@ -135,15 +135,17 @@ fn check_gpu_matches_cpu(gpu: &dyn Model, path: &Path, label: &str) {
 #[ignore = "needs an LFM2 GGUF + a Metal GPU; gated on CERA_GPU_PARITY"]
 fn metal_hidden_states_matches_cpu() {
     let Some(path) = gated_model() else { return };
-    let metal =
-        match cera::model::load_model_metal(GgufFile::open(&path).expect("open gguf"), Some(&path), 8192)
-        {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skip: no Metal GPU: {e}");
-                return;
-            }
-        };
+    let metal = match cera::model::load_model_metal(
+        GgufFile::open(&path).expect("open gguf"),
+        Some(&path),
+        8192,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("skip: no Metal GPU: {e}");
+            return;
+        }
+    };
     check_gpu_matches_cpu(metal.as_ref(), &path, "metal");
 }
 
