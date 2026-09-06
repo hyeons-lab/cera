@@ -166,24 +166,32 @@ impl Client {
     /// with optional `OPENAI_API_KEY`.
     /// Otherwise checks `OPENAI_API_KEY` to connect to OpenAI.
     pub fn from_env() -> Result<Self, ClientError> {
-        if let Ok(key) = std::env::var(OPENROUTER_API_KEY_ENV)
-            && !key.trim().is_empty()
-        {
+        let or_key = std::env::var(OPENROUTER_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+        let oa_base = std::env::var(OPENAI_BASE_URL_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+        let oa_key = std::env::var(OPENAI_API_KEY_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+
+        if or_key.is_some() && (oa_base.is_some() || oa_key.is_some()) {
+            tracing::warn!(
+                target: "cera_client",
+                "Both OpenRouter ({OPENROUTER_API_KEY_ENV}) and OpenAI ({OPENAI_API_KEY_ENV}/{OPENAI_BASE_URL_ENV}) environment variables are set; defaulting to OpenRouter precedence"
+            );
+        }
+
+        if let Some(key) = or_key {
             return Self::openrouter(key);
         }
 
-        if let Ok(base_url) = std::env::var(OPENAI_BASE_URL_ENV)
-            && !base_url.trim().is_empty()
-        {
-            let key = std::env::var(OPENAI_API_KEY_ENV)
-                .ok()
-                .filter(|k| !k.trim().is_empty());
-            return Self::custom(base_url, key);
+        if let Some(base_url) = oa_base {
+            return Self::custom(base_url, oa_key);
         }
 
-        if let Ok(key) = std::env::var(OPENAI_API_KEY_ENV)
-            && !key.trim().is_empty()
-        {
+        if let Some(key) = oa_key {
             return Self::openai(key);
         }
 

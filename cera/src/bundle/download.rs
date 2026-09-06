@@ -1027,6 +1027,17 @@ mod tests {
     }
 
     #[test]
+    fn test_active_download_guard_concurrent_distinct_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let target1 = dir.path().join("model1.bin");
+        let target2 = dir.path().join("model2.bin");
+        let guard1 = ActiveDownloadGuard::acquire(&target1).unwrap();
+        let guard2 = ActiveDownloadGuard::acquire(&target2).unwrap();
+        drop(guard1);
+        drop(guard2);
+    }
+
+    #[test]
     fn test_active_download_guard_wait_and_notify() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("model_wait.bin");
