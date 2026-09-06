@@ -1,14 +1,22 @@
 import 'dart:typed_data';
 
-/// Stub audio player for non-web platforms.
-Future<void> playAudioPcm(Float32List samples, int sampleRate) async {}
+/// Stub audio player backend for unsupported platforms.
+class AudioPlayerBackend {
+  bool get isSupported => false;
 
-void stopAudioPlayback() {}
+  Future<void> playPcm(Float32List samples, int sampleRate) async {}
 
-void startAudioStream(int sampleRate) {}
+  void stopPlayback() {}
 
-void appendAudioStreamChunk(Float32List chunk) {}
+  void startStream(int sampleRate) {}
 
-void finishAudioStream() {}
+  void appendStreamChunk(Float32List chunk) {}
 
-void stopAudioStream() {}
+  void finishStream() {}
+
+  void stopStream() {}
+
+  void dispose() {}
+}
+
+bool get isAudioPlaybackSupported => false;
