@@ -6,7 +6,7 @@ use reqwest::Response;
 use reqwest::header::HeaderMap;
 
 use crate::error::{ApiErrorEnvelope, ClientError};
-use crate::provider::{OPENAI_API_KEY_ENV, OPENROUTER_API_KEY_ENV, Provider};
+use crate::provider::{OPENAI_API_KEY_ENV, OPENAI_BASE_URL_ENV, OPENROUTER_API_KEY_ENV, Provider};
 use crate::stream::ChatCompletionStream;
 use crate::types::{
     ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest, EmbeddingResponse,
@@ -19,6 +19,7 @@ pub struct ClientBuilder {
     provider: Provider,
     api_key: Option<String>,
     timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
 }
 
 impl ClientBuilder {
@@ -28,6 +29,7 @@ impl ClientBuilder {
             provider,
             api_key: None,
             timeout: Some(Duration::from_secs(60)),
+            connect_timeout: None,
         }
     }
 
@@ -43,11 +45,19 @@ impl ClientBuilder {
         self
     }
 
+    /// Set socket connection timeout.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     /// Build the client instance.
     pub fn build(self) -> Result<Client, ClientError> {
+        #[allow(unused_mut)]
         let mut http_builder = reqwest::Client::builder();
-        if let Some(to) = self.timeout {
-            http_builder = http_builder.timeout(to);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ct) = self.connect_timeout {
+            http_builder = http_builder.connect_timeout(ct);
         }
 
         let http = http_builder.build()?;
@@ -55,6 +65,7 @@ impl ClientBuilder {
             http,
             provider: self.provider,
             api_key: self.api_key,
+            timeout: self.timeout,
         })
     }
 }
@@ -65,28 +76,26 @@ pub struct Client {
     http: reqwest::Client,
     provider: Provider,
     api_key: Option<String>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    timeout: Option<Duration>,
 }
 
 impl Client {
     /// Create a new client targeting OpenAI with an API key.
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: impl Into<String>) -> Result<Self, ClientError> {
         Self::openai(api_key)
     }
 
     /// Create a client targeting the official OpenAI API.
-    pub fn openai(api_key: impl Into<String>) -> Self {
-        Self::builder(Provider::OpenAi)
-            .api_key(api_key)
-            .build()
-            .expect("default HTTP client configuration should not fail")
+    pub fn openai(api_key: impl Into<String>) -> Result<Self, ClientError> {
+        Self::builder(Provider::OpenAi).api_key(api_key).build()
     }
 
     /// Create a client targeting the OpenRouter API.
-    pub fn openrouter(api_key: impl Into<String>) -> Self {
+    pub fn openrouter(api_key: impl Into<String>) -> Result<Self, ClientError> {
         Self::builder(Provider::openrouter())
             .api_key(api_key)
             .build()
-            .expect("default HTTP client configuration should not fail")
     }
 
     /// Create a client targeting OpenRouter with application attribution metadata.
@@ -94,42 +103,54 @@ impl Client {
         api_key: impl Into<String>,
         app_url: impl Into<String>,
         app_name: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self, ClientError> {
         Self::builder(Provider::openrouter_with_attribution(app_url, app_name))
             .api_key(api_key)
             .build()
-            .expect("default HTTP client configuration should not fail")
     }
 
     /// Create a client targeting a custom OpenAI-compatible server.
-    pub fn custom(base_url: impl Into<String>, api_key: Option<String>) -> Self {
+    pub fn custom(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Result<Self, ClientError> {
         let mut b = Self::builder(Provider::custom(base_url));
         if let Some(key) = api_key {
             b = b.api_key(key);
         }
         b.build()
-            .expect("default HTTP client configuration should not fail")
     }
 
     /// Automatically configure a client from available environment variables.
     ///
     /// Checks `OPENROUTER_API_KEY` first; if present, connects to OpenRouter.
+    /// Then checks `OPENAI_BASE_URL`; if present, connects to that custom endpoint
+    /// with optional `OPENAI_API_KEY`.
     /// Otherwise checks `OPENAI_API_KEY` to connect to OpenAI.
     pub fn from_env() -> Result<Self, ClientError> {
         if let Ok(key) = std::env::var(OPENROUTER_API_KEY_ENV)
             && !key.trim().is_empty()
         {
-            return Ok(Self::openrouter(key));
+            return Self::openrouter(key);
+        }
+
+        if let Ok(base_url) = std::env::var(OPENAI_BASE_URL_ENV)
+            && !base_url.trim().is_empty()
+        {
+            let key = std::env::var(OPENAI_API_KEY_ENV)
+                .ok()
+                .filter(|k| !k.trim().is_empty());
+            return Self::custom(base_url, key);
         }
 
         if let Ok(key) = std::env::var(OPENAI_API_KEY_ENV)
             && !key.trim().is_empty()
         {
-            return Ok(Self::openai(key));
+            return Self::openai(key);
         }
 
         Err(ClientError::MissingApiKey(format!(
-            "Neither {OPENROUTER_API_KEY_ENV} nor {OPENAI_API_KEY_ENV} is set in the environment"
+            "Neither {OPENROUTER_API_KEY_ENV}, {OPENAI_BASE_URL_ENV}, nor {OPENAI_API_KEY_ENV} is set in the environment"
         )))
     }
 
@@ -151,20 +172,21 @@ impl Client {
     /// Sends a non-streaming chat completion request to `/chat/completions`.
     pub async fn chat(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ClientError> {
+        request.stream = Some(false);
         let url = self.provider.endpoint_url("chat/completions")?;
         let mut headers = HeaderMap::new();
         self.provider
             .apply_headers(&mut headers, self.api_key.as_deref())?;
 
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&request)
-            .send()
-            .await?;
+        #[allow(unused_mut)]
+        let mut req = self.http.post(url).headers(headers).json(&request);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(to) = self.timeout {
+            req = req.timeout(to);
+        }
+        let response = req.send().await?;
 
         let checked = Self::check_response(response).await?;
         let body = checked.json::<ChatCompletionResponse>().await?;
@@ -184,6 +206,14 @@ impl Client {
         request.stream = Some(true);
         let url = self.provider.endpoint_url("chat/completions")?;
         let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("no-cache"),
+        );
         self.provider
             .apply_headers(&mut headers, self.api_key.as_deref())?;
 
@@ -210,13 +240,13 @@ impl Client {
         self.provider
             .apply_headers(&mut headers, self.api_key.as_deref())?;
 
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&request)
-            .send()
-            .await?;
+        #[allow(unused_mut)]
+        let mut req = self.http.post(url).headers(headers).json(&request);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(to) = self.timeout {
+            req = req.timeout(to);
+        }
+        let response = req.send().await?;
 
         let checked = Self::check_response(response).await?;
         let body = checked.json::<EmbeddingResponse>().await?;
@@ -230,7 +260,13 @@ impl Client {
         self.provider
             .apply_headers(&mut headers, self.api_key.as_deref())?;
 
-        let response = self.http.get(url).headers(headers).send().await?;
+        #[allow(unused_mut)]
+        let mut req = self.http.get(url).headers(headers);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(to) = self.timeout {
+            req = req.timeout(to);
+        }
+        let response = req.send().await?;
 
         let checked = Self::check_response(response).await?;
         let body = checked.json::<ListModelsResponse>().await?;
@@ -247,7 +283,7 @@ impl Client {
         let raw_text = response.text().await.unwrap_or_default();
         if let Ok(envelope) = serde_json::from_str::<ApiErrorEnvelope>(&raw_text) {
             return Err(ClientError::Api {
-                status,
+                status: Some(status),
                 message: envelope.error.message,
                 error_type: envelope.error.error_type,
                 code: envelope.error.code,
@@ -256,7 +292,7 @@ impl Client {
         }
 
         Err(ClientError::Api {
-            status,
+            status: Some(status),
             message: if raw_text.is_empty() {
                 format!("HTTP error {status}")
             } else {
@@ -275,15 +311,15 @@ mod tests {
 
     #[test]
     fn test_client_constructors() {
-        let client_oa = Client::openai("sk-12345");
+        let client_oa = Client::openai("sk-12345").unwrap();
         assert_eq!(client_oa.provider(), &Provider::OpenAi);
         assert_eq!(client_oa.api_key(), Some("sk-12345"));
 
-        let client_or = Client::openrouter("or-67890");
+        let client_or = Client::openrouter("or-67890").unwrap();
         assert_eq!(client_or.provider(), &Provider::openrouter());
         assert_eq!(client_or.api_key(), Some("or-67890"));
 
-        let client_custom = Client::custom("http://localhost:11434/v1", None);
+        let client_custom = Client::custom("http://localhost:11434/v1", None).unwrap();
         assert_eq!(
             client_custom.provider(),
             &Provider::custom("http://localhost:11434/v1")
@@ -299,6 +335,7 @@ mod tests {
         ))
         .api_key("key-abc")
         .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 

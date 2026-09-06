@@ -17,6 +17,9 @@ pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 /// Environment variable for OpenRouter API key.
 pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
+/// Environment variable for custom OpenAI base URL.
+pub const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+
 /// Endpoint provider target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provider {
@@ -100,21 +103,31 @@ impl Provider {
         if let Some(key) = api_key {
             let auth_value = format!("Bearer {key}");
             let mut val = HeaderValue::from_str(&auth_value)
-                .map_err(|e| ClientError::InvalidUrl(format!("Invalid auth header: {e}")))?;
+                .map_err(|e| ClientError::InvalidHeader(format!("Invalid auth header: {e}")))?;
             val.set_sensitive(true);
             headers.insert(AUTHORIZATION, val);
         }
 
         if let Self::OpenRouter { app_url, app_name } = self {
-            if let Some(url) = app_url
-                && let Ok(val) = HeaderValue::from_str(url)
-            {
-                headers.insert(HeaderName::from_static("http-referer"), val);
+            if let Some(url) = app_url {
+                match HeaderValue::from_str(url) {
+                    Ok(val) => {
+                        headers.insert(HeaderName::from_static("http-referer"), val);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "cera_client", error = %e, "Invalid http-referer header value; omitting");
+                    }
+                }
             }
-            if let Some(name) = app_name
-                && let Ok(val) = HeaderValue::from_str(name)
-            {
-                headers.insert(HeaderName::from_static("x-title"), val);
+            if let Some(name) = app_name {
+                match HeaderValue::from_str(name) {
+                    Ok(val) => {
+                        headers.insert(HeaderName::from_static("x-title"), val);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "cera_client", error = %e, "Invalid x-title header value; omitting");
+                    }
+                }
             }
         }
 
@@ -182,5 +195,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         provider.apply_headers(&mut headers, None).unwrap();
         assert!(!headers.contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn test_invalid_auth_header() {
+        let provider = Provider::OpenAi;
+        let mut headers = HeaderMap::new();
+        let err = provider
+            .apply_headers(&mut headers, Some("key_with_\ninvalid_newline"))
+            .unwrap_err();
+        match err {
+            ClientError::InvalidHeader(msg) => assert!(msg.contains("Invalid auth header")),
+            other => panic!("expected InvalidHeader error, got {other:?}"),
+        }
     }
 }

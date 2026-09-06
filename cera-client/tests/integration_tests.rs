@@ -6,6 +6,23 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+    let mut buf = vec![0u8; 4096];
+    let mut bytes_read = 0;
+    while bytes_read < buf.len() {
+        let n = socket.read(&mut buf[bytes_read..]).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        bytes_read += n;
+        let s = String::from_utf8_lossy(&buf[..bytes_read]);
+        if s.contains("\r\n\r\n") {
+            return s.into_owned();
+        }
+    }
+    String::from_utf8_lossy(&buf[..bytes_read]).into_owned()
+}
+
 /// Simple mock server to verify HTTP request formation and response handling.
 async fn spawn_mock_server(
     expected_path: &'static str,
@@ -17,9 +34,7 @@ async fn spawn_mock_server(
 
     let handle = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = socket.read(&mut buf).await.unwrap();
-        let request_str = String::from_utf8_lossy(&buf[..n]);
+        let request_str = read_request(&mut socket).await;
 
         assert!(
             request_str.contains(expected_path),
@@ -67,7 +82,7 @@ async fn test_mock_chat_completion() {
     )
     .await;
 
-    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string()));
+    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string())).unwrap();
     let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hi")]);
 
     let response = client.chat(request).await.unwrap();
@@ -88,8 +103,7 @@ async fn test_mock_chat_stream() {
 
     let handle = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let _ = socket.read(&mut buf).await.unwrap();
+        let _ = read_request(&mut socket).await;
 
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
         socket.write_all(headers.as_bytes()).await.unwrap();
@@ -112,7 +126,7 @@ async fn test_mock_chat_stream() {
         socket.flush().await.unwrap();
     });
 
-    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string()));
+    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string())).unwrap();
     let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Stream me")]);
 
     let mut stream = client.chat_stream(request).await.unwrap();
@@ -120,7 +134,9 @@ async fn test_mock_chat_stream() {
 
     while let Some(item) = stream.next().await {
         let chunk = item.unwrap();
-        if let Some(content) = &chunk.choices[0].delta.content {
+        if let Some(choice) = chunk.choices.first()
+            && let Some(content) = &choice.delta.content
+        {
             collected.push_str(content);
         }
     }
@@ -145,8 +161,7 @@ async fn test_mock_api_error_rate_limit() {
 
     let handle = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let _ = socket.read(&mut buf).await.unwrap();
+        let _ = read_request(&mut socket).await;
 
         let response = format!(
             "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{error_body}",
@@ -156,7 +171,7 @@ async fn test_mock_api_error_rate_limit() {
         socket.flush().await.unwrap();
     });
 
-    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string()));
+    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string())).unwrap();
     let request = ChatCompletionRequest::new("gpt-4o", vec![ChatMessage::user("Hi")]);
 
     let err = client.chat(request).await.unwrap_err();
@@ -168,7 +183,7 @@ async fn test_mock_api_error_rate_limit() {
             code,
             ..
         } => {
-            assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(status, Some(reqwest::StatusCode::TOO_MANY_REQUESTS));
             assert!(message.contains("Rate limit reached"));
             assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
         }
@@ -202,12 +217,80 @@ async fn test_mock_embeddings() {
     )
     .await;
 
-    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string()));
+    let client = Client::custom(format!("http://{addr}"), Some("mock_key".to_string())).unwrap();
     let request = EmbeddingRequest::new("text-embedding-3-small", "hello world");
 
     let response = client.embeddings(request).await.unwrap();
     assert_eq!(response.data.len(), 1);
     assert_eq!(response.data[0].embedding, vec![0.05, -0.1, 0.25]);
+
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mock_openrouter_numeric_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let error_body = r#"{"error":{"message":"Insufficient credits","code":402}}"#;
+
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+
+        let response = format!(
+            "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{error_body}",
+            error_body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
+    });
+
+    let client = Client::custom(format!("http://{addr}"), Some("or-key".to_string())).unwrap();
+    let request =
+        ChatCompletionRequest::new("anthropic/claude-3.5-sonnet", vec![ChatMessage::user("Hi")]);
+
+    let err = client.chat(request).await.unwrap_err();
+    match err {
+        ClientError::Api {
+            status,
+            message,
+            code,
+            ..
+        } => {
+            assert_eq!(status, Some(reqwest::StatusCode::PAYMENT_REQUIRED));
+            assert_eq!(message, "Insufficient credits");
+            assert_eq!(code.as_deref(), Some("402"));
+        }
+        other => panic!("expected Api error, got: {other:?}"),
+    }
+
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mock_models_without_object() {
+    let raw_models = r#"{
+        "data": [{
+            "id": "openrouter/auto",
+            "created": 1700000000,
+            "owned_by": "openrouter"
+        }]
+    }"#;
+
+    let (addr, handle) = spawn_mock_server(
+        "GET /models",
+        "Content-Type: application/json\r\n",
+        raw_models,
+    )
+    .await;
+
+    let client = Client::custom(format!("http://{addr}"), None).unwrap();
+    let response = client.models().await.unwrap();
+    assert_eq!(response.object, None);
+    assert_eq!(response.data.len(), 1);
+    assert_eq!(response.data[0].id, "openrouter/auto");
+    assert_eq!(response.data[0].object, None);
 
     handle.await.unwrap();
 }

@@ -15,11 +15,10 @@ reqwest = { workspace = true, features = ["stream", "json"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "time"] }
 futures-core = "0.3"
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 bytes = "1"
 tracing.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

@@ -8,12 +8,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum Role {
     /// System prompt setting instructions and context.
     System,
+    /// Developer prompt for reasoning models (e.g. o1/o3).
+    Developer,
     /// User input message.
     User,
     /// Model assistant reply.
     Assistant,
     /// Result returned from an executed tool call.
     Tool,
+    /// Result returned from a legacy function call.
+    Function,
 }
 
 /// A message in a chat conversation.
@@ -25,6 +29,10 @@ pub struct ChatMessage {
     /// Text contents of the message. Optional when assistant returns tool calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+
+    /// Refusal message if the model refused to respond.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 
     /// Optional participant name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,6 +53,19 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: Some(content.into()),
+            refusal: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Construct a new developer instruction message for reasoning models.
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Developer,
+            content: Some(content.into()),
+            refusal: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -56,6 +77,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: Some(content.into()),
+            refusal: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -67,6 +89,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: Some(content.into()),
+            refusal: None,
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -78,6 +101,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: None,
+            refusal: None,
             name: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
@@ -89,9 +113,22 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            refusal: None,
             name: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    /// Construct a new legacy function reply message.
+    pub fn function(name: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Function,
+            content: Some(content.into()),
+            refusal: None,
+            name: Some(name.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 }
@@ -144,6 +181,24 @@ impl ToolDefinition {
                 name: name.into(),
                 description,
                 parameters,
+                strict: None,
+            },
+        }
+    }
+
+    /// Construct a function tool definition with strict schema adherence.
+    pub fn strict_function(
+        name: impl Into<String>,
+        description: Option<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description,
+                parameters,
+                strict: Some(true),
             },
         }
     }
@@ -161,6 +216,34 @@ pub struct FunctionDefinition {
 
     /// JSON Schema describing the function parameter structure.
     pub parameters: serde_json::Value,
+
+    /// Whether to enable strict schema adherence for structured outputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+impl FunctionDefinition {
+    /// Create a function definition without description or strict enforcement.
+    pub fn new(name: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            parameters,
+            strict: None,
+        }
+    }
+
+    /// Set function description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set strict schema mode.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
 }
 
 /// Request payload for `/chat/completions`.
@@ -183,6 +266,14 @@ pub struct ChatCompletionRequest {
     /// Maximum number of tokens to generate in the completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    /// Upper bound on completion tokens, used by reasoning models (e.g. o1/o3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+
+    /// Options for streaming responses, such as requesting token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
 
     /// Whether to stream back partial progress via Server-Sent Events.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +321,8 @@ impl ChatCompletionRequest {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_completion_tokens: None,
+            stream_options: None,
             stream: None,
             tools: None,
             tool_choice: None,
@@ -257,6 +350,18 @@ impl ChatCompletionRequest {
     /// Set maximum tokens to generate.
     pub fn max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Set maximum completion tokens for reasoning models (e.g. o1/o3).
+    pub fn max_completion_tokens(mut self, max_completion_tokens: u32) -> Self {
+        self.max_completion_tokens = Some(max_completion_tokens);
+        self
+    }
+
+    /// Request token usage statistics in the final streaming chunk.
+    pub fn include_usage(mut self) -> Self {
+        self.stream_options = Some(serde_json::json!({ "include_usage": true }));
         self
     }
 
@@ -319,7 +424,8 @@ pub struct ChatCompletionResponse {
     pub id: String,
 
     /// Object type (typically `chat.completion`).
-    pub object: String,
+    #[serde(default)]
+    pub object: Option<String>,
 
     /// Unix timestamp of completion creation.
     pub created: u64,
@@ -345,6 +451,10 @@ pub struct ChatChunkDelta {
     /// Generated text content increment.
     #[serde(default)]
     pub content: Option<String>,
+
+    /// Incremental refusal message if model refused to answer.
+    #[serde(default)]
+    pub refusal: Option<String>,
 
     /// Incremental tool calls data.
     #[serde(default)]
@@ -403,7 +513,8 @@ pub struct ChatCompletionChunk {
     pub id: String,
 
     /// Object type (typically `chat.completion.chunk`).
-    pub object: String,
+    #[serde(default)]
+    pub object: Option<String>,
 
     /// Unix timestamp of chunk creation.
     pub created: u64,
@@ -548,8 +659,9 @@ pub struct ModelInfo {
     /// Unique model identifier (e.g. `gpt-4o`).
     pub id: String,
 
-    /// Object type (typically `model`).
-    pub object: String,
+    /// Object type (typically `model`, optional on OpenRouter and Ollama).
+    #[serde(default)]
+    pub object: Option<String>,
 
     /// Unix timestamp when the model was created or added.
     #[serde(default)]
@@ -563,8 +675,9 @@ pub struct ModelInfo {
 /// Response returned from `/models`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListModelsResponse {
-    /// Object type (`list`).
-    pub object: String,
+    /// Object type (`list`, optional on some proxies).
+    #[serde(default)]
+    pub object: Option<String>,
 
     /// List of available models.
     pub data: Vec<ModelInfo>,
@@ -733,5 +846,29 @@ mod tests {
         let res: ListModelsResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(res.data.len(), 1);
         assert_eq!(res.data[0].id, "gpt-4o");
+    }
+
+    #[test]
+    fn test_function_definition_and_role_serialization() {
+        let msg = ChatMessage::function("calc", "42");
+        let val = serde_json::to_value(&msg).unwrap();
+        assert_eq!(val["role"], "function");
+        assert_eq!(val["name"], "calc");
+        assert_eq!(val["content"], "42");
+
+        let tool_def = ToolDefinition::strict_function(
+            "get_weather",
+            Some("Fetch current weather".to_string()),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "location": { "type": "string" } },
+                "required": ["location"],
+                "additionalProperties": false
+            }),
+        );
+        let val_tool = serde_json::to_value(&tool_def).unwrap();
+        assert_eq!(val_tool["type"], "function");
+        assert_eq!(val_tool["function"]["name"], "get_weather");
+        assert_eq!(val_tool["function"]["strict"], true);
     }
 }

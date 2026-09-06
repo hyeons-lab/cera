@@ -47,7 +47,7 @@ on:
         required: true
         default: true
       crates:
-        description: 'crates.io (cera, cera-ffi, cera-cli, cera-wasm)'
+        description: 'crates.io (cera, cera-ffi, cera-cli, cera-wasm, cera-client)'
         type: boolean
         default: true
       cli:
@@ -178,7 +178,7 @@ jobs:
             echo "=== DRY RUN: packaging only, no upload ==="
             cargo package -p cera
             # Downstream crates depend on `cera = "0.1.x"`, which is not on the
-            # index during a dry run — point the dep back at the local path and
+            # index during a dry run; point the dep back at the local path and
             # skip the verify build's registry resolution.
             for c in cera-ffi cera-cli cera-wasm cera-client; do
               echo "--- packaging $c ---"
