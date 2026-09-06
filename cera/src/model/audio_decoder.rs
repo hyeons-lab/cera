@@ -81,6 +81,64 @@ pub trait AudioGpu: Send + Sync {
     }
 }
 
+/// Try to construct a GPU audio decoder backend for the given vocoder GGUF file.
+///
+/// Returns `None` for `Cpu`, when the chosen backend's feature is not compiled,
+/// or when the device/context cannot be created.
+pub fn build_gpu_audio_decoder(
+    gguf: &Arc<GgufFile>,
+    backend: crate::engine::BackendPreference,
+) -> Option<Arc<dyn AudioGpu>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Cpu => None,
+        BP::Metal | BP::Auto => {
+            try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf))
+        }
+        BP::Gpu => try_wgpu_audio_decoder(gguf),
+    }
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    let dummy_path = std::path::Path::new("");
+    match crate::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(gguf, dummy_path) {
+        Ok(d) => {
+            tracing::info!("audio decoder: using native Metal backend");
+            Some(Arc::new(d))
+        }
+        Err(e) => {
+            tracing::warn!("audio decoder: Metal backend unavailable for this model: {e:#}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+fn try_metal_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    None
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    let dummy_path = std::path::Path::new("");
+    match crate::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(gguf, dummy_path) {
+        Ok(d) => {
+            tracing::info!("audio decoder: using WGPU backend");
+            Some(Arc::new(d))
+        }
+        Err(e) => {
+            tracing::warn!("audio decoder: WGPU backend unavailable for this model: {e:#}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    None
+}
+
 /// Configuration for the depthformer (small transformer inside the decoder).
 #[derive(Debug, Clone)]
 pub struct DepthformerConfig {
@@ -1687,5 +1745,19 @@ mod tests {
                 "Sample mismatch at {idx}: batch={b}, stream={s}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_gpu_audio_decoder_empty_gguf_graceful_none() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"GGUF");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        let bytes: Arc<[u8]> = Arc::from(data.into_boxed_slice());
+        let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
+
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Cpu).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Auto).is_none());
     }
 }

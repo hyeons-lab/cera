@@ -583,6 +583,10 @@ pub struct Session {
     /// (and still backs the capability/dimension checks). Attached via
     /// [`Self::attach_gpu_audio_encoder`].
     gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
+    /// Optional cached GPU audio decoder. When present, [`Self::generate`]
+    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
+    /// the GPU rather than CPU. Attached via [`Self::attach_gpu_audio_decoder`].
+    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
     /// Vision encoder weights, if attached. None for non-VL
     /// sessions; populated via [`Self::attach_vision_encoder`]
     /// before [`Self::append_image`] is called. Held by `Arc`
@@ -740,6 +744,7 @@ impl Session {
             audio_decoder: None,
             detok_weights: None,
             gpu_audio_encoder: None,
+            gpu_audio_decoder: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
             image_max_long_size: None,
@@ -775,6 +780,22 @@ impl Session {
     ) {
         self.audio_decoder = Some(decoder);
         self.detok_weights = Some(detok);
+    }
+
+    /// Attach a GPU audio decoder backend. When present, [`Self::generate`]
+    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
+    /// the GPU. The CPU vocoder weights must still be attached via
+    /// [`Self::attach_vocoder`]. Preserved across `reset()`.
+    pub fn attach_gpu_audio_decoder(
+        &mut self,
+        decoder: Arc<dyn crate::model::audio_decoder::AudioGpu>,
+    ) {
+        self.gpu_audio_decoder = Some(decoder);
+    }
+
+    /// Whether a GPU audio decoder backend is attached to this session.
+    pub fn has_gpu_audio_decoder(&self) -> bool {
+        self.gpu_audio_decoder.is_some()
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -2231,8 +2252,13 @@ impl Session {
         // two `generate(N/2)` calls with the same seed.
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+                let gpu_ref = self.gpu_audio_decoder.as_deref();
+                let gpu_df_env = std::env::var("CERA_GPU_DF")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let use_gpu_df = gpu_df_env && gpu_ref.is_some_and(|g| g.supports_depthformer());
                 Some(crate::audio_engine::AudioOutputDecoder::new(
-                    dec, detok, None, 0.7, 40, false,
+                    dec, detok, gpu_ref, 0.7, 40, use_gpu_df,
                 ))
             } else {
                 None
