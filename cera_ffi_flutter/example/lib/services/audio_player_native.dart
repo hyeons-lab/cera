@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+const MethodChannel _audioChannel = MethodChannel('cera/audio_player');
 
 Process? _activeProcess;
 File? _currentTempFile;
@@ -9,7 +12,8 @@ final List<double> _streamBuffer = [];
 int _streamSampleRate = 24000;
 
 /// Whether audio playback is supported natively on this platform.
-bool get isAudioPlaybackSupported => Platform.isMacOS;
+bool get isAudioPlaybackSupported =>
+    Platform.isMacOS || Platform.isIOS || Platform.isLinux;
 
 /// Converts Float32 PCM samples to 16-bit mono RIFF/WAVE bytes.
 Uint8List _pcmToWav(
@@ -81,30 +85,30 @@ void _cleanTempFile() {
   }
 }
 
-/// Plays a completed mono Float32 PCM waveform natively via macOS afplay.
+/// Plays a completed mono Float32 PCM waveform natively.
 Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
   if (samples.isEmpty) return;
   stopAudioPlayback();
 
-  if (!Platform.isMacOS) {
-    debugPrint(
-      '[cera:audio_player_native] Native playback is currently supported on macOS',
-    );
-    return;
-  }
-
   try {
     final wavBytes = _pcmToWav(samples, sampleRate);
-    final tempDir = Directory.systemTemp;
-    final tempFile = File(
-      '${tempDir.path}/cera_audio_${DateTime.now().microsecondsSinceEpoch}.wav',
-    );
-    await tempFile.writeAsBytes(wavBytes, flush: true);
-    _currentTempFile = tempFile;
+    if (Platform.isMacOS || Platform.isIOS) {
+      await _audioChannel.invokeMethod('play', {'data': wavBytes});
+      return;
+    }
 
-    final process = await Process.start('/usr/bin/afplay', [tempFile.path]);
-    _activeProcess = process;
-    await process.exitCode;
+    if (Platform.isLinux) {
+      final tempDir = Directory.systemTemp;
+      final tempFile = File(
+        '${tempDir.path}/cera_audio_${DateTime.now().microsecondsSinceEpoch}.wav',
+      );
+      await tempFile.writeAsBytes(wavBytes, flush: true);
+      _currentTempFile = tempFile;
+
+      final process = await Process.start('aplay', [tempFile.path]);
+      _activeProcess = process;
+      await process.exitCode;
+    }
   } catch (err) {
     debugPrint('[cera:audio_player_native] playAudioPcm failed: $err');
   } finally {
@@ -115,6 +119,11 @@ Future<void> playAudioPcm(Float32List samples, int sampleRate) async {
 
 /// Stops any active audio playback.
 void stopAudioPlayback() {
+  if (Platform.isMacOS || Platform.isIOS) {
+    try {
+      unawaited(_audioChannel.invokeMethod('stop').catchError((_) => null));
+    } catch (_) {}
+  }
   final proc = _activeProcess;
   _activeProcess = null;
   if (proc != null) {

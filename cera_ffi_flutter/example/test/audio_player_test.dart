@@ -1,9 +1,31 @@
 import 'dart:io';
 import 'package:cera_ffi_flutter_example/services/audio_player_service.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('cera/audio_player'),
+          (call) async {
+            return null;
+          },
+        );
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('cera/audio_player'),
+          null,
+        );
+  });
+
   group('AudioPlayerService', () {
+
     test('isSupported reflects active platform capabilities', () {
       final player = AudioPlayerService();
       // On macOS native and Web, audio playback is supported.
