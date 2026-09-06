@@ -1388,6 +1388,10 @@ impl From<SessionConfig> for cera::SessionConfig {
 }
 
 /// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+///
+/// Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+/// and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+/// CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct SpecDecodeConfig {
     /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
@@ -1416,8 +1420,8 @@ impl From<cera::SpecDecode> for SpecDecodeConfig {
 impl From<SpecDecodeConfig> for cera::SpecDecode {
     fn from(c: SpecDecodeConfig) -> Self {
         Self {
-            ngram: c.ngram as usize,
-            k: c.k as usize,
+            ngram: (c.ngram as usize).clamp(1, 32),
+            k: (c.k as usize).clamp(1, 64),
         }
     }
 }
@@ -1425,7 +1429,7 @@ impl From<SpecDecodeConfig> for cera::SpecDecode {
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
-/// effect under the synchronous [`Session::generate`], they are
+/// effect under the synchronous [`Session::generate`]; they are
 /// meaningful once streaming (foreign-trait `ModalitySink`) lands
 /// in a follow-up PR. Including them in the record now keeps the FFI
 /// surface stable across that transition.
@@ -3774,6 +3778,32 @@ mod tests {
         assert_eq!(core.spec.as_ref().map(|s| (s.ngram, s.k)), Some((3, 8)));
         let back = GenerateOpts::from(&core);
         assert_eq!(back.spec, Some(SpecDecodeConfig { ngram: 3, k: 8 }));
+    }
+
+    #[test]
+    fn generate_opts_spec_decode_boundary_clamping() {
+        let ffi_zero = GenerateOpts {
+            spec: Some(SpecDecodeConfig { ngram: 0, k: 0 }),
+            ..GenerateOpts::default()
+        };
+        let core_zero: cera::GenerateOpts = ffi_zero.try_into().expect("clamps zero");
+        assert_eq!(
+            core_zero.spec.as_ref().map(|s| (s.ngram, s.k)),
+            Some((1, 1))
+        );
+
+        let ffi_huge = GenerateOpts {
+            spec: Some(SpecDecodeConfig {
+                ngram: 10_000,
+                k: 50_000,
+            }),
+            ..GenerateOpts::default()
+        };
+        let core_huge: cera::GenerateOpts = ffi_huge.try_into().expect("clamps excessive values");
+        assert_eq!(
+            core_huge.spec.as_ref().map(|s| (s.ngram, s.k)),
+            Some((32, 64))
+        );
     }
 
     #[test]

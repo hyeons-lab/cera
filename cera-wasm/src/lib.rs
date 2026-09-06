@@ -1421,6 +1421,30 @@ impl GenerateOpts {
     pub fn has_grammar(&self) -> bool {
         self.inner.grammar.is_some()
     }
+
+    /// Configure speculative decoding with prompt-lookup drafting.
+    ///
+    /// `ngram` specifies the lookup context length (clamped to 1..=32).
+    /// `k` specifies the number of candidate draft tokens proposed per step (clamped to 1..=64).
+    #[wasm_bindgen(js_name = setSpecDecode)]
+    pub fn set_spec_decode(&mut self, ngram: u32, k: u32) {
+        self.inner.spec = Some(cera::SpecDecode {
+            ngram: (ngram as usize).clamp(1, 32),
+            k: (k as usize).clamp(1, 64),
+        });
+    }
+
+    /// Clear speculative decoding, returning to standard non-speculative decoding.
+    #[wasm_bindgen(js_name = clearSpecDecode)]
+    pub fn clear_spec_decode(&mut self) {
+        self.inner.spec = None;
+    }
+
+    /// Whether speculative decoding is currently configured.
+    #[wasm_bindgen(getter, js_name = hasSpecDecode)]
+    pub fn has_spec_decode(&self) -> bool {
+        self.inner.spec.is_some()
+    }
 }
 
 /// Summary returned from a completed `Session.generate` call.

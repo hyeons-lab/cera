@@ -516,7 +516,7 @@ class FfiVadConfig {
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
-/// effect under the synchronous [`Session::generate`], they are
+/// effect under the synchronous [`Session::generate`]; they are
 /// meaningful once streaming (foreign-trait `ModalitySink`) lands
 /// in a follow-up PR. Including them in the record now keeps the FFI
 /// surface stable across that transition.
@@ -1132,6 +1132,10 @@ class SessionConfig {
 }
 
 /// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+///
+/// Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+/// and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+/// CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
 class SpecDecodeConfig {
   const SpecDecodeConfig({
     /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.

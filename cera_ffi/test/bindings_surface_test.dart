@@ -76,6 +76,15 @@ void main() {
       expect(optsF16Override.ubatchSize, 256);
       expect(optsF16Override.effectiveKvCompression, CeraKvCompression.f16);
 
+      const optsKvTurboQuant = CeraOptions(
+        kvCompression: CeraKvCompression.turboQuant,
+      );
+      expect(
+        optsKvTurboQuant.effectiveKvCompression,
+        CeraKvCompression.turboQuant,
+      );
+      expect(optsKvTurboQuant.turboQuant, isFalse);
+
       const spec = CeraSpecDecode(ngram: 4, k: 10);
       expect(spec.ngram, 4);
       expect(spec.k, 10);

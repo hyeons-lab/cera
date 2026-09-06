@@ -679,11 +679,7 @@ pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
 #[cfg(has_blas)]
 fn blas_cache_weights_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CERA_BLAS_CACHE_WEIGHTS")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| std::env::var("CERA_BLAS_CACHE_WEIGHTS").as_deref() == Ok("1"))
 }
 
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,

@@ -86,6 +86,10 @@ enum CeraKvCompression {
 }
 
 /// Speculative decoding options for prompt-lookup drafting.
+///
+/// Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+/// and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+/// CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
 class CeraSpecDecode {
   /// Creates speculative decoding options.
   const CeraSpecDecode({this.ngram = 2, this.k = 6});
@@ -106,7 +110,7 @@ class CeraOptions {
   const CeraOptions({
     this.contextSize = 4096,
     this.backend = CeraBackend.auto,
-    this.turboQuant = false,
+    @Deprecated('Use kvCompression instead') this.turboQuant = false,
     this.kvCompression,
     this.ubatchSize = 512,
     this.gpuDepthformer = false,
@@ -123,6 +127,7 @@ class CeraOptions {
   ///
   /// Deprecated in favor of [kvCompression]. If [kvCompression] is not specified,
   /// setting [turboQuant] to true uses [CeraKvCompression.turboQuant].
+  @Deprecated('Use kvCompression instead')
   final bool turboQuant;
 
   /// KV-cache compression mode: none, f16, or turboQuant.

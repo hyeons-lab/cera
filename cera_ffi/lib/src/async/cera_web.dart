@@ -32,6 +32,10 @@ extension type _WorkerOptions._(JSObject _) implements JSObject {
   external factory _WorkerOptions({String type});
 }
 
+extension type _SpecDecodeRequest._(JSObject _) implements JSObject {
+  external factory _SpecDecodeRequest({int ngram, int k});
+}
+
 /// A request to the worker. One literal type covers every op; the fields an op
 /// does not use are simply absent, which reaches JS as `undefined`.
 extension type _Request._(JSObject _) implements JSObject {
@@ -53,6 +57,7 @@ extension type _Request._(JSObject _) implements JSObject {
     double? topP,
     int? topK,
     int? seed,
+    _SpecDecodeRequest? spec,
     String? messagesJson,
     bool? addGenerationPrompt,
     String? text,
@@ -62,6 +67,7 @@ extension type _Request._(JSObject _) implements JSObject {
     String? quant,
     String? storeDir,
     bool? turboQuant,
+    int? ubatchSize,
     bool? wantsAudio,
     bool? wantsThought,
   });
@@ -355,7 +361,9 @@ class _WorkerCera implements Cera {
         contextSize: _options.contextSize,
         backend: _options.backend.name,
         inferenceType: inferenceType,
-        turboQuant: _options.turboQuant,
+        turboQuant:
+            _options.effectiveKvCompression == CeraKvCompression.turboQuant,
+        ubatchSize: _options.ubatchSize,
       ),
       // Hand the model's memory to the worker rather than copying it. A
       // multi-hundred-megabyte structured clone is both a pause and a moment
@@ -394,7 +402,9 @@ class _WorkerCera implements Cera {
           storeDir: storeDir,
           contextSize: _options.contextSize,
           backend: _options.backend.name,
-          turboQuant: _options.turboQuant,
+          turboQuant:
+              _options.effectiveKvCompression == CeraKvCompression.turboQuant,
+          ubatchSize: _options.ubatchSize,
         ),
       );
       _adoptOpenResult(result);
@@ -624,6 +634,10 @@ class _WorkerCera implements Cera {
             topP: topP,
             topK: topK,
             seed: seed,
+            spec:
+                spec != null
+                    ? _SpecDecodeRequest(ngram: spec.ngram, k: spec.k)
+                    : null,
             wantsAudio: onAudio != null,
             wantsThought: onThought != null,
           ),

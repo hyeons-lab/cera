@@ -318,17 +318,20 @@ async function tryGpuBundle(repo, bundleId, quant, contextSize, onProgress, turb
   return null;
 }
 
-function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant) {
+function openCpu(bytes, contextSize, mmproj, inferenceType, turboQuant, ubatchSize) {
   // `fromGgufParts` covers the text-only case too (a null projector is exactly
   // `fromGgufBytes`), so both paths resolve the inference type through one
   // constructor instead of two that have to agree.
   const engine = wasm.CeraEngine.fromGgufParts(bytes, mmproj, contextSize, inferenceType);
-  initCpuSession(engine, turboQuant);
+  initCpuSession(engine, turboQuant, ubatchSize);
   currentModelLabel = 'custom GGUF';
 }
 
-function initCpuSession(engine, turboQuant) {
+function initCpuSession(engine, turboQuant, ubatchSize) {
   const config = new wasm.SessionConfig();
+  if (ubatchSize != null && ubatchSize >= 0) {
+    config.ubatchSize = ubatchSize;
+  }
   let tq = null;
   if (turboQuant && typeof wasm.TurboQuantConfig === 'function') {
     tq = new wasm.TurboQuantConfig(BigInt(0));
@@ -336,7 +339,7 @@ function initCpuSession(engine, turboQuant) {
   }
   try {
     const session = engine.newSession(config);
-    cpu = { engine, session, tokenizer: engine.tokenizer, turboQuant: Boolean(turboQuant) };
+    cpu = { engine, session, tokenizer: engine.tokenizer, turboQuant: Boolean(turboQuant), ubatchSize };
   } finally {
     config.free();
     tq?.free();
@@ -352,7 +355,7 @@ function initCpuSession(engine, turboQuant) {
  * file the bundle needs, so a VL or audio bundle arrives complete with no
  * guessing, and the weights never cross into JS.
  */
-async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress, turboQuant) {
+async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress, turboQuant, ubatchSize) {
   const engine = await wasm.CeraEngine.fromBundleId(
     repo,
     bundleId,
@@ -360,7 +363,7 @@ async function openCpuBundle(repo, bundleId, quant, contextSize, onProgress, tur
     contextSize,
     onProgress,
   );
-  initCpuSession(engine, turboQuant);
+  initCpuSession(engine, turboQuant, ubatchSize);
   currentModelLabel = `${bundleId} (${quant})`;
 }
 
@@ -390,7 +393,7 @@ const OPS = {
    * it into linear memory (or into GPU buffers) during construction, so peak
    * usage is briefly twice the model size on both paths.
    */
-  async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType, turboQuant }) {
+  async open({ moduleUrl, bytes, mmproj, contextSize, backend, inferenceType, turboQuant, ubatchSize }) {
     OPS.close();
     await ensureModule(moduleUrl);
     const view = new Uint8Array(bytes);
@@ -408,9 +411,9 @@ const OPS = {
         );
       }
     } else if (backend === 'cpu') {
-      openCpu(view, ctx, proj, type, turboQuant);
+      openCpu(view, ctx, proj, type, turboQuant, ubatchSize);
     } else if (!(await tryGpu(view, ctx, proj, turboQuant))) {
-      openCpu(view, ctx, proj, type, turboQuant);
+      openCpu(view, ctx, proj, type, turboQuant, ubatchSize);
     }
     return {
       backend: backendLabel,
@@ -448,7 +451,7 @@ const OPS = {
    */
   async openBundle(req, post) {
     OPS.close();
-    const { moduleUrl, bundleId, quant, contextSize, backend, storeDir, turboQuant } = req;
+    const { moduleUrl, bundleId, quant, contextSize, backend, storeDir, turboQuant, ubatchSize } = req;
     await ensureModule(moduleUrl);
     const repo = new wasm.BundleRepo(storeDir ?? undefined);
     const ctx = contextSize ?? undefined;
@@ -471,7 +474,7 @@ const OPS = {
         };
       }
       if (backend === 'cpu') {
-        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant, ubatchSize);
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
@@ -492,7 +495,7 @@ const OPS = {
       // download itself failed, so it rides along rather than being discarded.
       console.warn(`[cera:worker] WebGPU backend failed to load bundle "${bundleId}", falling back to CPU:`, why);
       try {
-        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant);
+        await openCpuBundle(repo, bundleId, quant, ctx, onProgress, turboQuant, ubatchSize);
       } catch (err) {
         throw new Error(
           `${String((err && err.message) || err)} (the WebGPU path was tried first ` +
@@ -757,6 +760,9 @@ const OPS = {
     if (req.seed != null && currentPos === 0 && cpu) {
       const config = new wasm.SessionConfig();
       config.seed = BigInt(req.seed);
+      if (cpu.ubatchSize != null && cpu.ubatchSize >= 0) {
+        config.ubatchSize = cpu.ubatchSize;
+      }
       let tq = null;
       if (cpu.turboQuant && typeof wasm.TurboQuantConfig === 'function') {
         tq = new wasm.TurboQuantConfig(BigInt(0));
@@ -923,6 +929,11 @@ const OPS = {
         }
       : null;
     if (gpu) {
+      if (req.spec != null) {
+        console.warn(
+          '[cera:worker] speculative decoding is currently only supported on the CPU WASM backend; ignoring spec options on WebGPU',
+        );
+      }
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
       //
@@ -953,6 +964,9 @@ const OPS = {
       if (req.temperature != null) opts.temperature = req.temperature;
       if (req.topP != null) opts.topP = req.topP;
       if (req.topK != null) opts.topK = req.topK;
+      if (req.spec != null && typeof opts.setSpecDecode === 'function') {
+        opts.setSpecDecode(req.spec.ngram, req.spec.k);
+      }
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
       let uncommittedTokens = [];

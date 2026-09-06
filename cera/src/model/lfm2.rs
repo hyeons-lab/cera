@@ -19,6 +19,12 @@ use crate::tensor::DType;
 use crate::time::{Duration, Instant};
 use crate::turboquant;
 
+#[cfg(has_blas)]
+thread_local! {
+    static PAR_EXPERT_GATE_UP_ROWS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PAR_EXPERT_DEQUANT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
 // The pre-resolved mmap weight reference is the arch-agnostic one from
@@ -1063,29 +1069,39 @@ impl Lfm2Model {
                             .copy_from_slice(&ffn_input[token_j * hs..(token_j + 1) * hs]);
                     }
 
-                    let mut exp_gate_up_rows = vec![0.0f32; 2 * ff * hs];
-                    let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
-                    let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
-                    if let (Some(dq_g), Some(dq_u)) = (
-                        transformer::blas_dequantizer(moe.gate[e].dtype),
-                        transformer::blas_dequantizer(moe.up[e].dtype),
-                    ) {
-                        dq_g(g_data, ff, hs, &mut exp_gate_up_rows[..ff * hs]);
-                        dq_u(u_data, ff, hs, &mut exp_gate_up_rows[ff * hs..]);
-                    }
-
                     let mut exp_gate_up = vec![0.0f32; k_e * 2 * ff];
                     let mut exp_gate = vec![0.0f32; k_e * ff];
                     let mut exp_down = vec![0.0f32; k_e * hs];
 
-                    crate::backend::blas::sgemm_rowmajor_nt(
-                        k_e,
-                        2 * ff,
-                        hs,
-                        &exp_in,
-                        &exp_gate_up_rows,
-                        &mut exp_gate_up,
-                    );
+                    PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+                        if rows.len() < 2 * ff * hs {
+                            rows.resize(2 * ff * hs, 0.0);
+                        }
+                        let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
+                        let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
+                        let dq_g = transformer::blas_dequantizer(moe.gate[e].dtype);
+                        let dq_u = transformer::blas_dequantizer(moe.up[e].dtype);
+                        if let (Some(dq_g), Some(dq_u)) = (dq_g, dq_u) {
+                            dq_g(g_data, ff, hs, &mut rows[..ff * hs]);
+                            dq_u(u_data, ff, hs, &mut rows[ff * hs..2 * ff * hs]);
+
+                            crate::backend::blas::sgemm_rowmajor_nt(
+                                k_e,
+                                2 * ff,
+                                hs,
+                                &exp_in,
+                                &rows[..2 * ff * hs],
+                                &mut exp_gate_up,
+                            );
+                        } else {
+                            if dq_g.is_none() {
+                                transformer::warn_unbatchable("moe_gate", moe.gate[e].dtype);
+                            }
+                            if dq_u.is_none() {
+                                transformer::warn_unbatchable("moe_up", moe.up[e].dtype);
+                            }
+                        }
+                    });
 
                     for t in 0..k_e {
                         let gate_slice = &mut exp_gate[t * ff..(t + 1) * ff];
@@ -1095,17 +1111,21 @@ impl Lfm2Model {
                         cpu::silu_mul_inplace(gate_slice, u_src);
                     }
 
-                    let mut exp_down_scratch = Vec::new();
-                    transformer::try_blas_prefill_gemm_rowmajor(
-                        &self.gguf,
-                        &moe.down[e],
-                        &exp_gate,
-                        &mut exp_down,
-                        k_e,
-                        hs,
-                        ff,
-                        &mut exp_down_scratch,
-                    );
+                    let computed = PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
+                        transformer::try_blas_prefill_gemm_rowmajor(
+                            &self.gguf,
+                            &moe.down[e],
+                            &exp_gate,
+                            &mut exp_down,
+                            k_e,
+                            hs,
+                            ff,
+                            scratch,
+                        )
+                    });
+                    if !computed {
+                        transformer::warn_unbatchable("moe_down", moe.down[e].dtype);
+                    }
 
                     (e, exp_down)
                 })
