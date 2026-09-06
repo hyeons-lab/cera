@@ -656,6 +656,7 @@ impl Session {
         capabilities: ModalityCapabilities,
         config: SessionConfig,
     ) -> Result<Self, CeraError> {
+        #[cfg(not(target_arch = "wasm32"))]
         let mut config = config;
         #[cfg(not(target_arch = "wasm32"))]
         if !config.gpu_depthformer && gpu_depthformer_enabled() {

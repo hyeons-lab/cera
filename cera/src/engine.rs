@@ -2062,7 +2062,7 @@ fn load_text_model_auto(
 /// an independent handle for each backend it tries.
 #[cfg(any(
     all(feature = "metal", any(target_os = "macos", target_os = "ios")),
-    feature = "gpu"
+    all(feature = "gpu", feature = "mmap")
 ))]
 fn clone_gguf_like(gguf: &GgufFile, path: Option<&Path>) -> Result<GgufFile, CeraError> {
     if let Some(p) = path {
