@@ -277,48 +277,58 @@ impl BundleRepo {
             download::head_info(&self.head_client, url)
         };
 
-        if dest.exists() && self.cache_hit_valid(&dest, url, expected_sha256, &head) {
-            return Ok(dest);
+        loop {
+            if dest.exists() && self.cache_hit_valid(&dest, url, expected_sha256, &head) {
+                return Ok(dest);
+            }
+
+            // Cache miss: only now does the filesystem need to exist.
+            // Deferred so cache-hit callers don't pay a `stat` on the
+            // parent directory on every resolve.
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            // Prefer caller's hash; else use the server's linked-etag
+            // captured pre-redirect.
+            let download_hash = expected_sha256
+                .map(|s| s.to_ascii_lowercase())
+                .or_else(|| head.linked_sha256.clone());
+
+            tracing::info!(
+                target: "cera::bundle",
+                url,
+                dest = %dest.display(),
+                hash_source = match (expected_sha256.is_some(), head.linked_sha256.is_some()) {
+                    (true, _) => "caller",
+                    (false, true) => "x-linked-etag",
+                    (false, false) => "unverified",
+                },
+                "downloading bundle file"
+            );
+            match download::download_to(
+                &self.http_client,
+                url,
+                &dest,
+                download_hash.as_deref(),
+                // HEAD probe captures `x-linked-size` from HF's no-redirect
+                // response. The GET path's CDN response usually echoes
+                // `Content-Length` too, but defensively prefer the HEAD-
+                // probed value so the progress callback gets a reliable
+                // total even when the CDN omits the header.
+                head.content_length,
+                self.progress.as_deref(),
+            ) {
+                Ok(()) => return Ok(dest),
+                Err(CeraError::Backend(msg))
+                    if msg.contains("is already in progress in this process") =>
+                {
+                    download::wait_for_active_download(&dest);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // Cache miss: only now does the filesystem need to exist.
-        // Deferred so cache-hit callers don't pay a `stat` on the
-        // parent directory on every resolve.
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Prefer caller's hash; else use the server's linked-etag
-        // captured pre-redirect.
-        let download_hash = expected_sha256
-            .map(|s| s.to_ascii_lowercase())
-            .or_else(|| head.linked_sha256.clone());
-
-        tracing::info!(
-            target: "cera::bundle",
-            url,
-            dest = %dest.display(),
-            hash_source = match (expected_sha256.is_some(), head.linked_sha256.is_some()) {
-                (true, _) => "caller",
-                (false, true) => "x-linked-etag",
-                (false, false) => "unverified",
-            },
-            "downloading bundle file"
-        );
-        download::download_to(
-            &self.http_client,
-            url,
-            &dest,
-            download_hash.as_deref(),
-            // HEAD probe captures `x-linked-size` from HF's no-redirect
-            // response. The GET path's CDN response usually echoes
-            // `Content-Length` too, but defensively prefer the HEAD-
-            // probed value so the progress callback gets a reliable
-            // total even when the CDN omits the header.
-            head.content_length,
-            self.progress.as_deref(),
-        )?;
-        Ok(dest)
     }
 
     /// Download all assets for a bundle ID and quantization to the local cache

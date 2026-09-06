@@ -18,8 +18,11 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 
 use cera::bundle::BundleRepo;
+
+static ENSURE_CACHED_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Returns the resolved cache directory, creating it if missing.
 ///
@@ -50,13 +53,14 @@ pub fn cache_dir() -> PathBuf {
 /// matches production (etag-preferred, size-fallback, atomic rename).
 ///
 /// `filename` is kept for API compatibility with earlier test code but
-/// is no longer used — `BundleRepo` derives the on-disk path from the
+/// is no longer used: `BundleRepo` derives the on-disk path from the
 /// URL's host+path.
 ///
 /// Panics on unrecoverable errors (no file + download failed). Tests
 /// that call this are already gated on `CERA_TEST_DOWNLOAD=1`, so a
 /// panic here is the correct failure mode.
 pub fn ensure_cached(url: &str, _filename: &str) -> PathBuf {
+    let _guard = ENSURE_CACHED_LOCK.lock().unwrap();
     let repo = BundleRepo::new(cache_dir());
     repo.resolve_url(url, None)
         .unwrap_or_else(|e| panic!("resolve {url}: {e}"))
