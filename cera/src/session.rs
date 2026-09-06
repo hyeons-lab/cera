@@ -11,8 +11,8 @@
 //! consumers override just `on_text_tokens` + `on_done`.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -283,6 +283,17 @@ pub enum FinishReason {
 /// value. Saturating keeps the metric monotonic instead.
 fn duration_ms_u32(d: Duration) -> u32 {
     d.as_millis().min(u32::MAX as u128) as u32
+}
+
+/// Whether GPU depthformer is enabled via `CERA_GPU_DF`. Cached in a
+/// `OnceLock` so the check on the generation path is a single atomic load.
+fn gpu_depthformer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CERA_GPU_DF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Streaming output sink. Default-empty methods let text-only consumers
@@ -2253,12 +2264,13 @@ impl Session {
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
                 let gpu_ref = self.gpu_audio_decoder.as_deref();
-                let gpu_df_env = std::env::var("CERA_GPU_DF")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                let use_gpu_df = gpu_df_env && gpu_ref.is_some_and(|g| g.supports_depthformer());
                 Some(crate::audio_engine::AudioOutputDecoder::new(
-                    dec, detok, gpu_ref, 0.7, 40, use_gpu_df,
+                    dec,
+                    detok,
+                    gpu_ref,
+                    0.7,
+                    40,
+                    gpu_depthformer_enabled(),
                 ))
             } else {
                 None

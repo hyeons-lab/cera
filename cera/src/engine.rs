@@ -525,10 +525,10 @@ impl CeraEngine {
                         .map(Arc::new)
                 });
 
-            let gpu_dec = [voc_arc.as_ref(), tok_arc.as_ref(), mmproj.as_ref()]
-                .into_iter()
-                .flatten()
-                .find_map(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend));
+            let gpu_dec = voc_arc
+                .as_ref()
+                .or(mmproj.as_ref())
+                .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend));
 
             (dec, detok, gpu_dec)
         };

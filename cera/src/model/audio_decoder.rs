@@ -92,10 +92,9 @@ pub fn build_gpu_audio_decoder(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
-        BP::Metal | BP::Auto => {
-            try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf))
-        }
+        BP::Metal => try_metal_audio_decoder(gguf),
         BP::Gpu => try_wgpu_audio_decoder(gguf),
+        BP::Auto => try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf)),
     }
 }
 
@@ -108,7 +107,7 @@ fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
             Some(Arc::new(d))
         }
         Err(e) => {
-            tracing::warn!("audio decoder: Metal backend unavailable for this model: {e:#}");
+            tracing::warn!("audio decoder: Metal backend unavailable: {e:#}");
             None
         }
     }
@@ -128,7 +127,7 @@ fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
             Some(Arc::new(d))
         }
         Err(e) => {
-            tracing::warn!("audio decoder: WGPU backend unavailable for this model: {e:#}");
+            tracing::warn!("audio decoder: WGPU backend unavailable: {e:#}");
             None
         }
     }
@@ -1758,6 +1757,8 @@ mod tests {
         let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
 
         assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Cpu).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Metal).is_none());
+        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Gpu).is_none());
         assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Auto).is_none());
     }
 }
