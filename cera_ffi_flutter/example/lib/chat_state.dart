@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+
 import 'model_source.dart';
 
 /// Telemetry stats for a single generation turn.
@@ -161,7 +162,9 @@ class ChatSettings {
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
     backend: backend,
-    turboQuant: turboQuant,
+    kvCompression: turboQuant
+        ? CeraKvCompression.turboQuant
+        : CeraKvCompression.none,
     web: const CeraWebAssets(
       workerUrl: 'cera/cera_worker.js',
       moduleUrl: 'cera/cera_wasm.js',
