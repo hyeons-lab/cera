@@ -228,9 +228,7 @@ void main(List<String> args) {
   } else if (src.contains(oldWriteImpl)) {
     src = src.replaceAll(oldWriteImpl, writeImpl);
     applied += 1;
-    stdout.writeln(
-      '  updated _uniffiWriteEngineConfig with gpuDepthformer',
-    );
+    stdout.writeln('  updated _uniffiWriteEngineConfig with gpuDepthformer');
   }
   const encodeStub =
       "Uint8List _uniffiEncodeEngineConfig(EngineConfig value) {\n"
