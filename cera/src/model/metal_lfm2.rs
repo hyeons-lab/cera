@@ -923,7 +923,7 @@ impl MetalLfm2Model {
         // Untied output projection (`output.weight`). `wref.start` is an absolute
         // file offset (data_offset + raw), so it maps directly onto `mmap_buf`
         // (which wraps the whole file). `None` => tied embeddings.
-        // For non-native output dtypes (e.g. F16/BF16/Q2_K/Q3_K), dequantize to F32
+        // For non-native output dtypes (e.g. F16/BF16/Q4_1), dequantize to F32
         // on CPU once during upload into a dedicated buffer so they run on the
         // existing F32 logit-GEMV kernel.
         let (output_offset, output_buf, output_dtype) = match src.output_ref() {
@@ -1007,12 +1007,12 @@ impl MetalLfm2Model {
                 (wref.start, None, wref.dtype)
             } else {
                 anyhow::ensure!(
-                    matches!(wref.dtype, DType::F16 | DType::BF16 | DType::Q4_1),
+                    matches!(wref.dtype, DType::F16 | DType::BF16),
                     "Metal backend cannot dequantize layer weight with unsupported dtype {:?}",
                     wref.dtype,
                 );
-                // Dequantize non-native quant formats (F16, BF16, Q4_1) to F32
-                // on CPU during upload into a dedicated buffer so they execute via gemv_f32.
+                // Dequantize non-native weight formats (F16, BF16) to F32 on CPU
+                // during upload into a dedicated buffer so they execute via gemv_f32.
                 let f32_data = src.dequantize_weight(wref);
                 let buf = ctx.upload_f32(&f32_data);
                 (0, Some(buf), DType::F32)
@@ -1621,10 +1621,17 @@ impl MetalLfm2Model {
         let row_data: &[u8] = match &self.backing {
             #[cfg(feature = "mmap")]
             MetalBacking::Mmap(m) => &m[mmap_start..mmap_start + row_bytes],
-            MetalBacking::Bytes => unsafe {
-                let ptr = self.mmap_buf.contents() as *const u8;
-                std::slice::from_raw_parts(ptr.add(mmap_start), row_bytes)
-            },
+            MetalBacking::Bytes => {
+                let buf_len = self.mmap_buf.length() as usize;
+                assert!(
+                    mmap_start + row_bytes <= buf_len,
+                    "embedding row slice out of buffer bounds (offset {mmap_start}, len {row_bytes}, buf_len {buf_len})"
+                );
+                unsafe {
+                    let ptr = self.mmap_buf.contents() as *const u8;
+                    std::slice::from_raw_parts(ptr.add(mmap_start), row_bytes)
+                }
+            }
         };
         crate::model::transformer::dequantize_row_slice(self.embedding_dtype, row_data, dst);
         // Granite scales embeddings right after the token lookup (identity for
