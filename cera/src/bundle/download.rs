@@ -235,9 +235,6 @@ pub(crate) fn canonicalize_dest(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    if let Some(parent) = abs.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     if abs.exists() {
         abs.canonicalize().unwrap_or(abs)
     } else if let Some(parent) = abs.parent().filter(|p| p.exists()) {
@@ -269,6 +266,9 @@ struct ActiveDownloadGuard {
 
 impl ActiveDownloadGuard {
     fn acquire(path: &Path) -> Result<Self, CeraError> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let canon = canonicalize_dest(path);
         let mut active = lock_active_downloads();
         if !active.insert(canon.clone()) {

@@ -308,7 +308,12 @@ impl Client {
                     .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
             };
             #[cfg(target_arch = "wasm32")]
-            let text = checked.text().await.unwrap_or_default();
+            let text = {
+                // In WASM browser environments, response buffering is managed by the browser
+                // Fetch API where Response::chunk is unavailable. We read text and enforce
+                // preview truncation below.
+                checked.text().await.unwrap_or_default()
+            };
             if let Ok(envelope) = serde_json::from_str::<ApiErrorEnvelope>(&text) {
                 return Err(ClientError::Api {
                     status: Some(status),
