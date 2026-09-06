@@ -9,8 +9,8 @@
 // exactly like the LLM weights in metal_lfm2.rs.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState};
@@ -128,7 +128,8 @@ pub struct MetalAudioDecoder {
     kv_k: Vec<Option<Buffer>>,
     kv_v: Vec<Option<Buffer>>,
     n_past: AtomicUsize,
-    // mmap removed — all weights uploaded as dequantized F32 for CPU-matching precision
+    infer_lock: Mutex<()>,
+    session_active: AtomicBool,
 }
 
 impl MetalAudioDecoder {
@@ -142,10 +143,26 @@ impl MetalAudioDecoder {
         let q_norm_t = gguf.get_tensor("lfm.layers.2.self_attn.q_layernorm.weight")?;
         let head_dim = *q_norm_t.shape().first().unwrap_or(&0);
         anyhow::ensure!(head_dim > 0, "invalid q_layernorm head_dim");
+        anyhow::ensure!(
+            head_dim <= 128,
+            "detokenizer head_dim {head_dim} > 128; metal flash_attention cannot size q_shared"
+        );
         let (_, q_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.q_proj.weight")?;
+        anyhow::ensure!(
+            q_rows.is_multiple_of(head_dim),
+            "q_proj rows ({q_rows}) must be a multiple of head_dim ({head_dim})"
+        );
         let n_head = q_rows / head_dim;
         let (_, k_rows, _, _) = gguf.tensor_meta("lfm.layers.2.self_attn.k_proj.weight")?;
+        anyhow::ensure!(
+            k_rows.is_multiple_of(head_dim),
+            "k_proj rows ({k_rows}) must be a multiple of head_dim ({head_dim})"
+        );
         let n_kv = k_rows / head_dim;
+        anyhow::ensure!(
+            n_kv > 0 && n_head.is_multiple_of(n_kv),
+            "detokenizer GQA requires n_kv > 0 and n_head divisible by n_kv (n_head={n_head}, n_kv={n_kv})"
+        );
         let (_, ffn_rows, _, _) = gguf.tensor_meta("lfm.layers.0.feed_forward.w1.weight")?;
         let ffn_dim = ffn_rows;
 
@@ -368,11 +385,11 @@ impl MetalAudioDecoder {
             &cpu_dec.decoder_config,
         ) {
             Ok(df) => {
-                eprintln!("Metal depthformer loaded");
+                tracing::debug!("Metal depthformer loaded");
                 Some(df)
             }
             Err(e) => {
-                eprintln!("Metal depthformer failed: {e}, using CPU");
+                tracing::debug!("Metal depthformer failed: {e}, using CPU");
                 None
             }
         };
@@ -408,10 +425,13 @@ impl MetalAudioDecoder {
             kv_k,
             kv_v,
             n_past: AtomicUsize::new(0),
+            infer_lock: Mutex::new(()),
+            session_active: AtomicBool::new(false),
         })
     }
 
     pub fn reset(&self) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.n_past.store(0, Ordering::Relaxed);
         for b in self.conv_bufs.iter().flatten() {
             unsafe {
@@ -852,6 +872,7 @@ impl MetalAudioDecoder {
         cpu_weights: &DetokenizerWeights,
         codes: &[i32],
     ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let hs = self.cfg.n_embd;
         let n_frames = 6usize;
         let n_fft_bins = self.cfg.n_fft / 2 + 1; // 641
@@ -883,7 +904,6 @@ impl MetalAudioDecoder {
             }
             enc.end_encoding();
             cb.commit();
-            cb.wait_until_completed();
         }
 
         // 4. Output norm + linear head per frame
@@ -940,6 +960,7 @@ impl MetalAudioDecoder {
     /// after readback. Runs once at end-of-generation, so the frame-sized scratch
     /// is allocated per call rather than persisted.
     pub fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Same config tie as the WGPU twin: `idft_basis` and `hann` come from
         // `self.cfg` while every buffer below is sized from these arguments, so
         // a mismatch reads a basis of the wrong shape rather than computing a
@@ -1307,6 +1328,16 @@ impl MetalDepthformer {
         let freq_bits = cfg.rope_freq_base.to_bits();
 
         self.reset();
+        unsafe {
+            let dst = self.src_emb_buf.contents() as *mut f32;
+            let copy_len = embedding.len().min(self.dl_cols);
+            if copy_len > 0 {
+                std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, copy_len);
+            }
+            if copy_len < self.dl_cols {
+                std::ptr::write_bytes(dst.add(copy_len), 0, self.dl_cols - copy_len);
+            }
+        }
         let mut codes = [0i32; 8];
         let mut prev_token: i32 = -1;
 
@@ -1319,14 +1350,6 @@ impl MetalDepthformer {
 
             // 1. depth_linear projection: embedding -> hidden_buf
             let dl = &self.depth_linear_slices[j];
-            unsafe {
-                let dst = self.src_emb_buf.contents() as *mut f32;
-                let copy_len = embedding.len().min(self.dl_cols);
-                std::ptr::copy_nonoverlapping(embedding.as_ptr(), dst, copy_len);
-                if copy_len < self.dl_cols {
-                    std::ptr::write_bytes(dst.add(copy_len), 0, self.dl_cols - copy_len);
-                }
-            }
             // depth_linear GEMV
             self.encode_df_gemv(enc, dl, &self.src_emb_buf, &self.hidden_buf);
 
@@ -1555,6 +1578,7 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
     }
 
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         match &self.depthformer {
             Some(df) => df.sample_frame(embedding, temperature, top_k),
             None => {
@@ -1577,6 +1601,7 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
     }
 
     fn reset_depthformer(&self) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(df) = &self.depthformer {
             df.reset();
         }
@@ -1584,5 +1609,15 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
 
     fn reset_detokenizer(&self) {
         self.reset();
+    }
+
+    fn try_acquire_session(&self) -> bool {
+        self.session_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn release_session(&self) {
+        self.session_active.store(false, Ordering::Release);
     }
 }

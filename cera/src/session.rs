@@ -3151,4 +3151,11 @@ mod tests {
         assert_eq!(default_opts.min_p, 0.05);
         assert_eq!(default_opts.repetition_penalty, 1.1);
     }
+
+    #[test]
+    fn test_gpu_depthformer_env_helper() {
+        let val1 = gpu_depthformer_enabled();
+        let val2 = gpu_depthformer_enabled();
+        assert_eq!(val1, val2);
+    }
 }

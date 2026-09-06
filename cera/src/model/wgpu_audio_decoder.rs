@@ -26,7 +26,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use wgpu::Buffer;
@@ -143,6 +143,7 @@ pub struct WgpuAudioDecoder {
     kv_k: Vec<Option<Buffer>>,      // [swa x kv_dim] f32 per attn layer
     kv_v: Vec<Option<Buffer>>,
     n_past: AtomicUsize,
+    session_active: AtomicBool,
 }
 
 fn get_detok_tensor(gguf: &GgufFile, name1: &str, name2: &str) -> Result<crate::tensor::Tensor> {
@@ -568,6 +569,7 @@ impl WgpuAudioDecoder {
             kv_k,
             kv_v,
             n_past: AtomicUsize::new(0),
+            session_active: AtomicBool::new(false),
         })
     }
 
@@ -1339,6 +1341,16 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
 
     fn reset_detokenizer(&self) {
         self.reset();
+    }
+
+    fn try_acquire_session(&self) -> bool {
+        self.session_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn release_session(&self) {
+        self.session_active.store(false, Ordering::Release);
     }
 }
 

@@ -79,6 +79,15 @@ pub trait AudioGpu: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
         Box::pin(async move { Ok(self.istft_to_pcm(spectrum, n_fft, hop_length)) })
     }
+
+    /// Attempt to acquire an exclusive session lease for multi-frame generation.
+    /// Returns true if acquired, or false if another session is actively generating audio.
+    fn try_acquire_session(&self) -> bool {
+        true
+    }
+
+    /// Release the exclusive session lease acquired by [`Self::try_acquire_session`].
+    fn release_session(&self) {}
 }
 
 /// Try to construct a GPU audio decoder backend for the given vocoder GGUF file.
@@ -1760,5 +1769,60 @@ mod tests {
         assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Metal).is_none());
         assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Gpu).is_none());
         assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Auto).is_none());
+    }
+
+    struct MockAudioGpu {
+        active: std::sync::atomic::AtomicBool,
+    }
+
+    impl AudioGpu for MockAudioGpu {
+        fn supports_depthformer(&self) -> bool {
+            false
+        }
+        fn sample_audio_frame(
+            &self,
+            _embedding: &[f32],
+            _temperature: f32,
+            _top_k: usize,
+        ) -> [i32; 8] {
+            [0; 8]
+        }
+        fn detokenize_to_spectrum(
+            &self,
+            _cpu_weights: &DetokenizerWeights,
+            _codes: &[i32],
+        ) -> Vec<f32> {
+            vec![]
+        }
+        fn reset_depthformer(&self) {}
+        fn reset_detokenizer(&self) {}
+        fn try_acquire_session(&self) -> bool {
+            self.active
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        }
+        fn release_session(&self) {
+            self.active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn test_audio_gpu_session_lease_lifecycle() {
+        let gpu = MockAudioGpu {
+            active: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(gpu.try_acquire_session());
+        // Second concurrent acquisition fails while active.
+        assert!(!gpu.try_acquire_session());
+        gpu.release_session();
+        // Subsequent acquisition succeeds.
+        assert!(gpu.try_acquire_session());
+        gpu.release_session();
     }
 }

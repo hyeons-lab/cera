@@ -525,10 +525,13 @@ impl CeraEngine {
                         .map(Arc::new)
                 });
 
-            let gpu_dec = voc_arc
-                .as_ref()
-                .or(mmproj.as_ref())
-                .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend));
+            let gpu_dec = if dec.is_some() && detok.is_some() {
+                voc_arc.as_ref().and_then(|g| {
+                    crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend)
+                })
+            } else {
+                None
+            };
 
             (dec, detok, gpu_dec)
         };
@@ -1709,9 +1712,13 @@ fn try_load_audio_decoder_and_detok(
                 .map(Arc::new)
         });
 
-    let gpu_dec = voc_gguf
-        .as_ref()
-        .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, backend));
+    let gpu_dec = if dec.is_some() && detok.is_some() {
+        voc_gguf
+            .as_ref()
+            .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, backend))
+    } else {
+        None
+    };
 
     (dec, detok, gpu_dec)
 }

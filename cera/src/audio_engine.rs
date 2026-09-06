@@ -207,6 +207,14 @@ pub struct AudioOutputDecoder<'a> {
     pub watchdog: AudioSilenceWatchdog,
 }
 
+impl<'a> Drop for AudioOutputDecoder<'a> {
+    fn drop(&mut self) {
+        if let Some(g) = self.gpu {
+            g.release_session();
+        }
+    }
+}
+
 impl<'a> AudioOutputDecoder<'a> {
     /// Total audio frames decoded so far in this session.
     pub fn audio_frames(&self) -> usize {
@@ -270,12 +278,20 @@ impl<'a> AudioOutputDecoder<'a> {
         audio_top_k: usize,
         gpu_depthformer: bool,
     ) -> Self {
-        // One-shot GPU reset so repeated generate_audio calls don't leak
-        // state across invocations.
-        if let Some(g) = gpu {
-            g.reset_detokenizer();
-            g.reset_depthformer();
-        }
+        let active_gpu = match gpu {
+            Some(g) if g.try_acquire_session() => {
+                g.reset_detokenizer();
+                g.reset_depthformer();
+                Some(g)
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "GPU audio decoder busy with another session, falling back to CPU detokenization"
+                );
+                None
+            }
+            None => None,
+        };
         let df_state = DepthformerState::new(&weights.depthformer_config);
         let detok_state = DetokenizerState::new(&detok_weights.config);
         let streamer = crate::model::audio_decoder::IstftStreamer::new(
@@ -285,7 +301,7 @@ impl<'a> AudioOutputDecoder<'a> {
         Self {
             weights,
             detok_weights,
-            gpu,
+            gpu: active_gpu,
             df_state,
             detok_state,
             streamer,
@@ -296,7 +312,7 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_gpu_df: gpu_depthformer && gpu.is_some_and(|g| g.supports_depthformer()),
+            use_gpu_df: gpu_depthformer && active_gpu.is_some_and(|g| g.supports_depthformer()),
             streaming: true,
             all_codes: Vec::new(),
             watchdog: AudioSilenceWatchdog::new(),
