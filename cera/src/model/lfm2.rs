@@ -998,20 +998,20 @@ impl Lfm2Model {
 
         let mut all_router_logits = vec![0.0f32; n * n_expert];
         #[cfg(has_blas)]
-        {
-            transformer::try_blas_prefill_gemm_rowmajor(
-                &self.gguf,
-                &moe.router,
-                ffn_input,
-                &mut all_router_logits,
-                n,
-                n_expert,
-                hs,
-                &mut state.scratch.dequant_weight_scratch,
-            );
-        }
+        let blas_ok = transformer::try_blas_prefill_gemm_rowmajor(
+            &self.gguf,
+            &moe.router,
+            ffn_input,
+            &mut all_router_logits,
+            n,
+            n_expert,
+            hs,
+            &mut state.scratch.dequant_weight_scratch,
+        );
         #[cfg(not(has_blas))]
-        {
+        let blas_ok = false;
+
+        if !blas_ok {
             for j in 0..n {
                 let x = &ffn_input[j * hs..(j + 1) * hs];
                 let out_slice = &mut all_router_logits[j * n_expert..(j + 1) * n_expert];
@@ -1073,15 +1073,15 @@ impl Lfm2Model {
                     let mut exp_gate = vec![0.0f32; k_e * ff];
                     let mut exp_down = vec![0.0f32; k_e * hs];
 
-                    PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
-                        if rows.len() < 2 * ff * hs {
-                            rows.resize(2 * ff * hs, 0.0);
-                        }
-                        let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
-                        let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
-                        let dq_g = transformer::blas_dequantizer(moe.gate[e].dtype);
-                        let dq_u = transformer::blas_dequantizer(moe.up[e].dtype);
-                        if let (Some(dq_g), Some(dq_u)) = (dq_g, dq_u) {
+                    let dq_g = transformer::blas_dequantizer(moe.gate[e].dtype);
+                    let dq_u = transformer::blas_dequantizer(moe.up[e].dtype);
+                    let gate_up_ok = if let (Some(dq_g), Some(dq_u)) = (dq_g, dq_u) {
+                        PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+                            if rows.len() < 2 * ff * hs {
+                                rows.resize(2 * ff * hs, 0.0);
+                            }
+                            let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
+                            let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
                             dq_g(g_data, ff, hs, &mut rows[..ff * hs]);
                             dq_u(u_data, ff, hs, &mut rows[ff * hs..2 * ff * hs]);
 
@@ -1093,22 +1093,35 @@ impl Lfm2Model {
                                 &rows[..2 * ff * hs],
                                 &mut exp_gate_up,
                             );
-                        } else {
-                            if dq_g.is_none() {
-                                transformer::warn_unbatchable("moe_gate", moe.gate[e].dtype);
-                            }
-                            if dq_u.is_none() {
-                                transformer::warn_unbatchable("moe_up", moe.up[e].dtype);
-                            }
+                        });
+                        true
+                    } else {
+                        if dq_g.is_none() {
+                            transformer::warn_unbatchable("moe_gate", moe.gate[e].dtype);
                         }
-                    });
+                        if dq_u.is_none() {
+                            transformer::warn_unbatchable("moe_up", moe.up[e].dtype);
+                        }
+                        false
+                    };
 
-                    for t in 0..k_e {
-                        let gate_slice = &mut exp_gate[t * ff..(t + 1) * ff];
-                        let g_src = &exp_gate_up[t * 2 * ff..t * 2 * ff + ff];
-                        let u_src = &exp_gate_up[t * 2 * ff + ff..(t + 1) * 2 * ff];
-                        gate_slice.copy_from_slice(g_src);
-                        cpu::silu_mul_inplace(gate_slice, u_src);
+                    if gate_up_ok {
+                        for t in 0..k_e {
+                            let gate_slice = &mut exp_gate[t * ff..(t + 1) * ff];
+                            let g_src = &exp_gate_up[t * 2 * ff..t * 2 * ff + ff];
+                            let u_src = &exp_gate_up[t * 2 * ff + ff..(t + 1) * 2 * ff];
+                            gate_slice.copy_from_slice(g_src);
+                            cpu::silu_mul_inplace(gate_slice, u_src);
+                        }
+                    } else {
+                        for (slot, &(token_j, _)) in assigned.iter().enumerate() {
+                            let tok_in = &ffn_input[token_j * hs..(token_j + 1) * hs];
+                            let gate_slice = &mut exp_gate[slot * ff..(slot + 1) * ff];
+                            let up_slice = &mut exp_gate_up[slot * ff..(slot + 1) * ff];
+                            self.gemv(&moe.gate[e], tok_in, gate_slice);
+                            self.gemv(&moe.up[e], tok_in, up_slice);
+                            cpu::silu_mul_inplace(gate_slice, up_slice);
+                        }
                     }
 
                     let computed = PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
@@ -1125,6 +1138,11 @@ impl Lfm2Model {
                     });
                     if !computed {
                         transformer::warn_unbatchable("moe_down", moe.down[e].dtype);
+                        for slot in 0..k_e {
+                            let g_in = &exp_gate[slot * ff..(slot + 1) * ff];
+                            let d_out = &mut exp_down[slot * hs..(slot + 1) * hs];
+                            self.gemv(&moe.down[e], g_in, d_out);
+                        }
                     }
 
                     (e, exp_down)

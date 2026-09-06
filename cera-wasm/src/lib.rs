@@ -3809,3 +3809,26 @@ mod webgpu {
 
 #[cfg(feature = "wgpu")]
 pub use webgpu::{WebGpuCancelHandle, WebGpuSession};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn generate_opts_spec_decode_roundtrip() {
+        let mut opts = GenerateOpts::new();
+        assert!(!opts.has_spec_decode());
+
+        opts.set_spec_decode(3, 5);
+        assert!(opts.has_spec_decode());
+        assert_eq!(opts.inner.spec, Some(cera::SpecDecode { ngram: 3, k: 5 }));
+
+        opts.set_spec_decode(0, 100);
+        assert_eq!(opts.inner.spec, Some(cera::SpecDecode { ngram: 1, k: 64 }));
+
+        opts.clear_spec_decode();
+        assert!(!opts.has_spec_decode());
+        assert_eq!(opts.inner.spec, None);
+    }
+}

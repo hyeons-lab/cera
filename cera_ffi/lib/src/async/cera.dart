@@ -92,13 +92,27 @@ enum CeraKvCompression {
 /// CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
 class CeraSpecDecode {
   /// Creates speculative decoding options.
-  const CeraSpecDecode({this.ngram = 2, this.k = 6});
+  const CeraSpecDecode({this.ngram = 2, this.k = 6})
+    : assert(ngram > 0, 'ngram must be positive'),
+      assert(k > 0, 'k must be positive');
 
   /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
   final int ngram;
 
   /// Maximum draft length verified per round (speculation depth). Defaults to 6.
   final int k;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CeraSpecDecode && other.ngram == ngram && other.k == k;
+
+  @override
+  int get hashCode => Object.hash(ngram, k);
+
+  /// Creates a copy of this configuration with the given fields replaced.
+  CeraSpecDecode copyWith({int? ngram, int? k}) =>
+      CeraSpecDecode(ngram: ngram ?? this.ngram, k: k ?? this.k);
 
   @override
   String toString() => 'CeraSpecDecode(ngram: $ngram, k: $k)';
@@ -150,6 +164,30 @@ class CeraOptions {
 
   /// Web asset locations. Ignored on native targets.
   final CeraWebAssets web;
+
+  /// Creates a copy of this options set with the given fields replaced.
+  ///
+  /// Passing null preserves the existing field values. To explicitly return to
+  /// uncompressed KV caching, pass `kvCompression: CeraKvCompression.none`.
+  CeraOptions copyWith({
+    int? contextSize,
+    CeraBackend? backend,
+    bool? turboQuant,
+    CeraKvCompression? kvCompression,
+    int? ubatchSize,
+    bool? gpuDepthformer,
+    CeraWebAssets? web,
+  }) {
+    return CeraOptions(
+      contextSize: contextSize ?? this.contextSize,
+      backend: backend ?? this.backend,
+      turboQuant: turboQuant ?? this.turboQuant,
+      kvCompression: kvCompression ?? this.kvCompression,
+      ubatchSize: ubatchSize ?? this.ubatchSize,
+      gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
+      web: web ?? this.web,
+    );
+  }
 }
 
 /// What a loaded model accepts as input and emits as output.

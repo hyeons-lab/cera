@@ -342,11 +342,21 @@ class _WorkerCera implements Cera {
         }).toJS;
   }
 
+  void _warnUnsupportedWebOptions() {
+    if (_options.effectiveKvCompression == CeraKvCompression.f16) {
+      print(
+        '[cera:web] Warning: F16 KV compression is not supported on the Web platform; '
+        'falling back to uncompressed FP32.',
+      );
+    }
+  }
+
   Future<void> _start(
     Uint8List bytes,
     Uint8List? mmproj,
     String? inferenceType,
   ) async {
+    _warnUnsupportedWebOptions();
     _spawn();
     final buffer = _detach(bytes);
     final projBuffer = mmproj == null ? null : _detach(mmproj);
@@ -385,6 +395,7 @@ class _WorkerCera implements Cera {
     String? storeDir,
     void Function(CeraDownload progress)? onProgress,
   ) async {
+    _warnUnsupportedWebOptions();
     _spawn();
     final id = _newId();
     // Registered before the request goes out: the first progress event can

@@ -67,7 +67,7 @@ impl Default for SessionConfig {
 /// bound mobile decode this targets. Output is a valid greedy decode regardless
 /// of draft quality (every emitted token is the target's argmax); a poor draft
 /// only lowers the acceptance rate. See [`crate::spec`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpecDecode {
     /// Length of the trailing n-gram matched to locate a draft. Smaller matches
     /// more often (higher draft rate) but less precisely.

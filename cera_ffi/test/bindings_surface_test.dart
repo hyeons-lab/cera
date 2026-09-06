@@ -85,9 +85,32 @@ void main() {
       );
       expect(optsKvTurboQuant.turboQuant, isFalse);
 
+      final copied = optsDefault.copyWith(
+        ubatchSize: 256,
+        kvCompression: CeraKvCompression.f16,
+      );
+      expect(copied.ubatchSize, 256);
+      expect(copied.effectiveKvCompression, CeraKvCompression.f16);
+      expect(copied.contextSize, optsDefault.contextSize);
+
       const spec = CeraSpecDecode(ngram: 4, k: 10);
       expect(spec.ngram, 4);
       expect(spec.k, 10);
+      expect(spec, equals(const CeraSpecDecode(ngram: 4, k: 10)));
+      expect(
+        spec.hashCode,
+        equals(const CeraSpecDecode(ngram: 4, k: 10).hashCode),
+      );
+      expect(spec, isNot(equals(const CeraSpecDecode(ngram: 2, k: 10))));
+      expect(spec, isNot(equals(const CeraSpecDecode(ngram: 4, k: 6))));
+      expect(spec.copyWith(k: 8), equals(const CeraSpecDecode(ngram: 4, k: 8)));
+      expect(
+        spec.copyWith(ngram: 3),
+        equals(const CeraSpecDecode(ngram: 3, k: 10)),
+      );
+      expect(() => CeraSpecDecode(ngram: 0), throwsA(isA<AssertionError>()));
+      expect(() => CeraSpecDecode(k: 0), throwsA(isA<AssertionError>()));
+      expect(() => CeraSpecDecode(ngram: -1), throwsA(isA<AssertionError>()));
     },
   );
 

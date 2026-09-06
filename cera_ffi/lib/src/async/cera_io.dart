@@ -329,7 +329,10 @@ class _NativeCera implements Cera {
     if (topK != null) opts = opts.copyWith(topK: topK);
     if (spec != null) {
       opts = opts.copyWith(
-        spec: SpecDecodeConfig(ngram: spec.ngram, k: spec.k),
+        spec: SpecDecodeConfig(
+          ngram: spec.ngram.clamp(1, 32),
+          k: spec.k.clamp(1, 64),
+        ),
       );
     }
 
