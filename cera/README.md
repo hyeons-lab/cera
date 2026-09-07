@@ -2,6 +2,8 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
+> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
 

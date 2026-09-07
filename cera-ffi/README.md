@@ -4,6 +4,8 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
+> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 ## Status
 
 **Cache management.** Through PRs 2–13 `cera-ffi` built up a typed

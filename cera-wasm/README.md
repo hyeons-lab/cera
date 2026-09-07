@@ -3,6 +3,8 @@
 `wasm-bindgen` browser / Node bindings for the
 [cera](https://github.com/hyeons-lab/cera) inference engine.
 
+> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 > Status: pre-1.0. Today's surface covers manifest parsing, model
 > loading (CPU-only), engine metadata + capability probes, full
 > tokenizer access (`encode` / `decode` / `applyChatTemplate` /

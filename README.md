@@ -4,6 +4,9 @@
 on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
+> [!NOTE]
+> In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 ## Why Cera
 
 - **No Python, no runtime.** Pure Rust. The CLI is a single binary; the
