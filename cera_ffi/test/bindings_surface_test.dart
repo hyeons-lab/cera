@@ -50,6 +50,34 @@ void main() {
     expect(opts.spec?.k, 5);
   });
 
+  test('SpecDecodeConfig carries boundary parameters', () {
+    const low = SpecDecodeConfig(ngram: 0, k: 0);
+    expect(low.ngram, 0);
+    expect(low.k, 0);
+
+    const high = SpecDecodeConfig(ngram: 1000, k: 1000);
+    expect(high.ngram, 1000);
+    expect(high.k, 1000);
+
+    final opts = GenerateOpts(
+      maxTokens: 10,
+      temperature: 0.7,
+      topP: 0.9,
+      topK: 40,
+      minP: 0.05,
+      repetitionPenalty: 1.1,
+      stopTokens: const [],
+      ignoreEos: false,
+      grammar: null,
+      grammarTriggerTokens: const [],
+      flushEveryTokens: 16,
+      flushEveryMs: 50,
+      spec: high,
+    );
+    expect(opts.spec?.ngram, 1000);
+    expect(opts.spec?.k, 1000);
+  });
+
   test(
     'CeraOptions carries kvCompression, ubatchSize, and effectiveKvCompression',
     () {

@@ -31,6 +31,7 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
   private var hasStartedPlayback = false
   private var prebuffer: [AVAudioPCMBuffer] = []
   private let prebufferThreshold = 3
+  private var streamGeneration = 0
 
   init(messenger: FlutterBinaryMessenger) {
     self.channel = FlutterMethodChannel(name: "cera/audio_player", binaryMessenger: messenger)
@@ -86,6 +87,7 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
 
   private func startStream(sampleRate: Double, result: @escaping FlutterResult) {
     stop()
+    streamGeneration += 1
 
     let engine = AVAudioEngine()
     let node = AVAudioPlayerNode()
@@ -138,9 +140,8 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     typedData.data.withUnsafeBytes { rawBuffer in
-      if let baseAddress = rawBuffer.baseAddress {
-        memcpy(channelData, baseAddress, sampleCount * MemoryLayout<Float>.size)
-      }
+      guard let floatPtr = rawBuffer.bindMemory(to: Float.self).baseAddress else { return }
+      memcpy(channelData, floatPtr, sampleCount * MemoryLayout<Float>.size)
     }
 
     if !hasStartedPlayback && prebuffer.count < prebufferThreshold {
@@ -169,17 +170,45 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
       result(nil)
       return
     }
-    if !prebuffer.isEmpty {
-      for buf in prebuffer {
-        node.scheduleBuffer(buf, completionHandler: nil)
+    isStreaming = false
+    let currentGen = streamGeneration
+
+    let scheduleTeardown = { [weak self] in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        guard let self = self, self.streamGeneration == currentGen else { return }
+        self.stopStream()
       }
+    }
+
+    if !prebuffer.isEmpty {
+      let buffersToSchedule = prebuffer
       prebuffer.removeAll()
+      let lastIndex = buffersToSchedule.count - 1
+      for (i, buf) in buffersToSchedule.enumerated() {
+        if i == lastIndex {
+          node.scheduleBuffer(buf) {
+            scheduleTeardown()
+          }
+        } else {
+          node.scheduleBuffer(buf, completionHandler: nil)
+        }
+      }
       if !hasStartedPlayback {
         node.play()
         hasStartedPlayback = true
       }
+    } else if hasStartedPlayback {
+      if let format = audioFormat, let trailing = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 256) {
+        trailing.frameLength = 256
+        node.scheduleBuffer(trailing) {
+          scheduleTeardown()
+        }
+      } else {
+        scheduleTeardown()
+      }
+    } else {
+      stopStream()
     }
-    isStreaming = false
     result(nil)
   }
 

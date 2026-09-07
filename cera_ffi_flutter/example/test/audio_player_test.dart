@@ -252,5 +252,50 @@ void main() {
         }
       },
     );
+
+    test(
+      'native streaming handles short streams below prebuffer threshold',
+      () async {
+        final List<MethodCall> calls = [];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('cera/audio_player'),
+              (call) async {
+                calls.add(call);
+                return null;
+              },
+            );
+
+        try {
+          debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+          final player = AudioPlayerService();
+
+          player.startStream(sampleRate: 24000);
+          await pumpEventQueue();
+
+          // Single chunk below prebuffer threshold
+          player.appendChunk([0.05, -0.05]);
+          await pumpEventQueue();
+
+          player.finishStream();
+          expect(player.isPlaying, isFalse);
+          await pumpEventQueue();
+
+          final methodNames = calls.map((c) => c.method).toList();
+          expect(
+            methodNames,
+            containsAllInOrder([
+              'startStream',
+              'appendStreamChunk',
+              'finishStream',
+            ]),
+          );
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }
