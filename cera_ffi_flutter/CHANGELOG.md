@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.5
+
+### Added
+
+- **Speculative Decoding Options**: Exposed speculative decoding configuration over the FFI boundary.
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.5.5` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.5.4
 
 ### Changed
