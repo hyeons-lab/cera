@@ -19,6 +19,12 @@ use crate::tensor::DType;
 use crate::time::{Duration, Instant};
 use crate::turboquant;
 
+#[cfg(has_blas)]
+thread_local! {
+    static PAR_EXPERT_GATE_UP_ROWS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PAR_EXPERT_DEQUANT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
 // The pre-resolved mmap weight reference is the arch-agnostic one from
@@ -992,19 +998,20 @@ impl Lfm2Model {
 
         let mut all_router_logits = vec![0.0f32; n * n_expert];
         #[cfg(has_blas)]
-        {
-            transformer::try_blas_prefill_gemm_rowmajor(
-                &self.gguf,
-                &moe.router,
-                ffn_input,
-                &mut all_router_logits,
-                n,
-                n_expert,
-                hs,
-            );
-        }
+        let blas_ok = transformer::try_blas_prefill_gemm_rowmajor(
+            &self.gguf,
+            &moe.router,
+            ffn_input,
+            &mut all_router_logits,
+            n,
+            n_expert,
+            hs,
+            &mut state.scratch.dequant_weight_scratch,
+        );
         #[cfg(not(has_blas))]
-        {
+        let blas_ok = false;
+
+        if !blas_ok {
             for j in 0..n {
                 let x = &ffn_input[j * hs..(j + 1) * hs];
                 let out_slice = &mut all_router_logits[j * n_expert..(j + 1) * n_expert];
@@ -1062,47 +1069,81 @@ impl Lfm2Model {
                             .copy_from_slice(&ffn_input[token_j * hs..(token_j + 1) * hs]);
                     }
 
-                    let mut exp_gate_up_rows = vec![0.0f32; 2 * ff * hs];
-                    let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
-                    let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
-                    if let (Some(dq_g), Some(dq_u)) = (
-                        transformer::blas_dequantizer(moe.gate[e].dtype),
-                        transformer::blas_dequantizer(moe.up[e].dtype),
-                    ) {
-                        dq_g(g_data, ff, hs, &mut exp_gate_up_rows[..ff * hs]);
-                        dq_u(u_data, ff, hs, &mut exp_gate_up_rows[ff * hs..]);
-                    }
-
                     let mut exp_gate_up = vec![0.0f32; k_e * 2 * ff];
                     let mut exp_gate = vec![0.0f32; k_e * ff];
                     let mut exp_down = vec![0.0f32; k_e * hs];
 
-                    crate::backend::blas::sgemm_rowmajor_nt(
-                        k_e,
-                        2 * ff,
-                        hs,
-                        &exp_in,
-                        &exp_gate_up_rows,
-                        &mut exp_gate_up,
-                    );
+                    let dq_g = transformer::blas_dequantizer(moe.gate[e].dtype);
+                    let dq_u = transformer::blas_dequantizer(moe.up[e].dtype);
+                    let gate_up_ok = if let (Some(dq_g), Some(dq_u)) = (dq_g, dq_u) {
+                        PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+                            if rows.len() < 2 * ff * hs {
+                                rows.resize(2 * ff * hs, 0.0);
+                            }
+                            let g_data = transformer::weight_data(&self.gguf, &moe.gate[e]);
+                            let u_data = transformer::weight_data(&self.gguf, &moe.up[e]);
+                            dq_g(g_data, ff, hs, &mut rows[..ff * hs]);
+                            dq_u(u_data, ff, hs, &mut rows[ff * hs..2 * ff * hs]);
 
-                    for t in 0..k_e {
-                        let gate_slice = &mut exp_gate[t * ff..(t + 1) * ff];
-                        let g_src = &exp_gate_up[t * 2 * ff..t * 2 * ff + ff];
-                        let u_src = &exp_gate_up[t * 2 * ff + ff..(t + 1) * 2 * ff];
-                        gate_slice.copy_from_slice(g_src);
-                        cpu::silu_mul_inplace(gate_slice, u_src);
+                            crate::backend::blas::sgemm_rowmajor_nt(
+                                k_e,
+                                2 * ff,
+                                hs,
+                                &exp_in,
+                                &rows[..2 * ff * hs],
+                                &mut exp_gate_up,
+                            );
+                        });
+                        true
+                    } else {
+                        if dq_g.is_none() {
+                            transformer::warn_unbatchable("moe_gate", moe.gate[e].dtype);
+                        }
+                        if dq_u.is_none() {
+                            transformer::warn_unbatchable("moe_up", moe.up[e].dtype);
+                        }
+                        false
+                    };
+
+                    if gate_up_ok {
+                        for t in 0..k_e {
+                            let gate_slice = &mut exp_gate[t * ff..(t + 1) * ff];
+                            let g_src = &exp_gate_up[t * 2 * ff..t * 2 * ff + ff];
+                            let u_src = &exp_gate_up[t * 2 * ff + ff..(t + 1) * 2 * ff];
+                            gate_slice.copy_from_slice(g_src);
+                            cpu::silu_mul_inplace(gate_slice, u_src);
+                        }
+                    } else {
+                        for (slot, &(token_j, _)) in assigned.iter().enumerate() {
+                            let tok_in = &ffn_input[token_j * hs..(token_j + 1) * hs];
+                            let gate_slice = &mut exp_gate[slot * ff..(slot + 1) * ff];
+                            let up_slice = &mut exp_gate_up[slot * ff..(slot + 1) * ff];
+                            self.gemv(&moe.gate[e], tok_in, gate_slice);
+                            self.gemv(&moe.up[e], tok_in, up_slice);
+                            cpu::silu_mul_inplace(gate_slice, up_slice);
+                        }
                     }
 
-                    transformer::try_blas_prefill_gemm_rowmajor(
-                        &self.gguf,
-                        &moe.down[e],
-                        &exp_gate,
-                        &mut exp_down,
-                        k_e,
-                        hs,
-                        ff,
-                    );
+                    let computed = PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
+                        transformer::try_blas_prefill_gemm_rowmajor(
+                            &self.gguf,
+                            &moe.down[e],
+                            &exp_gate,
+                            &mut exp_down,
+                            k_e,
+                            hs,
+                            ff,
+                            scratch,
+                        )
+                    });
+                    if !computed {
+                        transformer::warn_unbatchable("moe_down", moe.down[e].dtype);
+                        for slot in 0..k_e {
+                            let g_in = &exp_gate[slot * ff..(slot + 1) * ff];
+                            let d_out = &mut exp_down[slot * hs..(slot + 1) * hs];
+                            self.gemv(&moe.down[e], g_in, d_out);
+                        }
+                    }
 
                     (e, exp_down)
                 })
@@ -1115,17 +1156,22 @@ impl Lfm2Model {
                     let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
 
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let n_chunks = hs / 4;
-                        let ed_ptr = ed.as_ptr();
-                        let out_ptr = out_tok.as_mut_ptr();
-                        let w_vec = vdupq_n_f32(weight);
-                        for i in 0..n_chunks {
-                            let ed_v = vld1q_f32(ed_ptr.add(i * 4));
-                            let out_v = vld1q_f32(out_ptr.add(i * 4));
-                            let res_v = vfmaq_f32(out_v, ed_v, w_vec);
-                            vst1q_f32(out_ptr.add(i * 4), res_v);
+                    {
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let n_chunks = hs / 4;
+                            let ed_ptr = ed.as_ptr();
+                            let out_ptr = out_tok.as_mut_ptr();
+                            let w_vec = vdupq_n_f32(weight);
+                            for i in 0..n_chunks {
+                                let ed_v = vld1q_f32(ed_ptr.add(i * 4));
+                                let out_v = vld1q_f32(out_ptr.add(i * 4));
+                                let res_v = vfmaq_f32(out_v, ed_v, w_vec);
+                                vst1q_f32(out_ptr.add(i * 4), res_v);
+                            }
+                        }
+                        for i in (hs / 4 * 4)..hs {
+                            out_tok[i] += weight * ed[i];
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -1203,17 +1249,22 @@ impl Lfm2Model {
 
                     let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let n_chunks = hs / 4;
-                        let ed_ptr = exp_down.as_ptr();
-                        let out_ptr = out_tok.as_mut_ptr();
-                        let w_vec = vdupq_n_f32(weight);
-                        for i in 0..n_chunks {
-                            let ed_v = vld1q_f32(ed_ptr.add(i * 4));
-                            let out_v = vld1q_f32(out_ptr.add(i * 4));
-                            let res_v = vfmaq_f32(out_v, ed_v, w_vec);
-                            vst1q_f32(out_ptr.add(i * 4), res_v);
+                    {
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let n_chunks = hs / 4;
+                            let ed_ptr = exp_down.as_ptr();
+                            let out_ptr = out_tok.as_mut_ptr();
+                            let w_vec = vdupq_n_f32(weight);
+                            for i in 0..n_chunks {
+                                let ed_v = vld1q_f32(ed_ptr.add(i * 4));
+                                let out_v = vld1q_f32(out_ptr.add(i * 4));
+                                let res_v = vfmaq_f32(out_v, ed_v, w_vec);
+                                vst1q_f32(out_ptr.add(i * 4), res_v);
+                            }
+                        }
+                        for i in (hs / 4 * 4)..hs {
+                            out_tok[i] += weight * exp_down[i];
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -2058,6 +2109,16 @@ impl Lfm2Model {
     /// `hidden` layout). The two entry points differ only in how they
     /// fill `hidden`; everything from the first RMSnorm onward is
     /// identical and lives here.
+    fn debug_hidden_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("CERA_DEBUG_HIDDEN").as_deref() == Ok("1"))
+    }
+
+    fn profile_prefill_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some())
+    }
+
     /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.
     fn prefill_layers_loop(
         &self,
@@ -2077,14 +2138,9 @@ impl Lfm2Model {
         // to print the last token's RMS at each layer entry, after
         // attn/conv (post 1st residual), and after FFN (post 2nd
         // residual). Used to find the layer where cera's hidden
-        // states diverge from llama.cpp's reference. Off in
-        // production: a missing-env-var check is one syscall per
-        // call, gated above every loop body to keep the hot path
-        // cold. Any non-`"1"` value (including unset, empty, or
-        // `"0"`) leaves diagnostics off — this matches the
-        // documented `=1` setter and avoids a stray
-        // `CERA_DEBUG_HIDDEN=0` accidentally enabling logging.
-        let debug_hidden = std::env::var("CERA_DEBUG_HIDDEN").as_deref() == Ok("1");
+        // states diverge from llama.cpp's reference. Cached in a
+        // OnceLock so hot-path prefill performs zero syscalls.
+        let debug_hidden = Self::debug_hidden_enabled();
         let log_rms = |label: &str, hidden: &[f32]| {
             if !debug_hidden {
                 return;
@@ -2176,7 +2232,7 @@ impl Lfm2Model {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         let mut kv_widen_v: Vec<f32> = Vec::new();
 
-        let profile_prefill = std::env::var_os("CERA_PROFILE_PREFILL").is_some();
+        let profile_prefill = Self::profile_prefill_enabled();
         #[allow(unused_mut)]
         let mut t_norm = Duration::ZERO;
         #[allow(unused_mut)]
@@ -2280,6 +2336,7 @@ impl Lfm2Model {
                                 n,
                                 3 * hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_conv_in += t.elapsed();
@@ -2582,6 +2639,7 @@ impl Lfm2Model {
                                 n,
                                 hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_conv_out += t_o.elapsed();
@@ -3314,6 +3372,7 @@ impl Lfm2Model {
                                 n,
                                 hs,
                                 hs,
+                                &mut state.scratch.dequant_weight_scratch,
                             );
                             if profile_prefill {
                                 t_attn_out += t_ao.elapsed();

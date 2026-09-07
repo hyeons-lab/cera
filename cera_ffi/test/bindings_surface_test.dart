@@ -24,7 +24,7 @@ import 'package:test/test.dart';
 /// Referencing the symbols means the package stops compiling if they vanish.
 void main() {
   test('GenerateOpts carries every field the Rust record declares', () {
-    // 12 fields as of cera-ffi/src/lib.rs. `grammarTriggerTokens`,
+    // 13 fields as of cera-ffi/src/lib.rs (including spec). `grammarTriggerTokens`,
     // `flushEveryTokens`, and `flushEveryMs` are the three that went missing.
     const opts = GenerateOpts(
       maxTokens: 1,
@@ -39,13 +39,126 @@ void main() {
       grammarTriggerTokens: <int>[],
       flushEveryTokens: 0,
       flushEveryMs: 0,
+      spec: SpecDecodeConfig(ngram: 3, k: 5),
     );
 
     expect(opts.maxTokens, 1);
     expect(opts.grammarTriggerTokens, isEmpty);
     expect(opts.flushEveryTokens, 0);
     expect(opts.flushEveryMs, 0);
+    expect(opts.spec?.ngram, 3);
+    expect(opts.spec?.k, 5);
   });
+
+  test('SpecDecodeConfig carries boundary parameters', () {
+    const low = SpecDecodeConfig(ngram: 0, k: 0);
+    expect(low.ngram, 0);
+    expect(low.k, 0);
+
+    const high = SpecDecodeConfig(ngram: 1000, k: 1000);
+    expect(high.ngram, 1000);
+    expect(high.k, 1000);
+
+    final opts = GenerateOpts(
+      maxTokens: 10,
+      temperature: 0.7,
+      topP: 0.9,
+      topK: 40,
+      minP: 0.05,
+      repetitionPenalty: 1.1,
+      stopTokens: const [],
+      ignoreEos: false,
+      grammar: null,
+      grammarTriggerTokens: const [],
+      flushEveryTokens: 16,
+      flushEveryMs: 50,
+      spec: high,
+    );
+    expect(opts.spec?.ngram, 1000);
+    expect(opts.spec?.k, 1000);
+  });
+
+  test(
+    'CeraOptions carries kvCompression, ubatchSize, and effectiveKvCompression',
+    () {
+      const optsDefault = CeraOptions();
+      expect(optsDefault.ubatchSize, 512);
+      expect(optsDefault.turboQuant, isFalse);
+      expect(optsDefault.kvCompression, isNull);
+      expect(optsDefault.effectiveKvCompression, CeraKvCompression.none);
+
+      const optsTurboQuant = CeraOptions(turboQuant: true);
+      expect(
+        optsTurboQuant.effectiveKvCompression,
+        CeraKvCompression.turboQuant,
+      );
+
+      const optsF16 = CeraOptions(kvCompression: CeraKvCompression.f16);
+      expect(optsF16.effectiveKvCompression, CeraKvCompression.f16);
+
+      const optsF16Override = CeraOptions(
+        turboQuant: true,
+        kvCompression: CeraKvCompression.f16,
+        ubatchSize: 256,
+      );
+      expect(optsF16Override.ubatchSize, 256);
+      expect(optsF16Override.effectiveKvCompression, CeraKvCompression.f16);
+
+      const optsKvTurboQuant = CeraOptions(
+        kvCompression: CeraKvCompression.turboQuant,
+      );
+      expect(
+        optsKvTurboQuant.effectiveKvCompression,
+        CeraKvCompression.turboQuant,
+      );
+      expect(optsKvTurboQuant.turboQuant, isFalse);
+
+      final copied = optsDefault.copyWith(
+        ubatchSize: 256,
+        kvCompression: CeraKvCompression.f16,
+      );
+      expect(copied.ubatchSize, 256);
+      expect(copied.effectiveKvCompression, CeraKvCompression.f16);
+      expect(copied.contextSize, optsDefault.contextSize);
+
+      const spec = CeraSpecDecode(ngram: 4, k: 10);
+      expect(spec.ngram, 4);
+      expect(spec.k, 10);
+      expect(spec, equals(const CeraSpecDecode(ngram: 4, k: 10)));
+      expect(
+        spec.hashCode,
+        equals(const CeraSpecDecode(ngram: 4, k: 10).hashCode),
+      );
+      expect(spec, isNot(equals(const CeraSpecDecode(ngram: 2, k: 10))));
+      expect(spec, isNot(equals(const CeraSpecDecode(ngram: 4, k: 6))));
+      expect(spec.copyWith(k: 8), equals(const CeraSpecDecode(ngram: 4, k: 8)));
+      expect(
+        spec.copyWith(ngram: 3),
+        equals(const CeraSpecDecode(ngram: 3, k: 10)),
+      );
+      expect(() => CeraSpecDecode(ngram: 0), throwsA(isA<AssertionError>()));
+      expect(() => CeraSpecDecode(k: 0), throwsA(isA<AssertionError>()));
+      expect(() => CeraSpecDecode(ngram: -1), throwsA(isA<AssertionError>()));
+    },
+  );
+
+  test(
+    'SessionConfig carries ubatchSize, gpuDepthformer, and kvCompression',
+    () {
+      const cfg = SessionConfig(
+        ubatchSize: 256,
+        gpuDepthformer: true,
+        kvCompression: KvCompressionTurboQuant(
+          seed: 42,
+          keys: true,
+          values: true,
+        ),
+      );
+      expect(cfg.ubatchSize, 256);
+      expect(cfg.gpuDepthformer, isTrue);
+      expect(cfg.kvCompression, isA<KvCompressionTurboQuant>());
+    },
+  );
 
   test('the RustBuffer-returning methods are declared on CeraEngine', () {
     // The guard is `_surfaceGuard` below, which is resolved at compile time.

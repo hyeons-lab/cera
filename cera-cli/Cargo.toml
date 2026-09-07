@@ -44,6 +44,11 @@ crossterm = "0.28"
 # Tiny dep — just a static `char → width` table.
 unicode-width = "0.2"
 
+# Hardware acceleration defaults on Apple platforms. Enables Metal GPU inference
+# and Apple Accelerate BLAS out of the box when installing or running `cera-cli`.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+cera = { path = "../cera", version = "0.5.4", features = ["metal", "blas"] }
+
 # `dlopen`/`dlsym` for the runtime-resolved NDK thermal API (src/thermal.rs).
 # Already in the dependency graph via cera's affinity pinning on these targets.
 [target.'cfg(target_os = "android")'.dependencies]

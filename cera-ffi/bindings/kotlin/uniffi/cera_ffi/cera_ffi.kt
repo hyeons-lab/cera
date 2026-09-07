@@ -7833,7 +7833,7 @@ public object FfiConverterTypeFfiVadConfig : FfiConverterRustBuffer<FfiVadConfig
  * Per-call decode options. Mirrors [`cera::GenerateOpts`].
  *
  * `flush_every_tokens` / `flush_every_ms` are accepted but have no
- * effect under the synchronous [`Session::generate`] — they're
+ * effect under the synchronous [`Session::generate`]; they are
  * meaningful once streaming (foreign-trait `ModalitySink`) lands
  * in a follow-up PR. Including them in the record now keeps the FFI
  * surface stable across that transition.
@@ -7875,7 +7875,7 @@ data class GenerateOpts(
      * `grammar` is set, the grammar stays inactive until the model emits one
      * of these tokens (e.g. the tool-call start marker from
      * [`CeraEngine::tool_call_start_token`]), then constrains the call and
-     * deactivates on completion. Empty → `grammar` is active from the start.
+     * deactivates on completion. Empty -> `grammar` is active from the start.
      */
     var `grammarTriggerTokens`: List<kotlin.UInt> = listOf(),
     /**
@@ -7886,6 +7886,11 @@ data class GenerateOpts(
      * Ignored under synchronous generate; reserved for streaming.
      */
     var `flushEveryMs`: kotlin.UInt = 50u,
+    /**
+     * Optional speculative decoding configuration (prompt-lookup drafting).
+     * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+     */
+    var `spec`: SpecDecodeConfig? = null,
 ) {
     companion object
 }
@@ -7908,6 +7913,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterSequenceUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeSpecDecodeConfig.read(buf),
         )
 
     override fun allocationSize(value: GenerateOpts) =
@@ -7923,7 +7929,8 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterOptionalString.allocationSize(value.`grammar`) +
                 FfiConverterSequenceUInt.allocationSize(value.`grammarTriggerTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
-                FfiConverterUInt.allocationSize(value.`flushEveryMs`)
+                FfiConverterUInt.allocationSize(value.`flushEveryMs`) +
+                FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`)
         )
 
     override fun write(
@@ -7942,6 +7949,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterSequenceUInt.write(value.`grammarTriggerTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
+        FfiConverterOptionalTypeSpecDecodeConfig.write(value.`spec`, buf)
     }
 }
 
@@ -8282,6 +8290,51 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
         FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
+    }
+}
+
+/**
+ * Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+ *
+ * Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+ * and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+ * CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
+ */
+data class SpecDecodeConfig(
+    /**
+     * Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+     */
+    var `ngram`: kotlin.UInt = 2u,
+    /**
+     * Maximum draft length verified per round (speculation depth). Defaults to 6.
+     */
+    var `k`: kotlin.UInt = 6u,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSpecDecodeConfig : FfiConverterRustBuffer<SpecDecodeConfig> {
+    override fun read(buf: ByteBuffer): SpecDecodeConfig =
+        SpecDecodeConfig(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+
+    override fun allocationSize(value: SpecDecodeConfig) =
+        (
+            FfiConverterUInt.allocationSize(value.`ngram`) +
+                FfiConverterUInt.allocationSize(value.`k`)
+        )
+
+    override fun write(
+        value: SpecDecodeConfig,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterUInt.write(value.`ngram`, buf)
+        FfiConverterUInt.write(value.`k`, buf)
     }
 }
 
@@ -9668,6 +9721,38 @@ public object FfiConverterOptionalTypeFfiVadConfig : FfiConverterRustBuffer<FfiV
         } else {
             buf.put(1)
             FfiConverterTypeFfiVadConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<SpecDecodeConfig?> {
+    override fun read(buf: ByteBuffer): SpecDecodeConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeSpecDecodeConfig.read(buf)
+    }
+
+    override fun allocationSize(value: SpecDecodeConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeSpecDecodeConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: SpecDecodeConfig?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeSpecDecodeConfig.write(value, buf)
         }
     }
 }

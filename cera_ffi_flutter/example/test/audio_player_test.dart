@@ -160,5 +160,179 @@ void main() {
         player2.dispose();
       },
     );
+
+    test('native streaming platform channel calls on macOS and iOS', () async {
+      final List<MethodCall> calls = [];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel('cera/audio_player'), (
+            call,
+          ) async {
+            calls.add(call);
+            return null;
+          });
+
+      for (final platform in [TargetPlatform.macOS, TargetPlatform.iOS]) {
+        calls.clear();
+        try {
+          debugDefaultTargetPlatformOverride = platform;
+          final player = AudioPlayerService();
+
+          player.startStream(sampleRate: 24000);
+          expect(player.isPlaying, isTrue);
+          await pumpEventQueue();
+
+          player.appendChunk([0.1, -0.2, 0.3]);
+          await pumpEventQueue();
+
+          player.finishStream();
+          expect(player.isPlaying, isFalse);
+          await pumpEventQueue();
+
+          player.stop();
+          await pumpEventQueue();
+
+          final methodNames = calls.map((c) => c.method).toList();
+          expect(methodNames, contains('startStream'));
+          expect(methodNames, contains('appendStreamChunk'));
+          expect(methodNames, contains('finishStream'));
+          expect(methodNames, contains('stopStream'));
+
+          final startCall = calls.firstWhere((c) => c.method == 'startStream');
+          expect(startCall.arguments, equals({'sampleRate': 24000}));
+
+          final appendCall = calls.firstWhere(
+            (c) => c.method == 'appendStreamChunk',
+          );
+          expect(
+            appendCall.arguments['data'],
+            equals(Float32List.fromList([0.1, -0.2, 0.3])),
+          );
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      }
+    });
+
+    test(
+      'native streaming handles platform channel errors gracefully',
+      () async {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('cera/audio_player'),
+              (call) async {
+                throw PlatformException(
+                  code: 'AUDIO_ERROR',
+                  message: 'Simulated failure',
+                );
+              },
+            );
+
+        try {
+          debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+          final player = AudioPlayerService();
+
+          // None of these should throw or crash the service
+          expect(() => player.startStream(sampleRate: 24000), returnsNormally);
+          await pumpEventQueue();
+
+          expect(() => player.appendChunk([0.1, 0.2]), returnsNormally);
+          await pumpEventQueue();
+
+          expect(() => player.finishStream(), returnsNormally);
+          await pumpEventQueue();
+
+          expect(() => player.stop(), returnsNormally);
+          await pumpEventQueue();
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    test(
+      'native streaming handles short streams below prebuffer threshold',
+      () async {
+        final List<MethodCall> calls = [];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('cera/audio_player'),
+              (call) async {
+                calls.add(call);
+                return null;
+              },
+            );
+
+        try {
+          debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+          final player = AudioPlayerService();
+
+          player.startStream(sampleRate: 24000);
+          await pumpEventQueue();
+
+          // Single chunk below prebuffer threshold
+          player.appendChunk([0.05, -0.05]);
+          await pumpEventQueue();
+
+          player.finishStream();
+          expect(player.isPlaying, isFalse);
+          await pumpEventQueue();
+
+          final methodNames = calls.map((c) => c.method).toList();
+          expect(
+            methodNames,
+            containsAllInOrder([
+              'startStream',
+              'appendStreamChunk',
+              'finishStream',
+            ]),
+          );
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    test(
+      'rapid finishStream followed immediately by playPcm preserves playback state',
+      () async {
+        final List<MethodCall> calls = [];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('cera/audio_player'),
+              (call) async {
+                calls.add(call);
+                return null;
+              },
+            );
+
+        try {
+          debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+          final player = AudioPlayerService();
+
+          player.startStream(sampleRate: 24000);
+          player.appendChunk([0.1, -0.1]);
+          player.finishStream();
+
+          // Immediately start single-shot playback
+          final future = player.playPcm([0.2, -0.2, 0.1], sampleRate: 24000);
+          expect(player.isPlaying, isTrue);
+          await future;
+
+          final methodNames = calls.map((c) => c.method).toList();
+          expect(methodNames, contains('finishStream'));
+          expect(methodNames, contains('play'));
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }

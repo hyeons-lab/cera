@@ -4602,7 +4602,7 @@ public func FfiConverterTypeFfiVadConfig_lower(_ value: FfiVadConfig) -> RustBuf
  * Per-call decode options. Mirrors [`cera::GenerateOpts`].
  *
  * `flush_every_tokens` / `flush_every_ms` are accepted but have no
- * effect under the synchronous [`Session::generate`] — they're
+ * effect under the synchronous [`Session::generate`]; they are
  * meaningful once streaming (foreign-trait `ModalitySink`) lands
  * in a follow-up PR. Including them in the record now keeps the FFI
  * surface stable across that transition.
@@ -4644,7 +4644,7 @@ public struct GenerateOpts: Equatable, Hashable {
      * `grammar` is set, the grammar stays inactive until the model emits one
      * of these tokens (e.g. the tool-call start marker from
      * [`CeraEngine::tool_call_start_token`]), then constrains the call and
-     * deactivates on completion. Empty → `grammar` is active from the start.
+     * deactivates on completion. Empty -> `grammar` is active from the start.
      */
     public var grammarTriggerTokens: [UInt32]
     /**
@@ -4655,6 +4655,11 @@ public struct GenerateOpts: Equatable, Hashable {
      * Ignored under synchronous generate; reserved for streaming.
      */
     public var flushEveryMs: UInt32
+    /**
+     * Optional speculative decoding configuration (prompt-lookup drafting).
+     * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+     */
+    public var spec: SpecDecodeConfig?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4686,14 +4691,18 @@ public struct GenerateOpts: Equatable, Hashable {
          * `grammar` is set, the grammar stays inactive until the model emits one
          * of these tokens (e.g. the tool-call start marker from
          * [`CeraEngine::tool_call_start_token`]), then constrains the call and
-         * deactivates on completion. Empty → `grammar` is active from the start.
+         * deactivates on completion. Empty -> `grammar` is active from the start.
          */grammarTriggerTokens: [UInt32] = [], 
         /**
          * Ignored under synchronous generate; reserved for streaming.
          */flushEveryTokens: UInt32 = UInt32(16), 
         /**
          * Ignored under synchronous generate; reserved for streaming.
-         */flushEveryMs: UInt32 = UInt32(50)) {
+         */flushEveryMs: UInt32 = UInt32(50), 
+        /**
+         * Optional speculative decoding configuration (prompt-lookup drafting).
+         * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+         */spec: SpecDecodeConfig? = nil) {
         self.maxTokens = maxTokens
         self.temperature = temperature
         self.topP = topP
@@ -4706,6 +4715,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.grammarTriggerTokens = grammarTriggerTokens
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
+        self.spec = spec
     }
 
     
@@ -4735,7 +4745,8 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 grammar: FfiConverterOptionString.read(from: &buf), 
                 grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
-                flushEveryMs: FfiConverterUInt32.read(from: &buf)
+                flushEveryMs: FfiConverterUInt32.read(from: &buf), 
+                spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf)
         )
     }
 
@@ -4752,6 +4763,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterSequenceUInt32.write(value.grammarTriggerTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
+        FfiConverterOptionTypeSpecDecodeConfig.write(value.spec, into: &buf)
     }
 }
 
@@ -5282,6 +5294,79 @@ public func FfiConverterTypeSessionConfig_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustBuffer {
     return FfiConverterTypeSessionConfig.lower(value)
+}
+
+
+/**
+ * Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+ *
+ * Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+ * and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+ * CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
+ */
+public struct SpecDecodeConfig: Equatable, Hashable {
+    /**
+     * Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+     */
+    public var ngram: UInt32
+    /**
+     * Maximum draft length verified per round (speculation depth). Defaults to 6.
+     */
+    public var k: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+         */ngram: UInt32 = UInt32(2), 
+        /**
+         * Maximum draft length verified per round (speculation depth). Defaults to 6.
+         */k: UInt32 = UInt32(6)) {
+        self.ngram = ngram
+        self.k = k
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SpecDecodeConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSpecDecodeConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SpecDecodeConfig {
+        return
+            try SpecDecodeConfig(
+                ngram: FfiConverterUInt32.read(from: &buf), 
+                k: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SpecDecodeConfig, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.ngram, into: &buf)
+        FfiConverterUInt32.write(value.k, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpecDecodeConfig_lift(_ buf: RustBuffer) throws -> SpecDecodeConfig {
+    return try FfiConverterTypeSpecDecodeConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSpecDecodeConfig_lower(_ value: SpecDecodeConfig) -> RustBuffer {
+    return FfiConverterTypeSpecDecodeConfig.lower(value)
 }
 
 
@@ -6545,6 +6630,30 @@ fileprivate struct FfiConverterOptionTypeFfiVadConfig: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiVadConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffer {
+    typealias SwiftType = SpecDecodeConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSpecDecodeConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSpecDecodeConfig.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

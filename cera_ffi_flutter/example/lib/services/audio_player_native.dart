@@ -169,11 +169,35 @@ class AudioPlayerBackend {
     stopStream();
     _streamSampleRate = sampleRate;
     _streamBuffer.clear();
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      unawaited(
+        _channel
+            .invokeMethod('startStream', {'sampleRate': sampleRate})
+            .catchError((err) {
+              debugPrint('[cera:audio_player_native] startStream failed: $err');
+              return null;
+            }),
+      );
+    }
   }
 
   /// Appends an audio PCM chunk to the live stream buffer.
   void appendStreamChunk(Float32List chunk) {
-    if (chunk.isNotEmpty) {
+    if (chunk.isEmpty) return;
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      unawaited(
+        _channel.invokeMethod('appendStreamChunk', {'data': chunk}).catchError((
+          err,
+        ) {
+          debugPrint(
+            '[cera:audio_player_native] appendStreamChunk failed: $err',
+          );
+          return null;
+        }),
+      );
+    } else {
       _streamBuffer.addAll(chunk);
     }
   }
@@ -183,7 +207,15 @@ class AudioPlayerBackend {
     debugPrint(
       '[cera:audio_player_native] finishStream (${_streamBuffer.length} samples)',
     );
-    if (_streamBuffer.isNotEmpty) {
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      unawaited(
+        _channel.invokeMethod('finishStream').catchError((err) {
+          debugPrint('[cera:audio_player_native] finishStream failed: $err');
+          return null;
+        }),
+      );
+    } else if (_streamBuffer.isNotEmpty) {
       final allSamples = Float32List.fromList(_streamBuffer);
       _streamBuffer.clear();
       unawaited(playPcm(allSamples, _streamSampleRate));
@@ -193,6 +225,12 @@ class AudioPlayerBackend {
   /// Stops streaming and ends audio playback.
   void stopStream() {
     _streamBuffer.clear();
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      try {
+        unawaited(_channel.invokeMethod('stopStream').catchError((_) => null));
+      } catch (_) {}
+    }
     stopPlayback();
   }
 

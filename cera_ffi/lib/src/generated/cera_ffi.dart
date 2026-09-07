@@ -516,7 +516,7 @@ class FfiVadConfig {
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
-/// effect under the synchronous [`Session::generate`] — they're
+/// effect under the synchronous [`Session::generate`]; they are
 /// meaningful once streaming (foreign-trait `ModalitySink`) lands
 /// in a follow-up PR. Including them in the record now keeps the FFI
 /// surface stable across that transition.
@@ -547,12 +547,15 @@ class GenerateOpts {
     /// `grammar` is set, the grammar stays inactive until the model emits one
     /// of these tokens (e.g. the tool-call start marker from
     /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
-    /// deactivates on completion. Empty → `grammar` is active from the start.
+    /// deactivates on completion. Empty -> `grammar` is active from the start.
     this.grammarTriggerTokens = const [],
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryTokens = 16,
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryMs = 50,
+    /// Optional speculative decoding configuration (prompt-lookup drafting).
+    /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+    this.spec = null,
   });
 
   final int maxTokens;
@@ -580,12 +583,15 @@ class GenerateOpts {
   /// `grammar` is set, the grammar stays inactive until the model emits one
   /// of these tokens (e.g. the tool-call start marker from
   /// [`CeraEngine::tool_call_start_token`]), then constrains the call and
-  /// deactivates on completion. Empty → `grammar` is active from the start.
+  /// deactivates on completion. Empty -> `grammar` is active from the start.
   final List<int> grammarTriggerTokens;
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryTokens;
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryMs;
+  /// Optional speculative decoding configuration (prompt-lookup drafting).
+  /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+  final SpecDecodeConfig? spec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -601,6 +607,7 @@ class GenerateOpts {
       'grammarTriggerTokens': this.grammarTriggerTokens,
       'flushEveryTokens': this.flushEveryTokens,
       'flushEveryMs': this.flushEveryMs,
+      'spec': this.spec == null ? null : (() { final __tmp = this.spec!; return __tmp.toJson(); })(),
     };
   }
 
@@ -618,6 +625,7 @@ class GenerateOpts {
       grammarTriggerTokens: json.containsKey('grammarTriggerTokens') ? (json['grammarTriggerTokens'] as List).map((item) => (item as num).toInt()).toList() : const [],
       flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
       flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
+      spec: json.containsKey('spec') ? json['spec'] == null ? null : (() { final __tmp = json['spec']; return SpecDecodeConfig.fromJson(__tmp as Map<String, dynamic>); })() : null,
     );
   }
 
@@ -634,6 +642,7 @@ class GenerateOpts {
     List<int>? grammarTriggerTokens,
     int? flushEveryTokens,
     int? flushEveryMs,
+    Object? spec = _sentinel,
   }) {
     return GenerateOpts(
       maxTokens: maxTokens ?? this.maxTokens,
@@ -648,21 +657,22 @@ class GenerateOpts {
       grammarTriggerTokens: grammarTriggerTokens ?? this.grammarTriggerTokens,
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
+      spec: spec == _sentinel ? this.spec : spec as SpecDecodeConfig?,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs)';
+    return 'GenerateOpts(maxTokens: $maxTokens, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs;
+      other is GenerateOpts && maxTokens == other.maxTokens && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec;
 
   @override
-  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs);
+  int get hashCode => Object.hash(maxTokens, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -1119,6 +1129,62 @@ class SessionConfig {
 
   @override
   int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer);
+}
+
+/// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
+///
+/// Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
+/// and verifies them in a single batched prefill step. This is optimal for memory-bandwidth-bound
+/// CPU inference; on high-throughput GPU backends, verification overhead may reduce net speedup.
+class SpecDecodeConfig {
+  const SpecDecodeConfig({
+    /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+    this.ngram = 2,
+    /// Maximum draft length verified per round (speculation depth). Defaults to 6.
+    this.k = 6,
+  });
+
+  /// Length of the trailing n-gram matched to locate a draft. Defaults to 2.
+  final int ngram;
+  /// Maximum draft length verified per round (speculation depth). Defaults to 6.
+  final int k;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'ngram': this.ngram,
+      'k': this.k,
+    };
+  }
+
+  factory SpecDecodeConfig.fromJson(Map<String, dynamic> json) {
+    return SpecDecodeConfig(
+      ngram: json.containsKey('ngram') ? (json['ngram'] as num).toInt() : 2,
+      k: json.containsKey('k') ? (json['k'] as num).toInt() : 6,
+    );
+  }
+
+  SpecDecodeConfig copyWith({
+    int? ngram,
+    int? k,
+  }) {
+    return SpecDecodeConfig(
+      ngram: ngram ?? this.ngram,
+      k: k ?? this.k,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SpecDecodeConfig(ngram: $ngram, k: $k)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SpecDecodeConfig && ngram == other.ngram && k == other.k;
+
+  @override
+  int get hashCode => Object.hash(ngram, k);
 }
 
 /// A tool call parsed from model output. Mirrors [`cera::tools::ToolCall`];
@@ -3186,6 +3252,12 @@ void _uniffiWriteGenerateOpts(GenerateOpts value, _UniFfiBinaryWriter writer) {
   }
   writer.writeU32(value.flushEveryTokens);
   writer.writeU32(value.flushEveryMs);
+  if (value.spec == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteSpecDecodeConfig(value.spec!, writer);
+  }
 }
 
 Uint8List _uniffiEncodeGenerateOpts(GenerateOpts value) {
@@ -3208,6 +3280,7 @@ GenerateOpts _uniffiReadGenerateOpts(_UniFfiBinaryReader reader) {
     grammarTriggerTokens: (() { final int __len = reader.readI32(); final out = <int>[]; for (var i = 0; i < __len; i++) { out.add(reader.readU32()); } return out; })(),
     flushEveryTokens: reader.readU32(),
     flushEveryMs: reader.readU32(),
+    spec: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadSpecDecodeConfig(reader); })(),
   );
 }
 
@@ -3439,6 +3512,33 @@ SessionConfig _uniffiDecodeSessionConfig(Uint8List bytes) {
   final value = _uniffiReadSessionConfig(reader);
   if (!reader.isDone) {
     throw StateError('extra bytes remaining while decoding SessionConfig');
+  }
+  return value;
+}
+
+void _uniffiWriteSpecDecodeConfig(SpecDecodeConfig value, _UniFfiBinaryWriter writer) {
+  writer.writeU32(value.ngram);
+  writer.writeU32(value.k);
+}
+
+Uint8List _uniffiEncodeSpecDecodeConfig(SpecDecodeConfig value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteSpecDecodeConfig(value, writer);
+  return writer.toBytes();
+}
+
+SpecDecodeConfig _uniffiReadSpecDecodeConfig(_UniFfiBinaryReader reader) {
+  return SpecDecodeConfig(
+    ngram: reader.readU32(),
+    k: reader.readU32(),
+  );
+}
+
+SpecDecodeConfig _uniffiDecodeSpecDecodeConfig(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadSpecDecodeConfig(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding SpecDecodeConfig');
   }
   return value;
 }
