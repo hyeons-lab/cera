@@ -86,6 +86,7 @@ let currentModelLabel = 'unknown';
 let pendingAudioSuffixTokens = null;
 let pendingImage = null;
 let isCancelled = false;
+let warnedSpecWebGpu = false;
 let cancelSharedBuffer = null;
 let cancelArray = null;
 try {
@@ -929,10 +930,11 @@ const OPS = {
         }
       : null;
     if (gpu) {
-      if (req.spec != null) {
+      if (req.spec != null && !warnedSpecWebGpu) {
         console.warn(
           '[cera:worker] speculative decoding is currently only supported on the CPU WASM backend; ignoring spec options on WebGPU',
         );
+        warnedSpecWebGpu = true;
       }
       // Caller-framed: `generateTokens` prepends nothing, which is what makes
       // the BOS rule in `encodePrompt` the single place BOS is decided.
@@ -1105,6 +1107,7 @@ const OPS = {
 
   close() {
     this.cancel();
+    warnedSpecWebGpu = false;
     pendingAudioSuffixTokens = null;
     pendingImage = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own

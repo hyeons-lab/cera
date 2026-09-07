@@ -25,6 +25,39 @@ thread_local! {
     static PAR_EXPERT_DEQUANT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Clears and shrinks thread-local scratch buffers allocated across Rayon workers
+/// during parallel MoE prefill.
+///
+/// Under `has_blas`, worker threads lazily allocate `PAR_EXPERT_GATE_UP_ROWS` and
+/// `PAR_EXPERT_DEQUANT_SCRATCH` up to `2 * ff * hs` floats. Because Rayon's global
+/// thread pool persists for the process lifetime, calling this helper broadcasts across
+/// all workers to release their capacity when models or sessions are dropped or idle.
+#[cfg(has_blas)]
+pub fn clear_all_rayon_thread_local_scratches() {
+    PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+        rows.clear();
+        rows.shrink_to_fit();
+    });
+    PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
+        scratch.clear();
+        scratch.shrink_to_fit();
+    });
+    rayon::broadcast(|_| {
+        PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+            rows.clear();
+            rows.shrink_to_fit();
+        });
+        PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.clear();
+            scratch.shrink_to_fit();
+        });
+    });
+}
+
+/// No-op fallback on targets without BLAS acceleration.
+#[cfg(not(has_blas))]
+pub fn clear_all_rayon_thread_local_scratches() {}
+
 // ── Pre-resolved weight reference ───────────────────────────────────────────
 
 // The pre-resolved mmap weight reference is the arch-agnostic one from
@@ -4609,6 +4642,12 @@ impl Model for Lfm2Model {
     }
 }
 
+impl Drop for Lfm2Model {
+    fn drop(&mut self) {
+        clear_all_rayon_thread_local_scratches();
+    }
+}
+
 // ── GPU weight source ───────────────────────────────────────────────────────
 //
 // Drives the wgpu loader (`gpu_lfm2.rs`) for LFM2. Conv layers expose
@@ -4844,5 +4883,35 @@ mod moe_routing_tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0, 0);
         assert_eq!(selected[1].0, 1);
+    }
+
+    #[test]
+    fn clear_all_rayon_thread_local_scratches_reclaims_memory() {
+        #[cfg(has_blas)]
+        {
+            super::PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+                rows.resize(1024, 1.0);
+            });
+            super::PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
+                scratch.resize(1024, 2.0);
+            });
+            assert!(super::PAR_EXPERT_GATE_UP_ROWS.with_borrow(|r| r.capacity()) >= 1024);
+            assert!(super::PAR_EXPERT_DEQUANT_SCRATCH.with_borrow(|s| s.capacity()) >= 1024);
+
+            super::clear_all_rayon_thread_local_scratches();
+
+            assert_eq!(
+                super::PAR_EXPERT_GATE_UP_ROWS.with_borrow(|r| r.capacity()),
+                0
+            );
+            assert_eq!(
+                super::PAR_EXPERT_DEQUANT_SCRATCH.with_borrow(|s| s.capacity()),
+                0
+            );
+        }
+        #[cfg(not(has_blas))]
+        {
+            super::clear_all_rayon_thread_local_scratches();
+        }
     }
 }

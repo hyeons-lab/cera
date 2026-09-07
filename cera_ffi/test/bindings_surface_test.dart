@@ -114,6 +114,24 @@ void main() {
     },
   );
 
+  test(
+    'SessionConfig carries ubatchSize, gpuDepthformer, and kvCompression',
+    () {
+      const cfg = SessionConfig(
+        ubatchSize: 256,
+        gpuDepthformer: true,
+        kvCompression: KvCompressionTurboQuant(
+          seed: 42,
+          keys: true,
+          values: true,
+        ),
+      );
+      expect(cfg.ubatchSize, 256);
+      expect(cfg.gpuDepthformer, isTrue);
+      expect(cfg.kvCompression, isA<KvCompressionTurboQuant>());
+    },
+  );
+
   test('the RustBuffer-returning methods are declared on CeraEngine', () {
     // The guard is `_surfaceGuard` below, which is resolved at compile time.
     // If any of those methods is dropped or renamed, this file stops
