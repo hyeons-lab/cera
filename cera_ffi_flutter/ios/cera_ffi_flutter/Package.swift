@@ -47,8 +47,8 @@ let ceraBinaryTarget: Target = hasLocalXCFramework
     ? .binaryTarget(name: "CeraFFI", path: localXCFramework)
     : .binaryTarget(
         name: "CeraFFI",
-        url: "https://github.com/hyeons-lab/cera/releases/download/vRELEASE_VERSION/CeraFFI.xcframework.zip",
-        checksum: "RELEASE_CHECKSUM"
+        url: "https://github.com/hyeons-lab/cera/releases/download/v0.5.5/CeraFFI.xcframework.zip",
+        checksum: "c2666b97cfd24a5387e8497c3bbaf8b819d9d15626c23477376d5b81f7f4caec"
     )
 
 let package = Package(
