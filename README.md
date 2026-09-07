@@ -4,6 +4,9 @@
 on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
+> [!NOTE]
+> The API will soon be updated to make it easier to use and consolidate several APIs.
+
 ## Why Cera
 
 - **No Python, no runtime.** Pure Rust. The CLI is a single binary; the
