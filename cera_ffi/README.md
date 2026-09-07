@@ -3,6 +3,8 @@
 Dart bindings for the [Cera](https://github.com/hyeons-lab/cera) on-device
 inference engine. Runs GGUF language models locally through `dart:ffi`.
 
+> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 **Building a Flutter app? Use
 [`cera_ffi_flutter`](https://pub.dev/packages/cera_ffi_flutter) instead.** It
 depends on this package and re-exports it, so the API is identical, and it adds

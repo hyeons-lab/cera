@@ -3,6 +3,8 @@
 Flutter and Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine: on-device LLM inference with no network round trip.
 
+> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+
 This is the package Flutter apps depend on. It is an **FFI plugin**: the native
 library is fetched and linked by each platform's own build system, with no
 method channels and no Dart-side setup.
