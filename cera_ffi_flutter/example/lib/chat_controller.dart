@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -16,9 +17,9 @@ class ChatController extends ValueNotifier<ChatState> {
   ChatController({Future<String?> Function()? defaultStoreDir})
     : _defaultStoreDir = defaultStoreDir ?? (() async => null),
       super(const ChatState()) {
-    const kAppRevisionBadge = 'rev24-local-models-webgpu';
+    const kAppRevisionBadge = 'rev25-local-models-webgpu';
     debugPrint(
-      '[cera:chat:version] ChatController v0.5.4 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.5.5 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }

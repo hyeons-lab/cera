@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.5
+
+### Added
+
+- **Speculative Decoding FFI Configuration**: Plumbed speculative decoding (`SpecDecode`) configuration over the UniFFI boundary.
+- **In-Memory Model Loading**: Added support for loading models and adapters directly from in-memory byte buffers across platforms.
+
+### Changed
+
+- **Version Alignment**: Bumped workspace patch version to 0.5.5 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.4
 
 ### Fixed
