@@ -297,5 +297,42 @@ void main() {
         }
       },
     );
+
+    test(
+      'rapid finishStream followed immediately by playPcm preserves playback state',
+      () async {
+        final List<MethodCall> calls = [];
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('cera/audio_player'),
+              (call) async {
+                calls.add(call);
+                return null;
+              },
+            );
+
+        try {
+          debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+          final player = AudioPlayerService();
+
+          player.startStream(sampleRate: 24000);
+          player.appendChunk([0.1, -0.1]);
+          player.finishStream();
+
+          // Immediately start single-shot playback
+          final future = player.playPcm([0.2, -0.2, 0.1], sampleRate: 24000);
+          expect(player.isPlaying, isTrue);
+          await future;
+
+          final methodNames = calls.map((c) => c.method).toList();
+          expect(methodNames, contains('finishStream'));
+          expect(methodNames, contains('play'));
+
+          player.dispose();
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }

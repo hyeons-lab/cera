@@ -1156,17 +1156,22 @@ impl Lfm2Model {
                     let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
 
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let n_chunks = hs / 4;
-                        let ed_ptr = ed.as_ptr();
-                        let out_ptr = out_tok.as_mut_ptr();
-                        let w_vec = vdupq_n_f32(weight);
-                        for i in 0..n_chunks {
-                            let ed_v = vld1q_f32(ed_ptr.add(i * 4));
-                            let out_v = vld1q_f32(out_ptr.add(i * 4));
-                            let res_v = vfmaq_f32(out_v, ed_v, w_vec);
-                            vst1q_f32(out_ptr.add(i * 4), res_v);
+                    {
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let n_chunks = hs / 4;
+                            let ed_ptr = ed.as_ptr();
+                            let out_ptr = out_tok.as_mut_ptr();
+                            let w_vec = vdupq_n_f32(weight);
+                            for i in 0..n_chunks {
+                                let ed_v = vld1q_f32(ed_ptr.add(i * 4));
+                                let out_v = vld1q_f32(out_ptr.add(i * 4));
+                                let res_v = vfmaq_f32(out_v, ed_v, w_vec);
+                                vst1q_f32(out_ptr.add(i * 4), res_v);
+                            }
+                        }
+                        for i in (hs / 4 * 4)..hs {
+                            out_tok[i] += weight * ed[i];
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
@@ -1244,17 +1249,22 @@ impl Lfm2Model {
 
                     let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
                     #[cfg(target_arch = "aarch64")]
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let n_chunks = hs / 4;
-                        let ed_ptr = exp_down.as_ptr();
-                        let out_ptr = out_tok.as_mut_ptr();
-                        let w_vec = vdupq_n_f32(weight);
-                        for i in 0..n_chunks {
-                            let ed_v = vld1q_f32(ed_ptr.add(i * 4));
-                            let out_v = vld1q_f32(out_ptr.add(i * 4));
-                            let res_v = vfmaq_f32(out_v, ed_v, w_vec);
-                            vst1q_f32(out_ptr.add(i * 4), res_v);
+                    {
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let n_chunks = hs / 4;
+                            let ed_ptr = exp_down.as_ptr();
+                            let out_ptr = out_tok.as_mut_ptr();
+                            let w_vec = vdupq_n_f32(weight);
+                            for i in 0..n_chunks {
+                                let ed_v = vld1q_f32(ed_ptr.add(i * 4));
+                                let out_v = vld1q_f32(out_ptr.add(i * 4));
+                                let res_v = vfmaq_f32(out_v, ed_v, w_vec);
+                                vst1q_f32(out_ptr.add(i * 4), res_v);
+                            }
+                        }
+                        for i in (hs / 4 * 4)..hs {
+                            out_tok[i] += weight * exp_down[i];
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]

@@ -140,8 +140,8 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
     }
 
     typedData.data.withUnsafeBytes { rawBuffer in
-      guard let floatPtr = rawBuffer.bindMemory(to: Float.self).baseAddress else { return }
-      memcpy(channelData, floatPtr, sampleCount * MemoryLayout<Float>.size)
+      guard let basePtr = rawBuffer.baseAddress else { return }
+      memcpy(channelData, basePtr, sampleCount * MemoryLayout<Float>.size)
     }
 
     if !hasStartedPlayback && prebuffer.count < prebufferThreshold {
@@ -200,6 +200,9 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
     } else if hasStartedPlayback {
       if let format = audioFormat, let trailing = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 256) {
         trailing.frameLength = 256
+        if let channelData = trailing.floatChannelData?[0] {
+          memset(channelData, 0, 256 * MemoryLayout<Float>.size)
+        }
         node.scheduleBuffer(trailing) {
           scheduleTeardown()
         }
@@ -213,6 +216,7 @@ class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
   }
 
   private func stopStream() {
+    streamGeneration += 1
     if let node = playerNode {
       node.stop()
     }

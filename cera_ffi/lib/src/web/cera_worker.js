@@ -967,7 +967,9 @@ const OPS = {
       if (req.topP != null) opts.topP = req.topP;
       if (req.topK != null) opts.topK = req.topK;
       if (req.spec != null && typeof opts.setSpecDecode === 'function') {
-        opts.setSpecDecode(req.spec.ngram, req.spec.k);
+        const ngram = typeof req.spec.ngram === 'number' ? req.spec.ngram : 2;
+        const k = typeof req.spec.k === 'number' ? req.spec.k : 6;
+        opts.setSpecDecode(ngram, k);
       }
       // Emit per token rather than per buffer-full; the point of a worker is
       // that the host sees output as it is produced.
