@@ -245,6 +245,14 @@ jobs:
             fi
           done
 
+      # Resolve dependencies and verify cera_ffi before minting the pub.dev OIDC token.
+      # Running `dart pub get` unauthenticated avoids sending the short-lived upload
+      # token on public package queries, which pub.dev's Google Cloud storage rejects with 403.
+      - name: Verify and analyze cera_ffi
+        run: |
+          set -euo pipefail
+          ( cd cera_ffi && dart pub get && dart analyze )
+
       # Provision a fresh pub.dev OIDC JWT token (PUB_TOKEN) immediately prior to
       # publishing. GitHub Actions ID tokens typically expire in 5 minutes.
       # Placing setup-dart after the release asset verification/wait loop guarantees
@@ -258,8 +266,6 @@ jobs:
       - name: Publish cera_ffi (Dart package)
         run: |
           set -euo pipefail
-          ( cd cera_ffi && dart pub get && dart analyze )
-
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN: cera_ffi package validation ==="
             ( cd cera_ffi && dart pub publish --dry-run )
