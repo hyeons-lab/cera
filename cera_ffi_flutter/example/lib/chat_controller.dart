@@ -444,16 +444,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
       _ceraEngine = cera;
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
-      final String voiceTag;
-      if (cera.capabilities.audioIn && cera.capabilities.audioOut) {
-        voiceTag = ' · Voice';
-      } else if (cera.capabilities.audioIn) {
-        voiceTag = ' · ASR';
-      } else if (cera.capabilities.audioOut) {
-        voiceTag = ' · Audio';
-      } else {
-        voiceTag = '';
-      }
+      final voiceTag = voiceTagFor(cera.capabilities);
 
       var effectiveSettings = value.settings;
       if (cera.capabilities.audioIn && !cera.capabilities.audioOut) {
@@ -463,7 +454,8 @@ class ChatController extends ValueNotifier<ChatState> {
           );
         }
       } else if (!cera.capabilities.audioIn && cera.capabilities.audioOut) {
-        if (effectiveSettings.audioChatMode == AudioChatMode.speechToText) {
+        if (effectiveSettings.audioChatMode == AudioChatMode.speechToText ||
+            effectiveSettings.audioChatMode == AudioChatMode.interleaved) {
           effectiveSettings = effectiveSettings.copyWith(
             audioChatMode: AudioChatMode.textToSpeech,
           );
@@ -472,6 +464,12 @@ class ChatController extends ValueNotifier<ChatState> {
         if (effectiveSettings.audioChatMode == AudioChatMode.textOnly) {
           effectiveSettings = effectiveSettings.copyWith(
             audioChatMode: AudioChatMode.interleaved,
+          );
+        }
+      } else {
+        if (effectiveSettings.audioChatMode != AudioChatMode.textOnly) {
+          effectiveSettings = effectiveSettings.copyWith(
+            audioChatMode: AudioChatMode.textOnly,
           );
         }
       }
@@ -694,9 +692,7 @@ class ChatController extends ValueNotifier<ChatState> {
         ? intent.pcmSamples.length / intent.sampleRate
         : 0.0;
     final promptText = intent.prompt.trim();
-    final isAsr =
-        value.settings.audioChatMode == AudioChatMode.speechToText ||
-        !(value.capabilities?.audioOut ?? false);
+    final isAsr = value.settings.audioChatMode == AudioChatMode.speechToText;
 
     final generationId = ++_generationId;
     final userTurn = Turn(
@@ -769,6 +765,15 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     }
 
+    final voicePersona = value.uiMode == AppUIMode.ttsStudio
+        ? value.settings.ttsStudioVoice
+        : value.settings.chatVoice;
+    final isInterleaved =
+        value.settings.audioChatMode == AudioChatMode.interleaved;
+    final String? systemPrompt = isInterleaved
+        ? 'Respond with interleaved text and audio. $voicePersona'.trim()
+        : null;
+
     try {
       debugPrint(
         '[cera:chat] Encoding audio prompt (${intent.pcmSamples.length} samples at ${intent.sampleRate} Hz, text: "$promptText")...',
@@ -777,6 +782,7 @@ class ChatController extends ValueNotifier<ChatState> {
         intent.pcmSamples,
         sampleRate: intent.sampleRate,
         prompt: promptText,
+        systemPrompt: systemPrompt,
       );
       debugPrint(
         '[cera:chat] Audio successfully encoded and seeded into KV cache',
@@ -1100,16 +1106,7 @@ class ChatController extends ValueNotifier<ChatState> {
           }
           _ceraEngine = reloaded;
           final visionTag = reloaded.capabilities.imageIn ? ' · Vision' : '';
-          final String voiceTag;
-          if (reloaded.capabilities.audioIn && reloaded.capabilities.audioOut) {
-            voiceTag = ' · Voice';
-          } else if (reloaded.capabilities.audioIn) {
-            voiceTag = ' · ASR';
-          } else if (reloaded.capabilities.audioOut) {
-            voiceTag = ' · Audio';
-          } else {
-            voiceTag = '';
-          }
+          final voiceTag = voiceTagFor(reloaded.capabilities);
           value = value.copyWith(
             isLoading: false,
             capabilities: () => reloaded.capabilities,
@@ -1136,6 +1133,18 @@ class ChatController extends ValueNotifier<ChatState> {
     if (!_disposed) {
       value = value.copyWith(turns: []);
     }
+  }
+
+  @visibleForTesting
+  static String voiceTagFor(CeraCapabilities caps) {
+    if (caps.audioIn && caps.audioOut) {
+      return ' · Voice';
+    } else if (caps.audioIn) {
+      return ' · ASR';
+    } else if (caps.audioOut) {
+      return ' · Audio';
+    }
+    return '';
   }
 
   @override

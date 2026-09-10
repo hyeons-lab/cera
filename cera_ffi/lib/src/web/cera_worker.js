@@ -539,7 +539,7 @@ const OPS = {
   /**
    * Feed mono PCM audio into the live conversation.
    */
-  async appendAudio({ pcm, sampleRate, prompt }) {
+  async appendAudio({ pcm, sampleRate, prompt, systemPrompt }) {
     const t0 = performance.now();
     const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
     const sr = sampleRate ?? 16000;
@@ -568,10 +568,14 @@ const OPS = {
         : markerName;
     const messages = [];
     if (currentPos === 0) {
-      const systemPrompt = capabilitiesOf().audioOut
+      const defaultSystemPrompt = capabilitiesOf().audioOut
         ? 'Respond with interleaved text and audio.'
         : 'Respond to the user.';
-      messages.push({ role: 'system', content: systemPrompt });
+      const effectiveSystemPrompt =
+        systemPrompt && systemPrompt.trim().length > 0
+          ? systemPrompt.trim()
+          : defaultSystemPrompt;
+      messages.push({ role: 'system', content: effectiveSystemPrompt });
     }
     messages.push({ role: 'user', content: userContent });
     let formatted;

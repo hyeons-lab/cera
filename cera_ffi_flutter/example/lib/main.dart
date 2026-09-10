@@ -621,6 +621,8 @@ class _ChatPageState extends State<ChatPage> {
     return ValueListenableBuilder<ChatState>(
       valueListenable: _controller,
       builder: (context, state, _) {
+        final hasAudioIn = state.capabilities?.audioIn ?? false;
+        final hasAudioOut = state.capabilities?.audioOut ?? false;
         return Scaffold(
           appBar: AppBar(
             title: Column(
@@ -745,9 +747,7 @@ class _ChatPageState extends State<ChatPage> {
                         audioPlayer: _controller.audioPlayer,
                       ),
                     ),
-                    if (state.hasModel &&
-                        ((state.capabilities?.audioIn ?? false) ||
-                            (state.capabilities?.audioOut ?? false)))
+                    if (state.hasModel && (hasAudioIn || hasAudioOut))
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 16,
@@ -786,10 +786,7 @@ class _ChatPageState extends State<ChatPage> {
                                 scrollDirection: Axis.horizontal,
                                 child: Row(
                                   children: [
-                                    if ((state.capabilities?.audioIn ??
-                                            false) &&
-                                        (state.capabilities?.audioOut ??
-                                            false)) ...[
+                                    if (hasAudioIn && hasAudioOut) ...[
                                       _AudioModeChip(
                                         label: 'Voice Chat',
                                         icon: Icons.record_voice_over_outlined,
@@ -805,8 +802,7 @@ class _ChatPageState extends State<ChatPage> {
                                       ),
                                       const SizedBox(width: 6),
                                     ],
-                                    if (state.capabilities?.audioIn ??
-                                        false) ...[
+                                    if (hasAudioIn) ...[
                                       _AudioModeChip(
                                         label: 'Speech to Text (ASR)',
                                         icon: Icons.transcribe_rounded,
@@ -822,8 +818,7 @@ class _ChatPageState extends State<ChatPage> {
                                       ),
                                       const SizedBox(width: 6),
                                     ],
-                                    if (state.capabilities?.audioOut ??
-                                        false) ...[
+                                    if (hasAudioOut) ...[
                                       _AudioModeChip(
                                         label: 'Text to Speech (TTS)',
                                         icon: Icons.volume_up_outlined,

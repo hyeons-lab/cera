@@ -501,6 +501,7 @@ class _NativeCera implements Cera {
     List<double> pcm, {
     int sampleRate = 16000,
     String? prompt,
+    String? systemPrompt,
   }) async {
     final ahead = _queue;
     final mine = Completer<void>();
@@ -535,15 +536,18 @@ class _NativeCera implements Cera {
               ? '${prompt.trim()}\n$markerName'
               : markerName;
 
+      final defaultSystemPrompt =
+          _capabilities.audioOut
+              ? 'Respond with interleaved text and audio.'
+              : 'Respond to the user.';
+      final effectiveSystemPrompt =
+          (systemPrompt != null && systemPrompt.trim().isNotEmpty)
+              ? systemPrompt.trim()
+              : defaultSystemPrompt;
+
       final messages = <ChatMessage>[
         if (_session.position() == 0)
-          ChatMessage(
-            role: 'system',
-            content:
-                _capabilities.audioOut
-                    ? 'Respond with interleaved text and audio.'
-                    : 'Respond to the user.',
-          ),
+          ChatMessage(role: 'system', content: effectiveSystemPrompt),
         ChatMessage(role: 'user', content: userContent),
       ];
 
@@ -566,10 +570,11 @@ class _NativeCera implements Cera {
         prefixTokens = [];
       }
 
+      final bos = _bosToken;
       if (_session.position() == 0 &&
-          _bosToken != null &&
-          (prefixTokens.isEmpty || prefixTokens.first != _bosToken)) {
-        prefixTokens = [_bosToken, ...prefixTokens];
+          bos != null &&
+          (prefixTokens.isEmpty || prefixTokens.first != bos)) {
+        prefixTokens = [bos, ...prefixTokens];
       }
       if (prefixTokens.isNotEmpty) {
         _session.appendTokens(prefixTokens);

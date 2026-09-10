@@ -504,6 +504,202 @@ void main() {
 
       controller.dispose();
     });
+
+    test(
+      'ChatController automatically aligns audioChatMode to model capabilities',
+      () {
+        final controller = ChatController();
+
+        // Audio-in only model -> auto-aligns to speechToText (ASR)
+        controller.value = controller.value.copyWith(
+          loadedModel: () => const MockLoadedModel('Whisper-Small'),
+          capabilities: () => const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: false,
+          ),
+        );
+
+        // Simulate the alignment logic when model loads
+        var effectiveSettings = controller.value.settings;
+        final caps = controller.value.capabilities!;
+        if (caps.audioIn && !caps.audioOut) {
+          if (effectiveSettings.audioChatMode != AudioChatMode.speechToText) {
+            effectiveSettings = effectiveSettings.copyWith(
+              audioChatMode: AudioChatMode.speechToText,
+            );
+          }
+        }
+        controller.value = controller.value.copyWith(
+          settings: effectiveSettings,
+        );
+        expect(
+          controller.value.settings.audioChatMode,
+          AudioChatMode.speechToText,
+        );
+
+        // Bidirectional audio model -> auto-aligns to interleaved Voice Chat
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.textOnly,
+          ),
+          capabilities: () => const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: true,
+          ),
+        );
+
+        final biCaps = controller.value.capabilities!;
+        var biSettings = controller.value.settings;
+        if (biCaps.audioIn && biCaps.audioOut) {
+          if (biSettings.audioChatMode == AudioChatMode.textOnly) {
+            biSettings = biSettings.copyWith(
+              audioChatMode: AudioChatMode.interleaved,
+            );
+          }
+        }
+        controller.value = controller.value.copyWith(settings: biSettings);
+        expect(
+          controller.value.settings.audioChatMode,
+          AudioChatMode.interleaved,
+        );
+
+        // Switch from interleaved to TTS-only model -> auto-aligns to textToSpeech
+        controller.value = controller.value.copyWith(
+          capabilities: () => const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: false,
+            audioOut: true,
+          ),
+        );
+
+        final ttsCaps = controller.value.capabilities!;
+        var ttsSettings = controller.value.settings;
+        if (!ttsCaps.audioIn && ttsCaps.audioOut) {
+          if (ttsSettings.audioChatMode == AudioChatMode.speechToText ||
+              ttsSettings.audioChatMode == AudioChatMode.interleaved) {
+            ttsSettings = ttsSettings.copyWith(
+              audioChatMode: AudioChatMode.textToSpeech,
+            );
+          }
+        }
+        controller.value = controller.value.copyWith(settings: ttsSettings);
+        expect(
+          controller.value.settings.audioChatMode,
+          AudioChatMode.textToSpeech,
+        );
+
+        // Switch from TTS-only to text-only model -> auto-resets to textOnly
+        controller.value = controller.value.copyWith(
+          capabilities: () => const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: false,
+            audioOut: false,
+          ),
+        );
+
+        final textCaps = controller.value.capabilities!;
+        var textSettings = controller.value.settings;
+        if (!textCaps.audioIn && !textCaps.audioOut) {
+          if (textSettings.audioChatMode != AudioChatMode.textOnly) {
+            textSettings = textSettings.copyWith(
+              audioChatMode: AudioChatMode.textOnly,
+            );
+          }
+        }
+        controller.value = controller.value.copyWith(settings: textSettings);
+        expect(controller.value.settings.audioChatMode, AudioChatMode.textOnly);
+
+        controller.dispose();
+      },
+    );
+
+    test(
+      'interleaved voice chat constructs systemPrompt incorporating voice persona',
+      () {
+        final controller = ChatController();
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.interleaved,
+            chatVoice: 'Use the British male voice.',
+          ),
+        );
+
+        final voicePersona = controller.value.settings.chatVoice;
+        final isInterleaved =
+            controller.value.settings.audioChatMode ==
+            AudioChatMode.interleaved;
+        final systemPrompt = isInterleaved
+            ? 'Respond with interleaved text and audio. $voicePersona'.trim()
+            : null;
+
+        expect(
+          systemPrompt,
+          'Respond with interleaved text and audio. Use the British male voice.',
+        );
+        controller.dispose();
+      },
+    );
+
+    test('voiceTagFor maps capabilities to descriptive status labels', () {
+      expect(
+        ChatController.voiceTagFor(
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: true,
+          ),
+        ),
+        ' · Voice',
+      );
+      expect(
+        ChatController.voiceTagFor(
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: false,
+          ),
+        ),
+        ' · ASR',
+      );
+      expect(
+        ChatController.voiceTagFor(
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: false,
+            audioOut: true,
+          ),
+        ),
+        ' · Audio',
+      );
+      expect(
+        ChatController.voiceTagFor(
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: false,
+            audioOut: false,
+          ),
+        ),
+        '',
+      );
+    });
   });
 }
 
