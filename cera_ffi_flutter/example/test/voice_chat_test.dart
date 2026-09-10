@@ -88,6 +88,22 @@ void main() {
       expect(normalized[3], closeTo(-0.2, 1e-5));
     });
 
+    test('normalizeAudio handles invalid targetPeak safely', () {
+      final samples = [0.2, -0.4, 0.1];
+      // When targetPeak is NaN or non-positive, fallback to 0.9
+      final normNan = AudioRecorderService.normalizeAudio(
+        samples,
+        targetPeak: double.nan,
+      );
+      expect(normNan[1], closeTo(-0.9, 1e-5));
+
+      final normZero = AudioRecorderService.normalizeAudio(
+        samples,
+        targetPeak: 0.0,
+      );
+      expect(normZero[1], closeTo(-0.9, 1e-5));
+    });
+
     test('normalizeAudio handles silent and non-finite samples safely', () {
       final silent = [0.0, 0.0, 0.0];
       final normSilent = AudioRecorderService.normalizeAudio(silent);
@@ -345,6 +361,52 @@ void main() {
         expect(recorderB.isDisposed, isFalse);
       },
     );
+
+    testWidgets(
+      'MessageComposer aborts active push-to-talk recording on dispose',
+      (WidgetTester tester) async {
+        final recorder = FakeAudioRecorderService();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              bottomNavigationBar: MessageComposer(
+                controller: TextEditingController(),
+                isBusy: false,
+                isGenerating: false,
+                canAttachImage: false,
+                canAttachAudio: true,
+                pendingImageBytes: null,
+                pendingImageName: null,
+                onSend: () {},
+                onStop: () {},
+                onPickImage: () {},
+                onClearImage: () {},
+                audioRecorder: recorder,
+                onSendAudio: (_, _) {},
+              ),
+            ),
+          ),
+        );
+
+        final micFinder = find.byIcon(Icons.mic_none_rounded);
+        expect(micFinder, findsOneWidget);
+
+        // Start recording
+        await tester.startGesture(tester.getCenter(micFinder));
+        await tester.pump();
+        expect(recorder.isRecording, isTrue);
+
+        // Unmount widget during active recording
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: SizedBox())),
+        );
+        await tester.pump();
+
+        expect(recorder.wasCancelled, isTrue);
+        expect(recorder.isDisposed, isFalse);
+      },
+    );
   });
 
   group('Voice Mode Selector Bar', () {
@@ -582,14 +644,14 @@ void main() {
     });
 
     test(
-      'ChatController automatically aligns audioChatMode to model capabilities',
+      'ChatController.alignAudioMode automatically aligns audioChatMode to model capabilities',
       () {
-        final controller = ChatController();
+        const initial = ChatSettings(audioChatMode: AudioChatMode.textOnly);
 
         // Audio-in only model -> auto-aligns to speechToText (ASR)
-        controller.value = controller.value.copyWith(
-          loadedModel: () => const MockLoadedModel('Whisper-Small'),
-          capabilities: () => const CeraCapabilities(
+        final asrSettings = ChatController.alignAudioMode(
+          initial,
+          const CeraCapabilities(
             textIn: true,
             textOut: true,
             imageIn: false,
@@ -597,31 +659,12 @@ void main() {
             audioOut: false,
           ),
         );
-
-        // Simulate the alignment logic when model loads
-        var effectiveSettings = controller.value.settings;
-        final caps = controller.value.capabilities!;
-        if (caps.audioIn && !caps.audioOut) {
-          if (effectiveSettings.audioChatMode != AudioChatMode.speechToText) {
-            effectiveSettings = effectiveSettings.copyWith(
-              audioChatMode: AudioChatMode.speechToText,
-            );
-          }
-        }
-        controller.value = controller.value.copyWith(
-          settings: effectiveSettings,
-        );
-        expect(
-          controller.value.settings.audioChatMode,
-          AudioChatMode.speechToText,
-        );
+        expect(asrSettings.audioChatMode, AudioChatMode.speechToText);
 
         // Bidirectional audio model -> auto-aligns to interleaved Voice Chat
-        controller.value = controller.value.copyWith(
-          settings: controller.value.settings.copyWith(
-            audioChatMode: AudioChatMode.textOnly,
-          ),
-          capabilities: () => const CeraCapabilities(
+        final voiceSettings = ChatController.alignAudioMode(
+          initial,
+          const CeraCapabilities(
             textIn: true,
             textOut: true,
             imageIn: false,
@@ -629,25 +672,12 @@ void main() {
             audioOut: true,
           ),
         );
-
-        final biCaps = controller.value.capabilities!;
-        var biSettings = controller.value.settings;
-        if (biCaps.audioIn && biCaps.audioOut) {
-          if (biSettings.audioChatMode == AudioChatMode.textOnly) {
-            biSettings = biSettings.copyWith(
-              audioChatMode: AudioChatMode.interleaved,
-            );
-          }
-        }
-        controller.value = controller.value.copyWith(settings: biSettings);
-        expect(
-          controller.value.settings.audioChatMode,
-          AudioChatMode.interleaved,
-        );
+        expect(voiceSettings.audioChatMode, AudioChatMode.interleaved);
 
         // Switch from interleaved to TTS-only model -> auto-aligns to textToSpeech
-        controller.value = controller.value.copyWith(
-          capabilities: () => const CeraCapabilities(
+        final ttsSettings = ChatController.alignAudioMode(
+          voiceSettings,
+          const CeraCapabilities(
             textIn: true,
             textOut: true,
             imageIn: false,
@@ -655,26 +685,12 @@ void main() {
             audioOut: true,
           ),
         );
-
-        final ttsCaps = controller.value.capabilities!;
-        var ttsSettings = controller.value.settings;
-        if (!ttsCaps.audioIn && ttsCaps.audioOut) {
-          if (ttsSettings.audioChatMode == AudioChatMode.speechToText ||
-              ttsSettings.audioChatMode == AudioChatMode.interleaved) {
-            ttsSettings = ttsSettings.copyWith(
-              audioChatMode: AudioChatMode.textToSpeech,
-            );
-          }
-        }
-        controller.value = controller.value.copyWith(settings: ttsSettings);
-        expect(
-          controller.value.settings.audioChatMode,
-          AudioChatMode.textToSpeech,
-        );
+        expect(ttsSettings.audioChatMode, AudioChatMode.textToSpeech);
 
         // Switch from TTS-only to text-only model -> auto-resets to textOnly
-        controller.value = controller.value.copyWith(
-          capabilities: () => const CeraCapabilities(
+        final textSettings = ChatController.alignAudioMode(
+          ttsSettings,
+          const CeraCapabilities(
             textIn: true,
             textOut: true,
             imageIn: false,
@@ -682,47 +698,57 @@ void main() {
             audioOut: false,
           ),
         );
-
-        final textCaps = controller.value.capabilities!;
-        var textSettings = controller.value.settings;
-        if (!textCaps.audioIn && !textCaps.audioOut) {
-          if (textSettings.audioChatMode != AudioChatMode.textOnly) {
-            textSettings = textSettings.copyWith(
-              audioChatMode: AudioChatMode.textOnly,
-            );
-          }
-        }
-        controller.value = controller.value.copyWith(settings: textSettings);
-        expect(controller.value.settings.audioChatMode, AudioChatMode.textOnly);
-
-        controller.dispose();
+        expect(textSettings.audioChatMode, AudioChatMode.textOnly);
       },
     );
 
     test(
-      'interleaved voice chat constructs systemPrompt incorporating voice persona',
+      'ChatController.systemPromptFor constructs systemPrompt incorporating voice persona',
       () {
-        final controller = ChatController();
-        controller.value = controller.value.copyWith(
-          settings: controller.value.settings.copyWith(
-            audioChatMode: AudioChatMode.interleaved,
-            chatVoice: 'Use the British male voice.',
-          ),
+        const settingsWithPersona = ChatSettings(
+          audioChatMode: AudioChatMode.interleaved,
+          chatVoice: 'Use the British male voice.',
         );
 
-        final voicePersona = controller.value.settings.chatVoice;
-        final isInterleaved =
-            controller.value.settings.audioChatMode ==
-            AudioChatMode.interleaved;
-        final systemPrompt = isInterleaved
-            ? 'Respond with interleaved text and audio. $voicePersona'.trim()
-            : null;
-
+        final promptInterleaved = ChatController.systemPromptFor(
+          settings: settingsWithPersona,
+          uiMode: AppUIMode.chat,
+        );
         expect(
-          systemPrompt,
+          promptInterleaved,
           'Respond with interleaved text and audio. Use the British male voice.',
         );
-        controller.dispose();
+
+        // When persona is empty, trimmed cleanly without trailing whitespace
+        const settingsEmptyPersona = ChatSettings(
+          audioChatMode: AudioChatMode.interleaved,
+          chatVoice: '',
+        );
+        final promptEmpty = ChatController.systemPromptFor(
+          settings: settingsEmptyPersona,
+          uiMode: AppUIMode.chat,
+        );
+        expect(promptEmpty, 'Respond with interleaved text and audio.');
+
+        // TTS mode for text prompt
+        const settingsTts = ChatSettings(
+          audioChatMode: AudioChatMode.textToSpeech,
+          chatVoice: 'Warm storyteller voice.',
+        );
+        final promptTts = ChatController.systemPromptFor(
+          settings: settingsTts,
+          uiMode: AppUIMode.chat,
+          isAudioPrompt: false,
+        );
+        expect(promptTts, 'Perform TTS. Warm storyteller voice.');
+
+        // TTS mode for audio prompt returns null
+        final promptTtsAudio = ChatController.systemPromptFor(
+          settings: settingsTts,
+          uiMode: AppUIMode.chat,
+          isAudioPrompt: true,
+        );
+        expect(promptTtsAudio, isNull);
       },
     );
 
@@ -834,9 +860,12 @@ class FakeAudioRecorderService extends AudioRecorderService {
     return [0.1, 0.2, 0.3];
   }
 
+  bool wasCancelled = false;
+
   @override
   Future<void> cancelRecording() async {
     _mockRecording = false;
+    wasCancelled = true;
   }
 
   @override

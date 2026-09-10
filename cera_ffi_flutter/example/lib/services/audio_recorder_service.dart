@@ -246,7 +246,10 @@ class AudioRecorderService {
       return sanitized;
     }
 
-    final scale = targetPeak / maxAmp;
+    final peak = (targetPeak.isFinite && targetPeak > 0.0 && targetPeak <= 1.0)
+        ? targetPeak
+        : 0.9;
+    final scale = peak / maxAmp;
     final normalized = Float32List(samples.length);
     for (var i = 0; i < samples.length; i++) {
       final s = samples[i];

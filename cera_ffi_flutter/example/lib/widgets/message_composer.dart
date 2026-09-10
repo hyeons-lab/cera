@@ -69,6 +69,9 @@ class _MessageComposerState extends State<MessageComposer> {
   @override
   void dispose() {
     _recordTimer?.cancel();
+    if (_isRecordingAudio || _isStartingRecording) {
+      _audioRecorder.cancelRecording().ignore();
+    }
     _localRecorder?.dispose();
     super.dispose();
   }

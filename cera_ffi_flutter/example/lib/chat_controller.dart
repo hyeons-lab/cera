@@ -449,33 +449,10 @@ class ChatController extends ValueNotifier<ChatState> {
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
       final voiceTag = voiceTagFor(cera.capabilities);
 
-      var effectiveSettings = value.settings;
-      if (cera.capabilities.audioIn && !cera.capabilities.audioOut) {
-        if (effectiveSettings.audioChatMode != AudioChatMode.speechToText) {
-          effectiveSettings = effectiveSettings.copyWith(
-            audioChatMode: AudioChatMode.speechToText,
-          );
-        }
-      } else if (!cera.capabilities.audioIn && cera.capabilities.audioOut) {
-        if (effectiveSettings.audioChatMode == AudioChatMode.speechToText ||
-            effectiveSettings.audioChatMode == AudioChatMode.interleaved) {
-          effectiveSettings = effectiveSettings.copyWith(
-            audioChatMode: AudioChatMode.textToSpeech,
-          );
-        }
-      } else if (cera.capabilities.audioIn && cera.capabilities.audioOut) {
-        if (effectiveSettings.audioChatMode == AudioChatMode.textOnly) {
-          effectiveSettings = effectiveSettings.copyWith(
-            audioChatMode: AudioChatMode.interleaved,
-          );
-        }
-      } else {
-        if (effectiveSettings.audioChatMode != AudioChatMode.textOnly) {
-          effectiveSettings = effectiveSettings.copyWith(
-            audioChatMode: AudioChatMode.textOnly,
-          );
-        }
-      }
+      final effectiveSettings = alignAudioMode(
+        value.settings,
+        cera.capabilities,
+      );
 
       value = value.copyWith(
         loadedModel: () => modelSource,
@@ -617,14 +594,11 @@ class ChatController extends ValueNotifier<ChatState> {
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
-    final voicePersona = value.uiMode == AppUIMode.ttsStudio
-        ? value.settings.ttsStudioVoice
-        : value.settings.chatVoice;
-    final String? systemPrompt = isTts
-        ? 'Perform TTS. $voicePersona'.trim()
-        : (isInterleaved
-              ? 'Respond with interleaved text and audio. $voicePersona'.trim()
-              : null);
+    final systemPrompt = systemPromptFor(
+      settings: value.settings,
+      uiMode: value.uiMode,
+      isAudioPrompt: false,
+    );
 
     final messages = <CeraMessage>[
       if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -768,14 +742,11 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     }
 
-    final voicePersona = value.uiMode == AppUIMode.ttsStudio
-        ? value.settings.ttsStudioVoice
-        : value.settings.chatVoice;
-    final isInterleaved =
-        value.settings.audioChatMode == AudioChatMode.interleaved;
-    final String? systemPrompt = isInterleaved
-        ? 'Respond with interleaved text and audio. $voicePersona'.trim()
-        : null;
+    final systemPrompt = systemPromptFor(
+      settings: value.settings,
+      uiMode: value.uiMode,
+      isAudioPrompt: true,
+    );
 
     try {
       debugPrint(
@@ -1148,6 +1119,53 @@ class ChatController extends ValueNotifier<ChatState> {
       return ' · Audio';
     }
     return '';
+  }
+
+  @visibleForTesting
+  static ChatSettings alignAudioMode(
+    ChatSettings settings,
+    CeraCapabilities caps,
+  ) {
+    if (caps.audioIn && !caps.audioOut) {
+      if (settings.audioChatMode != AudioChatMode.speechToText) {
+        return settings.copyWith(audioChatMode: AudioChatMode.speechToText);
+      }
+    } else if (!caps.audioIn && caps.audioOut) {
+      if (settings.audioChatMode == AudioChatMode.speechToText ||
+          settings.audioChatMode == AudioChatMode.interleaved) {
+        return settings.copyWith(audioChatMode: AudioChatMode.textToSpeech);
+      }
+    } else if (caps.audioIn && caps.audioOut) {
+      if (settings.audioChatMode == AudioChatMode.textOnly) {
+        return settings.copyWith(audioChatMode: AudioChatMode.interleaved);
+      }
+    } else {
+      if (settings.audioChatMode != AudioChatMode.textOnly) {
+        return settings.copyWith(audioChatMode: AudioChatMode.textOnly);
+      }
+    }
+    return settings;
+  }
+
+  @visibleForTesting
+  static String? systemPromptFor({
+    required ChatSettings settings,
+    required AppUIMode uiMode,
+    bool isAudioPrompt = false,
+  }) {
+    final rawPersona = uiMode == AppUIMode.ttsStudio
+        ? settings.ttsStudioVoice
+        : settings.chatVoice;
+    final voicePersona = rawPersona.trim();
+    final personaSuffix = voicePersona.isNotEmpty ? ' $voicePersona' : '';
+    final mode = settings.audioChatMode;
+    if (mode == AudioChatMode.interleaved) {
+      return 'Respond with interleaved text and audio.$personaSuffix'.trim();
+    }
+    if (mode == AudioChatMode.textToSpeech && !isAudioPrompt) {
+      return 'Perform TTS.$personaSuffix'.trim();
+    }
+    return null;
   }
 
   @override

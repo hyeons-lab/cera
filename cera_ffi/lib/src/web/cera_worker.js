@@ -564,7 +564,7 @@ const OPS = {
     const currentPos = position();
     const userContent =
       prompt && prompt.trim().length > 0
-        ? `${prompt.trim()} ${markerName}`
+        ? `${prompt.trim()}\n${markerName}`
         : markerName;
     const messages = [];
     if (currentPos === 0) {
@@ -590,7 +590,6 @@ const OPS = {
     let prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
     const bosId = tk.bosToken ?? tk.bosTokenId;
     if (splitIdx === -1 && prompt && prompt.trim() !== '') {
-      const currentPos = position();
       prefix = Array.from(encodePrompt(prompt, currentPos === 0));
     } else if (position() === 0 && tk.addBosToken && bosId != null) {
       if (prefix.length === 0 || prefix[0] !== bosId) {
