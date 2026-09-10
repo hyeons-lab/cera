@@ -8,7 +8,7 @@ import 'package:test/test.dart';
 
 /// Compile-time guard on the generated binding surface.
 ///
-/// These are not behavior tests — none of them call into the native library.
+/// These are not behavior tests: none of them call into the native library.
 /// They exist because two whole classes of regression are invisible to
 /// `dart analyze`:
 ///
@@ -248,6 +248,55 @@ void main() {
     expect(msg.images, isEmpty);
     expect(msg.audio, isNotNull);
   });
+
+  test(
+    'Keyword spotting and Whisper ASR types are exposed on the Dart surface',
+    () {
+      expect(_hotwordDetectorSurfaceGuard, isA<Function>());
+      expect(_hotwordIteratorSurfaceGuard, isA<Function>());
+      expect(_whisperModelSurfaceGuard, isA<Function>());
+      expect(_hotwordFunctionGuard, isA<Function>());
+      const cfg = FfiHotwordConfig(
+        threshold: 0.75,
+        cooldownMs: 2000,
+        stepMs: 80,
+        windowMs: 1200,
+        preRollMs: 100,
+        vadThreshold: 0.5,
+      );
+      expect(cfg.threshold, 0.75);
+      expect(cfg.vadThreshold, 0.5);
+      expect(cfg.stepMs, 80);
+
+      const score = FfiHotwordScore(keyword: 'hey liquid', score: 0.95);
+      expect(score.keyword, 'hey liquid');
+      expect(score.score, 0.95);
+
+      const event = FfiHotwordEvent(
+        keyword: 'hey liquid',
+        sampleOffset: 19200,
+        commandStartSample: 16000,
+        timestampMs: 1200.0,
+        confidence: 0.95,
+      );
+      expect(event.keyword, 'hey liquid');
+      expect(event.confidence, 0.95);
+      expect(event.timestampMs, 1200.0);
+      expect(event.sampleOffset, 19200);
+      expect(event.commandStartSample, 16000);
+
+      const whisperOpts = FfiWhisperTranscribeOpts(
+        language: null,
+        translate: false,
+        timestamps: false,
+        maxTokens: 448,
+        temperature: 0.0,
+      );
+      expect(whisperOpts.translate, isFalse);
+      expect(whisperOpts.timestamps, isFalse);
+      expect(whisperOpts.temperature, 0.0);
+    },
+  );
 }
 
 void Function(FfiSileroVad) get _vadSurfaceGuard => (FfiSileroVad vad) {
@@ -263,6 +312,34 @@ void Function(FfiVadIterator, FfiSileroVad) get _vadIteratorSurfaceGuard => (
   it.processChunk(vad, const <double>[]);
   it.flush();
   it.reset();
+};
+
+void Function(FfiHotwordDetector) get _hotwordDetectorSurfaceGuard => (
+  FfiHotwordDetector detector,
+) {
+  detector.keywords();
+  detector.processWindow(const <double>[]);
+};
+
+void Function(FfiHotwordIterator) get _hotwordIteratorSurfaceGuard => (
+  FfiHotwordIterator it,
+) {
+  final FfiHotwordEvent? _ = it.processChunk(const <double>[]);
+  it.reset();
+};
+
+void Function(FfiWhisperModel) get _whisperModelSurfaceGuard => (
+  FfiWhisperModel model,
+) {
+  final String _ = model.transcribe(const <double>[], null);
+  final Future<String> _ = model.transcribeAsync(const <double>[], null);
+  final List<String> _ = model.languages();
+  final bool _ = model.isMultilingual();
+};
+
+void Function() get _hotwordFunctionGuard => () {
+  final FfiHotwordConfig Function() _ = hotwordDefaultConfig;
+  final FfiWhisperTranscribeOpts Function() _ = whisperDefaultTranscribeOpts;
 };
 
 /// Compile-time reference to every method that used to be a runtime stub.

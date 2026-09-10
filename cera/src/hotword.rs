@@ -978,11 +978,13 @@ impl HotwordIterator {
             // Gating: if VAD is active and reported no speech within the window, skip KWS
             let window_samples = self.detector.weights.window_samples as u64;
             if self.vad.is_some() {
+                let lag_margin = self.vad_frame_size as u64;
                 let speech_in_window = match self.last_vad_speech_sample {
                     Some(last_sample) => {
-                        self.vad_processed_samples.saturating_sub(last_sample) <= window_samples
+                        self.vad_processed_samples.saturating_sub(last_sample)
+                            <= window_samples.saturating_add(lag_margin)
                     }
-                    None => self.vad_processed_samples < self.vad_frame_size as u64,
+                    None => self.vad_processed_samples < lag_margin,
                 };
                 if !speech_in_window {
                     continue;
@@ -1043,14 +1045,12 @@ impl HotwordIterator {
                 let pre_roll_samples = (self.config.pre_roll_ms as u64 * sample_rate) / 1000;
 
                 self.cooldown_until_sample = self.current_sample.saturating_add(cooldown_samples);
-                let keyword = self.detector.weights.keywords[idx].clone();
-                let sample_offset = self.current_sample;
-                let command_start_sample = sample_offset.saturating_sub(pre_roll_samples);
-                let timestamp_ms = (sample_offset as f64 * 1000.0 / sample_rate as f64) as f32;
-
                 if detected_event.is_none() {
+                    let sample_offset = self.current_sample;
+                    let command_start_sample = sample_offset.saturating_sub(pre_roll_samples);
+                    let timestamp_ms = (sample_offset as f64 * 1000.0 / sample_rate as f64) as f32;
                     detected_event = Some(HotwordEvent {
-                        keyword,
+                        keyword: self.detector.weights.keywords[idx].clone(),
                         sample_offset,
                         command_start_sample,
                         timestamp_ms,

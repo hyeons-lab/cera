@@ -38,6 +38,8 @@ filesystem tree manually" workaround.
 | 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
 | 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
 | 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`); both shipped |
+| 20+ | Native Keyword Spotting (KWS): `FfiHotwordConfig`, `FfiHotwordScore`, `FfiHotwordEvent`, `FfiHotwordDetector`, and `FfiHotwordIterator` (`process_chunk`, `reset`) |
+| 21+ | OpenAI Whisper ASR: `FfiWhisperModel`, `FfiWhisperTranscribeOpts`, `whisper_default_transcribe_opts` with synchronous/asynchronous transcription and cooperative task cancellation |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -996,6 +998,25 @@ do {
   audio-capable bundle (`UnsupportedModality` otherwise) and `sampleRate`
   must match the encoder's expected rate. Blocking; wrap it in
   `spawn_blocking` / `Task.detached` from an async context.
+
+## Keyword Spotting & Whisper ASR
+
+### Keyword Spotting (Wake Word Detection)
+
+`cera-ffi` exposes the native streaming wake word engine (`FfiHotwordDetector`, `FfiHotwordIterator`, `FfiHotwordConfig`, `FfiHotwordEvent`):
+
+- **`FfiHotwordDetector.fromFile(path)`** / **`fromBytes(bytes)`**: Loads a self-describing GGUF keyword spotting model (`kws.keywords`, window/hop dimensions, thresholds) with zero-allocation forward inference.
+- **`FfiHotwordIterator.fromFiles(detectorPath, vadPath, config)`**: Creates a streaming state machine with integrated circular ring buffering, 30.0x AGC peak normalization, Silero VAD gating, and post-detection lockout debounce.
+- **`iterator.processChunk(chunk)`**: Ingests arbitrary chunks of 16 kHz mono PCM float samples and returns any triggered `FfiHotwordEvent` (keyword, confidence, timestamp, audio sample offset) or `None`.
+- **`iterator.reset()`**: Clears ring buffers and debounces after command execution.
+
+### Whisper Speech Recognition (ASR)
+
+`cera-ffi` exposes pure-Rust OpenAI Whisper transcription (`FfiWhisperModel`, `FfiWhisperTranscribeOpts`):
+
+- **`FfiWhisperModel.fromFile(path)`** / **`fromBytes(bytes)`**: Instantiates the Whisper model from standard GGUF weights.
+- **`model.transcribe(pcm, opts)`**: Synchronous transcription returning recognized text.
+- **`model.transcribeAsync(pcm, opts)`**: Non-blocking asynchronous transcription powered by Tokio, supporting cooperative task cancellation when host listening states are dismissed.
 
 ## Design notes
 
