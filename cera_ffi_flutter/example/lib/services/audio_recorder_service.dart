@@ -90,12 +90,11 @@ class AudioRecorderService {
   }) async {
     if (!_isRecording) return [];
     _isRecording = false;
-    await _streamSub?.cancel();
-    _streamSub = null;
-    _leftoverByte = null;
-
     List<double> pcm;
     if (kIsWeb) {
+      await _streamSub?.cancel();
+      _streamSub = null;
+      _leftoverByte = null;
       final blobUrl = await _recorder.stop();
       if (blobUrl != null && blobUrl.isNotEmpty) {
         final decoded = await web_audio.decodeAudioBlob(
@@ -110,6 +109,9 @@ class AudioRecorderService {
       try {
         await _recorder.stop();
       } catch (_) {}
+      await _streamSub?.cancel();
+      _streamSub = null;
+      _leftoverByte = null;
       pcm = List<double>.from(_accumulatedPcm);
       _accumulatedPcm.clear();
     }

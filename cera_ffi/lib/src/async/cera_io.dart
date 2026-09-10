@@ -535,11 +535,21 @@ class _NativeCera implements Cera {
               ? '${prompt.trim()}\n$markerName'
               : markerName;
 
+      final messages = <ChatMessage>[
+        if (_session.position() == 0)
+          ChatMessage(
+            role: 'system',
+            content:
+                _capabilities.audioOut
+                    ? 'Respond with interleaved text and audio.'
+                    : 'Respond to the user.',
+          ),
+        ChatMessage(role: 'user', content: userContent),
+      ];
+
       String formatted;
       try {
-        formatted = _engine.applyChatTemplate([
-          ChatMessage(role: 'user', content: userContent),
-        ], true);
+        formatted = _engine.applyChatTemplate(messages, true);
       } catch (_) {
         formatted = userContent;
       }
@@ -547,11 +557,22 @@ class _NativeCera implements Cera {
       final allTokens = _engine.encodeText(formatted);
       final splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
 
+      List<int> prefixTokens;
       if (splitIdx > 0) {
-        _session.appendTokens(allTokens.sublist(0, splitIdx));
+        prefixTokens = allTokens.sublist(0, splitIdx);
       } else if (splitIdx == -1 && prompt != null && prompt.trim().isNotEmpty) {
-        final promptTokens = _frame(prompt);
-        if (promptTokens.isNotEmpty) _session.appendTokens(promptTokens);
+        prefixTokens = _frame(prompt);
+      } else {
+        prefixTokens = [];
+      }
+
+      if (_session.position() == 0 &&
+          _bosToken != null &&
+          (prefixTokens.isEmpty || prefixTokens.first != _bosToken)) {
+        prefixTokens = [_bosToken, ...prefixTokens];
+      }
+      if (prefixTokens.isNotEmpty) {
+        _session.appendTokens(prefixTokens);
       }
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       _session.appendAudio(floatList, sampleRate);

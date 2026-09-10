@@ -444,14 +444,46 @@ class ChatController extends ValueNotifier<ChatState> {
 
       _ceraEngine = cera;
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
+      final String voiceTag;
+      if (cera.capabilities.audioIn && cera.capabilities.audioOut) {
+        voiceTag = ' · Voice';
+      } else if (cera.capabilities.audioIn) {
+        voiceTag = ' · ASR';
+      } else if (cera.capabilities.audioOut) {
+        voiceTag = ' · Audio';
+      } else {
+        voiceTag = '';
+      }
+
+      var effectiveSettings = value.settings;
+      if (cera.capabilities.audioIn && !cera.capabilities.audioOut) {
+        if (effectiveSettings.audioChatMode != AudioChatMode.speechToText) {
+          effectiveSettings = effectiveSettings.copyWith(
+            audioChatMode: AudioChatMode.speechToText,
+          );
+        }
+      } else if (!cera.capabilities.audioIn && cera.capabilities.audioOut) {
+        if (effectiveSettings.audioChatMode == AudioChatMode.speechToText) {
+          effectiveSettings = effectiveSettings.copyWith(
+            audioChatMode: AudioChatMode.textToSpeech,
+          );
+        }
+      } else if (cera.capabilities.audioIn && cera.capabilities.audioOut) {
+        if (effectiveSettings.audioChatMode == AudioChatMode.textOnly) {
+          effectiveSettings = effectiveSettings.copyWith(
+            audioChatMode: AudioChatMode.interleaved,
+          );
+        }
+      }
 
       value = value.copyWith(
         loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
         backend: () => cera.backend,
-        status: '${modelSource.name} · ${cera.backend}$visionTag',
+        status: '${modelSource.name} · ${cera.backend}$visionTag$voiceTag',
         isLoading: false,
         downloadFraction: () => null,
+        settings: effectiveSettings,
       );
 
       // Persist preferences
@@ -662,7 +694,9 @@ class ChatController extends ValueNotifier<ChatState> {
         ? intent.pcmSamples.length / intent.sampleRate
         : 0.0;
     final promptText = intent.prompt.trim();
-    final isAsr = value.settings.audioChatMode == AudioChatMode.speechToText;
+    final isAsr =
+        value.settings.audioChatMode == AudioChatMode.speechToText ||
+        !(value.capabilities?.audioOut ?? false);
 
     final generationId = ++_generationId;
     final userTurn = Turn(
@@ -1066,11 +1100,21 @@ class ChatController extends ValueNotifier<ChatState> {
           }
           _ceraEngine = reloaded;
           final visionTag = reloaded.capabilities.imageIn ? ' · Vision' : '';
+          final String voiceTag;
+          if (reloaded.capabilities.audioIn && reloaded.capabilities.audioOut) {
+            voiceTag = ' · Voice';
+          } else if (reloaded.capabilities.audioIn) {
+            voiceTag = ' · ASR';
+          } else if (reloaded.capabilities.audioOut) {
+            voiceTag = ' · Audio';
+          } else {
+            voiceTag = '';
+          }
           value = value.copyWith(
             isLoading: false,
             capabilities: () => reloaded.capabilities,
             backend: () => reloaded.backend,
-            status: '${current.name} · ${reloaded.backend}$visionTag',
+            status: '${current.name} · ${reloaded.backend}$visionTag$voiceTag',
           );
         } catch (err) {
           if (_disposed || _loadSessionId != resetId) return;

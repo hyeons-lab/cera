@@ -21,6 +21,7 @@ class MessageComposer extends StatefulWidget {
     required this.onPickImage,
     required this.onClearImage,
     required this.onSendAudio,
+    this.audioRecorder,
   });
 
   final TextEditingController controller;
@@ -35,13 +36,14 @@ class MessageComposer extends StatefulWidget {
   final VoidCallback onPickImage;
   final VoidCallback onClearImage;
   final void Function(List<double> pcm, int sampleRate) onSendAudio;
+  final AudioRecorderService? audioRecorder;
 
   @override
   State<MessageComposer> createState() => _MessageComposerState();
 }
 
 class _MessageComposerState extends State<MessageComposer> {
-  final AudioRecorderService _audioRecorder = AudioRecorderService();
+  late final AudioRecorderService _audioRecorder;
   bool _isStartingRecording = false;
   bool _isRecordingAudio = false;
   bool _draggedToCancel = false;
@@ -50,9 +52,17 @@ class _MessageComposerState extends State<MessageComposer> {
   Timer? _recordTimer;
 
   @override
+  void initState() {
+    super.initState();
+    _audioRecorder = widget.audioRecorder ?? AudioRecorderService();
+  }
+
+  @override
   void dispose() {
     _recordTimer?.cancel();
-    _audioRecorder.dispose();
+    if (widget.audioRecorder == null) {
+      _audioRecorder.dispose();
+    }
     super.dispose();
   }
 

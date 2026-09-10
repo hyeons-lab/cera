@@ -786,48 +786,59 @@ class _ChatPageState extends State<ChatPage> {
                                 scrollDirection: Axis.horizontal,
                                 child: Row(
                                   children: [
-                                    _AudioModeChip(
-                                      label: 'Speech to Text (ASR)',
-                                      icon: Icons.transcribe_rounded,
-                                      isSelected:
-                                          state.settings.audioChatMode ==
-                                          AudioChatMode.speechToText,
-                                      onTap: () => _controller.dispatch(
-                                        const UpdateSettingsIntent(
-                                          audioChatMode:
-                                              AudioChatMode.speechToText,
+                                    if ((state.capabilities?.audioIn ??
+                                            false) &&
+                                        (state.capabilities?.audioOut ??
+                                            false)) ...[
+                                      _AudioModeChip(
+                                        label: 'Voice Chat',
+                                        icon: Icons.record_voice_over_outlined,
+                                        isSelected:
+                                            state.settings.audioChatMode ==
+                                            AudioChatMode.interleaved,
+                                        onTap: () => _controller.dispatch(
+                                          const UpdateSettingsIntent(
+                                            audioChatMode:
+                                                AudioChatMode.interleaved,
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    _AudioModeChip(
-                                      label: 'Voice Chat',
-                                      icon: Icons.record_voice_over_outlined,
-                                      isSelected:
-                                          state.settings.audioChatMode ==
-                                          AudioChatMode.interleaved,
-                                      onTap: () => _controller.dispatch(
-                                        const UpdateSettingsIntent(
-                                          audioChatMode:
-                                              AudioChatMode.interleaved,
+                                      const SizedBox(width: 6),
+                                    ],
+                                    if (state.capabilities?.audioIn ??
+                                        false) ...[
+                                      _AudioModeChip(
+                                        label: 'Speech to Text (ASR)',
+                                        icon: Icons.transcribe_rounded,
+                                        isSelected:
+                                            state.settings.audioChatMode ==
+                                            AudioChatMode.speechToText,
+                                        onTap: () => _controller.dispatch(
+                                          const UpdateSettingsIntent(
+                                            audioChatMode:
+                                                AudioChatMode.speechToText,
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    _AudioModeChip(
-                                      label: 'Text to Speech (TTS)',
-                                      icon: Icons.volume_up_outlined,
-                                      isSelected:
-                                          state.settings.audioChatMode ==
-                                          AudioChatMode.textToSpeech,
-                                      onTap: () => _controller.dispatch(
-                                        const UpdateSettingsIntent(
-                                          audioChatMode:
-                                              AudioChatMode.textToSpeech,
+                                      const SizedBox(width: 6),
+                                    ],
+                                    if (state.capabilities?.audioOut ??
+                                        false) ...[
+                                      _AudioModeChip(
+                                        label: 'Text to Speech (TTS)',
+                                        icon: Icons.volume_up_outlined,
+                                        isSelected:
+                                            state.settings.audioChatMode ==
+                                            AudioChatMode.textToSpeech,
+                                        onTap: () => _controller.dispatch(
+                                          const UpdateSettingsIntent(
+                                            audioChatMode:
+                                                AudioChatMode.textToSpeech,
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                    const SizedBox(width: 6),
+                                      const SizedBox(width: 6),
+                                    ],
                                     _AudioModeChip(
                                       label: 'Text Only',
                                       icon: Icons.chat_bubble_outline_rounded,
