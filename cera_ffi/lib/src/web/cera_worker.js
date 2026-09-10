@@ -539,7 +539,7 @@ const OPS = {
   /**
    * Feed mono PCM audio into the live conversation.
    */
-  async appendAudio({ pcm, sampleRate, prompt }) {
+  async appendAudio({ pcm, sampleRate, prompt, systemPrompt }) {
     const t0 = performance.now();
     const samples = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
     const sr = sampleRate ?? 16000;
@@ -564,14 +564,20 @@ const OPS = {
     const currentPos = position();
     const userContent =
       prompt && prompt.trim().length > 0
-        ? `${prompt.trim()} ${markerName}`
+        ? `${prompt.trim()}\n${markerName}`
         : markerName;
     const messages = [];
     if (currentPos === 0) {
-      const systemPrompt = capabilitiesOf().audioOut
+      const defaultSystemPrompt = capabilitiesOf().audioOut
         ? 'Respond with interleaved text and audio.'
         : 'Respond to the user.';
-      messages.push({ role: 'system', content: systemPrompt });
+      const effectiveSystemPrompt =
+        systemPrompt !== undefined && systemPrompt !== null
+          ? systemPrompt.trim()
+          : defaultSystemPrompt;
+      if (effectiveSystemPrompt.length > 0) {
+        messages.push({ role: 'system', content: effectiveSystemPrompt });
+      }
     }
     messages.push({ role: 'user', content: userContent });
     let formatted;
@@ -586,7 +592,6 @@ const OPS = {
     let prefix = splitIdx > 0 ? allTokens.slice(0, splitIdx) : [];
     const bosId = tk.bosToken ?? tk.bosTokenId;
     if (splitIdx === -1 && prompt && prompt.trim() !== '') {
-      const currentPos = position();
       prefix = Array.from(encodePrompt(prompt, currentPos === 0));
     } else if (position() === 0 && tk.addBosToken && bosId != null) {
       if (prefix.length === 0 || prefix[0] !== bosId) {

@@ -565,6 +565,7 @@ abstract interface class Cera {
     List<double> pcm, {
     int sampleRate = 16000,
     String? prompt,
+    String? systemPrompt,
   });
 
   /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16kHz inputs are

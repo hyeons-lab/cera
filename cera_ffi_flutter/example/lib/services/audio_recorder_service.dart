@@ -90,12 +90,11 @@ class AudioRecorderService {
   }) async {
     if (!_isRecording) return [];
     _isRecording = false;
-    await _streamSub?.cancel();
-    _streamSub = null;
-    _leftoverByte = null;
-
     List<double> pcm;
     if (kIsWeb) {
+      await _streamSub?.cancel();
+      _streamSub = null;
+      _leftoverByte = null;
       final blobUrl = await _recorder.stop();
       if (blobUrl != null && blobUrl.isNotEmpty) {
         final decoded = await web_audio.decodeAudioBlob(
@@ -110,6 +109,9 @@ class AudioRecorderService {
       try {
         await _recorder.stop();
       } catch (_) {}
+      await _streamSub?.cancel();
+      _streamSub = null;
+      _leftoverByte = null;
       pcm = List<double>.from(_accumulatedPcm);
       _accumulatedPcm.clear();
     }
@@ -244,7 +246,10 @@ class AudioRecorderService {
       return sanitized;
     }
 
-    final scale = targetPeak / maxAmp;
+    final peak = (targetPeak.isFinite && targetPeak > 0.0 && targetPeak <= 1.0)
+        ? targetPeak
+        : 0.9;
+    final scale = peak / maxAmp;
     final normalized = Float32List(samples.length);
     for (var i = 0; i < samples.length; i++) {
       final s = samples[i];

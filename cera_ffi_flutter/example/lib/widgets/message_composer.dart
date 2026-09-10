@@ -21,6 +21,7 @@ class MessageComposer extends StatefulWidget {
     required this.onPickImage,
     required this.onClearImage,
     required this.onSendAudio,
+    this.audioRecorder,
   });
 
   final TextEditingController controller;
@@ -35,13 +36,18 @@ class MessageComposer extends StatefulWidget {
   final VoidCallback onPickImage;
   final VoidCallback onClearImage;
   final void Function(List<double> pcm, int sampleRate) onSendAudio;
+  final AudioRecorderService? audioRecorder;
 
   @override
   State<MessageComposer> createState() => _MessageComposerState();
 }
 
 class _MessageComposerState extends State<MessageComposer> {
-  final AudioRecorderService _audioRecorder = AudioRecorderService();
+  AudioRecorderService? _localRecorder;
+
+  AudioRecorderService get _audioRecorder =>
+      widget.audioRecorder ?? (_localRecorder ??= AudioRecorderService());
+
   bool _isStartingRecording = false;
   bool _isRecordingAudio = false;
   bool _draggedToCancel = false;
@@ -50,9 +56,23 @@ class _MessageComposerState extends State<MessageComposer> {
   Timer? _recordTimer;
 
   @override
+  void didUpdateWidget(MessageComposer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.audioRecorder != oldWidget.audioRecorder) {
+      if (widget.audioRecorder != null && _localRecorder != null) {
+        _localRecorder!.dispose();
+        _localRecorder = null;
+      }
+    }
+  }
+
+  @override
   void dispose() {
     _recordTimer?.cancel();
-    _audioRecorder.dispose();
+    if (_isRecordingAudio || _isStartingRecording) {
+      _audioRecorder.cancelRecording().ignore();
+    }
+    _localRecorder?.dispose();
     super.dispose();
   }
 

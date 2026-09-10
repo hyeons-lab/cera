@@ -52,6 +52,7 @@ extension type _Request._(JSObject _) implements JSObject {
     JSAny? pcm,
     int? sampleRate,
     String? prompt,
+    String? systemPrompt,
     int? maxTokens,
     double? temperature,
     double? topP,
@@ -750,6 +751,7 @@ class _WorkerCera implements Cera {
     List<double> pcm, {
     int sampleRate = 16000,
     String? prompt,
+    String? systemPrompt,
   }) async {
     final ahead = _queue;
     final mine = Completer<void>();
@@ -768,6 +770,7 @@ class _WorkerCera implements Cera {
           pcm: Float32List.view(buffer.toDart).toJS,
           sampleRate: sampleRate,
           prompt: prompt,
+          systemPrompt: systemPrompt,
         ),
         transfer: <JSAny>[buffer],
       );

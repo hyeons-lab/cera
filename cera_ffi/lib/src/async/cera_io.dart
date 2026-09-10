@@ -501,6 +501,7 @@ class _NativeCera implements Cera {
     List<double> pcm, {
     int sampleRate = 16000,
     String? prompt,
+    String? systemPrompt,
   }) async {
     final ahead = _queue;
     final mine = Completer<void>();
@@ -535,11 +536,22 @@ class _NativeCera implements Cera {
               ? '${prompt.trim()}\n$markerName'
               : markerName;
 
+      final defaultSystemPrompt =
+          _capabilities.audioOut
+              ? 'Respond with interleaved text and audio.'
+              : 'Respond to the user.';
+      final effectiveSystemPrompt =
+          systemPrompt != null ? systemPrompt.trim() : defaultSystemPrompt;
+
+      final messages = <ChatMessage>[
+        if (_session.position() == 0 && effectiveSystemPrompt.isNotEmpty)
+          ChatMessage(role: 'system', content: effectiveSystemPrompt),
+        ChatMessage(role: 'user', content: userContent),
+      ];
+
       String formatted;
       try {
-        formatted = _engine.applyChatTemplate([
-          ChatMessage(role: 'user', content: userContent),
-        ], true);
+        formatted = _engine.applyChatTemplate(messages, true);
       } catch (_) {
         formatted = userContent;
       }
@@ -547,11 +559,23 @@ class _NativeCera implements Cera {
       final allTokens = _engine.encodeText(formatted);
       final splitIdx = markerId != null ? allTokens.indexOf(markerId) : -1;
 
+      List<int> prefixTokens;
       if (splitIdx > 0) {
-        _session.appendTokens(allTokens.sublist(0, splitIdx));
+        prefixTokens = allTokens.sublist(0, splitIdx);
       } else if (splitIdx == -1 && prompt != null && prompt.trim().isNotEmpty) {
-        final promptTokens = _frame(prompt);
-        if (promptTokens.isNotEmpty) _session.appendTokens(promptTokens);
+        prefixTokens = _frame(prompt);
+      } else {
+        prefixTokens = [];
+      }
+
+      final bos = _bosToken;
+      if (_session.position() == 0 &&
+          bos != null &&
+          (prefixTokens.isEmpty || prefixTokens.first != bos)) {
+        prefixTokens = [bos, ...prefixTokens];
+      }
+      if (prefixTokens.isNotEmpty) {
+        _session.appendTokens(prefixTokens);
       }
       final floatList = pcm is Float32List ? pcm : Float32List.fromList(pcm);
       _session.appendAudio(floatList, sampleRate);

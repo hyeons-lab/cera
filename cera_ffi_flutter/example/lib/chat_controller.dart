@@ -24,6 +24,9 @@ class ChatController extends ValueNotifier<ChatState> {
     _loadDownloadedRecords();
   }
 
+  /// Fixed output sampling rate for Cera vocoder neural audio models (24 kHz).
+  static const int vocoderSampleRate = 24000;
+
   final Future<String?> Function() _defaultStoreDir;
   final AudioPlayerService _audioPlayer = AudioPlayerService();
   Cera? _ceraEngine;
@@ -444,14 +447,21 @@ class ChatController extends ValueNotifier<ChatState> {
 
       _ceraEngine = cera;
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
+      final voiceTag = voiceTagFor(cera.capabilities);
+
+      final effectiveSettings = alignAudioMode(
+        value.settings,
+        cera.capabilities,
+      );
 
       value = value.copyWith(
         loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
         backend: () => cera.backend,
-        status: '${modelSource.name} · ${cera.backend}$visionTag',
+        status: '${modelSource.name} · ${cera.backend}$visionTag$voiceTag',
         isLoading: false,
         downloadFraction: () => null,
+        settings: effectiveSettings,
       );
 
       // Persist preferences
@@ -584,14 +594,11 @@ class ChatController extends ValueNotifier<ChatState> {
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
-    final voicePersona = value.uiMode == AppUIMode.ttsStudio
-        ? value.settings.ttsStudioVoice
-        : value.settings.chatVoice;
-    final String? systemPrompt = isTts
-        ? 'Perform TTS. $voicePersona'.trim()
-        : (isInterleaved
-              ? 'Respond with interleaved text and audio. $voicePersona'.trim()
-              : null);
+    final systemPrompt = systemPromptFor(
+      settings: value.settings,
+      uiMode: value.uiMode,
+      isAudioPrompt: false,
+    );
 
     final messages = <CeraMessage>[
       if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -735,6 +742,12 @@ class ChatController extends ValueNotifier<ChatState> {
       }
     }
 
+    final systemPrompt = systemPromptFor(
+      settings: value.settings,
+      uiMode: value.uiMode,
+      isAudioPrompt: true,
+    );
+
     try {
       debugPrint(
         '[cera:chat] Encoding audio prompt (${intent.pcmSamples.length} samples at ${intent.sampleRate} Hz, text: "$promptText")...',
@@ -743,6 +756,7 @@ class ChatController extends ValueNotifier<ChatState> {
         intent.pcmSamples,
         sampleRate: intent.sampleRate,
         prompt: promptText,
+        systemPrompt: systemPrompt,
       );
       debugPrint(
         '[cera:chat] Audio successfully encoded and seeded into KV cache',
@@ -826,7 +840,7 @@ class ChatController extends ValueNotifier<ChatState> {
         (value.capabilities?.audioOut ?? false) && isAudioChat;
 
     if (shouldStreamAudio) {
-      _audioPlayer.startStream(sampleRate: 24000);
+      _audioPlayer.startStream(sampleRate: vocoderSampleRate);
     }
 
     try {
@@ -949,7 +963,7 @@ class ChatController extends ValueNotifier<ChatState> {
                 ? (totalTokens / (totalMs / 1000.0))
                 : 0.0);
 
-      final rate = (audioSampleRate ?? 24000).toDouble();
+      final rate = (audioSampleRate ?? vocoderSampleRate).toDouble();
       final audioDurationSec = generatedAudioSamples.isNotEmpty
           ? (generatedAudioSamples.length / rate)
           : null;
@@ -1066,11 +1080,12 @@ class ChatController extends ValueNotifier<ChatState> {
           }
           _ceraEngine = reloaded;
           final visionTag = reloaded.capabilities.imageIn ? ' · Vision' : '';
+          final voiceTag = voiceTagFor(reloaded.capabilities);
           value = value.copyWith(
             isLoading: false,
             capabilities: () => reloaded.capabilities,
             backend: () => reloaded.backend,
-            status: '${current.name} · ${reloaded.backend}$visionTag',
+            status: '${current.name} · ${reloaded.backend}$visionTag$voiceTag',
           );
         } catch (err) {
           if (_disposed || _loadSessionId != resetId) return;
@@ -1092,6 +1107,67 @@ class ChatController extends ValueNotifier<ChatState> {
     if (!_disposed) {
       value = value.copyWith(turns: []);
     }
+  }
+
+  @visibleForTesting
+  static String voiceTagFor(CeraCapabilities caps) {
+    if (caps.audioIn && caps.audioOut) {
+      return ' · Voice';
+    } else if (caps.audioIn) {
+      return ' · ASR';
+    } else if (caps.audioOut) {
+      return ' · Audio';
+    }
+    return '';
+  }
+
+  @visibleForTesting
+  static ChatSettings alignAudioMode(
+    ChatSettings settings,
+    CeraCapabilities caps,
+  ) {
+    if (caps.audioIn && !caps.audioOut) {
+      if (settings.audioChatMode != AudioChatMode.speechToText) {
+        return settings.copyWith(audioChatMode: AudioChatMode.speechToText);
+      }
+    } else if (!caps.audioIn && caps.audioOut) {
+      if (settings.audioChatMode == AudioChatMode.speechToText ||
+          settings.audioChatMode == AudioChatMode.interleaved) {
+        return settings.copyWith(audioChatMode: AudioChatMode.textToSpeech);
+      }
+    } else if (caps.audioIn && caps.audioOut) {
+      // Respect explicit textOnly fallback; otherwise upgrade to interleaved.
+      if (settings.audioChatMode != AudioChatMode.textOnly &&
+          settings.audioChatMode != AudioChatMode.interleaved) {
+        return settings.copyWith(audioChatMode: AudioChatMode.interleaved);
+      }
+    } else {
+      if (settings.audioChatMode != AudioChatMode.textOnly) {
+        return settings.copyWith(audioChatMode: AudioChatMode.textOnly);
+      }
+    }
+    return settings;
+  }
+
+  @visibleForTesting
+  static String? systemPromptFor({
+    required ChatSettings settings,
+    required AppUIMode uiMode,
+    bool isAudioPrompt = false,
+  }) {
+    final rawPersona = uiMode == AppUIMode.ttsStudio
+        ? settings.ttsStudioVoice
+        : settings.chatVoice;
+    final voicePersona = rawPersona.trim();
+    final personaSuffix = voicePersona.isNotEmpty ? ' $voicePersona' : '';
+    final mode = settings.audioChatMode;
+    if (mode == AudioChatMode.interleaved) {
+      return 'Respond with interleaved text and audio.$personaSuffix'.trim();
+    }
+    if (mode == AudioChatMode.textToSpeech && !isAudioPrompt) {
+      return 'Perform TTS.$personaSuffix'.trim();
+    }
+    return null;
   }
 
   @override
