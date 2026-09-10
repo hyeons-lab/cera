@@ -38,6 +38,11 @@ def create_mel_filterbank(
     fmax: float = 7600.0,
 ) -> np.ndarray:
     """Create triangular Mel filterbank matrix of shape (n_mels, n_fft // 2 + 1)."""
+    nyquist = sr / 2.0
+    if fmax is None or fmax > nyquist:
+        fmax = nyquist
+    if fmin > fmax * 0.5:
+        fmin = fmax * 0.5
     min_mel = hz_to_mel(fmin)
     max_mel = hz_to_mel(fmax)
     mel_points = np.linspace(min_mel, max_mel, n_mels + 2)
@@ -52,9 +57,9 @@ def create_mel_filterbank(
         f_m = bin_points[m]
         f_m_plus = bin_points[m + 1]
 
-        for k in range(f_m_minus, f_m):
+        for k in range(f_m_minus, min(f_m, n_bins)):
             fb[m - 1, k] = (k - f_m_minus) / max(f_m - f_m_minus, 1)
-        for k in range(f_m, f_m_plus):
+        for k in range(f_m, min(f_m_plus, n_bins)):
             fb[m - 1, k] = (f_m_plus - k) / max(f_m_plus - f_m, 1)
 
     return fb
@@ -405,7 +410,10 @@ def main() -> None:
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         print(f"Loading checkpoint from {args.checkpoint}...")
-        state_dict = torch.load(args.checkpoint, map_location="cpu")
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        state_dict = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else checkpoint
+        if state_dict is None:
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
         model.load_state_dict(state_dict)
     else:
         print("Initializing reference model weights (seed: %d)..." % args.seed)

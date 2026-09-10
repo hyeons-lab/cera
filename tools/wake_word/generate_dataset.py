@@ -10,7 +10,7 @@ import argparse
 import json
 import os
 import random
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 # ── Built-in Phonetic Dictionary & Substitution Rules ─────────────────────────
@@ -98,7 +98,7 @@ def generate_phonetic_near_misses(keyword: str) -> Set[str]:
     return near_misses
 
 
-def generate_positive_variants(keyword: str, aliases: List[str]) -> List[Dict[str, any]]:
+def generate_positive_variants(keyword: str, aliases: List[str]) -> List[Dict[str, Any]]:
     """
     Generate positive utterance definitions with acoustic perturbation parameters.
     """
@@ -131,7 +131,7 @@ def generate_positive_variants(keyword: str, aliases: List[str]) -> List[Dict[st
     return positives
 
 
-def generate_negative_variants(keyword: str, count: int = 5000) -> List[Dict[str, any]]:
+def generate_negative_variants(keyword: str, count: int = 5000) -> List[Dict[str, Any]]:
     """
     Generate negative sample definitions covering near-rhymes, confusers, and chatter.
     """

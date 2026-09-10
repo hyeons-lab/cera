@@ -137,10 +137,11 @@ impl LogMelFrontEnd {
             hann_window.push(val as f32);
         }
 
-        // Triangular HTK Mel filterbank: 32 bins from 80 Hz to 7600 Hz
+        // Triangular HTK Mel filterbank: 32 bins from 80 Hz to Nyquist (capped at 7600 Hz)
         let n_fft_bins = fft_size / 2 + 1;
-        let min_mel = hz_to_mel(80.0);
-        let max_mel = hz_to_mel(7600.0);
+        let nyquist_hz = (sample_rate as f64) / 2.0;
+        let min_mel = hz_to_mel(80.0f64.min(nyquist_hz * 0.5));
+        let max_mel = hz_to_mel(7600.0f64.min(nyquist_hz));
         let num_points = mel_bins + 2;
 
         let mut mel_points = Vec::with_capacity(num_points);
@@ -286,6 +287,10 @@ impl HotwordWeights {
                 expected_len,
                 t.numel()
             );
+            ensure!(
+                t.as_f32_slice().iter().all(|x| x.is_finite()),
+                "tensor '{name}' contains non-finite float values"
+            );
             Ok(t)
         }
 
@@ -363,12 +368,14 @@ impl HotwordWeights {
 
 #[inline(always)]
 fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    let clamped = x.clamp(-80.0, 80.0);
+    clamped / (1.0 + (-clamped).exp())
 }
 
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    let clamped = x.clamp(-80.0, 80.0);
+    1.0 / (1.0 + (-clamped).exp())
 }
 
 /// 1D Convolution with stride 2, padding 1, and SiLU activation.
@@ -377,6 +384,7 @@ fn sigmoid(x: f32) -> f32 {
 /// Output layout: `[out_c, out_len]` row-major.
 /// Weight layout: `[out_c, in_c, 3]` row-major.
 #[inline]
+#[allow(clippy::needless_range_loop)]
 fn conv1d_silu_s2(
     input: &[f32],
     output: &mut [f32],
@@ -397,6 +405,9 @@ fn conv1d_silu_s2(
         return;
     }
 
+    let interior_end = if in_len > 1 { (in_len - 1) / 2 } else { 0 };
+    let bound = interior_end.min(out_len);
+
     for (out_c, &b) in bias.iter().enumerate().take(out_channels) {
         let w_out = &weights[out_c * in_channels * 3..(out_c + 1) * in_channels * 3];
         let out_row_start = out_c * out_len;
@@ -406,8 +417,23 @@ fn conv1d_silu_s2(
         for in_c in 0..in_channels {
             let w_c = &w_out[in_c * 3..(in_c + 1) * 3];
             let in_row = &input[in_c * in_len..(in_c + 1) * in_len];
+            let (w0, w1, w2) = (w_c[0], w_c[1], w_c[2]);
 
-            for (out_idx, out_val) in out_row.iter_mut().enumerate() {
+            if out_len > 0 {
+                let mut acc0 = w1 * in_row[0];
+                if in_len > 1 {
+                    acc0 += w2 * in_row[1];
+                }
+                out_row[0] += acc0;
+            }
+
+            for out_idx in 1..bound {
+                let base = out_idx * 2 - 1;
+                out_row[out_idx] +=
+                    w0 * in_row[base] + w1 * in_row[base + 1] + w2 * in_row[base + 2];
+            }
+
+            for out_idx in bound.max(1)..out_len {
                 let mut acc = 0.0f32;
                 for (k, &w) in w_c.iter().enumerate() {
                     let in_pos = out_idx * 2 + k;
@@ -415,7 +441,7 @@ fn conv1d_silu_s2(
                         acc += w * in_row[in_pos - 1];
                     }
                 }
-                *out_val += acc;
+                out_row[out_idx] += acc;
             }
         }
 
@@ -564,15 +590,15 @@ impl HotwordDetector {
                 }
             }
         }
-        let input_window = if peak > 0.002 {
-            let scale = (0.7 / peak).min(30.0);
-            for (dst, &src) in self.window_scratch.iter_mut().zip(window.iter()) {
-                *dst = if src.is_finite() { src * scale } else { 0.0 };
-            }
-            &self.window_scratch[..]
+        let scale = if peak > 0.002 {
+            (0.7 / peak).min(30.0)
         } else {
-            window
+            1.0
         };
+        for (dst, &src) in self.window_scratch.iter_mut().zip(window.iter()) {
+            *dst = if src.is_finite() { src * scale } else { 0.0 };
+        }
+        let input_window = &self.window_scratch[..];
 
         // 2. Extract log-mel spectrogram
         self.front_end.extract(input_window, &mut self.mel_scratch);
@@ -672,11 +698,12 @@ struct CircularBuffer {
 
 impl CircularBuffer {
     fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
         Self {
-            buffer: vec![0.0f32; capacity],
+            buffer: vec![0.0f32; cap],
             write_pos: 0,
             count: 0,
-            capacity,
+            capacity: cap,
         }
     }
 
@@ -694,14 +721,17 @@ impl CircularBuffer {
                 *dst = if src.is_finite() { src } else { 0.0 };
             }
 
-            self.write_pos = (self.write_pos + take) % self.capacity;
+            self.write_pos += take;
+            if self.write_pos == self.capacity {
+                self.write_pos = 0;
+            }
             remain = tail;
         }
         self.count = self.count.saturating_add(slice.len()).min(self.capacity);
     }
 
     fn read_last(&self, n: usize, out: &mut [f32]) -> bool {
-        if out.len() < n || self.count == 0 {
+        if self.capacity == 0 || out.len() < n || self.count == 0 {
             return false;
         }
 
@@ -732,8 +762,6 @@ impl CircularBuffer {
 
 // ── Stateful Streaming Hotword Iterator ───────────────────────────────────────
 
-const VAD_FRAME_SIZE: usize = 512;
-
 /// Streaming Keyword Spotting manager with VAD gating and debounce state.
 pub struct HotwordIterator {
     detector: HotwordDetector,
@@ -741,6 +769,8 @@ pub struct HotwordIterator {
     ring_buffer: CircularBuffer,
     window_buffer: Vec<f32>,
     vad_buffer: Vec<f32>,
+    vad_frame_size: usize,
+    vad_sample_rate: crate::vad::VadSampleRate,
     vad_processed_samples: u64,
     config: HotwordConfig,
 
@@ -753,29 +783,22 @@ pub struct HotwordIterator {
     last_log_sample: u64,
 }
 
-#[cfg(target_os = "android")]
-unsafe extern "C" {
-    fn __android_log_print(
-        prio: std::os::raw::c_int,
-        tag: *const std::os::raw::c_char,
-        fmt: *const std::os::raw::c_char,
-        ...
-    ) -> std::os::raw::c_int;
-}
-
-#[cfg(target_os = "android")]
-const ANDROID_TAG: &[u8] = b"HotwordDetector\0";
-
 impl HotwordIterator {
     /// Create a new streaming `HotwordIterator`.
     pub fn new(detector: HotwordDetector, vad: Option<SileroVad>, config: HotwordConfig) -> Self {
         let window_samples = detector.weights.window_samples;
         let ring_capacity = (window_samples * 2).max(24_000);
+        let (vad_frame_size, vad_sample_rate) = match detector.weights.sample_rate {
+            8000 => (256, crate::vad::VadSampleRate::Rate8kHz),
+            _ => (512, crate::vad::VadSampleRate::Rate16kHz),
+        };
 
         Self {
             ring_buffer: CircularBuffer::new(ring_capacity),
             window_buffer: vec![0.0f32; window_samples],
             vad_buffer: Vec::with_capacity(2048),
+            vad_frame_size,
+            vad_sample_rate,
             vad_processed_samples: 0,
             detector,
             vad,
@@ -834,21 +857,21 @@ impl HotwordIterator {
             remain = rest;
 
             self.ring_buffer.push_slice(sub_chunk);
-            self.current_sample += sub_chunk.len() as u64;
+            self.current_sample = self.current_sample.saturating_add(sub_chunk.len() as u64);
 
-            // 1. Step Silero VAD if attached (VAD_FRAME_SIZE increments)
+            // 1. Step Silero VAD if attached (vad_frame_size increments)
             if let Some(vad) = &mut self.vad {
+                let frame_size = self.vad_frame_size;
                 self.vad_buffer.extend_from_slice(sub_chunk);
-                while self.vad_buffer.len() >= VAD_FRAME_SIZE {
-                    let prob = vad.process_chunk(
-                        &self.vad_buffer[..VAD_FRAME_SIZE],
-                        crate::vad::VadSampleRate::Rate16kHz,
-                    )?;
-                    self.vad_processed_samples += VAD_FRAME_SIZE as u64;
+                while self.vad_buffer.len() >= frame_size {
+                    let prob =
+                        vad.process_chunk(&self.vad_buffer[..frame_size], self.vad_sample_rate)?;
+                    self.vad_processed_samples =
+                        self.vad_processed_samples.saturating_add(frame_size as u64);
                     if prob >= self.config.vad_threshold {
                         self.last_vad_speech_sample = Some(self.vad_processed_samples);
                     }
-                    self.vad_buffer.drain(..VAD_FRAME_SIZE);
+                    self.vad_buffer.drain(..frame_size);
                 }
             }
 
@@ -865,7 +888,7 @@ impl HotwordIterator {
                     Some(last_sample) => {
                         self.vad_processed_samples.saturating_sub(last_sample) <= window_samples
                     }
-                    None => self.vad_processed_samples < VAD_FRAME_SIZE as u64,
+                    None => self.vad_processed_samples < self.vad_frame_size as u64,
                 };
                 if !speech_in_window {
                     continue;
@@ -881,6 +904,7 @@ impl HotwordIterator {
             }
 
             // 4. Run KWS inference
+            let sample_rate = self.detector.weights.sample_rate as u64;
             let scores = self.detector.process_window(&self.window_buffer)?;
             let max_score = scores.iter().cloned().fold(0.0f32, f32::max);
             self.latest_score = max_score;
@@ -888,56 +912,24 @@ impl HotwordIterator {
                 self.recent_peak_score = max_score;
             }
 
-            #[cfg(target_os = "android")]
-            {
-                if max_score >= self.config.threshold * 0.8 {
-                    unsafe {
-                        use std::ffi::CString;
-                        if let Ok(msg) = CString::new(format!(
-                            "KWS score: {:.4} (threshold: {:.4}, cooldown: {})",
-                            max_score,
-                            self.config.threshold,
-                            self.current_sample < self.cooldown_until_sample
-                        )) {
-                            __android_log_print(
-                                4,
-                                ANDROID_TAG.as_ptr() as *const _,
-                                b"%s\0".as_ptr() as *const _,
-                                msg.as_ptr(),
-                            );
-                        }
-                    }
-                }
-
-                if self.current_sample.saturating_sub(self.last_log_sample) >= 16_000 {
-                    self.last_log_sample = self.current_sample;
-                    unsafe {
-                        use std::ffi::CString;
-                        if let Ok(msg) = CString::new(format!(
-                            "KWS heartbeat [1s peak={:.4}, threshold={:.4}]",
-                            self.recent_peak_score, self.config.threshold
-                        )) {
-                            __android_log_print(
-                                3,
-                                ANDROID_TAG.as_ptr() as *const _,
-                                b"%s\0".as_ptr() as *const _,
-                                msg.as_ptr(),
-                            );
-                        }
-                    }
-                    self.recent_peak_score = 0.0;
-                }
+            if max_score >= self.config.threshold * 0.8 {
+                tracing::debug!(
+                    max_score,
+                    threshold = self.config.threshold,
+                    in_cooldown = self.current_sample < self.cooldown_until_sample,
+                    "KWS evaluation score"
+                );
             }
 
-            #[cfg(not(target_os = "android"))]
-            {
-                if max_score >= 0.05 {
-                    tracing::debug!(
-                        max_score,
-                        threshold = self.config.threshold,
-                        "KWS evaluation score"
-                    );
-                }
+            let log_interval_samples = sample_rate;
+            if self.current_sample.saturating_sub(self.last_log_sample) >= log_interval_samples {
+                self.last_log_sample = self.current_sample;
+                tracing::debug!(
+                    recent_peak = self.recent_peak_score,
+                    threshold = self.config.threshold,
+                    "KWS heartbeat"
+                );
+                self.recent_peak_score = 0.0;
             }
 
             // 5. Threshold & Debounce checks
@@ -952,11 +944,10 @@ impl HotwordIterator {
             };
 
             if let Some((idx, score)) = triggered {
-                let sample_rate = self.detector.weights.sample_rate as u64;
                 let cooldown_samples = (self.config.cooldown_ms as u64 * sample_rate) / 1000;
                 let pre_roll_samples = (self.config.pre_roll_ms as u64 * sample_rate) / 1000;
 
-                self.cooldown_until_sample = self.current_sample + cooldown_samples;
+                self.cooldown_until_sample = self.current_sample.saturating_add(cooldown_samples);
                 let keyword = self.detector.weights.keywords[idx].clone();
                 let sample_offset = self.current_sample;
                 let command_start_sample = sample_offset.saturating_sub(pre_roll_samples);
@@ -1047,5 +1038,186 @@ mod tests {
         cb.push_slice(&[]);
         assert_eq!(cb.count, 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_circular_buffer_streaming_parity_irregular_chunks() {
+        let capacity = 1000;
+        let mut cb = CircularBuffer::new(capacity);
+        let mut ground_truth = Vec::new();
+
+        let irregular_chunk_sizes = [480, 600, 160, 320, 512, 100, 1024, 50, 77];
+        let mut current_val = 1.0f32;
+
+        for &chunk_size in &irregular_chunk_sizes {
+            let chunk: Vec<f32> = (0..chunk_size)
+                .map(|_| {
+                    let v = current_val;
+                    current_val += 1.0;
+                    v
+                })
+                .collect();
+            cb.push_slice(&chunk);
+            ground_truth.extend_from_slice(&chunk);
+
+            // Read last 250 samples
+            let window_len = 250;
+            let mut read_out = vec![0.0f32; window_len];
+            assert!(cb.read_last(window_len, &mut read_out));
+
+            let gt_start = ground_truth.len().saturating_sub(window_len);
+            let expected = &ground_truth[gt_start..];
+            assert_eq!(&read_out[..], expected);
+        }
+    }
+
+    fn create_test_detector() -> HotwordDetector {
+        let weights = HotwordWeights {
+            conv0_w: Tensor::zeros_f32(vec![64 * 32 * 3]),
+            conv0_b: Tensor::zeros_f32(vec![64]),
+            conv1_w: Tensor::zeros_f32(vec![64 * 64 * 3]),
+            conv1_b: Tensor::zeros_f32(vec![64]),
+            conv2_w: Tensor::zeros_f32(vec![64 * 64 * 3]),
+            conv2_b: Tensor::zeros_f32(vec![64]),
+            conv3_w: Tensor::zeros_f32(vec![64 * 64 * 3]),
+            conv3_b: Tensor::zeros_f32(vec![64]),
+            dense1_w: Tensor::zeros_f32(vec![32 * 64]),
+            dense1_b: Tensor::zeros_f32(vec![32]),
+            dense2_w: Tensor::zeros_f32(vec![32]),
+            dense2_b: Tensor::zeros_f32(vec![1]),
+            keywords: vec!["Hey Liquid".to_string()],
+            sample_rate: 16000,
+            window_samples: 19200,
+            hop_samples: 1280,
+            mel_bins: 32,
+            mel_window_samples: 400,
+            mel_hop_samples: 160,
+            fft_size: 512,
+            embedding_dim: 64,
+            default_threshold: 0.5,
+            cooldown_ms: 1000,
+            pre_roll_ms: 100,
+        };
+        let front_end = LogMelFrontEnd::new(
+            weights.sample_rate,
+            weights.mel_window_samples,
+            weights.mel_hop_samples,
+            weights.fft_size,
+            weights.mel_bins,
+        )
+        .unwrap();
+        let num_frames = front_end.num_frames(weights.window_samples);
+        let l0 = (num_frames - 1) / 2 + 1;
+        let l1 = (l0 - 1) / 2 + 1;
+        let l2 = (l1 - 1) / 2 + 1;
+        let l3 = (l2 - 1) / 2 + 1;
+
+        let mel_scratch = vec![0.0f32; weights.mel_bins * num_frames];
+        let conv0_scratch = vec![0.0f32; 64 * l0];
+        let conv1_scratch = vec![0.0f32; 64 * l1];
+        let conv2_scratch = vec![0.0f32; 64 * l2];
+        let conv3_scratch = vec![0.0f32; weights.embedding_dim * l3];
+        let emb_scratch = vec![0.0f32; weights.embedding_dim];
+
+        HotwordDetector {
+            weights,
+            front_end,
+            mel_scratch,
+            conv0_scratch,
+            conv1_scratch,
+            conv2_scratch,
+            conv3_scratch,
+            emb_scratch,
+            dense1_scratch: [0.0; 32],
+            scores_scratch: Vec::new(),
+            window_scratch: vec![0.0f32; 19200],
+        }
+    }
+
+    #[test]
+    fn test_hotword_iterator_irregular_chunks_sample_accounting() -> Result<()> {
+        let detector = create_test_detector();
+        let config = detector.default_config();
+        let mut iterator = HotwordIterator::new(detector, None, config);
+
+        let irregular_chunks = [480, 600, 100, 1280, 1600, 512, 480];
+        let mut total_samples = 0u64;
+
+        for &size in &irregular_chunks {
+            let chunk = vec![0.01f32; size];
+            let _ = iterator.process_chunk(&chunk)?;
+            total_samples += size as u64;
+            assert_eq!(iterator.current_sample, total_samples);
+        }
+
+        iterator.reset();
+        assert_eq!(iterator.current_sample, 0);
+        assert_eq!(iterator.last_eval_sample, 0);
+        assert_eq!(iterator.vad_buffer.len(), 0);
+        assert_eq!(iterator.vad_processed_samples, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_hotword_nan_and_inf_handling() -> Result<()> {
+        let mut detector = create_test_detector();
+        let mut window = vec![0.0f32; detector.weights.window_samples];
+        window[0] = f32::NAN;
+        window[1] = f32::INFINITY;
+        window[2] = f32::NEG_INFINITY;
+        window[100] = 0.5;
+
+        let scores = detector.process_window(&window)?;
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0].is_finite());
+        assert!((0.0..=1.0).contains(&scores[0]));
+
+        let config = detector.default_config();
+        let mut iterator = HotwordIterator::new(detector, None, config);
+        let chunk = [f32::NAN, f32::INFINITY, -f32::INFINITY, 0.2];
+        let event = iterator.process_chunk(&chunk)?;
+        assert!(event.is_none());
+        assert!(iterator.latest_score.is_finite());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_hotword_8khz_vad_configuration() {
+        let mut detector = create_test_detector();
+        detector.weights.sample_rate = 8000;
+        let config = detector.default_config();
+        let iterator = HotwordIterator::new(detector, None, config);
+        assert_eq!(iterator.vad_frame_size, 256);
+        assert_eq!(
+            iterator.vad_sample_rate,
+            crate::vad::VadSampleRate::Rate8kHz
+        );
+    }
+
+    #[test]
+    fn test_hotword_8khz_mel_filterbank() {
+        let frontend = LogMelFrontEnd::new(8000, 200, 80, 256, 32).expect("valid frontend");
+        let n_fft_bins = 256 / 2 + 1;
+        for m in 0..32 {
+            let row = &frontend.mel_filterbank[m * n_fft_bins..(m + 1) * n_fft_bins];
+            let sum: f32 = row.iter().copied().sum();
+            assert!(
+                sum > 0.0,
+                "mel filter row {m} must have non-zero coefficients"
+            );
+            assert!(row.iter().all(|x| x.is_finite()));
+        }
+    }
+
+    #[test]
+    fn test_circular_buffer_zero_capacity() {
+        let mut cb = CircularBuffer::new(0);
+        assert_eq!(cb.capacity, 1);
+        cb.push_slice(&[1.0, 2.0, 3.0]);
+        let mut out = [0.0f32; 1];
+        assert!(cb.read_last(1, &mut out));
+        assert_eq!(out[0], 3.0);
     }
 }

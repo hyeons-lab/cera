@@ -309,8 +309,8 @@ def extract_framed_windows(audio: np.ndarray, is_positive: bool, target_len: int
             for off in [0, 800, 1600]:
                 if off + target_len <= n:
                     windows.append(audio[off : off + target_len])
-                else:
-                    windows.append(audio[:target_len])
+            if n > target_len and (n - target_len) not in [0, 800, 1600]:
+                windows.append(audio[n - target_len :])
     else:
         if n <= target_len:
             max_offset = target_len - n

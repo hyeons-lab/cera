@@ -43,10 +43,18 @@ fn find_hotword_fixture() -> Option<PathBuf> {
 #[test]
 fn test_hotword_oracle_parity() -> Result<()> {
     let Some(model_path) = find_hotword_model() else {
+        if std::env::var("CERA_STRICT_TESTS").is_ok() {
+            panic!("Missing required test fixture models/hey_liquid.gguf under CERA_STRICT_TESTS");
+        }
         eprintln!("Skipping test: models/hey_liquid.gguf not found");
         return Ok(());
     };
     let Some(fixture_path) = find_hotword_fixture() else {
+        if std::env::var("CERA_STRICT_TESTS").is_ok() {
+            panic!(
+                "Missing required test fixture models/hey_liquid_fixture.json under CERA_STRICT_TESTS"
+            );
+        }
         eprintln!("Skipping test: models/hey_liquid_fixture.json not found");
         return Ok(());
     };

@@ -18,6 +18,9 @@ fn find_hotword_model() -> Option<PathBuf> {
 #[test]
 fn test_ffi_hotword_detector_and_iterator() -> Result<()> {
     let Some(model_path) = find_hotword_model() else {
+        if std::env::var("CERA_STRICT_TESTS").is_ok() {
+            panic!("Missing required test fixture models/hey_liquid.gguf under CERA_STRICT_TESTS");
+        }
         eprintln!("Skipping test: models/hey_liquid.gguf not found");
         return Ok(());
     };
@@ -84,6 +87,10 @@ fn test_ffi_hotword_detector_and_iterator() -> Result<()> {
 #[test]
 fn test_ffi_hotword_large_chunk_processing() -> Result<()> {
     let Some(model_path) = find_hotword_model() else {
+        if std::env::var("CERA_STRICT_TESTS").is_ok() {
+            panic!("Missing required test fixture models/hey_liquid.gguf under CERA_STRICT_TESTS");
+        }
+        eprintln!("Skipping test: models/hey_liquid.gguf not found");
         return Ok(());
     };
     let model_str = model_path.to_str().unwrap().to_string();

@@ -3083,6 +3083,7 @@ impl FfiSileroVad {
 #[uniffi::export]
 impl FfiSileroVad {
     /// Load a Silero VAD model from a `.gguf` file path.
+    #[cfg(not(target_arch = "wasm32"))]
     #[uniffi::constructor]
     pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
         let vad = cera::vad::SileroVad::from_file(&path).map_err(|e| FfiError::Backend {
@@ -3349,6 +3350,7 @@ impl FfiHotwordDetector {
 #[uniffi::export]
 impl FfiHotwordDetector {
     /// Load a KWS model from a `.gguf` file path.
+    #[cfg(not(target_arch = "wasm32"))]
     #[uniffi::constructor]
     pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
         let detector =
@@ -3409,6 +3411,7 @@ impl FfiHotwordIterator {
 #[uniffi::export]
 impl FfiHotwordIterator {
     /// Load and construct a streaming hotword iterator from file paths.
+    #[cfg(not(target_arch = "wasm32"))]
     #[uniffi::constructor]
     pub fn from_files(
         model_path: String,
@@ -3527,6 +3530,7 @@ pub struct FfiWhisperModel {
 #[uniffi::export]
 impl FfiWhisperModel {
     /// Load a Whisper ASR model from a local `.gguf` file path.
+    #[cfg(not(target_arch = "wasm32"))]
     #[uniffi::constructor]
     pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
         let (model, tokenizer) =
@@ -3582,10 +3586,44 @@ impl FfiWhisperModel {
         pcm: Vec<f32>,
         opts: Option<FfiWhisperTranscribeOpts>,
     ) -> Result<String, FfiError> {
-        let handle = tokio::task::spawn_blocking(move || self.transcribe(pcm, opts));
-        handle.await.map_err(|e| FfiError::Backend {
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_worker = cancel_flag.clone();
+        let mut cera_opts: cera::WhisperTranscribeOpts = opts.unwrap_or_default().into();
+        cera_opts.cancel = Some(cancel_worker);
+
+        struct WhisperCancelGuard {
+            cancel: Arc<std::sync::atomic::AtomicBool>,
+            abort: tokio::task::AbortHandle,
+            armed: bool,
+        }
+        impl Drop for WhisperCancelGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.abort.abort();
+                    self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+
+        let handle = tokio::task::spawn_blocking(move || {
+            self.model
+                .transcribe(&self.tokenizer, &pcm, &cera_opts)
+                .map_err(|e| FfiError::Backend {
+                    detail: e.to_string(),
+                })
+        });
+
+        let mut guard = WhisperCancelGuard {
+            cancel: cancel_flag,
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+
+        let result = handle.await.map_err(|e| FfiError::Backend {
             detail: format!("transcribe_async worker task failed: {e}"),
-        })?
+        })?;
+        guard.armed = false;
+        result
     }
 }
 
