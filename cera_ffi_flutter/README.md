@@ -164,6 +164,23 @@ final iterator = FfiVadIterator(
   config: sileroVadDefaultConfig(),
 );
 final event = iterator.processChunk(vad, audioFrame512);
+
+// Keyword Spotting (Wake Word Detection)
+final kwsConfig = hotwordDefaultConfig();
+final kwsIterator = FfiHotwordIterator.fromFiles(
+  '/path/to/kws.gguf',
+  '/path/to/silero_vad.gguf',
+  kwsConfig,
+);
+final events = kwsIterator.processChunk(audioChunk16kHz);
+for (final e in events) {
+  print('Wake word detected: ${e.keyword} (score: ${e.score})');
+}
+
+// Whisper Speech-to-Text Transcription
+final whisper = FfiWhisperModel.fromFile('/path/to/whisper.gguf');
+final result = await whisper.transcribe(audioPcm, whisperDefaultTranscribeOpts());
+print('Transcribed text: ${result.text}');
 ```
 
 ## Web

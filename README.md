@@ -18,6 +18,7 @@ or in the browser, from a single dependency-free core.
   bundle id; it can auto-download and cache models from Hugging Face.
 - **Multimodal.** Text, vision (image → text), and audio (in/out) models all
   load through the same session API.
+- **Wake word & speech recognition.** Native Keyword Spotting (KWS) and OpenAI Whisper ASR in pure Rust, linked through a single unified binary across mobile and desktop.
 - **Structured output.** Constrain generation to a GBNF grammar, or one flag
   for guaranteed-valid JSON.
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it
@@ -73,6 +74,7 @@ rather than half-applied.
   against LFM2.5-VL-450M.
 - **Audio (in / out)**: LFM2-Audio (`lfm2-audio-v1`): feed PCM audio in, and
   (with a vocoder) decode audio out.
+- **Wake word & ASR**: Pure-Rust streaming Keyword Spotting (`cera::hotword`), Silero VAD v5 (`cera::vad`), and OpenAI Whisper speech-to-text (`cera::model::whisper`).
 
 ## Platforms & backends
 
@@ -120,10 +122,10 @@ One Rust core, consumed from many places:
 | **Rust (Engine)** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
 | **Rust (API client)** | [`cera-client`](cera-client/) | any Rust project (`cargo add cera-client`); OpenAI and OpenRouter endpoints |
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
-| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms |
+| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, VAD, KWS, Whisper) |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
 | **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
-| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform |
+| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, VAD, KWS, Whisper) |
 | **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
@@ -279,6 +281,33 @@ cera vad --model models/silero_vad.gguf --audio speech.wav --json
 # Convert official Silero VAD v5 ONNX model to GGUF
 python scripts/convert_silero_vad.py silero_vad.onnx models/silero_vad.gguf
 ```
+
+## Keyword Spotting (Native Wake Word Engine)
+
+Cera includes a **native, pure-Rust Keyword Spotting (KWS) engine** (`cera::hotword`) designed for always-on, low-power wake word detection on mobile and edge devices:
+
+- **Self-describing GGUF containers**: Stores acoustic configurations, label lists, window and hop dimensions, and detection thresholds in GGUF metadata under `kws.*`.
+- **Zero-allocation streaming hot path**: Pre-allocated scratch buffers in both `LogMelFrontEnd` (32-channel HTK mel filterbank, FFT power spectrum, log1p compression) and `HotwordDetector` (Conv1D backbone with folded BatchNorm layers and vectorized MLP head) guarantee zero dynamic heap allocations on real-time audio threads.
+- **VAD-gated streaming iterator (`HotwordIterator`)**: Interleaves 512-sample Silero VAD gating (Stage 0a) with configurable hop KWS checks (Stage 0b). Automatically bypasses heavy acoustic evaluation during ambient silence to preserve battery life.
+- **Adaptive Automatic Gain Control (AGC)**: Peak normalization scales soft or far-field speech up to nominal reference levels with a 30.0x gain ceiling, preventing ambient noise floor amplification while maintaining sensitivity across desk or room distances.
+- **Cross-platform bindings**: Available in pure Rust (`cera::hotword`), Kotlin/Android, Swift/iOS, Python via `cera-ffi`, and Flutter via `cera_ffi_flutter`.
+
+```bash
+# Export and fold PyTorch wake word weights into a self-describing GGUF container
+python scripts/convert_kws.py --checkpoint model.pt --output models/hey_liquid.gguf
+
+# Train a custom wake word model with automated phonetic near-miss negative synthesis
+python tools/wake_word/train_kws.py --phrase "Hey Liquid" --epochs 25 --output models/hey_liquid.gguf
+```
+
+## Whisper Speech Recognition (ASR)
+
+Cera provides a **pure-Rust implementation of OpenAI Whisper ASR** (`cera::model::whisper`), exposed across all foreign language bindings via UniFFI (`cera-ffi`):
+
+- **Unified mobile deployment**: Mobile applications link a single native library (`libcera_ffi.so` or `CeraFFI.xcframework`) for wake word detection, speech activity gating, and full speech-to-text transcription without external C++ or JNI dependencies.
+- **Cooperative async cancellation**: Long-running background transcription tasks support instant cancellation via RAII drop guards and atomic flags (`transcribe_async`), freeing audio and thread resources immediately when UI listening windows close.
+- **Multilingual and timestamp support**: Automatic language identification across 99 supported languages, optional word and segment timestamps, and custom transcription options.
+- **Cross-platform bindings**: Available in pure Rust (`cera::model::whisper`), Swift, Kotlin, Python, and Dart/Flutter.
 
 ## Hugging Face Models & Streaming Quantization
 

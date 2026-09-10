@@ -30,6 +30,8 @@ cera = "0.5"
 - **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with on-the-fly zero-disk streaming quantization of remote SafeTensors models directly to GGUF in memory.
 - **WebGPU Depthformer Acceleration & Voice Modes**: High-performance compute shaders for Depthformer audio decoder, unified web runtime, and 4 dedicated voice interaction modes.
 - **Multimodal Vision ViT Optimization**: High-resolution image encoding improvements and async WebGPU readbacks.
+- **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection with zero dependencies. Includes parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model container parsing with folded BatchNorm layers, zero-heap forward inference (`HotwordDetector`), 30.0x AGC peak normalization, and Silero VAD gating state machine (`HotwordIterator`).
+- **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
 
 ## Breaking changes in 0.4.0
 
