@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.6
+
+### Added
+
+- **Keyword Spotting Bindings**: Multiplatform Flutter FFI bindings for native keyword spotting and wake word detection (`HotwordDetector`, `HotwordIterator`, `HotwordConfig`).
+- **Whisper ASR Bindings**: Flutter FFI bindings for pure-Rust Whisper speech-to-text transcription (`WhisperModel`, `WhisperTranscribeOpts`).
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.5.6` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.5.5
 
 ### Added

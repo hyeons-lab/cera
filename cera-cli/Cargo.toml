@@ -18,7 +18,7 @@ path = "src/main.rs"
 # `remote` enables `BundleRepo` + `CeraEngine::from_bundle_id`, which the CLI's
 # `--bundle-id` / `--quant` flags route through. Pulls reqwest + rustls + sha2
 # (~30 deps) but that's the cost of HTTP-cached bundle downloads.
-cera = { path = "../cera", version = "0.5.5", features = ["remote"] }
+cera = { path = "../cera", version = "0.5.6", features = ["remote"] }
 anyhow.workspace = true
 clap.workspace = true
 # `--tools` parses tool schemas from JSON and prints parsed tool calls as JSON.
@@ -47,7 +47,7 @@ unicode-width = "0.2"
 # Hardware acceleration defaults on Apple platforms. Enables Metal GPU inference
 # and Apple Accelerate BLAS out of the box when installing or running `cera-cli`.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-cera = { path = "../cera", version = "0.5.5", features = ["metal", "blas"] }
+cera = { path = "../cera", version = "0.5.6", features = ["metal", "blas"] }
 
 # `dlopen`/`dlsym` for the runtime-resolved NDK thermal API (src/thermal.rs).
 # Already in the dependency graph via cera's affinity pinning on these targets.

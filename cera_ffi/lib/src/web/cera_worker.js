@@ -31,7 +31,7 @@
 
 'use strict';
 
-console.info('[cera:worker:version] v0.5.5 (build: 2026-09-07-rev25-local-models-webgpu)');
+console.info('[cera:worker:version] v0.5.6 (build: 2026-09-10-rev26-kws-whisper)');
 
 const LOCAL_MODELS_DIR = '/models-local';
 

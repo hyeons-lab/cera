@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.6
+
+### Added
+
+- **Keyword Spotting (KWS) Engine**: Pure-Rust streaming acoustic front-end (`LogMelFrontEnd`), self-describing GGUF model detector (`HotwordDetector`), and VAD-gated chunk iterator (`HotwordIterator`) exposed over UniFFI (`FfiHotwordConfig`, `FfiHotwordDetector`, `FfiHotwordIterator`, `FfiHotwordEvent`).
+- **Whisper ASR UniFFI Bindings**: Exposed pure-Rust OpenAI Whisper speech-to-text inference across foreign language bindings (`FfiWhisperModel`, `FfiWhisperTranscribeOpts`) with asynchronous cancellation support.
+
+### Changed
+
+- **Version Alignment**: Bumped workspace patch version to 0.5.6 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.5
 
 ### Added
