@@ -3552,6 +3552,10 @@ final class FfiHotwordDetectorFfiCodec {
 }
 
 /// Streaming Keyword Spotting manager with VAD gating and debounce state.
+///
+/// Threading note: To avoid lock contention and ensure low audio callback latency,
+/// clients should invoke `process_chunk` serially from a dedicated background audio
+/// worker thread. `reset` may be invoked to clear ring buffers and debounce state.
 final class FfiHotwordIterator {
   FfiHotwordIterator._();
 
@@ -3566,6 +3570,9 @@ final class FfiHotwordIterator {
   ///
   /// For chunks containing multiple hops, returns the first detected event encountered
   /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
+  ///
+  /// Callers should invoke this method serially from a dedicated background audio
+  /// worker thread to avoid lock contention on high-frequency chunk callbacks.
   FfiHotwordEvent? processChunk(List<double> chunk) => _unsupportedOnWeb('FfiHotwordIterator.processChunk');
 
   /// Reset iterator state, ring buffer, and debounce timers.

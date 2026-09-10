@@ -2200,6 +2200,10 @@ public func FfiConverterTypeFfiHotwordDetector_lower(_ value: FfiHotwordDetector
 
 /**
  * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ *
+ * Threading note: To avoid lock contention and ensure low audio callback latency,
+ * clients should invoke `process_chunk` serially from a dedicated background audio
+ * worker thread. `reset` may be invoked to clear ring buffers and debounce state.
  */
 public protocol FfiHotwordIteratorProtocol: AnyObject, Sendable {
     
@@ -2208,6 +2212,9 @@ public protocol FfiHotwordIteratorProtocol: AnyObject, Sendable {
      *
      * For chunks containing multiple hops, returns the first detected event encountered
      * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     *
+     * Callers should invoke this method serially from a dedicated background audio
+     * worker thread to avoid lock contention on high-frequency chunk callbacks.
      */
     func processChunk(chunk: [Float]) throws  -> FfiHotwordEvent?
     
@@ -2219,6 +2226,10 @@ public protocol FfiHotwordIteratorProtocol: AnyObject, Sendable {
 }
 /**
  * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ *
+ * Threading note: To avoid lock contention and ensure low audio callback latency,
+ * clients should invoke `process_chunk` serially from a dedicated background audio
+ * worker thread. `reset` may be invoked to clear ring buffers and debounce state.
  */
 open class FfiHotwordIterator: FfiHotwordIteratorProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -2291,6 +2302,9 @@ public static func fromFiles(modelPath: String, vadModelPath: String?, config: F
      *
      * For chunks containing multiple hops, returns the first detected event encountered
      * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     *
+     * Callers should invoke this method serially from a dedicated background audio
+     * worker thread to avoid lock contention on high-frequency chunk callbacks.
      */
 open func processChunk(chunk: [Float])throws  -> FfiHotwordEvent?  {
     return try  FfiConverterOptionTypeFfiHotwordEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -8312,7 +8326,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {

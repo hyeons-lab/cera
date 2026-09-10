@@ -2113,7 +2113,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {
@@ -5120,6 +5120,10 @@ public object FfiConverterTypeFfiHotwordDetector : FfiConverter<FfiHotwordDetect
 
 /**
  * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ *
+ * Threading note: To avoid lock contention and ensure low audio callback latency,
+ * clients should invoke `process_chunk` serially from a dedicated background audio
+ * worker thread. `reset` may be invoked to clear ring buffers and debounce state.
  */
 public interface FfiHotwordIteratorInterface {
     /**
@@ -5127,6 +5131,9 @@ public interface FfiHotwordIteratorInterface {
      *
      * For chunks containing multiple hops, returns the first detected event encountered
      * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     *
+     * Callers should invoke this method serially from a dedicated background audio
+     * worker thread to avoid lock contention on high-frequency chunk callbacks.
      */
     fun `processChunk`(`chunk`: List<kotlin.Float>): FfiHotwordEvent?
 
@@ -5140,6 +5147,10 @@ public interface FfiHotwordIteratorInterface {
 
 /**
  * Streaming Keyword Spotting manager with VAD gating and debounce state.
+ *
+ * Threading note: To avoid lock contention and ensure low audio callback latency,
+ * clients should invoke `process_chunk` serially from a dedicated background audio
+ * worker thread. `reset` may be invoked to clear ring buffers and debounce state.
  */
 open class FfiHotwordIterator :
     Disposable,
@@ -5245,6 +5256,9 @@ open class FfiHotwordIterator :
      *
      * For chunks containing multiple hops, returns the first detected event encountered
      * during the chunk evaluation steps (or `None` if silence or cooldown persists).
+     *
+     * Callers should invoke this method serially from a dedicated background audio
+     * worker thread to avoid lock contention on high-frequency chunk callbacks.
      */
     @Throws(FfiException::class)
     override fun `processChunk`(`chunk`: List<kotlin.Float>): FfiHotwordEvent? =

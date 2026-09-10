@@ -3397,6 +3397,10 @@ impl FfiHotwordDetector {
 }
 
 /// Streaming Keyword Spotting manager with VAD gating and debounce state.
+///
+/// Threading note: To avoid lock contention and ensure low audio callback latency,
+/// clients should invoke `process_chunk` serially from a dedicated background audio
+/// worker thread. `reset` may be invoked to clear ring buffers and debounce state.
 #[derive(uniffi::Object)]
 pub struct FfiHotwordIterator {
     inner: std::sync::Mutex<cera::hotword::HotwordIterator>,
@@ -3450,6 +3454,9 @@ impl FfiHotwordIterator {
     ///
     /// For chunks containing multiple hops, returns the first detected event encountered
     /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
+    ///
+    /// Callers should invoke this method serially from a dedicated background audio
+    /// worker thread to avoid lock contention on high-frequency chunk callbacks.
     pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Option<FfiHotwordEvent>, FfiError> {
         let mut it = self.lock_inner();
         let ev = it.process_chunk(&chunk).map_err(|e| FfiError::Backend {

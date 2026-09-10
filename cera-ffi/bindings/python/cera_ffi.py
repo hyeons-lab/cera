@@ -585,7 +585,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 41817:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -8338,6 +8338,10 @@ class _UniffiFfiConverterOptionalTypeFfiHotwordEvent(_UniffiConverterRustBuffer)
 class FfiHotwordIteratorProtocol(typing.Protocol):
     """
     Streaming Keyword Spotting manager with VAD gating and debounce state.
+
+    Threading note: To avoid lock contention and ensure low audio callback latency,
+    clients should invoke `process_chunk` serially from a dedicated background audio
+    worker thread. `reset` may be invoked to clear ring buffers and debounce state.
 """
     
     def process_chunk(self, chunk: typing.List[float]) -> typing.Optional[FfiHotwordEvent]:
@@ -8346,6 +8350,9 @@ class FfiHotwordIteratorProtocol(typing.Protocol):
 
         For chunks containing multiple hops, returns the first detected event encountered
         during the chunk evaluation steps (or `None` if silence or cooldown persists).
+
+        Callers should invoke this method serially from a dedicated background audio
+        worker thread to avoid lock contention on high-frequency chunk callbacks.
 """
         raise NotImplementedError
     def reset(self, ) -> None:
@@ -8357,6 +8364,10 @@ class FfiHotwordIteratorProtocol(typing.Protocol):
 class FfiHotwordIterator(FfiHotwordIteratorProtocol):
     """
     Streaming Keyword Spotting manager with VAD gating and debounce state.
+
+    Threading note: To avoid lock contention and ensure low audio callback latency,
+    clients should invoke `process_chunk` serially from a dedicated background audio
+    worker thread. `reset` may be invoked to clear ring buffers and debounce state.
 """
     
     _handle: ctypes.c_uint64
@@ -8411,6 +8422,9 @@ class FfiHotwordIterator(FfiHotwordIteratorProtocol):
 
         For chunks containing multiple hops, returns the first detected event encountered
         during the chunk evaluation steps (or `None` if silence or cooldown persists).
+
+        Callers should invoke this method serially from a dedicated background audio
+        worker thread to avoid lock contention on high-frequency chunk callbacks.
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(chunk)

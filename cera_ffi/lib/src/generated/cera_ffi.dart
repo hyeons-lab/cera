@@ -4929,8 +4929,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 41817) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 41817, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 50343) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 50343, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset;
     try {
@@ -17122,6 +17122,10 @@ final class _FfiHotwordIteratorFinalizerToken {
 }
 
 /// Streaming Keyword Spotting manager with VAD gating and debounce state.
+///
+/// Threading note: To avoid lock contention and ensure low audio callback latency,
+/// clients should invoke `process_chunk` serially from a dedicated background audio
+/// worker thread. `reset` may be invoked to clear ring buffers and debounce state.
 final class FfiHotwordIterator {
   FfiHotwordIterator._(this._ffi, this._handle) {
     _finalizer.attach(this, _FfiHotwordIteratorFinalizerToken(_ffi._ffiHotwordIteratorFree, _handle), detach: this);
@@ -17161,6 +17165,9 @@ final class FfiHotwordIterator {
   ///
   /// For chunks containing multiple hops, returns the first detected event encountered
   /// during the chunk evaluation steps (or `None` if silence or cooldown persists).
+  ///
+  /// Callers should invoke this method serially from a dedicated background audio
+  /// worker thread to avoid lock contention on high-frequency chunk callbacks.
   FfiHotwordEvent? processChunk(List<double> chunk) {
     _ensureOpen();
     return _ffi.ffiHotwordIteratorInvokeProcessChunk(_handle, chunk);
