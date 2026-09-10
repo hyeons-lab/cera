@@ -61,6 +61,31 @@ impl Default for HotwordConfig {
     }
 }
 
+impl HotwordConfig {
+    /// Return a sanitized copy of the configuration with thresholds clamped to valid ranges
+    /// and non-finite values replaced by defaults.
+    pub fn sanitized(&self) -> Self {
+        let threshold = if self.threshold.is_finite() {
+            self.threshold.clamp(0.01, 0.99)
+        } else {
+            0.75
+        };
+        let vad_threshold = if self.vad_threshold.is_finite() {
+            self.vad_threshold.clamp(0.01, 0.99)
+        } else {
+            0.5
+        };
+        Self {
+            threshold,
+            cooldown_ms: self.cooldown_ms,
+            step_ms: self.step_ms.max(10),
+            window_ms: self.window_ms,
+            pre_roll_ms: self.pre_roll_ms,
+            vad_threshold,
+        }
+    }
+}
+
 /// Confidence score for a specific keyword candidate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HotwordScore {
@@ -101,6 +126,7 @@ pub struct LogMelFrontEnd {
     hann_window: Vec<f32>,
     mel_filterbank: Vec<f32>,
     fft_scratch: Vec<Complex32>,
+    power_scratch: Vec<f32>,
     sample_rate: usize,
     window_samples: usize,
     hop_samples: usize,
@@ -120,10 +146,15 @@ impl LogMelFrontEnd {
         ensure!(mel_bins > 0, "mel_bins must be > 0");
         ensure!(fft_size > 0, "fft_size must be > 0");
         ensure!(
+            fft_size.is_power_of_two(),
+            "fft_size must be a power of two"
+        );
+        ensure!(window_samples > 0, "window_samples must be > 0");
+        ensure!(hop_samples > 0, "hop_samples must be > 0");
+        ensure!(
             window_samples <= fft_size,
             "window_samples must be <= fft_size"
         );
-        ensure!(hop_samples > 0, "hop_samples must be > 0");
         ensure!(sample_rate > 0, "sample_rate must be > 0");
 
         let mut planner = FftPlanner::new();
@@ -131,13 +162,12 @@ impl LogMelFrontEnd {
 
         // Symmetric Hann window
         let mut hann_window = Vec::with_capacity(window_samples);
-        for n in 0..window_samples {
+        for i in 0..window_samples {
             let val =
-                0.5 - 0.5 * ((2.0 * std::f64::consts::PI * n as f64) / window_samples as f64).cos();
+                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / window_samples as f64).cos());
             hann_window.push(val as f32);
         }
 
-        // Triangular HTK Mel filterbank: 32 bins from 80 Hz to Nyquist (capped at 7600 Hz)
         let n_fft_bins = fft_size / 2 + 1;
         let nyquist_hz = (sample_rate as f64) / 2.0;
         let min_mel = hz_to_mel(80.0f64.min(nyquist_hz * 0.5));
@@ -179,6 +209,7 @@ impl LogMelFrontEnd {
             hann_window,
             mel_filterbank,
             fft_scratch: vec![Complex32::new(0.0, 0.0); fft_size],
+            power_scratch: vec![0.0f32; n_fft_bins],
             sample_rate,
             window_samples,
             hop_samples,
@@ -220,15 +251,21 @@ impl LogMelFrontEnd {
 
             self.fft.process(&mut self.fft_scratch);
 
+            for (p, c) in self
+                .power_scratch
+                .iter_mut()
+                .zip(&self.fft_scratch[..n_fft_bins])
+            {
+                *p = c.norm_sqr();
+            }
+
             for m in 0..self.mel_bins {
                 let filter_row = &self.mel_filterbank[m * n_fft_bins..(m + 1) * n_fft_bins];
                 let mut energy = 0.0f32;
-                for (&filter_coeff, complex) in
-                    filter_row.iter().zip(&self.fft_scratch[..n_fft_bins])
-                {
-                    energy += filter_coeff * complex.norm_sqr();
+                for (&filter_coeff, &power) in filter_row.iter().zip(&self.power_scratch) {
+                    energy += filter_coeff * power;
                 }
-                output[m * num_frames + i] = (1.0 + energy.max(0.0)).ln();
+                output[m * num_frames + i] = energy.max(0.0).ln_1p();
             }
         }
     }
@@ -306,6 +343,13 @@ impl HotwordWeights {
             keywords.iter().all(|k| !k.trim().is_empty()),
             "keyword labels must not be blank"
         );
+        if let Some(count) = gguf.get_u32("kws.keyword_count") {
+            ensure!(
+                count as usize == keywords.len(),
+                "kws.keyword_count ({count}) does not match kws.keywords length ({})",
+                keywords.len()
+            );
+        }
 
         let sample_rate = gguf.get_u32("kws.sample_rate").unwrap_or(16000) as usize;
         let window_samples = gguf.get_u32("kws.window_samples").unwrap_or(19200) as usize;
@@ -667,12 +711,20 @@ impl HotwordDetector {
         // 4. Dense Head Layer 1: Linear 64 -> 32 + SiLU
         let d1_w = self.weights.dense1_w.as_f32_slice();
         let d1_b = self.weights.dense1_b.as_f32_slice();
+        let emb_dim = self.weights.embedding_dim;
+        debug_assert_eq!(self.emb_scratch.len(), emb_dim);
+        ensure!(
+            self.emb_scratch.len() == emb_dim,
+            "embedding scratch dimension mismatch"
+        );
         for j in 0..32 {
-            let mut acc = d1_b[j];
-            let row = &d1_w[j * self.weights.embedding_dim..(j + 1) * self.weights.embedding_dim];
-            for (&w, &emb) in row.iter().zip(&self.emb_scratch) {
-                acc += w * emb;
-            }
+            let row = &d1_w[j * emb_dim..(j + 1) * emb_dim];
+            let acc = d1_b[j]
+                + row
+                    .iter()
+                    .zip(&self.emb_scratch)
+                    .map(|(&w, &emb)| w * emb)
+                    .sum::<f32>();
             self.dense1_scratch[j] = silu(acc);
         }
 
@@ -683,11 +735,13 @@ impl HotwordDetector {
         self.scores_scratch.clear();
 
         for k in 0..num_keywords {
-            let mut acc = d2_b[k];
             let row = &d2_w[k * 32..(k + 1) * 32];
-            for (&w, &h) in row.iter().zip(&self.dense1_scratch) {
-                acc += w * h;
-            }
+            let acc = d2_b[k]
+                + row
+                    .iter()
+                    .zip(&self.dense1_scratch)
+                    .map(|(&w, &h)| w * h)
+                    .sum::<f32>();
             self.scores_scratch.push(sigmoid(acc));
         }
 
@@ -795,11 +849,21 @@ pub struct HotwordIterator {
 impl HotwordIterator {
     /// Create a new streaming `HotwordIterator`.
     pub fn new(detector: HotwordDetector, vad: Option<SileroVad>, config: HotwordConfig) -> Self {
+        let config = config.sanitized();
         let window_samples = detector.weights.window_samples;
         let ring_capacity = (window_samples * 2).max(24_000);
-        let (vad_frame_size, vad_sample_rate) = match detector.weights.sample_rate {
-            8000 => (256, crate::vad::VadSampleRate::Rate8kHz),
-            _ => (512, crate::vad::VadSampleRate::Rate16kHz),
+        let (vad, vad_frame_size, vad_sample_rate) = match detector.weights.sample_rate {
+            8000 => (vad, 256, crate::vad::VadSampleRate::Rate8kHz),
+            16000 => (vad, 512, crate::vad::VadSampleRate::Rate16kHz),
+            other => {
+                if vad.is_some() {
+                    tracing::warn!(
+                        "Silero VAD attached to hotword model with unsupported sample rate {} Hz (requires 16000 or 8000 Hz); VAD disabled",
+                        other
+                    );
+                }
+                (None, 512, crate::vad::VadSampleRate::Rate16kHz)
+            }
         };
         let sample_rate = detector.weights.sample_rate as u64;
         let hop_samples = if config.step_ms > 0 {
@@ -807,11 +871,21 @@ impl HotwordIterator {
         } else {
             detector.weights.hop_samples as u64
         };
+        let vad_capacity = (hop_samples as usize + vad_frame_size * 2).max(2048);
+
+        let expected_window_ms = (window_samples * 1000) / detector.weights.sample_rate;
+        if config.window_ms != expected_window_ms && config.window_ms != 0 {
+            tracing::debug!(
+                "HotwordConfig.window_ms ({} ms) differs from model window ({} ms); using model window",
+                config.window_ms,
+                expected_window_ms
+            );
+        }
 
         Self {
             ring_buffer: CircularBuffer::new(ring_capacity),
             window_buffer: vec![0.0f32; window_samples],
-            vad_buffer: Vec::with_capacity(2048),
+            vad_buffer: Vec::with_capacity(vad_capacity),
             vad_frame_size,
             vad_sample_rate,
             vad_processed_samples: 0,
@@ -989,6 +1063,12 @@ impl HotwordIterator {
         Ok(detected_event)
     }
 }
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<HotwordDetector>();
+    assert_send_sync::<HotwordIterator>();
+};
 
 // ── Unit Tests ────────────────────────────────────────────────────────────────
 
@@ -1258,5 +1338,33 @@ mod tests {
         assert_eq!(iterator.last_eval_sample, 1280);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_hotword_config_sanitized() {
+        let bad_cfg = HotwordConfig {
+            threshold: f32::NAN,
+            cooldown_ms: 0,
+            step_ms: 2,
+            window_ms: 1200,
+            pre_roll_ms: 100,
+            vad_threshold: f32::INFINITY,
+        };
+        let sanitized = bad_cfg.sanitized();
+        assert_eq!(sanitized.threshold, 0.75);
+        assert_eq!(sanitized.vad_threshold, 0.5);
+        assert_eq!(sanitized.step_ms, 10);
+
+        let out_of_bounds = HotwordConfig {
+            threshold: -0.5,
+            cooldown_ms: 1000,
+            step_ms: 80,
+            window_ms: 1200,
+            pre_roll_ms: 100,
+            vad_threshold: 1.5,
+        };
+        let sanitized_oob = out_of_bounds.sanitized();
+        assert!((sanitized_oob.threshold - 0.01).abs() < 1e-6);
+        assert!((sanitized_oob.vad_threshold - 0.99).abs() < 1e-6);
     }
 }

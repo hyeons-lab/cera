@@ -567,6 +567,10 @@ def main() -> None:
     )
     args = parser.parse_args()
     keywords = args.keywords if args.keywords is not None else [args.phrase]
+    if len(keywords) != 1:
+        raise ValueError(
+            f"train_kws.py currently only supports training single-keyword models, got {len(keywords)} keywords: {keywords}"
+        )
 
     # 1. Synthesize audio dataset
     with tempfile.TemporaryDirectory() as tmpdir:
