@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
 
@@ -226,8 +227,14 @@ class AudioRecorderService {
   static List<double> normalizeAudio(
     List<double> samples, {
     double targetPeak = 0.9,
+    double maxGain = 30.0,
   }) {
     if (samples.isEmpty) return samples;
+
+    final peak = (targetPeak.isFinite && targetPeak > 0.0 && targetPeak <= 1.0)
+        ? targetPeak
+        : 0.9;
+    final ceiling = (maxGain.isFinite && maxGain > 0.0) ? maxGain : 30.0;
 
     double maxAmp = 0.0;
     for (final s in samples) {
@@ -246,10 +253,7 @@ class AudioRecorderService {
       return sanitized;
     }
 
-    final peak = (targetPeak.isFinite && targetPeak > 0.0 && targetPeak <= 1.0)
-        ? targetPeak
-        : 0.9;
-    final scale = peak / maxAmp;
+    final scale = (peak / maxAmp).clamp(0.0, ceiling);
     final normalized = Float32List(samples.length);
     for (var i = 0; i < samples.length; i++) {
       final s = samples[i];
