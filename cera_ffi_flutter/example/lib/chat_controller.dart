@@ -1136,7 +1136,9 @@ class ChatController extends ValueNotifier<ChatState> {
         return settings.copyWith(audioChatMode: AudioChatMode.textToSpeech);
       }
     } else if (caps.audioIn && caps.audioOut) {
-      if (settings.audioChatMode == AudioChatMode.textOnly) {
+      // Respect explicit textOnly fallback; otherwise upgrade to interleaved.
+      if (settings.audioChatMode != AudioChatMode.textOnly &&
+          settings.audioChatMode != AudioChatMode.interleaved) {
         return settings.copyWith(audioChatMode: AudioChatMode.interleaved);
       }
     } else {

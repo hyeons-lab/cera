@@ -407,6 +407,53 @@ void main() {
         expect(recorder.isDisposed, isFalse);
       },
     );
+
+    testWidgets(
+      'MessageComposer handles microphone permission denial gracefully without locking recording state',
+      (WidgetTester tester) async {
+        final recorder = FakeAudioRecorderService()..mockPermission = false;
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              bottomNavigationBar: MessageComposer(
+                controller: TextEditingController(),
+                isBusy: false,
+                isGenerating: false,
+                canAttachImage: false,
+                canAttachAudio: true,
+                pendingImageBytes: null,
+                pendingImageName: null,
+                onSend: () {},
+                onStop: () {},
+                onPickImage: () {},
+                onClearImage: () {},
+                audioRecorder: recorder,
+                onSendAudio: (_, _) {},
+              ),
+            ),
+          ),
+        );
+
+        final micFinder = find.byIcon(Icons.mic_none_rounded);
+        expect(micFinder, findsOneWidget);
+
+        // Tap/hold mic button with denied permission
+        await tester.startGesture(tester.getCenter(micFinder));
+        await tester.pump();
+        await tester.pumpAndSettle();
+
+        // Must not be stuck in recording state
+        expect(recorder.isRecording, isFalse);
+        // SnackBar must display permission error
+        expect(
+          find.text(
+            'Microphone error: Bad state: Microphone permission not granted',
+          ),
+          findsOneWidget,
+        );
+      },
+    );
   });
 
   group('Voice Mode Selector Bar', () {
@@ -661,9 +708,22 @@ void main() {
         );
         expect(asrSettings.audioChatMode, AudioChatMode.speechToText);
 
-        // Bidirectional audio model -> auto-aligns to interleaved Voice Chat
-        final voiceSettings = ChatController.alignAudioMode(
+        // Respects explicit textOnly preference when loading bidirectional model
+        final preservedTextSettings = ChatController.alignAudioMode(
           initial,
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: true,
+          ),
+        );
+        expect(preservedTextSettings.audioChatMode, AudioChatMode.textOnly);
+
+        // Switch from ASR to bidirectional audio model -> auto-aligns to interleaved Voice Chat
+        final voiceSettings = ChatController.alignAudioMode(
+          asrSettings,
           const CeraCapabilities(
             textIn: true,
             textOut: true,
@@ -686,6 +746,19 @@ void main() {
           ),
         );
         expect(ttsSettings.audioChatMode, AudioChatMode.textToSpeech);
+
+        // Switch from TTS to bidirectional audio model -> auto-aligns to interleaved Voice Chat
+        final voiceFromTts = ChatController.alignAudioMode(
+          ttsSettings,
+          const CeraCapabilities(
+            textIn: true,
+            textOut: true,
+            imageIn: false,
+            audioIn: true,
+            audioOut: true,
+          ),
+        );
+        expect(voiceFromTts.audioChatMode, AudioChatMode.interleaved);
 
         // Switch from TTS-only to text-only model -> auto-resets to textOnly
         final textSettings = ChatController.alignAudioMode(
@@ -729,6 +802,17 @@ void main() {
           uiMode: AppUIMode.chat,
         );
         expect(promptEmpty, 'Respond with interleaved text and audio.');
+
+        // When persona is whitespace only, trimmed cleanly without trailing whitespace
+        const settingsWhitespacePersona = ChatSettings(
+          audioChatMode: AudioChatMode.interleaved,
+          chatVoice: '   ',
+        );
+        final promptWhitespace = ChatController.systemPromptFor(
+          settings: settingsWhitespacePersona,
+          uiMode: AppUIMode.chat,
+        );
+        expect(promptWhitespace, 'Respond with interleaved text and audio.');
 
         // TTS mode for text prompt
         const settingsTts = ChatSettings(
@@ -839,15 +923,19 @@ void main() {
 class FakeAudioRecorderService extends AudioRecorderService {
   bool _mockRecording = false;
   bool isDisposed = false;
+  bool mockPermission = true;
 
   @override
   bool get isRecording => _mockRecording;
 
   @override
-  Future<bool> hasPermission() async => true;
+  Future<bool> hasPermission() async => mockPermission;
 
   @override
   Future<void> startRecording({int sampleRate = 16000}) async {
+    if (!mockPermission) {
+      throw StateError('Microphone permission not granted');
+    }
     _mockRecording = true;
   }
 

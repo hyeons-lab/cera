@@ -541,12 +541,10 @@ class _NativeCera implements Cera {
               ? 'Respond with interleaved text and audio.'
               : 'Respond to the user.';
       final effectiveSystemPrompt =
-          (systemPrompt != null && systemPrompt.trim().isNotEmpty)
-              ? systemPrompt.trim()
-              : defaultSystemPrompt;
+          systemPrompt != null ? systemPrompt.trim() : defaultSystemPrompt;
 
       final messages = <ChatMessage>[
-        if (_session.position() == 0)
+        if (_session.position() == 0 && effectiveSystemPrompt.isNotEmpty)
           ChatMessage(role: 'system', content: effectiveSystemPrompt),
         ChatMessage(role: 'user', content: userContent),
       ];

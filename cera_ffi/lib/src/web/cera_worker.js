@@ -572,10 +572,12 @@ const OPS = {
         ? 'Respond with interleaved text and audio.'
         : 'Respond to the user.';
       const effectiveSystemPrompt =
-        systemPrompt && systemPrompt.trim().length > 0
+        systemPrompt !== undefined && systemPrompt !== null
           ? systemPrompt.trim()
           : defaultSystemPrompt;
-      messages.push({ role: 'system', content: effectiveSystemPrompt });
+      if (effectiveSystemPrompt.length > 0) {
+        messages.push({ role: 'system', content: effectiveSystemPrompt });
+      }
     }
     messages.push({ role: 'user', content: userContent });
     let formatted;
