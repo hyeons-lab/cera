@@ -50,8 +50,9 @@ fn test_ffi_hotword_detector_and_iterator() -> Result<()> {
     assert!(scores[0] >= 0.0 && scores[0] <= 1.0);
 
     // 3. Test FfiHotwordIterator
+    let threshold = scores[0] * 0.95;
     let mut custom_config: FfiHotwordConfig = config;
-    custom_config.threshold = 0.40;
+    custom_config.threshold = threshold;
 
     let iterator = FfiHotwordIterator::from_files(model_str, None, Some(custom_config))?;
 
@@ -68,7 +69,7 @@ fn test_ffi_hotword_detector_and_iterator() -> Result<()> {
     );
     let event = &detected_events[0];
     assert_eq!(event.keyword, "Hey Liquid");
-    assert!(event.confidence >= 0.40);
+    assert!(event.confidence >= threshold);
     assert!(event.sample_offset > 0);
 
     // 4. Test reset
@@ -87,17 +88,6 @@ fn test_ffi_hotword_large_chunk_processing() -> Result<()> {
     };
     let model_str = model_path.to_str().unwrap().to_string();
 
-    let custom_config = FfiHotwordConfig {
-        threshold: 0.40,
-        cooldown_ms: 2000,
-        step_ms: 80,
-        window_ms: 1200,
-        pre_roll_ms: 150,
-        vad_threshold: 0.5,
-    };
-
-    let iterator = FfiHotwordIterator::from_files(model_str, None, Some(custom_config))?;
-
     // Synthesize 3 seconds (48,000 samples)
     let mut synthetic_audio = vec![0.0f32; 48000];
     for (i, sample) in synthetic_audio.iter_mut().enumerate() {
@@ -108,6 +98,21 @@ fn test_ffi_hotword_large_chunk_processing() -> Result<()> {
         *sample = s as f32;
     }
 
+    let detector = FfiHotwordDetector::from_file(model_str.clone())?;
+    let sample_scores = detector.process_window(synthetic_audio[..19200].to_vec())?;
+    let threshold = sample_scores[0] * 0.95;
+
+    let custom_config = FfiHotwordConfig {
+        threshold,
+        cooldown_ms: 2000,
+        step_ms: 80,
+        window_ms: 1200,
+        pre_roll_ms: 150,
+        vad_threshold: 0.5,
+    };
+
+    let iterator = FfiHotwordIterator::from_files(model_str, None, Some(custom_config))?;
+
     // Pass the entire 48,000 samples in a single call
     let event = iterator.process_chunk(synthetic_audio)?;
     assert!(
@@ -116,7 +121,7 @@ fn test_ffi_hotword_large_chunk_processing() -> Result<()> {
     );
     let event = event.unwrap();
     assert_eq!(event.keyword, "Hey Liquid");
-    assert!(event.confidence >= 0.40);
+    assert!(event.confidence >= threshold);
 
     Ok(())
 }

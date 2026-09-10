@@ -439,6 +439,7 @@ pub struct HotwordDetector {
     emb_scratch: Vec<f32>,
     dense1_scratch: [f32; 32],
     scores_scratch: Vec<f32>,
+    window_scratch: Vec<f32>,
 }
 
 impl HotwordDetector {
@@ -494,6 +495,8 @@ impl HotwordDetector {
         let emb_scratch = vec![0.0f32; weights.embedding_dim];
         let num_keywords = weights.keywords.len();
 
+        let window_samples = weights.window_samples;
+
         Ok(Self {
             weights,
             front_end,
@@ -505,6 +508,7 @@ impl HotwordDetector {
             emb_scratch,
             dense1_scratch: [0.0f32; 32],
             scores_scratch: Vec::with_capacity(num_keywords),
+            window_scratch: vec![0.0f32; window_samples],
         })
     }
 
@@ -546,10 +550,34 @@ impl HotwordDetector {
 
         let num_frames = self.front_end.num_frames(window.len());
 
-        // 1. Extract log-mel spectrogram
-        self.front_end.extract(window, &mut self.mel_scratch);
+        // 1. Automatic Gain Control (Peak Normalization):
+        // Scale speech window so peak amplitude reaches nominal reference (0.7)
+        // when speech is present (peak > 0.002). Far-field or low-volume microphone
+        // signals are normalized to near-field levels with a 30.0x gain ceiling to avoid
+        // amplifying imperceptible background silence.
+        let mut peak = 0.0f32;
+        for &sample in window {
+            if sample.is_finite() {
+                let abs = sample.abs();
+                if abs > peak {
+                    peak = abs;
+                }
+            }
+        }
+        let input_window = if peak > 0.002 {
+            let scale = (0.7 / peak).min(30.0);
+            for (dst, &src) in self.window_scratch.iter_mut().zip(window.iter()) {
+                *dst = if src.is_finite() { src * scale } else { 0.0 };
+            }
+            &self.window_scratch[..]
+        } else {
+            window
+        };
 
-        // 2. Convolutional Backbone Forward Pass
+        // 2. Extract log-mel spectrogram
+        self.front_end.extract(input_window, &mut self.mel_scratch);
+
+        // 3. Convolutional Backbone Forward Pass
         let l0 = (num_frames - 1) / 2 + 1;
         conv1d_silu_s2(
             &self.mel_scratch,
@@ -673,17 +701,24 @@ impl CircularBuffer {
     }
 
     fn read_last(&self, n: usize, out: &mut [f32]) -> bool {
-        if self.count < n || out.len() < n {
+        if out.len() < n || self.count == 0 {
             return false;
         }
 
-        let start = (self.write_pos + self.capacity - n) % self.capacity;
-        if start + n <= self.capacity {
-            out[..n].copy_from_slice(&self.buffer[start..start + n]);
+        let available = self.count.min(n).min(self.capacity);
+        let pad = n - available;
+        if pad > 0 {
+            out[..pad].fill(0.0);
+        }
+
+        let dst = &mut out[pad..n];
+        let start = (self.write_pos + self.capacity - available) % self.capacity;
+        if start + available <= self.capacity {
+            dst.copy_from_slice(&self.buffer[start..start + available]);
         } else {
             let first = self.capacity - start;
-            out[..first].copy_from_slice(&self.buffer[start..]);
-            out[first..n].copy_from_slice(&self.buffer[..n - first]);
+            dst[..first].copy_from_slice(&self.buffer[start..]);
+            dst[first..available].copy_from_slice(&self.buffer[..available - first]);
         }
         true
     }
@@ -711,9 +746,25 @@ pub struct HotwordIterator {
 
     current_sample: u64,
     last_eval_sample: u64,
-    last_vad_speech_sample: u64,
+    last_vad_speech_sample: Option<u64>,
     cooldown_until_sample: u64,
+    latest_score: f32,
+    recent_peak_score: f32,
+    last_log_sample: u64,
 }
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn __android_log_print(
+        prio: std::os::raw::c_int,
+        tag: *const std::os::raw::c_char,
+        fmt: *const std::os::raw::c_char,
+        ...
+    ) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "android")]
+const ANDROID_TAG: &[u8] = b"HotwordDetector\0";
 
 impl HotwordIterator {
     /// Create a new streaming `HotwordIterator`.
@@ -724,15 +775,18 @@ impl HotwordIterator {
         Self {
             ring_buffer: CircularBuffer::new(ring_capacity),
             window_buffer: vec![0.0f32; window_samples],
-            vad_buffer: Vec::with_capacity(1024),
+            vad_buffer: Vec::with_capacity(2048),
             vad_processed_samples: 0,
             detector,
             vad,
             config,
             current_sample: 0,
             last_eval_sample: 0,
-            last_vad_speech_sample: 0,
+            last_vad_speech_sample: None,
             cooldown_until_sample: 0,
+            latest_score: 0.0,
+            recent_peak_score: 0.0,
+            last_log_sample: 0,
         }
     }
 
@@ -747,8 +801,11 @@ impl HotwordIterator {
         }
         self.current_sample = 0;
         self.last_eval_sample = 0;
-        self.last_vad_speech_sample = 0;
+        self.last_vad_speech_sample = None;
         self.cooldown_until_sample = 0;
+        self.latest_score = 0.0;
+        self.recent_peak_score = 0.0;
+        self.last_log_sample = 0;
     }
 
     /// Process a streaming chunk of audio samples and return a detection event if triggered.
@@ -789,7 +846,7 @@ impl HotwordIterator {
                     )?;
                     self.vad_processed_samples += VAD_FRAME_SIZE as u64;
                     if prob >= self.config.vad_threshold {
-                        self.last_vad_speech_sample = self.vad_processed_samples;
+                        self.last_vad_speech_sample = Some(self.vad_processed_samples);
                     }
                     self.vad_buffer.drain(..VAD_FRAME_SIZE);
                 }
@@ -803,13 +860,16 @@ impl HotwordIterator {
 
             // Gating: if VAD is active and reported no speech within the window, skip KWS
             let window_samples = self.detector.weights.window_samples as u64;
-            if self.vad.is_some()
-                && self
-                    .vad_processed_samples
-                    .saturating_sub(self.last_vad_speech_sample)
-                    > window_samples
-            {
-                continue;
+            if self.vad.is_some() {
+                let speech_in_window = match self.last_vad_speech_sample {
+                    Some(last_sample) => {
+                        self.vad_processed_samples.saturating_sub(last_sample) <= window_samples
+                    }
+                    None => self.vad_processed_samples < VAD_FRAME_SIZE as u64,
+                };
+                if !speech_in_window {
+                    continue;
+                }
             }
 
             // 3. Extract 1200 ms audio window from ring buffer
@@ -822,6 +882,63 @@ impl HotwordIterator {
 
             // 4. Run KWS inference
             let scores = self.detector.process_window(&self.window_buffer)?;
+            let max_score = scores.iter().cloned().fold(0.0f32, f32::max);
+            self.latest_score = max_score;
+            if max_score > self.recent_peak_score {
+                self.recent_peak_score = max_score;
+            }
+
+            #[cfg(target_os = "android")]
+            {
+                if max_score >= self.config.threshold * 0.8 {
+                    unsafe {
+                        use std::ffi::CString;
+                        if let Ok(msg) = CString::new(format!(
+                            "KWS score: {:.4} (threshold: {:.4}, cooldown: {})",
+                            max_score,
+                            self.config.threshold,
+                            self.current_sample < self.cooldown_until_sample
+                        )) {
+                            __android_log_print(
+                                4,
+                                ANDROID_TAG.as_ptr() as *const _,
+                                b"%s\0".as_ptr() as *const _,
+                                msg.as_ptr(),
+                            );
+                        }
+                    }
+                }
+
+                if self.current_sample.saturating_sub(self.last_log_sample) >= 16_000 {
+                    self.last_log_sample = self.current_sample;
+                    unsafe {
+                        use std::ffi::CString;
+                        if let Ok(msg) = CString::new(format!(
+                            "KWS heartbeat [1s peak={:.4}, threshold={:.4}]",
+                            self.recent_peak_score, self.config.threshold
+                        )) {
+                            __android_log_print(
+                                3,
+                                ANDROID_TAG.as_ptr() as *const _,
+                                b"%s\0".as_ptr() as *const _,
+                                msg.as_ptr(),
+                            );
+                        }
+                    }
+                    self.recent_peak_score = 0.0;
+                }
+            }
+
+            #[cfg(not(target_os = "android"))]
+            {
+                if max_score >= 0.05 {
+                    tracing::debug!(
+                        max_score,
+                        threshold = self.config.threshold,
+                        "KWS evaluation score"
+                    );
+                }
+            }
 
             // 5. Threshold & Debounce checks
             let triggered = if self.current_sample >= self.cooldown_until_sample {
@@ -872,6 +989,15 @@ mod tests {
         let mut cb = CircularBuffer::new(10);
         assert!(!cb.read_last(5, &mut [0.0; 5]));
 
+        // Partial fill: fewer samples than requested window (zero-padded on left)
+        cb.push_slice(&[42.0, 43.0]);
+        let mut partial = [0.0f32; 5];
+        assert!(cb.read_last(5, &mut partial));
+        assert_eq!(partial, [0.0, 0.0, 0.0, 42.0, 43.0]);
+
+        cb.reset();
+        assert!(!cb.read_last(5, &mut [0.0; 5]));
+
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         cb.push_slice(&data);
 
@@ -898,6 +1024,21 @@ mod tests {
         assert_eq!(mel.len(), 32 * 118);
         assert!(mel.iter().all(|&v| v == 0.0));
         Ok(())
+    }
+
+    #[test]
+    fn test_circular_buffer_window_exceeds_capacity() {
+        let mut cb = CircularBuffer::new(10);
+        cb.push_slice(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let mut out = [0.0f32; 15];
+        // Requesting 15 samples from a 10-capacity buffer should clamp available to 5 and zero-pad 10 zeros
+        assert!(cb.read_last(15, &mut out));
+        assert_eq!(
+            out,
+            [
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0
+            ]
+        );
     }
 
     #[test]

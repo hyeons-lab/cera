@@ -48,8 +48,8 @@
 //!   decode output to Kotlin / Swift / Python implementations.
 //!
 //! Voice Activity Detection (VAD):
-//! - [`FfiSileroVad`] — native Silero VAD v5 speech detector for 16 kHz and 8 kHz audio.
-//! - [`FfiVadIterator`] — stateful speech boundary detector emitting start/end events for live audio streams.
+//! - [`FfiSileroVad`]: native Silero VAD v5 speech detector for 16 kHz and 8 kHz audio.
+//! - [`FfiVadIterator`]: stateful speech boundary detector emitting start/end events for live audio streams.
 //! - [`FfiVadConfig`], [`FfiVadSampleRate`], [`FfiSpeechTimestamp`], [`FfiVadEvent`].
 //!
 //! Keyword Spotting (KWS):

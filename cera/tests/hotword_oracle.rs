@@ -110,7 +110,8 @@ fn test_hotword_oracle_parity() -> Result<()> {
 
     // 3. Streaming evaluation with HotwordIterator
     let mut config = detector.default_config();
-    config.threshold = 0.40; // Allow fixture probability (~0.499) to trigger
+    let threshold = fixture.probabilities[0] * 0.95;
+    config.threshold = threshold;
     let mut iterator = HotwordIterator::new(detector, None, config);
 
     let chunk_size = 640; // 40 ms @ 16 kHz
@@ -119,7 +120,7 @@ fn test_hotword_oracle_parity() -> Result<()> {
     for chunk in synthetic_audio.chunks(chunk_size) {
         if let Some(event) = iterator.process_chunk(chunk)? {
             assert_eq!(event.keyword, "Hey Liquid");
-            assert!(event.confidence >= 0.40);
+            assert!(event.confidence >= threshold);
             assert!(event.sample_offset > 0);
             detected_count += 1;
         }

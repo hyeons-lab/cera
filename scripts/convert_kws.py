@@ -307,9 +307,18 @@ def generate_verification_fixture(
         + 0.1 * np.sin(2.0 * np.pi * 1760.0 * t)
     ).astype(np.float32)
 
-    # Extract reference mel spectrogram
+    # Extract reference mel spectrogram for raw front-end oracle parity
     mel_frames = extract_log_mel_spectrogram(synthetic_audio)
-    mel_tensor = torch.from_numpy(mel_frames).unsqueeze(0)
+
+    # Normalize audio window to nominal peak (0.7) if speech is present (peak > 0.002),
+    # matching HotwordDetector::process_window Automatic Gain Control (AGC).
+    peak = float(np.max(np.abs(synthetic_audio)))
+    if peak > 0.002:
+        scale = min(0.7 / peak, 30.0)
+        norm_audio = synthetic_audio * scale
+        mel_tensor = torch.from_numpy(extract_log_mel_spectrogram(norm_audio)).unsqueeze(0)
+    else:
+        mel_tensor = torch.from_numpy(mel_frames).unsqueeze(0)
 
     # Run reference model forward pass
     with torch.no_grad():
