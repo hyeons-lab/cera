@@ -300,12 +300,51 @@ jobs:
             exit 1
           fi
 
-      # Refresh the pub.dev OIDC JWT token prior to publishing cera_ffi_flutter.
-      # The sibling cera_ffi index propagation loop can wait up to 300s, which risks
-      # exhausting the 5-minute TTL of the token minted for cera_ffi. Re-running
-      # setup-dart requests a fresh token from ACTIONS_ID_TOKEN_REQUEST_URL with a
-      # full 5-minute lifespan for the Flutter plugin publish step.
-      - name: Refresh pub.dev OIDC token for cera_ffi_flutter via setup-dart
+      # Resolve dependencies and verify cera_ffi_flutter against the newly published cera_ffi.
+      # Running this unauthenticated (with pub-tokens.json removed) prevents flutter pub get
+      # from attaching the OIDC bearer token to public metadata requests, which pub.dev rejects with 403.
+      # Resolving before provisioning setup-dart also prevents the retry loop from consuming the token's 5-minute TTL.
+      - name: Resolve and verify cera_ffi_flutter
+        if: env.DRY_RUN == 'false'
+        run: |
+          set -euo pipefail
+          echo "=== Checking if cera_ffi_flutter@${VERSION} is already on pub.dev ==="
+          pkg_status=$(curl -sSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 20 -o /dev/null -w "%{http_code}" "https://pub.dev/api/packages/cera_ffi_flutter/versions/${VERSION}" 2>/dev/null || true)
+          pkg_status="${pkg_status:-000}"
+
+          if [ "$pkg_status" = "200" ]; then
+            echo "cera_ffi_flutter@${VERSION} already on pub.dev - skipping dependency resolution"
+            exit 0
+          fi
+
+          # Ensure no lingering auth token is sent on public pub.dev metadata queries
+          rm -f ~/.config/dart/pub-tokens.json
+
+          (
+            cd cera_ffi_flutter
+            rm -f pubspec_overrides.yaml
+            resolved=false
+            for attempt in $(seq 1 18); do
+              rm -rf .dart_tool pubspec.lock
+              if flutter pub get; then
+                resolved=true
+                break
+              fi
+              echo "flutter pub get failed (attempt ${attempt}/18), waiting 20s for pub.dev dependency cache to propagate..."
+              sleep 20
+            done
+            if [ "$resolved" = "false" ]; then
+              echo "::error::flutter pub get failed to resolve dependencies after 18 attempts (360s)" >&2
+              exit 1
+            fi
+            flutter analyze
+          )
+
+      # Provision a fresh pub.dev OIDC token for publishing cera_ffi_flutter.
+      # This step runs AFTER cera_ffi_flutter dependencies have been resolved and verified,
+      # ensuring the short-lived (5-minute TTL) token is not expired by the resolution loop
+      # and is used exclusively for publishing to pub.dev.
+      - name: Provision pub.dev OIDC token for cera_ffi_flutter via setup-dart
         if: env.DRY_RUN == 'false'
         uses: dart-lang/setup-dart@v1
 
@@ -361,22 +400,6 @@ jobs:
           echo "=== Publishing cera_ffi_flutter@${VERSION} to pub.dev ==="
           (
             cd cera_ffi_flutter
-            rm -f pubspec_overrides.yaml
-            resolved=false
-            for attempt in $(seq 1 18); do
-              rm -rf .dart_tool pubspec.lock
-              if flutter pub get; then
-                resolved=true
-                break
-              fi
-              echo "flutter pub get failed (attempt ${attempt}/18), waiting 20s for pub.dev dependency cache to propagate..."
-              sleep 20
-            done
-            if [ "$resolved" = "false" ]; then
-              echo "::error::flutter pub get failed to resolve dependencies after 18 attempts (360s)" >&2
-              exit 1
-            fi
-            flutter analyze
             flutter pub publish --force
           )
 
