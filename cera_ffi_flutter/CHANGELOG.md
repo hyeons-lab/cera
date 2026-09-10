@@ -4,8 +4,8 @@
 
 ### Added
 
-- **Keyword Spotting Bindings**: Multiplatform Flutter FFI bindings for native keyword spotting and wake word detection (`HotwordDetector`, `HotwordIterator`, `HotwordConfig`).
-- **Whisper ASR Bindings**: Flutter FFI bindings for pure-Rust Whisper speech-to-text transcription (`WhisperModel`, `WhisperTranscribeOpts`).
+- **Keyword Spotting Bindings**: Multiplatform Flutter FFI bindings for native keyword spotting and wake word detection (`FfiHotwordDetector`, `FfiHotwordIterator`, `FfiHotwordConfig`).
+- **Whisper ASR Bindings**: Flutter FFI bindings for pure-Rust Whisper speech-to-text transcription (`FfiWhisperModel`, `FfiWhisperTranscribeOpts`).
 
 ### Changed
 

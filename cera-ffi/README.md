@@ -1007,7 +1007,7 @@ do {
 
 - **`FfiHotwordDetector.fromFile(path)`** / **`fromBytes(bytes)`**: Loads a self-describing GGUF keyword spotting model (`kws.keywords`, window/hop dimensions, thresholds) with zero-allocation forward inference.
 - **`FfiHotwordIterator.fromFiles(detectorPath, vadPath, config)`**: Creates a streaming state machine with integrated circular ring buffering, 30.0x AGC peak normalization, Silero VAD gating, and post-detection lockout debounce.
-- **`iterator.processChunk(chunk)`**: Ingests arbitrary chunks of 16 kHz mono PCM float samples and returns any triggered `FfiHotwordEvent`s (keyword, score, timestamp, audio sample offset).
+- **`iterator.processChunk(chunk)`**: Ingests arbitrary chunks of 16 kHz mono PCM float samples and returns any triggered `FfiHotwordEvent` (keyword, confidence, timestamp, audio sample offset) or `None`.
 - **`iterator.reset()`**: Clears ring buffers and debounces after command execution.
 
 ### Whisper Speech Recognition (ASR)
@@ -1015,7 +1015,7 @@ do {
 `cera-ffi` exposes pure-Rust OpenAI Whisper transcription (`FfiWhisperModel`, `FfiWhisperTranscribeOpts`):
 
 - **`FfiWhisperModel.fromFile(path)`** / **`fromBytes(bytes)`**: Instantiates the Whisper model from standard GGUF weights.
-- **`model.transcribe(pcm, opts)`**: Synchronous transcription returning recognized text and language metadata.
+- **`model.transcribe(pcm, opts)`**: Synchronous transcription returning recognized text.
 - **`model.transcribeAsync(pcm, opts)`**: Non-blocking asynchronous transcription powered by Tokio, supporting cooperative task cancellation when host listening states are dismissed.
 
 ## Design notes

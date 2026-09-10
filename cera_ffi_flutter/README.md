@@ -172,15 +172,15 @@ final kwsIterator = FfiHotwordIterator.fromFiles(
   '/path/to/silero_vad.gguf',
   kwsConfig,
 );
-final events = kwsIterator.processChunk(audioChunk16kHz);
-for (final e in events) {
-  print('Wake word detected: ${e.keyword} (score: ${e.score})');
+final event = kwsIterator.processChunk(audioChunk16kHz);
+if (event != null) {
+  print('Wake word detected: ${event.keyword} (confidence: ${event.confidence})');
 }
 
 // Whisper Speech-to-Text Transcription
 final whisper = FfiWhisperModel.fromFile('/path/to/whisper.gguf');
-final result = await whisper.transcribe(audioPcm, whisperDefaultTranscribeOpts());
-print('Transcribed text: ${result.text}');
+final text = await whisper.transcribeAsync(audioPcm, whisperDefaultTranscribeOpts());
+print('Transcribed text: $text');
 ```
 
 ## Web
