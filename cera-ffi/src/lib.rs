@@ -3355,7 +3355,7 @@ impl FfiHotwordDetector {
     pub fn from_file(path: String) -> Result<Arc<Self>, FfiError> {
         let detector =
             cera::hotword::HotwordDetector::from_file(&path).map_err(|e| FfiError::Backend {
-                detail: e.to_string(),
+                detail: format!("failed to load hotword model from {path}: {e}"),
             })?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(detector),
@@ -3367,7 +3367,7 @@ impl FfiHotwordDetector {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let detector =
             cera::hotword::HotwordDetector::from_bytes(bytes).map_err(|e| FfiError::Backend {
-                detail: e.to_string(),
+                detail: format!("failed to load hotword model from bytes: {e}"),
             })?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(detector),
@@ -3420,18 +3420,20 @@ impl FfiHotwordIterator {
     ) -> Result<Arc<Self>, FfiError> {
         let detector = cera::hotword::HotwordDetector::from_file(&model_path).map_err(|e| {
             FfiError::Backend {
-                detail: e.to_string(),
+                detail: format!("failed to load hotword model from {model_path}: {e}"),
             }
         })?;
         let vad = if let Some(vp) = vad_model_path {
             let v = cera::vad::SileroVad::from_file(&vp).map_err(|e| FfiError::Backend {
-                detail: e.to_string(),
+                detail: format!("failed to load VAD model from {vp}: {e}"),
             })?;
             Some(v)
         } else {
             None
         };
-        let cfg = config.unwrap_or_default().into();
+        let cfg = config
+            .map(Into::into)
+            .unwrap_or_else(|| detector.default_config());
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(cera::hotword::HotwordIterator::new(detector, vad, cfg)),
         }))
@@ -3559,8 +3561,14 @@ impl FfiWhisperModel {
         let cera_opts: cera::WhisperTranscribeOpts = opts.unwrap_or_default().into();
         self.model
             .transcribe(&self.tokenizer, &pcm, &cera_opts)
-            .map_err(|e| FfiError::Backend {
-                detail: e.to_string(),
+            .map_err(|e| {
+                if e.to_string().contains("transcription cancelled") {
+                    FfiError::Cancelled
+                } else {
+                    FfiError::Backend {
+                        detail: e.to_string(),
+                    }
+                }
             })
     }
 
@@ -3608,8 +3616,14 @@ impl FfiWhisperModel {
         let handle = tokio::task::spawn_blocking(move || {
             self.model
                 .transcribe(&self.tokenizer, &pcm, &cera_opts)
-                .map_err(|e| FfiError::Backend {
-                    detail: e.to_string(),
+                .map_err(|e| {
+                    if e.to_string().contains("transcription cancelled") {
+                        FfiError::Cancelled
+                    } else {
+                        FfiError::Backend {
+                            detail: e.to_string(),
+                        }
+                    }
                 })
         });
 
@@ -3619,8 +3633,14 @@ impl FfiWhisperModel {
             armed: true,
         };
 
-        let result = handle.await.map_err(|e| FfiError::Backend {
-            detail: format!("transcribe_async worker task failed: {e}"),
+        let result = handle.await.map_err(|e| {
+            if e.is_cancelled() {
+                FfiError::Cancelled
+            } else {
+                FfiError::Backend {
+                    detail: format!("transcribe_async worker task failed: {e}"),
+                }
+            }
         })?;
         guard.armed = false;
         result

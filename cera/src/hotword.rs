@@ -302,6 +302,10 @@ impl HotwordWeights {
             !keywords.is_empty(),
             "model must define at least one keyword"
         );
+        ensure!(
+            keywords.iter().all(|k| !k.trim().is_empty()),
+            "keyword labels must not be blank"
+        );
 
         let sample_rate = gguf.get_u32("kws.sample_rate").unwrap_or(16000) as usize;
         let window_samples = gguf.get_u32("kws.window_samples").unwrap_or(19200) as usize;
@@ -312,6 +316,10 @@ impl HotwordWeights {
         let fft_size = gguf.get_u32("kws.fft_size").unwrap_or(512) as usize;
         let embedding_dim = gguf.get_u32("kws.embedding_dim").unwrap_or(64) as usize;
         let default_threshold = gguf.get_f32("kws.default_threshold").unwrap_or(0.75);
+        ensure!(
+            default_threshold.is_finite() && default_threshold > 0.0 && default_threshold <= 1.0,
+            "kws.default_threshold must be in (0.0, 1.0]"
+        );
         let cooldown_ms = gguf.get_u32("kws.cooldown_ms").unwrap_or(2000) as usize;
         let pre_roll_ms = gguf.get_u32("kws.pre_roll_ms").unwrap_or(150) as usize;
 
@@ -773,6 +781,7 @@ pub struct HotwordIterator {
     vad_sample_rate: crate::vad::VadSampleRate,
     vad_processed_samples: u64,
     config: HotwordConfig,
+    hop_samples: u64,
 
     current_sample: u64,
     last_eval_sample: u64,
@@ -792,6 +801,12 @@ impl HotwordIterator {
             8000 => (256, crate::vad::VadSampleRate::Rate8kHz),
             _ => (512, crate::vad::VadSampleRate::Rate16kHz),
         };
+        let sample_rate = detector.weights.sample_rate as u64;
+        let hop_samples = if config.step_ms > 0 {
+            ((config.step_ms as u64 * sample_rate) / 1000).max(1)
+        } else {
+            detector.weights.hop_samples as u64
+        };
 
         Self {
             ring_buffer: CircularBuffer::new(ring_capacity),
@@ -803,6 +818,7 @@ impl HotwordIterator {
             detector,
             vad,
             config,
+            hop_samples,
             current_sample: 0,
             last_eval_sample: 0,
             last_vad_speech_sample: None,
@@ -840,7 +856,7 @@ impl HotwordIterator {
             return Ok(None);
         }
 
-        let hop_samples = self.detector.weights.hop_samples as u64;
+        let hop_samples = self.hop_samples;
         let mut remain = chunk;
         let mut detected_event = None;
 
@@ -862,7 +878,11 @@ impl HotwordIterator {
             // 1. Step Silero VAD if attached (vad_frame_size increments)
             if let Some(vad) = &mut self.vad {
                 let frame_size = self.vad_frame_size;
-                self.vad_buffer.extend_from_slice(sub_chunk);
+                self.vad_buffer.extend(
+                    sub_chunk
+                        .iter()
+                        .map(|&s| if s.is_finite() { s } else { 0.0 }),
+                );
                 while self.vad_buffer.len() >= frame_size {
                     let prob =
                         vad.process_chunk(&self.vad_buffer[..frame_size], self.vad_sample_rate)?;
@@ -937,7 +957,8 @@ impl HotwordIterator {
                 scores
                     .iter()
                     .enumerate()
-                    .find(|&(_, score)| *score >= self.config.threshold)
+                    .filter(|&(_, score)| *score >= self.config.threshold)
+                    .max_by(|a, b| a.1.total_cmp(b.1))
                     .map(|(idx, &score)| (idx, score))
             } else {
                 None
@@ -1179,6 +1200,7 @@ mod tests {
         let event = iterator.process_chunk(&chunk)?;
         assert!(event.is_none());
         assert!(iterator.latest_score.is_finite());
+        assert!(iterator.vad_buffer.iter().all(|x| x.is_finite()));
 
         Ok(())
     }
@@ -1219,5 +1241,22 @@ mod tests {
         let mut out = [0.0f32; 1];
         assert!(cb.read_last(1, &mut out));
         assert_eq!(out[0], 3.0);
+    }
+
+    #[test]
+    fn test_hotword_custom_step_ms_evaluation() -> Result<()> {
+        let detector = create_test_detector();
+        let mut config = detector.default_config();
+        config.step_ms = 40; // 640 samples @ 16kHz
+        let mut iterator = HotwordIterator::new(detector, None, config);
+
+        let chunk = vec![0.1f32; 640];
+        iterator.process_chunk(&chunk)?;
+        assert_eq!(iterator.last_eval_sample, 640);
+
+        iterator.process_chunk(&chunk)?;
+        assert_eq!(iterator.last_eval_sample, 1280);
+
+        Ok(())
     }
 }
