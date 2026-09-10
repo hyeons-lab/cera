@@ -43,7 +43,11 @@ class MessageComposer extends StatefulWidget {
 }
 
 class _MessageComposerState extends State<MessageComposer> {
-  late final AudioRecorderService _audioRecorder;
+  AudioRecorderService? _localRecorder;
+
+  AudioRecorderService get _audioRecorder =>
+      widget.audioRecorder ?? (_localRecorder ??= AudioRecorderService());
+
   bool _isStartingRecording = false;
   bool _isRecordingAudio = false;
   bool _draggedToCancel = false;
@@ -52,17 +56,20 @@ class _MessageComposerState extends State<MessageComposer> {
   Timer? _recordTimer;
 
   @override
-  void initState() {
-    super.initState();
-    _audioRecorder = widget.audioRecorder ?? AudioRecorderService();
+  void didUpdateWidget(MessageComposer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.audioRecorder != oldWidget.audioRecorder) {
+      if (widget.audioRecorder != null && _localRecorder != null) {
+        _localRecorder!.dispose();
+        _localRecorder = null;
+      }
+    }
   }
 
   @override
   void dispose() {
     _recordTimer?.cancel();
-    if (widget.audioRecorder == null) {
-      _audioRecorder.dispose();
-    }
+    _localRecorder?.dispose();
     super.dispose();
   }
 

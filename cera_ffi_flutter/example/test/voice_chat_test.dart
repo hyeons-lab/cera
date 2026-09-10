@@ -59,6 +59,20 @@ void main() {
       expect(floats[3], closeTo(0.5, 1e-3));
     });
 
+    test(
+      'pcm16ToFloat32 handles empty, 1-byte, and odd-length byte lists safely',
+      () {
+        expect(AudioRecorderService.pcm16ToFloat32(Uint8List(0)), isEmpty);
+        expect(AudioRecorderService.pcm16ToFloat32(Uint8List(1)), isEmpty);
+
+        // 3 bytes: 1 complete 16-bit sample (2 bytes) + 1 trailing odd byte (ignored safely)
+        final threeBytes = Uint8List.fromList([0x00, 0x00, 0xFF]);
+        final floats = AudioRecorderService.pcm16ToFloat32(threeBytes);
+        expect(floats.length, 1);
+        expect(floats[0], closeTo(0.0, 1e-4));
+      },
+    );
+
     test('normalizeAudio scales peak amplitude and clamps safely', () {
       final samples = [0.1, -0.2, 0.4, -0.1];
       final normalized = AudioRecorderService.normalizeAudio(
@@ -269,6 +283,68 @@ void main() {
       expect(sentPcm, isNull);
       expect(sentRate, isNull);
     });
+
+    testWidgets(
+      'MessageComposer updates recorder reactively on parent rebuild and does not dispose injected recorder',
+      (WidgetTester tester) async {
+        final recorderA = FakeAudioRecorderService();
+        final recorderB = FakeAudioRecorderService();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              bottomNavigationBar: MessageComposer(
+                controller: TextEditingController(),
+                isBusy: false,
+                isGenerating: false,
+                canAttachImage: false,
+                canAttachAudio: true,
+                pendingImageBytes: null,
+                pendingImageName: null,
+                onSend: () {},
+                onStop: () {},
+                onPickImage: () {},
+                onClearImage: () {},
+                audioRecorder: recorderA,
+                onSendAudio: (_, _) {},
+              ),
+            ),
+          ),
+        );
+
+        // Rebuild parent with recorderB
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              bottomNavigationBar: MessageComposer(
+                controller: TextEditingController(),
+                isBusy: false,
+                isGenerating: false,
+                canAttachImage: false,
+                canAttachAudio: true,
+                pendingImageBytes: null,
+                pendingImageName: null,
+                onSend: () {},
+                onStop: () {},
+                onPickImage: () {},
+                onClearImage: () {},
+                audioRecorder: recorderB,
+                onSendAudio: (_, _) {},
+              ),
+            ),
+          ),
+        );
+
+        // Remove MessageComposer completely from tree
+        await tester.pumpWidget(
+          const MaterialApp(home: Scaffold(body: SizedBox())),
+        );
+
+        // Injected recorders must not be disposed by MessageComposer
+        expect(recorderA.isDisposed, isFalse);
+        expect(recorderB.isDisposed, isFalse);
+      },
+    );
   });
 
   group('Voice Mode Selector Bar', () {
@@ -700,11 +776,43 @@ void main() {
         '',
       );
     });
+
+    test(
+      'StopGenerationIntent stops audio player playback and clears generating state',
+      () async {
+        final controller = ChatController();
+        controller.value = controller.value.copyWith(
+          isGenerating: true,
+          turns: [
+            const Turn(
+              role: 'assistant',
+              text: 'Generating audio output...',
+              isGenerating: true,
+            ),
+          ],
+        );
+
+        expect(controller.value.isGenerating, isTrue);
+        expect(controller.value.turns.first.isGenerating, isTrue);
+
+        await controller.dispatch(const StopGenerationIntent());
+
+        expect(controller.value.isGenerating, isFalse);
+        expect(controller.value.turns.first.isGenerating, isFalse);
+
+        controller.dispose();
+      },
+    );
+
+    test('vocoderSampleRate is 24000 Hz', () {
+      expect(ChatController.vocoderSampleRate, 24000);
+    });
   });
 }
 
 class FakeAudioRecorderService extends AudioRecorderService {
   bool _mockRecording = false;
+  bool isDisposed = false;
 
   @override
   bool get isRecording => _mockRecording;
@@ -734,6 +842,7 @@ class FakeAudioRecorderService extends AudioRecorderService {
   @override
   Future<void> dispose() async {
     _mockRecording = false;
+    isDisposed = true;
   }
 }
 

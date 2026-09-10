@@ -24,6 +24,9 @@ class ChatController extends ValueNotifier<ChatState> {
     _loadDownloadedRecords();
   }
 
+  /// Fixed output sampling rate for Cera vocoder neural audio models (24 kHz).
+  static const int vocoderSampleRate = 24000;
+
   final Future<String?> Function() _defaultStoreDir;
   final AudioPlayerService _audioPlayer = AudioPlayerService();
   Cera? _ceraEngine;
@@ -866,7 +869,7 @@ class ChatController extends ValueNotifier<ChatState> {
         (value.capabilities?.audioOut ?? false) && isAudioChat;
 
     if (shouldStreamAudio) {
-      _audioPlayer.startStream(sampleRate: 24000);
+      _audioPlayer.startStream(sampleRate: vocoderSampleRate);
     }
 
     try {
@@ -989,7 +992,7 @@ class ChatController extends ValueNotifier<ChatState> {
                 ? (totalTokens / (totalMs / 1000.0))
                 : 0.0);
 
-      final rate = (audioSampleRate ?? 24000).toDouble();
+      final rate = (audioSampleRate ?? vocoderSampleRate).toDouble();
       final audioDurationSec = generatedAudioSamples.isNotEmpty
           ? (generatedAudioSamples.length / rate)
           : null;
