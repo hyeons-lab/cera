@@ -27,7 +27,8 @@ fn gemma2_matches_llama_cpp_oracle() {
     let gguf = GgufFile::open(path).expect("open test_gemma2.gguf");
     let model = LlamaModel::from_gguf(gguf, 256).expect("load gemma2 model");
 
-    let tokens = vec![88u32, 108, 105]; // 'T', 'h', 'e'
+    // Token IDs in test GGUF fixture (4 special tokens + ASCII byte value): 'T' (84 + 4 = 88), 'h' (104 + 4 = 108), 'e' (101 + 4 = 105).
+    let tokens = vec![88u32, 108, 105];
     let mut state =
         InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
 
@@ -129,7 +130,8 @@ fn olmo2_matches_llama_cpp_oracle() {
     let gguf = GgufFile::open(path).expect("open test_olmo2.gguf");
     let model = LlamaModel::from_gguf(gguf, 256).expect("load olmo2 model");
 
-    let tokens = vec![88u32, 108, 105]; // 'T', 'h', 'e'
+    // Token IDs in test GGUF fixture (4 special tokens + ASCII byte value): 'T' (84 + 4 = 88), 'h' (104 + 4 = 108), 'e' (101 + 4 = 105).
+    let tokens = vec![88u32, 108, 105];
     let mut state =
         InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
 
