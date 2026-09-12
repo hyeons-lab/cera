@@ -44,6 +44,7 @@ fn make_test_config(n_layers: usize, hidden_size: usize) -> ModelConfig {
         rms_norm_eps: 1e-5,
         block_types: vec![BlockType::GatedConv, BlockType::Attention],
         conv_kernel_size: Some(4),
+        ssm: None,
         kv_heads_per_layer: vec![0, 2],
         scalars: ScalarMultipliers::default(),
         moe: None,

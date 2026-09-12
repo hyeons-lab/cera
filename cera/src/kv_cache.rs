@@ -307,6 +307,22 @@ pub enum LayerState {
         /// Pre-allocated ring buffer history snapshots for speculative decoding rollback.
         history: ConvHistory,
     },
+    /// State buffers for Mamba-2 SSM recurrent layers.
+    Mamba2 {
+        conv_state: Vec<f32>,
+        ssm_state: Vec<f32>,
+    },
+    /// Parallel attention and Mamba-2 SSM layers.
+    ParallelAttentionMamba2 {
+        key_cache: Vec<f32>,
+        value_cache: Vec<f32>,
+        key_cache_f16: Vec<u16>,
+        value_cache_f16: Vec<u16>,
+        compressed_keys: Option<CompressedKeyCache>,
+        compressed_values: Option<CompressedValueCache>,
+        conv_state: Vec<f32>,
+        ssm_state: Vec<f32>,
+    },
 }
 
 /// Pre-allocated scratch buffers reused across layers and tokens.
@@ -319,6 +335,14 @@ pub struct ScratchBuffers {
     pub conv_proj: Vec<f32>,
     /// Scratch for shortconv bx / conv output (hidden_size).
     pub conv_scratch: Vec<f32>,
+    /// Scratch for Mamba-2 in_proj output (d_in_proj).
+    pub ssm_in_proj: Vec<f32>,
+    /// Scratch for Mamba-2 conv1d output (conv_dim).
+    pub ssm_conv_out: Vec<f32>,
+    /// Scratch for Mamba-2 recurrent scan output (d_inner).
+    pub ssm_y: Vec<f32>,
+    /// Scratch for parallel branch output (hidden_size).
+    pub ssm_branch_out: Vec<f32>,
     /// Scratch for Q projection (hidden_size = n_heads * head_dim).
     pub q: Vec<f32>,
     /// Scratch for K projection (max kv_dim).
@@ -420,6 +444,10 @@ impl InferenceState {
                 ffn_input: Vec::new(),
                 conv_proj: Vec::new(),
                 conv_scratch: Vec::new(),
+                ssm_in_proj: Vec::new(),
+                ssm_conv_out: Vec::new(),
+                ssm_y: Vec::new(),
+                ssm_branch_out: Vec::new(),
                 q: Vec::new(),
                 k: Vec::new(),
                 v: Vec::new(),
@@ -491,6 +519,29 @@ impl InferenceState {
                 LayerState::Conv { buffer, history } => {
                     buffer.fill(0.0);
                     history.clear();
+                }
+                LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    conv_state.fill(0.0);
+                    ssm_state.fill(0.0);
+                }
+                LayerState::ParallelAttentionMamba2 {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    conv_state,
+                    ssm_state,
+                    ..
+                } => {
+                    key_cache.clear();
+                    value_cache.clear();
+                    key_cache_f16.clear();
+                    value_cache_f16.clear();
+                    conv_state.fill(0.0);
+                    ssm_state.fill(0.0);
                 }
             }
         }
@@ -567,11 +618,10 @@ impl InferenceState {
             let mut rotations = try_alloc::<Option<RotationState>>(config.block_types.len())?;
             for (layer_idx, bt) in config.block_types.iter().enumerate() {
                 rotations.push(match bt {
-                    BlockType::Attention => Some(RotationState::try_from_seed(
-                        seed ^ layer_idx as u64,
-                        head_dim,
-                    )?),
-                    BlockType::GatedConv => None,
+                    BlockType::Attention | BlockType::ParallelAttentionMamba2 => Some(
+                        RotationState::try_from_seed(seed ^ layer_idx as u64, head_dim)?,
+                    ),
+                    BlockType::GatedConv | BlockType::Mamba2 => None,
                 });
             }
             (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
@@ -663,6 +713,83 @@ impl InferenceState {
                             history: ConvHistory::new(buf_len),
                         })
                     }
+                    BlockType::Mamba2 => {
+                        let ssm = config.ssm.as_ref().ok_or_else(|| {
+                            CeraError::Backend("ssm config missing for Mamba2 layer".to_string())
+                        })?;
+                        let conv_dim =
+                            checked_elems::<f32>(ssm.d_inner + 2 * ssm.n_group * ssm.d_state, 1)?;
+                        let conv_state_len =
+                            checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
+                        let ssm_state_len = checked_elems::<f32>(ssm.d_inner, ssm.d_state)?;
+                        Ok(LayerState::Mamba2 {
+                            conv_state: zeroed_f32(conv_state_len)?,
+                            ssm_state: zeroed_f32(ssm_state_len)?,
+                        })
+                    }
+                    BlockType::ParallelAttentionMamba2 => {
+                        let n_kv_heads = config.kv_heads_per_layer[layer_idx];
+                        let kv_dim = checked_elems::<f32>(n_kv_heads, head_dim)?;
+                        let kv_capacity = checked_elems::<f32>(capacity, kv_dim)?;
+                        let compressed_keys = if compress_keys && n_kv_heads > 0 {
+                            Some(CompressedKeyCache::try_new(
+                                n_kv_heads,
+                                head_dim,
+                                initial_capacity,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let compressed_values = if compress_values && n_kv_heads > 0 {
+                            Some(CompressedValueCache::try_new(
+                                n_kv_heads,
+                                head_dim,
+                                initial_capacity,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let key_cache = if (compress_keys && n_kv_heads > 0) || use_f16 {
+                            Vec::new()
+                        } else {
+                            try_alloc::<f32>(kv_capacity)?
+                        };
+                        let value_cache = if (compress_values && n_kv_heads > 0) || use_f16 {
+                            Vec::new()
+                        } else {
+                            try_alloc::<f32>(kv_capacity)?
+                        };
+                        let key_cache_f16 = if use_f16 && n_kv_heads > 0 {
+                            try_alloc::<u16>(kv_capacity)?
+                        } else {
+                            Vec::new()
+                        };
+                        let value_cache_f16 = if use_f16 && n_kv_heads > 0 {
+                            try_alloc::<u16>(kv_capacity)?
+                        } else {
+                            Vec::new()
+                        };
+                        let ssm = config.ssm.as_ref().ok_or_else(|| {
+                            CeraError::Backend(
+                                "ssm config missing for ParallelAttentionMamba2 layer".to_string(),
+                            )
+                        })?;
+                        let conv_dim =
+                            checked_elems::<f32>(ssm.d_inner + 2 * ssm.n_group * ssm.d_state, 1)?;
+                        let conv_state_len =
+                            checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
+                        let ssm_state_len = checked_elems::<f32>(ssm.d_inner, ssm.d_state)?;
+                        Ok(LayerState::ParallelAttentionMamba2 {
+                            key_cache,
+                            value_cache,
+                            key_cache_f16,
+                            value_cache_f16,
+                            compressed_keys,
+                            compressed_values,
+                            conv_state: zeroed_f32(conv_state_len)?,
+                            ssm_state: zeroed_f32(ssm_state_len)?,
+                        })
+                    }
                 }
             },
         ) {
@@ -677,6 +804,28 @@ impl InferenceState {
                 ffn_input: zeroed_f32(config.hidden_size)?,
                 conv_proj: zeroed_f32(checked_elems::<f32>(3, config.hidden_size)?)?,
                 conv_scratch: zeroed_f32(config.hidden_size)?,
+                ssm_in_proj: if let Some(ssm) = &config.ssm {
+                    let d_in_proj = 2 * ssm.d_inner + 2 * ssm.n_group * ssm.d_state + ssm.dt_rank;
+                    zeroed_f32(d_in_proj)?
+                } else {
+                    Vec::new()
+                },
+                ssm_conv_out: if let Some(ssm) = &config.ssm {
+                    let conv_dim = ssm.d_inner + 2 * ssm.n_group * ssm.d_state;
+                    zeroed_f32(conv_dim)?
+                } else {
+                    Vec::new()
+                },
+                ssm_y: if let Some(ssm) = &config.ssm {
+                    zeroed_f32(ssm.d_inner)?
+                } else {
+                    Vec::new()
+                },
+                ssm_branch_out: if config.ssm.is_some() {
+                    zeroed_f32(config.hidden_size)?
+                } else {
+                    Vec::new()
+                },
                 q: zeroed_f32(q_dim)?,
                 k: zeroed_f32(max_kv_dim)?,
                 v: zeroed_f32(max_kv_dim)?,
@@ -736,105 +885,159 @@ impl InferenceState {
 
     /// Append K and V vectors to an attention layer's cache (uncompressed path).
     pub fn append_kv(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        if let LayerState::Attention {
-            key_cache,
-            value_cache,
-            ..
-        } = &mut self.layers[layer]
-        {
-            key_cache.extend_from_slice(k);
-            value_cache.extend_from_slice(v);
+        match &mut self.layers[layer] {
+            LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                key_cache,
+                value_cache,
+                ..
+            } => {
+                key_cache.extend_from_slice(k);
+                value_cache.extend_from_slice(v);
+            }
+            _ => {}
         }
     }
 
     /// Append K and V to an attention layer's f16 cache, converting each f32 to
     /// IEEE-754 half on the way in. Used when `KvCompression::F16` is active.
     pub fn append_kv_f16(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        if let LayerState::Attention {
-            key_cache_f16,
-            value_cache_f16,
-            ..
-        } = &mut self.layers[layer]
-        {
-            key_cache_f16.extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
-            value_cache_f16.extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
+        match &mut self.layers[layer] {
+            LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } => {
+                key_cache_f16.extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
+                value_cache_f16.extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
+            }
+            _ => {}
         }
     }
 
     /// Borrow the f16 key and value caches for an attention layer (IEEE-754 half
     /// bits, time-major `[seq_len × kv_dim]`). Panics on a non-attention layer.
     pub fn kv_cache_f16(&self, layer: usize) -> (&[u16], &[u16]) {
-        if let LayerState::Attention {
-            key_cache_f16,
-            value_cache_f16,
-            ..
-        } = &self.layers[layer]
-        {
-            (key_cache_f16, value_cache_f16)
-        } else {
-            panic!("kv_cache_f16 called on non-attention layer {layer}");
+        match &self.layers[layer] {
+            LayerState::Attention {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } => (key_cache_f16, value_cache_f16),
+            _ => panic!("kv_cache_f16 called on non-attention layer {layer}"),
         }
     }
 
     /// Borrow the key and value caches for an attention layer.
     /// The returned slices are laid out as [seq_len, kv_dim] (time-major).
     pub fn kv_cache(&self, layer: usize) -> (&[f32], &[f32]) {
-        if let LayerState::Attention {
-            key_cache,
-            value_cache,
-            ..
-        } = &self.layers[layer]
-        {
-            (key_cache, value_cache)
-        } else {
-            panic!("kv_cache called on non-attention layer {layer}");
+        match &self.layers[layer] {
+            LayerState::Attention {
+                key_cache,
+                value_cache,
+                ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                key_cache,
+                value_cache,
+                ..
+            } => (key_cache, value_cache),
+            _ => panic!("kv_cache called on non-attention layer {layer}"),
         }
     }
 
     /// Borrow the compressed key cache for an attention layer, if present.
     pub fn compressed_keys(&self, layer: usize) -> Option<&CompressedKeyCache> {
-        if let LayerState::Attention {
-            compressed_keys, ..
-        } = &self.layers[layer]
-        {
-            compressed_keys.as_ref()
-        } else {
-            None
+        match &self.layers[layer] {
+            LayerState::Attention {
+                compressed_keys, ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                compressed_keys, ..
+            } => compressed_keys.as_ref(),
+            _ => None,
         }
     }
 
     /// Mutably borrow the compressed key cache for an attention layer, if present.
     pub fn compressed_keys_mut(&mut self, layer: usize) -> Option<&mut CompressedKeyCache> {
-        if let LayerState::Attention {
-            compressed_keys, ..
-        } = &mut self.layers[layer]
-        {
-            compressed_keys.as_mut()
-        } else {
-            None
+        match &mut self.layers[layer] {
+            LayerState::Attention {
+                compressed_keys, ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                compressed_keys, ..
+            } => compressed_keys.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Borrow the Mamba-2 convolution and SSM states for a layer.
+    pub fn mamba2_state(&self, layer: usize) -> (&[f32], &[f32]) {
+        match &self.layers[layer] {
+            LayerState::Mamba2 {
+                conv_state,
+                ssm_state,
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                conv_state,
+                ssm_state,
+                ..
+            } => (conv_state, ssm_state),
+            _ => panic!("mamba2_state called on non-mamba2 layer {layer}"),
+        }
+    }
+
+    /// Mutably borrow the Mamba-2 convolution and SSM states for a layer.
+    pub fn mamba2_state_mut(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
+        match &mut self.layers[layer] {
+            LayerState::Mamba2 {
+                conv_state,
+                ssm_state,
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                conv_state,
+                ssm_state,
+                ..
+            } => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
+            _ => panic!("mamba2_state_mut called on non-mamba2 layer {layer}"),
         }
     }
 
     /// Is any attention layer's KV currently backed by a compressed
     /// (TurboQuant) cache? Used by `Session::append_tokens` to decide
-    /// whether `n_keep` shift is supported for this state — v1 gates
+    /// whether `n_keep` shift is supported for this state: v1 gates
     /// shift on uncompressed caches only.
     /// `true` iff *every* attention layer has BOTH
-    /// `compressed_keys` and `compressed_values` populated. Used by
-    /// the prefix-cache lookup gate to distinguish a fully-
-    /// TurboQuant state (matchable against
-    /// `LayerSnapshot::AttentionCompressed`) from a mixed-mode one
-    /// (no snapshot variant fits — `snapshot()` returns `None`).
+    /// `compressed_keys` and `compressed_values` populated.
     pub fn is_fully_compressed(&self) -> bool {
         self.layers.iter().all(|l| match l {
             LayerState::Attention {
                 compressed_keys,
                 compressed_values,
                 ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
+                compressed_keys,
+                compressed_values,
+                ..
             } => compressed_keys.is_some() && compressed_values.is_some(),
-            // Conv layers are never compressed; they don't impact
-            // the "fully compressed" determination.
-            LayerState::Conv { .. } => true,
+            // Conv and Mamba2 layers are never compressed.
+            LayerState::Conv { .. } | LayerState::Mamba2 { .. } => true,
         })
     }
 
@@ -846,6 +1049,12 @@ impl InferenceState {
                     compressed_keys: Some(_),
                     ..
                 } | LayerState::Attention {
+                    compressed_values: Some(_),
+                    ..
+                } | LayerState::ParallelAttentionMamba2 {
+                    compressed_keys: Some(_),
+                    ..
+                } | LayerState::ParallelAttentionMamba2 {
                     compressed_values: Some(_),
                     ..
                 }
@@ -922,6 +1131,50 @@ impl InferenceState {
                 LayerState::Conv { buffer, .. } => layers.push(LayerSnapshot::Conv {
                     buffer: bytemuck::cast_slice(buffer).to_vec(),
                 }),
+                LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => layers.push(LayerSnapshot::Mamba2 {
+                    conv_state: bytemuck::cast_slice(conv_state).to_vec(),
+                    ssm_state: bytemuck::cast_slice(ssm_state).to_vec(),
+                }),
+                LayerState::ParallelAttentionMamba2 {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    compressed_keys,
+                    compressed_values,
+                    conv_state,
+                    ssm_state,
+                } => {
+                    let snap = if kv_f16 {
+                        LayerSnapshot::AttentionF16 {
+                            k_data: key_cache_f16.iter().flat_map(|h| h.to_le_bytes()).collect(),
+                            v_data: value_cache_f16
+                                .iter()
+                                .flat_map(|h| h.to_le_bytes())
+                                .collect(),
+                        }
+                    } else {
+                        match (compressed_keys, compressed_values) {
+                            (None, None) => LayerSnapshot::Attention {
+                                k_data: bytemuck::cast_slice(key_cache).to_vec(),
+                                v_data: bytemuck::cast_slice(value_cache).to_vec(),
+                            },
+                            (Some(k), Some(v)) => LayerSnapshot::AttentionCompressed {
+                                keys: crate::turboquant::encode_compressed_keys(k),
+                                values: crate::turboquant::encode_compressed_values(v),
+                            },
+                            (Some(_), None) | (None, Some(_)) => return None,
+                        }
+                    };
+                    layers.push(LayerSnapshot::ParallelAttentionMamba2 {
+                        snap: Box::new(snap),
+                        conv_state: bytemuck::cast_slice(conv_state).to_vec(),
+                        ssm_state: bytemuck::cast_slice(ssm_state).to_vec(),
+                    });
+                }
             }
         }
         Some(StateSnapshot::new(layers, self.seq_len))
@@ -1072,6 +1325,74 @@ impl InferenceState {
                     history.clear();
                     history.push(snapshot.seq_len, buffer);
                 }
+                (
+                    LayerState::Mamba2 {
+                        conv_state,
+                        ssm_state,
+                    },
+                    LayerSnapshot::Mamba2 {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    decode_f32_into(conv_state, snap_conv);
+                    decode_f32_into(ssm_state, snap_ssm);
+                }
+                (
+                    LayerState::ParallelAttentionMamba2 {
+                        key_cache,
+                        value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
+                        compressed_keys,
+                        compressed_values,
+                        conv_state,
+                        ssm_state,
+                    },
+                    LayerSnapshot::ParallelAttentionMamba2 {
+                        snap,
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    match &**snap {
+                        LayerSnapshot::Attention { k_data, v_data } => {
+                            assert!(!kv_f16, "f32 Attention snapshot restored into an f16 state");
+                            decode_f32_into(key_cache, k_data);
+                            decode_f32_into(value_cache, v_data);
+                            key_cache_f16.clear();
+                            value_cache_f16.clear();
+                        }
+                        LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                            assert!(
+                                kv_f16,
+                                "AttentionF16 snapshot restored into a non-f16 state"
+                            );
+                            decode_u16_into(key_cache_f16, k_data);
+                            decode_u16_into(value_cache_f16, v_data);
+                            key_cache.clear();
+                            value_cache.clear();
+                        }
+                        LayerSnapshot::AttentionCompressed { keys, values } => {
+                            if let (Some(ck), Some(cv)) = (
+                                crate::turboquant::decode_compressed_keys(keys),
+                                crate::turboquant::decode_compressed_values(values),
+                            ) {
+                                *compressed_keys = Some(ck);
+                                *compressed_values = Some(cv);
+                                key_cache.clear();
+                                value_cache.clear();
+                            } else {
+                                tracing::error!(
+                                    "invalid TQK1/TQV1 compressed blob in snapshot; skipping layer restore"
+                                );
+                            }
+                        }
+                        _ => panic!("snapshot layer kind doesn't match state layer kind"),
+                    }
+                    decode_f32_into(conv_state, snap_conv);
+                    decode_f32_into(ssm_state, snap_ssm);
+                }
                 _ => panic!("snapshot layer kind doesn't match state layer kind"),
             }
         }
@@ -1105,22 +1426,35 @@ impl InferenceState {
             return;
         }
 
-        // Validate whether all convolution layers can safely roll back to `len`.
-        // If any convolution layer lacks `len` in its history ring buffer, force `safe_len = 0`
-        // to safely reset the state and avoid corrupted convolution history.
+        // Validate whether all convolution and recurrent layers can safely roll back to `len`.
+        // If any convolution layer lacks `len` in its history ring buffer, or if any recurrent
+        // Mamba-2 layer is present without intermediate history, force `safe_len = 0`
+        // to safely reset the state and avoid corrupted state transitions.
         let mut safe_len = len;
         if safe_len > 0 {
             for layer in self.layers.iter() {
-                if let LayerState::Conv { history, .. } = layer
-                    && !history.has_pos(safe_len)
-                {
-                    tracing::warn!(
-                        target: "cera::kv_cache",
-                        target_len = safe_len,
-                        "truncate_to target pos not in ConvHistory ring buffer; forcing full clear to prevent convolution state corruption"
-                    );
-                    safe_len = 0;
-                    break;
+                match layer {
+                    LayerState::Conv { history, .. } => {
+                        if !history.has_pos(safe_len) {
+                            tracing::warn!(
+                                target: "cera::kv_cache",
+                                target_len = safe_len,
+                                "truncate_to target pos not in ConvHistory ring buffer; forcing full clear to prevent convolution state corruption"
+                            );
+                            safe_len = 0;
+                            break;
+                        }
+                    }
+                    LayerState::Mamba2 { .. } | LayerState::ParallelAttentionMamba2 { .. } => {
+                        tracing::warn!(
+                            target: "cera::kv_cache",
+                            target_len = safe_len,
+                            "truncate_to called on Mamba-2 state with safe_len > 0; recurrent state lacks intermediate history, forcing full clear"
+                        );
+                        safe_len = 0;
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1166,6 +1500,33 @@ impl InferenceState {
                     if !history.rollback_to(safe_len, buffer) {
                         buffer.fill(0.0);
                         history.clear();
+                    }
+                }
+                LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    if safe_len == 0 {
+                        conv_state.fill(0.0);
+                        ssm_state.fill(0.0);
+                    }
+                }
+                LayerState::ParallelAttentionMamba2 {
+                    key_cache,
+                    value_cache,
+                    key_cache_f16,
+                    value_cache_f16,
+                    conv_state,
+                    ssm_state,
+                    ..
+                } => {
+                    trunc(key_cache, seq_len, safe_len);
+                    trunc(value_cache, seq_len, safe_len);
+                    trunc(key_cache_f16, seq_len, safe_len);
+                    trunc(value_cache_f16, seq_len, safe_len);
+                    if safe_len == 0 {
+                        conv_state.fill(0.0);
+                        ssm_state.fill(0.0);
                     }
                 }
             }
@@ -1274,6 +1635,9 @@ impl InferenceState {
         let seq_len = self.seq_len;
         let delta = -(shift as i32);
 
+        // Only pure Attention layers are shifted. Recurrent states (Conv,
+        // Mamba2, ParallelAttentionMamba2) cannot be shifted in-place and are
+        // skipped here: HybridModel::supports_kv_shift explicitly reports false.
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if let LayerState::Attention {
                 key_cache,
@@ -1285,13 +1649,13 @@ impl InferenceState {
             {
                 if kv_f16 {
                     // ── f16 path ──────────────────────────────────────────
-                    // Layer has no KV yet — nothing to shift.
+                    // Layer has no KV yet: nothing to shift.
                     if key_cache_f16.is_empty() && value_cache_f16.is_empty() {
                         continue;
                     }
                     // Same invariants as the f32 path, on the u16 caches:
                     // equal lengths, a clean multiple of `seq_len` (in u16
-                    // units — the element count is identical to f32).
+                    // units, the element count is identical to f32).
                     assert_eq!(
                         key_cache_f16.len(),
                         value_cache_f16.len(),
@@ -1360,7 +1724,7 @@ impl InferenceState {
                 }
 
                 // ── f32 path ──────────────────────────────────────────────
-                // Layer has no KV yet — nothing to shift. Reaches here
+                // Layer has no KV yet: nothing to shift. Reaches here
                 // for models whose first `n_layers - 1` layers were
                 // populated but the last one wasn't; guard defensively.
                 if key_cache.is_empty() && value_cache.is_empty() {
@@ -1401,7 +1765,7 @@ impl InferenceState {
                 let drop_start = n_keep * kv_dim;
                 let drop_end = (n_keep + shift) * kv_dim;
                 // `Vec::drain` on a contiguous range is a memmove of
-                // the tail — no reallocation, one pass.
+                // the tail: no reallocation, one pass.
                 key_cache.drain(drop_start..drop_end);
                 value_cache.drain(drop_start..drop_end);
 
@@ -1611,26 +1975,43 @@ pub enum LayerSnapshot {
     Conv {
         buffer: Vec<u8>,
     },
+    Mamba2 {
+        conv_state: Vec<u8>,
+        ssm_state: Vec<u8>,
+    },
+    ParallelAttentionMamba2 {
+        snap: Box<LayerSnapshot>,
+        conv_state: Vec<u8>,
+        ssm_state: Vec<u8>,
+    },
 }
 
 impl LayerSnapshot {
     /// `true` iff this snapshot was captured from a TurboQuant-
     /// compressed attention layer. Callers about to invoke
     /// [`InferenceState::restore`] should check that this matches
-    /// the target's per-layer compression mode — `restore` panics
+    /// the target's per-layer compression mode: `restore` panics
     /// on a compression-mode mismatch (e.g. compressed snapshot
     /// into an uncompressed live state).
     pub fn is_compressed(&self) -> bool {
-        matches!(self, LayerSnapshot::AttentionCompressed { .. })
+        match self {
+            LayerSnapshot::AttentionCompressed { .. } => true,
+            LayerSnapshot::ParallelAttentionMamba2 { snap, .. } => snap.is_compressed(),
+            _ => false,
+        }
     }
 
     /// `true` iff this snapshot was captured from an f16 (`KvCompression::F16`)
     /// attention layer. Mirrors [`Self::is_compressed`]; callers gate `restore`
     /// on this matching the target state's `kv_f16` flag so an f16 snapshot is
-    /// never restored into an f32 state (or vice versa) — the byte widths
+    /// never restored into an f32 state (or vice versa): the byte widths
     /// differ, so a cross-mode restore would corrupt the cache.
     pub fn is_f16(&self) -> bool {
-        matches!(self, LayerSnapshot::AttentionF16 { .. })
+        match self {
+            LayerSnapshot::AttentionF16 { .. } => true,
+            LayerSnapshot::ParallelAttentionMamba2 { snap, .. } => snap.is_f16(),
+            _ => false,
+        }
     }
 }
 
@@ -1643,6 +2024,31 @@ impl StateSnapshot {
                 LayerSnapshot::AttentionCompressed { keys, values } => keys.len() + values.len(),
                 LayerSnapshot::AttentionF16 { k_data, v_data } => k_data.len() + v_data.len(),
                 LayerSnapshot::Conv { buffer } => buffer.len(),
+                LayerSnapshot::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => conv_state.len() + ssm_state.len(),
+                LayerSnapshot::ParallelAttentionMamba2 {
+                    snap,
+                    conv_state,
+                    ssm_state,
+                } => {
+                    let snap_len = match &**snap {
+                        LayerSnapshot::Attention { k_data, v_data } => k_data.len() + v_data.len(),
+                        LayerSnapshot::AttentionCompressed { keys, values } => {
+                            keys.len() + values.len()
+                        }
+                        LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                            k_data.len() + v_data.len()
+                        }
+                        _ => {
+                            unreachable!(
+                                "ParallelAttentionMamba2 should only wrap Attention variants"
+                            )
+                        }
+                    };
+                    snap_len + conv_state.len() + ssm_state.len()
+                }
             })
             .sum()
     }
@@ -2057,6 +2463,22 @@ impl KvPrefixCache {
                     let v = builder.create_vector(v_data);
                     (3u8, Some(k), Some(v))
                 }
+                LayerSnapshot::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    let k = builder.create_vector(conv_state);
+                    let v = builder.create_vector(ssm_state);
+                    (4u8, Some(k), Some(v))
+                }
+                LayerSnapshot::ParallelAttentionMamba2 { .. } => {
+                    // Parallel attention and Mamba-2 layers cannot be serialized
+                    // into the 2-vector flatbuffer LayerData schema: skip disk write.
+                    tracing::warn!(
+                        "KvPrefixCache: ParallelAttentionMamba2 layers cannot be serialized yet; skipping disk write"
+                    );
+                    return;
+                }
             };
             let ld = crate::generated::cera::cache::LayerData::create(
                 &mut builder,
@@ -2240,6 +2662,17 @@ impl KvPrefixCache {
                     }
                     layers.push(LayerSnapshot::AttentionF16 { k_data, v_data });
                 }
+                4 => {
+                    let conv_state = l.k_data()?.bytes().to_vec();
+                    let ssm_state = l.v_data()?.bytes().to_vec();
+                    if !conv_state.len().is_multiple_of(4) || !ssm_state.len().is_multiple_of(4) {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::Mamba2 {
+                        conv_state,
+                        ssm_state,
+                    });
+                }
                 _ => return None,
             }
         }
@@ -2336,6 +2769,8 @@ pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
         buf.push(match bt {
             crate::model::BlockType::Attention => 0,
             crate::model::BlockType::GatedConv => 1,
+            crate::model::BlockType::Mamba2 => 2,
+            crate::model::BlockType::ParallelAttentionMamba2 => 3,
         });
     }
     for k in &config.kv_heads_per_layer {
@@ -2371,6 +2806,7 @@ mod tests {
                 })
                 .collect(),
             conv_kernel_size: Some(3),
+            ssm: None,
             kv_heads_per_layer: (0..n_layers)
                 .map(|i| if i % 2 == 0 { 2 } else { 0 })
                 .collect(),
@@ -2697,12 +3133,17 @@ mod tests {
         // not the slot contents, drives the variant.
         for (i, l) in snap.layers.iter().enumerate() {
             match &state.layers[i] {
-                LayerState::Attention { .. } => assert!(
-                    l.is_f16(),
-                    "attention layer {i} must snapshot as AttentionF16"
-                ),
+                LayerState::Attention { .. } | LayerState::ParallelAttentionMamba2 { .. } => {
+                    assert!(
+                        l.is_f16(),
+                        "attention layer {i} must snapshot as AttentionF16"
+                    )
+                }
                 LayerState::Conv { .. } => {
                     assert!(matches!(l, LayerSnapshot::Conv { .. }))
+                }
+                LayerState::Mamba2 { .. } => {
+                    assert!(matches!(l, LayerSnapshot::Mamba2 { .. }))
                 }
             }
         }
