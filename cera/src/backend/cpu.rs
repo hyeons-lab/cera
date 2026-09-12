@@ -2933,6 +2933,49 @@ unsafe fn rmsnorm_neon(
     }
 }
 
+/// NEON-accelerated unweighted RMSNorm kernel (weight = 1.0) taking raw pointer.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn rmsnorm_unweighted_neon(ptr: *mut f32, n: usize, eps: f32) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let src_ptr = ptr as *const f32;
+        let dst_ptr = ptr;
+        let mut sum_sq0 = vdupq_n_f64(0.0);
+        let mut sum_sq1 = vdupq_n_f64(0.0);
+        let n_chunks = n / 4;
+
+        for i in 0..n_chunks {
+            let v = vld1q_f32(src_ptr.add(i * 4));
+            let v_lo = vcvt_f64_f32(vget_low_f32(v));
+            let v_hi = vcvt_f64_f32(vget_high_f32(v));
+            sum_sq0 = vfmaq_f64(sum_sq0, v_lo, v_lo);
+            sum_sq1 = vfmaq_f64(sum_sq1, v_hi, v_hi);
+        }
+
+        let mut total_sum_sq = vaddvq_f64(vaddq_f64(sum_sq0, sum_sq1));
+        for i in (n_chunks * 4)..n {
+            let v = *src_ptr.add(i) as f64;
+            total_sum_sq += v * v;
+        }
+
+        let mean = total_sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+        let v_inv_rms = vdupq_n_f32(inv_rms);
+
+        for i in 0..n_chunks {
+            let s = vld1q_f32(src_ptr.add(i * 4));
+            let scaled = vmulq_f32(s, v_inv_rms);
+            vst1q_f32(dst_ptr.add(i * 4), scaled);
+        }
+        for i in (n_chunks * 4)..n {
+            *dst_ptr.add(i) = *src_ptr.add(i) * inv_rms;
+        }
+    }
+}
+
 /// RMS normalization in-place: x = x / rms(x) * weight.
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
@@ -2953,6 +2996,32 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
 
         for i in 0..n {
             x[i] = x[i] * inv_rms * weight[i];
+        }
+    }
+}
+
+/// Unweighted RMS normalization in-place: x = x / rms(x).
+pub fn rmsnorm_unweighted(x: &mut [f32], eps: f32) {
+    if x.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        rmsnorm_unweighted_neon(x.as_mut_ptr(), x.len(), eps);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let n = x.len();
+        let mut sum_sq = 0.0f64;
+        for &v in x.iter() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let mean = sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+
+        for v in x.iter_mut() {
+            *v *= inv_rms;
         }
     }
 }
@@ -3134,7 +3203,9 @@ pub fn relu_inplace(x: &mut [f32]) {
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
-    let len = gate.len();
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
     if len >= 1024 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
@@ -3152,6 +3223,61 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     } else {
         for (g, &u) in gate.iter_mut().zip(up.iter()) {
             *g = *g / (1.0 + ggml_expf(-*g)) * u;
+        }
+    }
+}
+
+/// Fused GeLU activation + element-wise multiply: gate = gelu(gate) * up.
+/// Uses the tanh approximation matching [`gelu_inplace`].
+pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    if len >= 1024 {
+        let chunk_size = 512;
+        let up_ptr = up.as_ptr() as usize;
+        par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
+            let u_chunk = unsafe {
+                core::slice::from_raw_parts(
+                    (up_ptr as *const f32).add(idx * chunk_size),
+                    g_chunk.len(),
+                )
+            };
+            for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
+                let gv = *g;
+                let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+                *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+            }
+        });
+    } else {
+        for (g, &u) in gate.iter_mut().zip(up.iter()) {
+            let gv = *g;
+            let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+            *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+        }
+    }
+}
+
+/// Logit soft-capping in-place: x = cap * tanh(x / cap).
+/// Used by Gemma 2 for attention scores and final output logits.
+pub fn softcap_inplace(x: &mut [f32], cap: f32) {
+    if !cap.is_finite() || cap <= 0.0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    if x.len() >= 1024 {
+        let chunk_size = 512;
+        par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
+            for v in chunk.iter_mut() {
+                *v = cap * (*v * inv_cap).tanh();
+            }
+        });
+    } else {
+        for v in x.iter_mut() {
+            *v = cap * (*v * inv_cap).tanh();
         }
     }
 }
@@ -6901,6 +7027,25 @@ mod tests {
     }
 
     #[test]
+    fn test_rmsnorm_unweighted() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let eps = 1e-5;
+
+        // mean_sq = (1+4+9+16+25)/5 = 11.0
+        let rms = (11.0f32 + eps).sqrt();
+        let expected: Vec<f32> = x.iter().map(|&v| v / rms).collect();
+
+        rmsnorm_unweighted(&mut x, eps);
+
+        for (i, (&got, &exp)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "rmsnorm_unweighted[{i}]: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rmsnorm_with_weight() {
         let mut x = vec![2.0, 2.0];
         let weight = vec![3.0, 0.5];
@@ -6948,6 +7093,84 @@ mod tests {
             assert!(
                 (got - expected).abs() < 1e-6,
                 "silu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        silu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        silu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "silu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gelu_mul_inplace() {
+        let mut gate = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+        let up = vec![2.0, 3.0, 0.5, 1.0, -2.0];
+
+        // Reference: gelu(gate) * up
+        let mut gate_ref = gate.clone();
+        gelu_inplace(&mut gate_ref);
+        mul_inplace(&mut gate_ref, &up);
+
+        gelu_mul_inplace(&mut gate, &up);
+
+        for (i, (&got, &expected)) in gate.iter().zip(gate_ref.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "gelu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        gelu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        gelu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "gelu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softcap_inplace() {
+        let cap = 50.0f32;
+        let mut x = vec![0.0, 10.0, -10.0, 100.0, -100.0];
+        let expected: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+
+        softcap_inplace(&mut x, cap);
+
+        for (i, (&got, &exp)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-6,
+                "softcap mismatch at {i}: got {got}, expected {exp}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
+        let expected_large: Vec<f32> = x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        softcap_inplace(&mut x_large, cap);
+        for (i, (&got, &exp)) in x_large.iter().zip(expected_large.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "softcap large mismatch at {i}: got {got}, expected {exp}"
             );
         }
     }

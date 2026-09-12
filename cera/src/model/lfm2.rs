@@ -1973,6 +1973,8 @@ impl Lfm2Model {
                         head_dim,
                         scale,
                         seq_len,
+                        attn_logit_softcapping: None,
+                        sliding_window: None,
                     },
                     attn_out,
                     &mut state.scratch.scores,
@@ -2077,6 +2079,7 @@ impl Lfm2Model {
                         hs,
                         cfg.intermediate_size,
                         &ffn_input,
+                        transformer::FfnActivation::Swiglu,
                         state,
                     );
                 }
