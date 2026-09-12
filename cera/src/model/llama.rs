@@ -203,7 +203,19 @@ impl LlamaModel {
         };
 
         let attn_logit_softcapping = gguf.get_f32(&format!("{prefix}.attn_logit_softcapping"));
+        if let Some(cap) = attn_logit_softcapping {
+            ensure!(
+                cap.is_finite() && cap > 0.0,
+                "attn_logit_softcapping must be positive and finite: {cap}"
+            );
+        }
         let final_logit_softcapping = gguf.get_f32(&format!("{prefix}.final_logit_softcapping"));
+        if let Some(cap) = final_logit_softcapping {
+            ensure!(
+                cap.is_finite() && cap > 0.0,
+                "final_logit_softcapping must be positive and finite: {cap}"
+            );
+        }
 
         // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
         // Absent on every other arch ⇒ identity, so this is a no-op for
@@ -363,8 +375,20 @@ impl LlamaModel {
             let q_norm_name = format!("blk.{i}.attn_q_norm.weight");
             let k_norm_name = format!("blk.{i}.attn_k_norm.weight");
             if gguf.tensors.contains_key(&q_norm_name) {
-                attn_q_norm_weights.push(Some(gguf.get_tensor(&q_norm_name)?.to_f32_vec()));
-                attn_k_norm_weights.push(Some(gguf.get_tensor(&k_norm_name)?.to_f32_vec()));
+                let qn = gguf.get_tensor(&q_norm_name)?.to_f32_vec();
+                ensure!(
+                    qn.len() == head_dim || qn.len() == config.n_heads * head_dim,
+                    "invalid Q norm length {} for layer {i}",
+                    qn.len()
+                );
+                let kn = gguf.get_tensor(&k_norm_name)?.to_f32_vec();
+                ensure!(
+                    kn.len() == head_dim || kn.len() == config.n_kv_heads * head_dim,
+                    "invalid K norm length {} for layer {i}",
+                    kn.len()
+                );
+                attn_q_norm_weights.push(Some(qn));
+                attn_k_norm_weights.push(Some(kn));
             } else {
                 attn_q_norm_weights.push(None);
                 attn_k_norm_weights.push(None);

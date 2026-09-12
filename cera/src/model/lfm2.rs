@@ -1974,6 +1974,7 @@ impl Lfm2Model {
                         scale,
                         seq_len,
                         attn_logit_softcapping: None,
+                        sliding_window: None,
                     },
                     attn_out,
                     &mut state.scratch.scores,

@@ -2933,6 +2933,49 @@ unsafe fn rmsnorm_neon(
     }
 }
 
+/// NEON-accelerated unweighted RMSNorm kernel (weight = 1.0) taking raw pointer.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn rmsnorm_unweighted_neon(ptr: *mut f32, n: usize, eps: f32) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let src_ptr = ptr as *const f32;
+        let dst_ptr = ptr;
+        let mut sum_sq0 = vdupq_n_f64(0.0);
+        let mut sum_sq1 = vdupq_n_f64(0.0);
+        let n_chunks = n / 4;
+
+        for i in 0..n_chunks {
+            let v = vld1q_f32(src_ptr.add(i * 4));
+            let v_lo = vcvt_f64_f32(vget_low_f32(v));
+            let v_hi = vcvt_f64_f32(vget_high_f32(v));
+            sum_sq0 = vfmaq_f64(sum_sq0, v_lo, v_lo);
+            sum_sq1 = vfmaq_f64(sum_sq1, v_hi, v_hi);
+        }
+
+        let mut total_sum_sq = vaddvq_f64(vaddq_f64(sum_sq0, sum_sq1));
+        for i in (n_chunks * 4)..n {
+            let v = *src_ptr.add(i) as f64;
+            total_sum_sq += v * v;
+        }
+
+        let mean = total_sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+        let v_inv_rms = vdupq_n_f32(inv_rms);
+
+        for i in 0..n_chunks {
+            let s = vld1q_f32(src_ptr.add(i * 4));
+            let scaled = vmulq_f32(s, v_inv_rms);
+            vst1q_f32(dst_ptr.add(i * 4), scaled);
+        }
+        for i in (n_chunks * 4)..n {
+            *dst_ptr.add(i) = *src_ptr.add(i) * inv_rms;
+        }
+    }
+}
+
 /// RMS normalization in-place: x = x / rms(x) * weight.
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
@@ -2953,6 +2996,32 @@ pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
 
         for i in 0..n {
             x[i] = x[i] * inv_rms * weight[i];
+        }
+    }
+}
+
+/// Unweighted RMS normalization in-place: x = x / rms(x).
+pub fn rmsnorm_unweighted(x: &mut [f32], eps: f32) {
+    if x.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        rmsnorm_unweighted_neon(x.as_mut_ptr(), x.len(), eps);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let n = x.len();
+        let mut sum_sq = 0.0f64;
+        for &v in x.iter() {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let mean = sum_sq / n as f64;
+        let rms = (mean + eps as f64).sqrt();
+        let inv_rms = (1.0 / rms) as f32;
+
+        for v in x.iter_mut() {
+            *v *= inv_rms;
         }
     }
 }
@@ -3195,7 +3264,7 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
 /// Logit soft-capping in-place: x = cap * tanh(x / cap).
 /// Used by Gemma 2 for attention scores and final output logits.
 pub fn softcap_inplace(x: &mut [f32], cap: f32) {
-    if cap <= 0.0 {
+    if !cap.is_finite() || cap <= 0.0 {
         return;
     }
     let inv_cap = 1.0 / cap;
@@ -6953,6 +7022,25 @@ mod tests {
             assert!(
                 (got - exp).abs() < 1e-5,
                 "rmsnorm[{i}]: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rmsnorm_unweighted() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let eps = 1e-5;
+
+        // mean_sq = (1+4+9+16+25)/5 = 11.0
+        let rms = (11.0f32 + eps).sqrt();
+        let expected: Vec<f32> = x.iter().map(|&v| v / rms).collect();
+
+        rmsnorm_unweighted(&mut x, eps);
+
+        for (i, (&got, &exp)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "rmsnorm_unweighted[{i}]: got {got}, expected {exp}"
             );
         }
     }

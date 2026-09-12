@@ -4,7 +4,7 @@
 #![cfg(feature = "mmap")]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
@@ -16,11 +16,21 @@ fn rel_diff(a: f64, b: f64) -> f64 {
     (a - b).abs() / (a.abs() + b.abs() + 1e-9)
 }
 
+fn get_test_model_path(filename: &str) -> PathBuf {
+    let temp_path = std::env::temp_dir().join(filename);
+    if temp_path.exists() {
+        temp_path
+    } else {
+        PathBuf::from("/tmp").join(filename)
+    }
+}
+
 #[test]
 fn gemma2_matches_llama_cpp_oracle() {
-    let path = Path::new("/tmp/test_gemma2.gguf");
+    let path_buf = get_test_model_path("test_gemma2.gguf");
+    let path = path_buf.as_path();
     if !path.exists() {
-        eprintln!("skipping: /tmp/test_gemma2.gguf does not exist");
+        eprintln!("skipping: {:?} does not exist", path);
         return;
     }
 
@@ -121,9 +131,10 @@ fn gemma2_matches_llama_cpp_oracle() {
 
 #[test]
 fn olmo2_matches_llama_cpp_oracle() {
-    let path = Path::new("/tmp/test_olmo2.gguf");
+    let path_buf = get_test_model_path("test_olmo2.gguf");
+    let path = path_buf.as_path();
     if !path.exists() {
-        eprintln!("skipping: /tmp/test_olmo2.gguf does not exist");
+        eprintln!("skipping: {:?} does not exist", path);
         return;
     }
 
@@ -224,9 +235,10 @@ fn olmo2_matches_llama_cpp_oracle() {
 
 #[test]
 fn gemma2_long_prefill_bypasses_flash_attn_and_matches_decode() {
-    let path = Path::new("/tmp/test_gemma2.gguf");
+    let path_buf = get_test_model_path("test_gemma2.gguf");
+    let path = path_buf.as_path();
     if !path.exists() {
-        eprintln!("skipping: /tmp/test_gemma2.gguf does not exist");
+        eprintln!("skipping: {:?} does not exist", path);
         return;
     }
 
