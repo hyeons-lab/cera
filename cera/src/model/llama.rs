@@ -321,7 +321,7 @@ impl LlamaModel {
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
                 gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
             } else if norm_order == NormOrder::PostNorm {
-                vec![1.0f32; hidden_size]
+                Vec::new()
             } else {
                 bail!("missing required tensor `{attn_norm_name}` for PreNorm architecture");
             };
@@ -331,7 +331,7 @@ impl LlamaModel {
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
                 gguf.get_tensor(&ffn_norm_name)?.to_f32_vec()
             } else if norm_order == NormOrder::PostNorm {
-                vec![1.0f32; hidden_size]
+                Vec::new()
             } else {
                 bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
             };
@@ -541,23 +541,24 @@ impl LlamaModel {
         // helpers that need `&mut state`; restore at the end.
         let mut normed = std::mem::take(&mut state.scratch.normed);
         let mut ffn_input = std::mem::take(&mut state.scratch.ffn_input);
-        normed.resize(hs, 0.0);
-        ffn_input.resize(hs, 0.0);
+        if self.norm_order == NormOrder::PreNorm {
+            normed.resize(hs, 0.0);
+            ffn_input.resize(hs, 0.0);
+        }
 
         for i in 0..cfg.n_layers {
             // Attention pre-norm (PreNorm only).
-            match self.norm_order {
+            let normed_in = match self.norm_order {
                 NormOrder::PreNorm => {
                     normed.copy_from_slice(hidden);
                     cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
+                    &normed[..]
                 }
-                NormOrder::PostNorm => {
-                    normed.copy_from_slice(hidden);
-                }
-            }
+                NormOrder::PostNorm => &hidden[..],
+            };
 
             #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&normed, state);
+            transformer::quantize_to_scratch(normed_in, state);
 
             let refs = &self.layer_refs[i];
             let weights = AttnWeights {
@@ -584,7 +585,7 @@ impl LlamaModel {
                 },
             };
             transformer::forward_attn_block(
-                &self.gguf, i, &weights, &extras, dims, &normed, pos, state,
+                &self.gguf, i, &weights, &extras, dims, normed_in, pos, state,
             );
 
             // Post-norm on attention output (Gemma 2, Olmo 2/3).
@@ -600,18 +601,17 @@ impl LlamaModel {
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             // FFN pre-norm (PreNorm only).
-            match self.norm_order {
+            let ffn_in = match self.norm_order {
                 NormOrder::PreNorm => {
                     ffn_input.copy_from_slice(hidden);
                     cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
+                    &ffn_input[..]
                 }
-                NormOrder::PostNorm => {
-                    ffn_input.copy_from_slice(hidden);
-                }
-            }
+                NormOrder::PostNorm => &hidden[..],
+            };
 
             #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&ffn_input, state);
+            transformer::quantize_to_scratch(ffn_in, state);
 
             let refs = &self.layer_refs[i];
             let ffn_weights = FfnWeights {
@@ -625,7 +625,7 @@ impl LlamaModel {
                 &ffn_weights,
                 hs,
                 cfg.intermediate_size,
-                &ffn_input,
+                ffn_in,
                 self.activation,
                 state,
             );
@@ -949,9 +949,15 @@ impl LlamaModel {
         }
 
         // Per-layer buffers (reused across layers).
-        let mut normed = vec![0.0f32; hs * n];
+        let mut normed = match self.norm_order {
+            NormOrder::PreNorm => vec![0.0f32; hs * n],
+            NormOrder::PostNorm => Vec::new(),
+        };
         let mut block_out = vec![0.0f32; hs * n];
-        let mut ffn_input = vec![0.0f32; hs * n];
+        let mut ffn_input = match self.norm_order {
+            NormOrder::PreNorm => vec![0.0f32; hs * n],
+            NormOrder::PostNorm => Vec::new(),
+        };
         let mut ffn_out = vec![0.0f32; hs * n];
         let mut norm_col = vec![0.0f32; hs];
         let mut ffn_col = vec![0.0f32; hs];
@@ -1000,7 +1006,7 @@ impl LlamaModel {
             let refs = &self.layer_refs[layer];
 
             // Attention pre-norm: rmsnorm each column (PreNorm only).
-            match self.norm_order {
+            let normed_input: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
                     for j in 0..n {
                         for i in 0..hs {
@@ -1015,11 +1021,10 @@ impl LlamaModel {
                             normed[i * n + j] = norm_col[i];
                         }
                     }
+                    &normed
                 }
-                NormOrder::PostNorm => {
-                    normed.copy_from_slice(&hidden);
-                }
-            }
+                NormOrder::PostNorm => &hidden,
+            };
 
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
             #[cfg(has_blas)]
@@ -1027,7 +1032,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_q,
-                    &normed,
+                    normed_input,
                     &mut q_mat,
                     q_dim,
                     n,
@@ -1037,7 +1042,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_k,
-                    &normed,
+                    normed_input,
                     &mut k_mat,
                     kv_dim,
                     n,
@@ -1047,7 +1052,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_v,
-                    &normed,
+                    normed_input,
                     &mut v_mat,
                     kv_dim,
                     n,
@@ -1058,7 +1063,7 @@ impl LlamaModel {
             #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
-                    &normed,
+                    normed_input,
                     hs,
                     n,
                     &mut col,
@@ -1097,13 +1102,13 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on Q/K/V — added to the projection outputs before bias/RoPE,
+            // LoRA on Q/K/V: added to the projection outputs before bias/RoPE,
             // input is the normed hidden `[hs×n]` (matches the decode hook order).
             if let Some(lora) = &lora {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut q_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1112,7 +1117,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut k_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1121,7 +1126,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut v_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1464,7 +1469,7 @@ impl LlamaModel {
             cpu::add_inplace(&mut hidden, &block_out);
 
             // FFN pre-norm: rmsnorm each column (PreNorm only).
-            match self.norm_order {
+            let ffn_in: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
                     for j in 0..n {
                         for i in 0..hs {
@@ -1479,11 +1484,10 @@ impl LlamaModel {
                             ffn_input[i * n + j] = ffn_col[i];
                         }
                     }
+                    &ffn_input
                 }
-                NormOrder::PostNorm => {
-                    ffn_input.copy_from_slice(&hidden);
-                }
-            }
+                NormOrder::PostNorm => &hidden,
+            };
 
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(has_blas)]
@@ -1491,7 +1495,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_gate,
-                    &ffn_input,
+                    ffn_in,
                     &mut gate_mat,
                     is,
                     n,
@@ -1501,7 +1505,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_up,
-                    &ffn_input,
+                    ffn_in,
                     &mut up_mat,
                     is,
                     n,
@@ -1512,7 +1516,7 @@ impl LlamaModel {
             #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
-                    &ffn_input,
+                    ffn_in,
                     hs,
                     n,
                     &mut col,
@@ -1541,13 +1545,13 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on gate/up — BEFORE the SwiGLU mul, input is the normed FFN
+            // LoRA on gate/up: BEFORE the SwiGLU mul, input is the normed FFN
             // input `[hs×n]` (mirrors the decode hook order).
             if let Some(lora) = &lora {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
                     crate::lora::apply_prefill(
                         t,
-                        &ffn_input,
+                        ffn_in,
                         &mut gate_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1556,7 +1560,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
                     crate::lora::apply_prefill(
                         t,
-                        &ffn_input,
+                        ffn_in,
                         &mut up_mat,
                         n,
                         &mut state.scratch.lora_tmp,
