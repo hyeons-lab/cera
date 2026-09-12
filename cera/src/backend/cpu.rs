@@ -3156,6 +3156,50 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     }
 }
 
+/// Fused GeLU activation + element-wise multiply: gate = gelu(gate) * up.
+/// Uses the tanh approximation matching [`gelu_inplace`].
+pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    let len = gate.len();
+    if len >= 1024 {
+        let chunk_size = 512;
+        let up_ptr = up.as_ptr() as usize;
+        par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
+            let u_chunk = unsafe {
+                core::slice::from_raw_parts(
+                    (up_ptr as *const f32).add(idx * chunk_size),
+                    g_chunk.len(),
+                )
+            };
+            for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
+                let gv = *g;
+                let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+                *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+            }
+        });
+    } else {
+        for (g, &u) in gate.iter_mut().zip(up.iter()) {
+            let gv = *g;
+            let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+            *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+        }
+    }
+}
+
+/// Logit soft-capping in-place: x = cap * tanh(x / cap).
+/// Used by Gemma 2 for attention scores and final output logits.
+pub fn softcap_inplace(x: &mut [f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    for v in x.iter_mut() {
+        *v = cap * (*v * inv_cap).tanh();
+    }
+}
+
 /// Sigmoid activation in-place: `x = 1 / (1 + exp(-x))`. Uses
 /// `ggml_expf` for the inner exponential to match the SiLU /
 /// softmax precision pattern.
