@@ -1917,6 +1917,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             block_types: vec![crate::model::BlockType::Attention; 4],
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer: vec![2; 4],
             scalars: crate::model::ScalarMultipliers::default(),
             moe: Some(crate::model::MoeConfig {
@@ -2133,6 +2134,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             block_types: vec![crate::model::BlockType::Attention; 2],
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer: vec![2; 2],
             scalars: crate::model::ScalarMultipliers::default(),
             moe: None,

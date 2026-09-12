@@ -1703,6 +1703,13 @@ pub(crate) fn forward_attn_block(
         key_cache_f16,
         value_cache_f16,
         ..
+    }
+    | LayerState::ParallelAttentionMamba2 {
+        key_cache,
+        value_cache,
+        key_cache_f16,
+        value_cache_f16,
+        ..
     } = &mut state.layers[layer]
     {
         if use_f16 {
@@ -1730,10 +1737,17 @@ pub(crate) fn forward_attn_block(
         .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
     {
         // Bind both representations; only the active one is non-empty. The
-        // `use_f16` choice is made once below, when building the `KvView` — the
+        // `use_f16` choice is made once below, when building the `KvView` : the
         // head loop itself no longer carries the discriminant.
         let (k_cache, v_cache, k_cache_f16, v_cache_f16) = match &state.layers[layer] {
             LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            }
+            | LayerState::ParallelAttentionMamba2 {
                 key_cache,
                 value_cache,
                 key_cache_f16,
