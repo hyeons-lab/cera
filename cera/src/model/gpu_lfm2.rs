@@ -6829,6 +6829,12 @@ impl GpuLfm2Model {
                          a cross-backend cache-namespace leak."
                     );
                 }
+                LayerSnapshot::Mamba2 { .. } | LayerSnapshot::ParallelAttentionMamba2 { .. } => {
+                    panic!(
+                        "GpuLfm2Model::restore_state_locked received a Mamba2 snapshot at layer {i}; \
+                         Mamba2 is not supported on GpuLfm2Model."
+                    );
+                }
             }
         }
         self.gpu_state
