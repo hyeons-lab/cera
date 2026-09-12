@@ -3209,6 +3209,7 @@ mod tests {
             rms_norm_eps: 0.0,
             block_types: Vec::new(),
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer: Vec::new(),
             scalars: crate::model::ScalarMultipliers::default(),
             moe: None,
