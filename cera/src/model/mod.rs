@@ -681,27 +681,29 @@ pub fn load_model(
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     let shape = crate::backend::calibrate::DecodeShape::from_gguf(&gguf);
 
-    let model: Box<dyn Model> =
-        match arch.as_str() {
-            // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-            "lfm2" | "lfm2moe" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
-                gguf,
-                context_size,
-                model_id,
-            )?),
-            // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
-            // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
-            // "mistral3"/"mistral4" archs with different layouts, not served here).
-            "qwen2" | "qwen3" | "llama" | "granite" => Box::new(
-                llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
-            ),
-            "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
-                gguf,
-                context_size,
-                model_id,
-            )?),
-            other => bail!("unsupported architecture: {other}"),
-        };
+    let model: Box<dyn Model> = match arch.as_str() {
+        // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+        "lfm2" | "lfm2moe" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
+        // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
+        // "mistral3"/"mistral4" archs with different layouts, not served here).
+        "qwen2" | "qwen3" | "llama" | "granite" | "gemma" | "gemma2" | "olmo" | "olmo2"
+        | "olmo3" => Box::new(llama::LlamaModel::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
+        other => bail!("unsupported architecture: {other}"),
+    };
 
     // Size the decode pool to this model rather than a flat cap. Registered
     // only now, after a constructor actually returned a model:

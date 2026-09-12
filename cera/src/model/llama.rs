@@ -24,6 +24,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 use crate::kv_cache::LayerState;
+pub use crate::model::transformer::FfnActivation;
 use crate::model::transformer::{self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // Only the batched-LM-head warning path names `DType` unqualified; every other
@@ -31,6 +32,14 @@ use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 // and non-int8 targets do not see it as unused under clippy's `-D warnings`.
 #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 use crate::tensor::DType;
+
+/// Layer normalization ordering (Pre-Norm vs Post-Norm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NormOrder {
+    #[default]
+    PreNorm,
+    PostNorm,
+}
 
 // ── Per-layer weight references ─────────────────────────────────────────────
 
@@ -51,19 +60,25 @@ pub struct LlamaModel {
     gguf: GgufFile,
     config: ModelConfig,
     head_dim: usize,
-    /// RoPE pair layout: `Neox` for Qwen2/Qwen3, `Norm` for LLaMA/Mistral/Granite.
+    /// RoPE pair layout: `Neox` for Qwen2/Qwen3/Gemma/Gemma2/Olmo2, `Norm` for LLaMA/Mistral/Granite/Olmo.
     rope_type: RopeType,
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
     /// applied per-pair on the NORM path. `None` for archs without the tensor
     /// (Qwen/Mistral/Granite) ⇒ plain RoPE.
     rope_freqs: Option<Vec<f32>>,
+    norm_order: NormOrder,
+    activation: FfnActivation,
+    attn_logit_softcapping: Option<f32>,
+    final_logit_softcapping: Option<f32>,
     // Granite 3.x scalar multipliers live on `config.scalars` (identity for
     // every other arch) — see `ScalarMultipliers`.
     // Pre-dequantized small F32 weights.
     output_norm_weight: Vec<f32>,
     attn_norm_weights: Vec<Vec<f32>>,
     ffn_norm_weights: Vec<Vec<f32>>,
-    // Qwen3 per-head QK-norm weights (None for Qwen2).
+    attn_post_norm_weights: Vec<Option<Vec<f32>>>,
+    ffn_post_norm_weights: Vec<Option<Vec<f32>>>,
+    // Qwen3 / Olmo 2 QK-norm weights (None for Qwen2).
     attn_q_norm_weights: Vec<Option<Vec<f32>>>,
     attn_k_norm_weights: Vec<Option<Vec<f32>>>,
     // Qwen2 Q/K/V projection biases (None for Qwen3).
@@ -76,6 +91,9 @@ pub struct LlamaModel {
     /// tied embeddings (`token_embd.weight` reused for the logit projection).
     output_ref: Option<WeightRef>,
     layer_refs: Vec<LayerWeightRefs>,
+    sliding_window: Option<usize>,
+    sliding_window_pattern: Option<Vec<bool>>,
+    yarn: Option<cpu::YarnParams>,
     #[allow(dead_code)]
     model_id: String,
 }
@@ -161,26 +179,132 @@ impl LlamaModel {
             .to_string();
         let prefix = arch.as_str();
 
-        // RoPE layout per arch. Qwen GGUFs are NEOX (split-halves); the
-        // LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
+        // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2/3 GGUFs are NEOX (split-halves);
+        // the LLaMA-family (incl. Mistral, Granite, and Olmo 1) are NORM (interleaved pairs).
         let rope_type = match prefix {
-            "qwen2" | "qwen3" => RopeType::Neox,
+            "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" => RopeType::Norm,
+            "llama" | "granite" | "olmo" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
-            // silently default to NORM (wrong for any NEOX-family arch — phi3,
-            // stablelm, gemma, starcoder2, … are all NEOX in llama.cpp).
+            // silently default to NORM (wrong for any NEOX-family arch: phi3,
+            // stablelm, starcoder2, etc. are all NEOX in llama.cpp).
             other => bail!(
                 "LlamaModel: no RoPE layout mapping for arch {other:?}; \
                  add it to the rope_type match in llama.rs"
             ),
         };
 
+        let norm_order = match prefix {
+            "olmo" | "olmo2" | "olmo3" => NormOrder::PostNorm,
+            _ => NormOrder::PreNorm,
+        };
+
+        let activation = match prefix {
+            "gemma" | "gemma2" => FfnActivation::Geglu,
+            _ => FfnActivation::Swiglu,
+        };
+
+        let attn_logit_softcapping = gguf.get_f32(&format!("{prefix}.attn_logit_softcapping"));
+        let final_logit_softcapping = gguf.get_f32(&format!("{prefix}.final_logit_softcapping"));
+
+        let sliding_window = gguf
+            .get_u32(&format!("{prefix}.attention.sliding_window"))
+            .or_else(|| gguf.get_u32("attention.sliding_window"))
+            .map(|w| w as usize)
+            .filter(|&w| w > 0);
+        let sliding_window_pattern = gguf
+            .get_bool_array(&format!("{prefix}.attention.sliding_window_pattern"))
+            .or_else(|| gguf.get_bool_array("attention.sliding_window_pattern"))
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                gguf.get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+                    .or_else(|| gguf.get_u32("attention.sliding_window_pattern"))
+                    .map(|period| {
+                        let p = period as usize;
+                        if p <= 1 {
+                            vec![false]
+                        } else if p > 1024 {
+                            tracing::warn!("sliding_window_pattern period {p} exceeds maximum 1024; defaulting to full attention");
+                            vec![false]
+                        } else {
+                            (0..p).map(|i| i < p - 1).collect()
+                        }
+                    })
+            })
+            .or_else(|| {
+                // Default SWA patterns when sliding_window is set but pattern key is omitted in GGUF:
+                // Olmo 2/3 default to period 4 (3 SWA layers, 1 dense layer).
+                // Gemma 2 defaults to period 2 (1 SWA layer, 1 dense layer).
+                match prefix {
+                    "olmo2" | "olmo3" if sliding_window.is_some() => {
+                        Some(vec![true, true, true, false])
+                    }
+                    "gemma2" if sliding_window.is_some() => Some(vec![true, false]),
+                    _ => None,
+                }
+            });
+
+        let rope_scaling_type = gguf
+            .get_str(&format!("{prefix}.rope.scaling.type"))
+            .or_else(|| gguf.get_str("rope.scaling.type"));
+        let yarn = if rope_scaling_type == Some("yarn") {
+            let factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.factor"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let orig_ctx_len = gguf
+                .get_u32(&format!("{prefix}.rope.scaling.original_context_length"))
+                .or_else(|| gguf.get_u32("rope.scaling.original_context_length"))
+                .map(|len| len as usize)
+                .filter(|&len| len > 0)
+                .unwrap_or(context_size);
+            let attn_factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.attn_factor"))
+                .or_else(|| gguf.get_f32(&format!("{prefix}.rope.scaling.yarn_attn_factor")))
+                .or_else(|| gguf.get_f32("rope.scaling.attn_factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_attn_factor"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let beta_fast = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_beta_fast"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_beta_fast"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(32.0);
+            let beta_slow = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_beta_slow"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_beta_slow"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let ext_factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_ext_factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_ext_factor"))
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .map(|x| x.clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            let freq_scale = if factor > 0.0 { 1.0 / factor } else { 1.0 };
+            Some(cpu::YarnParams::new(
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow,
+                orig_ctx_len,
+            ))
+        } else {
+            None
+        };
+        if yarn.is_some() && rope_type != RopeType::Neox {
+            tracing::warn!(
+                "YaRN RoPE scaling configured on {rope_type:?} layout; only NeoX is currently supported"
+            );
+        }
+
         // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
-        // Absent on every other arch ⇒ identity, so this is a no-op for
+        // Absent on every other arch => identity, so this is a no-op for
         // LLaMA/Mistral/Qwen. Carried on `config.scalars`.
-        let scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
+        let mut scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
 
         let n_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
@@ -189,6 +313,11 @@ impl LlamaModel {
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
+
+        // Gemma scales token embeddings by sqrt(hidden_size).
+        if matches!(prefix, "gemma" | "gemma2") && scalars.embedding == 1.0 {
+            scalars.embedding = (hidden_size as f32).sqrt();
+        }
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
             .with_context(|| format!("missing {prefix}.feed_forward_length"))?
@@ -274,6 +403,8 @@ impl LlamaModel {
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
+        let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
         let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
         let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
         let mut attn_q_bias = Vec::with_capacity(n_layers);
@@ -282,16 +413,48 @@ impl LlamaModel {
         let mut layer_refs = Vec::with_capacity(n_layers);
 
         for i in 0..n_layers {
-            attn_norm_weights.push(
-                gguf.get_tensor(&format!("blk.{i}.attn_norm.weight"))?
-                    .to_f32_vec(),
-            );
-            ffn_norm_weights.push(
-                gguf.get_tensor(&format!("blk.{i}.ffn_norm.weight"))?
-                    .to_f32_vec(),
-            );
+            let attn_norm_name = format!("blk.{i}.attn_norm.weight");
+            let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
+                gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
+            } else if norm_order == NormOrder::PostNorm {
+                Vec::new()
+            } else {
+                bail!("missing required tensor `{attn_norm_name}` for PreNorm architecture");
+            };
+            attn_norm_weights.push(attn_norm);
 
-            // Qwen3 QK-norm — gate on tensor presence so the same code path
+            let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
+            let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
+                gguf.get_tensor(&ffn_norm_name)?.to_f32_vec()
+            } else if norm_order == NormOrder::PostNorm {
+                Vec::new()
+            } else {
+                bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
+            };
+            ffn_norm_weights.push(ffn_norm);
+
+            // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
+            let attn_post = [
+                format!("blk.{i}.post_attention_norm.weight"),
+                format!("blk.{i}.attn_post_norm.weight"),
+            ]
+            .into_iter()
+            .find(|name| gguf.tensors.contains_key(name))
+            .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
+            .transpose()?;
+            attn_post_norm_weights.push(attn_post);
+
+            let ffn_post = [
+                format!("blk.{i}.post_ffw_norm.weight"),
+                format!("blk.{i}.ffn_post_norm.weight"),
+            ]
+            .into_iter()
+            .find(|name| gguf.tensors.contains_key(name))
+            .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
+            .transpose()?;
+            ffn_post_norm_weights.push(ffn_post);
+
+            // Qwen3 / Olmo 2 QK-norm: gate on tensor presence so the same code path
             // serves both archs.
             let q_norm_name = format!("blk.{i}.attn_q_norm.weight");
             let k_norm_name = format!("blk.{i}.attn_k_norm.weight");
@@ -427,9 +590,15 @@ impl LlamaModel {
             head_dim,
             rope_type,
             rope_freqs,
+            norm_order,
+            activation,
+            attn_logit_softcapping,
+            final_logit_softcapping,
             output_norm_weight,
             attn_norm_weights,
             ffn_norm_weights,
+            attn_post_norm_weights,
+            ffn_post_norm_weights,
             attn_q_norm_weights,
             attn_k_norm_weights,
             attn_q_bias,
@@ -438,12 +607,49 @@ impl LlamaModel {
             embd_ref,
             output_ref,
             layer_refs,
+            sliding_window,
+            sliding_window_pattern,
+            yarn,
             model_id,
         })
     }
 
-    /// Attention dims for a layer (constant across layers here).
-    fn attn_dims(&self) -> AttnDims<'_> {
+    /// Check whether layer `il` is a sliding window attention layer.
+    pub fn is_swa_layer(&self, il: usize) -> bool {
+        if self.sliding_window.unwrap_or(0) == 0 {
+            return false;
+        }
+        if let Some(pattern) = &self.sliding_window_pattern {
+            if pattern.is_empty() {
+                false
+            } else {
+                pattern[il % pattern.len()]
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Return sliding window size for layer `il`, or `None` if it is a full attention layer.
+    pub fn layer_sliding_window(&self, il: usize) -> Option<usize> {
+        if self.is_swa_layer(il) {
+            self.sliding_window
+        } else {
+            None
+        }
+    }
+
+    /// Return YaRN parameters for layer `il`, or `None` if it is an SWA layer or non-YaRN model.
+    pub fn layer_yarn(&self, il: usize) -> Option<cpu::YarnParams> {
+        if self.is_swa_layer(il) {
+            None
+        } else {
+            self.yarn
+        }
+    }
+
+    /// Attention dims for layer `il`.
+    fn attn_dims(&self, il: usize) -> AttnDims<'_> {
         AttnDims {
             hidden_size: self.config.hidden_size,
             n_heads: self.config.n_heads,
@@ -454,6 +660,9 @@ impl LlamaModel {
             rope_type: self.rope_type,
             attn_scale: self.config.scalars.attn,
             rope_freqs: self.rope_freqs.as_deref(),
+            attn_logit_softcapping: self.attn_logit_softcapping,
+            sliding_window: self.layer_sliding_window(il),
+            yarn: self.layer_yarn(il),
         }
     }
 
@@ -461,22 +670,29 @@ impl LlamaModel {
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let dims = self.attn_dims();
 
         // Take scratch out of `state` to avoid borrow conflicts with the
         // helpers that need `&mut state`; restore at the end.
         let mut normed = std::mem::take(&mut state.scratch.normed);
         let mut ffn_input = std::mem::take(&mut state.scratch.ffn_input);
-        normed.resize(hs, 0.0);
-        ffn_input.resize(hs, 0.0);
+        if self.norm_order == NormOrder::PreNorm {
+            normed.resize(hs, 0.0);
+            ffn_input.resize(hs, 0.0);
+        }
 
         for i in 0..cfg.n_layers {
-            // Attention pre-norm.
-            normed.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
+            // Attention pre-norm (PreNorm only).
+            let normed_in = match self.norm_order {
+                NormOrder::PreNorm => {
+                    normed.copy_from_slice(hidden);
+                    cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
+                    &normed[..]
+                }
+                NormOrder::PostNorm => &hidden[..],
+            };
 
             #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&normed, state);
+            transformer::quantize_to_scratch(normed_in, state);
 
             let refs = &self.layer_refs[i];
             let weights = AttnWeights {
@@ -502,9 +718,15 @@ impl LlamaModel {
                     _ => None,
                 },
             };
+            let dims = self.attn_dims(i);
             transformer::forward_attn_block(
-                &self.gguf, i, &weights, &extras, dims, &normed, pos, state,
+                &self.gguf, i, &weights, &extras, dims, normed_in, pos, state,
             );
+
+            // Post-norm on attention output (Gemma 2, Olmo 2/3).
+            if let Some(post_norm) = &self.attn_post_norm_weights[i] {
+                cpu::rmsnorm(&mut state.scratch.out[..hs], post_norm, cfg.rms_norm_eps);
+            }
 
             // Granite scales the block output before the residual add (identity
             // for every other arch).
@@ -513,12 +735,18 @@ impl LlamaModel {
             }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
-            // FFN pre-norm.
-            ffn_input.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
+            // FFN pre-norm (PreNorm only).
+            let ffn_in = match self.norm_order {
+                NormOrder::PreNorm => {
+                    ffn_input.copy_from_slice(hidden);
+                    cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
+                    &ffn_input[..]
+                }
+                NormOrder::PostNorm => &hidden[..],
+            };
 
             #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&ffn_input, state);
+            transformer::quantize_to_scratch(ffn_in, state);
 
             let refs = &self.layer_refs[i];
             let ffn_weights = FfnWeights {
@@ -532,9 +760,15 @@ impl LlamaModel {
                 &ffn_weights,
                 hs,
                 cfg.intermediate_size,
-                &ffn_input,
+                ffn_in,
+                self.activation,
                 state,
             );
+
+            // Post-norm on FFN output (Gemma 2, Olmo 2/3).
+            if let Some(post_norm) = &self.ffn_post_norm_weights[i] {
+                cpu::rmsnorm(&mut state.scratch.out[..hs], post_norm, cfg.rms_norm_eps);
+            }
 
             if self.config.scalars.residual != 1.0 {
                 cpu::scale_inplace(&mut state.scratch.out[..hs], self.config.scalars.residual);
@@ -543,7 +777,7 @@ impl LlamaModel {
 
             // Oracle gate: residual stream after the full layer (= llama.cpp's
             // `l_out-{i}`). All-position for early layers, last-position for the
-            // final layer — the test sums vs. takes-last accordingly. Guarded so
+            // final layer: the test sums vs. takes-last accordingly. Guarded so
             // the per-token `format!` allocation only happens when dumping.
             if transformer::oracle_dump::is_active() {
                 transformer::oracle_dump::record(&format!("l_out-{i}"), hidden);
@@ -584,6 +818,9 @@ impl LlamaModel {
         // Granite divides the logits by `logits_scaling` (identity elsewhere).
         if self.config.scalars.logit != 1.0 {
             cpu::scale_inplace(&mut logits, 1.0 / self.config.scalars.logit);
+        }
+        if let Some(cap) = self.final_logit_softcapping {
+            cpu::softcap_inplace(&mut logits, cap);
         }
         transformer::oracle_dump::record("result_output", &logits);
         logits
@@ -707,6 +944,9 @@ impl LlamaModel {
         // over the whole buffer here, per row inside `project_logits`.
         if cfg.scalars.logit != 1.0 {
             cpu::scale_inplace(&mut logits, 1.0 / cfg.scalars.logit);
+        }
+        if let Some(cap) = self.final_logit_softcapping {
+            cpu::softcap_inplace(&mut logits, cap);
         }
         Some(logits)
     }
@@ -844,9 +1084,15 @@ impl LlamaModel {
         }
 
         // Per-layer buffers (reused across layers).
-        let mut normed = vec![0.0f32; hs * n];
+        let mut normed = match self.norm_order {
+            NormOrder::PreNorm => vec![0.0f32; hs * n],
+            NormOrder::PostNorm => Vec::new(),
+        };
         let mut block_out = vec![0.0f32; hs * n];
-        let mut ffn_input = vec![0.0f32; hs * n];
+        let mut ffn_input = match self.norm_order {
+            NormOrder::PreNorm => vec![0.0f32; hs * n],
+            NormOrder::PostNorm => Vec::new(),
+        };
         let mut ffn_out = vec![0.0f32; hs * n];
         let mut norm_col = vec![0.0f32; hs];
         let mut ffn_col = vec![0.0f32; hs];
@@ -873,7 +1119,7 @@ impl LlamaModel {
         // longer prompts; below the threshold its two-pass online-softmax overhead
         // loses. Mirrors LFM2's measured crossover (~pp256 on Apple Silicon).
         const FLASH_ATTN_THRESHOLD: usize = 256;
-        let use_flash = n >= FLASH_ATTN_THRESHOLD;
+        let use_flash = n >= FLASH_ATTN_THRESHOLD && self.attn_logit_softcapping.is_none();
         // Per-query-head attention output, [n_heads][n * head_dim], scattered
         // back into out_proj_input after the flash pass. (Byte-identical to the
         // old per-KV-head [n_kv_heads][group_size * n * head_dim] layout, since
@@ -894,20 +1140,26 @@ impl LlamaModel {
         for layer in 0..cfg.n_layers {
             let refs = &self.layer_refs[layer];
 
-            // Attention pre-norm: rmsnorm each column.
-            for j in 0..n {
-                for i in 0..hs {
-                    norm_col[i] = hidden[i * n + j];
+            // Attention pre-norm: rmsnorm each column (PreNorm only).
+            let normed_input: &[f32] = match self.norm_order {
+                NormOrder::PreNorm => {
+                    for j in 0..n {
+                        for i in 0..hs {
+                            norm_col[i] = hidden[i * n + j];
+                        }
+                        cpu::rmsnorm(
+                            &mut norm_col,
+                            &self.attn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                        );
+                        for i in 0..hs {
+                            normed[i * n + j] = norm_col[i];
+                        }
+                    }
+                    &normed
                 }
-                cpu::rmsnorm(
-                    &mut norm_col,
-                    &self.attn_norm_weights[layer],
-                    cfg.rms_norm_eps,
-                );
-                for i in 0..hs {
-                    normed[i * n + j] = norm_col[i];
-                }
-            }
+                NormOrder::PostNorm => &hidden,
+            };
 
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
             #[cfg(has_blas)]
@@ -915,7 +1167,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_q,
-                    &normed,
+                    normed_input,
                     &mut q_mat,
                     q_dim,
                     n,
@@ -925,7 +1177,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_k,
-                    &normed,
+                    normed_input,
                     &mut k_mat,
                     kv_dim,
                     n,
@@ -935,7 +1187,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.attn_v,
-                    &normed,
+                    normed_input,
                     &mut v_mat,
                     kv_dim,
                     n,
@@ -946,7 +1198,7 @@ impl LlamaModel {
             #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
-                    &normed,
+                    normed_input,
                     hs,
                     n,
                     &mut col,
@@ -985,13 +1237,13 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on Q/K/V — added to the projection outputs before bias/RoPE,
+            // LoRA on Q/K/V: added to the projection outputs before bias/RoPE,
             // input is the normed hidden `[hs×n]` (matches the decode hook order).
             if let Some(lora) = &lora {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut q_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1000,7 +1252,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut k_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1009,7 +1261,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
                     crate::lora::apply_prefill(
                         t,
-                        &normed,
+                        normed_input,
                         &mut v_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1080,28 +1332,47 @@ impl LlamaModel {
                     cpu::add_inplace(v, v_bias);
                 }
 
-                // Qwen3 per-head QK-norm — BEFORE RoPE.
+                // Qwen3 / Olmo 2 QK-norm (before RoPE).
                 if let Some((q_norm, k_norm)) = qk_norm {
-                    for h in 0..n_heads {
-                        cpu::rmsnorm(
-                            &mut q[h * head_dim..(h + 1) * head_dim],
-                            q_norm,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-                    for h in 0..n_kv_heads {
-                        cpu::rmsnorm(
-                            &mut k[h * head_dim..(h + 1) * head_dim],
-                            k_norm,
-                            cfg.rms_norm_eps,
-                        );
+                    if q_norm.len() == head_dim {
+                        for h in 0..n_heads {
+                            cpu::rmsnorm(
+                                &mut q[h * head_dim..(h + 1) * head_dim],
+                                q_norm,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                        for h in 0..n_kv_heads {
+                            cpu::rmsnorm(
+                                &mut k[h * head_dim..(h + 1) * head_dim],
+                                k_norm,
+                                cfg.rms_norm_eps,
+                            );
+                        }
+                    } else {
+                        cpu::rmsnorm(q, q_norm, cfg.rms_norm_eps);
+                        cpu::rmsnorm(k, k_norm, cfg.rms_norm_eps);
                     }
                 }
 
-                // RoPE — layout per arch (NEOX for Qwen, NORM for LLaMA/Granite).
+                // RoPE: layout per arch (NEOX for Qwen/Olmo2, NORM for LLaMA/Granite).
+                // Optional YaRN scaling for NEOX.
                 match self.rope_type {
                     RopeType::Neox => {
-                        cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta)
+                        if let Some(yarn) = self.layer_yarn(layer) {
+                            cpu::rope_neox_yarn(
+                                q,
+                                k,
+                                pos,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                cfg.rope_theta,
+                                &yarn,
+                            );
+                        } else {
+                            cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+                        }
                     }
                     RopeType::Norm => cpu::rope_norm(
                         q,
@@ -1165,7 +1436,8 @@ impl LlamaModel {
                 }
                 _ => unreachable!("dense transformer layer is always Attention"),
             };
-            if use_flash {
+            let layer_swa = self.layer_sliding_window(layer);
+            if use_flash && layer_swa.is_none() {
                 // Flash attention (tiled + rayon), parallel across *query heads*,
                 // not KV heads. Splitting per-KV-head caps parallelism at
                 // n_kv_heads (8 for Llama-3.2-1B) — half-idle on a 16-core host,
@@ -1256,6 +1528,15 @@ impl LlamaModel {
                             scale,
                             seq_len,
                         );
+                        if let Some(cap) = self.attn_logit_softcapping {
+                            cpu::softcap_inplace(scores, cap);
+                        }
+                        if let Some(w) = layer_swa.filter(|&w| w > 0 && seq_len > w) {
+                            let mask_end = seq_len - w;
+                            for s in &mut scores[..mask_end] {
+                                *s = f32::NEG_INFINITY;
+                            }
+                        }
                         cpu::softmax_inplace(scores);
                         cpu::attn_values(
                             scores,
@@ -1273,7 +1554,7 @@ impl LlamaModel {
                 }
             }
 
-            // Batched output projection GEMM → block_out[hs × n] (k = q_dim).
+            // Batched output projection GEMM -> block_out[hs * n] (k = q_dim).
             #[cfg(has_blas)]
             {
                 transformer::try_blas_prefill_gemm(
@@ -1309,9 +1590,9 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on the output projection — applied to the projection output
+            // LoRA on the output projection - applied to the projection output
             // BEFORE the residual scale (so Granite's multiplier wraps the delta
-            // too); input is the attention output `[q_dim×n]`.
+            // too); input is the attention output `[q_dim*n]`.
             if let Some(lora) = &lora
                 && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
             {
@@ -1324,26 +1605,45 @@ impl LlamaModel {
                 );
             }
 
+            // Post-norm on attention output (Gemma 2, Olmo 2/3).
+            if let Some(post_norm) = &self.attn_post_norm_weights[layer] {
+                for j in 0..n {
+                    for i in 0..hs {
+                        norm_col[i] = block_out[i * n + j];
+                    }
+                    cpu::rmsnorm(&mut norm_col, post_norm, cfg.rms_norm_eps);
+                    for i in 0..hs {
+                        block_out[i * n + j] = norm_col[i];
+                    }
+                }
+            }
+
             // Granite residual scale, then residual add into hidden.
             if cfg.scalars.residual != 1.0 {
                 cpu::scale_inplace(&mut block_out, cfg.scalars.residual);
             }
             cpu::add_inplace(&mut hidden, &block_out);
 
-            // FFN pre-norm: rmsnorm each column.
-            for j in 0..n {
-                for i in 0..hs {
-                    ffn_col[i] = hidden[i * n + j];
+            // FFN pre-norm: rmsnorm each column (PreNorm only).
+            let ffn_in: &[f32] = match self.norm_order {
+                NormOrder::PreNorm => {
+                    for j in 0..n {
+                        for i in 0..hs {
+                            ffn_col[i] = hidden[i * n + j];
+                        }
+                        cpu::rmsnorm(
+                            &mut ffn_col,
+                            &self.ffn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                        );
+                        for i in 0..hs {
+                            ffn_input[i * n + j] = ffn_col[i];
+                        }
+                    }
+                    &ffn_input
                 }
-                cpu::rmsnorm(
-                    &mut ffn_col,
-                    &self.ffn_norm_weights[layer],
-                    cfg.rms_norm_eps,
-                );
-                for i in 0..hs {
-                    ffn_input[i * n + j] = ffn_col[i];
-                }
-            }
+                NormOrder::PostNorm => &hidden,
+            };
 
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(has_blas)]
@@ -1351,7 +1651,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_gate,
-                    &ffn_input,
+                    ffn_in,
                     &mut gate_mat,
                     is,
                     n,
@@ -1361,7 +1661,7 @@ impl LlamaModel {
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_up,
-                    &ffn_input,
+                    ffn_in,
                     &mut up_mat,
                     is,
                     n,
@@ -1372,7 +1672,7 @@ impl LlamaModel {
             #[cfg(not(has_blas))]
             {
                 transformer::quantize_columns(
-                    &ffn_input,
+                    ffn_in,
                     hs,
                     n,
                     &mut col,
@@ -1401,13 +1701,13 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on gate/up — BEFORE the SwiGLU mul, input is the normed FFN
+            // LoRA on gate/up: BEFORE the SwiGLU mul, input is the normed FFN
             // input `[hs×n]` (mirrors the decode hook order).
             if let Some(lora) = &lora {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
                     crate::lora::apply_prefill(
                         t,
-                        &ffn_input,
+                        ffn_in,
                         &mut gate_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1416,7 +1716,7 @@ impl LlamaModel {
                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
                     crate::lora::apply_prefill(
                         t,
-                        &ffn_input,
+                        ffn_in,
                         &mut up_mat,
                         n,
                         &mut state.scratch.lora_tmp,
@@ -1424,7 +1724,14 @@ impl LlamaModel {
                 }
             }
 
-            cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
+            match self.activation {
+                FfnActivation::Swiglu => {
+                    cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
+                }
+                FfnActivation::Geglu => {
+                    cpu::gelu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
+                }
+            }
 
             #[cfg(has_blas)]
             {
@@ -1461,8 +1768,8 @@ impl LlamaModel {
                 );
             }
 
-            // LoRA on the down projection — applied BEFORE the residual scale;
-            // input is the SwiGLU product in `gate_mat` `[is×n]`.
+            // LoRA on the down projection - applied BEFORE the residual scale;
+            // input is the SwiGLU product in `gate_mat` `[is*n]`.
             if let Some(lora) = &lora
                 && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
             {
@@ -1473,6 +1780,19 @@ impl LlamaModel {
                     n,
                     &mut state.scratch.lora_tmp,
                 );
+            }
+
+            // Post-norm on FFN output (Gemma 2, Olmo 2/3).
+            if let Some(post_norm) = &self.ffn_post_norm_weights[layer] {
+                for j in 0..n {
+                    for i in 0..hs {
+                        ffn_col[i] = ffn_out[i * n + j];
+                    }
+                    cpu::rmsnorm(&mut ffn_col, post_norm, cfg.rms_norm_eps);
+                    for i in 0..hs {
+                        ffn_out[i * n + j] = ffn_col[i];
+                    }
+                }
             }
 
             // Granite residual scale, then residual add.
@@ -1712,10 +2032,18 @@ impl Model for LlamaModel {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        true
+        // YaRN frequencies and per-layer SWA patterns do not compose with standard
+        // unscaled RoPE delta rotation in `shift_kv_with_rope`.
+        self.yarn.is_none() && self.sliding_window.is_none()
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
+        if self.yarn.is_some() || self.sliding_window.is_some() {
+            tracing::warn!(
+                "shift_kv called on model with YaRN or sliding window; skipping unscaled RoPE rotation"
+            );
+            return;
+        }
         state.shift_kv_with_rope(
             n_keep,
             shift,
@@ -1827,6 +2155,9 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // logit), and untied output. Correctness is gated by the GPU-internal
         // differential test (batched vs per-token, all four archs) in
         // `tests/gpu_transformer_parity.rs`.
-        true
+        //
+        // YaRN frequency scaling and per-layer sliding window attention
+        // patterns are not implemented in the current GPU prefill shaders.
+        self.yarn.is_none() && self.sliding_window.is_none()
     }
 }

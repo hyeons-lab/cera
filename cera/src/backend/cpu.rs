@@ -3134,7 +3134,9 @@ pub fn relu_inplace(x: &mut [f32]) {
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
-    let len = gate.len();
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
     if len >= 1024 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
@@ -3152,6 +3154,61 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     } else {
         for (g, &u) in gate.iter_mut().zip(up.iter()) {
             *g = *g / (1.0 + ggml_expf(-*g)) * u;
+        }
+    }
+}
+
+/// Fused GeLU activation + element-wise multiply: gate = gelu(gate) * up.
+/// Uses the tanh approximation matching [`gelu_inplace`].
+pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    if len >= 1024 {
+        let chunk_size = 512;
+        let up_ptr = up.as_ptr() as usize;
+        par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
+            let u_chunk = unsafe {
+                core::slice::from_raw_parts(
+                    (up_ptr as *const f32).add(idx * chunk_size),
+                    g_chunk.len(),
+                )
+            };
+            for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
+                let gv = *g;
+                let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+                *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+            }
+        });
+    } else {
+        for (g, &u) in gate.iter_mut().zip(up.iter()) {
+            let gv = *g;
+            let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
+            *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+        }
+    }
+}
+
+/// Logit soft-capping in-place: x = cap * tanh(x / cap).
+/// Used by Gemma 2 for attention scores and final output logits.
+pub fn softcap_inplace(x: &mut [f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    if x.len() >= 1024 {
+        let chunk_size = 512;
+        par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
+            for v in chunk.iter_mut() {
+                *v = cap * (*v * inv_cap).tanh();
+            }
+        });
+    } else {
+        for v in x.iter_mut() {
+            *v = cap * (*v * inv_cap).tanh();
         }
     }
 }
@@ -5836,6 +5893,255 @@ pub fn rope(
     }
 }
 
+/// Parameters for YaRN (Yet another RoPE extensioN) rotary embeddings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct YarnParams {
+    /// Inverse frequency scaling factor (typically `1.0 / factor`).
+    pub freq_scale: f32,
+    /// YaRN extrapolation factor (`1.0` enables interpolation-extrapolation blending, `0.0` disables).
+    pub ext_factor: f32,
+    /// Attention magnitude scaling factor (defaults to `1.0`).
+    pub attn_factor: f32,
+    /// High frequency correction cutoff parameter (typically `32.0`).
+    pub beta_fast: f32,
+    /// Low frequency correction cutoff parameter (typically `1.0`).
+    pub beta_slow: f32,
+    /// Original context length before RoPE scaling (e.g. `8192` or `64`).
+    pub orig_ctx_len: usize,
+    /// Precomputed attention magnitude scaling factor (`attn_factor * (1 + 0.1 * ln(1 / freq_scale))`).
+    pub mscale: f32,
+}
+
+impl YarnParams {
+    /// Constructs a new `YarnParams` instance, precomputing the attention scaling multiplier `mscale`.
+    pub fn new(
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        orig_ctx_len: usize,
+    ) -> Self {
+        let mut mscale = attn_factor;
+        if ext_factor != 0.0 && freq_scale > 0.0 {
+            mscale *= 1.0 + 0.1 * (1.0 / freq_scale).ln();
+        }
+        Self {
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            orig_ctx_len,
+            mscale,
+        }
+    }
+}
+
+/// Calculates the dimension index corresponding to a given rotation count for YaRN.
+#[inline]
+fn rope_yarn_corr_dim(n_dims: usize, n_ctx_orig: usize, n_rot: f32, base: f32) -> f32 {
+    if n_dims == 0
+        || !base.is_finite()
+        || base <= 1.0
+        || !n_rot.is_finite()
+        || n_rot <= 0.0
+        || n_ctx_orig == 0
+    {
+        return 0.0;
+    }
+    let ratio = n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI);
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return 0.0;
+    }
+    let val = n_dims as f32 * ratio.ln() / (2.0 * base.ln());
+    if val.is_finite() { val } else { 0.0 }
+}
+
+/// Calculates YaRN correction dimension boundaries (corr_dims) for interpolation
+/// and extrapolation blending.
+#[inline]
+pub fn rope_yarn_corr_dims(
+    n_dims: usize,
+    n_ctx_orig: usize,
+    freq_base: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> [f32; 2] {
+    let dim_fast = rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, freq_base);
+    let dim_slow = rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base);
+    let max_dim = n_dims.saturating_sub(1) as f32;
+    let low = dim_fast.min(dim_slow).floor().clamp(0.0, max_dim);
+    let high = dim_fast.max(dim_slow).ceil().clamp(low, max_dim);
+    [low, high]
+}
+
+/// Calculates the YaRN ramp blending factor between low and high dimension thresholds.
+#[inline]
+pub fn rope_yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
+    if !low.is_finite() || !high.is_finite() {
+        return 0.0;
+    }
+    let diff = (high - low).max(0.001);
+    let y = ((i0 / 2) as f32 - low) / diff;
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// Precompute YaRN RoPE (cos, sin) pairs for a single token position.
+#[inline]
+fn compute_yarn_cos_sin(
+    pos: usize,
+    head_dim: usize,
+    freq_base: f32,
+    yarn: &YarnParams,
+    cos_sin: &mut [(f32, f32)],
+) {
+    let half_dim = head_dim / 2;
+    debug_assert!(cos_sin.len() >= half_dim);
+    if cos_sin.len() < half_dim
+        || head_dim < 2
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return;
+    }
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let corr_dims = rope_yarn_corr_dims(
+        head_dim,
+        yarn.orig_ctx_len,
+        freq_base,
+        yarn.beta_fast,
+        yarn.beta_slow,
+    );
+    let mscale = yarn.mscale;
+    let mut theta_base = pos as f32;
+    for (i, entry) in cos_sin[..half_dim].iter_mut().enumerate() {
+        let i0 = i * 2;
+        let theta_extrap = theta_base;
+        let theta_interp = yarn.freq_scale * theta_extrap;
+        let theta = if yarn.ext_factor != 0.0 {
+            let ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * yarn.ext_factor;
+            theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix
+        } else {
+            theta_interp
+        };
+        let (sin_t, cos_t) = theta.sin_cos();
+        *entry = (cos_t * mscale, sin_t * mscale);
+        theta_base *= theta_scale;
+    }
+}
+
+/// Apply precomputed NeoX RoPE rotation to a single head slice.
+#[inline(always)]
+fn rotate_head_neox_with_cos_sin(head: &mut [f32], half_dim: usize, cos_sin: &[(f32, f32)]) {
+    if head.len() < 2 * half_dim || cos_sin.len() < half_dim {
+        return;
+    }
+    let (h0, h1) = head[..2 * half_dim].split_at_mut(half_dim);
+    let cos_sin = &cos_sin[..half_dim];
+    for i in 0..half_dim {
+        let (cos_t, sin_t) = cos_sin[i];
+        let x0 = h0[i];
+        let x1 = h1[i];
+        h0[i] = x0 * cos_t - x1 * sin_t;
+        h1[i] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+/// Apply split-halves NeoX RoPE with YaRN scaling to a single head vector.
+pub fn apply_rope_neox_yarn_to_head(
+    head: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    freq_base: f32,
+    yarn: &YarnParams,
+) {
+    debug_assert_eq!(head.len(), head_dim);
+    debug_assert!(head_dim.is_multiple_of(2));
+
+    if head.len() < head_dim
+        || head_dim < 2
+        || !head_dim.is_multiple_of(2)
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return;
+    }
+
+    let half_dim = head_dim / 2;
+    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut heap_buf;
+    let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
+        &mut stack_buf[..half_dim]
+    } else {
+        heap_buf = vec![(0.0, 0.0); half_dim];
+        &mut heap_buf
+    };
+    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+    rotate_head_neox_with_cos_sin(head, half_dim, cos_sin_slice);
+}
+
+/// NEOX-layout (split-halves) RoPE with YaRN scaling for Q and K.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_yarn(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    yarn: &YarnParams,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(k.len(), n_kv_heads * head_dim);
+
+    let min_q = n_heads.checked_mul(head_dim);
+    let min_k = n_kv_heads.checked_mul(head_dim);
+    if min_q.is_none_or(|sz| q.len() < sz)
+        || min_k.is_none_or(|sz| k.len() < sz)
+        || head_dim < 2
+        || !head_dim.is_multiple_of(2)
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return;
+    }
+
+    let half_dim = head_dim / 2;
+    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut heap_buf;
+    let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
+        &mut stack_buf[..half_dim]
+    } else {
+        heap_buf = vec![(0.0, 0.0); half_dim];
+        &mut heap_buf
+    };
+    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+
+    for h in 0..n_heads {
+        let offset = h * head_dim;
+        rotate_head_neox_with_cos_sin(&mut q[offset..offset + head_dim], half_dim, cos_sin_slice);
+    }
+
+    for h in 0..n_kv_heads {
+        let offset = h * head_dim;
+        rotate_head_neox_with_cos_sin(&mut k[offset..offset + head_dim], half_dim, cos_sin_slice);
+    }
+}
+
 /// Apply RoPE rotation to a single head vector.
 /// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
 ///
@@ -6950,6 +7256,84 @@ mod tests {
                 "silu_mul mismatch at {i}: got {got}, expected {expected}"
             );
         }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        silu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        silu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "silu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gelu_mul_inplace() {
+        let mut gate = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+        let up = vec![2.0, 3.0, 0.5, 1.0, -2.0];
+
+        // Reference: gelu(gate) * up
+        let mut gate_ref = gate.clone();
+        gelu_inplace(&mut gate_ref);
+        mul_inplace(&mut gate_ref, &up);
+
+        gelu_mul_inplace(&mut gate, &up);
+
+        for (i, (&got, &expected)) in gate.iter().zip(gate_ref.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "gelu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        gelu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        gelu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "gelu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softcap_inplace() {
+        let cap = 50.0f32;
+        let mut x = vec![0.0, 10.0, -10.0, 100.0, -100.0];
+        let expected: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+
+        softcap_inplace(&mut x, cap);
+
+        for (i, (&got, &exp)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-6,
+                "softcap mismatch at {i}: got {got}, expected {exp}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
+        let expected_large: Vec<f32> = x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        softcap_inplace(&mut x_large, cap);
+        for (i, (&got, &exp)) in x_large.iter().zip(expected_large.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "softcap large mismatch at {i}: got {got}, expected {exp}"
+            );
+        }
     }
 
     #[test]
@@ -7492,6 +7876,162 @@ mod tests {
                 "norm rope delta mismatch at {i}: {} vs {}",
                 direct[i],
                 composed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_neox_yarn_identity_with_base_rope() {
+        let head_dim = 16;
+        let freq_base = 10000.0_f32;
+        let raw = vec![
+            0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9, -1.0, 1.1, -1.2, 1.3, -1.4, 1.5, -1.6,
+        ];
+        let yarn = YarnParams::new(1.0, 0.0, 1.0, 32.0, 1.0, 64);
+
+        for pos in [0, 1, 5, 23, 100] {
+            let mut direct = raw.clone();
+            apply_rope_to_head(&mut direct, pos, head_dim, freq_base);
+
+            let mut yarn_head = raw.clone();
+            apply_rope_neox_yarn_to_head(&mut yarn_head, pos, head_dim, freq_base, &yarn);
+
+            for i in 0..head_dim {
+                assert!(
+                    (direct[i] - yarn_head[i]).abs() < 1e-6,
+                    "yarn identity mismatch at pos {pos}, dim {i}: {} vs {}",
+                    direct[i],
+                    yarn_head[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_rope_yarn_corr_dims_and_ramp() {
+        let dims = rope_yarn_corr_dims(16, 64, 10000.0, 32.0, 1.0);
+        assert_eq!(dims[0], 0.0);
+        assert_eq!(dims[1], 3.0);
+
+        // ramp at i0 = 0 (low) is 1.0 (pure extrapolation)
+        let r0 = rope_yarn_ramp(dims[0], dims[1], 0);
+        assert!((r0 - 1.0).abs() < 1e-6);
+
+        // ramp at i0 = 6 (high = 3, i0/2 = 3) is 0.0 (pure interpolation)
+        let r_high = rope_yarn_ramp(dims[0], dims[1], 6);
+        assert!((r_high - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rope_yarn_corr_dim_invalid_inputs() {
+        // Non-positive or non-finite inputs return 0.0 safely
+        assert_eq!(rope_yarn_corr_dim(0, 64, 32.0, 10000.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 0, 32.0, 10000.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, 0.0, 10000.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, -1.0, 10000.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, 32.0, 1.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, 32.0, 0.5), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, f32::NAN, 10000.0), 0.0);
+        assert_eq!(rope_yarn_corr_dim(16, 64, 32.0, f32::NAN), 0.0);
+        // Extremely large n_rot causing ratio underflow
+        assert_eq!(rope_yarn_corr_dim(16, 1, 1e38, 10000.0), 0.0);
+
+        // Non-finite ramp inputs return 0.0 safely
+        assert_eq!(rope_yarn_ramp(f32::NAN, 1.0, 0), 0.0);
+        assert_eq!(rope_yarn_ramp(0.0, f32::NAN, 0), 0.0);
+    }
+
+    #[test]
+    fn test_rope_yarn_corr_dims_inverted_betas() {
+        // beta_fast < beta_slow should be sorted so low <= high
+        let dims = rope_yarn_corr_dims(16, 64, 10000.0, 1.0, 32.0);
+        assert!(dims[0] <= dims[1]);
+        assert_eq!(dims[0], 0.0);
+        assert_eq!(dims[1], 3.0);
+    }
+
+    #[test]
+    fn test_rope_yarn_corr_dims_high_dimension_clamp_no_panic() {
+        // Large original context length relative to head_dim causing low > max_dim
+        let dims = rope_yarn_corr_dims(16, 131072, 10000.0, 0.01, 0.001);
+        assert!(dims[0] <= dims[1]);
+        assert!(dims[1] <= 15.0);
+    }
+
+    #[test]
+    fn test_apply_rope_neox_yarn_to_head_empty_or_short() {
+        let yarn = YarnParams::new(1.0, 1.0, 1.0, 32.0, 1.0, 64);
+        let mut empty_head = Vec::new();
+        apply_rope_neox_yarn_to_head(&mut empty_head, 0, 0, 10000.0, &yarn);
+
+        let mut q = Vec::new();
+        let mut k = Vec::new();
+        rope_neox_yarn(&mut q, &mut k, 0, 0, 0, 0, 10000.0, &yarn);
+
+        // Odd head dimension (e.g. 15) must safely return without panic or modification
+        let mut q_odd = vec![1.0; 15];
+        let mut k_odd = vec![2.0; 15];
+        rope_neox_yarn(&mut q_odd, &mut k_odd, 1, 1, 1, 15, 10000.0, &yarn);
+        assert_eq!(q_odd, vec![1.0; 15]);
+        assert_eq!(k_odd, vec![2.0; 15]);
+
+        // Invalid freq_base (<= 0.0 or non-finite) must safely return without modification
+        let mut q_freq = vec![1.0; 16];
+        let mut k_freq = vec![2.0; 16];
+        rope_neox_yarn(&mut q_freq, &mut k_freq, 1, 1, 1, 16, 0.0, &yarn);
+        assert_eq!(q_freq, vec![1.0; 16]);
+        assert_eq!(k_freq, vec![2.0; 16]);
+        rope_neox_yarn(&mut q_freq, &mut k_freq, 1, 1, 1, 16, f32::NAN, &yarn);
+        assert_eq!(q_freq, vec![1.0; 16]);
+        assert_eq!(k_freq, vec![2.0; 16]);
+
+        // Invalid yarn parameters (<= 0.0 or non-finite) must safely return without modification
+        let mut yarn_bad = yarn;
+        yarn_bad.freq_scale = 0.0;
+        let mut q_bad = vec![1.0; 16];
+        let mut k_bad = vec![2.0; 16];
+        rope_neox_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+
+        yarn_bad.freq_scale = 1.0;
+        yarn_bad.mscale = f32::NAN;
+        rope_neox_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+    }
+
+    #[test]
+    fn test_rope_neox_yarn_large_head_dim_and_extreme_pos() {
+        let yarn = YarnParams::new(0.125, 1.0, 1.2, 32.0, 1.0, 8192);
+        // Exercise dynamic heap fallback when head_dim > 512 (head_dim = 1024)
+        let head_dim = 1024;
+        let mut q = vec![1.0; head_dim];
+        let mut k = vec![1.0; head_dim];
+        rope_neox_yarn(&mut q, &mut k, 65536, 1, 1, head_dim, 10000.0, &yarn);
+        assert!(q.iter().all(|x| x.is_finite()));
+        assert!(k.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_rope_neox_yarn_pos0_scaling() {
+        let head_dim = 16;
+        let freq_base = 10000.0_f32;
+        let raw = vec![1.0; 16];
+        let factor = 2.0_f32;
+        let attn_factor = 1.069315_f32;
+        let yarn = YarnParams::new(1.0 / factor, 1.0, attn_factor, 32.0, 1.0, 64);
+
+        let mut head = raw.clone();
+        apply_rope_neox_yarn_to_head(&mut head, 0, head_dim, freq_base, &yarn);
+
+        // At pos 0, theta is 0 for all dims, cos(0) = 1, sin(0) = 0.
+        // Effective scale is mscale = attn_factor * (1.0 + 0.1 * ln(factor)).
+        let expected_scale = attn_factor * (1.0 + 0.1 * factor.ln());
+        for (i, &val) in head.iter().enumerate() {
+            assert!(
+                (val - expected_scale).abs() < 1e-5,
+                "dim {i} expected {expected_scale} got {val}",
             );
         }
     }

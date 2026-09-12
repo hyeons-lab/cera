@@ -1352,6 +1352,12 @@ pub(crate) struct AttnDims<'a> {
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
     /// applied only on the NORM path; `None` ⇒ plain RoPE.
     pub rope_freqs: Option<&'a [f32]>,
+    /// Optional logit soft-capping factor for attention scores (e.g. Gemma 2).
+    pub attn_logit_softcapping: Option<f32>,
+    /// Optional sliding window attention size (e.g. Olmo 3).
+    pub sliding_window: Option<usize>,
+    /// Optional YaRN RoPE scaling configuration (e.g. Olmo 3).
+    pub yarn: Option<cpu::YarnParams>,
 }
 
 // ── Decode-time GQA attention ───────────────────────────────────────────────
@@ -1388,6 +1394,9 @@ pub(crate) struct DecodeAttnDims {
     pub head_dim: usize,
     pub scale: f32,
     pub seq_len: usize,
+    pub attn_logit_softcapping: Option<f32>,
+    /// Optional sliding window attention size.
+    pub sliding_window: Option<usize>,
 }
 
 impl DecodeAttnDims {
@@ -1447,7 +1456,7 @@ fn decode_attn_head(
     let q_head = &q[h * d.head_dim..(h + 1) * d.head_dim];
     let kv_h_offset = (h / d.group_size()) * d.head_dim;
     match kv {
-        KvView::F16 { k, v } => {
+        KvView::F16 { k, .. } => {
             cpu::attn_scores_f16(
                 q_head,
                 k,
@@ -1458,18 +1467,8 @@ fn decode_attn_head(
                 d.scale,
                 d.seq_len,
             );
-            cpu::softmax_inplace(scores);
-            cpu::attn_values_f16(
-                scores,
-                v,
-                head_out,
-                d.kv_dim(),
-                kv_h_offset,
-                d.head_dim,
-                d.seq_len,
-            );
         }
-        KvView::F32 { k, v } => {
+        KvView::F32 { k, .. } => {
             cpu::attn_scores(
                 q_head,
                 k,
@@ -1480,7 +1479,33 @@ fn decode_attn_head(
                 d.scale,
                 d.seq_len,
             );
-            cpu::softmax_inplace(scores);
+        }
+    }
+
+    if let Some(cap) = d.attn_logit_softcapping {
+        cpu::softcap_inplace(scores, cap);
+    }
+    if let Some(w) = d.sliding_window.filter(|&w| w > 0 && d.seq_len > w) {
+        let mask_end = d.seq_len - w;
+        for s in &mut scores[..mask_end] {
+            *s = f32::NEG_INFINITY;
+        }
+    }
+    cpu::softmax_inplace(scores);
+
+    match kv {
+        KvView::F16 { v, .. } => {
+            cpu::attn_values_f16(
+                scores,
+                v,
+                head_out,
+                d.kv_dim(),
+                kv_h_offset,
+                d.head_dim,
+                d.seq_len,
+            );
+        }
+        KvView::F32 { v, .. } => {
             cpu::attn_values(
                 scores,
                 v,
@@ -1659,29 +1684,52 @@ pub(crate) fn forward_attn_block(
         crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
     }
 
-    // Qwen3 per-head QK norm: RMSNorm each head slice with shared weights,
-    // applied BEFORE RoPE (mirrors LFM2's mandatory QK-norm).
+    // Qwen3 per-head QK norm (weights len == head_dim) or Olmo 2 full-vector QK norm
+    // (weights len == q_dim / kv_dim), applied BEFORE RoPE.
     if let Some((q_norm, k_norm)) = extras.qk_norm {
-        for h in 0..n_heads {
-            cpu::rmsnorm(
-                &mut q[h * head_dim..(h + 1) * head_dim],
-                q_norm,
-                dims.rms_norm_eps,
-            );
+        if q_norm.len() == head_dim {
+            for h in 0..n_heads {
+                cpu::rmsnorm(
+                    &mut q[h * head_dim..(h + 1) * head_dim],
+                    q_norm,
+                    dims.rms_norm_eps,
+                );
+            }
+        } else {
+            cpu::rmsnorm(q, q_norm, dims.rms_norm_eps);
         }
-        for h in 0..n_kv_heads {
-            cpu::rmsnorm(
-                &mut k[h * head_dim..(h + 1) * head_dim],
-                k_norm,
-                dims.rms_norm_eps,
-            );
+        if k_norm.len() == head_dim {
+            for h in 0..n_kv_heads {
+                cpu::rmsnorm(
+                    &mut k[h * head_dim..(h + 1) * head_dim],
+                    k_norm,
+                    dims.rms_norm_eps,
+                );
+            }
+        } else {
+            cpu::rmsnorm(k, k_norm, dims.rms_norm_eps);
         }
     }
 
-    // RoPE — layout per arch (NEOX split-halves for Qwen2/Qwen3, NORM
-    // interleaved for LLaMA/Mistral/Granite).
+    // RoPE: layout per arch (NEOX split-halves for Qwen2/Qwen3/Olmo2, NORM
+    // interleaved for LLaMA/Mistral/Granite). Optional YaRN scaling for NEOX.
     match dims.rope_type {
-        cpu::RopeType::Neox => cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta),
+        cpu::RopeType::Neox => {
+            if let Some(yarn) = &dims.yarn {
+                cpu::rope_neox_yarn(
+                    q,
+                    k,
+                    pos,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    dims.rope_theta,
+                    yarn,
+                );
+            } else {
+                cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta);
+            }
+        }
         cpu::RopeType::Norm => cpu::rope_norm(
             q,
             k,
@@ -1774,6 +1822,8 @@ pub(crate) fn forward_attn_block(
                 head_dim,
                 scale,
                 seq_len,
+                attn_logit_softcapping: dims.attn_logit_softcapping,
+                sliding_window: dims.sliding_window,
             },
             attn_out,
             &mut state.scratch.scores,
@@ -1828,9 +1878,18 @@ pub(crate) struct FfnWeights<'a> {
     pub ffn_down: &'a WeightRef,
 }
 
-/// Run one SwiGLU FFN block for a single token: `ffn_input` is the already
+/// Gated FFN activation function: SwiGLU (SiLU * up) vs GeGLU (GeLU * up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfnActivation {
+    #[default]
+    Swiglu,
+    Geglu,
+}
+
+/// Run one gated FFN block (SwiGLU or GeGLU) for a single token: `ffn_input` is the already
 /// RMSNorm'd (and, on aarch64, pre-quantized) hidden state. Writes the result
-/// into `state.scratch.out[..hidden_size]`. Identical to LFM2's FFN.
+/// into `state.scratch.out[..hidden_size]`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_ffn_block(
     gguf: &GgufFile,
     layer: usize,
@@ -1838,12 +1897,14 @@ pub(crate) fn forward_ffn_block(
     hidden_size: usize,
     intermediate_size: usize,
     ffn_input: &[f32],
+    activation: FfnActivation,
     state: &mut InferenceState,
 ) {
     let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
     {
-        let can_fuse_swiglu = lora.is_none()
+        let can_fuse_swiglu = activation == FfnActivation::Swiglu
+            && lora.is_none()
             && weights.ffn_gate.dtype == DType::Q4_0
             && weights.ffn_up.dtype == DType::Q4_0;
         if can_fuse_swiglu {
@@ -1935,10 +1996,20 @@ pub(crate) fn forward_ffn_block(
             }
         }
 
-        cpu::silu_mul_inplace(
-            &mut state.scratch.gate[..intermediate_size],
-            &state.scratch.up[..intermediate_size],
-        );
+        match activation {
+            FfnActivation::Swiglu => {
+                cpu::silu_mul_inplace(
+                    &mut state.scratch.gate[..intermediate_size],
+                    &state.scratch.up[..intermediate_size],
+                );
+            }
+            FfnActivation::Geglu => {
+                cpu::gelu_mul_inplace(
+                    &mut state.scratch.gate[..intermediate_size],
+                    &state.scratch.up[..intermediate_size],
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2152,6 +2223,8 @@ mod decode_attn_tests {
                 head_dim,
                 scale: 1.0 / (head_dim as f32).sqrt(),
                 seq_len,
+                attn_logit_softcapping: None,
+                sliding_window: None,
             };
             // Skipped when the gate is overridden, since the override moves the
             // very threshold this is asserting against — otherwise anyone who
@@ -2262,6 +2335,8 @@ mod decode_attn_tests {
                     head_dim,
                     scale: 1.0 / (head_dim as f32).sqrt(),
                     seq_len,
+                    attn_logit_softcapping: None,
+                    sliding_window: None,
                 };
                 let want = serial_reference(&q, &kv, &d);
                 let mut got = vec![0.0f32; n_heads * head_dim];
@@ -2271,6 +2346,94 @@ mod decode_attn_tests {
                     "decode_attention differs at seq_len={seq_len} (use_f16={use_f16})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_decode_attention_sliding_window_masking() {
+        let n_heads = 1;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 4;
+        let window = 2;
+
+        let q = vec![1.0; head_dim];
+        let k = vec![1.0; seq_len * head_dim];
+        // Large values at tokens 0 and 1, smaller values at tokens 2 and 3.
+        let mut v = vec![0.0; seq_len * head_dim];
+        for d in 0..head_dim {
+            v[d] = 100.0;
+            v[head_dim + d] = 100.0;
+            v[2 * head_dim + d] = 2.0;
+            v[3 * head_dim + d] = 4.0;
+        }
+
+        let kv = KvView::F32 { k: &k, v: &v };
+        let d = DecodeAttnDims {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            scale: 1.0,
+            seq_len,
+            attn_logit_softcapping: None,
+            sliding_window: Some(window),
+        };
+
+        let mut out = vec![0.0f32; head_dim];
+        let mut scratch = Vec::new();
+        decode_attention(&q, &kv, &d, &mut out, &mut scratch);
+
+        // Since tokens 0 and 1 are masked out (seq_len - window = 4 - 2 = 2, so [..2] are -inf),
+        // attention weights for tokens 2 and 3 are equal (0.5 each).
+        // Average of 2.0 and 4.0 is 3.0.
+        for &val in &out[..head_dim] {
+            assert!(
+                (val - 3.0).abs() < 1e-5,
+                "expected masked attention output 3.0, got {val}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_attention_sliding_window_with_softcapping() {
+        let n_heads = 1;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 4;
+        let window = 2;
+
+        let q = vec![1.0; head_dim];
+        let k = vec![1.0; seq_len * head_dim];
+        let mut v = vec![0.0; seq_len * head_dim];
+        for d in 0..head_dim {
+            v[d] = 1000.0;
+            v[head_dim + d] = 1000.0;
+            v[2 * head_dim + d] = 2.0;
+            v[3 * head_dim + d] = 4.0;
+        }
+
+        let kv = KvView::F32 { k: &k, v: &v };
+        let d = DecodeAttnDims {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            scale: 1.0,
+            seq_len,
+            attn_logit_softcapping: Some(50.0),
+            sliding_window: Some(window),
+        };
+
+        let mut out = vec![0.0f32; head_dim];
+        let mut scratch = Vec::new();
+        decode_attention(&q, &kv, &d, &mut out, &mut scratch);
+
+        // Tokens 0 and 1 must be strictly -inf even after softcapping,
+        // so they do not leak into softmax. Tokens 2 and 3 equal 0.5 each -> 3.0.
+        for &val in &out[..head_dim] {
+            assert!(
+                (val - 3.0).abs() < 1e-5,
+                "expected masked attention output 3.0 under softcapping, got {val}",
+            );
         }
     }
 }
