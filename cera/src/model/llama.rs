@@ -60,7 +60,7 @@ pub struct LlamaModel {
     gguf: GgufFile,
     config: ModelConfig,
     head_dim: usize,
-    /// RoPE pair layout: `Neox` for Qwen2/Qwen3/Gemma, `Norm` for LLaMA/Mistral/Granite/Olmo.
+    /// RoPE pair layout: `Neox` for Qwen2/Qwen3/Gemma/Gemma2/Olmo2, `Norm` for LLaMA/Mistral/Granite/Olmo.
     rope_type: RopeType,
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
     /// applied per-pair on the NORM path. `None` for archs without the tensor
@@ -176,8 +176,8 @@ impl LlamaModel {
             .to_string();
         let prefix = arch.as_str();
 
-        // RoPE layout per arch. Qwen and Gemma GGUFs are NEOX (split-halves); the
-        // LLaMA-family (incl. Mistral, Granite, and Olmo) are NORM (interleaved pairs).
+        // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2 GGUFs are NEOX (split-halves);
+        // the LLaMA-family (incl. Mistral, Granite, and Olmo 1) are NORM (interleaved pairs).
         let rope_type = match prefix {
             "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
@@ -320,16 +320,20 @@ impl LlamaModel {
             let attn_norm_name = format!("blk.{i}.attn_norm.weight");
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
                 gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
-            } else {
+            } else if norm_order == NormOrder::PostNorm {
                 vec![1.0f32; hidden_size]
+            } else {
+                bail!("missing required tensor `{attn_norm_name}` for PreNorm architecture");
             };
             attn_norm_weights.push(attn_norm);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
                 gguf.get_tensor(&ffn_norm_name)?.to_f32_vec()
-            } else {
+            } else if norm_order == NormOrder::PostNorm {
                 vec![1.0f32; hidden_size]
+            } else {
+                bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
             };
             ffn_norm_weights.push(ffn_norm);
 
