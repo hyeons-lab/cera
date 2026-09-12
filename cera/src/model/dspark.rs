@@ -729,6 +729,7 @@ impl DSparkDraftModel {
             rope_type: self.config.rope_type,
             attn_scale: None,
             rope_freqs: None,
+            attn_logit_softcapping: None,
         };
         let attn_extras = AttnExtras {
             qkv_bias: None,
@@ -784,6 +785,7 @@ impl DSparkDraftModel {
                 self.config.hidden_size,
                 self.config.intermediate_size,
                 normed,
+                transformer::FfnActivation::Swiglu,
                 state,
             );
 
