@@ -6997,6 +6997,42 @@ mod tests {
     }
 
     #[test]
+    fn test_gelu_mul_inplace() {
+        let mut gate = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+        let up = vec![2.0, 3.0, 0.5, 1.0, -2.0];
+
+        // Reference: gelu(gate) * up
+        let mut gate_ref = gate.clone();
+        gelu_inplace(&mut gate_ref);
+        mul_inplace(&mut gate_ref, &up);
+
+        gelu_mul_inplace(&mut gate, &up);
+
+        for (i, (&got, &expected)) in gate.iter().zip(gate_ref.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "gelu_mul mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_softcap_inplace() {
+        let cap = 50.0f32;
+        let mut x = vec![0.0, 10.0, -10.0, 100.0, -100.0];
+        let expected: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+
+        softcap_inplace(&mut x, cap);
+
+        for (i, (&got, &exp)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-6,
+                "softcap mismatch at {i}: got {got}, expected {exp}"
+            );
+        }
+    }
+
+    #[test]
     fn test_sigmoid() {
         let mut x = vec![0.0f32, 2.0, -2.0, 10.0, -10.0];
         sigmoid_inplace(&mut x);
