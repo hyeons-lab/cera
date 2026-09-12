@@ -3134,7 +3134,9 @@ pub fn relu_inplace(x: &mut [f32]) {
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
-    let len = gate.len();
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
     if len >= 1024 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
@@ -3160,9 +3162,11 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
 /// Uses the tanh approximation matching [`gelu_inplace`].
 pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
+    let len = gate.len().min(up.len());
+    let gate = &mut gate[..len];
+    let up = &up[..len];
     const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
     const COEF: f32 = 0.044_715;
-    let len = gate.len();
     if len >= 1024 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
@@ -3195,8 +3199,17 @@ pub fn softcap_inplace(x: &mut [f32], cap: f32) {
         return;
     }
     let inv_cap = 1.0 / cap;
-    for v in x.iter_mut() {
-        *v = cap * (*v * inv_cap).tanh();
+    if x.len() >= 1024 {
+        let chunk_size = 512;
+        par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
+            for v in chunk.iter_mut() {
+                *v = cap * (*v * inv_cap).tanh();
+            }
+        });
+    } else {
+        for v in x.iter_mut() {
+            *v = cap * (*v * inv_cap).tanh();
+        }
     }
 }
 
@@ -6994,6 +7007,21 @@ mod tests {
                 "silu_mul mismatch at {i}: got {got}, expected {expected}"
             );
         }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        silu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        silu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "silu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
     }
 
     #[test]
@@ -7014,6 +7042,21 @@ mod tests {
                 "gelu_mul mismatch at {i}: got {got}, expected {expected}"
             );
         }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+        let mut ref_large = gate_large.clone();
+        gelu_inplace(&mut ref_large);
+        mul_inplace(&mut ref_large, &up_large);
+        gelu_mul_inplace(&mut gate_large, &up_large);
+        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "gelu_mul large mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
     }
 
     #[test]
@@ -7028,6 +7071,18 @@ mod tests {
             assert!(
                 (got - exp).abs() < 1e-6,
                 "softcap mismatch at {i}: got {got}, expected {exp}"
+            );
+        }
+
+        // Test parallel branch (len >= 1024)
+        let n = 2048;
+        let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
+        let expected_large: Vec<f32> = x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        softcap_inplace(&mut x_large, cap);
+        for (i, (&got, &exp)) in x_large.iter().zip(expected_large.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "softcap large mismatch at {i}: got {got}, expected {exp}"
             );
         }
     }
