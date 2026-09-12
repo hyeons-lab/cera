@@ -221,3 +221,33 @@ fn olmo2_matches_llama_cpp_oracle() {
     eprintln!("[olmo2] decode after batched vs sequential cosine: {d_cos:.6}");
     assert!(d_cos > 0.9999, "olmo2 decode cosine too low: {d_cos}");
 }
+
+#[test]
+fn gemma2_long_prefill_bypasses_flash_attn_and_matches_decode() {
+    let path = Path::new("/tmp/test_gemma2.gguf");
+    if !path.exists() {
+        eprintln!("skipping: /tmp/test_gemma2.gguf does not exist");
+        return;
+    }
+
+    let gguf = GgufFile::open(path).expect("open test_gemma2.gguf");
+    // Size cache to 512 tokens so 280 tokens fit (> FLASH_ATTN_THRESHOLD = 256).
+    let model = LlamaModel::from_gguf(gguf, 512).expect("load gemma2 model");
+
+    // Prompt with 280 tokens (> 256 threshold where Flash Attention normally activates,
+    // but Flash Attention is bypassed because attn_logit_softcapping is present).
+    let tokens: Vec<u32> = (0..280).map(|i| 88 + (i % 20) as u32).collect();
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let logits_prefill = model.forward_prefill(&tokens, 0, &mut state);
+    assert_eq!(logits_prefill.len(), model.config().vocab_size);
+    assert!(logits_prefill.iter().all(|v| v.is_finite()));
+    assert_eq!(state.seq_len, 280);
+
+    // Verify a subsequent decode step succeeds.
+    let next_logits = model.forward(&[88], 280, &mut state);
+    assert_eq!(next_logits.len(), model.config().vocab_size);
+    assert!(next_logits.iter().all(|v| v.is_finite()));
+    assert_eq!(state.seq_len, 281);
+}
