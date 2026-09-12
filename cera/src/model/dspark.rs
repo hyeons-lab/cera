@@ -730,6 +730,8 @@ impl DSparkDraftModel {
             attn_scale: None,
             rope_freqs: None,
             attn_logit_softcapping: None,
+            sliding_window: None,
+            yarn: None,
         };
         let attn_extras = AttnExtras {
             qkv_bias: None,

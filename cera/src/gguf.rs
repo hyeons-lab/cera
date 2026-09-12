@@ -698,6 +698,28 @@ impl GgufFile {
         }
     }
 
+    /// Get a boolean array metadata value. Also converts integer arrays where non-zero is true.
+    pub fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        match self.metadata.get(key) {
+            Some(GgufValue::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    GgufValue::Bool(b) => Some(*b),
+                    GgufValue::I32(i) => Some(*i != 0),
+                    GgufValue::U32(u) => Some(*u != 0),
+                    GgufValue::I16(i) => Some(*i != 0),
+                    GgufValue::U16(u) => Some(*u != 0),
+                    GgufValue::I8(i) => Some(*i != 0),
+                    GgufValue::U8(u) => Some(*u != 0),
+                    GgufValue::I64(i) => Some(*i != 0),
+                    GgufValue::U64(u) => Some(*u != 0),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
     /// Raw access to the full backing data region (mmap or owned).
     /// Name retained for backward compat with existing callers; despite
     /// the name, the buffer may be heap-owned (via `from_bytes` /

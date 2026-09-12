@@ -91,6 +91,9 @@ pub struct LlamaModel {
     /// tied embeddings (`token_embd.weight` reused for the logit projection).
     output_ref: Option<WeightRef>,
     layer_refs: Vec<LayerWeightRefs>,
+    sliding_window: Option<usize>,
+    sliding_window_pattern: Option<Vec<bool>>,
+    yarn: Option<cpu::YarnParams>,
     #[allow(dead_code)]
     model_id: String,
 }
@@ -176,10 +179,10 @@ impl LlamaModel {
             .to_string();
         let prefix = arch.as_str();
 
-        // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2 GGUFs are NEOX (split-halves);
+        // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2/3 GGUFs are NEOX (split-halves);
         // the LLaMA-family (incl. Mistral, Granite, and Olmo 1) are NORM (interleaved pairs).
         let rope_type = match prefix {
-            "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" => RopeType::Neox,
+            "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
             "llama" | "granite" | "olmo" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
@@ -193,7 +196,7 @@ impl LlamaModel {
         };
 
         let norm_order = match prefix {
-            "olmo" | "olmo2" => NormOrder::PostNorm,
+            "olmo" | "olmo2" | "olmo3" => NormOrder::PostNorm,
             _ => NormOrder::PreNorm,
         };
 
@@ -205,8 +208,101 @@ impl LlamaModel {
         let attn_logit_softcapping = gguf.get_f32(&format!("{prefix}.attn_logit_softcapping"));
         let final_logit_softcapping = gguf.get_f32(&format!("{prefix}.final_logit_softcapping"));
 
+        let sliding_window = gguf
+            .get_u32(&format!("{prefix}.attention.sliding_window"))
+            .or_else(|| gguf.get_u32("attention.sliding_window"))
+            .map(|w| w as usize)
+            .filter(|&w| w > 0);
+        let sliding_window_pattern = gguf
+            .get_bool_array(&format!("{prefix}.attention.sliding_window_pattern"))
+            .or_else(|| gguf.get_bool_array("attention.sliding_window_pattern"))
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                gguf.get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+                    .or_else(|| gguf.get_u32("attention.sliding_window_pattern"))
+                    .map(|period| {
+                        let p = period as usize;
+                        if p <= 1 {
+                            vec![false]
+                        } else if p > 1024 {
+                            tracing::warn!("sliding_window_pattern period {p} exceeds maximum 1024; defaulting to full attention");
+                            vec![false]
+                        } else {
+                            (0..p).map(|i| i < p - 1).collect()
+                        }
+                    })
+            })
+            .or_else(|| {
+                // Default SWA patterns when sliding_window is set but pattern key is omitted in GGUF:
+                // Olmo 2/3 default to period 4 (3 SWA layers, 1 dense layer).
+                // Gemma 2 defaults to period 2 (1 SWA layer, 1 dense layer).
+                match prefix {
+                    "olmo2" | "olmo3" if sliding_window.is_some() => {
+                        Some(vec![true, true, true, false])
+                    }
+                    "gemma2" if sliding_window.is_some() => Some(vec![true, false]),
+                    _ => None,
+                }
+            });
+
+        let rope_scaling_type = gguf
+            .get_str(&format!("{prefix}.rope.scaling.type"))
+            .or_else(|| gguf.get_str("rope.scaling.type"));
+        let yarn = if rope_scaling_type == Some("yarn") {
+            let factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.factor"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let orig_ctx_len = gguf
+                .get_u32(&format!("{prefix}.rope.scaling.original_context_length"))
+                .or_else(|| gguf.get_u32("rope.scaling.original_context_length"))
+                .map(|len| len as usize)
+                .filter(|&len| len > 0)
+                .unwrap_or(context_size);
+            let attn_factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.attn_factor"))
+                .or_else(|| gguf.get_f32(&format!("{prefix}.rope.scaling.yarn_attn_factor")))
+                .or_else(|| gguf.get_f32("rope.scaling.attn_factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_attn_factor"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let beta_fast = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_beta_fast"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_beta_fast"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(32.0);
+            let beta_slow = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_beta_slow"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_beta_slow"))
+                .filter(|x| x.is_finite() && *x > 0.0)
+                .unwrap_or(1.0);
+            let ext_factor = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_ext_factor"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_ext_factor"))
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .map(|x| x.clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            let freq_scale = if factor > 0.0 { 1.0 / factor } else { 1.0 };
+            Some(cpu::YarnParams::new(
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow,
+                orig_ctx_len,
+            ))
+        } else {
+            None
+        };
+        if yarn.is_some() && rope_type != RopeType::Neox {
+            tracing::warn!(
+                "YaRN RoPE scaling configured on {rope_type:?} layout; only NeoX is currently supported"
+            );
+        }
+
         // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
-        // Absent on every other arch ⇒ identity, so this is a no-op for
+        // Absent on every other arch => identity, so this is a no-op for
         // LLaMA/Mistral/Qwen. Carried on `config.scalars`.
         let mut scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
 
@@ -511,12 +607,49 @@ impl LlamaModel {
             embd_ref,
             output_ref,
             layer_refs,
+            sliding_window,
+            sliding_window_pattern,
+            yarn,
             model_id,
         })
     }
 
-    /// Attention dims for a layer (constant across layers here).
-    fn attn_dims(&self) -> AttnDims<'_> {
+    /// Check whether layer `il` is a sliding window attention layer.
+    pub fn is_swa_layer(&self, il: usize) -> bool {
+        if self.sliding_window.unwrap_or(0) == 0 {
+            return false;
+        }
+        if let Some(pattern) = &self.sliding_window_pattern {
+            if pattern.is_empty() {
+                false
+            } else {
+                pattern[il % pattern.len()]
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Return sliding window size for layer `il`, or `None` if it is a full attention layer.
+    pub fn layer_sliding_window(&self, il: usize) -> Option<usize> {
+        if self.is_swa_layer(il) {
+            self.sliding_window
+        } else {
+            None
+        }
+    }
+
+    /// Return YaRN parameters for layer `il`, or `None` if it is an SWA layer or non-YaRN model.
+    pub fn layer_yarn(&self, il: usize) -> Option<cpu::YarnParams> {
+        if self.is_swa_layer(il) {
+            None
+        } else {
+            self.yarn
+        }
+    }
+
+    /// Attention dims for layer `il`.
+    fn attn_dims(&self, il: usize) -> AttnDims<'_> {
         AttnDims {
             hidden_size: self.config.hidden_size,
             n_heads: self.config.n_heads,
@@ -528,6 +661,8 @@ impl LlamaModel {
             attn_scale: self.config.scalars.attn,
             rope_freqs: self.rope_freqs.as_deref(),
             attn_logit_softcapping: self.attn_logit_softcapping,
+            sliding_window: self.layer_sliding_window(il),
+            yarn: self.layer_yarn(il),
         }
     }
 
@@ -535,7 +670,6 @@ impl LlamaModel {
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let dims = self.attn_dims();
 
         // Take scratch out of `state` to avoid borrow conflicts with the
         // helpers that need `&mut state`; restore at the end.
@@ -584,6 +718,7 @@ impl LlamaModel {
                     _ => None,
                 },
             };
+            let dims = self.attn_dims(i);
             transformer::forward_attn_block(
                 &self.gguf, i, &weights, &extras, dims, normed_in, pos, state,
             );
@@ -1220,10 +1355,24 @@ impl LlamaModel {
                     }
                 }
 
-                // RoPE — layout per arch (NEOX for Qwen, NORM for LLaMA/Granite).
+                // RoPE: layout per arch (NEOX for Qwen/Olmo2, NORM for LLaMA/Granite).
+                // Optional YaRN scaling for NEOX.
                 match self.rope_type {
                     RopeType::Neox => {
-                        cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta)
+                        if let Some(yarn) = self.layer_yarn(layer) {
+                            cpu::rope_neox_yarn(
+                                q,
+                                k,
+                                pos,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                cfg.rope_theta,
+                                &yarn,
+                            );
+                        } else {
+                            cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+                        }
                     }
                     RopeType::Norm => cpu::rope_norm(
                         q,
@@ -1287,7 +1436,8 @@ impl LlamaModel {
                 }
                 _ => unreachable!("dense transformer layer is always Attention"),
             };
-            if use_flash {
+            let layer_swa = self.layer_sliding_window(layer);
+            if use_flash && layer_swa.is_none() {
                 // Flash attention (tiled + rayon), parallel across *query heads*,
                 // not KV heads. Splitting per-KV-head caps parallelism at
                 // n_kv_heads (8 for Llama-3.2-1B) — half-idle on a 16-core host,
@@ -1380,6 +1530,12 @@ impl LlamaModel {
                         );
                         if let Some(cap) = self.attn_logit_softcapping {
                             cpu::softcap_inplace(scores, cap);
+                        }
+                        if let Some(w) = layer_swa.filter(|&w| w > 0 && seq_len > w) {
+                            let mask_end = seq_len - w;
+                            for s in &mut scores[..mask_end] {
+                                *s = f32::NEG_INFINITY;
+                            }
                         }
                         cpu::softmax_inplace(scores);
                         cpu::attn_values(
@@ -1876,10 +2032,18 @@ impl Model for LlamaModel {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        true
+        // YaRN frequencies and per-layer SWA patterns do not compose with standard
+        // unscaled RoPE delta rotation in `shift_kv_with_rope`.
+        self.yarn.is_none() && self.sliding_window.is_none()
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
+        if self.yarn.is_some() || self.sliding_window.is_some() {
+            tracing::warn!(
+                "shift_kv called on model with YaRN or sliding window; skipping unscaled RoPE rotation"
+            );
+            return;
+        }
         state.shift_kv_with_rope(
             n_keep,
             shift,
@@ -1991,6 +2155,9 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // logit), and untied output. Correctness is gated by the GPU-internal
         // differential test (batched vs per-token, all four archs) in
         // `tests/gpu_transformer_parity.rs`.
-        true
+        //
+        // YaRN frequency scaling and per-layer sliding window attention
+        // patterns are not implemented in the current GPU prefill shaders.
+        self.yarn.is_none() && self.sliding_window.is_none()
     }
 }
