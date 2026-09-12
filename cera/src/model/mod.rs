@@ -1,5 +1,6 @@
 pub mod bert;
 pub mod dspark;
+pub mod hybrid;
 pub mod lfm2;
 pub mod llama;
 pub mod pii;
@@ -54,11 +55,23 @@ use anyhow::{Result, bail, ensure};
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 
-/// Per-layer block type (for hybrid architectures like LFM2).
+/// Per-layer block type (for hybrid architectures like LFM2, Granite Hybrid, Falcon H1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockType {
     Attention,
     GatedConv,
+    Mamba2,
+    ParallelAttentionMamba2,
+}
+
+/// Mamba-2 SSM architecture parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsmConfig {
+    pub d_conv: usize,
+    pub d_inner: usize,
+    pub d_state: usize,
+    pub dt_rank: usize,
+    pub n_group: usize,
 }
 
 /// Architecture scalar multipliers (Granite 3.x; HF names in parens). Every
@@ -147,6 +160,8 @@ pub struct ModelConfig {
     pub block_types: Vec<BlockType>,
     /// Convolution kernel size (LFM2-specific).
     pub conv_kernel_size: Option<usize>,
+    /// Mamba-2 SSM architecture parameters (Granite 4.0-h, Falcon H1R).
+    pub ssm: Option<SsmConfig>,
     /// Per-layer KV head counts. Length = n_layers. 0 for conv layers.
     pub kv_heads_per_layer: Vec<usize>,
     /// Architecture scalar multipliers (Granite 3.x). Identity for every other
@@ -700,6 +715,9 @@ pub fn load_model(
                 context_size,
                 model_id,
             )?),
+            "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
+                hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
             other => bail!("unsupported architecture: {other}"),
         };
 

@@ -398,6 +398,7 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 block_types: vec![BlockType::Attention; n_layers],
                 conv_kernel_size: None,
+                ssm: None,
                 kv_heads_per_layer: vec![2; n_layers],
                 scalars: crate::model::ScalarMultipliers::default(),
                 moe: None,

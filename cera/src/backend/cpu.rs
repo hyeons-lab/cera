@@ -3192,6 +3192,13 @@ pub fn glu_split(input: &[f32], output: &mut [f32]) {
     }
 }
 
+/// Softplus activation: `softplus(x) = (x > 20.0) ? x : ln(1 + exp(x))`.
+/// Matches ggml `ggml_compute_softplus_f32`.
+#[inline]
+pub fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { x.exp().ln_1p() }
+}
+
 // ── Softmax ─────────────────────────────────────────────────────────────────
 
 /// Softmax in-place over a 1D slice.
@@ -6022,6 +6029,190 @@ pub fn conv1d_depthwise(
     }
 }
 
+// ── Mamba-2 SSM operations ──────────────────────────────────────────────────
+
+/// Single-token causal 1D convolution step for Mamba-2 SSM layers.
+///
+/// Computes depthwise 1D convolution across `conv_dim` channels with `d_conv` taps,
+/// updates the rolling `conv_state` buffer (shape `[d_conv - 1, conv_dim]`),
+/// adds optional channel bias, and applies SiLU activation.
+///
+/// Layout of `conv_state`: `[tap * conv_dim + ch]` for `tap` in `0..d_conv - 1`.
+/// Layout of `conv_weight`: `[ch * d_conv + tap]` for `ch` in `0..conv_dim`, `tap` in `0..d_conv`.
+pub fn mamba2_conv1d_step(
+    x_bc: &[f32],
+    conv_state: &mut [f32],
+    conv_weight: &[f32],
+    conv_bias: Option<&[f32]>,
+    conv_dim: usize,
+    d_conv: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(x_bc.len(), conv_dim);
+    debug_assert_eq!(out.len(), conv_dim);
+    debug_assert_eq!(conv_state.len(), d_conv.saturating_sub(1) * conv_dim);
+    debug_assert_eq!(conv_weight.len(), conv_dim * d_conv);
+    if let Some(bias) = conv_bias {
+        debug_assert_eq!(bias.len(), conv_dim);
+    }
+
+    if d_conv == 0 || conv_dim == 0 {
+        return;
+    }
+    if x_bc.len() < conv_dim
+        || out.len() < conv_dim
+        || conv_state.len() < d_conv.saturating_sub(1) * conv_dim
+        || conv_weight.len() < conv_dim * d_conv
+    {
+        return;
+    }
+    if conv_bias.is_some_and(|b| b.len() < conv_dim) {
+        return;
+    }
+
+    for ch in 0..conv_dim {
+        let mut sum = 0.0f32;
+        let w_ch = &conv_weight[ch * d_conv..ch * d_conv + d_conv];
+        if d_conv > 1 {
+            for tap in 0..d_conv - 1 {
+                sum += conv_state[tap * conv_dim + ch] * w_ch[tap];
+            }
+        }
+        sum += x_bc[ch] * w_ch[d_conv - 1];
+        if let Some(bias) = conv_bias {
+            sum += bias[ch];
+        }
+        out[ch] = sum / (1.0 + (-sum).exp());
+    }
+
+    if d_conv > 1 {
+        if d_conv > 2 {
+            conv_state.copy_within(conv_dim.., 0);
+        }
+        let last_slot = (d_conv - 2) * conv_dim;
+        conv_state[last_slot..last_slot + conv_dim].copy_from_slice(x_bc);
+    }
+}
+
+/// Single-token State-Space Duality (SSD) recurrent scan step for Mamba-2 SSM layers.
+///
+/// Updates the recurrent `ssm_state` buffer (shape `[d_inner, d_state]`),
+/// computes `y = dot(state, C)`, adds skip connection `y += x * ssm_d`,
+/// applies SwiGLU gating `y *= silu(z)`, and applies optional grouped RMSNorm.
+///
+/// Dimensions:
+/// - `d_inner`: SSM hidden/intermediate dimension (`n_head * head_dim`)
+/// - `d_state`: SSM recurrent state dimension per channel
+/// - `n_head`: number of SSM heads
+/// - `n_group`: number of SSM groups (`n_head` must be a multiple of `n_group`)
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_ssd_step(
+    z: &[f32],
+    x: &[f32],
+    b: &[f32],
+    c: &[f32],
+    dt: &[f32],
+    dt_bias: &[f32],
+    ssm_a: &[f32],
+    ssm_d: &[f32],
+    ssm_norm: Option<&[f32]>,
+    rms_norm_eps: f32,
+    ssm_state: &mut [f32],
+    d_inner: usize,
+    d_state: usize,
+    n_head: usize,
+    n_group: usize,
+    y: &mut [f32],
+) {
+    debug_assert_eq!(z.len(), d_inner);
+    debug_assert_eq!(x.len(), d_inner);
+    debug_assert_eq!(b.len(), n_group * d_state);
+    debug_assert_eq!(c.len(), n_group * d_state);
+    debug_assert_eq!(dt.len(), n_head);
+    debug_assert_eq!(dt_bias.len(), n_head);
+    debug_assert_eq!(ssm_a.len(), n_head);
+    debug_assert_eq!(ssm_d.len(), n_head);
+    debug_assert_eq!(ssm_state.len(), d_inner * d_state);
+    debug_assert_eq!(y.len(), d_inner);
+    debug_assert!(n_head > 0 && n_group > 0 && n_head.is_multiple_of(n_group));
+    if n_head == 0
+        || n_group == 0
+        || !n_head.is_multiple_of(n_group)
+        || !d_inner.is_multiple_of(n_head)
+    {
+        return;
+    }
+    if z.len() < d_inner
+        || x.len() < d_inner
+        || b.len() < n_group * d_state
+        || c.len() < n_group * d_state
+        || dt.len() < n_head
+        || dt_bias.len() < n_head
+        || ssm_a.len() < n_head
+        || ssm_d.len() < n_head
+        || ssm_state.len() < d_inner * d_state
+        || y.len() < d_inner
+    {
+        return;
+    }
+    let head_dim = d_inner / n_head;
+    let heads_per_group = n_head / n_group;
+
+    for h in 0..n_head {
+        let dt_val = dt[h] + dt_bias[h];
+        let dt_soft_plus = softplus(dt_val);
+        let da = (dt_soft_plus * ssm_a[h]).exp();
+        let g = h / heads_per_group;
+        let b_g = &b[g * d_state..(g + 1) * d_state];
+        let c_g = &c[g * d_state..(g + 1) * d_state];
+        let d_val = ssm_d[h];
+
+        for i1 in 0..head_dim {
+            let ii = h * head_dim + i1;
+            let x_val = x[ii];
+            let x_dt = x_val * dt_soft_plus;
+            let state_row = &mut ssm_state[ii * d_state..(ii + 1) * d_state];
+
+            let mut dot = 0.0f32;
+            for k in 0..d_state {
+                let s = state_row[k] * da + b_g[k] * x_dt;
+                state_row[k] = s;
+                dot += s * c_g[k];
+            }
+
+            // Skip connection: y = dot + x * D
+            let y_val = dot + x_val * d_val;
+            // SwiGLU gating: y *= silu(z)
+            let z_val = z[ii];
+            let silu_z = z_val / (1.0 + (-z_val).exp());
+            y[ii] = y_val * silu_z;
+        }
+    }
+
+    // Grouped RMSNorm
+    if let Some(norm_weight) = ssm_norm {
+        let group_size = d_inner / n_group;
+        if norm_weight.len() == d_inner {
+            for g in 0..n_group {
+                let y_g = &mut y[g * group_size..(g + 1) * group_size];
+                let w_g = &norm_weight[g * group_size..(g + 1) * group_size];
+                rmsnorm(y_g, w_g, rms_norm_eps);
+            }
+        } else if norm_weight.len() == group_size {
+            for g in 0..n_group {
+                let y_g = &mut y[g * group_size..(g + 1) * group_size];
+                rmsnorm(y_g, norm_weight, rms_norm_eps);
+            }
+        } else {
+            debug_assert!(
+                false,
+                "ssm_norm length {} matches neither d_inner ({d_inner}) nor group_size ({group_size})",
+                norm_weight.len()
+            );
+        }
+    }
+}
+
 // ── Element-wise operations ─────────────────────────────────────────────────
 
 /// Element-wise addition: a += b.
@@ -8446,5 +8637,115 @@ mod f16_gemv_tests {
                 "len {len}: expected {expected}, got {actual} (diff {diff}, rel_diff {rel_diff})"
             );
         }
+    }
+
+    #[test]
+    fn test_softplus() {
+        assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 1e-6);
+        assert!((softplus(25.0) - 25.0).abs() < 1e-6);
+        assert!((softplus(-10.0) - (-10.0f32).exp()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mamba2_conv1d_step() {
+        let conv_dim = 2;
+        let d_conv = 3;
+        let mut conv_state = vec![0.0f32; (d_conv - 1) * conv_dim];
+        let conv_weight = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
+        let conv_bias = vec![0.1, -0.2];
+        let mut out = vec![0.0f32; conv_dim];
+
+        let x1 = vec![1.0, 2.0];
+        mamba2_conv1d_step(
+            &x1,
+            &mut conv_state,
+            &conv_weight,
+            Some(&conv_bias),
+            conv_dim,
+            d_conv,
+            &mut out,
+        );
+
+        let expected_out_0 = 3.1 / (1.0 + (-3.1f32).exp());
+        let expected_out_1 = 4.8 / (1.0 + (-4.8f32).exp());
+        assert!((out[0] - expected_out_0).abs() < 1e-5);
+        assert!((out[1] - expected_out_1).abs() < 1e-5);
+        assert_eq!(&conv_state[conv_dim..], &[1.0, 2.0]);
+
+        let x2 = vec![0.5, -1.0];
+        mamba2_conv1d_step(
+            &x2,
+            &mut conv_state,
+            &conv_weight,
+            Some(&conv_bias),
+            conv_dim,
+            d_conv,
+            &mut out,
+        );
+        let exp2_0 = 3.6 / (1.0 + (-3.6f32).exp());
+        let exp2_1 = 0.3 / (1.0 + (-0.3f32).exp());
+        assert!((out[0] - exp2_0).abs() < 1e-5);
+        assert!((out[1] - exp2_1).abs() < 1e-5);
+
+        // Test without bias (conv_bias = None)
+        let mut conv_state_nobias = vec![0.0f32; (d_conv - 1) * conv_dim];
+        let mut out_nobias = vec![0.0f32; conv_dim];
+        mamba2_conv1d_step(
+            &x1,
+            &mut conv_state_nobias,
+            &conv_weight,
+            None,
+            conv_dim,
+            d_conv,
+            &mut out_nobias,
+        );
+        let exp_nobias_0 = 3.0 / (1.0 + (-3.0f32).exp());
+        let exp_nobias_1 = 5.0 / (1.0 + (-5.0f32).exp());
+        assert!((out_nobias[0] - exp_nobias_0).abs() < 1e-5);
+        assert!((out_nobias[1] - exp_nobias_1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_mamba2_ssd_step() {
+        let d_inner = 2;
+        let d_state = 2;
+        let n_head = 1;
+        let n_group = 1;
+
+        let mut ssm_state = vec![0.0f32; d_inner * d_state];
+        let z = vec![1.0, -0.5];
+        let x = vec![0.5, 1.5];
+        let b = vec![1.0, 2.0];
+        let c = vec![0.5, -0.5];
+        let dt = vec![0.0];
+        let dt_bias = vec![0.0];
+        let ssm_a = vec![-1.0];
+        let ssm_d = vec![0.2];
+        let ssm_norm = vec![1.0, 1.0];
+        let mut y = vec![0.0f32; d_inner];
+
+        mamba2_ssd_step(
+            &z,
+            &x,
+            &b,
+            &c,
+            &dt,
+            &dt_bias,
+            &ssm_a,
+            &ssm_d,
+            Some(&ssm_norm),
+            1e-5,
+            &mut ssm_state,
+            d_inner,
+            d_state,
+            n_head,
+            n_group,
+            &mut y,
+        );
+
+        assert!(y[0].is_finite());
+        assert!(y[1].is_finite());
+        assert!((ssm_state[0] - 0.5 * std::f32::consts::LN_2).abs() < 1e-5);
+        assert!((ssm_state[1] - 1.0 * std::f32::consts::LN_2).abs() < 1e-5);
     }
 }

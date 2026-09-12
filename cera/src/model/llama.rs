@@ -261,6 +261,7 @@ impl LlamaModel {
             rms_norm_eps,
             block_types,
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer,
             scalars,
             // Dense transformers only; the `llama`-family loader has no expert path.

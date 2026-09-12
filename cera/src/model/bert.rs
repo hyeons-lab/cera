@@ -542,6 +542,7 @@ impl BertModel {
             rms_norm_eps,
             block_types: vec![BlockType::Attention; n_layers],
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer: vec![n_heads; n_layers],
             scalars: ScalarMultipliers::default(),
             moe: None,
