@@ -165,6 +165,7 @@ impl HfModelConfig {
             "nanbeige" | "nanbeige2" | "nanbeige4" => "nanbeige",
             "olmo" => "olmo",
             "olmo2" | "olmo3" => "olmo2",
+            "olmoe" => "olmoe",
             "mamba2" | "falcon_mamba" => "mamba2",
             "mamba" => "mamba",
             "phi3" | "phi" => "phi3",
@@ -183,6 +184,8 @@ impl HfModelConfig {
                         "nanbeige"
                     } else if arch_lower.contains("minicpm") {
                         "minicpm"
+                    } else if arch_lower.contains("olmoe") {
+                        "olmoe"
                     } else if arch_lower.contains("olmo2") || arch_lower.contains("olmo3") {
                         "olmo2"
                     } else if arch_lower.contains("olmo") {
@@ -389,8 +392,10 @@ impl HfModelConfig {
             if let (Some(h), Some(dim_base)) = (
                 self.hidden_size,
                 self.extra.get("dim_model_base").and_then(|v| v.as_f64()),
-            ) {
-                let logit_scale = h as f64 / dim_base;
+            ) && h > 0
+                && dim_base > 0.0
+            {
+                let logit_scale = dim_base / (h as f64);
                 writer.add_f32("minicpm.logit_scale", logit_scale as f32);
             }
         }
@@ -512,7 +517,7 @@ mod tests {
             "model_type": "minicpm",
             "architectures": ["MiniCPMForCausalLM"],
             "hidden_size": 2304,
-            "num_hidden_layers": 40,
+            "num_hidden_layers": 36,
             "scale_emb": 12.0,
             "scale_depth": 1.4,
             "dim_model_base": 256.0
@@ -525,6 +530,16 @@ mod tests {
         assert_eq!(
             writer.get_metadata("minicpm.embedding_scale"),
             Some(&MetadataValue::Float32(12.0))
+        );
+        let expected_residual = (1.4 / (36.0f64).sqrt()) as f32;
+        assert_eq!(
+            writer.get_metadata("minicpm.residual_scale"),
+            Some(&MetadataValue::Float32(expected_residual))
+        );
+        let expected_logit = (256.0 / 2304.0) as f32;
+        assert_eq!(
+            writer.get_metadata("minicpm.logit_scale"),
+            Some(&MetadataValue::Float32(expected_logit))
         );
     }
 
@@ -552,5 +567,17 @@ mod tests {
             writer.get_metadata("gemma2.attention.sliding_window"),
             Some(&MetadataValue::Uint32(4096))
         );
+    }
+
+    #[test]
+    fn test_olmoe_config_mapping() {
+        let json_data = r#"{
+            "model_type": "olmoe",
+            "architectures": ["OlmoeForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 16
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "olmoe");
     }
 }

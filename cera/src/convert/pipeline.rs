@@ -256,7 +256,7 @@ pub fn stream_quantize_hf_repo(
     // Register all tensors in GGUF writer
     struct PendingTensor {
         shard_idx: usize,
-        name: String,
+        gguf_name: String,
         dtype: String,
         data_start: usize,
         data_end: usize,
@@ -305,7 +305,7 @@ pub fn stream_quantize_hf_repo(
 
             pending_tensors.push(PendingTensor {
                 shard_idx,
-                name: gguf_name,
+                gguf_name,
                 dtype: tensor_info.dtype.clone(),
                 data_start,
                 data_end,
@@ -456,8 +456,14 @@ pub fn stream_quantize_hf_repo(
         if num_elements != pt.expected_elements {
             return Err(CeraError::Backend(format!(
                 "tensor `{}` element count mismatch: expected {}, got {num_elements}",
-                pt.name, pt.expected_elements
+                pt.gguf_name, pt.expected_elements
             )));
+        }
+
+        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.contains("norm.weight") {
+            for v in f32_data.iter_mut() {
+                *v += 1.0;
+            }
         }
 
         // Quantize to target GGML type
@@ -933,7 +939,7 @@ fn fetch_hf_file_range_into(
         return Ok(());
     }
 
-    let range_val = format!("bytes={start}-{}", end.saturating_sub(1));
+    let range_val = format!("bytes={start}-{end}");
 
     let mut last_error = String::new();
     for attempt in 0..MAX_RETRIES {

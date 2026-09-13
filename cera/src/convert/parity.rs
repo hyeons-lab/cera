@@ -1,6 +1,7 @@
 //! Parity audit between Cera-converted GGUF models and reference community GGUF models.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "mmap")]
 use std::path::Path;
 
 use serde::Serialize;
@@ -81,16 +82,20 @@ pub struct GgufParityReport {
     pub min_snr_db: f32,
     pub total_tensors_compared: usize,
     pub inference_parity: Option<InferenceParityResult>,
+    pub inference_error: Option<String>,
 }
 
 impl GgufParityReport {
     /// Check whether this parity audit satisfies quality thresholds.
     pub fn is_passing(&self, min_weight_sim: f32, min_logit_sim: f32) -> bool {
-        if self.min_cosine_similarity < min_weight_sim {
+        if self.inference_error.is_some() {
+            return false;
+        }
+        if self.min_cosine_similarity.is_nan() || self.min_cosine_similarity < min_weight_sim {
             return false;
         }
         if let Some(inf) = &self.inference_parity
-            && inf.logit_cosine_similarity < min_logit_sim
+            && (inf.logit_cosine_similarity.is_nan() || inf.logit_cosine_similarity < min_logit_sim)
         {
             return false;
         }
@@ -173,9 +178,20 @@ impl GgufParityReport {
         ));
 
         let display_limit = 12.min(self.tensor_entries.len());
-        for entry in self.tensor_entries.iter().take(display_limit) {
+        let mut sorted_entries: Vec<&TensorParityEntry> = self.tensor_entries.iter().collect();
+        sorted_entries.sort_by(|a, b| {
+            a.cosine_similarity
+                .total_cmp(&b.cosine_similarity)
+                .then_with(|| b.rmse.total_cmp(&a.rmse))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        for entry in sorted_entries.iter().take(display_limit) {
             let short_name = if entry.name.len() > 32 {
-                format!("...{}", &entry.name[entry.name.len() - 29..])
+                let target_start = entry.name.len().saturating_sub(29);
+                let safe_start = (target_start..entry.name.len())
+                    .find(|&i| entry.name.is_char_boundary(i))
+                    .unwrap_or(entry.name.len());
+                format!("...{}", &entry.name[safe_start..])
             } else {
                 entry.name.clone()
             };
@@ -209,6 +225,11 @@ impl GgufParityReport {
                 (inf.top_k_overlap as f32 / inf.top_k_total.max(1) as f32) * 100.0,
                 inf.max_abs_diff,
             ));
+        } else if let Some(ref err) = self.inference_error {
+            out.push_str("--------------------------------------------------------------------------------\n");
+            out.push_str(" INFERENCE PARITY ERROR\n");
+            out.push_str("--------------------------------------------------------------------------------\n");
+            out.push_str(&format!("Error: {err}\n"));
         }
         out.push_str(
             "================================================================================\n",
@@ -238,6 +259,14 @@ fn format_gguf_value(val: &GgufValue) -> String {
 fn float_equal(a: f64, b: f64) -> bool {
     if a.is_nan() && b.is_nan() {
         return true;
+    }
+    if a.is_nan() || b.is_nan() {
+        return false;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return a.is_infinite()
+            && b.is_infinite()
+            && (a.is_sign_positive() == b.is_sign_positive());
     }
     let diff = (a - b).abs();
     let max_abs = a.abs().max(b.abs()).max(1.0);
@@ -285,18 +314,51 @@ fn gguf_value_as_i64(v: &GgufValue) -> Option<i64> {
     }
 }
 
+fn gguf_array_len(val: &GgufValue) -> Option<usize> {
+    match val {
+        GgufValue::Array(arr) => Some(arr.len()),
+        _ => None,
+    }
+}
+
 /// Compare metadata keys and values between Cera and reference GGUF files.
 pub fn compare_gguf_metadata(cera: &GgufFile, reference: &GgufFile) -> MetadataDiff {
     let mut diff = MetadataDiff::default();
 
     // Check all keys in reference
     for (key, ref_val) in &reference.metadata {
-        // Skip tokenizer lists for metadata comparison to avoid bloating report
+        // Compare tokenizer array lengths rather than dumping huge arrays of strings/scores
         if key == "tokenizer.ggml.tokens"
             || key == "tokenizer.ggml.scores"
             || key == "tokenizer.ggml.token_type"
             || key == "tokenizer.ggml.merges"
         {
+            let count_key = format!("{key}.count");
+            let cera_len = cera.metadata.get(key).and_then(gguf_array_len);
+            let ref_len = gguf_array_len(ref_val);
+            if let (Some(c_len), Some(r_len)) = (cera_len, ref_len) {
+                if c_len == r_len {
+                    diff.keys.insert(count_key, MetadataParityStatus::Match);
+                    diff.matching_count += 1;
+                } else {
+                    diff.keys.insert(
+                        count_key,
+                        MetadataParityStatus::Mismatch {
+                            cera: format!("{c_len} items"),
+                            reference: format!("{r_len} items"),
+                        },
+                    );
+                    diff.mismatch_count += 1;
+                }
+            } else if let Some(r_len) = ref_len {
+                diff.keys.insert(
+                    count_key,
+                    MetadataParityStatus::MissingInCera {
+                        reference: format!("{r_len} items"),
+                    },
+                );
+                diff.missing_in_cera_count += 1;
+            }
             continue;
         }
 
@@ -335,6 +397,17 @@ pub fn compare_gguf_metadata(cera: &GgufFile, reference: &GgufFile) -> MetadataD
             || key == "tokenizer.ggml.token_type"
             || key == "tokenizer.ggml.merges"
         {
+            if !reference.metadata.contains_key(key) {
+                let count_key = format!("{key}.count");
+                let c_len = gguf_array_len(cera_val).unwrap_or(0);
+                diff.keys.insert(
+                    count_key,
+                    MetadataParityStatus::ExtraInCera {
+                        cera: format!("{c_len} items"),
+                    },
+                );
+                diff.extra_in_cera_count += 1;
+            }
             continue;
         }
         if !reference.metadata.contains_key(key) {
@@ -367,14 +440,18 @@ pub fn compare_gguf_tensors(
     for (name, ref_info) in &reference.tensors {
         let cera_tensor = match cera.get_tensor(name) {
             Ok(t) => t,
-            Err(_) => {
-                // Tensor missing in Cera
+            Err(e) => {
+                let is_missing = !cera.tensors.contains_key(name);
                 entries.push(TensorParityEntry {
                     name: name.clone(),
                     shape_cera: Vec::new(),
                     shape_reference: ref_info.shape.clone(),
                     shapes_match: false,
-                    dtype_cera: "MISSING".to_string(),
+                    dtype_cera: if is_missing {
+                        "MISSING".to_string()
+                    } else {
+                        format!("ERROR: {e}")
+                    },
                     dtype_reference: format!("{:?}", ref_info.dtype),
                     cosine_similarity: 0.0,
                     snr_db: 0.0,
@@ -393,27 +470,35 @@ pub fn compare_gguf_tensors(
             .map_err(|e| CeraError::Backend(format!("reading ref tensor `{name}`: {e}")))?;
 
         let shapes_match = cera_tensor.shape() == ref_tensor.shape();
-        let f32_cera = cera_tensor.to_f32_vec();
-        let f32_ref = ref_tensor.to_f32_vec();
+        let (cos_sim, snr, rmse, max_abs) = if !shapes_match {
+            (0.0f32, 0.0f32, f32::INFINITY, f32::INFINITY)
+        } else {
+            let f32_cera = cera_tensor.to_f32_vec();
+            let f32_ref = ref_tensor.to_f32_vec();
+            if f32_cera.len() != f32_ref.len() {
+                (0.0f32, 0.0f32, f32::INFINITY, f32::INFINITY)
+            } else {
+                let cos_sim = compute_cosine_similarity(&f32_cera, &f32_ref);
+                let snr = compute_snr_db(&f32_cera, &f32_ref);
+                let rmse = compute_rmse(&f32_cera, &f32_ref);
+                let max_abs = f32_cera
+                    .iter()
+                    .zip(f32_ref.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                (cos_sim, snr, rmse, max_abs)
+            }
+        };
 
-        let cos_sim = compute_cosine_similarity(&f32_cera, &f32_ref);
-        let snr = compute_snr_db(&f32_cera, &f32_ref);
-        let rmse = compute_rmse(&f32_cera, &f32_ref);
-        let max_abs = f32_cera
-            .iter()
-            .zip(f32_ref.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-
-        if cos_sim < min_cosine {
-            min_cosine = cos_sim;
+        if cos_sim.is_nan() || cos_sim < min_cosine {
+            min_cosine = if cos_sim.is_nan() { 0.0 } else { cos_sim };
             min_cosine_tensor = Some(name.clone());
         }
         if snr < min_snr {
             min_snr = snr;
         }
 
-        sum_cosine += cos_sim;
+        sum_cosine += if cos_sim.is_nan() { 0.0 } else { cos_sim };
         sum_snr += snr;
         compared_count += 1;
 
@@ -431,8 +516,31 @@ pub fn compare_gguf_tensors(
         });
     }
 
-    let mean_cosine = if compared_count > 0 {
-        sum_cosine / (compared_count as f32)
+    // Check extra tensors in Cera
+    for (name, cera_info) in &cera.tensors {
+        if !reference.tensors.contains_key(name) {
+            entries.push(TensorParityEntry {
+                name: name.clone(),
+                shape_cera: cera_info.shape.clone(),
+                shape_reference: Vec::new(),
+                shapes_match: false,
+                dtype_cera: format!("{:?}", cera_info.dtype),
+                dtype_reference: "MISSING".to_string(),
+                cosine_similarity: 0.0,
+                snr_db: 0.0,
+                rmse: f32::INFINITY,
+                max_abs_diff: f32::INFINITY,
+            });
+            min_cosine = 0.0;
+            if min_cosine_tensor.is_none() {
+                min_cosine_tensor = Some(name.clone());
+            }
+            min_snr = 0.0;
+        }
+    }
+
+    let mean_cosine = if !entries.is_empty() {
+        sum_cosine / (entries.len() as f32)
     } else {
         0.0
     };
@@ -468,6 +576,7 @@ pub fn compare_gguf_files(
 
     let metadata_diff = compare_gguf_metadata(&cera_gguf, &ref_gguf);
     let tensor_summary = compare_gguf_tensors(&cera_gguf, &ref_gguf)?;
+    let total_tensors_compared = tensor_summary.entries.len();
 
     Ok(GgufParityReport {
         cera_path: cera_path.display().to_string(),
@@ -479,9 +588,27 @@ pub fn compare_gguf_files(
         min_similarity_tensor: tensor_summary.min_similarity_tensor,
         mean_snr_db: tensor_summary.mean_snr_db,
         min_snr_db: tensor_summary.min_snr_db,
-        total_tensors_compared: cera_gguf.tensors.len(),
+        total_tensors_compared,
         inference_parity: None,
+        inference_error: None,
     })
+}
+
+#[cfg(any(feature = "mmap", test))]
+fn get_top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    if logits.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let mut indexed: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    let k = k.min(indexed.len());
+    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+    indexed.truncate(k);
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    indexed
 }
 
 /// Compare prompt prefill inference logits between two GGUF models.
@@ -518,24 +645,20 @@ pub fn compare_inference_parity(
         .map_err(|e| CeraError::Backend(format!("init ref inference state: {e}")))?;
     let logits_ref = model_ref.forward_prefill(&tokens, 0, &mut state_ref);
 
+    if logits_cera.len() != logits_ref.len() {
+        return Err(CeraError::Backend(format!(
+            "logit dimension mismatch: Cera model output {} logits, reference model output {}",
+            logits_cera.len(),
+            logits_ref.len()
+        )));
+    }
+
     let cos_sim = compute_cosine_similarity(&logits_cera, &logits_ref);
     let max_diff = logits_cera
         .iter()
         .zip(logits_ref.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-
-    // Extract top-5 tokens
-    fn get_top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
-        let mut indexed: Vec<(u32, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (i as u32, v))
-            .collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        indexed.truncate(k);
-        indexed
-    }
 
     let top_cera = get_top_k(&logits_cera, 5);
     let top_ref = get_top_k(&logits_ref, 5);
@@ -571,6 +694,7 @@ pub fn audit_gguf_parity(
         match compare_inference_parity(cera_path, reference_path, p, test_tokens) {
             Ok(inf) => report.inference_parity = Some(inf),
             Err(e) => {
+                report.inference_error = Some(e.to_string());
                 tracing::warn!("Inference parity check skipped or failed: {e}");
             }
         }
@@ -608,5 +732,146 @@ mod tests {
 
         assert_eq!(diff.matching_count, 1);
         assert_eq!(diff.mismatch_count, 1);
+    }
+
+    #[test]
+    fn test_report_is_passing_with_inference_error() {
+        let report = GgufParityReport {
+            cera_path: "cera.gguf".into(),
+            reference_path: "ref.gguf".into(),
+            metadata_diff: MetadataDiff::default(),
+            tensor_entries: Vec::new(),
+            mean_cosine_similarity: 1.0,
+            min_cosine_similarity: 1.0,
+            min_similarity_tensor: None,
+            mean_snr_db: 100.0,
+            min_snr_db: 100.0,
+            total_tensors_compared: 1,
+            inference_parity: None,
+            inference_error: Some("Runtime backend execution failed".into()),
+        };
+        assert!(!report.is_passing(0.99, 0.99));
+    }
+
+    #[test]
+    fn test_get_top_k_ordering() {
+        let logits = vec![1.0, 5.0, 2.0, 8.0, 3.0];
+        let top = get_top_k(&logits, 3);
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0], (3, 8.0));
+        assert_eq!(top[1], (1, 5.0));
+        assert_eq!(top[2], (4, 3.0));
+    }
+
+    #[test]
+    fn test_report_is_passing_thresholds() {
+        let report = GgufParityReport {
+            cera_path: "cera.gguf".into(),
+            reference_path: "ref.gguf".into(),
+            metadata_diff: MetadataDiff::default(),
+            tensor_entries: Vec::new(),
+            mean_cosine_similarity: 0.98,
+            min_cosine_similarity: 0.95,
+            min_similarity_tensor: None,
+            mean_snr_db: 40.0,
+            min_snr_db: 35.0,
+            total_tensors_compared: 1,
+            inference_parity: Some(InferenceParityResult {
+                prompt: "test".into(),
+                tokens: vec![1, 2],
+                logit_cosine_similarity: 0.94,
+                top_k_overlap: 4,
+                top_k_total: 5,
+                cera_top_tokens: vec![(1, 1.0)],
+                reference_top_tokens: vec![(1, 1.0)],
+                max_abs_diff: 0.05,
+            }),
+            inference_error: None,
+        };
+
+        // Fails because min weight sim 0.95 < required 0.99
+        assert!(!report.is_passing(0.99, 0.90));
+
+        // Fails because logit sim 0.94 < required 0.95
+        assert!(!report.is_passing(0.90, 0.95));
+
+        // Passes when both thresholds are satisfied
+        assert!(report.is_passing(0.90, 0.90));
+    }
+
+    #[test]
+    fn test_float_equal_infinity() {
+        assert!(float_equal(f64::INFINITY, f64::INFINITY));
+        assert!(float_equal(f64::NEG_INFINITY, f64::NEG_INFINITY));
+        assert!(!float_equal(f64::INFINITY, f64::NEG_INFINITY));
+        assert!(!float_equal(f64::INFINITY, 1.0));
+        assert!(!float_equal(1.0, f64::INFINITY));
+        assert!(float_equal(f64::NAN, f64::NAN));
+        assert!(!float_equal(f64::NAN, 1.0));
+        assert!(!float_equal(1.0, f64::NAN));
+    }
+
+    #[test]
+    fn test_format_table_multibyte_utf8_truncation() {
+        let long_unicode_name = "blk.0.层_norm_注意力机制_权重.weight";
+        let report = GgufParityReport {
+            cera_path: "cera.gguf".into(),
+            reference_path: "ref.gguf".into(),
+            metadata_diff: MetadataDiff::default(),
+            tensor_entries: vec![TensorParityEntry {
+                name: long_unicode_name.into(),
+                shape_cera: vec![64, 64],
+                shape_reference: vec![64, 64],
+                shapes_match: true,
+                dtype_cera: "Q4_0".into(),
+                dtype_reference: "Q4_0".into(),
+                cosine_similarity: 0.999,
+                snr_db: 45.0,
+                rmse: 0.001,
+                max_abs_diff: 0.002,
+            }],
+            mean_cosine_similarity: 0.999,
+            min_cosine_similarity: 0.999,
+            min_similarity_tensor: Some(long_unicode_name.into()),
+            mean_snr_db: 45.0,
+            min_snr_db: 45.0,
+            total_tensors_compared: 1,
+            inference_parity: None,
+            inference_error: None,
+        };
+        let table = report.format_table();
+        assert!(table.contains("..."));
+    }
+
+    #[test]
+    fn test_report_is_passing_rejects_nan() {
+        let mut report = GgufParityReport {
+            cera_path: "cera.gguf".into(),
+            reference_path: "ref.gguf".into(),
+            metadata_diff: MetadataDiff::default(),
+            tensor_entries: Vec::new(),
+            mean_cosine_similarity: 0.99,
+            min_cosine_similarity: f32::NAN,
+            min_similarity_tensor: None,
+            mean_snr_db: 40.0,
+            min_snr_db: 35.0,
+            total_tensors_compared: 1,
+            inference_parity: None,
+            inference_error: None,
+        };
+        assert!(!report.is_passing(0.90, 0.90));
+
+        report.min_cosine_similarity = 0.95;
+        report.inference_parity = Some(InferenceParityResult {
+            prompt: "test".into(),
+            tokens: vec![1, 2],
+            logit_cosine_similarity: f32::NAN,
+            top_k_overlap: 5,
+            top_k_total: 5,
+            cera_top_tokens: vec![(1, 1.0)],
+            reference_top_tokens: vec![(1, 1.0)],
+            max_abs_diff: 0.0,
+        });
+        assert!(!report.is_passing(0.90, 0.90));
     }
 }

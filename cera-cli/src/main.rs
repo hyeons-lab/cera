@@ -3952,19 +3952,27 @@ fn main() -> Result<()> {
             min_logit_similarity,
             json,
         } => {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&min_weight_similarity),
+                "--min-weight-similarity must be between 0.0 and 1.0 (got {min_weight_similarity})"
+            );
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&min_logit_similarity),
+                "--min-logit-similarity must be between 0.0 and 1.0 (got {min_logit_similarity})"
+            );
+
             let target_quant = cera::convert::TargetQuant::parse_str(&quant)
                 .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
             let quant_strategy = cera::convert::QuantStrategy::parse_str(&strategy)
                 .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
 
-            let mut _temp_file = None;
+            let mut _temp_dir = None;
             let cera_path = if let Some(ref st_path) = safetensors {
-                let tmp = tempfile::Builder::new()
-                    .prefix("cera-converted-")
-                    .suffix(".gguf")
-                    .tempfile()
-                    .context("creating temporary GGUF file for SafeTensors conversion")?;
-                let tmp_path = tmp.path().to_path_buf();
+                let tmp_dir = tempfile::Builder::new()
+                    .prefix("cera-parity-")
+                    .tempdir()
+                    .context("creating temporary directory for SafeTensors conversion")?;
+                let tmp_path = tmp_dir.path().join("cera-converted.gguf");
                 eprintln!(
                     "Quantizing SafeTensors from `{}` to `{}` (quant: {}, strategy: {})...",
                     st_path.display(),
@@ -3980,7 +3988,7 @@ fn main() -> Result<()> {
                     &[],
                 )
                 .context("converting SafeTensors to quantized GGUF")?;
-                _temp_file = Some(tmp);
+                _temp_dir = Some(tmp_dir);
                 tmp_path
             } else if let Some(ref path) = cera_gguf {
                 path.clone()
@@ -4006,6 +4014,9 @@ fn main() -> Result<()> {
 
             let passing = report.is_passing(min_weight_similarity, min_logit_similarity);
             if !passing {
+                if let Some(ref err) = report.inference_error {
+                    anyhow::bail!("parity audit failed: inference execution error: {err}");
+                }
                 anyhow::bail!(
                     "parity audit failed thresholds (min weight sim: {:.4} vs required {:.4}, min logit sim: {} vs required {:.4})",
                     report.min_cosine_similarity,

@@ -276,14 +276,14 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
             "post_feedforward_layernorm.weight" => "ffn_post_norm.weight",
             "post_feedforward_layernorm.bias" => "ffn_post_norm.bias",
             "post_attention_layernorm.weight" => {
-                if arch == "gemma2" {
+                if arch == "gemma2" || arch == "olmo2" || arch == "olmoe" {
                     "attn_post_norm.weight"
                 } else {
                     "ffn_norm.weight"
                 }
             }
             "post_attention_layernorm.bias" => {
-                if arch == "gemma2" {
+                if arch == "gemma2" || arch == "olmo2" || arch == "olmoe" {
                     "attn_post_norm.bias"
                 } else {
                     "ffn_norm.bias"
@@ -435,6 +435,27 @@ mod tests {
         assert_eq!(
             translate_hf_to_gguf_tensor_name("model.layers.15.mlp.down_proj.weight"),
             "blk.15.ffn_down.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.post_attention_layernorm.weight",
+                "llama"
+            ),
+            "blk.0.ffn_norm.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.post_attention_layernorm.weight",
+                "gemma2"
+            ),
+            "blk.0.attn_post_norm.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.post_attention_layernorm.weight",
+                "olmo2"
+            ),
+            "blk.0.attn_post_norm.weight"
         );
 
         // Whisper mappings
