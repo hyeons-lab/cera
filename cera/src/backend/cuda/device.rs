@@ -36,7 +36,7 @@ impl CudaDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let init_res = std::panic::catch_unwind(|| result::init());
+        let init_res = std::panic::catch_unwind(result::init);
         std::panic::set_hook(prev_hook);
 
         match init_res {

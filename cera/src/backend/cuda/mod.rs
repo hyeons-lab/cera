@@ -15,12 +15,14 @@ use anyhow::{Context, Result};
 
 pub mod buffer;
 pub mod device;
+pub mod kernels;
 pub mod module;
 pub mod stream;
 
 pub use buffer::{CudaBuffer, CudaPinnedBuffer, CudaUnifiedBuffer};
-pub use cudarc::driver::LaunchConfig;
+pub use cudarc::driver::{LaunchConfig, PushKernelArg, sys};
 pub use device::CudaDevice;
+pub use kernels::*;
 pub use module::{CudaKernel, CudaModule};
 pub use stream::{CudaEvent, CudaGraph, CudaStream};
 
@@ -88,6 +90,17 @@ impl CudaContext {
         self.upload_bytes(bytes)
     }
 
+    /// Download bytes from a device-resident buffer into host memory.
+    pub fn download_bytes(&self, buf: &CudaBuffer, dst: &mut [u8]) -> Result<()> {
+        buf.copy_to_host(dst)
+    }
+
+    /// Download f32 elements from a device-resident buffer into host memory.
+    pub fn download_f32(&self, buf: &CudaBuffer, dst: &mut [f32]) -> Result<()> {
+        let bytes = bytemuck::cast_slice_mut(dst);
+        self.download_bytes(buf, bytes)
+    }
+
     /// Allocate page-locked host memory mapped into GPU address space for zero-copy UMA access.
     pub fn create_pinned_buffer(&self, size_bytes: usize) -> Result<CudaPinnedBuffer> {
         CudaPinnedBuffer::new(self.device.ctx.clone(), size_bytes)
@@ -130,6 +143,358 @@ impl CudaContext {
         let module = CudaModule::from_ptx(&self.device.ctx, ptx_src)?;
         cache.insert(key, module.clone());
         Ok(module)
+    }
+
+    /// Determine target architecture string for NVRTC compilation based on device capability.
+    pub fn nvrtc_arch(&self) -> &'static str {
+        match self.device.compute_capability {
+            (8, 7) => "compute_87", // Jetson Orin (Tegra Ampere)
+            (8, 6) => "compute_86", // Ampere consumer (RTX 30xx)
+            (8, 0) => "compute_80", // Ampere datacenter (A100)
+            (8, 9) => "compute_89", // Ada Lovelace (RTX 40xx)
+            (9, 0) => "compute_90", // Hopper (H100)
+            (7, 5) => "compute_75", // Turing (RTX 20xx / T4)
+            (7, 0) => "compute_70", // Volta (V100)
+            _ => "compute_75",      // Baseline fallback
+        }
+    }
+
+    /// Compile or retrieve cached CUDA C++ source module.
+    pub fn load_cuda(&self, cu_src: &'static str, name: &str) -> Result<CudaModule> {
+        let key = cu_src.as_ptr() as usize;
+        let mut cache = self
+            .module_cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("CUDA module cache lock poisoned: {e}"))?;
+
+        if let Some(module) = cache.get(&key) {
+            return Ok(module.clone());
+        }
+
+        let arch = self.nvrtc_arch();
+        let module = CudaModule::from_cuda_src(&self.device.ctx, cu_src, Some(name), Some(arch))?;
+        cache.insert(key, module.clone());
+        Ok(module)
+    }
+
+    /// Load or retrieve cached kernel function by static CUDA source and entry point name.
+    pub fn load_kernel(
+        &self,
+        cu_src: &'static str,
+        module_name: &str,
+        func_name: &str,
+    ) -> Result<CudaKernel> {
+        let module = self.load_cuda(cu_src, module_name)?;
+        module.get_kernel(func_name)
+    }
+
+    /// Execute single-token Q4_0 matrix-vector multiplication (y = A * x).
+    pub fn gemv_q4_0(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0")?;
+        let warps_per_block = 8u32; // 256 threads / 32 = 8 warps
+        let num_blocks = m.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4_0 kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token Q4_0 matrix-vector multiplication with residual accumulation (y += A * x).
+    pub fn gemv_q4_0_accum(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_accum")?;
+        let warps_per_block = 8u32;
+        let num_blocks = m.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4_0_accum kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token Q8_0 matrix-vector multiplication (y = A * x).
+    pub fn gemv_q8_0(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0")?;
+        let warps_per_block = 8u32;
+        let num_blocks = m.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0 kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token Q8_0 matrix-vector multiplication with residual accumulation (y += A * x).
+    pub fn gemv_q8_0_accum(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_accum")?;
+        let warps_per_block = 8u32;
+        let num_blocks = m.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0_accum kernel")?;
+        Ok(())
+    }
+
+    /// Execute Root Mean Square Normalization (RMSNorm).
+    pub fn rmsnorm(
+        &self,
+        out: &mut CudaBuffer,
+        x: &CudaBuffer,
+        weight: &CudaBuffer,
+        n: u32,
+        eps: f32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(RMSNORM_SRC, "rmsnorm", "rmsnorm")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = RmsNormParams { n, eps };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(x);
+        builder.arg(weight);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch rmsnorm kernel")?;
+        Ok(())
+    }
+
+    /// Execute fused per-head RMSNorm + RoPE for Query and Key tensors.
+    pub fn qk_norm_rope(
+        &self,
+        q: &mut CudaBuffer,
+        k_cache: &mut CudaBuffer,
+        q_norm_w: Option<&CudaBuffer>,
+        k_norm_w: Option<&CudaBuffer>,
+        freq_factors: Option<&CudaBuffer>,
+        params: QkNormRopeParams,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(QK_NORM_ROPE_SRC, "qk_norm_rope", "qk_norm_rope")?;
+        let num_blocks = params.n_heads.max(params.n_kv_heads);
+        // Shared memory for per-head reduction: head_dim floats + 8 floats for warp sums
+        let shared_mem_bytes = (params.head_dim + 8) * std::mem::size_of::<f32>() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes,
+        };
+
+        let null_ptr: sys::CUdeviceptr = 0;
+        let q_norm_ptr = q_norm_w.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
+        let k_norm_ptr = k_norm_w.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
+        let freq_ptr = freq_factors.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
+
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(q);
+        builder.arg(k_cache);
+        builder.arg(&q_norm_ptr);
+        builder.arg(&k_norm_ptr);
+        builder.arg(&freq_ptr);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch qk_norm_rope kernel")?;
+        Ok(())
+    }
+
+    /// Execute SwiGLU elementwise operation in-place: a[i] = silu(a[i]) * b[i].
+    pub fn silu_mul_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "silu_mul_inplace")?;
+        let cfg = LaunchConfig::for_num_elems(n);
+        let params = ElementwiseParams { n, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a);
+        builder.arg(b);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch silu_mul_inplace kernel")?;
+        Ok(())
+    }
+
+    /// Execute elementwise vector addition in-place: a[i] += b[i].
+    pub fn add_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "add_inplace")?;
+        let cfg = LaunchConfig::for_num_elems(n);
+        let params = ElementwiseParams { n, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a);
+        builder.arg(b);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch add_inplace kernel")?;
+        Ok(())
+    }
+
+    /// Execute scaled vector addition in-place: a[i] += scale * b[i].
+    pub fn scaled_add_inplace(
+        &self,
+        a: &mut CudaBuffer,
+        b: &CudaBuffer,
+        scale: f32,
+        n: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "scaled_add_inplace")?;
+        let cfg = LaunchConfig::for_num_elems(n);
+        let params = ScaleParams { n, scale };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a);
+        builder.arg(b);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch scaled_add_inplace kernel")?;
+        Ok(())
+    }
+
+    /// Execute scalar scaling in-place: a[i] *= scale.
+    pub fn scale_inplace(&self, a: &mut CudaBuffer, scale: f32, n: u32) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "scale_f32")?;
+        let cfg = LaunchConfig::for_num_elems(n);
+        let params = ScaleParams { n, scale };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch scale_f32 kernel")?;
+        Ok(())
+    }
+
+    /// Cast f32 buffer into f16 representation at a specific element offset in dst.
+    pub fn cast_f32_to_f16_offset(
+        &self,
+        src: &CudaBuffer,
+        dst: &CudaBuffer,
+        dst_element_offset: usize,
+        n: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "cast_f32_to_f16")?;
+        let cfg = LaunchConfig::for_num_elems(n);
+        let params = ElementwiseParams { n, _pad: 0 };
+        let dst_ptr =
+            dst.cu_device_ptr() + (dst_element_offset * std::mem::size_of::<u16>()) as u64;
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(src);
+        builder.arg(&dst_ptr);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch cast_f32_to_f16 kernel")?;
+        Ok(())
+    }
+
+    /// Execute numerically stable softmax in-place on a single row of logits.
+    pub fn softmax(&self, x: &mut CudaBuffer, n: u32) -> Result<()> {
+        let kernel = self.load_kernel(SOFTMAX_SRC, "softmax", "softmax")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = SoftmaxParams { n, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(x);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch softmax kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token FlashAttention decode across all query heads.
+    pub fn flash_attention(
+        &self,
+        out: &mut CudaBuffer,
+        q: &CudaBuffer,
+        k_cache: &CudaBuffer,
+        v_cache: &CudaBuffer,
+        params: AttentionParams,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(ATTENTION_SRC, "attention", "flash_attention")?;
+        let cfg = LaunchConfig {
+            grid_dim: (params.n_heads, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(q);
+        builder.arg(k_cache);
+        builder.arg(v_cache);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch flash_attention kernel")?;
+        Ok(())
+    }
+
+    /// Execute fused 1D short convolution for LFM2 GatedConv blocks.
+    pub fn conv1d_fused(
+        &self,
+        out: &mut CudaBuffer,
+        proj: &CudaBuffer,
+        rbuffer: &mut CudaBuffer,
+        weight: &CudaBuffer,
+        params: Conv1dParams,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(CONV1D_FUSED_SRC, "conv1d_fused", "conv1d_fused")?;
+        let cfg = LaunchConfig::for_num_elems(params.hs);
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(proj);
+        builder.arg(rbuffer);
+        builder.arg(weight);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch conv1d_fused kernel")?;
+        Ok(())
     }
 
     /// Synchronize the context's default stream.

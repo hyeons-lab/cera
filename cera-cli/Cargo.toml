@@ -63,3 +63,5 @@ default = []
 gpu = ["cera/gpu"]
 metal = ["cera/metal"]
 blas = ["cera/blas"]
+cuda = ["cera/cuda"]
+

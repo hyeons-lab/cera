@@ -1368,6 +1368,7 @@ pub(crate) fn dequantize_row(gguf: &GgufFile, wref: &WeightRef, row_idx: usize) 
 /// Used by the GPU and Metal loaders to upload non-quantized-kernel dtypes as F32.
 #[cfg(any(
     feature = "gpu",
+    feature = "cuda",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 pub(crate) fn dequantize_weight(gguf: &GgufFile, wref: &WeightRef) -> Vec<f32> {

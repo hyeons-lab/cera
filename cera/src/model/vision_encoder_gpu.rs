@@ -1503,7 +1503,7 @@ pub fn build_gpu_vision_encoder(
     match backend {
         BP::Cpu => None,
         BP::Metal => try_metal_vision_encoder(weights),
-        BP::Gpu => try_wgpu_vision_encoder(weights),
+        BP::Gpu | BP::Cuda => try_wgpu_vision_encoder(weights),
         BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
     }
 }

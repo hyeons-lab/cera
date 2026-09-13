@@ -102,7 +102,7 @@ pub fn build_gpu_audio_decoder(
     match backend {
         BP::Cpu => None,
         BP::Metal => try_metal_audio_decoder(gguf),
-        BP::Gpu => try_wgpu_audio_decoder(gguf),
+        BP::Gpu | BP::Cuda => try_wgpu_audio_decoder(gguf),
         BP::Auto => try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf)),
     }
 }
