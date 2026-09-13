@@ -53,7 +53,7 @@ const GGML_TYPE_I32: u32 = 26;
 // ── Public types ────────────────────────────────────────────────────────────
 
 /// A typed value from GGUF metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
     U8(u8),
     I8(i8),
