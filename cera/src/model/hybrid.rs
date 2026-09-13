@@ -508,6 +508,7 @@ impl HybridModel {
             rope_type: self.rope_type,
             attn_scale: self.config.scalars.attn,
             rope_freqs: self.rope_freqs.as_deref(),
+            attn_logit_softcapping: None,
         }
     }
 
@@ -766,6 +767,7 @@ impl HybridModel {
                 hs,
                 cfg.intermediate_size,
                 &ffn_input,
+                transformer::FfnActivation::Swiglu,
                 state,
             );
 
