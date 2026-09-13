@@ -709,6 +709,23 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Execute GPU-resident argmax: find index of maximum value in float vector x and store u32 token id in dst.
+    pub fn argmax_f32(&self, dst: &mut CudaBuffer, x: &CudaBuffer, n: u32) -> Result<()> {
+        let kernel = self.load_kernel(ARGMAX_F32_SRC, "argmax", "argmax_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = ArgmaxParams { n, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(x);
+        builder.arg(dst);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch argmax_f32 kernel")?;
+        Ok(())
+    }
+
     /// Synchronize the context's default stream.
     pub fn synchronize(&self) -> Result<()> {
         self.stream.synchronize()

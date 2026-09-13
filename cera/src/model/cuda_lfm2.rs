@@ -152,6 +152,8 @@ pub struct CudaWorkspace {
     pub final_norm: CudaBuffer,
     pub logits: CudaBuffer,
     pub pinned_logits: CudaPinnedBuffer,
+    pub argmax_token: CudaBuffer,
+    pub pinned_token: CudaPinnedBuffer,
     pub embd_scratch: Vec<f32>,
 }
 
@@ -372,6 +374,8 @@ impl CudaLfm2Model {
             final_norm: ctx.create_buffer(hs * f32_size)?,
             logits: ctx.create_buffer(vocab_size * f32_size)?,
             pinned_logits: ctx.create_pinned_buffer(vocab_size * f32_size)?,
+            argmax_token: ctx.create_buffer(std::mem::size_of::<u32>())?,
+            pinned_token: ctx.create_pinned_buffer(std::mem::size_of::<u32>())?,
             embd_scratch: vec![0.0f32; hs],
         };
 
@@ -615,6 +619,55 @@ impl Model for CudaLfm2Model {
         }
 
         last_logits
+    }
+
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tokens.len(), 1, "CUDA forward_greedy expects single token");
+        let token = tokens[0];
+        let cur_pos = pos;
+        assert!(
+            cur_pos < self.max_seq_len,
+            "cur_pos {cur_pos} exceeds max_seq_len {}",
+            self.max_seq_len
+        );
+
+        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let vocab_size = self.config.vocab_size as u32;
+
+        if let Err(e) = self.forward_step_device(token as usize, cur_pos, &mut ws, true) {
+            tracing::error!("CUDA forward_greedy step failed at pos {cur_pos}: {e:?}");
+            return 0;
+        }
+
+        // Execute GPU-resident argmax directly into ws.argmax_token
+        let ws_ref = &mut *ws;
+        if let Err(e) = self
+            .ctx
+            .argmax_f32(&mut ws_ref.argmax_token, &ws_ref.logits, vocab_size)
+        {
+            tracing::error!("CUDA argmax_f32 failed: {e:?}");
+            return 0;
+        }
+
+        if let Err(e) = self.ctx.synchronize() {
+            tracing::error!("CUDA synchronize failed: {e:?}");
+            return 0;
+        }
+
+        // Read back ONLY 4 bytes (u32 token ID) instead of 512 KB of logits
+        let pinned_slice = ws_ref.pinned_token.as_mut_slice();
+        if let Err(e) = ws_ref.argmax_token.copy_to_host(pinned_slice) {
+            tracing::error!("CUDA token readback failed: {e:?}");
+            return 0;
+        }
+
+        let next_token = u32::from_ne_bytes(pinned_slice[..4].try_into().unwrap_or([0; 4]));
+
+        self.seq_len.store(cur_pos + 1, Ordering::Relaxed);
+        state.seq_len += 1;
+
+        next_token
     }
 
     fn config(&self) -> &ModelConfig {

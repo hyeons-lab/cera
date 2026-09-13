@@ -17,6 +17,7 @@ pub const ELEMENTWISE_SRC: &str = include_str!("../shaders/cuda/elementwise.cu")
 pub const SOFTMAX_SRC: &str = include_str!("../shaders/cuda/softmax.cu");
 pub const ATTENTION_SRC: &str = include_str!("../shaders/cuda/attention.cu");
 pub const CONV1D_FUSED_SRC: &str = include_str!("../shaders/cuda/conv1d_fused.cu");
+pub const ARGMAX_F32_SRC: &str = include_str!("../shaders/cuda/argmax.cu");
 
 /// Parameters for matrix-vector multiplication kernels (GEMV).
 #[repr(C)]
@@ -124,3 +125,12 @@ pub struct Conv1dParams {
     pub _pad: u32,
 }
 unsafe impl DeviceRepr for Conv1dParams {}
+
+/// Parameters for argmax reduction kernel.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ArgmaxParams {
+    pub n: u32,
+    pub _pad: u32,
+}
+unsafe impl DeviceRepr for ArgmaxParams {}
