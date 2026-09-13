@@ -240,7 +240,7 @@ impl TqGpuCache {
                         n_kv_heads,
                     }));
                 }
-                BlockType::GatedConv | BlockType::Mamba2 => layers.push(None),
+                BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => layers.push(None),
             }
         }
 

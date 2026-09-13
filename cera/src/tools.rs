@@ -148,7 +148,9 @@ impl ToolFormat {
             // (Llama-3.1 uses bare JSON), so we don't claim it here.
             // Qwen2.5 GGUFs usually report "qwen2", but accept "qwen2.5"
             // too in case a converter emits the point-release string.
-            "qwen2" | "qwen2.5" | "qwen3" | "qwen3moe" => Some(ToolFormat::Hermes),
+            "qwen2" | "qwen2.5" | "qwen3" | "qwen3moe" | "qwen35" | "qwen3_5" | "qwen3.5" => {
+                Some(ToolFormat::Hermes)
+            }
             _ => None,
         }
     }
