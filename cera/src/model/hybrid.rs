@@ -511,6 +511,7 @@ impl HybridModel {
             attn_logit_softcapping: None,
             sliding_window: None,
             yarn: None,
+            attn_temp_scale: None,
         }
     }
 
@@ -680,6 +681,7 @@ impl HybridModel {
                 _ => None,
             },
             qk_norm: None,
+            attn_output_bias: None,
         };
         let dims = self.attn_dims(layer);
         transformer::forward_attn_block(
@@ -766,6 +768,7 @@ impl HybridModel {
                 &self.gguf,
                 i,
                 &ffn_weights,
+                &transformer::FfnExtras::default(),
                 hs,
                 cfg.intermediate_size,
                 &ffn_input,
