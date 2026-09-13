@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 use crate::backend::cuda::{
     AttentionParams, Conv1dParams, CudaBuffer, CudaContext, CudaGraph, CudaPinnedBuffer,
@@ -178,6 +178,10 @@ impl CudaLfm2Model {
         let hs = config.hidden_size;
         let is = config.intermediate_size;
         let head_dim = config.head_dim;
+        ensure!(
+            head_dim <= 128,
+            "CUDA FlashAttention kernel supports head_dim <= 128, got {head_dim}"
+        );
         let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
         let vocab_size = config.vocab_size;
