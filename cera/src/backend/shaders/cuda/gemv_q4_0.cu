@@ -1,13 +1,14 @@
 // Native CUDA Q4_0 Matrix-Vector multiplication (GEMV) for single-token decode.
 //
 // Optimized for NVIDIA Ampere (sm_87 on Jetson Orin) memory subsystem:
-// - Warp-cooperative block processing: 32 threads cooperatively load 32 contiguous nibbles (16 bytes).
-// - 100% coalesced 16-byte weight transactions and 128-byte activation transactions.
+// - Warp-cooperative block processing: 32 threads cooperatively process 32 contiguous nibbles (16 bytes).
+// - 100% coalesced weight transactions and 128-byte activation transactions.
 // - 4 rows processed per warp: vector x is loaded once and reused across 4 adjacent rows.
+// - Single-cycle FP16 to FP32 hardware conversion via inline PTX cvt.f32.f16.
+// - Fused multiply-add accumulation (fmaf) with scale pre-multiplication.
 // - Intra-warp reduction via __shfl_down_sync.
 
 #include <stdint.h>
-#include <string.h>
 
 __device__ __forceinline__ float half_to_float(uint16_t h) {
     float f;
@@ -58,59 +59,52 @@ __global__ void gemv_q4_0(
     for (uint32_t ib = 0; ib < nb; ib++) {
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
+        const size_t block_offset = (size_t)ib * 18;
 
         // Row 0
         float d0 = 0.0f;
         if (lane == 0) {
-            uint16_t d0_h;
-            memcpy(&d0_h, row0_ptr + (size_t)ib * 18, sizeof(uint16_t));
-            d0 = half_to_float(d0_h);
+            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
         }
         d0 = __shfl_sync(0xffffffff, d0, 0);
-        const uint8_t byte0 = *(row0_ptr + (size_t)ib * 18 + 2 + byte_idx);
-        const float q0 = is_hi ? ((float)(byte0 >> 4) - 8.0f) : ((float)(byte0 & 0x0F) - 8.0f);
-        sum0 += (q0 * x_val) * d0;
+        const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
+        const float q0 = (float)(is_hi ? (byte0 >> 4) : (byte0 & 0x0F)) - 8.0f;
+        sum0 = fmaf(q0 * d0, x_val, sum0);
 
         // Row 1
         if (row1_ptr) {
             float d1 = 0.0f;
             if (lane == 0) {
-                uint16_t d1_h;
-                memcpy(&d1_h, row1_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d1 = half_to_float(d1_h);
+                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
             }
             d1 = __shfl_sync(0xffffffff, d1, 0);
-            const uint8_t byte1 = *(row1_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q1 = is_hi ? ((float)(byte1 >> 4) - 8.0f) : ((float)(byte1 & 0x0F) - 8.0f);
-            sum1 += (q1 * x_val) * d1;
+            const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
+            const float q1 = (float)(is_hi ? (byte1 >> 4) : (byte1 & 0x0F)) - 8.0f;
+            sum1 = fmaf(q1 * d1, x_val, sum1);
         }
 
         // Row 2
         if (row2_ptr) {
             float d2 = 0.0f;
             if (lane == 0) {
-                uint16_t d2_h;
-                memcpy(&d2_h, row2_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d2 = half_to_float(d2_h);
+                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
             }
             d2 = __shfl_sync(0xffffffff, d2, 0);
-            const uint8_t byte2 = *(row2_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q2 = is_hi ? ((float)(byte2 >> 4) - 8.0f) : ((float)(byte2 & 0x0F) - 8.0f);
-            sum2 += (q2 * x_val) * d2;
+            const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
+            const float q2 = (float)(is_hi ? (byte2 >> 4) : (byte2 & 0x0F)) - 8.0f;
+            sum2 = fmaf(q2 * d2, x_val, sum2);
         }
 
         // Row 3
         if (row3_ptr) {
             float d3 = 0.0f;
             if (lane == 0) {
-                uint16_t d3_h;
-                memcpy(&d3_h, row3_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d3 = half_to_float(d3_h);
+                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
             }
             d3 = __shfl_sync(0xffffffff, d3, 0);
-            const uint8_t byte3 = *(row3_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q3 = is_hi ? ((float)(byte3 >> 4) - 8.0f) : ((float)(byte3 & 0x0F) - 8.0f);
-            sum3 += (q3 * x_val) * d3;
+            const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
+            const float q3 = (float)(is_hi ? (byte3 >> 4) : (byte3 & 0x0F)) - 8.0f;
+            sum3 = fmaf(q3 * d3, x_val, sum3);
         }
     }
 
@@ -167,59 +161,52 @@ __global__ void gemv_q4_0_accum(
     for (uint32_t ib = 0; ib < nb; ib++) {
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
+        const size_t block_offset = (size_t)ib * 18;
 
         // Row 0
         float d0 = 0.0f;
         if (lane == 0) {
-            uint16_t d0_h;
-            memcpy(&d0_h, row0_ptr + (size_t)ib * 18, sizeof(uint16_t));
-            d0 = half_to_float(d0_h);
+            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
         }
         d0 = __shfl_sync(0xffffffff, d0, 0);
-        const uint8_t byte0 = *(row0_ptr + (size_t)ib * 18 + 2 + byte_idx);
-        const float q0 = is_hi ? ((float)(byte0 >> 4) - 8.0f) : ((float)(byte0 & 0x0F) - 8.0f);
-        sum0 += (q0 * x_val) * d0;
+        const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
+        const float q0 = (float)(is_hi ? (byte0 >> 4) : (byte0 & 0x0F)) - 8.0f;
+        sum0 = fmaf(q0 * d0, x_val, sum0);
 
         // Row 1
         if (row1_ptr) {
             float d1 = 0.0f;
             if (lane == 0) {
-                uint16_t d1_h;
-                memcpy(&d1_h, row1_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d1 = half_to_float(d1_h);
+                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
             }
             d1 = __shfl_sync(0xffffffff, d1, 0);
-            const uint8_t byte1 = *(row1_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q1 = is_hi ? ((float)(byte1 >> 4) - 8.0f) : ((float)(byte1 & 0x0F) - 8.0f);
-            sum1 += (q1 * x_val) * d1;
+            const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
+            const float q1 = (float)(is_hi ? (byte1 >> 4) : (byte1 & 0x0F)) - 8.0f;
+            sum1 = fmaf(q1 * d1, x_val, sum1);
         }
 
         // Row 2
         if (row2_ptr) {
             float d2 = 0.0f;
             if (lane == 0) {
-                uint16_t d2_h;
-                memcpy(&d2_h, row2_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d2 = half_to_float(d2_h);
+                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
             }
             d2 = __shfl_sync(0xffffffff, d2, 0);
-            const uint8_t byte2 = *(row2_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q2 = is_hi ? ((float)(byte2 >> 4) - 8.0f) : ((float)(byte2 & 0x0F) - 8.0f);
-            sum2 += (q2 * x_val) * d2;
+            const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
+            const float q2 = (float)(is_hi ? (byte2 >> 4) : (byte2 & 0x0F)) - 8.0f;
+            sum2 = fmaf(q2 * d2, x_val, sum2);
         }
 
         // Row 3
         if (row3_ptr) {
             float d3 = 0.0f;
             if (lane == 0) {
-                uint16_t d3_h;
-                memcpy(&d3_h, row3_ptr + (size_t)ib * 18, sizeof(uint16_t));
-                d3 = half_to_float(d3_h);
+                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
             }
             d3 = __shfl_sync(0xffffffff, d3, 0);
-            const uint8_t byte3 = *(row3_ptr + (size_t)ib * 18 + 2 + byte_idx);
-            const float q3 = is_hi ? ((float)(byte3 >> 4) - 8.0f) : ((float)(byte3 & 0x0F) - 8.0f);
-            sum3 += (q3 * x_val) * d3;
+            const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
+            const float q3 = (float)(is_hi ? (byte3 >> 4) : (byte3 & 0x0F)) - 8.0f;
+            sum3 = fmaf(q3 * d3, x_val, sum3);
         }
     }
 

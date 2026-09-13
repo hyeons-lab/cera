@@ -383,3 +383,36 @@ fn test_cuda_q4_0_and_fused_rmsnorm_parity() {
         );
     }
 }
+
+#[test]
+fn test_cuda_argmax_f32() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA not available, skipping test_cuda_argmax_f32");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+    let n = 1024usize;
+    let mut logits = vec![0.0f32; n];
+    logits[42] = 100.0f32;
+    logits[999] = 99.0f32;
+
+    let logits_buf = ctx.upload_f32(&logits).expect("upload logits");
+    let mut token_buf = ctx
+        .create_buffer(std::mem::size_of::<u32>())
+        .expect("allocate token buf");
+
+    ctx.argmax_f32(&mut token_buf, &logits_buf, n as u32)
+        .expect("argmax_f32 kernel launch failed");
+    ctx.synchronize().expect("synchronize failed");
+
+    let mut pinned = ctx
+        .create_pinned_buffer(std::mem::size_of::<u32>())
+        .expect("allocate pinned buffer");
+    token_buf
+        .copy_to_host(pinned.as_mut_slice())
+        .expect("copy_to_host failed");
+
+    let token_id = u32::from_ne_bytes(pinned.as_slice()[..4].try_into().unwrap());
+    assert_eq!(token_id, 42, "argmax_f32 produced incorrect token ID");
+}
