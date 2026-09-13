@@ -255,6 +255,7 @@ impl Gemma4Model {
                 logit: 1.0,
             },
             moe: None,
+            ssm: None,
             is_causal: true,
             class_labels: Vec::new(),
         };
