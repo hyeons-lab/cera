@@ -125,10 +125,18 @@ __global__ void flash_attention(
 
         if (t < seq_len) {
             const uint16_t* k_ptr = k_cache + (size_t)t * kv_dim + kv_h_offset;
+            const uint32_t* k_ptr32 = (const uint32_t*)k_ptr;
             float dot = 0.0f;
+            const uint32_t num_pairs = head_dim / 2;
             #pragma unroll 4
-            for (uint32_t d = 0; d < head_dim; d++) {
-                dot += s_q[d] * half_to_float(k_ptr[d]);
+            for (uint32_t p = 0; p < num_pairs; p++) {
+                const uint32_t pair = k_ptr32[p];
+                const uint16_t h0 = (uint16_t)(pair & 0xffff);
+                const uint16_t h1 = (uint16_t)(pair >> 16);
+                dot += s_q[p * 2] * half_to_float(h0) + s_q[p * 2 + 1] * half_to_float(h1);
+            }
+            if (head_dim & 1) {
+                dot += s_q[head_dim - 1] * half_to_float(k_ptr[head_dim - 1]);
             }
             score = dot * scale;
         }

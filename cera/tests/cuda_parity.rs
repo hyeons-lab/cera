@@ -216,3 +216,170 @@ fn test_cuda_q8_0_gemv_and_gemm_parity() {
         );
     }
 }
+
+#[test]
+fn test_cuda_q4_0_and_fused_rmsnorm_parity() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA driver not available on this host; skipping live Q4 parity test");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+
+    let m: usize = 4;
+    let k: usize = 64; // 2 blocks of 32
+    let nb = k / 32;
+
+    // Construct synthetic Q4_0 weight matrix: m rows, k columns
+    let mut q4_bytes = Vec::new();
+    let mut float_weights = vec![0.0f32; m * k];
+
+    for row in 0..m {
+        for b in 0..nb {
+            let d_val = 0.25f32;
+            let d_fp16: u16 = half::f16::from_f32(d_val).to_bits();
+            q4_bytes.extend_from_slice(&d_fp16.to_le_bytes());
+
+            for i in 0..16 {
+                let lo_nibble = ((row + b + i) % 15) as u8;
+                let hi_nibble = ((row * 2 + b + i * 3) % 15) as u8;
+                let byte = (hi_nibble << 4) | (lo_nibble & 0x0F);
+                q4_bytes.push(byte);
+
+                let col0 = b * 32 + i;
+                let col1 = b * 32 + i + 16;
+                float_weights[row * k + col0] = ((lo_nibble as i8) - 8) as f32 * d_val;
+                float_weights[row * k + col1] = ((hi_nibble as i8) - 8) as f32 * d_val;
+            }
+        }
+    }
+
+    let weight_buf = ctx
+        .upload_bytes(&q4_bytes)
+        .expect("failed to upload Q4 weights");
+
+    // 1. Test GEMV Q4_0
+    let x_vec: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 2.0).collect();
+    let x_buf = ctx.upload_f32(&x_vec).expect("failed to upload x vector");
+    let mut out_gemv = ctx
+        .create_buffer(m * std::mem::size_of::<f32>())
+        .expect("allocate out_gemv");
+
+    ctx.gemv_q4_0(&mut out_gemv, &weight_buf, &x_buf, m as u32, k as u32)
+        .expect("gemv_q4_0 failed");
+
+    let mut gemv_result = vec![0.0f32; m];
+    ctx.download_f32(&out_gemv, &mut gemv_result)
+        .expect("download gemv result");
+
+    for r in 0..m {
+        let expected: f32 = (0..k).map(|c| float_weights[r * k + c] * x_vec[c]).sum();
+        assert!(
+            (gemv_result[r] - expected).abs() < 1e-3,
+            "GEMV Q4_0 mismatch at row {r}: got {}, expected {}",
+            gemv_result[r],
+            expected
+        );
+    }
+
+    // 2. Test GEMM Q4_0 (Batch of 2 tokens)
+    let batch_m: usize = 2;
+    let mut x_batch = x_vec.clone();
+    x_batch.extend((0..k).map(|i| (i as f32) * 0.05 + 1.0));
+    let x_batch_buf = ctx.upload_f32(&x_batch).expect("failed to upload x batch");
+    let mut out_gemm = ctx
+        .create_buffer(batch_m * m * std::mem::size_of::<f32>())
+        .expect("allocate out_gemm");
+
+    ctx.gemm_q4_0(
+        &mut out_gemm,
+        &weight_buf,
+        &x_batch_buf,
+        batch_m as u32,
+        m as u32,
+        k as u32,
+    )
+    .expect("gemm_q4_0 failed");
+
+    let mut gemm_result = vec![0.0f32; batch_m * m];
+    ctx.download_f32(&out_gemm, &mut gemm_result)
+        .expect("download gemm result");
+
+    for b in 0..batch_m {
+        for r in 0..m {
+            let expected: f32 = (0..k)
+                .map(|c| float_weights[r * k + c] * x_batch[b * k + c])
+                .sum();
+            let actual = gemm_result[b * m + r];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "GEMM Q4_0 mismatch at batch {b}, row {r}: got {}, expected {}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    // 3. Test on-device Q4_0 embedding gather
+    let mut out_gather = ctx
+        .create_buffer(k * std::mem::size_of::<f32>())
+        .expect("allocate out_gather");
+    let target_token: u32 = 2;
+
+    ctx.gather_embedding_q4_0(&mut out_gather, &weight_buf, target_token, k as u32)
+        .expect("gather_embedding_q4_0 failed");
+
+    let mut gather_result = vec![0.0f32; k];
+    ctx.download_f32(&out_gather, &mut gather_result)
+        .expect("download gather result");
+
+    for c in 0..k {
+        let expected = float_weights[(target_token as usize) * k + c];
+        assert!(
+            (gather_result[c] - expected).abs() < 1e-4,
+            "Gather Q4_0 mismatch at col {c}: got {}, expected {}",
+            gather_result[c],
+            expected
+        );
+    }
+
+    // 4. Test fused_add_rmsnorm
+    let hidden_vec = vec![1.0f32; k];
+    let residual_vec = vec![0.5f32; k];
+    let norm_weight = vec![2.0f32; k];
+
+    let mut hidden_buf = ctx.upload_f32(&hidden_vec).expect("upload hidden");
+    let res_buf = ctx.upload_f32(&residual_vec).expect("upload residual");
+    let w_buf = ctx.upload_f32(&norm_weight).expect("upload norm weight");
+    let mut norm_out_buf = ctx
+        .create_buffer(k * std::mem::size_of::<f32>())
+        .expect("allocate norm out");
+
+    ctx.fused_add_rmsnorm(
+        &mut norm_out_buf,
+        &mut hidden_buf,
+        &res_buf,
+        &w_buf,
+        k as u32,
+        1e-5,
+    )
+    .expect("fused_add_rmsnorm failed");
+
+    let mut final_hidden = vec![0.0f32; k];
+    ctx.download_f32(&hidden_buf, &mut final_hidden)
+        .expect("download final hidden");
+    for val in &final_hidden {
+        assert!((val - 1.5f32).abs() < 1e-4, "hidden state was not updated");
+    }
+
+    let mut norm_result = vec![0.0f32; k];
+    ctx.download_f32(&norm_out_buf, &mut norm_result)
+        .expect("download norm result");
+    for val in &norm_result {
+        // (1.5 / sqrt(1.5^2 + 1e-5)) * 2.0 ≈ 2.0
+        assert!(
+            (val - 2.0f32).abs() < 1e-3,
+            "norm result mismatch: got {val}"
+        );
+    }
+}

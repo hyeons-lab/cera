@@ -45,4 +45,34 @@ __global__ void gather_embedding_q8_0(
     }
 }
 
+// gather_embedding_q4_0: dequantizes 1 token's Q4_0 embedding row into float activation buffer
+__global__ void gather_embedding_q4_0(
+    float* __restrict__ dst,
+    const uint8_t* __restrict__ table,
+    GatherParams params
+) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nb = params.hidden_size / 32;
+    const size_t row_bytes = (size_t)nb * 18;
+    const uint8_t* row_ptr = table + (size_t)params.token_id * row_bytes;
+
+    for (uint32_t ib = tid; ib < nb; ib += blockDim.x) {
+        const uint8_t* blk = row_ptr + (size_t)ib * 18;
+        uint16_t d_h;
+        memcpy(&d_h, blk, sizeof(uint16_t));
+        const float d = half_to_float(d_h);
+        const uint8_t* qs = blk + 2;
+
+        float* dst_blk = dst + (size_t)ib * 32;
+        #pragma unroll 16
+        for (int i = 0; i < 16; i++) {
+            const uint8_t byte = qs[i];
+            const float lo = (float)(byte & 0x0F) - 8.0f;
+            const float hi = (float)(byte >> 4) - 8.0f;
+            dst_blk[i] = lo * d;
+            dst_blk[i + 16] = hi * d;
+        }
+    }
+}
+
 } // extern "C"

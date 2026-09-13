@@ -54,6 +54,36 @@ impl CudaWeight {
             _ => anyhow::bail!("unsupported CUDA GEMV accum weight dtype {:?}", self.dtype),
         }
     }
+
+    /// Dispatch batched GEMM (out = X * A^T).
+    pub fn dispatch_gemm(
+        &self,
+        ctx: &CudaContext,
+        out: &mut CudaBuffer,
+        x: &CudaBuffer,
+        batch_size: u32,
+    ) -> Result<()> {
+        match self.dtype {
+            DType::Q4_0 => ctx.gemm_q4_0(out, &self.buf, x, batch_size, self.m, self.k),
+            DType::Q8_0 => ctx.gemm_q8_0(out, &self.buf, x, batch_size, self.m, self.k),
+            _ => anyhow::bail!("unsupported CUDA GEMM weight dtype {:?}", self.dtype),
+        }
+    }
+
+    /// Dispatch batched GEMM with fused residual accumulation (out += X * A^T).
+    pub fn dispatch_gemm_accum(
+        &self,
+        ctx: &CudaContext,
+        out: &mut CudaBuffer,
+        x: &CudaBuffer,
+        batch_size: u32,
+    ) -> Result<()> {
+        match self.dtype {
+            DType::Q4_0 => ctx.gemm_q4_0_accum(out, &self.buf, x, batch_size, self.m, self.k),
+            DType::Q8_0 => ctx.gemm_q8_0_accum(out, &self.buf, x, batch_size, self.m, self.k),
+            _ => anyhow::bail!("unsupported CUDA GEMM accum weight dtype {:?}", self.dtype),
+        }
+    }
 }
 
 /// Dense SwiGLU feed-forward layer weights on CUDA.
@@ -316,7 +346,7 @@ impl CudaLfm2Model {
         let embd_data = src.embedding_tensor_data()?;
         let embedding_bytes = embd_data.into_owned();
         let embedding_hidden_size = hs;
-        let embedding_table = if embedding_dtype == DType::Q8_0 {
+        let embedding_table = if embedding_dtype == DType::Q8_0 || embedding_dtype == DType::Q4_0 {
             Some(ctx.upload_bytes(&embedding_bytes)?)
         } else {
             None
@@ -388,8 +418,21 @@ impl CudaLfm2Model {
 
         // 1. Token embedding lookup
         if let Some(table) = &self.embedding_table {
-            self.ctx
-                .gather_embedding_q8_0(&mut ws.hidden, table, token_id as u32, hs)?;
+            match self.embedding_dtype {
+                DType::Q8_0 => {
+                    self.ctx
+                        .gather_embedding_q8_0(&mut ws.hidden, table, token_id as u32, hs)?;
+                }
+                DType::Q4_0 => {
+                    self.ctx
+                        .gather_embedding_q4_0(&mut ws.hidden, table, token_id as u32, hs)?;
+                }
+                _ => {
+                    self.dequant_embedding_row(token_id, &mut ws.embd_scratch);
+                    ws.hidden
+                        .copy_from_host(bytemuck::cast_slice(&ws.embd_scratch))?;
+                }
+            }
         } else {
             self.dequant_embedding_row(token_id, &mut ws.embd_scratch);
             ws.hidden
