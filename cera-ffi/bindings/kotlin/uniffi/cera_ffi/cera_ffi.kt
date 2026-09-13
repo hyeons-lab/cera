@@ -934,9 +934,17 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ffisilerovad_reset(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffivaditerator_flush(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk(): Int
 
@@ -1421,6 +1429,14 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Float
 
+    external fun uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride(
+        `ptr`: Long,
+        `chunk`: RustBuffer.ByValue,
+        `rate`: RustBuffer.ByValue,
+        `stride`: Int,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Float
+
     external fun uniffi_cera_ffi_fn_method_ffisilerovad_reset(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1443,6 +1459,21 @@ internal object UniffiLib {
     ): Long
 
     external fun uniffi_cera_ffi_fn_method_ffivaditerator_flush(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_cera_ffi_fn_method_ffivaditerator_pop_event(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -2125,10 +2156,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048) {
@@ -5450,6 +5493,15 @@ public interface FfiSileroVadInterface {
     ): kotlin.Float
 
     /**
+     * Process a single chunk of audio advancing by `stride` samples and return speech probability.
+     */
+    fun `processChunkWithStride`(
+        `chunk`: List<kotlin.Float>,
+        `rate`: FfiVadSampleRate,
+        `stride`: kotlin.UInt,
+    ): kotlin.Float
+
+    /**
      * Reset recurrent state tensors and streaming context to zeros.
      */
     fun `reset`()
@@ -5600,6 +5652,29 @@ open class FfiSileroVad :
                         it,
                         FfiConverterSequenceFloat.lower(`chunk`),
                         FfiConverterTypeFfiVadSampleRate.lower(`rate`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Process a single chunk of audio advancing by `stride` samples and return speech probability.
+     */
+    @Throws(FfiException::class)
+    override fun `processChunkWithStride`(
+        `chunk`: List<kotlin.Float>,
+        `rate`: FfiVadSampleRate,
+        `stride`: kotlin.UInt,
+    ): kotlin.Float =
+        FfiConverterFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride(
+                        it,
+                        FfiConverterSequenceFloat.lower(`chunk`),
+                        FfiConverterTypeFfiVadSampleRate.lower(`rate`),
+                        FfiConverterUInt.lower(`stride`),
                         _status,
                     )
                 }
@@ -5769,6 +5844,21 @@ public interface FfiVadIteratorInterface {
     fun `flush`(): FfiVadEvent?
 
     /**
+     * Active frame stride in samples.
+     */
+    fun `frameStride`(): kotlin.UInt
+
+    /**
+     * Whether speech is currently active.
+     */
+    fun `isSpeechActive`(): kotlin.Boolean
+
+    /**
+     * Pop a queued speech event emitted by previous chunk evaluations.
+     */
+    fun `popEvent`(): FfiVadEvent?
+
+    /**
      * Process a single chunk of audio and return any speech start or end event.
      */
     fun `processChunk`(
@@ -5910,6 +6000,54 @@ open class FfiVadIterator :
             callWithHandle {
                 uniffiRustCallWithError(FfiException) { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_flush(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Active frame stride in samples.
+     */
+    @Throws(FfiException::class)
+    override fun `frameStride`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether speech is currently active.
+     */
+    @Throws(FfiException::class)
+    override fun `isSpeechActive`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Pop a queued speech event emitted by previous chunk evaluations.
+     */
+    @Throws(FfiException::class)
+    override fun `popEvent`(): FfiVadEvent? =
+        FfiConverterOptionalTypeFfiVadEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_pop_event(
                         it,
                         _status,
                     )
@@ -9124,6 +9262,7 @@ data class FfiVadConfig(
     var `minSpeechDurationMs`: kotlin.UInt = 64u,
     var `minSilenceDurationMs`: kotlin.UInt = 100u,
     var `speechPadMs`: kotlin.UInt = 30u,
+    var `frameStride`: kotlin.UInt? = null,
 ) {
     companion object
 }
@@ -9139,6 +9278,7 @@ public object FfiConverterTypeFfiVadConfig : FfiConverterRustBuffer<FfiVadConfig
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalUInt.read(buf),
         )
 
     override fun allocationSize(value: FfiVadConfig) =
@@ -9147,7 +9287,8 @@ public object FfiConverterTypeFfiVadConfig : FfiConverterRustBuffer<FfiVadConfig
                 FfiConverterFloat.allocationSize(value.`negThreshold`) +
                 FfiConverterUInt.allocationSize(value.`minSpeechDurationMs`) +
                 FfiConverterUInt.allocationSize(value.`minSilenceDurationMs`) +
-                FfiConverterUInt.allocationSize(value.`speechPadMs`)
+                FfiConverterUInt.allocationSize(value.`speechPadMs`) +
+                FfiConverterOptionalUInt.allocationSize(value.`frameStride`)
         )
 
     override fun write(
@@ -9159,6 +9300,7 @@ public object FfiConverterTypeFfiVadConfig : FfiConverterRustBuffer<FfiVadConfig
         FfiConverterUInt.write(value.`minSpeechDurationMs`, buf)
         FfiConverterUInt.write(value.`minSilenceDurationMs`, buf)
         FfiConverterUInt.write(value.`speechPadMs`, buf)
+        FfiConverterOptionalUInt.write(value.`frameStride`, buf)
     }
 }
 
