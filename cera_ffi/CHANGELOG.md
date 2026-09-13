@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.7
+
+### Added
+
+- **Configurable VAD Frame Stride**: Exposed `frame_stride` on `FfiVadConfig`, `process_chunk_with_stride` on `FfiSileroVad`, and `pop_event`, `frame_stride`, and `is_speech_active` on `FfiVadIterator` to support arbitrary streaming chunk cadences (such as 20 ms / 320 samples at 16 kHz) and multi-window event queueing.
+
+### Changed
+
+- **Version Alignment**: Bumped workspace patch version to 0.5.7 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.6
 
 ### Added

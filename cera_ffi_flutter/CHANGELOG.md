@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.7
+
+### Added
+
+- **Configurable VAD Frame Stride**: Multiplatform Flutter FFI bindings for configurable VAD frame stride and arbitrary streaming chunk sizing (`FfiVadConfig.frameStride`, `FfiSileroVad.processChunkWithStride`, `FfiVadIterator.popEvent`).
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.5.7` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.5.6
 
 ### Added
