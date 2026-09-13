@@ -22,6 +22,9 @@ pub mod wgsl_pp;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 /// Compute operations supported by backends.
 #[derive(Debug)]
 pub enum Op {

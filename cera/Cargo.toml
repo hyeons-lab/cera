@@ -32,6 +32,7 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 rustfft.workspace = true
 flatbuffers.workspace = true
+cudarc = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 # Image decode + resize for the VL input preprocessor. PNG + JPEG
@@ -182,6 +183,7 @@ mmap = ["dep:memmap2", "std-fs"]
 disk-cache = ["std-fs"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:futures-channel"]
 metal = ["dep:metal", "dep:objc", "mmap"]
+cuda = ["dep:cudarc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src"]
 # BundleRepo + HTTP downloader + SHA-256 integrity. Opt-in so wasm and
 # tightly-scoped embedded builds don't pull reqwest. (See
