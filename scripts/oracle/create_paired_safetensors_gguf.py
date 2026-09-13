@@ -101,7 +101,7 @@ def generate_paired_model(out_dir, arch="llama", seed=42):
     elif arch == "minicpm":
         config_json["scale_emb"] = 1.0
         config_json["scale_depth"] = 1.0
-        config_json["dim_model_base"] = n_embd
+        config_json["dim_model_base"] = 32
     elif arch == "gemma2":
         config_json["attn_logit_softcapping"] = 50.0
         config_json["final_logit_softcapping"] = 30.0
@@ -156,6 +156,11 @@ def generate_paired_model(out_dir, arch="llama", seed=42):
             gguf_tensors[f"blk.{i}.attn_post_norm.weight"] = ffn_norm + 1.0
             gguf_tensors[f"blk.{i}.ffn_norm.weight"] = pre_ffn + 1.0
             gguf_tensors[f"blk.{i}.ffn_post_norm.weight"] = post_ffn + 1.0
+        elif arch == "olmo2":
+            hf_tensors[f"model.layers.{i}.post_attention_layernorm.weight"] = attn_norm
+            hf_tensors[f"model.layers.{i}.post_feedforward_layernorm.weight"] = ffn_norm
+            gguf_tensors[f"blk.{i}.attn_post_norm.weight"] = attn_norm
+            gguf_tensors[f"blk.{i}.ffn_post_norm.weight"] = ffn_norm
         else:
             hf_tensors[f"model.layers.{i}.input_layernorm.weight"] = attn_norm
             hf_tensors[f"model.layers.{i}.post_attention_layernorm.weight"] = ffn_norm
@@ -200,7 +205,7 @@ def generate_paired_model(out_dir, arch="llama", seed=42):
     elif arch == "minicpm":
         writer.add_float32("minicpm.embedding_scale", 1.0)
         writer.add_float32("minicpm.residual_scale", float(1.0 / np.sqrt(n_layers)))
-        writer.add_float32("minicpm.logit_scale", float(n_embd / n_embd))
+        writer.add_float32("minicpm.logit_scale", float(32.0 / n_embd))
     elif arch == "gemma2":
         writer.add_float32("gemma2.attn_logit_softcapping", 50.0)
         writer.add_float32("gemma2.final_logit_softcapping", 30.0)
