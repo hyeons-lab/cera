@@ -157,8 +157,16 @@ impl HfModelConfig {
         match self.model_type.to_ascii_lowercase().as_str() {
             "llama" | "llama2" | "llama3" => "llama",
             "qwen2" | "qwen" => "qwen2",
+            "qwen3" => "qwen3",
             "mistral" => "llama", // Mistral maps to llama architecture in GGUF
-            "gemma" | "gemma2" => "gemma",
+            "gemma" => "gemma",
+            "gemma2" => "gemma2",
+            "minicpm" | "minicpm3" => "minicpm",
+            "nanbeige" | "nanbeige2" | "nanbeige4" => "nanbeige",
+            "olmo" => "olmo",
+            "olmo2" | "olmo3" => "olmo2",
+            "mamba2" | "falcon_mamba" => "mamba2",
+            "mamba" => "mamba",
             "phi3" | "phi" => "phi3",
             "lfm" | "lfm2" | "lfm2.5" | "liquid" => "lfm2",
             "whisper" => "whisper",
@@ -171,10 +179,22 @@ impl HfModelConfig {
                         "lfm2"
                     } else if arch_lower.contains("qwen2") || arch_lower.contains("qwen") {
                         "qwen2"
-                    } else if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-                        "llama"
+                    } else if arch_lower.contains("nanbeige") {
+                        "nanbeige"
+                    } else if arch_lower.contains("minicpm") {
+                        "minicpm"
+                    } else if arch_lower.contains("olmo2") || arch_lower.contains("olmo3") {
+                        "olmo2"
+                    } else if arch_lower.contains("olmo") {
+                        "olmo"
+                    } else if arch_lower.contains("gemma2") {
+                        "gemma2"
                     } else if arch_lower.contains("gemma") {
                         "gemma"
+                    } else if arch_lower.contains("mamba2") {
+                        "mamba2"
+                    } else if arch_lower.contains("mamba") {
+                        "mamba"
                     } else {
                         "llama"
                     }
@@ -328,6 +348,79 @@ impl HfModelConfig {
             writer.add_u32("general.pad_token_id", pad);
         }
 
+        if arch == "nanbeige" {
+            let num_loops = self
+                .extra
+                .get("num_loops")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .unwrap_or(1) as u32;
+            writer.add_u32("nanbeige.num_loops", num_loops);
+
+            let skip_loop_final_norm = self
+                .extra
+                .get("skip_loop_final_norm")
+                .and_then(|v| {
+                    v.as_bool().or_else(|| match v {
+                        Value::Number(n) => n.as_u64().map(|x| x != 0),
+                        Value::String(s) => match s.trim() {
+                            "true" | "1" => Some(true),
+                            "false" | "0" => Some(false),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                })
+                .unwrap_or(false);
+            writer.add_bool("nanbeige.skip_loop_final_norm", skip_loop_final_norm);
+        }
+
+        if arch == "minicpm" || arch == "minicpm3" {
+            if let Some(scale_emb) = self.extra.get("scale_emb").and_then(|v| v.as_f64()) {
+                writer.add_f32("minicpm.embedding_scale", scale_emb as f32);
+            }
+            if let Some(scale_depth) = self.extra.get("scale_depth").and_then(|v| v.as_f64()) {
+                let n_layers = self.num_hidden_layers.unwrap_or(1) as f64;
+                let residual_scale = scale_depth / n_layers.sqrt();
+                writer.add_f32("minicpm.residual_scale", residual_scale as f32);
+            }
+            if let (Some(h), Some(dim_base)) = (
+                self.hidden_size,
+                self.extra.get("dim_model_base").and_then(|v| v.as_f64()),
+            ) {
+                let logit_scale = h as f64 / dim_base;
+                writer.add_f32("minicpm.logit_scale", logit_scale as f32);
+            }
+        }
+
+        if arch == "gemma2" {
+            if let Some(cap) = self
+                .extra
+                .get("attn_logit_softcapping")
+                .and_then(|v| v.as_f64())
+            {
+                writer.add_f32("gemma2.attn_logit_softcapping", cap as f32);
+            }
+            if let Some(cap) = self
+                .extra
+                .get("final_logit_softcapping")
+                .and_then(|v| v.as_f64())
+            {
+                writer.add_f32("gemma2.final_logit_softcapping", cap as f32);
+            }
+            if let Some(sw) = self.extra.get("sliding_window").and_then(|v| v.as_u64()) {
+                writer.add_u32("gemma2.attention.sliding_window", sw as u32);
+            }
+        }
+
+        if (arch == "olmo" || arch == "olmo2")
+            && let Some(sw) = self.extra.get("sliding_window").and_then(|v| v.as_u64())
+        {
+            writer.add_u32(format!("{arch}.attention.sliding_window"), sw as u32);
+        }
+
         // Token classification labels (e.g. LiquidAI/pii-detect)
         if let Some(Value::Object(id2label)) = self.extra.get("id2label") {
             let mut label_pairs: Vec<(usize, String)> = Vec::new();
@@ -383,6 +476,81 @@ mod tests {
         assert_eq!(
             writer.get_metadata("token_classifier.labels"),
             Some(&MetadataValue::StringArray(expected_labels))
+        );
+    }
+
+    #[test]
+    fn test_nanbeige_config_mapping() {
+        let json_data = r#"{
+            "model_type": "nanbeige",
+            "architectures": ["NanbeigeForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "num_loops": 2,
+            "skip_loop_final_norm": false
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "nanbeige");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "nanbeige-test");
+        assert_eq!(
+            writer.get_metadata("nanbeige.num_loops"),
+            Some(&MetadataValue::Uint32(2))
+        );
+        assert_eq!(
+            writer.get_metadata("nanbeige.skip_loop_final_norm"),
+            Some(&MetadataValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_minicpm_config_mapping() {
+        let json_data = r#"{
+            "model_type": "minicpm",
+            "architectures": ["MiniCPMForCausalLM"],
+            "hidden_size": 2304,
+            "num_hidden_layers": 40,
+            "scale_emb": 12.0,
+            "scale_depth": 1.4,
+            "dim_model_base": 256.0
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "minicpm");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "minicpm-test");
+        assert_eq!(
+            writer.get_metadata("minicpm.embedding_scale"),
+            Some(&MetadataValue::Float32(12.0))
+        );
+    }
+
+    #[test]
+    fn test_gemma2_config_mapping() {
+        let json_data = r#"{
+            "model_type": "gemma2",
+            "architectures": ["Gemma2ForCausalLM"],
+            "hidden_size": 2304,
+            "num_hidden_layers": 26,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "sliding_window": 4096
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "gemma2");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "gemma2-test");
+        assert_eq!(
+            writer.get_metadata("gemma2.attn_logit_softcapping"),
+            Some(&MetadataValue::Float32(50.0))
+        );
+        assert_eq!(
+            writer.get_metadata("gemma2.attention.sliding_window"),
+            Some(&MetadataValue::Uint32(4096))
         );
     }
 }
