@@ -126,6 +126,11 @@ pub trait GpuWeightSource {
     /// prefill, so it never queries this — dead under `metal` alone.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn supports_batched_prefill(&self) -> bool;
+    /// Optional physical loop norm interval (number of physical layers per loop).
+    /// Used by looped architectures like Nanbeige.
+    fn loop_norm_interval(&self) -> Option<usize> {
+        None
+    }
 }
 
 // ── Routed mixture-of-experts loading, shared by both GPU backends ──────────
