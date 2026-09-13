@@ -236,13 +236,14 @@ impl VadIterator {
     }
 
     /// Flush any in-flight active speech segment at the end of the audio stream.
+    ///
+    /// Consumes any un-evaluated tail samples from the internal buffer, closes any active speech segment,
+    /// and returns queued events. If multiple events were queued, call `pop_event` or `flush` again
+    /// to drain remaining events.
     pub fn flush(&mut self) -> Option<VadEvent> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Some(event);
-        }
-        self.current_sample += self.sample_buffer.len() as u64;
-        self.sample_buffer.clear();
         if self.triggered {
+            self.current_sample += self.sample_buffer.len() as u64;
+            self.sample_buffer.clear();
             let hz = self.rate.hz() as f64;
             let start = self.current_speech_start.unwrap_or(0);
             let end = (self.temp_end.unwrap_or(self.current_sample) + self.speech_pad_samples)
@@ -253,15 +254,17 @@ impl VadIterator {
 
             let start_ms = ((start as f64 * 1000.0) / hz) as f32;
             let end_ms = ((end as f64 * 1000.0) / hz) as f32;
-            Some(VadEvent::SpeechEnd {
+            self.pending_events.push_back(VadEvent::SpeechEnd {
                 start_sample: start,
                 end_sample: end,
                 start_ms,
                 end_ms,
-            })
+            });
         } else {
-            None
+            self.current_sample += self.sample_buffer.len() as u64;
+            self.sample_buffer.clear();
         }
+        self.pending_events.pop_front()
     }
 
     fn update_state(&mut self, prob: f32, advance_samples: u64) -> Option<VadEvent> {
@@ -311,6 +314,10 @@ impl VadIterator {
     /// Accepts chunks matching the window size (512 samples @ 16kHz, 256 @ 8kHz) or arbitrary streaming
     /// frame cadences (e.g. 20 ms / 320 samples @ 16kHz). When chunks differ from the window size,
     /// samples are buffered internally until a full receptive window is reached.
+    ///
+    /// When processing large chunks that span multiple stride windows, multiple events may be emitted.
+    /// In such cases, the first event is returned immediately and subsequent events are queued internally
+    /// and can be drained via [`pop_event`](Self::pop_event).
     pub fn process_chunk(
         &mut self,
         vad: &mut SileroVad,
@@ -1052,5 +1059,113 @@ mod tests {
     fn test_vad_from_file_missing_path_returns_error() {
         let res = SileroVad::from_file(std::path::Path::new("nonexistent_vad_model.gguf"));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_vad_config_sanitized() {
+        let default_cfg = VadConfig::default();
+        let sanitized_default = default_cfg.sanitized();
+        assert_eq!(sanitized_default.threshold, 0.5);
+        assert_eq!(sanitized_default.neg_threshold, 0.35);
+
+        // Out-of-bounds threshold
+        let bad_cfg = VadConfig {
+            threshold: 1.5,
+            neg_threshold: 1.2,
+            ..VadConfig::default()
+        };
+        let sanitized_bad = bad_cfg.sanitized();
+        assert_eq!(sanitized_bad.threshold, 1.0);
+        assert_eq!(sanitized_bad.neg_threshold, 1.0);
+
+        // Negative and inverted threshold
+        let inv_cfg = VadConfig {
+            threshold: 0.4,
+            neg_threshold: 0.8,
+            ..VadConfig::default()
+        };
+        let sanitized_inv = inv_cfg.sanitized();
+        assert_eq!(sanitized_inv.threshold, 0.4);
+        assert_eq!(sanitized_inv.neg_threshold, 0.4);
+
+        // Non-finite (NaN / Inf) threshold
+        let nan_cfg = VadConfig {
+            threshold: f32::NAN,
+            neg_threshold: f32::INFINITY,
+            ..VadConfig::default()
+        };
+        let sanitized_nan = nan_cfg.sanitized();
+        assert_eq!(sanitized_nan.threshold, 0.5);
+        assert_eq!(sanitized_nan.neg_threshold, 0.35);
+    }
+
+    #[test]
+    fn test_vad_iterator_sanitization_and_stride() {
+        // Iterator clamps custom stride within [1, window_size]
+        let config_stride_zero = VadConfig {
+            frame_stride: Some(0),
+            ..VadConfig::default()
+        };
+        let iter_16k_zero = VadIterator::new(VadSampleRate::Rate16kHz, config_stride_zero);
+        assert_eq!(iter_16k_zero.frame_stride(), 1);
+
+        let config_stride_huge = VadConfig {
+            frame_stride: Some(1024),
+            ..VadConfig::default()
+        };
+        let iter_16k_huge = VadIterator::new(VadSampleRate::Rate16kHz, config_stride_huge.clone());
+        assert_eq!(iter_16k_huge.frame_stride(), 512);
+
+        let iter_8k_huge = VadIterator::new(VadSampleRate::Rate8kHz, config_stride_huge);
+        assert_eq!(iter_8k_huge.frame_stride(), 256);
+
+        // Unsanitized config (NaN threshold) is sanitized on construction
+        let nan_config = VadConfig {
+            threshold: f32::NAN,
+            neg_threshold: 2.0,
+            frame_stride: Some(320),
+            ..VadConfig::default()
+        };
+        let iter = VadIterator::new(VadSampleRate::Rate16kHz, nan_config);
+        assert_eq!(iter.frame_stride(), 320);
+        assert_eq!(iter.config.threshold, 0.5);
+        assert_eq!(iter.config.neg_threshold, 0.5);
+    }
+
+    #[test]
+    fn test_vad_iterator_flush_and_state() {
+        let config = VadConfig::default();
+        let mut iterator = VadIterator::new(VadSampleRate::Rate16kHz, config);
+        assert!(!iterator.is_speech_active());
+        assert_eq!(iterator.pop_event(), None);
+
+        // Flushing when no speech is active returns None
+        assert_eq!(iterator.flush(), None);
+
+        // Manually trigger speech state to verify flush finalization
+        iterator.triggered = true;
+        iterator.current_speech_start = Some(1600);
+        iterator.current_sample = 3200;
+        iterator.sample_buffer.extend_from_slice(&[0.1f32; 160]);
+
+        let flush_ev = iterator.flush();
+        assert!(!iterator.is_speech_active());
+        assert!(iterator.sample_buffer.is_empty());
+        assert_eq!(iterator.current_sample, 3360);
+
+        match flush_ev {
+            Some(VadEvent::SpeechEnd {
+                start_sample,
+                end_sample,
+                ..
+            }) => {
+                assert_eq!(start_sample, 1600);
+                assert!(end_sample <= 3360);
+            }
+            other => panic!("expected SpeechEnd event on flush, got {:?}", other),
+        }
+
+        // Subsequent flush returns None
+        assert_eq!(iterator.flush(), None);
     }
 }
