@@ -8,6 +8,8 @@ use cudarc::driver::DeviceRepr;
 // Embedded CUDA source strings
 pub const GEMV_Q4_0_SRC: &str = include_str!("../shaders/cuda/gemv_q4_0.cu");
 pub const GEMV_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemv_q8_0.cu");
+pub const GEMM_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemm_q8_0.cu");
+pub const GATHER_EMBEDDING_SRC: &str = include_str!("../shaders/cuda/gather_embedding.cu");
 pub const RMSNORM_SRC: &str = include_str!("../shaders/cuda/rmsnorm.cu");
 pub const QK_NORM_ROPE_SRC: &str = include_str!("../shaders/cuda/qk_norm_rope.cu");
 pub const ELEMENTWISE_SRC: &str = include_str!("../shaders/cuda/elementwise.cu");
@@ -23,6 +25,26 @@ pub struct GemvParams {
     pub k: u32,
 }
 unsafe impl DeviceRepr for GemvParams {}
+
+/// Parameters for matrix-matrix multiplication kernels (GEMM).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GemmParams {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub _pad: u32,
+}
+unsafe impl DeviceRepr for GemmParams {}
+
+/// Parameters for embedding gather kernel.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GatherParams {
+    pub token_id: u32,
+    pub hidden_size: u32,
+}
+unsafe impl DeviceRepr for GatherParams {}
 
 /// Parameters for Root Mean Square Normalization (RMSNorm).
 #[repr(C)]

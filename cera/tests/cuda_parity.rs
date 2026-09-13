@@ -94,3 +94,125 @@ fn test_cuda_device_availability_probe() {
         );
     }
 }
+
+#[test]
+fn test_cuda_q8_0_gemv_and_gemm_parity() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA driver not available on this host; skipping live Q8 parity test");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+
+    let m: usize = 4;
+    let k: usize = 64; // 2 blocks of 32
+    let nb = k / 32;
+
+    // Construct synthetic Q8_0 weight matrix: m rows, k columns
+    let mut q8_bytes = Vec::new();
+    let mut float_weights = Vec::new();
+
+    for row in 0..m {
+        for b in 0..nb {
+            // Scale d = 0.5f32 (0x3800 in IEEE FP16)
+            let d_val = 0.5f32;
+            let d_fp16: u16 = half::f16::from_f32(d_val).to_bits();
+            q8_bytes.extend_from_slice(&d_fp16.to_le_bytes());
+
+            for col in 0..32 {
+                let q_val = (((row * 32 + b * 32 + col) % 7) as i8) - 3;
+                q8_bytes.push(q_val as u8);
+                float_weights.push((q_val as f32) * d_val);
+            }
+        }
+    }
+
+    let weight_buf = ctx
+        .upload_bytes(&q8_bytes)
+        .expect("failed to upload Q8 weights");
+
+    // 1. Test GEMV (M=1 token against m rows)
+    let x_vec: Vec<f32> = (0..k).map(|i| (i as f32) * 0.05).collect();
+    let x_buf = ctx.upload_f32(&x_vec).expect("failed to upload x vector");
+    let mut out_gemv = ctx
+        .create_buffer(m * std::mem::size_of::<f32>())
+        .expect("allocate out_gemv");
+
+    ctx.gemv_q8_0(&mut out_gemv, &weight_buf, &x_buf, m as u32, k as u32)
+        .expect("gemv_q8_0 failed");
+
+    let mut gemv_result = vec![0.0f32; m];
+    ctx.download_f32(&out_gemv, &mut gemv_result)
+        .expect("download gemv result");
+
+    for r in 0..m {
+        let expected: f32 = (0..k).map(|c| float_weights[r * k + c] * x_vec[c]).sum();
+        assert!(
+            (gemv_result[r] - expected).abs() < 1e-3,
+            "GEMV mismatch at row {r}: got {}, expected {}",
+            gemv_result[r],
+            expected
+        );
+    }
+
+    // 2. Test GEMM (Batch of 2 tokens against m rows)
+    let batch_m: usize = 2;
+    let mut x_batch = x_vec.clone();
+    x_batch.extend((0..k).map(|i| (i as f32) * -0.02));
+    let x_batch_buf = ctx.upload_f32(&x_batch).expect("failed to upload x batch");
+    let mut out_gemm = ctx
+        .create_buffer(batch_m * m * std::mem::size_of::<f32>())
+        .expect("allocate out_gemm");
+
+    ctx.gemm_q8_0(
+        &mut out_gemm,
+        &weight_buf,
+        &x_batch_buf,
+        batch_m as u32,
+        m as u32,
+        k as u32,
+    )
+    .expect("gemm_q8_0 failed");
+
+    let mut gemm_result = vec![0.0f32; batch_m * m];
+    ctx.download_f32(&out_gemm, &mut gemm_result)
+        .expect("download gemm result");
+
+    for b in 0..batch_m {
+        for r in 0..m {
+            let expected: f32 = (0..k)
+                .map(|c| float_weights[r * k + c] * x_batch[b * k + c])
+                .sum();
+            let actual = gemm_result[b * m + r];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "GEMM mismatch at batch {b}, row {r}: got {}, expected {}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    // 3. Test on-device embedding gather
+    let mut out_gather = ctx
+        .create_buffer(k * std::mem::size_of::<f32>())
+        .expect("allocate out_gather");
+    let target_token: u32 = 1;
+
+    ctx.gather_embedding_q8_0(&mut out_gather, &weight_buf, target_token, k as u32)
+        .expect("gather_embedding_q8_0 failed");
+
+    let mut gather_result = vec![0.0f32; k];
+    ctx.download_f32(&out_gather, &mut gather_result)
+        .expect("download gather result");
+
+    for c in 0..k {
+        let expected = float_weights[(target_token as usize) * k + c];
+        assert!(
+            (gather_result[c] - expected).abs() < 1e-4,
+            "Gather mismatch at col {c}: got {}, expected {}",
+            gather_result[c],
+            expected
+        );
+    }
+}

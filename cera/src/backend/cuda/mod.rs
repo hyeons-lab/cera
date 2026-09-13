@@ -253,7 +253,7 @@ impl CudaContext {
     ) -> Result<()> {
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0")?;
         let warps_per_block = 8u32;
-        let num_blocks = m.div_ceil(warps_per_block);
+        let num_blocks = m.div_ceil(warps_per_block * 2);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (warps_per_block * 32, 1, 1),
@@ -280,7 +280,7 @@ impl CudaContext {
     ) -> Result<()> {
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_accum")?;
         let warps_per_block = 8u32;
-        let num_blocks = m.div_ceil(warps_per_block);
+        let num_blocks = m.div_ceil(warps_per_block * 2);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (warps_per_block * 32, 1, 1),
@@ -293,6 +293,97 @@ impl CudaContext {
         builder.arg(out);
         builder.arg(&params);
         unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0_accum kernel")?;
+        Ok(())
+    }
+
+    /// Execute batched Q8_0 matrix-matrix multiplication (Y[M, N] = X[M, K] * A[N, K]^T).
+    pub fn gemm_q8_0(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMM_Q8_0_SRC, "gemm_q8_0", "gemm_q8_0")?;
+        let tile_m = 16u32;
+        let tile_n = 16u32;
+        let grid_x = n.div_ceil(tile_n);
+        let grid_y = m.div_ceil(tile_m);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (tile_n, tile_m, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemmParams { m, n, k, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemm_q8_0 kernel")?;
+        Ok(())
+    }
+
+    /// Execute batched Q8_0 matrix-matrix multiplication with residual accumulation (Y += X * A^T).
+    pub fn gemm_q8_0_accum(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMM_Q8_0_SRC, "gemm_q8_0", "gemm_q8_0_accum")?;
+        let tile_m = 16u32;
+        let tile_n = 16u32;
+        let grid_x = n.div_ceil(tile_n);
+        let grid_y = m.div_ceil(tile_m);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (tile_n, tile_m, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemmParams { m, n, k, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemm_q8_0_accum kernel")?;
+        Ok(())
+    }
+
+    /// Dequantize token embedding row directly on GPU into activation buffer.
+    pub fn gather_embedding_q8_0(
+        &self,
+        out: &mut CudaBuffer,
+        table: &CudaBuffer,
+        token_id: u32,
+        hidden_size: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(
+            GATHER_EMBEDDING_SRC,
+            "gather_embedding",
+            "gather_embedding_q8_0",
+        )?;
+        let threads = 128u32.min(hidden_size / 32).max(32);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GatherParams {
+            token_id,
+            hidden_size,
+        };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(out);
+        builder.arg(table);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gather_embedding_q8_0 kernel")?;
         Ok(())
     }
 
