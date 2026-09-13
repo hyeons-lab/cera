@@ -140,7 +140,7 @@ impl HybridModel {
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
 
-        let scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
+        let scalars = ScalarMultipliers::from_gguf(&gguf, prefix, n_layers, hidden_size)?;
 
         // Mamba-2 SSM configuration
         let d_conv = gguf
