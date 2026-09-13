@@ -745,9 +745,9 @@ pub fn load_model(
             model_id,
         )?),
         // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
-        // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
+        // "mistral3"/"mistral4" archs with different layouts, not served here).
         "qwen2" | "qwen3" | "llama" | "granite" | "gemma" | "gemma2" | "olmo" | "olmo2"
-        | "olmo3" | "minicpm" => Box::new(llama::LlamaModel::from_gguf_with_id(
+        | "olmo3" | "minicpm" | "nanbeige" => Box::new(llama::LlamaModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -815,7 +815,7 @@ pub fn load_model_gpu(
         // Dense transformers share the generalized wgpu loader (per-arch rope /
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "nanbeige" => Ok(Box::new(
             gpu_lfm2::GpuLfm2Model::from_llama_with_id(gguf, context_size, model_id)?,
         )),
         other => bail!("unsupported architecture for GPU: {other}"),
@@ -844,7 +844,7 @@ pub fn load_model_metal(
             context_size,
         )?)),
         // Dense transformers share the generalized Metal forward path.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "nanbeige" => Ok(Box::new(
             metal_lfm2::MetalLfm2Model::from_llama(gguf, path, context_size)?,
         )),
         other => bail!("unsupported architecture for Metal: {other}"),
