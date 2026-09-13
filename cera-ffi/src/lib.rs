@@ -4006,6 +4006,7 @@ mod tests {
             BackendPreference::Cpu,
             BackendPreference::Gpu,
             BackendPreference::Metal,
+            BackendPreference::Cuda,
         ] {
             let core: cera::BackendPreference = ffi.into();
             let back: BackendPreference = core.into();

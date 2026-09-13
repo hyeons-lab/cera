@@ -44,13 +44,14 @@ print("OK: cera_ffi v\(version)")
 // 2. Enum marshaling — construct each variant + Swift's switch
 // exhaustiveness check guards against future variant adds breaking
 // silently.
-let backends: [BackendPreference] = [.auto, .cpu, .gpu, .metal]
+let backends: [BackendPreference] = [.auto, .cpu, .gpu, .metal, .cuda]
 for b in backends {
     switch b {
     case .auto: print("OK: BackendPreference.auto")
     case .cpu: print("OK: BackendPreference.cpu")
     case .gpu: print("OK: BackendPreference.gpu")
     case .metal: print("OK: BackendPreference.metal")
+    case .cuda: print("OK: BackendPreference.cuda")
     }
 }
 
