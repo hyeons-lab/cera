@@ -242,12 +242,18 @@ impl VadIterator {
     /// to drain remaining events.
     pub fn flush(&mut self) -> Option<VadEvent> {
         if self.triggered {
-            self.current_sample += self.sample_buffer.len() as u64;
+            self.current_sample = self
+                .current_sample
+                .saturating_add(self.sample_buffer.len() as u64);
             self.sample_buffer.clear();
             let hz = self.rate.hz() as f64;
             let start = self.current_speech_start.unwrap_or(0);
-            let end = (self.temp_end.unwrap_or(self.current_sample) + self.speech_pad_samples)
-                .min(self.current_sample);
+            let end = self
+                .temp_end
+                .unwrap_or(self.current_sample)
+                .saturating_add(self.speech_pad_samples)
+                .min(self.current_sample)
+                .max(start);
             self.triggered = false;
             self.temp_end = None;
             self.current_speech_start = None;
@@ -261,7 +267,9 @@ impl VadIterator {
                 end_ms,
             });
         } else {
-            self.current_sample += self.sample_buffer.len() as u64;
+            self.current_sample = self
+                .current_sample
+                .saturating_add(self.sample_buffer.len() as u64);
             self.sample_buffer.clear();
         }
         self.pending_events.pop_front()
@@ -270,7 +278,7 @@ impl VadIterator {
     fn update_state(&mut self, prob: f32, advance_samples: u64) -> Option<VadEvent> {
         let hz = self.rate.hz() as f64;
         let cur_sample = self.current_sample;
-        self.current_sample += advance_samples;
+        self.current_sample = self.current_sample.saturating_add(advance_samples);
 
         if prob >= self.config.threshold {
             self.temp_end = None;
@@ -290,7 +298,10 @@ impl VadIterator {
             let temp_end_val = *self.temp_end.get_or_insert(cur_sample);
             if cur_sample.saturating_sub(temp_end_val) >= self.min_silence_samples {
                 let start = self.current_speech_start.unwrap_or(0);
-                let end = (temp_end_val + self.speech_pad_samples).min(self.current_sample);
+                let end = temp_end_val
+                    .saturating_add(self.speech_pad_samples)
+                    .min(self.current_sample)
+                    .max(start);
                 self.triggered = false;
                 self.temp_end = None;
                 self.current_speech_start = None;
@@ -662,15 +673,21 @@ impl SileroVad {
             if i != speeches.len() - 1 {
                 let next_start = speeches[i + 1].0;
                 let sil_dur = next_start.saturating_sub(speeches[i].1);
-                if sil_dur < 2 * speech_pad_samples {
-                    speeches[i].1 += sil_dur / 2;
+                if sil_dur < speech_pad_samples.saturating_mul(2) {
+                    speeches[i].1 = speeches[i].1.saturating_add(sil_dur / 2);
                     speeches[i + 1].0 = speeches[i + 1].0.saturating_sub(sil_dur / 2);
                 } else {
-                    speeches[i].1 = (speeches[i].1 + speech_pad_samples).min(audio_len);
+                    speeches[i].1 = speeches[i]
+                        .1
+                        .saturating_add(speech_pad_samples)
+                        .min(audio_len);
                     speeches[i + 1].0 = speeches[i + 1].0.saturating_sub(speech_pad_samples);
                 }
             } else {
-                speeches[i].1 = (speeches[i].1 + speech_pad_samples).min(audio_len);
+                speeches[i].1 = speeches[i]
+                    .1
+                    .saturating_add(speech_pad_samples)
+                    .min(audio_len);
             }
 
             let start_ms = ((speeches[i].0 as f64 * 1000.0) / hz) as f32;
@@ -1215,5 +1232,32 @@ mod tests {
         // Subsequent valid chunk completing the window succeeds
         let valid_chunk = [0.0f32; 412];
         assert!(iterator.process_chunk(&mut vad, &valid_chunk).is_ok());
+    }
+
+    #[test]
+    fn test_vad_iterator_saturating_add_overflow_safety() {
+        let config = VadConfig {
+            speech_pad_ms: 1000,
+            ..VadConfig::default()
+        };
+        let mut iterator = VadIterator::new(VadSampleRate::Rate16kHz, config);
+        iterator.triggered = true;
+        iterator.current_speech_start = Some(u64::MAX - 500);
+        iterator.temp_end = Some(u64::MAX - 100);
+        iterator.current_sample = u64::MAX;
+
+        let event = iterator.flush();
+        match event {
+            Some(VadEvent::SpeechEnd {
+                start_sample,
+                end_sample,
+                ..
+            }) => {
+                assert_eq!(start_sample, u64::MAX - 500);
+                assert_eq!(end_sample, u64::MAX);
+                assert!(end_sample >= start_sample);
+            }
+            other => panic!("expected SpeechEnd event on flush, got {:?}", other),
+        }
     }
 }

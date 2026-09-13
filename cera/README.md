@@ -21,6 +21,32 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 cera = "0.5"
 ```
 
+## Highlights in 0.5.7
+
+- **11 New Model Architectures**: Expands full inference coverage to all 26 model families in the Pipette benchmark catalog:
+  - **Gemma 2 (`gemma2`)**: Dual post-norms, GeGLU activation, embedding multipliers, attention soft-capping, and final logit soft-capping.
+  - **Gemma 4 (`gemma4`)**: Per-Layer Embeddings (PLE / MatFormer), cross-layer KV cache sharing, and unweighted V-norm.
+  - **Olmo 2 (`olmo2`)**: PostNorm topology, split-half NeoX RoPE, per-head and vector-scoped QK-norm.
+  - **Olmo 3 (`olmo3`)**: Interleaved sliding window attention, YaRN RoPE frequency scaling, and dual RoPE schedule.
+  - **Granite Hybrid & Falcon H1R (`granitehybrid`, `falcon-h1`)**: Hybrid Mamba-2 SSD recurrence with parallel full-attention blocks.
+  - **MiniCPM & MiniCPM5 (`minicpm`, `minicpm5`)**: Dense transformers with scaled attention and non-standard head dimensions.
+  - **Nanbeige 4.2 (`nanbeige`)**: Looped-layer dense transformer with shared physical layer weights and intermediate loop normalization.
+  - **Phi-3, Phi-3.5 & Phi-4-mini (`phi3`, `phi`)**: Fused QKV projections, packed SwiGLU FFN layouts, and NeoX RoPE.
+  - **Ministral 3 & Mistral 3 (`mistral3`)**: Interleaved Norm YaRN RoPE, position-dependent attention temperature scaling, and Tekken BPE tokenization.
+  - **Qwen 3.5 / Ornith 1.0 (`qwen35`)**: Interleaved Gated Delta Net recurrence, associative memory updates, and full attention layers.
+  - **Ling 3.0 Tiny (`bailingmoe3`, `bailingmoe`)**: Hybrid KDA linear recurrence, MLA latent attention compression, and fine-grained MoE routing.
+- **SafeTensors-to-GGUF Parity Audit Framework (`cera::convert::parity`)**: Automated parity verification suite and `cera compare-quants` CLI command. Audits tensor shapes, SNR, RMSE, cosine similarity, metadata translation, and prefill logit parity across quantization formats.
+- **Quantized CPU Kernel Performance Optimizations**:
+  - 4-row register-tiled K-quant GEMV NEON kernels with dynamic 1-row work stealing.
+  - Fused SwiGLU kernels for Q4_0, Q4_K, and Q5_K formats with in-register SiLU activation.
+  - Fused QKV attention `concat3` unified dispatches sharing quantized activation column sums.
+  - Fused RMSNorm and dynamic Q8_0 quantization (`rmsnorm_and_quantize_q8_0`).
+  - Direct greedy argmax projection (`gemv_preq_argmax`) bypassing full vocabulary logit allocation.
+  - Dedicated prefill thread pool isolation via `par_range_prefill`.
+- **Configurable Voice Activity Detection (`cera::vad`)**:
+  - Configurable frame stride (`frame_stride_samples`, supporting 256 or 512 samples) for low-latency streaming speech detection.
+  - Streaming sample queueing via `push_samples` with automatic frame boundary handling and overflow protection.
+
 ## Highlights in 0.5.0
 
 - **FreeToken: Semantic Anchor Caching ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588))**: Two-tier prefix caching (`cera::kv_cache::KvPrefixCache`) with semantic anchor points, TurboQuant cold storage compression, and FlatBuffers v2 disk persistence.

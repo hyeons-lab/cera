@@ -31,7 +31,7 @@
 
 'use strict';
 
-console.info('[cera:worker:version] v0.5.6 (build: 2026-09-10-rev26-kws-whisper)');
+console.info('[cera:worker:version] v0.5.7 (build: 2026-09-13-rev27-vad-stride)');
 
 const LOCAL_MODELS_DIR = '/models-local';
 

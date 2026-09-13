@@ -40,19 +40,21 @@ of these architectures loads:
 | `lfm2` | Liquid **LFM2 / LFM2.5** (the canonical LeapBundles family) | text, vision, audio |
 | `lfm2moe` | Liquid **LFM2.5-8B-A1B** (routed mixture-of-experts) | text |
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
+| `gemma2` | **Gemma 2** (dual post-norms, GeGLU, embedding scaling, attention and logit soft-capping) | text |
+| `gemma4` | **Gemma 4** (Per-Layer Embeddings / PLE, cross-layer KV sharing, unweighted V-norm) | text |
+| `olmo2` | **Olmo 2** (PostNorm topology, split-half Neox RoPE, per-head and vector QK-norm) | text |
+| `olmo3` | **Olmo 3** (sliding window attention, YaRN RoPE scaling) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
 | `qwen35` | **Qwen 3.5 / Ornith 1.0** (interleaved Gated Delta Net hybrid) | text |
 | `granite` | **IBM Granite 3.x**, and the dense **Granite 4.1** line (3b / 8b / 30b) | text |
+| `granitehybrid`, `falcon-h1` | **Granite 4.0-H / Falcon H1R** (hybrid Mamba-2 SSD recurrence and parallel attention) | text |
 | `minicpm`, `minicpm5` | **MiniCPM / MiniCPM5** (MiniCPM-1B / 2B) | text |
 | `nanbeige` | **Nanbeige 4.2** (looped-layer dense transformer) | text |
 | `phi3`, `phi` | **Phi-3 / Phi-3.5 / Phi-4-mini** (fused QKV, packed SwiGLU FFN) | text |
 | `mistral3` | **Ministral 3** (Norm YaRN RoPE, attention temperature scaling, Tekken BPE) | text |
 | `bailingmoe3`, `bailingmoe` | **Ling 3.0 Tiny** (hybrid KDA linear, MLA latent attention, and MoE) | text |
 
-No Granite 4.0 model loads today. The 4.0-H hybrids convert to a separate arch
-`granitehybrid`; the non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do
-convert to `granite`, but write `attention.head_count_kv` as a per-layer array
-that the loader does not yet accept. The 4.1 line above is unaffected.
+For Granite 4.0, the 4.0-H hybrid models load under `granitehybrid` (and Falcon H1R under `falcon-h1`). The non-hybrid dense 4.0 variants write `attention.head_count_kv` as a per-layer array that the loader does not yet accept. The 4.1 line above is unaffected.
 
 Every architecture above runs on **all three compute backends** (CPU, Metal, and
 wgpu), with single-token decode and prompt prefill on each. Prefill uses
@@ -118,6 +120,17 @@ native Metal, Q4_1 works as a projection weight but not as `token_embd` /
 tensors parse, and are dequantized on the LoRA, vision, and audio paths, but the
 transformer weight and token-embedding paths have no kernel for them; an
 F16-weight LLM is not a supported configuration.
+
+### CPU Performance Optimizations
+
+Cera provides a highly optimized quantized CPU execution path for ARM NEON (aarch64) and x86_64:
+
+- **Register-Tiled K-Quant GEMV**: `gemv_q4k_q8_0_neon_dotprod` employs 4-row register tiling with 2-row and 1-row remainders. Dynamic 1-row work stealing across threads eliminates load imbalance on performance cores.
+- **Fused SwiGLU NEON Kernels**: Gate and up projections for Q4_0, Q4_K, and Q5_K formats are fused into a single kernel dispatch (`gemv_q4k_gate_up_swiglu_neon`). In-register SiLU activation avoids intermediate buffer writes, while quantized activation vector loads are shared across both projections.
+- **Fused QKV Attention (`concat3`)**: Unified kernel dispatches combine Q, K, and V projections into a single parallel pass, sharing activation quantization and column sums.
+- **Fused RMSNorm and Dynamic Q8_0 Quantization**: `rmsnorm_and_quantize_q8_0` combines layer normalization with activation quantization in a single pass, eliminating intermediate memory roundtrips before linear projections.
+- **Direct Greedy Argmax (`gemv_preq_argmax`)**: Direct argmax extraction from quantized output heads skips allocating, projecting, and writing back the entire vocabulary logit vector during greedy decode. This saves over 500 KB of memory bandwidth per step on large vocabularies.
+- **Dedicated Prefill Thread Pool**: `par_range_prefill` isolates compute-heavy prompt prefill from latency-sensitive decode steps, preventing thread pool contention.
 
 ## Language bindings
 
