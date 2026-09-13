@@ -53,10 +53,17 @@ impl CudaDevice {
         // rather than burning 100% CPU in a spin-wait loop, which is critical for preventing
         // scheduling jitter on the 20 ms Tier 1 audio pipeline (AEC, beamforming, VAD).
         unsafe {
-            let _ = sys::cuDevicePrimaryCtxSetFlags_v2(
+            let res = sys::cuDevicePrimaryCtxSetFlags_v2(
                 cu_device,
                 sys::CUctx_flags_enum::CU_CTX_SCHED_BLOCKING_SYNC as u32,
             );
+            if res != sys::cudaError_enum::CUDA_SUCCESS
+                && res != sys::cudaError_enum::CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE
+            {
+                return Err(cudarc::driver::DriverError(res)).context(
+                    "failed to configure CU_CTX_SCHED_BLOCKING_SYNC on CUDA primary context",
+                );
+            }
         }
 
         let ctx = CudaContext::new(ordinal).with_context(|| {

@@ -3078,7 +3078,7 @@ class BackendPreference(enum.Enum):
     
     AUTO = 0
     """
-    Probe Metal → GPU → CPU at load time.
+    Probe CUDA / Metal / GPU / CPU at load time.
 """
     
     CPU = 1
@@ -3091,6 +3091,11 @@ class BackendPreference(enum.Enum):
     METAL = 3
     """
     Native Metal. Requires the `metal` feature + macOS.
+"""
+    
+    CUDA = 4
+    """
+    Native CUDA. Requires the `cuda` feature.
 """
     
 
@@ -3107,6 +3112,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             return BackendPreference.GPU
         if variant == 4:
             return BackendPreference.METAL
+        if variant == 5:
+            return BackendPreference.CUDA
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -3118,6 +3125,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
         if value == BackendPreference.GPU:
             return
         if value == BackendPreference.METAL:
+            return
+        if value == BackendPreference.CUDA:
             return
         raise ValueError(value)
 
@@ -3131,6 +3140,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             buf.write_i32(3)
         if value == BackendPreference.METAL:
             buf.write_i32(4)
+        if value == BackendPreference.CUDA:
+            buf.write_i32(5)
 
 
 

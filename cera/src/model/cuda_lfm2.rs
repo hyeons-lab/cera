@@ -122,6 +122,7 @@ pub struct CudaWorkspace {
     pub final_norm: CudaBuffer,
     pub logits: CudaBuffer,
     pub pinned_logits: CudaPinnedBuffer,
+    pub embd_scratch: Vec<f32>,
 }
 
 /// Native CUDA LFM2 model instance.
@@ -228,8 +229,8 @@ impl CudaLfm2Model {
                     .conv_out_proj_ref(i)
                     .context("missing conv_out_proj_ref")?;
 
-                let d_conv = 3u32;
                 let kernel_size = (conv_w_data.len() / hs) as u32;
+                let d_conv = kernel_size.saturating_sub(1);
                 let rbuffer =
                     ctx.create_buffer((d_conv as usize) * hs * std::mem::size_of::<f32>())?;
 
@@ -337,6 +338,7 @@ impl CudaLfm2Model {
             final_norm: ctx.create_buffer(hs * f32_size)?,
             logits: ctx.create_buffer(vocab_size * f32_size)?,
             pinned_logits: ctx.create_pinned_buffer(vocab_size * f32_size)?,
+            embd_scratch: vec![0.0f32; hs],
         };
 
         Ok(Self {
@@ -374,6 +376,7 @@ impl CudaLfm2Model {
         token_id: usize,
         pos: usize,
         ws: &mut CudaWorkspace,
+        compute_logits: bool,
     ) -> Result<()> {
         let hs = self.config.hidden_size as u32;
         let is = self.config.intermediate_size as u32;
@@ -384,9 +387,9 @@ impl CudaLfm2Model {
             self.ctx
                 .gather_embedding_q8_0(&mut ws.hidden, table, token_id as u32, hs)?;
         } else {
-            let mut embd_row = vec![0.0f32; self.embedding_hidden_size];
-            self.dequant_embedding_row(token_id, &mut embd_row);
-            ws.hidden.copy_from_host(bytemuck::cast_slice(&embd_row))?;
+            self.dequant_embedding_row(token_id, &mut ws.embd_scratch);
+            ws.hidden
+                .copy_from_host(bytemuck::cast_slice(&ws.embd_scratch))?;
         }
 
         // 2. Sequential layer execution
@@ -474,7 +477,7 @@ impl CudaLfm2Model {
                         d_conv: conv.d_conv,
                         _pad: 0,
                     };
-                    let mut rbuffer = conv.rbuffer.lock().unwrap();
+                    let mut rbuffer = conv.rbuffer.lock().unwrap_or_else(|e| e.into_inner());
                     self.ctx.conv1d_fused(
                         &mut ws.conv_out,
                         &ws.conv_proj,
@@ -509,13 +512,13 @@ impl CudaLfm2Model {
                 .dispatch_accum(&self.ctx, &mut ws.hidden, &ws.gate)?;
         }
 
-        // 3. Final RMSNorm
-        self.ctx
-            .rmsnorm(&mut ws.final_norm, &ws.hidden, &self.output_norm, hs, eps)?;
-
-        // 4. Logit projection
-        self.output_weight
-            .dispatch(&self.ctx, &mut ws.logits, &ws.final_norm)?;
+        // 3. Final RMSNorm and logit projection (elided for intermediate prefill tokens)
+        if compute_logits {
+            self.ctx
+                .rmsnorm(&mut ws.final_norm, &ws.hidden, &self.output_norm, hs, eps)?;
+            self.output_weight
+                .dispatch(&self.ctx, &mut ws.logits, &ws.final_norm)?;
+        }
 
         Ok(())
     }
@@ -539,17 +542,25 @@ impl Model for CudaLfm2Model {
                 self.max_seq_len
             );
 
-            self.forward_step_device(token as usize, cur_pos, &mut ws)
-                .expect("CUDA forward step failed");
+            if let Err(e) = self.forward_step_device(token as usize, cur_pos, &mut ws, is_last) {
+                tracing::error!("CUDA forward step failed at pos {cur_pos}: {e:?}");
+                return vec![0.0f32; vocab_size];
+            }
 
             if is_last {
-                self.ctx.synchronize().expect("CUDA synchronize failed");
+                if let Err(e) = self.ctx.synchronize() {
+                    tracing::error!("CUDA synchronize failed: {e:?}");
+                    return vec![0.0f32; vocab_size];
+                }
 
-                let mut logits = vec![0.0f32; vocab_size];
-                ws.logits
-                    .copy_to_host(bytemuck::cast_slice_mut(&mut logits))
-                    .expect("CUDA logit readback failed");
-                last_logits = logits;
+                let ws_ref = &mut *ws;
+                let pinned_slice = ws_ref.pinned_logits.as_mut_slice();
+                if let Err(e) = ws_ref.logits.copy_to_host(pinned_slice) {
+                    tracing::error!("CUDA logit readback failed: {e:?}");
+                    return vec![0.0f32; vocab_size];
+                }
+                let pinned_f32: &[f32] = bytemuck::cast_slice(ws_ref.pinned_logits.as_slice());
+                last_logits = pinned_f32[..vocab_size].to_vec();
             }
 
             self.seq_len.store(cur_pos + 1, Ordering::Relaxed);
