@@ -5,6 +5,7 @@ pub mod hybrid;
 pub mod lfm2;
 pub mod llama;
 pub mod pii;
+pub mod qwen35;
 pub mod transformer;
 pub mod whisper;
 pub mod whisper_preprocessor;
@@ -63,6 +64,7 @@ pub enum BlockType {
     GatedConv,
     Mamba2,
     ParallelAttentionMamba2,
+    DeltaNet,
 }
 
 /// Mamba-2 SSM architecture parameters.
@@ -777,6 +779,11 @@ pub fn load_model(
         "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
             gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
         ),
+        "qwen35" | "qwen3_5" | "qwen3.5" => Box::new(qwen35::Qwen35Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
         other => bail!("unsupported architecture: {other}"),
     };
 

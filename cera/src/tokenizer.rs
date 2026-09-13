@@ -1043,8 +1043,8 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // (LLM_CHAT pre type), which differs from LLAMA3 only in splitting
         // numbers one digit at a time (`\p{N}` rather than `\p{N}{1,3}`). The
         // upstream `\s+(?!\S)` lookahead is emulated in `encode`'s split loop
-        // (see the LLAMA3 arm). Used by both Qwen2 and Qwen3 GGUFs.
-        "qwen2" => concat!(
+        // Used by Qwen2, Qwen3, and Qwen3.5 GGUFs.
+        "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}",
@@ -1315,6 +1315,16 @@ mod tests {
             build_pretokenize_regex("default").as_str(),
             build_pretokenize_regex("llama3").as_str(),
         );
+    }
+
+    #[test]
+    fn test_pretokenize_qwen35_matches_qwen2() {
+        let qwen2_re = build_pretokenize_regex("qwen2");
+        let qwen2_pattern = qwen2_re.as_str();
+        assert_eq!(build_pretokenize_regex("qwen3").as_str(), qwen2_pattern);
+        assert_eq!(build_pretokenize_regex("qwen35").as_str(), qwen2_pattern);
+        assert_eq!(build_pretokenize_regex("qwen3_5").as_str(), qwen2_pattern);
+        assert_eq!(build_pretokenize_regex("qwen3.5").as_str(), qwen2_pattern);
     }
 
     #[test]

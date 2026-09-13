@@ -276,19 +276,43 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
             "post_feedforward_layernorm.weight" => "ffn_post_norm.weight",
             "post_feedforward_layernorm.bias" => "ffn_post_norm.bias",
             "post_attention_layernorm.weight" => {
-                if arch == "gemma2" || arch == "olmo2" || arch == "olmoe" {
+                if arch == "gemma2"
+                    || arch == "olmo2"
+                    || arch == "olmoe"
+                    || arch == "qwen35"
+                    || arch == "qwen3_5"
+                    || arch == "qwen3.5"
+                {
                     "attn_post_norm.weight"
                 } else {
                     "ffn_norm.weight"
                 }
             }
             "post_attention_layernorm.bias" => {
-                if arch == "gemma2" || arch == "olmo2" || arch == "olmoe" {
+                if arch == "gemma2"
+                    || arch == "olmo2"
+                    || arch == "olmoe"
+                    || arch == "qwen35"
+                    || arch == "qwen3_5"
+                    || arch == "qwen3.5"
+                {
                     "attn_post_norm.bias"
                 } else {
                     "ffn_norm.bias"
                 }
             }
+            "linear_attn.in_proj_qkv.weight" | "linear_attn.in_proj_qkvz.weight" => {
+                "attn_qkv.weight"
+            }
+            "linear_attn.in_proj_z.weight" => "attn_gate.weight",
+            "linear_attn.conv1d.weight" => "ssm_conv1d.weight",
+            "linear_attn.conv1d.bias" => "ssm_conv1d.bias",
+            "linear_attn.dt_bias" | "linear_attn.dt_proj.bias" => "ssm_dt.bias",
+            "linear_attn.A_log" => "ssm_a",
+            "linear_attn.in_proj_b.weight" => "ssm_beta.weight",
+            "linear_attn.in_proj_a.weight" => "ssm_alpha.weight",
+            "linear_attn.norm.weight" => "ssm_norm.weight",
+            "linear_attn.out_proj.weight" => "ssm_out.weight",
             "operator.conv.weight" | "conv.conv.weight" => "shortconv.conv.weight",
             "operator.conv.bias" | "conv.conv.bias" => "shortconv.conv.bias",
             "operator.in_proj.weight" | "conv.in_proj.weight" => "shortconv.in_proj.weight",
@@ -456,6 +480,27 @@ mod tests {
                 "olmo2"
             ),
             "blk.0.attn_post_norm.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.post_attention_layernorm.weight",
+                "qwen35"
+            ),
+            "blk.0.attn_post_norm.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                "qwen35"
+            ),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.linear_attn.A_log",
+                "qwen35"
+            ),
+            "blk.0.ssm_a"
         );
 
         // Whisper mappings

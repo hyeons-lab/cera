@@ -486,6 +486,13 @@ pub fn stream_quantize_hf_repo(
             }
         }
 
+        if matches!(arch, "qwen35" | "qwen3_5" | "qwen3.5") && pt.gguf_name.ends_with(".ssm_a") {
+            for v in f32_data.iter_mut() {
+                let clamped = v.clamp(-80.0, 80.0);
+                *v = -clamped.exp();
+            }
+        }
+
         // Quantize to target GGML type
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);
         quant_buf.resize(target_size, 0);
@@ -871,6 +878,15 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.ends_with("norm.weight") {
             for v in f32_data.iter_mut() {
                 *v += 1.0;
+            }
+        }
+
+        if matches!(arch.as_str(), "qwen35" | "qwen3_5" | "qwen3.5")
+            && pt.gguf_name.ends_with(".ssm_a")
+        {
+            for v in f32_data.iter_mut() {
+                let clamped = v.clamp(-80.0, 80.0);
+                *v = -clamped.exp();
             }
         }
 

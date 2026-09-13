@@ -4637,10 +4637,12 @@ impl MetalLfm2Model {
                          cross-backend cache-namespace leak."
                     );
                 }
-                LayerSnapshot::Mamba2 { .. } | LayerSnapshot::ParallelAttentionMamba2 { .. } => {
+                LayerSnapshot::Mamba2 { .. }
+                | LayerSnapshot::ParallelAttentionMamba2 { .. }
+                | LayerSnapshot::DeltaNet { .. } => {
                     panic!(
-                        "MetalLfm2Model::restore_state_locked received a Mamba2 snapshot at layer {i}; \
-                         Mamba2 is not supported on MetalLfm2Model."
+                        "MetalLfm2Model::restore_state_locked received an unsupported recurrent snapshot at layer {i}; \
+                         Mamba2 and DeltaNet are not supported on MetalLfm2Model."
                     );
                 }
             }
