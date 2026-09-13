@@ -1330,9 +1330,12 @@ pub(crate) struct AttnWeights<'a> {
 ///   Present for Qwen2, `None` for Qwen3.
 /// - `qk_norm`: per-head RMSNorm weights for Q and K, applied BEFORE RoPE
 ///   (head_dim each). Present for Qwen3, `None` for Qwen2.
+/// - `attn_output_bias`: bias vector added right after attention output projection.
+#[derive(Default)]
 pub(crate) struct AttnExtras<'a> {
     pub qkv_bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
     pub qk_norm: Option<(&'a [f32], &'a [f32])>,
+    pub attn_output_bias: Option<&'a [f32]>,
 }
 
 /// Static per-layer dimensions for the attention helper.
@@ -1346,18 +1349,20 @@ pub(crate) struct AttnDims<'a> {
     pub rms_norm_eps: f32,
     /// RoPE pair layout: `Neox` for Qwen2/Qwen3, `Norm` for LLaMA/Mistral/Granite.
     pub rope_type: cpu::RopeType,
-    /// Softmax scale override. `None` ⇒ `1/sqrt(head_dim)` (the default). Granite
+    /// Softmax scale override. `None` => `1/sqrt(head_dim)` (the default). Granite
     /// 3.x sets this to its `attention.scale` multiplier.
     pub attn_scale: Option<f32>,
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
-    /// applied only on the NORM path; `None` ⇒ plain RoPE.
+    /// applied only on the NORM path; `None` => plain RoPE.
     pub rope_freqs: Option<&'a [f32]>,
     /// Optional logit soft-capping factor for attention scores (e.g. Gemma 2).
     pub attn_logit_softcapping: Option<f32>,
     /// Optional sliding window attention size (e.g. Olmo 3).
     pub sliding_window: Option<usize>,
-    /// Optional YaRN RoPE scaling configuration (e.g. Olmo 3).
+    /// Optional YaRN RoPE scaling configuration (e.g. Olmo 3, Mistral 3).
     pub yarn: Option<cpu::YarnParams>,
+    /// Optional attention temperature scaling (scale, floor_scale) (e.g. Mistral 3).
+    pub attn_temp_scale: Option<(f32, usize)>,
 }
 
 // ── Decode-time GQA attention ───────────────────────────────────────────────
@@ -1728,16 +1733,41 @@ pub(crate) fn forward_attn_block(
                 cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, dims.rope_theta);
             }
         }
-        cpu::RopeType::Norm => cpu::rope_norm(
-            q,
-            k,
-            pos,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            dims.rope_theta,
-            dims.rope_freqs,
-        ),
+        cpu::RopeType::Norm => {
+            if let Some(yarn) = &dims.yarn {
+                cpu::rope_norm_yarn(
+                    q,
+                    k,
+                    pos,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    dims.rope_theta,
+                    yarn,
+                );
+            } else {
+                cpu::rope_norm(
+                    q,
+                    k,
+                    pos,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    dims.rope_theta,
+                    dims.rope_freqs,
+                );
+            }
+        }
+    }
+
+    // Optional attention temperature scaling (Mistral 3 / Llama 4).
+    if let Some((scale, floor_scale)) = dims.attn_temp_scale
+        && scale > 0.0
+        && floor_scale > 0
+        && pos >= floor_scale
+    {
+        let q_scale = ((pos as f32 / floor_scale as f32).floor() + 1.0).ln() * scale + 1.0;
+        cpu::scale_inplace(q, q_scale);
     }
 
     // Append K, V to the cache (f16 or f32). `kv_f16` is read before the
@@ -1881,6 +1911,11 @@ pub(crate) fn forward_attn_block(
             &mut state.scratch.lora_tmp,
         );
     }
+
+    if let Some(bias) = extras.attn_output_bias {
+        let len = hidden_size.min(bias.len());
+        cpu::add_inplace(&mut state.scratch.out[..len], &bias[..len]);
+    }
 }
 
 /// Pre-resolved FFN weight refs for a transformer layer.
@@ -1888,6 +1923,14 @@ pub(crate) struct FfnWeights<'a> {
     pub ffn_gate: &'a WeightRef,
     pub ffn_up: &'a WeightRef,
     pub ffn_down: &'a WeightRef,
+}
+
+/// Optional per-layer FFN biases.
+#[derive(Default)]
+pub(crate) struct FfnExtras<'a> {
+    pub gate_bias: Option<&'a [f32]>,
+    pub up_bias: Option<&'a [f32]>,
+    pub down_bias: Option<&'a [f32]>,
 }
 
 /// Gated FFN activation function: SwiGLU (SiLU * up) vs GeGLU (GeLU * up).
@@ -1906,6 +1949,7 @@ pub(crate) fn forward_ffn_block(
     gguf: &GgufFile,
     layer: usize,
     weights: &FfnWeights,
+    extras: &FfnExtras<'_>,
     hidden_size: usize,
     intermediate_size: usize,
     ffn_input: &[f32],
@@ -1916,6 +1960,8 @@ pub(crate) fn forward_ffn_block(
     #[cfg(target_arch = "aarch64")]
     let can_fuse_swiglu = activation == FfnActivation::Swiglu
         && lora.is_none()
+        && extras.gate_bias.is_none()
+        && extras.up_bias.is_none()
         && weights.ffn_gate.dtype == DType::Q4_0
         && weights.ffn_up.dtype == DType::Q4_0;
     #[cfg(target_arch = "aarch64")]
@@ -1984,8 +2030,16 @@ pub(crate) fn forward_ffn_block(
     let fused_swiglu_done = can_fuse_swiglu;
     #[cfg(not(target_arch = "aarch64"))]
     let fused_swiglu_done = false;
-
     if !fused_swiglu_done {
+        if let Some(b) = extras.gate_bias {
+            let len = intermediate_size.min(b.len());
+            cpu::add_inplace(&mut state.scratch.gate[..len], &b[..len]);
+        }
+        if let Some(b) = extras.up_bias {
+            let len = intermediate_size.min(b.len());
+            cpu::add_inplace(&mut state.scratch.up[..len], &b[..len]);
+        }
+
         // LoRA on gate/up - BEFORE the SwiGLU mul (which reads both), input is the
         // normed FFN input.
         if let Some(lora) = &lora {
@@ -2062,6 +2116,11 @@ pub(crate) fn forward_ffn_block(
             &mut state.scratch.out[..hidden_size],
             &mut state.scratch.lora_tmp,
         );
+    }
+
+    if let Some(b) = extras.down_bias {
+        let len = hidden_size.min(b.len());
+        cpu::add_inplace(&mut state.scratch.out[..len], &b[..len]);
     }
 }
 
