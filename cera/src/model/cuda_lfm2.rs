@@ -133,6 +133,7 @@ pub struct CudaLfm2Model {
     pub output_weight: CudaWeight,
     pub embedding_bytes: Vec<u8>,
     pub embedding_dtype: DType,
+    pub embedding_table: Option<CudaBuffer>,
     pub embedding_hidden_size: usize,
     pub freq_factors: Option<CudaBuffer>,
     pub workspace: Mutex<CudaWorkspace>,
@@ -310,6 +311,11 @@ impl CudaLfm2Model {
         let embd_data = src.embedding_tensor_data()?;
         let embedding_bytes = embd_data.into_owned();
         let embedding_hidden_size = hs;
+        let embedding_table = if embedding_dtype == DType::Q8_0 {
+            Some(ctx.upload_bytes(&embedding_bytes)?)
+        } else {
+            None
+        };
 
         // RoPE frequency factors
         let freq_factors = src.rope_freqs().map(|w| ctx.upload_f32(w)).transpose()?;
@@ -341,6 +347,7 @@ impl CudaLfm2Model {
             output_weight,
             embedding_bytes,
             embedding_dtype,
+            embedding_table,
             embedding_hidden_size,
             freq_factors,
             workspace: Mutex::new(workspace),
@@ -373,9 +380,14 @@ impl CudaLfm2Model {
         let eps = self.config.rms_norm_eps;
 
         // 1. Token embedding lookup
-        let mut embd_row = vec![0.0f32; self.embedding_hidden_size];
-        self.dequant_embedding_row(token_id, &mut embd_row);
-        ws.hidden.copy_from_host(bytemuck::cast_slice(&embd_row))?;
+        if let Some(table) = &self.embedding_table {
+            self.ctx
+                .gather_embedding_q8_0(&mut ws.hidden, table, token_id as u32, hs)?;
+        } else {
+            let mut embd_row = vec![0.0f32; self.embedding_hidden_size];
+            self.dequant_embedding_row(token_id, &mut embd_row);
+            ws.hidden.copy_from_host(bytemuck::cast_slice(&embd_row))?;
+        }
 
         // 2. Sequential layer execution
         for layer in &self.layers {
@@ -520,6 +532,7 @@ impl Model for CudaLfm2Model {
         let mut last_logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             let cur_pos = pos + i;
+            let is_last = i == tokens.len() - 1;
             assert!(
                 cur_pos < self.max_seq_len,
                 "cur_pos {cur_pos} exceeds max_seq_len {}",
@@ -528,13 +541,16 @@ impl Model for CudaLfm2Model {
 
             self.forward_step_device(token as usize, cur_pos, &mut ws)
                 .expect("CUDA forward step failed");
-            self.ctx.synchronize().expect("CUDA synchronize failed");
 
-            let mut logits = vec![0.0f32; vocab_size];
-            ws.logits
-                .copy_to_host(bytemuck::cast_slice_mut(&mut logits))
-                .expect("CUDA logit readback failed");
-            last_logits = logits;
+            if is_last {
+                self.ctx.synchronize().expect("CUDA synchronize failed");
+
+                let mut logits = vec![0.0f32; vocab_size];
+                ws.logits
+                    .copy_to_host(bytemuck::cast_slice_mut(&mut logits))
+                    .expect("CUDA logit readback failed");
+                last_logits = logits;
+            }
 
             self.seq_len.store(cur_pos + 1, Ordering::Relaxed);
             state.seq_len += 1;
