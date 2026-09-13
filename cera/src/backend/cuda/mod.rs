@@ -253,7 +253,7 @@ impl CudaContext {
     ) -> Result<()> {
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0")?;
         let warps_per_block = 8u32;
-        let num_blocks = m.div_ceil(warps_per_block * 2);
+        let num_blocks = m.div_ceil(warps_per_block * 4);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (warps_per_block * 32, 1, 1),
@@ -280,7 +280,7 @@ impl CudaContext {
     ) -> Result<()> {
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_accum")?;
         let warps_per_block = 8u32;
-        let num_blocks = m.div_ceil(warps_per_block * 2);
+        let num_blocks = m.div_ceil(warps_per_block * 4);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (warps_per_block * 32, 1, 1),
@@ -448,7 +448,7 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Execute SwiGLU elementwise operation in-place: a[i] = silu(a[i]) * b[i].
+    /// Execute SwiGLU elementwise operation in-place: `a[i] = silu(a[i]) * b[i]`.
     pub fn silu_mul_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "silu_mul_inplace")?;
         let cfg = LaunchConfig::for_num_elems(n);
@@ -461,7 +461,7 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Execute elementwise vector addition in-place: a[i] += b[i].
+    /// Execute elementwise vector addition in-place: `a[i] += b[i]`.
     pub fn add_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "add_inplace")?;
         let cfg = LaunchConfig::for_num_elems(n);
@@ -474,7 +474,7 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Execute scaled vector addition in-place: a[i] += scale * b[i].
+    /// Execute scaled vector addition in-place: `a[i] += scale * b[i]`.
     pub fn scaled_add_inplace(
         &self,
         a: &mut CudaBuffer,
@@ -493,7 +493,7 @@ impl CudaContext {
         Ok(())
     }
 
-    /// Execute scalar scaling in-place: a[i] *= scale.
+    /// Execute scalar scaling in-place: `a[i] *= scale`.
     pub fn scale_inplace(&self, a: &mut CudaBuffer, scale: f32, n: u32) -> Result<()> {
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "scale_f32")?;
         let cfg = LaunchConfig::for_num_elems(n);
@@ -516,6 +516,9 @@ impl CudaContext {
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "cast_f32_to_f16")?;
         let cfg = LaunchConfig::for_num_elems(n);
         let params = ElementwiseParams { n, _pad: 0 };
+        // SAFETY: dst_ptr evaluates to a 64-bit unsigned device virtual address (CUdeviceptr = u64).
+        // The cast_f32_to_f16 kernel accepts uint16_t* __restrict__ dst, which matches the standard
+        // 64-bit CUDA driver execution stack pointer layout.
         let dst_ptr =
             dst.cu_device_ptr() + (dst_element_offset * std::mem::size_of::<u16>()) as u64;
         let mut builder = self.stream.launch_builder(&kernel);

@@ -34,6 +34,8 @@ __global__ void gemm_q8_0(
     GemmParams params
 ) {
     __shared__ float s_x[TILE_M][32];
+    __shared__ int8_t s_w[TILE_N][32];
+    __shared__ float s_d[TILE_N];
 
     const uint32_t tx = threadIdx.x; // 0..15 (output row within tile)
     const uint32_t ty = threadIdx.y; // 0..15 (token within tile)
@@ -44,7 +46,6 @@ __global__ void gemm_q8_0(
 
     const uint32_t nb = params.k / 32;
     const size_t row_bytes = (size_t)nb * 34;
-    const uint8_t* row_ptr = (n_idx < params.n) ? (a + (size_t)n_idx * row_bytes) : nullptr;
 
     float sum = 0.0f;
 
@@ -72,22 +73,54 @@ __global__ void gemm_q8_0(
             s_x[tok1][col1] = 0.0f;
         }
 
+        // Cooperatively load 16x32 weights into shared memory (2 int8 per thread)
+        const uint32_t w_elem0 = tid * 2;
+        const uint32_t w_elem1 = w_elem0 + 1;
+        const uint32_t w_row0 = w_elem0 / 32;
+        const uint32_t w_col0 = w_elem0 % 32;
+        const uint32_t global_n0 = blockIdx.x * TILE_N + w_row0;
+
+        if (global_n0 < params.n) {
+            const uint8_t* blk0 = a + (size_t)global_n0 * row_bytes + (size_t)ib * 34;
+            s_w[w_row0][w_col0] = *(const int8_t*)(blk0 + 2 + w_col0);
+        } else {
+            s_w[w_row0][w_col0] = 0;
+        }
+
+        const uint32_t w_row1 = w_elem1 / 32;
+        const uint32_t w_col1 = w_elem1 % 32;
+        const uint32_t global_n1 = blockIdx.x * TILE_N + w_row1;
+
+        if (global_n1 < params.n) {
+            const uint8_t* blk1 = a + (size_t)global_n1 * row_bytes + (size_t)ib * 34;
+            s_w[w_row1][w_col1] = *(const int8_t*)(blk1 + 2 + w_col1);
+        } else {
+            s_w[w_row1][w_col1] = 0;
+        }
+
+        // First 16 threads load the 16 scales
+        if (tid < TILE_N) {
+            const uint32_t global_n = blockIdx.x * TILE_N + tid;
+            if (global_n < params.n) {
+                const uint8_t* blk = a + (size_t)global_n * row_bytes + (size_t)ib * 34;
+                uint16_t d_h;
+                memcpy(&d_h, blk, sizeof(uint16_t));
+                s_d[tid] = half_to_float(d_h);
+            } else {
+                s_d[tid] = 0.0f;
+            }
+        }
+
         __syncthreads();
 
-        // Compute dot product for active (m_idx, n_idx)
-        if (row_ptr && m_idx < params.m) {
-            const uint8_t* blk = row_ptr + (size_t)ib * 34;
-            uint16_t d_h;
-            memcpy(&d_h, blk, sizeof(uint16_t));
-            const float d = half_to_float(d_h);
-            const int8_t* qs = (const int8_t*)(blk + 2);
-
+        // Compute dot product from shared memory activations and weights
+        if (m_idx < params.m && n_idx < params.n) {
             float dot = 0.0f;
             #pragma unroll 8
             for (int i = 0; i < 32; i++) {
-                dot += (float)qs[i] * s_x[ty][i];
+                dot += (float)s_w[tx][i] * s_x[ty][i];
             }
-            sum += dot * d;
+            sum += dot * s_d[tx];
         }
 
         __syncthreads();
@@ -106,6 +139,8 @@ __global__ void gemm_q8_0_accum(
     GemmParams params
 ) {
     __shared__ float s_x[TILE_M][32];
+    __shared__ int8_t s_w[TILE_N][32];
+    __shared__ float s_d[TILE_N];
 
     const uint32_t tx = threadIdx.x;
     const uint32_t ty = threadIdx.y;
@@ -116,7 +151,6 @@ __global__ void gemm_q8_0_accum(
 
     const uint32_t nb = params.k / 32;
     const size_t row_bytes = (size_t)nb * 34;
-    const uint8_t* row_ptr = (n_idx < params.n) ? (a + (size_t)n_idx * row_bytes) : nullptr;
 
     float sum = 0.0f;
 
@@ -142,21 +176,51 @@ __global__ void gemm_q8_0_accum(
             s_x[tok1][col1] = 0.0f;
         }
 
+        const uint32_t w_elem0 = tid * 2;
+        const uint32_t w_elem1 = w_elem0 + 1;
+        const uint32_t w_row0 = w_elem0 / 32;
+        const uint32_t w_col0 = w_elem0 % 32;
+        const uint32_t global_n0 = blockIdx.x * TILE_N + w_row0;
+
+        if (global_n0 < params.n) {
+            const uint8_t* blk0 = a + (size_t)global_n0 * row_bytes + (size_t)ib * 34;
+            s_w[w_row0][w_col0] = *(const int8_t*)(blk0 + 2 + w_col0);
+        } else {
+            s_w[w_row0][w_col0] = 0;
+        }
+
+        const uint32_t w_row1 = w_elem1 / 32;
+        const uint32_t w_col1 = w_elem1 % 32;
+        const uint32_t global_n1 = blockIdx.x * TILE_N + w_row1;
+
+        if (global_n1 < params.n) {
+            const uint8_t* blk1 = a + (size_t)global_n1 * row_bytes + (size_t)ib * 34;
+            s_w[w_row1][w_col1] = *(const int8_t*)(blk1 + 2 + w_col1);
+        } else {
+            s_w[w_row1][w_col1] = 0;
+        }
+
+        if (tid < TILE_N) {
+            const uint32_t global_n = blockIdx.x * TILE_N + tid;
+            if (global_n < params.n) {
+                const uint8_t* blk = a + (size_t)global_n * row_bytes + (size_t)ib * 34;
+                uint16_t d_h;
+                memcpy(&d_h, blk, sizeof(uint16_t));
+                s_d[tid] = half_to_float(d_h);
+            } else {
+                s_d[tid] = 0.0f;
+            }
+        }
+
         __syncthreads();
 
-        if (row_ptr && m_idx < params.m) {
-            const uint8_t* blk = row_ptr + (size_t)ib * 34;
-            uint16_t d_h;
-            memcpy(&d_h, blk, sizeof(uint16_t));
-            const float d = half_to_float(d_h);
-            const int8_t* qs = (const int8_t*)(blk + 2);
-
+        if (m_idx < params.m && n_idx < params.n) {
             float dot = 0.0f;
             #pragma unroll 8
             for (int i = 0; i < 32; i++) {
-                dot += (float)qs[i] * s_x[ty][i];
+                dot += (float)s_w[tx][i] * s_x[ty][i];
             }
-            sum += dot * d;
+            sum += dot * s_d[tx];
         }
 
         __syncthreads();

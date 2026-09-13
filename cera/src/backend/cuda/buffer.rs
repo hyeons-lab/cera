@@ -22,7 +22,7 @@ pub struct CudaBuffer {
 }
 
 impl CudaBuffer {
-    /// Wrap an existing CudaSlice<u8>.
+    /// Wrap an existing `CudaSlice<u8>`.
     pub fn new(slice: CudaSlice<u8>) -> Self {
         Self { slice }
     }
@@ -67,12 +67,12 @@ impl CudaBuffer {
         Ok(())
     }
 
-    /// Reference to the underlying CudaSlice<u8>.
+    /// Reference to the underlying `CudaSlice<u8>`.
     pub fn inner(&self) -> &CudaSlice<u8> {
         &self.slice
     }
 
-    /// Mutable reference to the underlying CudaSlice<u8>.
+    /// Mutable reference to the underlying `CudaSlice<u8>`.
     pub fn inner_mut(&mut self) -> &mut CudaSlice<u8> {
         &mut self.slice
     }
@@ -220,7 +220,7 @@ pub struct CudaUnifiedBuffer {
 }
 
 impl CudaUnifiedBuffer {
-    /// Wrap an existing UnifiedSlice<u8>.
+    /// Wrap an existing `UnifiedSlice<u8>`.
     pub fn new(slice: UnifiedSlice<u8>) -> Self {
         Self { slice }
     }
@@ -256,12 +256,12 @@ impl CudaUnifiedBuffer {
             .context("failed to prefetch unified memory to device")
     }
 
-    /// Reference to underlying UnifiedSlice<u8>.
+    /// Reference to underlying `UnifiedSlice<u8>`.
     pub fn inner(&self) -> &UnifiedSlice<u8> {
         &self.slice
     }
 
-    /// Mutable reference to underlying UnifiedSlice<u8>.
+    /// Mutable reference to underlying `UnifiedSlice<u8>`.
     pub fn inner_mut(&mut self) -> &mut UnifiedSlice<u8> {
         &mut self.slice
     }

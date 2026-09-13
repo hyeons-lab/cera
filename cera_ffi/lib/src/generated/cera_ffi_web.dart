@@ -1589,13 +1589,15 @@ class UserMessage {
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
 enum BackendPreference {
-  /// Probe Metal → GPU → CPU at load time.
+  /// Probe CUDA / Metal / GPU / CPU at load time.
   auto,
   cpu,
   /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
   gpu,
   /// Native Metal. Requires the `metal` feature + macOS.
   metal,
+  /// Native CUDA. Requires the `cuda` feature.
+  cuda,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -2540,6 +2542,7 @@ String _encodeBackendPreference(BackendPreference value) {
     BackendPreference.cpu => 'cpu',
     BackendPreference.gpu => 'gpu',
     BackendPreference.metal => 'metal',
+    BackendPreference.cuda => 'cuda',
   };
 }
 
@@ -2549,6 +2552,7 @@ BackendPreference _decodeBackendPreference(String raw) {
     'cpu' => BackendPreference.cpu,
     'gpu' => BackendPreference.gpu,
     'metal' => BackendPreference.metal,
+    'cuda' => BackendPreference.cuda,
     _ => throw StateError('Unknown BackendPreference variant: $raw'),
   };
 }
