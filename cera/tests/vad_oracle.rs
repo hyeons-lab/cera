@@ -440,16 +440,16 @@ fn test_silero_vad_stride_validation_and_20ms_timestamps() -> Result<()> {
         total_speech_default, total_speech_20ms
     );
     assert!(
-        total_speech_default > 0.0,
+        total_speech_default.is_finite() && total_speech_default > 0.0,
         "Expected speech detected with default stride, but got 0ms"
     );
     assert!(
-        total_speech_20ms > 0.0,
+        total_speech_20ms.is_finite() && total_speech_20ms > 0.0,
         "Expected speech detected with 20ms stride, but got 0ms"
     );
     let dur_ratio = total_speech_20ms / total_speech_default;
     assert!(
-        (0.85..=1.15).contains(&dur_ratio),
+        dur_ratio.is_finite() && (0.85..=1.15).contains(&dur_ratio),
         "Total speech duration ratio {dur_ratio:.2} outside expected range [0.85, 1.15]"
     );
 

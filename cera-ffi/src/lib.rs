@@ -3078,9 +3078,7 @@ pub struct FfiSileroVad {
 
 impl FfiSileroVad {
     fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::vad::SileroVad>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
-            detail: format!("VAD mutex poisoned: {e}"),
-        })
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -3202,9 +3200,7 @@ pub struct FfiVadIterator {
 
 impl FfiVadIterator {
     fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::vad::VadIterator>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
-            detail: format!("VAD iterator mutex poisoned: {e}"),
-        })
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 

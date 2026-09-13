@@ -318,11 +318,19 @@ impl VadIterator {
     /// When processing large chunks that span multiple stride windows, multiple events may be emitted.
     /// In such cases, the first event is returned immediately and subsequent events are queued internally
     /// and can be drained via [`pop_event`](Self::pop_event).
+    ///
+    /// Returns an error if `chunk` contains non-finite values (NaN or Inf). In that event, the
+    /// internal sample buffer remains unmodified.
     pub fn process_chunk(
         &mut self,
         vad: &mut SileroVad,
         chunk: &[f32],
     ) -> Result<Option<VadEvent>> {
+        ensure!(
+            chunk.iter().all(|s| s.is_finite()),
+            "input audio chunk contains non-finite values (NaN or Inf)"
+        );
+
         let window_size = self.rate.window_size();
 
         // Fast path for exact-size chunks matching stride with an empty buffer and no queued events
@@ -520,6 +528,10 @@ impl SileroVad {
     ///
     /// - For [`VadSampleRate::Rate16kHz`], `chunk` must have exactly 512 samples and `stride` must be in `1..=512`.
     /// - For [`VadSampleRate::Rate8kHz`], `chunk` must have exactly 256 samples and `stride` must be in `1..=256`.
+    ///
+    /// ### Acoustic Context Contract
+    /// This method updates the internal recurrent context buffer assuming that the subsequent call begins
+    /// exactly `stride` samples later in the audio stream. Callers must advance their audio window by `stride`.
     pub fn process_chunk_with_stride(
         &mut self,
         chunk: &[f32],
@@ -1167,5 +1179,41 @@ mod tests {
 
         // Subsequent flush returns None
         assert_eq!(iterator.flush(), None);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn test_vad_iterator_non_finite_rejection_and_buffer_recovery() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let candidates = [
+            manifest_dir.join("models/silero_vad.gguf"),
+            manifest_dir.join("../models/silero_vad.gguf"),
+            std::path::PathBuf::from("models/silero_vad.gguf"),
+        ];
+        let Some(path) = candidates.into_iter().find(|p| p.exists()) else {
+            eprintln!("Skipping test: models/silero_vad.gguf not found");
+            return;
+        };
+        let mut vad = SileroVad::from_file(&path).expect("load SileroVad fixture");
+        let mut iterator = VadIterator::new(VadSampleRate::Rate16kHz, VadConfig::default());
+
+        // Buffer some valid samples first (less than window size)
+        let initial_chunk = [0.0f32; 100];
+        assert!(iterator.process_chunk(&mut vad, &initial_chunk).is_ok());
+        assert_eq!(iterator.sample_buffer.len(), 100);
+
+        // Feed non-finite chunk
+        let mut nan_chunk = [0.0f32; 160];
+        nan_chunk[10] = f32::NAN;
+        assert!(iterator.process_chunk(&mut vad, &nan_chunk).is_err());
+        assert_eq!(
+            iterator.sample_buffer.len(),
+            100,
+            "sample buffer must not append poisoned NaN samples"
+        );
+
+        // Subsequent valid chunk completing the window succeeds
+        let valid_chunk = [0.0f32; 412];
+        assert!(iterator.process_chunk(&mut vad, &valid_chunk).is_ok());
     }
 }

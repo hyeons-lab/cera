@@ -1084,7 +1084,7 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         speech_pad_ms: usize,
 
-        /// Frame stride / hop size in samples (optional).
+        /// Frame stride / hop size in samples (optional; default: full window size of 512 for 16 kHz or 256 for 8 kHz).
         #[arg(long)]
         frame_stride: Option<usize>,
 
