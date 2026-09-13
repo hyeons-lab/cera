@@ -660,10 +660,10 @@ impl MetalLfm2Model {
         Self::from_weight_source(&cpu, path, context_size)
     }
 
-    /// Dense-transformer entry point (Qwen2/Qwen3/LLaMA/Mistral/Granite). Builds
+    /// Dense-transformer entry point (Qwen2/Qwen3/LLaMA/Mistral/Granite/MiniCPM). Builds
     /// the CPU `LlamaModel` and drives the same shared loader. Per-arch behavior
     /// (NEOX/NORM rope, Llama-3 freq factors, QK-norm, QKV bias, decoupled
-    /// head_dim, Granite scalars, untied output) is surfaced via the
+    /// head_dim, Granite/MiniCPM scalars, untied output) is surfaced via the
     /// `GpuWeightSource` accessors + `config`.
     pub fn from_llama(
         gguf: GgufFile,

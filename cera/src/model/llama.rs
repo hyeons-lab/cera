@@ -70,8 +70,8 @@ pub struct LlamaModel {
     activation: FfnActivation,
     attn_logit_softcapping: Option<f32>,
     final_logit_softcapping: Option<f32>,
-    // Granite 3.x scalar multipliers live on `config.scalars` (identity for
-    // every other arch) — see `ScalarMultipliers`.
+    // Granite 3.x and MiniCPM scalar multipliers live on `config.scalars` (identity
+    // for every other arch): see `ScalarMultipliers`.
     // Pre-dequantized small F32 weights.
     output_norm_weight: Vec<f32>,
     attn_norm_weights: Vec<Vec<f32>>,
@@ -180,11 +180,11 @@ impl LlamaModel {
         let prefix = arch.as_str();
 
         // RoPE layout per arch. Qwen, Gemma 2, Olmo 2, and Olmo 3 GGUFs are NEOX (split-halves);
-        // the LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
+        // the LLaMA-family (incl. Mistral, Granite, and MiniCPM) are NORM (interleaved pairs).
         let rope_type = match prefix {
             "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" => RopeType::Norm,
+            "llama" | "granite" | "minicpm" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch: phi3,
@@ -307,11 +307,6 @@ impl LlamaModel {
             );
         }
 
-        // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
-        // Absent on every other arch => identity, so this is a no-op for
-        // LLaMA/Mistral/Qwen. Carried on `config.scalars`.
-        let mut scalars = ScalarMultipliers::from_gguf(&gguf, prefix)?;
-
         let n_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
                 .with_context(|| format!("missing {prefix}.block_count"))? as usize;
@@ -319,6 +314,13 @@ impl LlamaModel {
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
+        ensure!(n_layers > 0, "{prefix}.block_count must be > 0");
+        ensure!(hidden_size > 0, "{prefix}.embedding_length must be > 0");
+
+        // Granite 3.x and MiniCPM scalar multipliers (embedding/residual/attention/logit).
+        // Absent on every other arch => identity, so this is a no-op for
+        // LLaMA/Mistral/Qwen. Carried on `config.scalars`.
+        let mut scalars = ScalarMultipliers::from_gguf(&gguf, prefix, n_layers, hidden_size)?;
 
         // Gemma 2 scales token embeddings by sqrt(hidden_size).
         if prefix == "gemma2" && scalars.embedding == 1.0 {
@@ -328,6 +330,10 @@ impl LlamaModel {
             .get_u32(&format!("{prefix}.feed_forward_length"))
             .with_context(|| format!("missing {prefix}.feed_forward_length"))?
             as usize;
+        ensure!(
+            intermediate_size > 0,
+            "{prefix}.feed_forward_length must be > 0"
+        );
         let n_heads = gguf
             .get_u32(&format!("{prefix}.attention.head_count"))
             .with_context(|| format!("missing {prefix}.attention.head_count"))?
@@ -364,29 +370,43 @@ impl LlamaModel {
             .get_u32(&format!("{prefix}.context_length"))
             .unwrap_or(128000) as usize;
         let max_seq_len = context_size.min(gguf_max_seq_len);
+        let default_rope_theta = if prefix == "minicpm" {
+            10_000.0
+        } else {
+            1_000_000.0
+        };
         let rope_theta = gguf
             .get_f32(&format!("{prefix}.rope.freq_base"))
-            .unwrap_or(1_000_000.0);
+            .unwrap_or(default_rope_theta);
+        ensure!(
+            rope_theta.is_finite() && rope_theta > 0.0,
+            "{prefix}.rope.freq_base must be positive and finite"
+        );
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);
+        ensure!(
+            rms_norm_eps.is_finite() && rms_norm_eps > 0.0,
+            "{prefix}.attention.layer_norm_rms_epsilon must be positive and finite"
+        );
 
         // head_dim: default hidden_size / n_heads, overridden by the optional
         // `{prefix}.attention.key_length` (Qwen3 sets this explicitly).
-        let head_dim = gguf
-            .get_u32(&format!("{prefix}.attention.key_length"))
-            .map(|v| v as usize)
-            .unwrap_or(hidden_size / n_heads);
+        let head_dim = match gguf.get_u32(&format!("{prefix}.attention.key_length")) {
+            Some(v) => {
+                ensure!(v > 0, "{prefix}.attention.key_length must be > 0");
+                v as usize
+            }
+            None => {
+                ensure!(
+                    hidden_size.is_multiple_of(n_heads),
+                    "hidden_size ({hidden_size}) must be divisible by n_heads ({n_heads})"
+                );
+                hidden_size / n_heads
+            }
+        };
         ensure!(head_dim > 0, "head_dim must be > 0");
-        if gguf
-            .get_u32(&format!("{prefix}.attention.key_length"))
-            .is_none()
-        {
-            ensure!(
-                hidden_size.is_multiple_of(n_heads),
-                "hidden_size ({hidden_size}) must be a multiple of n_heads ({n_heads})"
-            );
-        }
+
 
         let block_types = vec![BlockType::Attention; n_layers];
         let kv_heads_per_layer = vec![n_kv_heads; n_layers];

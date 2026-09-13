@@ -75,26 +75,26 @@ pub struct SsmConfig {
     pub n_group: usize,
 }
 
-/// Architecture scalar multipliers (Granite 3.x; HF names in parens). Every
-/// other arch leaves all of these absent ⇒ [`ScalarMultipliers::default`]
-/// (identity), so they are a no-op for LLaMA/Mistral/Qwen.
+/// Architecture scalar multipliers (Granite 3.x, MiniCPM; HF names in parens).
+/// Architectures without these multipliers leave them absent:
+/// [`ScalarMultipliers::default`] (identity), so they are a no-op for LLaMA,
+/// Mistral, and Qwen.
 ///
 /// These travel on [`ModelConfig`] alongside the other GGUF-derived scalars
-/// (`rope_theta`, `rms_norm_eps`, …) so a new multiplier-bearing arch or
+/// (`rope_theta`, `rms_norm_eps`, ...) so a new multiplier-bearing arch or
 /// back-end consumes them from config instead of re-deriving the four keys.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScalarMultipliers {
-    /// `embedding_multiplier` — scale embeddings right after the token lookup.
-    /// `1.0` ⇒ no-op.
+    /// `embedding_multiplier`: scale embeddings right after token lookup.
+    /// `1.0` is a no-op.
     pub embedding: f32,
-    /// `residual_multiplier` — scale each attention/FFN block output before its
-    /// residual add. `1.0` ⇒ no-op.
+    /// `residual_multiplier`: scale each attention/FFN block output before its
+    /// residual add. `1.0` is a no-op.
     pub residual: f32,
-    /// `attention_multiplier` — softmax scale that *replaces* `1/sqrt(head_dim)`.
-    /// `None` ⇒ use the default `1/sqrt(head_dim)` (it is a replacement, not a
-    /// multiplier, so it can't share the `1.0`-identity representation).
+    /// `attention_multiplier`: softmax scale that replaces `1/sqrt(head_dim)`.
+    /// `None` uses default `1/sqrt(head_dim)`.
     pub attn: Option<f32>,
-    /// `logits_scaling` — divide the final logits by this. `1.0` ⇒ no-op.
+    /// `logits_scaling`: divide the final logits by this. `1.0` is a no-op.
     pub logit: f32,
 }
 
@@ -110,33 +110,66 @@ impl Default for ScalarMultipliers {
 }
 
 impl ScalarMultipliers {
-    /// Load the four Granite scalars from GGUF metadata under `{prefix}.*`.
-    /// Absent keys map to identity, so this returns [`Self::default`] for every
-    /// non-Granite arch.
-    pub fn from_gguf(gguf: &GgufFile, prefix: &str) -> Result<Self> {
+    /// Load scalar multipliers from GGUF metadata under `{prefix}.*`.
+    /// Handles Granite and MiniCPM architectural defaults. Absent keys on other
+    /// architectures map to identity defaults ([`Self::default`]).
+    pub fn from_gguf(
+        gguf: &GgufFile,
+        prefix: &str,
+        n_layers: usize,
+        hidden_size: usize,
+    ) -> Result<Self> {
+        let (default_emb, default_res, default_logit) = if prefix == "minicpm" {
+            (
+                12.0,
+                if n_layers > 0 {
+                    1.4 / (n_layers as f32).sqrt()
+                } else {
+                    1.0
+                },
+                if hidden_size > 0 {
+                    256.0 / (hidden_size as f32)
+                } else {
+                    1.0
+                },
+            )
+        } else {
+            (1.0, 1.0, 1.0)
+        };
+
         let embedding = gguf
             .get_f32(&format!("{prefix}.embedding_scale"))
-            .unwrap_or(1.0);
+            .unwrap_or(default_emb);
         let residual = gguf
             .get_f32(&format!("{prefix}.residual_scale"))
-            .unwrap_or(1.0);
-        ensure!(
-            embedding.is_finite() && residual.is_finite(),
-            "{prefix} embedding and residual scales must be finite"
-        );
-        // llama.cpp treats a stored `attention.scale == 0.0` as "absent ⇒ use
-        // 1/sqrt(head_dim)", so map Some(0.0) → None to match (a literal 0.0
+            .unwrap_or(default_res);
+        // llama.cpp treats a stored `attention.scale == 0.0` as "absent => use
+        // 1/sqrt(head_dim)", so map Some(0.0) -> None to match (a literal 0.0
         // would otherwise zero every attention score).
         let attn = gguf
             .get_f32(&format!("{prefix}.attention.scale"))
             .filter(|&s| s.is_finite() && s > 0.0);
         let logit = gguf
             .get_f32(&format!("{prefix}.logit_scale"))
-            .unwrap_or(1.0);
+            .unwrap_or(default_logit);
         ensure!(
-            logit.is_finite() && logit > 0.0,
-            "{prefix}.logit_scale must be positive and finite"
+            embedding.is_finite() && (1e-4..=1e4).contains(&embedding),
+            "{prefix}.embedding_scale must be finite and within [1e-4, 1e4]"
         );
+        ensure!(
+            residual.is_finite() && (1e-4..=1e4).contains(&residual),
+            "{prefix}.residual_scale must be finite and within [1e-4, 1e4]"
+        );
+        ensure!(
+            logit.is_finite() && (1e-4..=1e4).contains(&logit),
+            "{prefix}.logit_scale must be finite and within [1e-4, 1e4]"
+        );
+        if let Some(a) = attn {
+            ensure!(
+                a.is_finite() && (1e-4..=1e4).contains(&a),
+                "{prefix}.attention.scale must be finite and within [1e-4, 1e4]"
+            );
+        }
         Ok(Self {
             embedding,
             residual,
@@ -172,7 +205,7 @@ pub struct ModelConfig {
     pub ssm: Option<SsmConfig>,
     /// Per-layer KV head counts. Length = n_layers. 0 for conv layers.
     pub kv_heads_per_layer: Vec<usize>,
-    /// Architecture scalar multipliers (Granite 3.x). Identity for every other
+    /// Architecture scalar multipliers (Granite 3.x and MiniCPM). Identity for every other
     /// arch (see [`ScalarMultipliers`]).
     pub scalars: ScalarMultipliers,
     /// Mixture-of-experts parameters (`lfm2moe`). `None` for dense
@@ -714,9 +747,13 @@ pub fn load_model(
         // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
         // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
         // "mistral3"/"mistral4" archs with different layouts, not served here).
-        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" => Box::new(
-            llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
+        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm" => {
+            Box::new(llama::LlamaModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?)
+        }
         "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
             gguf,
             context_size,
@@ -778,7 +815,7 @@ pub fn load_model_gpu(
         // Dense transformers share the generalized wgpu loader (per-arch rope /
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
-        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
             gpu_lfm2::GpuLfm2Model::from_llama_with_id(gguf, context_size, model_id)?,
         )),
         other => bail!("unsupported architecture for GPU: {other}"),
@@ -807,7 +844,7 @@ pub fn load_model_metal(
             context_size,
         )?)),
         // Dense transformers share the generalized Metal forward path.
-        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
             metal_lfm2::MetalLfm2Model::from_llama(gguf, path, context_size)?,
         )),
         other => bail!("unsupported architecture for Metal: {other}"),
