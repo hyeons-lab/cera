@@ -88,6 +88,12 @@ pub struct VadConfig {
     pub min_silence_duration_ms: usize,
     /// Amount of padding to prepend and append to speech segments, in milliseconds (default: 30 ms).
     pub speech_pad_ms: usize,
+    /// Optional frame stride / hop size in samples.
+    ///
+    /// When set, streaming chunks and batch segmentation advance by this stride rather than
+    /// the sample rate's full window size (512 for 16 kHz, 256 for 8 kHz). For example, setting
+    /// this to 320 at 16 kHz configures a 20 ms frame stride with a 32 ms receptive window.
+    pub frame_stride: Option<usize>,
 }
 
 impl Default for VadConfig {
@@ -98,6 +104,7 @@ impl Default for VadConfig {
             min_speech_duration_ms: 64,
             min_silence_duration_ms: 100,
             speech_pad_ms: 30,
+            frame_stride: None,
         }
     }
 }
@@ -116,12 +123,14 @@ impl VadConfig {
         } else {
             (threshold - 0.15).max(0.0)
         };
+        let frame_stride = self.frame_stride.filter(|&s| s > 0);
         Self {
             threshold,
             neg_threshold,
             min_speech_duration_ms: self.min_speech_duration_ms,
             min_silence_duration_ms: self.min_silence_duration_ms,
             speech_pad_ms: self.speech_pad_ms,
+            frame_stride,
         }
     }
 }
@@ -164,12 +173,17 @@ pub struct VadIterator {
     temp_end: Option<u64>,
     current_speech_start: Option<u64>,
     current_sample: u64,
+    sample_buffer: Vec<f32>,
+    stride: usize,
 }
 
 impl VadIterator {
     /// Create a new streaming `VadIterator` with the given sample rate and configuration.
     pub fn new(rate: VadSampleRate, config: VadConfig) -> Self {
-        let config = config.sanitized();
+        let stride = config
+            .frame_stride
+            .unwrap_or_else(|| rate.window_size())
+            .clamp(1, rate.window_size());
         let samples_per_ms = rate.hz() as u64 / 1000;
         let min_silence_samples = config.min_silence_duration_ms as u64 * samples_per_ms;
         let speech_pad_samples = config.speech_pad_ms as u64 * samples_per_ms;
@@ -182,19 +196,38 @@ impl VadIterator {
             temp_end: None,
             current_speech_start: None,
             current_sample: 0,
+            sample_buffer: Vec::with_capacity(rate.window_size() * 2),
+            stride,
         }
     }
 
-    /// Reset stream state (sample counter, triggers, pending speech boundaries).
+    /// The configured sample rate.
+    pub fn sample_rate(&self) -> VadSampleRate {
+        self.rate
+    }
+
+    /// The active frame stride in samples.
+    pub fn frame_stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Whether speech is currently active.
+    pub fn is_speech_active(&self) -> bool {
+        self.triggered
+    }
+
+    /// Reset stream state (sample counter, triggers, pending speech boundaries, sample buffer).
     pub fn reset(&mut self) {
         self.triggered = false;
         self.temp_end = None;
         self.current_speech_start = None;
         self.current_sample = 0;
+        self.sample_buffer.clear();
     }
 
     /// Flush any in-flight active speech segment at the end of the audio stream.
     pub fn flush(&mut self) -> Option<VadEvent> {
+        self.sample_buffer.clear();
         if self.triggered {
             let hz = self.rate.hz() as f64;
             let start = self.current_speech_start.unwrap_or(0);
@@ -217,20 +250,10 @@ impl VadIterator {
         }
     }
 
-    /// Process a streaming chunk of audio using `vad` and return any detected speech start or end event.
-    ///
-    /// - `vad`: mutable reference to `SileroVad` session.
-    /// - `chunk`: audio samples (512 samples for 16kHz, 256 for 8kHz).
-    pub fn process_chunk(
-        &mut self,
-        vad: &mut SileroVad,
-        chunk: &[f32],
-    ) -> Result<Option<VadEvent>> {
-        let prob = vad.process_chunk(chunk, self.rate)?;
+    fn update_state(&mut self, prob: f32, advance_samples: u64) -> Option<VadEvent> {
         let hz = self.rate.hz() as f64;
-
         let cur_sample = self.current_sample;
-        self.current_sample += chunk.len() as u64;
+        self.current_sample += advance_samples;
 
         if prob >= self.config.threshold {
             self.temp_end = None;
@@ -239,10 +262,10 @@ impl VadIterator {
                 let start_sample = cur_sample.saturating_sub(self.speech_pad_samples);
                 self.current_speech_start = Some(start_sample);
                 let ms = ((start_sample as f64 * 1000.0) / hz) as f32;
-                return Ok(Some(VadEvent::SpeechStart {
+                return Some(VadEvent::SpeechStart {
                     sample: start_sample,
                     ms,
-                }));
+                });
             }
         }
 
@@ -257,16 +280,55 @@ impl VadIterator {
 
                 let start_ms = ((start as f64 * 1000.0) / hz) as f32;
                 let end_ms = ((end as f64 * 1000.0) / hz) as f32;
-                return Ok(Some(VadEvent::SpeechEnd {
+                return Some(VadEvent::SpeechEnd {
                     start_sample: start,
                     end_sample: end,
                     start_ms,
                     end_ms,
-                }));
+                });
             }
         }
 
-        Ok(None)
+        None
+    }
+
+    /// Process a streaming chunk of audio using `vad` and return any detected speech start or end event.
+    ///
+    /// Accepts chunks matching the window size (512 samples @ 16kHz, 256 @ 8kHz) or arbitrary streaming
+    /// frame cadences (e.g. 20 ms / 320 samples @ 16kHz). When chunks differ from the window size,
+    /// samples are buffered internally until a full receptive window is reached.
+    pub fn process_chunk(
+        &mut self,
+        vad: &mut SileroVad,
+        chunk: &[f32],
+    ) -> Result<Option<VadEvent>> {
+        let window_size = self.rate.window_size();
+
+        // Fast path for exact-size chunks matching stride with an empty buffer
+        if self.sample_buffer.is_empty() && chunk.len() == window_size && self.stride == window_size
+        {
+            let prob = vad.process_chunk(chunk, self.rate)?;
+            return Ok(self.update_state(prob, chunk.len() as u64));
+        }
+
+        self.sample_buffer.extend_from_slice(chunk);
+        let mut emitted_event = None;
+
+        while self.sample_buffer.len() >= window_size {
+            let prob = vad.process_chunk_with_stride(
+                &self.sample_buffer[..window_size],
+                self.rate,
+                self.stride,
+            )?;
+            let event = self.update_state(prob, self.stride as u64);
+            self.sample_buffer.drain(..self.stride);
+
+            if event.is_some() && emitted_event.is_none() {
+                emitted_event = event;
+            }
+        }
+
+        Ok(emitted_event)
     }
 }
 
@@ -425,6 +487,19 @@ impl SileroVad {
     /// - For [`VadSampleRate::Rate16kHz`], `chunk` must have exactly 512 samples.
     /// - For [`VadSampleRate::Rate8kHz`], `chunk` must have exactly 256 samples.
     pub fn process_chunk(&mut self, chunk: &[f32], rate: VadSampleRate) -> Result<f32> {
+        self.process_chunk_with_stride(chunk, rate, rate.window_size())
+    }
+
+    /// Process a single chunk of audio advancing by `stride` samples and return the speech probability in `[0.0, 1.0]`.
+    ///
+    /// - For [`VadSampleRate::Rate16kHz`], `chunk` must have exactly 512 samples and `stride` must be in `1..=512`.
+    /// - For [`VadSampleRate::Rate8kHz`], `chunk` must have exactly 256 samples and `stride` must be in `1..=256`.
+    pub fn process_chunk_with_stride(
+        &mut self,
+        chunk: &[f32],
+        rate: VadSampleRate,
+        stride: usize,
+    ) -> Result<f32> {
         let expected_size = rate.window_size();
         ensure!(
             chunk.len() == expected_size,
@@ -434,13 +509,20 @@ impl SileroVad {
             chunk.len()
         );
         ensure!(
+            stride > 0 && stride <= expected_size,
+            "stride must be between 1 and {} for {:?}, got {}",
+            expected_size,
+            rate,
+            stride
+        );
+        ensure!(
             chunk.iter().all(|s| s.is_finite()),
             "input audio chunk contains non-finite values (NaN or Inf)"
         );
 
         let prob = match rate {
-            VadSampleRate::Rate16kHz => self.forward_16k(chunk),
-            VadSampleRate::Rate8kHz => self.forward_8k(chunk),
+            VadSampleRate::Rate16kHz => self.forward_16k(chunk, stride),
+            VadSampleRate::Rate8kHz => self.forward_8k(chunk, stride),
         };
         Ok(prob)
     }
@@ -460,27 +542,40 @@ impl SileroVad {
         }
 
         let config = config.sanitized();
+        let stride = config.frame_stride.unwrap_or(window_size);
+        ensure!(
+            stride > 0 && stride <= window_size,
+            "frame_stride must be between 1 and {} for {:?}, got {}",
+            window_size,
+            rate,
+            stride
+        );
+
         let samples_per_ms = rate.hz() as u64 / 1000;
         let min_speech_samples = config.min_speech_duration_ms as u64 * samples_per_ms;
         let min_silence_samples = config.min_silence_duration_ms as u64 * samples_per_ms;
         let speech_pad_samples = config.speech_pad_ms as u64 * samples_per_ms;
         let hz = rate.hz() as f64;
 
-        let num_chunks = audio.len().div_ceil(window_size);
-        let mut speech_probs = Vec::with_capacity(num_chunks);
-        let mut chunks = audio.chunks_exact(window_size);
+        let mut speech_probs: Vec<(u64, f32)> = Vec::new();
+        let mut offset = 0;
 
-        for chunk in &mut chunks {
-            let prob = self.process_chunk(chunk, rate)?;
-            speech_probs.push(prob);
-        }
-
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut padded = [0.0f32; 512];
-            padded[..rem.len()].copy_from_slice(rem);
-            let prob = self.process_chunk(&padded[..window_size], rate)?;
-            speech_probs.push(prob);
+        while offset < audio.len() {
+            if offset + window_size <= audio.len() {
+                let chunk = &audio[offset..offset + window_size];
+                let prob = self.process_chunk_with_stride(chunk, rate, stride)?;
+                speech_probs.push((offset as u64, prob));
+                offset += stride;
+            } else {
+                let rem = &audio[offset..];
+                let mut padded = [0.0f32; 512];
+                padded[..rem.len()].copy_from_slice(rem);
+                let effective_stride = stride.min(window_size);
+                let prob =
+                    self.process_chunk_with_stride(&padded[..window_size], rate, effective_stride)?;
+                speech_probs.push((offset as u64, prob));
+                break;
+            }
         }
 
         let mut speeches: Vec<(u64, u64)> = Vec::new();
@@ -488,9 +583,7 @@ impl SileroVad {
         let mut temp_end: Option<u64> = None;
         let mut triggered = false;
 
-        for (i, &prob) in speech_probs.iter().enumerate() {
-            let cur_sample = (i * window_size) as u64;
-
+        for &(cur_sample, prob) in &speech_probs {
             if prob >= config.threshold {
                 temp_end = None;
                 if !triggered {
@@ -559,14 +652,15 @@ impl SileroVad {
 
     // ── Internal forward passes ───────────────────────────────────────────────
 
-    fn forward_16k(&mut self, chunk: &[f32]) -> f32 {
+    fn forward_16k(&mut self, chunk: &[f32], stride: usize) -> f32 {
         // Direct context prepend and right reflect-pad:
         // Context (64) + Chunk (512) -> 576 samples
         // Padded with 64 right reflected -> 640 samples
         let mut padded = [0.0f32; 640];
         padded[..64].copy_from_slice(&self.context_16k);
         padded[64..576].copy_from_slice(chunk);
-        self.context_16k.copy_from_slice(&padded[512..576]);
+        self.context_16k
+            .copy_from_slice(&padded[stride..stride + 64]);
 
         for i in 0..64 {
             padded[576 + i] = padded[575 - 1 - i];
@@ -652,14 +746,15 @@ impl SileroVad {
         self.lstm_and_head(&enc3, VadSampleRate::Rate16kHz)
     }
 
-    fn forward_8k(&mut self, chunk: &[f32]) -> f32 {
+    fn forward_8k(&mut self, chunk: &[f32], stride: usize) -> f32 {
         // Direct context prepend and right reflect-pad:
         // Context (32) + Chunk (256) -> 288 samples
         // Padded with 32 right reflected -> 320 samples
         let mut padded = [0.0f32; 320];
         padded[..32].copy_from_slice(&self.context_8k);
         padded[32..288].copy_from_slice(chunk);
-        self.context_8k.copy_from_slice(&padded[256..288]);
+        self.context_8k
+            .copy_from_slice(&padded[stride..stride + 32]);
 
         for i in 0..32 {
             padded[288 + i] = padded[287 - 1 - i];

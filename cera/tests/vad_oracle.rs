@@ -276,3 +276,164 @@ fn test_vad_iterator_streaming_events() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_vad_iterator_streaming_20ms_frames() -> Result<()> {
+    let model_path = match find_vad_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/silero_vad.gguf not found");
+            return Ok(());
+        }
+    };
+    let audio_path = match find_audio_sample() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/en.wav not found");
+            return Ok(());
+        }
+    };
+
+    let mut vad = SileroVad::from_file(&model_path)?;
+    let (audio_16k, _) = read_wav_pcm16_mono(&audio_path);
+
+    // 20 ms frames at 16 kHz = 320 samples per frame
+    let config = VadConfig {
+        frame_stride: Some(320),
+        ..VadConfig::default()
+    };
+    let mut iterator = cera::vad::VadIterator::new(VadSampleRate::Rate16kHz, config);
+    assert_eq!(iterator.frame_stride(), 320);
+    assert_eq!(iterator.sample_rate(), VadSampleRate::Rate16kHz);
+
+    let mut events = Vec::new();
+    let (chunks, rem) = audio_16k.as_chunks::<320>();
+    for chunk in chunks {
+        if let Some(event) = iterator.process_chunk(&mut vad, chunk)? {
+            events.push(event);
+        }
+    }
+    if !rem.is_empty() {
+        if let Some(event) = iterator.process_chunk(&mut vad, rem)? {
+            events.push(event);
+        }
+    }
+    if let Some(event) = iterator.flush() {
+        events.push(event);
+    }
+
+    assert!(
+        !events.is_empty(),
+        "20ms streaming VadIterator should emit speech start/end events"
+    );
+    let starts = events
+        .iter()
+        .filter(|e| matches!(e, cera::vad::VadEvent::SpeechStart { .. }))
+        .count();
+    let ends = events
+        .iter()
+        .filter(|e| matches!(e, cera::vad::VadEvent::SpeechEnd { .. }))
+        .count();
+
+    println!(
+        "20ms streaming VadIterator emitted {} total events: {} starts, {} ends",
+        events.len(),
+        starts,
+        ends
+    );
+    assert!(starts > 0, "Expected at least one speech start event");
+    assert!(ends > 0, "Expected at least one speech end event");
+
+    Ok(())
+}
+
+#[test]
+fn test_silero_vad_stride_validation_and_20ms_timestamps() -> Result<()> {
+    let model_path = match find_vad_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/silero_vad.gguf not found");
+            return Ok(());
+        }
+    };
+    let audio_path = match find_audio_sample() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/en.wav not found");
+            return Ok(());
+        }
+    };
+
+    let mut vad = SileroVad::from_file(&model_path)?;
+    let (audio_16k, _) = read_wav_pcm16_mono(&audio_path);
+
+    // Test stride boundary validation
+    let dummy_chunk = [0.0f32; 512];
+    assert!(
+        vad.process_chunk_with_stride(&dummy_chunk, VadSampleRate::Rate16kHz, 0)
+            .is_err(),
+        "stride 0 should be rejected"
+    );
+    assert!(
+        vad.process_chunk_with_stride(&dummy_chunk, VadSampleRate::Rate16kHz, 513)
+            .is_err(),
+        "stride > window_size should be rejected"
+    );
+    assert!(
+        vad.process_chunk_with_stride(&dummy_chunk, VadSampleRate::Rate16kHz, 320)
+            .is_ok(),
+        "valid stride 320 should succeed"
+    );
+
+    // Compare batch timestamps with 20ms stride vs default 32ms stride
+    let default_config = VadConfig::default();
+    let default_timestamps =
+        vad.get_speech_timestamps(&audio_16k, VadSampleRate::Rate16kHz, &default_config)?;
+
+    let stride_20ms_config = VadConfig {
+        frame_stride: Some(320),
+        ..VadConfig::default()
+    };
+    let stride_timestamps =
+        vad.get_speech_timestamps(&audio_16k, VadSampleRate::Rate16kHz, &stride_20ms_config)?;
+
+    println!(
+        "Timestamps count: default={}, 20ms stride={}",
+        default_timestamps.len(),
+        stride_timestamps.len()
+    );
+
+    assert!(
+        !stride_timestamps.is_empty(),
+        "20ms stride should detect speech segments"
+    );
+
+    let total_speech_default: f32 = default_timestamps
+        .iter()
+        .map(|t| t.end_ms - t.start_ms)
+        .sum();
+    let total_speech_20ms: f32 = stride_timestamps
+        .iter()
+        .map(|t| t.end_ms - t.start_ms)
+        .sum();
+    println!(
+        "Total speech duration: default={:.1}ms, 20ms stride={:.1}ms",
+        total_speech_default, total_speech_20ms
+    );
+    let dur_ratio = total_speech_20ms / total_speech_default;
+    assert!(
+        (0.85..=1.15).contains(&dur_ratio),
+        "Total speech duration ratio {dur_ratio:.2} outside expected range [0.85, 1.15]"
+    );
+
+    for s in &stride_timestamps {
+        assert!(s.end_ms > s.start_ms);
+        assert!(
+            s.end_ms - s.start_ms >= 60.0,
+            "Segment duration {:.1}ms below min speech duration",
+            s.end_ms - s.start_ms
+        );
+    }
+
+    Ok(())
+}

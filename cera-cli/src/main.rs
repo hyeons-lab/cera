@@ -1084,6 +1084,10 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         speech_pad_ms: usize,
 
+        /// Frame stride / hop size in samples (optional).
+        #[arg(long)]
+        frame_stride: Option<usize>,
+
         /// Output results as a JSON array of speech timestamps.
         #[arg(long)]
         json: bool,
@@ -3697,6 +3701,7 @@ fn main() -> Result<()> {
             min_speech_ms,
             min_silence_ms,
             speech_pad_ms,
+            frame_stride,
             json,
         } => {
             let vad_rate = match sample_rate {
@@ -3713,6 +3718,7 @@ fn main() -> Result<()> {
                 min_speech_duration_ms: min_speech_ms,
                 min_silence_duration_ms: min_silence_ms,
                 speech_pad_ms,
+                frame_stride,
             };
 
             let mut vad = cera::vad::SileroVad::from_file(&model)

@@ -3028,6 +3028,8 @@ pub struct FfiVadConfig {
     pub min_silence_duration_ms: u32,
     #[uniffi(default = 30)]
     pub speech_pad_ms: u32,
+    #[uniffi(default = None)]
+    pub frame_stride: Option<u32>,
 }
 
 impl From<cera::vad::VadConfig> for FfiVadConfig {
@@ -3038,6 +3040,7 @@ impl From<cera::vad::VadConfig> for FfiVadConfig {
             min_speech_duration_ms: cfg.min_speech_duration_ms as u32,
             min_silence_duration_ms: cfg.min_silence_duration_ms as u32,
             speech_pad_ms: cfg.speech_pad_ms as u32,
+            frame_stride: cfg.frame_stride.map(|s| s as u32),
         }
     }
 }
@@ -3056,6 +3059,7 @@ impl From<FfiVadConfig> for cera::vad::VadConfig {
             min_speech_duration_ms: cfg.min_speech_duration_ms as usize,
             min_silence_duration_ms: cfg.min_silence_duration_ms as usize,
             speech_pad_ms: cfg.speech_pad_ms as usize,
+            frame_stride: cfg.frame_stride.map(|s| s as usize),
         }
     }
 }
@@ -3119,6 +3123,20 @@ impl FfiSileroVad {
     pub fn process_chunk(&self, chunk: Vec<f32>, rate: FfiVadSampleRate) -> Result<f32, FfiError> {
         let mut vad = self.lock_inner()?;
         vad.process_chunk(&chunk, rate.into())
+            .map_err(|e| FfiError::Backend {
+                detail: e.to_string(),
+            })
+    }
+
+    /// Process a single chunk of audio advancing by `stride` samples and return speech probability.
+    pub fn process_chunk_with_stride(
+        &self,
+        chunk: Vec<f32>,
+        rate: FfiVadSampleRate,
+        stride: u32,
+    ) -> Result<f32, FfiError> {
+        let mut vad = self.lock_inner()?;
+        vad.process_chunk_with_stride(&chunk, rate.into(), stride as usize)
             .map_err(|e| FfiError::Backend {
                 detail: e.to_string(),
             })
@@ -3228,6 +3246,18 @@ impl FfiVadIterator {
                 detail: e.to_string(),
             })?;
         Ok(ev.map(Into::into))
+    }
+
+    /// Active frame stride in samples.
+    pub fn frame_stride(&self) -> Result<u32, FfiError> {
+        let it = self.lock_inner()?;
+        Ok(it.frame_stride() as u32)
+    }
+
+    /// Whether speech is currently active.
+    pub fn is_speech_active(&self) -> Result<bool, FfiError> {
+        let it = self.lock_inner()?;
+        Ok(it.is_speech_active())
     }
 }
 
