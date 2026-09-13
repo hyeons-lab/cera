@@ -624,27 +624,46 @@ impl Qwen35Model {
         }
 
         // 1. In-projections
-        let mut qkv_mixed = vec![0.0f32; conv_dim];
-        let mut z = vec![0.0f32; value_dim];
-        let mut beta_raw = vec![0.0f32; num_v_heads];
-        let mut alpha_raw = vec![0.0f32; num_v_heads];
+        let mut qkv_mixed = std::mem::take(&mut state.scratch.ssm_in_proj);
+        let mut conv_out = std::mem::take(&mut state.scratch.ssm_conv_out);
+        let mut z = std::mem::take(&mut state.scratch.ssm_y);
+        let mut core_out = std::mem::take(&mut state.scratch.ssm_branch_out);
+
+        qkv_mixed.resize(conv_dim, 0.0);
+        conv_out.resize(conv_dim, 0.0);
+        z.resize(value_dim, 0.0);
+        core_out.resize(value_dim, 0.0);
+
+        let mut beta_raw_buf = [0.0f32; 64];
+        let mut alpha_raw_buf = [0.0f32; 64];
+        let mut beta_raw_heap;
+        let mut alpha_raw_heap;
+        let (beta_raw, alpha_raw) = if num_v_heads <= 64 {
+            (
+                &mut beta_raw_buf[..num_v_heads],
+                &mut alpha_raw_buf[..num_v_heads],
+            )
+        } else {
+            beta_raw_heap = vec![0.0f32; num_v_heads];
+            alpha_raw_heap = vec![0.0f32; num_v_heads];
+            (beta_raw_heap.as_mut_slice(), alpha_raw_heap.as_mut_slice())
+        };
 
         transformer::gemv(&self.gguf, &refs.wqkv, normed, &mut qkv_mixed);
         transformer::gemv(&self.gguf, &refs.wqkv_gate, normed, &mut z);
-        transformer::gemv(&self.gguf, &refs.ssm_beta, normed, &mut beta_raw);
-        transformer::gemv(&self.gguf, &refs.ssm_alpha, normed, &mut alpha_raw);
+        transformer::gemv(&self.gguf, &refs.ssm_beta, normed, beta_raw);
+        transformer::gemv(&self.gguf, &refs.ssm_alpha, normed, alpha_raw);
 
         // 2. Activations (beta sigmoid in-place, gate softplus * ssm_a in-place into alpha_raw)
-        cpu::sigmoid_inplace(&mut beta_raw);
+        cpu::sigmoid_inplace(beta_raw);
         for (h, a) in alpha_raw.iter_mut().enumerate().take(num_v_heads) {
             let alpha_biased = *a + refs.ssm_dt[h];
             let alpha_sp = cpu::softplus(alpha_biased);
-            let gate_h = alpha_sp * refs.ssm_a[h];
+            let gate_h = (alpha_sp * refs.ssm_a[h]).clamp(-80.0, 10.0);
             *a = gate_h.exp();
         }
 
         // 3. Causal Depthwise Conv1D with SiLU
-        let mut conv_out = vec![0.0f32; conv_dim];
         cpu::mamba2_conv1d_step(
             &qkv_mixed,
             conv_state,
@@ -676,10 +695,18 @@ impl Qwen35Model {
         }
 
         // 6. Gated Delta Net recurrence update
-        let mut core_out = vec![0.0f32; value_dim];
         let s_dim = head_v_dim;
-        let mut sk = vec![0.0f32; s_dim];
-        let mut d = vec![0.0f32; s_dim];
+        let mut sk_buf = [0.0f32; 256];
+        let mut d_buf = [0.0f32; 256];
+        let mut sk_heap;
+        let mut d_heap;
+        let (sk, d) = if s_dim <= 256 {
+            (&mut sk_buf[..s_dim], &mut d_buf[..s_dim])
+        } else {
+            sk_heap = vec![0.0f32; s_dim];
+            d_heap = vec![0.0f32; s_dim];
+            (sk_heap.as_mut_slice(), d_heap.as_mut_slice())
+        };
         let heads_per_group = (num_v_heads / num_k_heads.max(1)).max(1);
 
         for h in 0..num_v_heads {
@@ -762,6 +789,11 @@ impl Qwen35Model {
             &core_out,
             &mut out[..hidden_size],
         );
+
+        state.scratch.ssm_in_proj = qkv_mixed;
+        state.scratch.ssm_conv_out = conv_out;
+        state.scratch.ssm_y = z;
+        state.scratch.ssm_branch_out = core_out;
     }
 
     /// Process a single token through one full Attention block.
@@ -787,15 +819,27 @@ impl Qwen35Model {
 
         let q_out_dim = refs.attn_q.m;
         let has_gate = q_out_dim == 2 * n_heads * head_dim;
-        let mut q_full = vec![0.0f32; q_out_dim];
-        transformer::gemv(&self.gguf, &refs.attn_q, normed, &mut q_full);
 
-        let mut q = vec![0.0f32; n_heads * head_dim];
+        let mut q_full = std::mem::take(&mut state.scratch.conv_proj);
+        let mut q = std::mem::take(&mut state.scratch.q);
+        let mut k = std::mem::take(&mut state.scratch.k);
+        let mut v = std::mem::take(&mut state.scratch.v);
+        let mut attn_out = std::mem::take(&mut state.scratch.attn_out);
         let mut gate = if has_gate {
-            Some(vec![0.0f32; n_heads * head_dim])
+            let mut g = std::mem::take(&mut state.scratch.conv_scratch);
+            g.resize(n_heads * head_dim, 0.0);
+            Some(g)
         } else {
             None
         };
+
+        q_full.resize(q_out_dim, 0.0);
+        q.resize(n_heads * head_dim, 0.0);
+        k.resize(n_kv_heads * head_dim, 0.0);
+        v.resize(n_kv_heads * head_dim, 0.0);
+        attn_out.resize(n_heads * head_dim, 0.0);
+
+        transformer::gemv(&self.gguf, &refs.attn_q, normed, &mut q_full);
 
         if let Some(ref mut gate_buf) = gate {
             for h in 0..n_heads {
@@ -814,7 +858,6 @@ impl Qwen35Model {
         }
 
         // K projection
-        let mut k = vec![0.0f32; n_kv_heads * head_dim];
         transformer::gemv(&self.gguf, &refs.attn_k, normed, &mut k);
 
         // Apply K RMSNorm per head
@@ -824,7 +867,6 @@ impl Qwen35Model {
         }
 
         // V projection
-        let mut v = vec![0.0f32; n_kv_heads * head_dim];
         transformer::gemv(&self.gguf, &refs.attn_v, normed, &mut v);
 
         // Apply RoPE to Q and K
@@ -846,7 +888,6 @@ impl Qwen35Model {
         }
 
         // Decode attention
-        let mut attn_out = vec![0.0f32; n_heads * head_dim];
         let kv = match &state.layers.get(layer) {
             Some(LayerState::Attention {
                 key_cache,
@@ -867,7 +908,17 @@ impl Qwen35Model {
                     }
                 }
             }
-            _ => return,
+            _ => {
+                state.scratch.conv_proj = q_full;
+                state.scratch.q = q;
+                state.scratch.k = k;
+                state.scratch.v = v;
+                state.scratch.attn_out = attn_out;
+                if let Some(g) = gate {
+                    state.scratch.conv_scratch = g;
+                }
+                return;
+            }
         };
 
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -887,6 +938,7 @@ impl Qwen35Model {
         if let Some(mut g) = gate {
             cpu::sigmoid_inplace(&mut g);
             cpu::mul_inplace(&mut attn_out, &g);
+            state.scratch.conv_scratch = g;
         }
 
         // Out projection
@@ -896,17 +948,30 @@ impl Qwen35Model {
             &attn_out,
             &mut out[..hidden_size],
         );
+
+        state.scratch.conv_proj = q_full;
+        state.scratch.q = q;
+        state.scratch.k = k;
+        state.scratch.v = v;
+        state.scratch.attn_out = attn_out;
     }
 
     /// Run single token through all layers.
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let hs = self.config.hidden_size;
-        let mut normed = vec![0.0f32; hs];
-        let mut layer_out = vec![0.0f32; hs];
-        let mut ffn_in = vec![0.0f32; hs];
-        let mut ffn_gate = vec![0.0f32; self.config.intermediate_size];
-        let mut ffn_up = vec![0.0f32; self.config.intermediate_size];
-        let mut ffn_out = vec![0.0f32; hs];
+        let mut normed = std::mem::take(&mut state.scratch.normed);
+        let mut layer_out = std::mem::take(&mut state.scratch.out);
+        let mut ffn_in = std::mem::take(&mut state.scratch.ffn_input);
+        let mut ffn_gate = std::mem::take(&mut state.scratch.gate);
+        let mut ffn_up = std::mem::take(&mut state.scratch.up);
+        let mut ffn_out = std::mem::take(&mut state.scratch.lora_tmp);
+
+        normed.resize(hs, 0.0);
+        layer_out.resize(hs, 0.0);
+        ffn_in.resize(hs, 0.0);
+        ffn_gate.resize(self.config.intermediate_size, 0.0);
+        ffn_up.resize(self.config.intermediate_size, 0.0);
+        ffn_out.resize(hs, 0.0);
 
         for (il, layer_ref) in self.layers.iter().enumerate() {
             normed.copy_from_slice(hidden);
@@ -953,6 +1018,13 @@ impl Qwen35Model {
                 transformer::oracle_dump::record(&format!("l_out-{il}"), hidden);
             }
         }
+
+        state.scratch.normed = normed;
+        state.scratch.out = layer_out;
+        state.scratch.ffn_input = ffn_in;
+        state.scratch.gate = ffn_gate;
+        state.scratch.up = ffn_up;
+        state.scratch.lora_tmp = ffn_out;
     }
 
     /// Project final hidden state to logits.
