@@ -25,6 +25,31 @@ impl CudaModule {
         Ok(Self { module })
     }
 
+    /// Compile CUDA C++ source via NVRTC and load it into the CUDA device context.
+    pub fn from_cuda_src(
+        ctx: &Arc<CudaContext>,
+        cu_src: &str,
+        name: Option<&str>,
+        arch: Option<&'static str>,
+    ) -> Result<Self> {
+        let opts = cudarc::nvrtc::CompileOptions {
+            arch,
+            use_fast_math: Some(true),
+            name: name.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(cu_src, opts).map_err(|e| {
+            anyhow::anyhow!(
+                "NVRTC compilation failed for {}: {e:?}",
+                name.unwrap_or("kernel")
+            )
+        })?;
+        let module = ctx
+            .load_module(ptx)
+            .context("failed to load compiled PTX module into CUDA context")?;
+        Ok(Self { module })
+    }
+
     /// Retrieve an entry-point kernel function by name.
     pub fn get_kernel(&self, name: &str) -> Result<CudaKernel> {
         let func = self

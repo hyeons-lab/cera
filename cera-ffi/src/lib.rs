@@ -313,13 +313,15 @@ impl From<cera::CeraError> for FfiError {
 /// annotations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum BackendPreference {
-    /// Probe Metal → GPU → CPU at load time.
+    /// Probe CUDA / Metal / GPU / CPU at load time.
     Auto,
     Cpu,
     /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
     Gpu,
     /// Native Metal. Requires the `metal` feature + macOS.
     Metal,
+    /// Native CUDA. Requires the `cuda` feature.
+    Cuda,
 }
 
 impl From<BackendPreference> for cera::BackendPreference {
@@ -329,6 +331,7 @@ impl From<BackendPreference> for cera::BackendPreference {
             BackendPreference::Cpu => cera::BackendPreference::Cpu,
             BackendPreference::Gpu => cera::BackendPreference::Gpu,
             BackendPreference::Metal => cera::BackendPreference::Metal,
+            BackendPreference::Cuda => cera::BackendPreference::Cuda,
         }
     }
 }
@@ -340,6 +343,7 @@ impl From<cera::BackendPreference> for BackendPreference {
             cera::BackendPreference::Cpu => BackendPreference::Cpu,
             cera::BackendPreference::Gpu => BackendPreference::Gpu,
             cera::BackendPreference::Metal => BackendPreference::Metal,
+            cera::BackendPreference::Cuda => BackendPreference::Cuda,
         }
     }
 }

@@ -161,3 +161,8 @@ impl CudaGraph {
         Ok(())
     }
 }
+
+// Safety: CudaGraph wraps raw pointers managed by the CUDA driver primary context.
+// CUDA driver operations are thread-safe and internally synchronized.
+unsafe impl Send for CudaGraph {}
+unsafe impl Sync for CudaGraph {}

@@ -37,7 +37,13 @@ impl CudaBuffer {
         self.slice.is_empty()
     }
 
-    /// Underlying device pointer.
+    /// Underlying device pointer using the buffer's allocation stream.
+    pub fn cu_device_ptr(&self) -> sys::CUdeviceptr {
+        let (ptr, _guard) = self.slice.device_ptr(self.slice.stream());
+        ptr
+    }
+
+    /// Underlying device pointer on a specific stream.
     pub fn device_ptr(&self, stream: &CudaStream) -> sys::CUdeviceptr {
         let (ptr, _guard) = self.slice.device_ptr(stream);
         ptr
@@ -76,6 +82,13 @@ unsafe impl<'a, 'b: 'a> PushKernelArg<&'b CudaBuffer> for LaunchArgs<'a> {
     #[inline(always)]
     fn arg(&mut self, arg: &'b CudaBuffer) -> &mut Self {
         self.arg(&arg.slice)
+    }
+}
+
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b mut CudaBuffer> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut CudaBuffer) -> &mut Self {
+        self.arg(&mut arg.slice)
     }
 }
 
@@ -193,6 +206,13 @@ unsafe impl<'a, 'b: 'a> PushKernelArg<&'b CudaPinnedBuffer> for LaunchArgs<'a> {
     }
 }
 
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b mut CudaPinnedBuffer> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut CudaPinnedBuffer) -> &mut Self {
+        self.arg(&arg.device_ptr)
+    }
+}
+
 /// Unified / Managed memory buffer accessible from both CPU and GPU.
 #[derive(Debug)]
 pub struct CudaUnifiedBuffer {
@@ -251,5 +271,12 @@ unsafe impl<'a, 'b: 'a> PushKernelArg<&'b CudaUnifiedBuffer> for LaunchArgs<'a> 
     #[inline(always)]
     fn arg(&mut self, arg: &'b CudaUnifiedBuffer) -> &mut Self {
         self.arg(&arg.slice)
+    }
+}
+
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b mut CudaUnifiedBuffer> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut CudaUnifiedBuffer) -> &mut Self {
+        self.arg(&mut arg.slice)
     }
 }

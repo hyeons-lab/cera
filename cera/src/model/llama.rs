@@ -1736,6 +1736,7 @@ impl Model for LlamaModel {
 // accessors. Granite scalars ride on `config().scalars`.
 #[cfg(any(
     feature = "gpu",
+    feature = "cuda",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
