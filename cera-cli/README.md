@@ -83,6 +83,7 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
 | `vad` | Run Voice Activity Detection (VAD) on audio files using pure-Rust Silero VAD v5 with timestamp segmentation and `--json` export. |
+| `compare-quants` | Audit metadata, tensor inventory, quantization fidelity (cosine similarity, SNR, RMSE), and inference logit parity between Cera-converted models and reference community GGUFs. |
 
 ```sh
 # Run Voice Activity Detection on a WAV audio file
@@ -90,6 +91,12 @@ cera vad --model models/silero_vad.gguf --audio test.wav --threshold 0.5 --json
 
 # Run directly from any Hugging Face model repository
 cera run --hf LiquidAI/LFM2.5-1.2B-Instruct-GGUF --quant Q4_0 --prompt "Hello"
+
+# Compare on-the-fly SafeTensors quantization against a community reference GGUF
+cera compare-quants --safetensors ./hf_model --reference ./reference_q4_k_m.gguf --quant Q4_K_M
+
+# Audit parity between two existing GGUFs and output structured JSON
+cera compare-quants --cera-gguf ./cera.gguf --reference ./upstream.gguf --json
 ```
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:

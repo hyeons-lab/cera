@@ -157,6 +157,11 @@ fn map_whisper_block_sub(sub: &str) -> &str {
 
 /// Translate Hugging Face standard tensor names to standard GGUF tensor names.
 pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
+    translate_hf_to_gguf_tensor_name_with_arch(hf_name, "llama")
+}
+
+/// Translate Hugging Face standard tensor names to standard GGUF tensor names for a specific architecture.
+pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> String {
     // Direct global mappings
     if hf_name == "model.embed_tokens.weight"
         || hf_name == "lfm2.embed_tokens.weight"
@@ -266,8 +271,24 @@ pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
             "mlp.down_proj.bias" | "feed_forward.w2.bias" => "ffn_down.bias",
             "input_layernorm.weight" | "operator_norm.weight" => "attn_norm.weight",
             "input_layernorm.bias" | "operator_norm.bias" => "attn_norm.bias",
-            "post_attention_layernorm.weight" => "ffn_norm.weight",
-            "post_attention_layernorm.bias" => "ffn_norm.bias",
+            "pre_feedforward_layernorm.weight" => "ffn_norm.weight",
+            "pre_feedforward_layernorm.bias" => "ffn_norm.bias",
+            "post_feedforward_layernorm.weight" => "ffn_post_norm.weight",
+            "post_feedforward_layernorm.bias" => "ffn_post_norm.bias",
+            "post_attention_layernorm.weight" => {
+                if arch == "gemma2" {
+                    "attn_post_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                }
+            }
+            "post_attention_layernorm.bias" => {
+                if arch == "gemma2" {
+                    "attn_post_norm.bias"
+                } else {
+                    "ffn_norm.bias"
+                }
+            }
             "operator.conv.weight" | "conv.conv.weight" => "shortconv.conv.weight",
             "operator.conv.bias" | "conv.conv.bias" => "shortconv.conv.bias",
             "operator.in_proj.weight" | "conv.in_proj.weight" => "shortconv.in_proj.weight",
