@@ -159,7 +159,8 @@ impl HfModelConfig {
             "qwen35" | "qwen3_5" | "qwen3.5" => "qwen35",
             "qwen2" | "qwen" => "qwen2",
             "qwen3" => "qwen3",
-            "mistral" => "llama", // Mistral maps to llama architecture in GGUF
+            "mistral3" | "ministral3" | "ministral" => "mistral3",
+            "mistral" => "llama", // Classic Mistral maps to llama architecture in GGUF
             "gemma" => "gemma",
             "gemma2" => "gemma2",
             "minicpm" | "minicpm3" => "minicpm",
@@ -190,6 +191,8 @@ impl HfModelConfig {
                         "qwen2"
                     } else if arch_lower.contains("nanbeige") {
                         "nanbeige"
+                    } else if arch_lower.contains("mistral3") || arch_lower.contains("ministral") {
+                        "mistral3"
                     } else if arch_lower.contains("minicpm") {
                         "minicpm"
                     } else if arch_lower.contains("olmoe") {
@@ -475,6 +478,118 @@ impl HfModelConfig {
             }
         }
 
+        if arch == "mistral3" {
+            let text_config = self.extra.get("text_config");
+            let rope_scaling = self
+                .extra
+                .get("rope_parameters")
+                .or_else(|| self.extra.get("rope_scaling"))
+                .or_else(|| {
+                    text_config
+                        .and_then(|tc| tc.get("rope_parameters").or_else(|| tc.get("rope_scaling")))
+                });
+            if let Some(scale_type) = rope_scaling
+                .and_then(|v| v.get("type").or_else(|| v.get("rope_type")))
+                .and_then(Value::as_str)
+            {
+                writer.add_string("mistral3.rope.scaling.type", scale_type);
+            }
+            if let Some(factor) = rope_scaling
+                .and_then(|v| v.get("factor"))
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v > 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.factor", factor as f32);
+            }
+            if let Some(orig_ctx) = rope_scaling
+                .and_then(|v| {
+                    v.get("original_max_position_embeddings")
+                        .or_else(|| v.get("original_context_length"))
+                })
+                .and_then(Value::as_u64)
+                .filter(|&v| v > 0)
+            {
+                writer.add_u32(
+                    "mistral3.rope.scaling.original_context_length",
+                    orig_ctx as u32,
+                );
+                writer.add_u32("mistral3.attention.temperature_length", orig_ctx as u32);
+            }
+            if let Some(scale) = self
+                .extra
+                .get("attention_temperature_scale")
+                .or_else(|| self.extra.get("attn_temp_scale"))
+                .or_else(|| rope_scaling.and_then(|v| v.get("llama_4_scaling_beta")))
+                .or_else(|| {
+                    self.extra
+                        .get("llama_4_scaling")
+                        .and_then(|v| v.get("beta"))
+                })
+                .or_else(|| {
+                    text_config.and_then(|tc| {
+                        tc.get("attention_temperature_scale")
+                            .or_else(|| tc.get("attn_temp_scale"))
+                            .or_else(|| tc.get("llama_4_scaling").and_then(|v| v.get("beta")))
+                    })
+                })
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v > 0.0)
+            {
+                writer.add_f32("mistral3.attention.temperature_scale", scale as f32);
+            }
+            if let Some(log_mul) = self
+                .extra
+                .get("yarn_log_multiplier")
+                .or_else(|| {
+                    rope_scaling.and_then(|v| {
+                        v.get("yarn_log_multiplier")
+                            .or_else(|| v.get("mscale_all_dim"))
+                    })
+                })
+                .or_else(|| text_config.and_then(|tc| tc.get("yarn_log_multiplier")))
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v >= 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.yarn_log_multiplier", log_mul as f32);
+            }
+            if let Some(beta_fast) = rope_scaling
+                .and_then(|v| {
+                    v.get("yarn_beta_fast")
+                        .or_else(|| v.get("beta_fast"))
+                        .or_else(|| v.get("beta"))
+                })
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v > 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.yarn_beta_fast", beta_fast as f32);
+            }
+            if let Some(beta_slow) = rope_scaling
+                .and_then(|v| {
+                    v.get("yarn_beta_slow")
+                        .or_else(|| v.get("beta_slow"))
+                        .or_else(|| v.get("alpha"))
+                })
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v > 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.yarn_beta_slow", beta_slow as f32);
+            }
+            if let Some(ext_factor) = rope_scaling
+                .and_then(|v| v.get("yarn_ext_factor").or_else(|| v.get("ext_factor")))
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v >= 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.yarn_ext_factor", ext_factor as f32);
+            }
+            if let Some(attn_factor) = rope_scaling
+                .and_then(|v| v.get("attn_factor").or_else(|| v.get("yarn_attn_factor")))
+                .and_then(Value::as_f64)
+                .filter(|&v| v.is_finite() && v > 0.0)
+            {
+                writer.add_f32("mistral3.rope.scaling.attn_factor", attn_factor as f32);
+            }
+        }
+
         // Token classification labels (e.g. LiquidAI/pii-detect)
         if let Some(Value::Object(id2label)) = self.extra.get("id2label") {
             let mut label_pairs: Vec<(usize, String)> = Vec::new();
@@ -701,6 +816,194 @@ mod tests {
         assert_eq!(
             writer.get_metadata("qwen35.full_attention_interval"),
             Some(&MetadataValue::Uint32(4))
+        );
+    }
+
+    #[test]
+    fn test_mistral3_config_mapping() {
+        let json_data = r#"{
+            "model_type": "mistral3",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "attention_temperature_scale": 0.1,
+            "yarn_log_multiplier": 0.0707
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "mistral3");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "mistral3-test");
+
+        assert_eq!(
+            writer.get_metadata("mistral3.attention.temperature_scale"),
+            Some(&MetadataValue::Float32(0.1))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_log_multiplier"),
+            Some(&MetadataValue::Float32(0.0707))
+        );
+    }
+
+    #[test]
+    fn test_mistral3_nested_rope_scaling_mapping() {
+        let json_data = r#"{
+            "model_type": "mistral3",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "attention_temperature_scale": 0.1,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 2.0,
+                "original_max_position_embeddings": 32768,
+                "yarn_log_multiplier": 0.0707,
+                "yarn_beta_fast": 32.0,
+                "yarn_beta_slow": 1.0
+            }
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "mistral3");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "mistral3-nested-test");
+
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.type"),
+            Some(&MetadataValue::String("yarn".to_string()))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.factor"),
+            Some(&MetadataValue::Float32(2.0))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.original_context_length"),
+            Some(&MetadataValue::Uint32(32768))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_log_multiplier"),
+            Some(&MetadataValue::Float32(0.0707))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_beta_fast"),
+            Some(&MetadataValue::Float32(32.0))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_beta_slow"),
+            Some(&MetadataValue::Float32(1.0))
+        );
+    }
+
+    #[test]
+    fn test_mistral3_rope_parameters_canonical_mapping() {
+        let json_data = r#"{
+            "model_type": "mistral3",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "rope_parameters": {
+                "rope_type": "yarn",
+                "factor": 2.5,
+                "original_max_position_embeddings": 32768,
+                "mscale_all_dim": 0.0707,
+                "llama_4_scaling_beta": 0.125,
+                "beta": 32.0,
+                "alpha": 1.0
+            }
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "mistral3");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "mistral3-rope-params-test");
+
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.type"),
+            Some(&MetadataValue::String("yarn".to_string()))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.factor"),
+            Some(&MetadataValue::Float32(2.5))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.original_context_length"),
+            Some(&MetadataValue::Uint32(32768))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_log_multiplier"),
+            Some(&MetadataValue::Float32(0.0707))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.attention.temperature_scale"),
+            Some(&MetadataValue::Float32(0.125))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_beta_fast"),
+            Some(&MetadataValue::Float32(32.0))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.yarn_beta_slow"),
+            Some(&MetadataValue::Float32(1.0))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.attention.temperature_length"),
+            Some(&MetadataValue::Uint32(32768))
+        );
+    }
+
+    #[test]
+    fn test_mistral3_multimodal_text_config_mapping() {
+        let json_data = r#"{
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "model_type": "pixtral",
+            "text_config": {
+                "model_type": "mistral3",
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "intermediate_size": 14336,
+                "vocab_size": 32768,
+                "rope_parameters": {
+                    "rope_type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 16384,
+                    "mscale_all_dim": 0.1,
+                    "llama_4_scaling_beta": 0.2,
+                    "beta": 64.0,
+                    "alpha": 2.0
+                }
+            }
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "mistral3");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "pixtral-test");
+
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.type"),
+            Some(&MetadataValue::String("yarn".to_string()))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.factor"),
+            Some(&MetadataValue::Float32(4.0))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.rope.scaling.original_context_length"),
+            Some(&MetadataValue::Uint32(16384))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.attention.temperature_length"),
+            Some(&MetadataValue::Uint32(16384))
+        );
+        assert_eq!(
+            writer.get_metadata("mistral3.attention.temperature_scale"),
+            Some(&MetadataValue::Float32(0.2))
         );
     }
 }

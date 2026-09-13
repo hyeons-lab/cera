@@ -759,15 +759,11 @@ pub fn load_model(
             context_size,
             model_id,
         )?),
-        // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
-        // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
-        // "mistral3"/"mistral4" archs with different layouts, not served here).
+        // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
         "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
-        | "minicpm5" | "nanbeige" => Box::new(llama::LlamaModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
+        | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" => Box::new(
+            llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+        ),
         "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
             gguf,
             context_size,

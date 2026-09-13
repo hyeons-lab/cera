@@ -2147,6 +2147,7 @@ impl Lfm2Model {
                         &self.gguf,
                         i,
                         &ffn_weights,
+                        &transformer::FfnExtras::default(),
                         hs,
                         cfg.intermediate_size,
                         &ffn_input,
