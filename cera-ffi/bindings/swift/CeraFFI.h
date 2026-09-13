@@ -609,6 +609,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ffisilerovad_get_speech_timestamps(uint64_t
 float uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk(uint64_t ptr, RustBuffer chunk, RustBuffer rate, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_PROCESS_CHUNK_WITH_STRIDE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_PROCESS_CHUNK_WITH_STRIDE
+float uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride(uint64_t ptr, RustBuffer chunk, RustBuffer rate, uint32_t stride, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFISILEROVAD_RESET
 void uniffi_cera_ffi_fn_method_ffisilerovad_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -632,6 +637,21 @@ uint64_t uniffi_cera_ffi_fn_constructor_ffivaditerator_new(RustBuffer rate, Rust
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FLUSH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FLUSH
 RustBuffer uniffi_cera_ffi_fn_method_ffivaditerator_flush(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FRAME_STRIDE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_FRAME_STRIDE
+uint32_t uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_IS_SPEECH_ACTIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_IS_SPEECH_ACTIVE
+int8_t uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_POP_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_POP_EVENT
+RustBuffer uniffi_cera_ffi_fn_method_ffivaditerator_pop_event(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIVADITERATOR_PROCESS_CHUNK
@@ -1485,6 +1505,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_PROCESS_CHUNK_WITH_STRIDE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_PROCESS_CHUNK_WITH_STRIDE
+uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFISILEROVAD_RESET
 uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_reset(void
@@ -1494,6 +1520,24 @@ uint16_t uniffi_cera_ffi_checksum_method_ffisilerovad_reset(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FLUSH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FLUSH
 uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_flush(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FRAME_STRIDE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_FRAME_STRIDE
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_IS_SPEECH_ACTIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_IS_SPEECH_ACTIVE
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_POP_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIVADITERATOR_POP_EVENT
+uint16_t uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event(void
     
 );
 #endif

@@ -597,11 +597,19 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1448,6 +1456,14 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk.restype = ctypes.c_float
+_UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint32,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride.restype = ctypes.c_float
 _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_reset.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1464,6 +1480,21 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_flush.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_flush.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_pop_event.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_pop_event.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_process_chunk.argtypes = (
     ctypes.c_uint64,
     ctypes.c_uint64,
@@ -1893,6 +1924,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps.re
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.restype = ctypes.c_uint16
@@ -1902,6 +1936,15 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new.restype = cty
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.restype = ctypes.c_uint16
@@ -3527,63 +3570,6 @@ class _UniffiFfiConverterTypeFfiSpeechTimestamp(_UniffiConverterRustBuffer):
         _UniffiFfiConverterFloat32.write(value.start_ms, buf)
         _UniffiFfiConverterFloat32.write(value.end_ms, buf)
 
-@dataclass
-class FfiVadConfig:
-    """
-    Configuration options for batch speech detection and segmentation.
-"""
-    def __init__(self, *, threshold:float = 0.5, neg_threshold:float = 0.35, min_speech_duration_ms:int = 64, min_silence_duration_ms:int = 100, speech_pad_ms:int = 30):
-        self.threshold = threshold
-        self.neg_threshold = neg_threshold
-        self.min_speech_duration_ms = min_speech_duration_ms
-        self.min_silence_duration_ms = min_silence_duration_ms
-        self.speech_pad_ms = speech_pad_ms
-        
-        
-
-    
-    def __str__(self):
-        return "FfiVadConfig(threshold={}, neg_threshold={}, min_speech_duration_ms={}, min_silence_duration_ms={}, speech_pad_ms={})".format(self.threshold, self.neg_threshold, self.min_speech_duration_ms, self.min_silence_duration_ms, self.speech_pad_ms)
-    def __eq__(self, other):
-        if self.threshold != other.threshold:
-            return False
-        if self.neg_threshold != other.neg_threshold:
-            return False
-        if self.min_speech_duration_ms != other.min_speech_duration_ms:
-            return False
-        if self.min_silence_duration_ms != other.min_silence_duration_ms:
-            return False
-        if self.speech_pad_ms != other.speech_pad_ms:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeFfiVadConfig(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return FfiVadConfig(
-            threshold=_UniffiFfiConverterFloat32.read(buf),
-            neg_threshold=_UniffiFfiConverterFloat32.read(buf),
-            min_speech_duration_ms=_UniffiFfiConverterUInt32.read(buf),
-            min_silence_duration_ms=_UniffiFfiConverterUInt32.read(buf),
-            speech_pad_ms=_UniffiFfiConverterUInt32.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterFloat32.check_lower(value.threshold)
-        _UniffiFfiConverterFloat32.check_lower(value.neg_threshold)
-        _UniffiFfiConverterUInt32.check_lower(value.min_speech_duration_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.min_silence_duration_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.speech_pad_ms)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterFloat32.write(value.threshold, buf)
-        _UniffiFfiConverterFloat32.write(value.neg_threshold, buf)
-        _UniffiFfiConverterUInt32.write(value.min_speech_duration_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.min_silence_duration_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.speech_pad_ms, buf)
-
 class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -3608,6 +3594,72 @@ class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
             return _UniffiFfiConverterUInt32.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiVadConfig:
+    """
+    Configuration options for batch speech detection and segmentation.
+"""
+    def __init__(self, *, threshold:float = 0.5, neg_threshold:float = 0.35, min_speech_duration_ms:int = 64, min_silence_duration_ms:int = 100, speech_pad_ms:int = 30, frame_stride:typing.Optional[int] = _DEFAULT):
+        self.threshold = threshold
+        self.neg_threshold = neg_threshold
+        self.min_speech_duration_ms = min_speech_duration_ms
+        self.min_silence_duration_ms = min_silence_duration_ms
+        self.speech_pad_ms = speech_pad_ms
+        if frame_stride is _DEFAULT:
+            self.frame_stride = None
+        else:
+            self.frame_stride = frame_stride
+        
+        
+
+    
+    def __str__(self):
+        return "FfiVadConfig(threshold={}, neg_threshold={}, min_speech_duration_ms={}, min_silence_duration_ms={}, speech_pad_ms={}, frame_stride={})".format(self.threshold, self.neg_threshold, self.min_speech_duration_ms, self.min_silence_duration_ms, self.speech_pad_ms, self.frame_stride)
+    def __eq__(self, other):
+        if self.threshold != other.threshold:
+            return False
+        if self.neg_threshold != other.neg_threshold:
+            return False
+        if self.min_speech_duration_ms != other.min_speech_duration_ms:
+            return False
+        if self.min_silence_duration_ms != other.min_silence_duration_ms:
+            return False
+        if self.speech_pad_ms != other.speech_pad_ms:
+            return False
+        if self.frame_stride != other.frame_stride:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiVadConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiVadConfig(
+            threshold=_UniffiFfiConverterFloat32.read(buf),
+            neg_threshold=_UniffiFfiConverterFloat32.read(buf),
+            min_speech_duration_ms=_UniffiFfiConverterUInt32.read(buf),
+            min_silence_duration_ms=_UniffiFfiConverterUInt32.read(buf),
+            speech_pad_ms=_UniffiFfiConverterUInt32.read(buf),
+            frame_stride=_UniffiFfiConverterOptionalUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterFloat32.check_lower(value.threshold)
+        _UniffiFfiConverterFloat32.check_lower(value.neg_threshold)
+        _UniffiFfiConverterUInt32.check_lower(value.min_speech_duration_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.min_silence_duration_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.speech_pad_ms)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.frame_stride)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterFloat32.write(value.threshold, buf)
+        _UniffiFfiConverterFloat32.write(value.neg_threshold, buf)
+        _UniffiFfiConverterUInt32.write(value.min_speech_duration_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.min_silence_duration_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.speech_pad_ms, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.frame_stride, buf)
 
 class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
     @classmethod
@@ -8552,6 +8604,11 @@ class FfiSileroVadProtocol(typing.Protocol):
         - 8 kHz: chunk must have exactly 256 samples.
 """
         raise NotImplementedError
+    def process_chunk_with_stride(self, chunk: typing.List[float],rate: FfiVadSampleRate,stride: int) -> float:
+        """
+        Process a single chunk of audio advancing by `stride` samples and return speech probability.
+"""
+        raise NotImplementedError
     def reset(self, ) -> None:
         """
         Reset recurrent state tensors and streaming context to zeros.
@@ -8669,6 +8726,30 @@ class FfiSileroVad(FfiSileroVadProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def process_chunk_with_stride(self, chunk: typing.List[float],rate: FfiVadSampleRate,stride: int) -> float:
+        """
+        Process a single chunk of audio advancing by `stride` samples and return speech probability.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(chunk)
+
+        _UniffiFfiConverterTypeFfiVadSampleRate.check_lower(rate)
+
+        _UniffiFfiConverterUInt32.check_lower(stride)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(chunk),
+            _UniffiFfiConverterTypeFfiVadSampleRate.lower(rate),
+            _UniffiFfiConverterUInt32.lower(stride),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterFloat32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def reset(self, ) -> None:
         """
         Reset recurrent state tensors and streaming context to zeros.
@@ -8750,6 +8831,21 @@ class FfiVadIteratorProtocol(typing.Protocol):
         Flush any pending in-flight speech segment at the end of an audio stream.
 """
         raise NotImplementedError
+    def frame_stride(self, ) -> int:
+        """
+        Active frame stride in samples.
+"""
+        raise NotImplementedError
+    def is_speech_active(self, ) -> bool:
+        """
+        Whether speech is currently active.
+"""
+        raise NotImplementedError
+    def pop_event(self, ) -> typing.Optional[FfiVadEvent]:
+        """
+        Pop a queued speech event emitted by previous chunk evaluations.
+"""
+        raise NotImplementedError
     def process_chunk(self, vad: FfiSileroVad,chunk: typing.List[float]) -> typing.Optional[FfiVadEvent]:
         """
         Process a single chunk of audio and return any speech start or end event.
@@ -8817,6 +8913,51 @@ class FfiVadIterator(FfiVadIteratorProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_flush,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def frame_stride(self, ) -> int:
+        """
+        Active frame stride in samples.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def is_speech_active(self, ) -> bool:
+        """
+        Whether speech is currently active.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def pop_event(self, ) -> typing.Optional[FfiVadEvent]:
+        """
+        Pop a queued speech event emitted by previous chunk evaluations.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalTypeFfiVadEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_pop_event,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

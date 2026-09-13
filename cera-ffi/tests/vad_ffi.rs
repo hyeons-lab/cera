@@ -86,6 +86,7 @@ fn test_ffi_vad_iterator_and_model() -> Result<()> {
     }
 
     assert!(!iterator.is_speech_active()?);
+    assert!(iterator.pop_event()?.is_none());
     let flushed = iterator.flush()?;
     assert!(flushed.is_none());
 

@@ -3259,6 +3259,12 @@ impl FfiVadIterator {
         let it = self.lock_inner()?;
         Ok(it.is_speech_active())
     }
+
+    /// Pop a queued speech event emitted by previous chunk evaluations.
+    pub fn pop_event(&self) -> Result<Option<FfiVadEvent>, FfiError> {
+        let mut it = self.lock_inner()?;
+        Ok(it.pop_event().map(Into::into))
+    }
 }
 
 // ---------------------------------------------------------------------------

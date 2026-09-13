@@ -2394,6 +2394,11 @@ public protocol FfiSileroVadProtocol: AnyObject, Sendable {
     func processChunk(chunk: [Float], rate: FfiVadSampleRate) throws  -> Float
     
     /**
+     * Process a single chunk of audio advancing by `stride` samples and return speech probability.
+     */
+    func processChunkWithStride(chunk: [Float], rate: FfiVadSampleRate, stride: UInt32) throws  -> Float
+    
+    /**
      * Reset recurrent state tensors and streaming context to zeros.
      */
     func reset() throws 
@@ -2508,6 +2513,20 @@ open func processChunk(chunk: [Float], rate: FfiVadSampleRate)throws  -> Float  
 }
     
     /**
+     * Process a single chunk of audio advancing by `stride` samples and return speech probability.
+     */
+open func processChunkWithStride(chunk: [Float], rate: FfiVadSampleRate, stride: UInt32)throws  -> Float  {
+    return try  FfiConverterFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(chunk),
+        FfiConverterTypeFfiVadSampleRate_lower(rate),
+        FfiConverterUInt32.lower(stride),$0
+    )
+})
+}
+    
+    /**
      * Reset recurrent state tensors and streaming context to zeros.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2576,6 +2595,21 @@ public protocol FfiVadIteratorProtocol: AnyObject, Sendable {
      * Flush any pending in-flight speech segment at the end of an audio stream.
      */
     func flush() throws  -> FfiVadEvent?
+    
+    /**
+     * Active frame stride in samples.
+     */
+    func frameStride() throws  -> UInt32
+    
+    /**
+     * Whether speech is currently active.
+     */
+    func isSpeechActive() throws  -> Bool
+    
+    /**
+     * Pop a queued speech event emitted by previous chunk evaluations.
+     */
+    func popEvent() throws  -> FfiVadEvent?
     
     /**
      * Process a single chunk of audio and return any speech start or end event.
@@ -2662,6 +2696,39 @@ public convenience init(rate: FfiVadSampleRate, config: FfiVadConfig?) {
 open func flush()throws  -> FfiVadEvent?  {
     return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_ffivaditerator_flush(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Active frame stride in samples.
+     */
+open func frameStride()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether speech is currently active.
+     */
+open func isSpeechActive()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Pop a queued speech event emitted by previous chunk evaluations.
+     */
+open func popEvent()throws  -> FfiVadEvent?  {
+    return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffivaditerator_pop_event(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -5384,15 +5451,17 @@ public struct FfiVadConfig: Equatable, Hashable {
     public var minSpeechDurationMs: UInt32
     public var minSilenceDurationMs: UInt32
     public var speechPadMs: UInt32
+    public var frameStride: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(threshold: Float = Float(0.5), negThreshold: Float = Float(0.35), minSpeechDurationMs: UInt32 = UInt32(64), minSilenceDurationMs: UInt32 = UInt32(100), speechPadMs: UInt32 = UInt32(30)) {
+    public init(threshold: Float = Float(0.5), negThreshold: Float = Float(0.35), minSpeechDurationMs: UInt32 = UInt32(64), minSilenceDurationMs: UInt32 = UInt32(100), speechPadMs: UInt32 = UInt32(30), frameStride: UInt32? = nil) {
         self.threshold = threshold
         self.negThreshold = negThreshold
         self.minSpeechDurationMs = minSpeechDurationMs
         self.minSilenceDurationMs = minSilenceDurationMs
         self.speechPadMs = speechPadMs
+        self.frameStride = frameStride
     }
 
     
@@ -5415,7 +5484,8 @@ public struct FfiConverterTypeFfiVadConfig: FfiConverterRustBuffer {
                 negThreshold: FfiConverterFloat.read(from: &buf), 
                 minSpeechDurationMs: FfiConverterUInt32.read(from: &buf), 
                 minSilenceDurationMs: FfiConverterUInt32.read(from: &buf), 
-                speechPadMs: FfiConverterUInt32.read(from: &buf)
+                speechPadMs: FfiConverterUInt32.read(from: &buf), 
+                frameStride: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
@@ -5425,6 +5495,7 @@ public struct FfiConverterTypeFfiVadConfig: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.minSpeechDurationMs, into: &buf)
         FfiConverterUInt32.write(value.minSilenceDurationMs, into: &buf)
         FfiConverterUInt32.write(value.speechPadMs, into: &buf)
+        FfiConverterOptionUInt32.write(value.frameStride, into: &buf)
     }
 }
 
@@ -8338,10 +8409,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048) {

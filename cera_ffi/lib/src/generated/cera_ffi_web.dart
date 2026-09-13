@@ -599,6 +599,7 @@ class FfiVadConfig {
     this.minSpeechDurationMs = 64,
     this.minSilenceDurationMs = 100,
     this.speechPadMs = 30,
+    this.frameStride = null,
   });
 
   final double threshold;
@@ -606,6 +607,7 @@ class FfiVadConfig {
   final int minSpeechDurationMs;
   final int minSilenceDurationMs;
   final int speechPadMs;
+  final int? frameStride;
 
   Map<String, dynamic> toJson() {
     return {
@@ -614,6 +616,7 @@ class FfiVadConfig {
       'minSpeechDurationMs': this.minSpeechDurationMs,
       'minSilenceDurationMs': this.minSilenceDurationMs,
       'speechPadMs': this.speechPadMs,
+      'frameStride': this.frameStride,
     };
   }
 
@@ -624,6 +627,7 @@ class FfiVadConfig {
       minSpeechDurationMs: json.containsKey('minSpeechDurationMs') ? (json['minSpeechDurationMs'] as num).toInt() : 64,
       minSilenceDurationMs: json.containsKey('minSilenceDurationMs') ? (json['minSilenceDurationMs'] as num).toInt() : 100,
       speechPadMs: json.containsKey('speechPadMs') ? (json['speechPadMs'] as num).toInt() : 30,
+      frameStride: json.containsKey('frameStride') ? json['frameStride'] == null ? null : (json['frameStride'] as num).toInt() : null,
     );
   }
 
@@ -633,6 +637,7 @@ class FfiVadConfig {
     int? minSpeechDurationMs,
     int? minSilenceDurationMs,
     int? speechPadMs,
+    Object? frameStride = _sentinel,
   }) {
     return FfiVadConfig(
       threshold: threshold ?? this.threshold,
@@ -640,21 +645,22 @@ class FfiVadConfig {
       minSpeechDurationMs: minSpeechDurationMs ?? this.minSpeechDurationMs,
       minSilenceDurationMs: minSilenceDurationMs ?? this.minSilenceDurationMs,
       speechPadMs: speechPadMs ?? this.speechPadMs,
+      frameStride: frameStride == _sentinel ? this.frameStride : frameStride as int?,
     );
   }
 
   @override
   String toString() {
-    return 'FfiVadConfig(threshold: $threshold, negThreshold: $negThreshold, minSpeechDurationMs: $minSpeechDurationMs, minSilenceDurationMs: $minSilenceDurationMs, speechPadMs: $speechPadMs)';
+    return 'FfiVadConfig(threshold: $threshold, negThreshold: $negThreshold, minSpeechDurationMs: $minSpeechDurationMs, minSilenceDurationMs: $minSilenceDurationMs, speechPadMs: $speechPadMs, frameStride: $frameStride)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiVadConfig && threshold == other.threshold && negThreshold == other.negThreshold && minSpeechDurationMs == other.minSpeechDurationMs && minSilenceDurationMs == other.minSilenceDurationMs && speechPadMs == other.speechPadMs;
+      other is FfiVadConfig && threshold == other.threshold && negThreshold == other.negThreshold && minSpeechDurationMs == other.minSpeechDurationMs && minSilenceDurationMs == other.minSilenceDurationMs && speechPadMs == other.speechPadMs && frameStride == other.frameStride;
 
   @override
-  int get hashCode => Object.hash(threshold, negThreshold, minSpeechDurationMs, minSilenceDurationMs, speechPadMs);
+  int get hashCode => Object.hash(threshold, negThreshold, minSpeechDurationMs, minSilenceDurationMs, speechPadMs, frameStride);
 }
 
 /// Options for Whisper speech transcription.
@@ -3607,6 +3613,9 @@ final class FfiSileroVad {
   /// - 8 kHz: chunk must have exactly 256 samples.
   double processChunk(List<double> chunk, FfiVadSampleRate rate) => _unsupportedOnWeb('FfiSileroVad.processChunk');
 
+  /// Process a single chunk of audio advancing by `stride` samples and return speech probability.
+  double processChunkWithStride(List<double> chunk, FfiVadSampleRate rate, int stride) => _unsupportedOnWeb('FfiSileroVad.processChunkWithStride');
+
   /// Reset recurrent state tensors and streaming context to zeros.
   void reset() => _unsupportedOnWeb('FfiSileroVad.reset');
 }
@@ -3629,6 +3638,15 @@ final class FfiVadIterator {
 
   /// Flush any pending in-flight speech segment at the end of an audio stream.
   FfiVadEvent? flush() => _unsupportedOnWeb('FfiVadIterator.flush');
+
+  /// Active frame stride in samples.
+  int frameStride() => _unsupportedOnWeb('FfiVadIterator.frameStride');
+
+  /// Whether speech is currently active.
+  bool isSpeechActive() => _unsupportedOnWeb('FfiVadIterator.isSpeechActive');
+
+  /// Pop a queued speech event emitted by previous chunk evaluations.
+  FfiVadEvent? popEvent() => _unsupportedOnWeb('FfiVadIterator.popEvent');
 
   /// Process a single chunk of audio and return any speech start or end event.
   FfiVadEvent? processChunk(FfiSileroVad vad, List<double> chunk) => _unsupportedOnWeb('FfiVadIterator.processChunk');

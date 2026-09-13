@@ -313,10 +313,10 @@ fn test_vad_iterator_streaming_20ms_frames() -> Result<()> {
             events.push(event);
         }
     }
-    if !rem.is_empty() {
-        if let Some(event) = iterator.process_chunk(&mut vad, rem)? {
-            events.push(event);
-        }
+    if !rem.is_empty()
+        && let Some(event) = iterator.process_chunk(&mut vad, rem)?
+    {
+        events.push(event);
     }
     if let Some(event) = iterator.flush() {
         events.push(event);
@@ -385,6 +385,25 @@ fn test_silero_vad_stride_validation_and_20ms_timestamps() -> Result<()> {
         "valid stride 320 should succeed"
     );
 
+    let zero_config = VadConfig {
+        frame_stride: Some(0),
+        ..VadConfig::default()
+    };
+    assert!(
+        vad.get_speech_timestamps(&audio_16k, VadSampleRate::Rate16kHz, &zero_config)
+            .is_err(),
+        "frame_stride 0 in VadConfig should be rejected by get_speech_timestamps"
+    );
+    let excessive_config = VadConfig {
+        frame_stride: Some(1024),
+        ..VadConfig::default()
+    };
+    assert!(
+        vad.get_speech_timestamps(&audio_16k, VadSampleRate::Rate16kHz, &excessive_config)
+            .is_err(),
+        "frame_stride > window_size should be rejected by get_speech_timestamps"
+    );
+
     // Compare batch timestamps with 20ms stride vs default 32ms stride
     let default_config = VadConfig::default();
     let default_timestamps =
@@ -434,6 +453,53 @@ fn test_silero_vad_stride_validation_and_20ms_timestamps() -> Result<()> {
             s.end_ms - s.start_ms
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_vad_iterator_multi_window_and_pop_event() -> Result<()> {
+    let model_path = match find_vad_model() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/silero_vad.gguf not found");
+            return Ok(());
+        }
+    };
+    let audio_path = match find_audio_sample() {
+        Some(p) => p,
+        None => {
+            eprintln!("Skipping test: models/en.wav not found");
+            return Ok(());
+        }
+    };
+
+    let mut vad = SileroVad::from_file(&model_path)?;
+    let (audio_16k, _) = read_wav_pcm16_mono(&audio_path);
+
+    let config = VadConfig {
+        frame_stride: Some(320),
+        ..VadConfig::default()
+    };
+    let mut iterator = cera::vad::VadIterator::new(VadSampleRate::Rate16kHz, config);
+
+    // Feed a large chunk (16,000 samples = 1 second) that contains speech
+    let chunk_1s = &audio_16k[..audio_16k.len().min(16000)];
+    let first_event = iterator.process_chunk(&mut vad, chunk_1s)?;
+
+    let mut all_events = Vec::new();
+    if let Some(ev) = first_event {
+        all_events.push(ev);
+    }
+    while let Some(ev) = iterator.pop_event() {
+        all_events.push(ev);
+    }
+
+    println!("Multi-window chunk yielded {} events", all_events.len());
+    assert!(
+        !all_events.is_empty(),
+        "Ingesting 1 second chunk should produce speech events"
+    );
 
     Ok(())
 }

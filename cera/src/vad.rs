@@ -17,6 +17,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
@@ -123,7 +124,7 @@ impl VadConfig {
         } else {
             (threshold - 0.15).max(0.0)
         };
-        let frame_stride = self.frame_stride.filter(|&s| s > 0);
+        let frame_stride = self.frame_stride;
         Self {
             threshold,
             neg_threshold,
@@ -175,11 +176,13 @@ pub struct VadIterator {
     current_sample: u64,
     sample_buffer: Vec<f32>,
     stride: usize,
+    pending_events: VecDeque<VadEvent>,
 }
 
 impl VadIterator {
     /// Create a new streaming `VadIterator` with the given sample rate and configuration.
     pub fn new(rate: VadSampleRate, config: VadConfig) -> Self {
+        let config = config.sanitized();
         let stride = config
             .frame_stride
             .unwrap_or_else(|| rate.window_size())
@@ -198,6 +201,7 @@ impl VadIterator {
             current_sample: 0,
             sample_buffer: Vec::with_capacity(rate.window_size() * 2),
             stride,
+            pending_events: VecDeque::with_capacity(4),
         }
     }
 
@@ -216,6 +220,11 @@ impl VadIterator {
         self.triggered
     }
 
+    /// Pop a queued speech event emitted by previous chunk evaluations.
+    pub fn pop_event(&mut self) -> Option<VadEvent> {
+        self.pending_events.pop_front()
+    }
+
     /// Reset stream state (sample counter, triggers, pending speech boundaries, sample buffer).
     pub fn reset(&mut self) {
         self.triggered = false;
@@ -223,10 +232,15 @@ impl VadIterator {
         self.current_speech_start = None;
         self.current_sample = 0;
         self.sample_buffer.clear();
+        self.pending_events.clear();
     }
 
     /// Flush any in-flight active speech segment at the end of the audio stream.
     pub fn flush(&mut self) -> Option<VadEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
+        self.current_sample += self.sample_buffer.len() as u64;
         self.sample_buffer.clear();
         if self.triggered {
             let hz = self.rate.hz() as f64;
@@ -304,31 +318,36 @@ impl VadIterator {
     ) -> Result<Option<VadEvent>> {
         let window_size = self.rate.window_size();
 
-        // Fast path for exact-size chunks matching stride with an empty buffer
-        if self.sample_buffer.is_empty() && chunk.len() == window_size && self.stride == window_size
+        // Fast path for exact-size chunks matching stride with an empty buffer and no queued events
+        if self.sample_buffer.is_empty()
+            && self.pending_events.is_empty()
+            && chunk.len() == window_size
+            && self.stride == window_size
         {
             let prob = vad.process_chunk(chunk, self.rate)?;
             return Ok(self.update_state(prob, chunk.len() as u64));
         }
 
         self.sample_buffer.extend_from_slice(chunk);
-        let mut emitted_event = None;
+        let mut offset = 0;
 
-        while self.sample_buffer.len() >= window_size {
+        while offset + window_size <= self.sample_buffer.len() {
             let prob = vad.process_chunk_with_stride(
-                &self.sample_buffer[..window_size],
+                &self.sample_buffer[offset..offset + window_size],
                 self.rate,
                 self.stride,
             )?;
-            let event = self.update_state(prob, self.stride as u64);
-            self.sample_buffer.drain(..self.stride);
-
-            if event.is_some() && emitted_event.is_none() {
-                emitted_event = event;
+            if let Some(event) = self.update_state(prob, self.stride as u64) {
+                self.pending_events.push_back(event);
             }
+            offset += self.stride;
         }
 
-        Ok(emitted_event)
+        if offset > 0 {
+            self.sample_buffer.drain(..offset);
+        }
+
+        Ok(self.pending_events.pop_front())
     }
 }
 
@@ -557,7 +576,8 @@ impl SileroVad {
         let speech_pad_samples = config.speech_pad_ms as u64 * samples_per_ms;
         let hz = rate.hz() as f64;
 
-        let mut speech_probs: Vec<(u64, f32)> = Vec::new();
+        let estimated_chunks = audio.len().saturating_sub(window_size) / stride + 2;
+        let mut speech_probs: Vec<(u64, f32)> = Vec::with_capacity(estimated_chunks);
         let mut offset = 0;
 
         while offset < audio.len() {
@@ -570,9 +590,7 @@ impl SileroVad {
                 let rem = &audio[offset..];
                 let mut padded = [0.0f32; 512];
                 padded[..rem.len()].copy_from_slice(rem);
-                let effective_stride = stride.min(window_size);
-                let prob =
-                    self.process_chunk_with_stride(&padded[..window_size], rate, effective_stride)?;
+                let prob = self.process_chunk_with_stride(&padded[..window_size], rate, stride)?;
                 speech_probs.push((offset as u64, prob));
                 break;
             }
