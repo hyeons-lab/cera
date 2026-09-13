@@ -8,6 +8,7 @@ use cudarc::driver::DeviceRepr;
 // Embedded CUDA source strings
 pub const GEMV_Q4_0_SRC: &str = include_str!("../shaders/cuda/gemv_q4_0.cu");
 pub const GEMV_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemv_q8_0.cu");
+pub const GEMM_Q4_0_SRC: &str = include_str!("../shaders/cuda/gemm_q4_0.cu");
 pub const GEMM_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemm_q8_0.cu");
 pub const GATHER_EMBEDDING_SRC: &str = include_str!("../shaders/cuda/gather_embedding.cu");
 pub const RMSNORM_SRC: &str = include_str!("../shaders/cuda/rmsnorm.cu");
