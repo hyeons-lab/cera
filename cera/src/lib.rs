@@ -2,9 +2,10 @@
 // here (keeping it would trip the `stable_features` lint). `stdarch_neon_i8mm`
 // and `stdarch_aarch64_prefetch` are still unstable — remove them from this
 // list as they stabilize.
+#![allow(stable_features)]
 #![cfg_attr(
     target_arch = "aarch64",
-    feature(stdarch_aarch64_prefetch, stdarch_neon_i8mm)
+    feature(stdarch_aarch64_prefetch, stdarch_neon_i8mm, stdarch_neon_dotprod)
 )]
 
 /// Crate version, sourced from `Cargo.toml` at compile time. Useful
