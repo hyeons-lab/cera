@@ -246,7 +246,7 @@ pub fn compute_rmse(orig: &[f32], dequant: &[f32]) -> f32 {
         let diff = o - d;
         sum_sq += diff * diff;
     }
-    (sum_sq / orig.len() as f32).sqrt()
+    (0.0f32.max(sum_sq) / orig.len() as f32).sqrt()
 }
 
 /// Compute Cosine Similarity between original and dequantized tensor.
