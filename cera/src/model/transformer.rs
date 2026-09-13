@@ -1394,6 +1394,7 @@ pub(crate) struct DecodeAttnDims {
     pub head_dim: usize,
     pub scale: f32,
     pub seq_len: usize,
+    pub attn_logit_softcapping: Option<f32>,
     /// Optional sliding window attention size.
     pub sliding_window: Option<usize>,
 }
@@ -1835,6 +1836,7 @@ pub(crate) fn forward_attn_block(
                 head_dim,
                 scale,
                 seq_len,
+                attn_logit_softcapping: dims.attn_logit_softcapping,
                 sliding_window: dims.sliding_window,
             },
             attn_out,
