@@ -12,7 +12,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cera::backend::cuda::{CudaContext, CudaDevice};
+use cera::backend::cuda::{CudaContext, CudaDevice, QkNormRopeParams};
 use cera::engine::BackendPreference;
 
 #[test]
@@ -474,5 +474,84 @@ fn test_cuda_append_kv_cache_f16() {
         let expected_v = half::f16::from_f32(v_vec[i]).to_bits();
         assert_eq!(k_out[offset + i], expected_k, "k mismatch at index {i}");
         assert_eq!(v_out[offset + i], expected_v, "v mismatch at index {i}");
+    }
+}
+
+#[test]
+fn test_cuda_qk_norm_rope_precomputed_inv_freq() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA not available, skipping test_cuda_qk_norm_rope_precomputed_inv_freq");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+    let n_heads = 2u32;
+    let n_kv_heads = 1u32;
+    let head_dim = 64u32;
+    let half_dim = (head_dim / 2).min(64) as usize;
+    let freq_base = 10000.0f32;
+    let pos = 5u32;
+
+    // Precompute inverse frequencies on CPU
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let inv_freqs: Vec<f32> = (0..half_dim).map(|i| theta_scale.powf(i as f32)).collect();
+    let rope_inv_freq_buf = ctx.upload_f32(&inv_freqs).expect("upload rope_inv_freq");
+
+    let q_len = (n_heads * head_dim) as usize;
+    let k_len = (n_kv_heads * head_dim) as usize;
+    let q_init: Vec<f32> = (0..q_len).map(|i| (i as f32) * 0.05 + 0.1).collect();
+    let k_init: Vec<f32> = (0..k_len).map(|i| (i as f32) * -0.03 + 0.5).collect();
+
+    let mut q_buf = ctx.upload_f32(&q_init).expect("upload q");
+    let mut k_buf = ctx.upload_f32(&k_init).expect("upload k");
+
+    let params = QkNormRopeParams {
+        pos,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        eps: 1e-5,
+        freq_base,
+        rope_type: 0, // NeoX
+        has_freq_factors: 0,
+        has_qk_norm: 0,
+    };
+
+    ctx.qk_norm_rope(
+        &mut q_buf,
+        &mut k_buf,
+        None,
+        None,
+        Some(&rope_inv_freq_buf),
+        params,
+    )
+    .expect("qk_norm_rope failed");
+    ctx.synchronize().expect("synchronize failed");
+
+    let mut q_out = vec![0.0f32; q_len];
+    ctx.download_f32(&q_buf, &mut q_out).expect("download q");
+
+    // Check against CPU reference RoPE
+    for h in 0..n_heads as usize {
+        for d in 0..half_dim {
+            let theta = (pos as f32) * inv_freqs[d];
+            let cos_a = theta.cos();
+            let sin_a = theta.sin();
+            let x0 = q_init[h * head_dim as usize + d];
+            let x1 = q_init[h * head_dim as usize + d + half_dim];
+            let expected_0 = x0 * cos_a - x1 * sin_a;
+            let expected_1 = x0 * sin_a + x1 * cos_a;
+
+            let actual_0 = q_out[h * head_dim as usize + d];
+            let actual_1 = q_out[h * head_dim as usize + d + half_dim];
+            assert!(
+                (actual_0 - expected_0).abs() < 1e-4,
+                "Q head {h} dim {d} mismatch: {actual_0} vs {expected_0}"
+            );
+            assert!(
+                (actual_1 - expected_1).abs() < 1e-4,
+                "Q head {h} dim {d}+half mismatch: {actual_1} vs {expected_1}"
+            );
+        }
     }
 }

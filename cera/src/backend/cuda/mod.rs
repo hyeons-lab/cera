@@ -537,7 +537,7 @@ impl CudaContext {
         k_cache: &mut CudaBuffer,
         q_norm_w: Option<&CudaBuffer>,
         k_norm_w: Option<&CudaBuffer>,
-        freq_factors: Option<&CudaBuffer>,
+        rope_inv_freq: Option<&CudaBuffer>,
         params: QkNormRopeParams,
     ) -> Result<()> {
         let kernel = self.load_kernel(QK_NORM_ROPE_SRC, "qk_norm_rope", "qk_norm_rope")?;
@@ -553,7 +553,7 @@ impl CudaContext {
         let null_ptr: sys::CUdeviceptr = 0;
         let q_norm_ptr = q_norm_w.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
         let k_norm_ptr = k_norm_w.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
-        let freq_ptr = freq_factors.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
+        let freq_ptr = rope_inv_freq.map(|b| b.cu_device_ptr()).unwrap_or(null_ptr);
 
         let mut builder = self.stream.launch_builder(&kernel);
         builder.arg(q);
