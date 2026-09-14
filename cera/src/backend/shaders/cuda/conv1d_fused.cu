@@ -36,12 +36,14 @@ __global__ void conv1d_fused(
     const float bx = x_val * b_val;
 
     float sum = 0.0f;
+    #pragma unroll
     for (uint32_t k = 0; k < d_conv; k++) {
         sum = fmaf(rbuffer[(size_t)k * hs + ch], weight[(size_t)ch * ks + k], sum);
     }
     sum = fmaf(bx, weight[(size_t)ch * ks + d_conv], sum);
 
     if (d_conv > 1) {
+        #pragma unroll
         for (uint32_t k = 0; k < d_conv - 1; k++) {
             rbuffer[(size_t)k * hs + ch] = rbuffer[(size_t)(k + 1) * hs + ch];
         }

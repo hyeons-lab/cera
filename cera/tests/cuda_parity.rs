@@ -415,6 +415,20 @@ fn test_cuda_argmax_f32() {
 
     let token_id = u32::from_ne_bytes(pinned.as_slice()[..4].try_into().unwrap());
     assert_eq!(token_id, 42, "argmax_f32 produced incorrect token ID");
+
+    // Test argmax_f32_pinned zero-copy UMA direct write
+    let mut pinned_direct = ctx
+        .create_pinned_buffer(std::mem::size_of::<u32>())
+        .expect("allocate pinned buffer for direct write");
+    ctx.argmax_f32_pinned(&mut pinned_direct, &logits_buf, n as u32)
+        .expect("argmax_f32_pinned kernel launch failed");
+    ctx.synchronize().expect("synchronize failed");
+
+    let direct_token_id = u32::from_ne_bytes(pinned_direct.as_slice()[..4].try_into().unwrap());
+    assert_eq!(
+        direct_token_id, 42,
+        "argmax_f32_pinned produced incorrect token ID"
+    );
 }
 
 #[test]

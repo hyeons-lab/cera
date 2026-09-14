@@ -19,6 +19,12 @@ __device__ __forceinline__ uint16_t float_to_half(float f) {
     return h;
 }
 
+__device__ __forceinline__ uint32_t float2_to_half2(float lo, float hi) {
+    uint32_t pair;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(pair) : "f"(hi), "f"(lo));
+    return pair;
+}
+
 extern "C" {
 
 struct ElementwiseParams {
@@ -97,20 +103,16 @@ __global__ void append_kv_cache_f16(
         const float4 k_val = reinterpret_cast<const float4*>(k_src)[gid];
         const float4 v_val = reinterpret_cast<const float4*>(v_src)[gid];
 
-        uint16_t k_h[4];
-        k_h[0] = float_to_half(k_val.x);
-        k_h[1] = float_to_half(k_val.y);
-        k_h[2] = float_to_half(k_val.z);
-        k_h[3] = float_to_half(k_val.w);
+        const uint32_t k_pair0 = float2_to_half2(k_val.x, k_val.y);
+        const uint32_t k_pair1 = float2_to_half2(k_val.z, k_val.w);
+        const uint32_t v_pair0 = float2_to_half2(v_val.x, v_val.y);
+        const uint32_t v_pair1 = float2_to_half2(v_val.z, v_val.w);
 
-        uint16_t v_h[4];
-        v_h[0] = float_to_half(v_val.x);
-        v_h[1] = float_to_half(v_val.y);
-        v_h[2] = float_to_half(v_val.z);
-        v_h[3] = float_to_half(v_val.w);
+        const uint64_t k64 = ((uint64_t)k_pair1 << 32) | (uint64_t)k_pair0;
+        const uint64_t v64 = ((uint64_t)v_pair1 << 32) | (uint64_t)v_pair0;
 
-        *reinterpret_cast<uint64_t*>(k_dst + (size_t)gid * 4) = *reinterpret_cast<const uint64_t*>(k_h);
-        *reinterpret_cast<uint64_t*>(v_dst + (size_t)gid * 4) = *reinterpret_cast<const uint64_t*>(v_h);
+        *reinterpret_cast<uint64_t*>(k_dst + (size_t)gid * 4) = k64;
+        *reinterpret_cast<uint64_t*>(v_dst + (size_t)gid * 4) = v64;
     }
 
     const uint32_t rem_start = num_vec4 * 4;
@@ -125,7 +127,7 @@ __global__ void append_kv_cache_f16(
 __device__ __forceinline__ float silu_scalar(float g) {
     if (g < -80.0f) g = -80.0f;
     else if (g > 80.0f) g = 80.0f;
-    return g / (1.0f + expf(-g));
+    return g / (1.0f + __expf(-g));
 }
 
 // silu_mul_inplace: a[i] = (silu(a[i])) * b[i]

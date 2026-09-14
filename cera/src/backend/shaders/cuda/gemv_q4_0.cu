@@ -56,6 +56,7 @@ __global__ void gemv_q4_0(
     const uint32_t byte_idx = lane & 15;
     const uint32_t shift = (lane >> 2) & 4;
 
+    #pragma unroll 2
     for (uint32_t ib = 0; ib < nb; ib++) {
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
@@ -78,30 +79,35 @@ __global__ void gemv_q4_0(
         const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
         const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
 
+        const float x0 = x_val * d0;
+        const float x1 = x_val * d1;
+        const float x2 = x_val * d2;
+        const float x3 = x_val * d3;
+
         // Row 0
         const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
         const float q0 = (float)((byte0 >> shift) & 0x0F) - 8.0f;
-        sum0 = fmaf(q0 * d0, x_val, sum0);
+        sum0 = fmaf(q0, x0, sum0);
 
         // Row 1
         if (row1_ptr) {
             const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
             const float q1 = (float)((byte1 >> shift) & 0x0F) - 8.0f;
-            sum1 = fmaf(q1 * d1, x_val, sum1);
+            sum1 = fmaf(q1, x1, sum1);
         }
 
         // Row 2
         if (row2_ptr) {
             const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
             const float q2 = (float)((byte2 >> shift) & 0x0F) - 8.0f;
-            sum2 = fmaf(q2 * d2, x_val, sum2);
+            sum2 = fmaf(q2, x2, sum2);
         }
 
         // Row 3
         if (row3_ptr) {
             const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
             const float q3 = (float)((byte3 >> shift) & 0x0F) - 8.0f;
-            sum3 = fmaf(q3 * d3, x_val, sum3);
+            sum3 = fmaf(q3, x3, sum3);
         }
     }
 
@@ -155,6 +161,7 @@ __global__ void gemv_q4_0_accum(
     const uint32_t byte_idx = lane & 15;
     const uint32_t shift = (lane >> 2) & 4;
 
+    #pragma unroll 2
     for (uint32_t ib = 0; ib < nb; ib++) {
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
@@ -177,30 +184,35 @@ __global__ void gemv_q4_0_accum(
         const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
         const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
 
+        const float x0 = x_val * d0;
+        const float x1 = x_val * d1;
+        const float x2 = x_val * d2;
+        const float x3 = x_val * d3;
+
         // Row 0
         const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
         const float q0 = (float)((byte0 >> shift) & 0x0F) - 8.0f;
-        sum0 = fmaf(q0 * d0, x_val, sum0);
+        sum0 = fmaf(q0, x0, sum0);
 
         // Row 1
         if (row1_ptr) {
             const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
             const float q1 = (float)((byte1 >> shift) & 0x0F) - 8.0f;
-            sum1 = fmaf(q1 * d1, x_val, sum1);
+            sum1 = fmaf(q1, x1, sum1);
         }
 
         // Row 2
         if (row2_ptr) {
             const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
             const float q2 = (float)((byte2 >> shift) & 0x0F) - 8.0f;
-            sum2 = fmaf(q2 * d2, x_val, sum2);
+            sum2 = fmaf(q2, x2, sum2);
         }
 
         // Row 3
         if (row3_ptr) {
             const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
             const float q3 = (float)((byte3 >> shift) & 0x0F) - 8.0f;
-            sum3 = fmaf(q3 * d3, x_val, sum3);
+            sum3 = fmaf(q3, x3, sum3);
         }
     }
 
