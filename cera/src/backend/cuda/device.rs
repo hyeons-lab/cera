@@ -4,10 +4,22 @@
 // Applies CU_CTX_SCHED_BLOCKING_SYNC to eliminate driver spin-wait polling,
 // protecting host ARM CPU cores for realtime audio DSP in automotive setups.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaContext, result, sys};
+use cudarc::driver::{CudaContext, DriverError, result, sys};
+
+static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+static CUDA_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+fn safe_cuda_init() -> std::thread::Result<Result<(), DriverError>> {
+    let _guard = PANIC_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let init_res = std::panic::catch_unwind(result::init);
+    std::panic::set_hook(prev_hook);
+    init_res
+}
 
 /// CUDA device handle encapsulating primary context and hardware attributes.
 #[derive(Debug, Clone)]
@@ -25,20 +37,12 @@ pub struct CudaDevice {
 impl CudaDevice {
     /// Check if the CUDA driver dynamic library is present and loadable on this system.
     pub fn is_available() -> bool {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let res = std::panic::catch_unwind(|| result::init().is_ok()).unwrap_or(false);
-        std::panic::set_hook(prev_hook);
-        res
+        *CUDA_AVAILABLE.get_or_init(|| matches!(safe_cuda_init(), Ok(Ok(()))))
     }
 
     /// Initialize a CUDA device by ordinal with blocking driver synchronization.
     pub fn new(ordinal: usize) -> Result<Self> {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let init_res = std::panic::catch_unwind(result::init);
-        std::panic::set_hook(prev_hook);
-
+        let init_res = safe_cuda_init();
         match init_res {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e).context("failed to initialize CUDA driver"),

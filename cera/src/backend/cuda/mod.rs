@@ -131,10 +131,7 @@ impl CudaContext {
     /// Compile or retrieve cached PTX module by static source pointer.
     pub fn load_ptx(&self, ptx_src: &'static str) -> Result<CudaModule> {
         let key = ptx_src.as_ptr() as usize;
-        let mut cache = self
-            .module_cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("CUDA module cache lock poisoned: {e}"))?;
+        let mut cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(module) = cache.get(&key) {
             return Ok(module.clone());
@@ -162,10 +159,7 @@ impl CudaContext {
     /// Compile or retrieve cached CUDA C++ source module.
     pub fn load_cuda(&self, cu_src: &'static str, name: &str) -> Result<CudaModule> {
         let key = cu_src.as_ptr() as usize;
-        let mut cache = self
-            .module_cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("CUDA module cache lock poisoned: {e}"))?;
+        let mut cache = self.module_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(module) = cache.get(&key) {
             return Ok(module.clone());
@@ -902,6 +896,11 @@ impl CudaContext {
         rope_inv_freq: Option<&CudaBuffer>,
         params: QkNormRopeParams,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.head_dim <= 128,
+            "CUDA qk_norm_rope kernel supports head_dim <= 128, got {}",
+            params.head_dim
+        );
         let kernel = self.load_kernel(QK_NORM_ROPE_SRC, "qk_norm_rope", "qk_norm_rope")?;
         let num_blocks = params.n_heads.max(params.n_kv_heads);
         // Shared memory for per-head reduction: head_dim floats + 8 floats for warp sums
@@ -930,6 +929,9 @@ impl CudaContext {
 
     /// Execute SwiGLU elementwise operation in-place: `a[i] = silu(a[i]) * b[i]`.
     pub fn silu_mul_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "silu_mul_inplace")?;
         let cfg = LaunchConfig::for_num_elems(n.div_ceil(4));
         let params = ElementwiseParams { n, _pad: 0 };
@@ -943,6 +945,9 @@ impl CudaContext {
 
     /// Execute elementwise vector addition in-place: `a[i] += b[i]`.
     pub fn add_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "add_inplace")?;
         let cfg = LaunchConfig::for_num_elems(n);
         let params = ElementwiseParams { n, _pad: 0 };
@@ -962,6 +967,9 @@ impl CudaContext {
         scale: f32,
         n: u32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "scaled_add_inplace")?;
         let cfg = LaunchConfig::for_num_elems(n);
         let params = ScaleParams { n, scale };
@@ -975,6 +983,9 @@ impl CudaContext {
 
     /// Execute scalar scaling in-place: `a[i] *= scale`.
     pub fn scale_inplace(&self, a: &mut CudaBuffer, scale: f32, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "scale_f32")?;
         let cfg = LaunchConfig::for_num_elems(n);
         let params = ScaleParams { n, scale };

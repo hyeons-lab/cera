@@ -20,6 +20,7 @@ struct GemmParams {
     uint32_t m; // Number of batch tokens
     uint32_t n; // Number of output rows
     uint32_t k; // Number of input columns (multiple of 32)
+    uint32_t _pad;
 };
 
 #define TILE_M 16

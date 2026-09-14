@@ -1493,7 +1493,7 @@ impl VisionGpuEncode for MetalVisionEncoder {
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
-/// or when the device/context can't be created — the caller then falls back to
+/// or when the device/context can't be created: the caller then falls back to
 /// the CPU encoder. `Auto` prefers Metal, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
@@ -1501,9 +1501,9 @@ pub fn build_gpu_vision_encoder(
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu => None,
+        BP::Cpu | BP::Cuda => None,
         BP::Metal => try_metal_vision_encoder(weights),
-        BP::Gpu | BP::Cuda => try_wgpu_vision_encoder(weights),
+        BP::Gpu => try_wgpu_vision_encoder(weights),
         BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
     }
 }

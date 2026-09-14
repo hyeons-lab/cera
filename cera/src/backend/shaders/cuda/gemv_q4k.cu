@@ -16,6 +16,12 @@ __device__ __forceinline__ float half_to_float(uint16_t h) {
     return f;
 }
 
+__device__ __forceinline__ float silu_scalar(float g) {
+    if (g < -80.0f) g = -80.0f;
+    else if (g > 80.0f) g = 80.0f;
+    return g / (1.0f + __expf(-g));
+}
+
 extern "C" {
 
 struct GemvParams {
@@ -555,7 +561,7 @@ __global__ void gemv_q4k_swiglu(
     }
 
     if (lane == 0) {
-        float silu = sum_g / (1.0f + __expf(-sum_g));
+        float silu = silu_scalar(sum_g);
         out[row] = silu * sum_u;
     }
 }

@@ -971,20 +971,28 @@ pub fn load_model_cuda(
     path: Option<&std::path::Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>> {
-    let _ = path;
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" | "lfm2moe" => Ok(Box::new(cuda_lfm2::CudaLfm2Model::from_gguf(
+        "lfm2" => Ok(Box::new(cuda_lfm2::CudaLfm2Model::from_gguf(
             gguf,
             path,
             context_size,
         )?)),
-        "qwen2" | "qwen3" | "llama" | "granite" => Ok(Box::new(
-            cuda_lfm2::CudaLfm2Model::from_llama(gguf, path, context_size)?,
-        )),
+        "llama" | "qwen3" => Ok(Box::new(cuda_lfm2::CudaLfm2Model::from_llama(
+            gguf,
+            path,
+            context_size,
+        )?)),
+        "lfm2moe" => bail!("lfm2moe architecture is not yet implemented for CUDA backend"),
+        "qwen2" => bail!(
+            "qwen2 architecture requires bias projections which are not yet implemented for CUDA backend"
+        ),
+        "granite" => bail!(
+            "granite architecture requires residual scaling which is not yet implemented for CUDA backend"
+        ),
         other => bail!("unsupported architecture for CUDA: {other}"),
     }
 }
