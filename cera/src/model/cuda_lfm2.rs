@@ -7,14 +7,14 @@
 // - Online softmax FlashAttention for bounded O(1) shared-memory context scaling.
 // - 1-token-per-launch CUDA Graph capture for sub-microsecond dispatch latency.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::backend::cuda::{
-    AttentionParams, Conv1dParams, CudaBuffer, CudaContext, CudaGraph, CudaPinnedBuffer,
-    QkNormRopeParams,
+    AttentionParams, Conv1dParams, CudaBuffer, CudaContext, CudaPinnedBuffer, QkNormRopeParams,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
@@ -177,7 +177,7 @@ pub struct CudaLfm2Model {
     pub seq_len: AtomicUsize,
     pub max_seq_len: usize,
     pub infer_lock: Mutex<()>,
-    pub decode_graph: Mutex<Option<CudaGraph>>,
+    pub gpu_mem_bytes: u64,
 }
 
 impl CudaLfm2Model {
@@ -218,6 +218,26 @@ impl CudaLfm2Model {
             head_dim <= 128,
             "CUDA FlashAttention kernel supports head_dim <= 128, got {head_dim}"
         );
+        ensure!(
+            hs > 0 && hs.is_multiple_of(4),
+            "hidden_size must be positive and a multiple of 4, got {hs}"
+        );
+        ensure!(
+            head_dim > 0 && head_dim.is_multiple_of(4),
+            "head_dim must be positive and a multiple of 4, got {head_dim}"
+        );
+        ensure!(
+            config.n_heads > 0,
+            "n_heads must be positive, got {}",
+            config.n_heads
+        );
+        for (i, &n_kv) in config.kv_heads_per_layer.iter().enumerate() {
+            ensure!(
+                n_kv > 0 && config.n_heads.is_multiple_of(n_kv),
+                "layer {i}: n_heads ({}) must be multiple of n_kv ({n_kv})",
+                config.n_heads
+            );
+        }
         let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
         let vocab_size = config.vocab_size;
@@ -227,10 +247,13 @@ impl CudaLfm2Model {
             config.n_layers
         );
 
+        let gpu_mem_bytes = Cell::new(0u64);
+
         // Helper to upload a WeightRef to a device-resident CudaWeight
         let upload_weight = |wref: &WeightRef| -> Result<CudaWeight> {
             let bytes = src.weight_bytes(wref);
             let buf = ctx.upload_bytes(&bytes)?;
+            gpu_mem_bytes.set(gpu_mem_bytes.get() + buf.len() as u64);
             Ok(CudaWeight {
                 buf,
                 dtype: wref.dtype,
@@ -243,7 +266,9 @@ impl CudaLfm2Model {
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let attn_norm = ctx.upload_f32(src.attn_norm_weight(i))?;
+            gpu_mem_bytes.set(gpu_mem_bytes.get() + attn_norm.len() as u64);
             let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i))?;
+            gpu_mem_bytes.set(gpu_mem_bytes.get() + ffn_norm.len() as u64);
 
             // Feed-Forward weights
             let gate_ref = src.ffn_gate_ref(i)?;
@@ -261,6 +286,7 @@ impl CudaLfm2Model {
                     .conv_weight(i)
                     .context("missing conv weight for GatedConv layer")?;
                 let weight = ctx.upload_f32(conv_w_data)?;
+                gpu_mem_bytes.set(gpu_mem_bytes.get() + weight.len() as u64);
 
                 let w_in_ref = src
                     .conv_in_proj_ref(i)
@@ -273,6 +299,7 @@ impl CudaLfm2Model {
                 let d_conv = kernel_size.saturating_sub(1);
                 let rbuffer =
                     ctx.create_buffer((d_conv as usize) * hs * std::mem::size_of::<f32>())?;
+                gpu_mem_bytes.set(gpu_mem_bytes.get() + rbuffer.len() as u64);
 
                 CudaLayerOperator::Conv(Box::new(CudaConvLayer {
                     w_in: upload_weight(w_in_ref)?,
@@ -297,15 +324,22 @@ impl CudaLfm2Model {
                     .attn_q_norm_weight(i)
                     .map(|w| ctx.upload_f32(w))
                     .transpose()?;
+                if let Some(ref qn) = q_norm {
+                    gpu_mem_bytes.set(gpu_mem_bytes.get() + qn.len() as u64);
+                }
                 let k_norm = src
                     .attn_k_norm_weight(i)
                     .map(|w| ctx.upload_f32(w))
                     .transpose()?;
+                if let Some(ref kn) = k_norm {
+                    gpu_mem_bytes.set(gpu_mem_bytes.get() + kn.len() as u64);
+                }
 
                 // Allocate FP16 KV cache for this layer
                 let cache_bytes = max_seq_len * (kv_dim as usize) * std::mem::size_of::<u16>();
                 let k_cache = ctx.create_buffer(cache_bytes)?;
                 let v_cache = ctx.create_buffer(cache_bytes)?;
+                gpu_mem_bytes.set(gpu_mem_bytes.get() + (k_cache.len() + v_cache.len()) as u64);
 
                 CudaLayerOperator::Attention(Box::new(CudaAttnLayer {
                     wq: upload_weight(ref_q)?,
@@ -333,6 +367,7 @@ impl CudaLfm2Model {
 
         // Final output norm
         let output_norm = ctx.upload_f32(src.output_norm_weight())?;
+        gpu_mem_bytes.set(gpu_mem_bytes.get() + output_norm.len() as u64);
 
         // Output projection weight
         let output_weight = if let Some(out_ref) = src.output_ref() {
@@ -360,6 +395,9 @@ impl CudaLfm2Model {
         } else {
             None
         };
+        if let Some(ref table) = embedding_table {
+            gpu_mem_bytes.set(gpu_mem_bytes.get() + table.len() as u64);
+        }
 
         // Precompute RoPE inverse frequencies once on CPU, incorporating optional LLaMA-3 freq factors
         let half_dim = (head_dim / 2).min(64);
@@ -373,6 +411,7 @@ impl CudaLfm2Model {
             inv_freqs.push(f);
         }
         let rope_inv_freq = ctx.upload_f32(&inv_freqs)?;
+        gpu_mem_bytes.set(gpu_mem_bytes.get() + rope_inv_freq.len() as u64);
 
         // Allocate static execution workspace (zero runtime allocations)
         let f32_size = std::mem::size_of::<f32>();
@@ -395,6 +434,25 @@ impl CudaLfm2Model {
             pinned_token: ctx.create_pinned_buffer(std::mem::size_of::<u32>())?,
             embd_scratch: vec![0.0f32; hs],
         };
+        gpu_mem_bytes.set(
+            gpu_mem_bytes.get()
+                + (workspace.hidden.len()
+                    + workspace.normed.len()
+                    + workspace.q.len()
+                    + workspace.k.len()
+                    + workspace.v.len()
+                    + workspace.attn_out.len()
+                    + workspace.conv_proj.len()
+                    + workspace.conv_out.len()
+                    + workspace.ffn_input.len()
+                    + workspace.gate.len()
+                    + workspace.up.len()
+                    + workspace.final_norm.len()
+                    + workspace.logits.len()
+                    + workspace.pinned_logits.len()
+                    + workspace.argmax_token.len()
+                    + workspace.pinned_token.len()) as u64,
+        );
 
         Ok(Self {
             ctx,
@@ -411,7 +469,7 @@ impl CudaLfm2Model {
             seq_len: AtomicUsize::new(0),
             max_seq_len,
             infer_lock: Mutex::new(()),
-            decode_graph: Mutex::new(None),
+            gpu_mem_bytes: gpu_mem_bytes.into_inner(),
         })
     }
 
@@ -771,14 +829,8 @@ impl Model for CudaLfm2Model {
         if tokens.is_empty() {
             return 0;
         }
-        let token = tokens[0];
-        let cur_pos = pos;
-        if cur_pos >= self.max_seq_len {
-            tracing::error!("cur_pos {cur_pos} exceeds max_seq_len {}", self.max_seq_len);
-            return 0;
-        }
 
-        if cur_pos == 0 {
+        if pos == 0 {
             self.seq_len.store(0, Ordering::Relaxed);
             let _ = self.zero_conv_buffers();
         }
@@ -786,9 +838,21 @@ impl Model for CudaLfm2Model {
         let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let vocab_size = self.config.vocab_size as u32;
 
-        if let Err(e) = self.forward_step_device(token as usize, cur_pos, &mut ws, true) {
-            tracing::error!("CUDA forward_greedy step failed at pos {cur_pos}: {e:?}");
-            return 0;
+        for (i, &token) in tokens.iter().enumerate() {
+            let cur_pos = pos + i;
+            let is_last = i == tokens.len() - 1;
+            if cur_pos >= self.max_seq_len {
+                tracing::error!("cur_pos {cur_pos} exceeds max_seq_len {}", self.max_seq_len);
+                return 0;
+            }
+
+            if let Err(e) = self.forward_step_device(token as usize, cur_pos, &mut ws, is_last) {
+                tracing::error!("CUDA forward_greedy step failed at pos {cur_pos}: {e:?}");
+                return 0;
+            }
+
+            self.seq_len.store(cur_pos + 1, Ordering::Relaxed);
+            state.seq_len += 1;
         }
 
         // Execute GPU-resident argmax directly into ws.pinned_token via zero-copy UMA
@@ -808,12 +872,11 @@ impl Model for CudaLfm2Model {
 
         // Read back ONLY 4 bytes directly from pinned host memory without intermediate copies
         let pinned_slice = ws_ref.pinned_token.as_slice();
-        let next_token = u32::from_ne_bytes(pinned_slice[..4].try_into().unwrap_or([0; 4]));
+        u32::from_ne_bytes(pinned_slice[..4].try_into().unwrap_or([0; 4]))
+    }
 
-        self.seq_len.store(cur_pos + 1, Ordering::Relaxed);
-        state.seq_len += 1;
-
-        next_token
+    fn gpu_memory_bytes(&self) -> u64 {
+        self.gpu_mem_bytes
     }
 
     fn config(&self) -> &ModelConfig {
@@ -824,5 +887,8 @@ impl Model for CudaLfm2Model {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.seq_len.store(len, Ordering::Relaxed);
         state.seq_len = len;
+        if len == 0 {
+            let _ = self.zero_conv_buffers();
+        }
     }
 }

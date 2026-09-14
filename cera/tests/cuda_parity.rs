@@ -432,6 +432,52 @@ fn test_cuda_argmax_f32() {
 }
 
 #[test]
+fn test_cuda_argmax_masked_logits() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA not available, skipping test_cuda_argmax_masked_logits");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+    let n = 2048usize;
+    // Set all logits to -f32::MAX (masked out), except the very last one
+    let mut logits = vec![-f32::MAX; n];
+    let winning_idx = n - 1;
+    logits[winning_idx] = -100.0f32;
+
+    let logits_buf = ctx.upload_f32(&logits).expect("upload logits");
+    let mut pinned_direct = ctx
+        .create_pinned_buffer(std::mem::size_of::<u32>())
+        .expect("allocate pinned buffer");
+
+    ctx.argmax_f32_pinned(&mut pinned_direct, &logits_buf, n as u32)
+        .expect("argmax_f32_pinned kernel launch failed");
+    ctx.synchronize().expect("synchronize failed");
+
+    let direct_token_id = u32::from_ne_bytes(pinned_direct.as_slice()[..4].try_into().unwrap());
+    assert_eq!(
+        direct_token_id as usize, winning_idx,
+        "argmax_f32_pinned failed tie-breaker on masked logits: expected {winning_idx}, got {direct_token_id}"
+    );
+}
+
+#[test]
+fn test_cuda_pinned_buffer_zero_length() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA not available, skipping test_cuda_pinned_buffer_zero_length");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+    let pinned = ctx
+        .create_pinned_buffer(0)
+        .expect("allocate zero-len pinned buffer");
+    assert_eq!(pinned.len(), 0);
+    assert!(pinned.is_empty());
+    assert!(pinned.as_slice().is_empty());
+}
+
+#[test]
 fn test_cuda_append_kv_cache_f16() {
     if !CudaDevice::is_available() {
         eprintln!("CUDA not available, skipping test_cuda_append_kv_cache_f16");
@@ -581,9 +627,9 @@ fn test_cuda_q4_0_concat3_and_swiglu_parity() {
                 raw.extend_from_slice(&d_fp16.to_le_bytes());
 
                 let mut q_nibbles = [0i8; 32];
-                for i in 0..32 {
+                for (i, slot) in q_nibbles.iter_mut().enumerate() {
                     let q = (((r * 32 + b * 32 + i + offset) % 15) as i8) - 7;
-                    q_nibbles[i] = q;
+                    *slot = q;
                     floats.push((q as f32) * d_val);
                 }
                 for i in 0..16 {
@@ -988,7 +1034,7 @@ fn test_cuda_q4k_gemv_gemm_swiglu_and_gather_parity() {
     ctx.download_f32(&out_gather, &mut gather_result)
         .expect("download gather");
     for c in 0..k {
-        let expected = ref_weights[1 * k + c];
+        let expected = ref_weights[k + c];
         assert!(
             (gather_result[c] - expected).abs() < 1e-4,
             "Q4K gather mismatch at col {c}: got {}, expected {}",

@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <float.h>
+#include <math.h>
 
 extern "C" {
 
@@ -24,8 +25,8 @@ __global__ void argmax_f32(
     ArgmaxParams params
 ) {
     const uint32_t n = params.n;
-    float maxval = -FLT_MAX;
-    uint32_t argmax = 0;
+    float maxval = -INFINITY;
+    uint32_t argmax = UINT32_MAX;
 
     const uint32_t n4 = n / 4;
     const float4* x4 = reinterpret_cast<const float4*>(x);
@@ -75,8 +76,8 @@ __global__ void argmax_f32(
     __syncthreads();
 
     if (warp_id == 0) {
-        maxval = (lane < n_warps) ? s_maxval[lane] : -FLT_MAX;
-        argmax = (lane < n_warps) ? s_argmax[lane] : 0;
+        maxval = (lane < n_warps) ? s_maxval[lane] : -INFINITY;
+        argmax = (lane < n_warps) ? s_argmax[lane] : UINT32_MAX;
 
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {

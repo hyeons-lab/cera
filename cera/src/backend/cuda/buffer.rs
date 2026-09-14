@@ -120,6 +120,14 @@ unsafe impl Sync for CudaPinnedBuffer {}
 impl CudaPinnedBuffer {
     /// Allocate a pinned host buffer mapped into device address space.
     pub fn new(ctx: Arc<CudaContext>, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Ok(Self {
+                host_ptr: std::ptr::null_mut(),
+                device_ptr: 0,
+                len: 0,
+                ctx,
+            });
+        }
         ctx.bind_to_thread()
             .context("failed to bind CUDA context to thread")?;
 
