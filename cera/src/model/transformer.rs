@@ -1352,6 +1352,8 @@ pub(crate) struct AttnDims<'a> {
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
     /// applied only on the NORM path; `None` ⇒ plain RoPE.
     pub rope_freqs: Option<&'a [f32]>,
+    /// Optional logit soft-capping factor for attention scores (e.g. Gemma 2).
+    pub attn_logit_softcapping: Option<f32>,
 }
 
 // ── Decode-time GQA attention ───────────────────────────────────────────────
@@ -1388,6 +1390,7 @@ pub(crate) struct DecodeAttnDims {
     pub head_dim: usize,
     pub scale: f32,
     pub seq_len: usize,
+    pub attn_logit_softcapping: Option<f32>,
 }
 
 impl DecodeAttnDims {
@@ -1458,6 +1461,9 @@ fn decode_attn_head(
                 d.scale,
                 d.seq_len,
             );
+            if let Some(cap) = d.attn_logit_softcapping {
+                cpu::softcap_inplace(scores, cap);
+            }
             cpu::softmax_inplace(scores);
             cpu::attn_values_f16(
                 scores,
@@ -1480,6 +1486,9 @@ fn decode_attn_head(
                 d.scale,
                 d.seq_len,
             );
+            if let Some(cap) = d.attn_logit_softcapping {
+                cpu::softcap_inplace(scores, cap);
+            }
             cpu::softmax_inplace(scores);
             cpu::attn_values(
                 scores,
@@ -1659,22 +1668,30 @@ pub(crate) fn forward_attn_block(
         crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
     }
 
-    // Qwen3 per-head QK norm: RMSNorm each head slice with shared weights,
-    // applied BEFORE RoPE (mirrors LFM2's mandatory QK-norm).
+    // Qwen3 per-head QK norm (weights len == head_dim) or Olmo 2 full-vector QK norm
+    // (weights len == q_dim / kv_dim), applied BEFORE RoPE.
     if let Some((q_norm, k_norm)) = extras.qk_norm {
-        for h in 0..n_heads {
-            cpu::rmsnorm(
-                &mut q[h * head_dim..(h + 1) * head_dim],
-                q_norm,
-                dims.rms_norm_eps,
-            );
+        if q_norm.len() == head_dim {
+            for h in 0..n_heads {
+                cpu::rmsnorm(
+                    &mut q[h * head_dim..(h + 1) * head_dim],
+                    q_norm,
+                    dims.rms_norm_eps,
+                );
+            }
+        } else {
+            cpu::rmsnorm(q, q_norm, dims.rms_norm_eps);
         }
-        for h in 0..n_kv_heads {
-            cpu::rmsnorm(
-                &mut k[h * head_dim..(h + 1) * head_dim],
-                k_norm,
-                dims.rms_norm_eps,
-            );
+        if k_norm.len() == head_dim {
+            for h in 0..n_kv_heads {
+                cpu::rmsnorm(
+                    &mut k[h * head_dim..(h + 1) * head_dim],
+                    k_norm,
+                    dims.rms_norm_eps,
+                );
+            }
+        } else {
+            cpu::rmsnorm(k, k_norm, dims.rms_norm_eps);
         }
     }
 
@@ -1774,6 +1791,7 @@ pub(crate) fn forward_attn_block(
                 head_dim,
                 scale,
                 seq_len,
+                attn_logit_softcapping: dims.attn_logit_softcapping,
             },
             attn_out,
             &mut state.scratch.scores,
@@ -1828,9 +1846,18 @@ pub(crate) struct FfnWeights<'a> {
     pub ffn_down: &'a WeightRef,
 }
 
-/// Run one SwiGLU FFN block for a single token: `ffn_input` is the already
+/// Gated FFN activation function: SwiGLU (SiLU * up) vs GeGLU (GeLU * up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfnActivation {
+    #[default]
+    Swiglu,
+    Geglu,
+}
+
+/// Run one gated FFN block (SwiGLU or GeGLU) for a single token: `ffn_input` is the already
 /// RMSNorm'd (and, on aarch64, pre-quantized) hidden state. Writes the result
-/// into `state.scratch.out[..hidden_size]`. Identical to LFM2's FFN.
+/// into `state.scratch.out[..hidden_size]`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_ffn_block(
     gguf: &GgufFile,
     layer: usize,
@@ -1838,12 +1865,14 @@ pub(crate) fn forward_ffn_block(
     hidden_size: usize,
     intermediate_size: usize,
     ffn_input: &[f32],
+    activation: FfnActivation,
     state: &mut InferenceState,
 ) {
     let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
     {
-        let can_fuse_swiglu = lora.is_none()
+        let can_fuse_swiglu = activation == FfnActivation::Swiglu
+            && lora.is_none()
             && weights.ffn_gate.dtype == DType::Q4_0
             && weights.ffn_up.dtype == DType::Q4_0;
         if can_fuse_swiglu {
@@ -1935,10 +1964,20 @@ pub(crate) fn forward_ffn_block(
             }
         }
 
-        cpu::silu_mul_inplace(
-            &mut state.scratch.gate[..intermediate_size],
-            &state.scratch.up[..intermediate_size],
-        );
+        match activation {
+            FfnActivation::Swiglu => {
+                cpu::silu_mul_inplace(
+                    &mut state.scratch.gate[..intermediate_size],
+                    &state.scratch.up[..intermediate_size],
+                );
+            }
+            FfnActivation::Geglu => {
+                cpu::gelu_mul_inplace(
+                    &mut state.scratch.gate[..intermediate_size],
+                    &state.scratch.up[..intermediate_size],
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2152,6 +2191,7 @@ mod decode_attn_tests {
                 head_dim,
                 scale: 1.0 / (head_dim as f32).sqrt(),
                 seq_len,
+                attn_logit_softcapping: None,
             };
             // Skipped when the gate is overridden, since the override moves the
             // very threshold this is asserting against — otherwise anyone who
@@ -2262,6 +2302,7 @@ mod decode_attn_tests {
                     head_dim,
                     scale: 1.0 / (head_dim as f32).sqrt(),
                     seq_len,
+                    attn_logit_softcapping: None,
                 };
                 let want = serial_reference(&q, &kv, &d);
                 let mut got = vec![0.0f32; n_heads * head_dim];
