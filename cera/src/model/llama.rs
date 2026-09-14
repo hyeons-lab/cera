@@ -139,6 +139,16 @@ fn lm_head_gemm_disabled() -> bool {
 }
 
 impl LlamaModel {
+    fn check_rewind_mode(
+        &self,
+        state: &InferenceState,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        if !self.config.is_causal || state.lora.as_ref().is_some_and(|l| l.is_classifier()) {
+            return Err(crate::kv_cache::KvRewindError::NonCausal);
+        }
+        Ok(())
+    }
+
     /// Construct without a model identifier.
     #[allow(dead_code)]
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
@@ -1545,6 +1555,33 @@ impl LlamaModel {
 }
 
 impl Model for LlamaModel {
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &crate::kv_cache::KvCompression,
+        max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        super::reset_cpu_kv(self, state, compression, max_seq_len)
+    }
+
+    fn check_kv_rewind(
+        &self,
+        state: &InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        self.check_rewind_mode(state)?;
+        state.check_truncate_to(len)
+    }
+
+    fn try_truncate_kv(
+        &self,
+        state: &mut InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        self.check_rewind_mode(state)?;
+        state.try_truncate_to(len)
+    }
+
     fn supports_hidden_states(&self) -> bool {
         true
     }
@@ -1739,6 +1776,9 @@ impl Model for LlamaModel {
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
+    fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
+        Some(vec![&self.gguf])
+    }
     fn config(&self) -> &ModelConfig {
         &self.config
     }

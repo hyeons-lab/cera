@@ -2757,11 +2757,14 @@ public protocol FfiWhisperModelProtocol: AnyObject, Sendable {
     
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?) throws  -> String
     
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?) async throws  -> String
     
@@ -2868,6 +2871,7 @@ open func languages() -> [String]  {
     
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
 open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2881,6 +2885,8 @@ open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> St
     
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
 open func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?)async throws  -> String  {
     return
@@ -2942,6 +2948,155 @@ public func FfiConverterTypeFfiWhisperModel_lift(_ handle: UInt64) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiWhisperModel_lower(_ value: FfiWhisperModel) -> UInt64 {
     return FfiConverterTypeFfiWhisperModel.lower(value)
+}
+
+
+
+
+
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+public protocol GenerativeModelProtocol: AnyObject, Sendable {
+    
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    func createSession(config: SessionConfig) throws  -> Session
+    
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    func engine()  -> CeraEngine
+    
+}
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+open class GenerativeModel: GenerativeModelProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_generativemodel(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_generativemodel(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+open func createSession(config: SessionConfig)throws  -> Session  {
+    return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_generativemodel_create_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSessionConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+open func engine() -> CeraEngine  {
+    return try!  FfiConverterTypeCeraEngine_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_generativemodel_engine(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGenerativeModel: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = GenerativeModel
+
+    public static func lift(_ handle: UInt64) throws -> GenerativeModel {
+        return GenerativeModel(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: GenerativeModel) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenerativeModel {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: GenerativeModel, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerativeModel_lift(_ handle: UInt64) throws -> GenerativeModel {
+    return try FfiConverterTypeGenerativeModel.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerativeModel_lower(_ value: GenerativeModel) -> UInt64 {
+    return FfiConverterTypeGenerativeModel.lower(value)
 }
 
 
@@ -3493,6 +3648,309 @@ public func FfiConverterTypeModalitySink_lower(_ value: ModalitySink) -> UInt64 
 
 
 /**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+public protocol ModelHandleProtocol: AnyObject, Sendable {
+    
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    func asGenerative()  -> GenerativeModel?
+    
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    func kind()  -> String
+    
+}
+/**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+open class ModelHandle: ModelHandleProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_modelhandle(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_modelhandle(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+open func asGenerative() -> GenerativeModel?  {
+    return try!  FfiConverterOptionTypeGenerativeModel.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+open func kind() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_modelhandle_kind(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelHandle: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ModelHandle
+
+    public static func lift(_ handle: UInt64) throws -> ModelHandle {
+        return ModelHandle(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ModelHandle) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelHandle {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ModelHandle, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelHandle_lift(_ handle: UInt64) throws -> ModelHandle {
+    return try FfiConverterTypeModelHandle.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelHandle_lower(_ value: ModelHandle) -> UInt64 {
+    return FfiConverterTypeModelHandle.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+public protocol ModelLoaderProtocol: AnyObject, Sendable {
+    
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    func build() throws  -> ModelHandle
+    
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    func buildGenerative() throws  -> GenerativeModel
+    
+}
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+open class ModelLoader: ModelLoaderProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_modelloader(self.handle, $0) }
+    }
+    /**
+     * Retain explicit source data and the existing production engine options.
+     * Construction does not load weights or contact a remote service.
+     */
+public convenience init(source: ModelSource, config: EngineConfig) {
+    let handle =
+        try! rustCall() {
+    uniffi_cera_ffi_fn_constructor_modelloader_new(
+        FfiConverterTypeModelSource_lower(source),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_modelloader(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+open func build()throws  -> ModelHandle  {
+    return try  FfiConverterTypeModelHandle_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+    uniffi_cera_ffi_fn_method_modelloader_build(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+open func buildGenerative()throws  -> GenerativeModel  {
+    return try  FfiConverterTypeGenerativeModel_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+    uniffi_cera_ffi_fn_method_modelloader_build_generative(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelLoader: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ModelLoader
+
+    public static func lift(_ handle: UInt64) throws -> ModelLoader {
+        return ModelLoader(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ModelLoader) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelLoader {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ModelLoader, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelLoader_lift(_ handle: UInt64) throws -> ModelLoader {
+    return try FfiConverterTypeModelLoader.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelLoader_lower(_ value: ModelLoader) -> UInt64 {
+    return FfiConverterTypeModelLoader.lower(value)
+}
+
+
+
+
+
+
+/**
  * Zero-dependency PII Classifier for named entity recognition.
  */
 public protocol PiiClassifierProtocol: AnyObject, Sendable {
@@ -4021,6 +4479,19 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * precedence over the model's minimum-resolution floor).
      */
     func setImageMaxLongSize(maxLongSize: UInt32?) throws 
+    
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    func recoveryStatus() throws  -> SessionRecoveryStatus
     
 }
 /**
@@ -4629,6 +5100,25 @@ open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithErr
 }
 }
     
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+open func recoveryStatus()throws  -> SessionRecoveryStatus  {
+    return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_recovery_status(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
 
     
 }
@@ -5151,15 +5641,16 @@ public struct FfiHotwordEvent: Equatable, Hashable {
      */
     public var keyword: String
     /**
-     * Exact audio stream sample index where the keyword completed.
+     * Exclusive end sample of the window evaluated when detection triggered.
+     * This is a detection-hop boundary; it does not locate the spoken word's end.
      */
     public var sampleOffset: UInt64
     /**
-     * Audio stream sample index including pre-roll safety margin for downstream ASR.
+     * `sample_offset` minus the configured pre-roll samples, saturating at zero.
      */
     public var commandStartSample: UInt64
     /**
-     * Timestamp in milliseconds from stream origin where keyword completed.
+     * `sample_offset` converted to milliseconds using the model sample rate.
      */
     public var timestampMs: Float
     /**
@@ -5174,13 +5665,14 @@ public struct FfiHotwordEvent: Equatable, Hashable {
          * The matched keyword string.
          */keyword: String, 
         /**
-         * Exact audio stream sample index where the keyword completed.
+         * Exclusive end sample of the window evaluated when detection triggered.
+         * This is a detection-hop boundary; it does not locate the spoken word's end.
          */sampleOffset: UInt64, 
         /**
-         * Audio stream sample index including pre-roll safety margin for downstream ASR.
+         * `sample_offset` minus the configured pre-roll samples, saturating at zero.
          */commandStartSample: UInt64, 
         /**
-         * Timestamp in milliseconds from stream origin where keyword completed.
+         * `sample_offset` converted to milliseconds using the model sample rate.
          */timestampMs: Float, 
         /**
          * Model confidence probability (0.0 to 1.0).
@@ -5886,6 +6378,69 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
 
 
 /**
+ * Recovery diagnostic retained after a failed `send_message` ingestion.
+ * The call's original error is still returned separately. Generation failures
+ * after successful ingestion do not create this report.
+ */
+public struct IngestRecovery: Equatable, Hashable {
+    public var outcome: RecoveryOutcome
+    public var rewindError: KvRewindFailure?
+    public var resetError: FfiError?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: RecoveryOutcome, rewindError: KvRewindFailure?, resetError: FfiError?) {
+        self.outcome = outcome
+        self.rewindError = rewindError
+        self.resetError = resetError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IngestRecovery: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIngestRecovery: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IngestRecovery {
+        return
+            try IngestRecovery(
+                outcome: FfiConverterTypeRecoveryOutcome.read(from: &buf), 
+                rewindError: FfiConverterOptionTypeKvRewindFailure.read(from: &buf), 
+                resetError: FfiConverterOptionTypeFfiError.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IngestRecovery, into buf: inout [UInt8]) {
+        FfiConverterTypeRecoveryOutcome.write(value.outcome, into: &buf)
+        FfiConverterOptionTypeKvRewindFailure.write(value.rewindError, into: &buf)
+        FfiConverterOptionTypeFfiError.write(value.resetError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestRecovery_lift(_ buf: RustBuffer) throws -> IngestRecovery {
+    return try FfiConverterTypeIngestRecovery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestRecovery_lower(_ value: IngestRecovery) -> RustBuffer {
+    return FfiConverterTypeIngestRecovery.lower(value)
+}
+
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -6018,6 +6573,84 @@ public func FfiConverterTypeModalityCapabilities_lower(_ value: ModalityCapabili
 }
 
 
+public struct ModelFiles: Equatable, Hashable {
+    public var model: String
+    public var multimodalProjector: String?
+    public var audioDecoder: String?
+    public var audioTokenizer: String?
+    public var draftModel: String?
+    public var extras: [String: String]
+    public var inferenceType: String?
+    public var chatTemplate: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(model: String, multimodalProjector: String?, audioDecoder: String?, audioTokenizer: String?, draftModel: String?, extras: [String: String], inferenceType: String?, chatTemplate: String?) {
+        self.model = model
+        self.multimodalProjector = multimodalProjector
+        self.audioDecoder = audioDecoder
+        self.audioTokenizer = audioTokenizer
+        self.draftModel = draftModel
+        self.extras = extras
+        self.inferenceType = inferenceType
+        self.chatTemplate = chatTemplate
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ModelFiles: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelFiles: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelFiles {
+        return
+            try ModelFiles(
+                model: FfiConverterString.read(from: &buf), 
+                multimodalProjector: FfiConverterOptionString.read(from: &buf), 
+                audioDecoder: FfiConverterOptionString.read(from: &buf), 
+                audioTokenizer: FfiConverterOptionString.read(from: &buf), 
+                draftModel: FfiConverterOptionString.read(from: &buf), 
+                extras: FfiConverterDictionaryStringString.read(from: &buf), 
+                inferenceType: FfiConverterOptionString.read(from: &buf), 
+                chatTemplate: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelFiles, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.model, into: &buf)
+        FfiConverterOptionString.write(value.multimodalProjector, into: &buf)
+        FfiConverterOptionString.write(value.audioDecoder, into: &buf)
+        FfiConverterOptionString.write(value.audioTokenizer, into: &buf)
+        FfiConverterOptionString.write(value.draftModel, into: &buf)
+        FfiConverterDictionaryStringString.write(value.extras, into: &buf)
+        FfiConverterOptionString.write(value.inferenceType, into: &buf)
+        FfiConverterOptionString.write(value.chatTemplate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelFiles_lift(_ buf: RustBuffer) throws -> ModelFiles {
+    return try FfiConverterTypeModelFiles.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelFiles_lower(_ value: ModelFiles) -> RustBuffer {
+    return FfiConverterTypeModelFiles.lower(value)
+}
+
+
 /**
  * Short summary of a loaded model. Mirrors [`cera::ModelMetadata`].
  */
@@ -6131,6 +6764,150 @@ public func FfiConverterTypeModelMetadata_lower(_ value: ModelMetadata) -> RustB
 }
 
 
+public struct ModelParts: Equatable, Hashable {
+    public var model: Data
+    public var multimodalProjector: Data?
+    public var audioDecoder: Data?
+    public var audioTokenizer: Data?
+    public var draftModel: Data?
+    public var inferenceType: String?
+    public var chatTemplate: String?
+    public var generationDefaults: GenerationDefaults?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(model: Data, multimodalProjector: Data?, audioDecoder: Data?, audioTokenizer: Data?, draftModel: Data?, inferenceType: String?, chatTemplate: String?, generationDefaults: GenerationDefaults?) {
+        self.model = model
+        self.multimodalProjector = multimodalProjector
+        self.audioDecoder = audioDecoder
+        self.audioTokenizer = audioTokenizer
+        self.draftModel = draftModel
+        self.inferenceType = inferenceType
+        self.chatTemplate = chatTemplate
+        self.generationDefaults = generationDefaults
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ModelParts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelParts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelParts {
+        return
+            try ModelParts(
+                model: FfiConverterData.read(from: &buf), 
+                multimodalProjector: FfiConverterOptionData.read(from: &buf), 
+                audioDecoder: FfiConverterOptionData.read(from: &buf), 
+                audioTokenizer: FfiConverterOptionData.read(from: &buf), 
+                draftModel: FfiConverterOptionData.read(from: &buf), 
+                inferenceType: FfiConverterOptionString.read(from: &buf), 
+                chatTemplate: FfiConverterOptionString.read(from: &buf), 
+                generationDefaults: FfiConverterOptionTypeGenerationDefaults.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelParts, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.model, into: &buf)
+        FfiConverterOptionData.write(value.multimodalProjector, into: &buf)
+        FfiConverterOptionData.write(value.audioDecoder, into: &buf)
+        FfiConverterOptionData.write(value.audioTokenizer, into: &buf)
+        FfiConverterOptionData.write(value.draftModel, into: &buf)
+        FfiConverterOptionString.write(value.inferenceType, into: &buf)
+        FfiConverterOptionString.write(value.chatTemplate, into: &buf)
+        FfiConverterOptionTypeGenerationDefaults.write(value.generationDefaults, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelParts_lift(_ buf: RustBuffer) throws -> ModelParts {
+    return try FfiConverterTypeModelParts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelParts_lower(_ value: ModelParts) -> RustBuffer {
+    return FfiConverterTypeModelParts.lower(value)
+}
+
+
+public struct SamplingDefaults: Equatable, Hashable {
+    public var temperature: Float?
+    public var topP: Float?
+    public var topK: UInt32?
+    public var minP: Float?
+    public var repetitionPenalty: Float?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(temperature: Float?, topP: Float?, topK: UInt32?, minP: Float?, repetitionPenalty: Float?) {
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.repetitionPenalty = repetitionPenalty
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SamplingDefaults: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSamplingDefaults: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SamplingDefaults {
+        return
+            try SamplingDefaults(
+                temperature: FfiConverterOptionFloat.read(from: &buf), 
+                topP: FfiConverterOptionFloat.read(from: &buf), 
+                topK: FfiConverterOptionUInt32.read(from: &buf), 
+                minP: FfiConverterOptionFloat.read(from: &buf), 
+                repetitionPenalty: FfiConverterOptionFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SamplingDefaults, into buf: inout [UInt8]) {
+        FfiConverterOptionFloat.write(value.temperature, into: &buf)
+        FfiConverterOptionFloat.write(value.topP, into: &buf)
+        FfiConverterOptionUInt32.write(value.topK, into: &buf)
+        FfiConverterOptionFloat.write(value.minP, into: &buf)
+        FfiConverterOptionFloat.write(value.repetitionPenalty, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSamplingDefaults_lift(_ buf: RustBuffer) throws -> SamplingDefaults {
+    return try FfiConverterTypeSamplingDefaults.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSamplingDefaults_lower(_ value: SamplingDefaults) -> RustBuffer {
+    return FfiConverterTypeSamplingDefaults.lower(value)
+}
+
+
 /**
  * Per-session configuration. Mirrors [`cera::SessionConfig`].
  */
@@ -6241,6 +7018,88 @@ public func FfiConverterTypeSessionConfig_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustBuffer {
     return FfiConverterTypeSessionConfig.lower(value)
+}
+
+
+/**
+ * Coherent snapshot of a session at the instant the lock was acquired.
+ * Another thread may change the session after this method returns.
+ */
+public struct SessionRecoveryStatus: Equatable, Hashable {
+    /**
+     * False requires a successful checked reset or recreation.
+     */
+    public var usable: Bool
+    /**
+     * Meaningful as reusable context only when `usable` is true.
+     */
+    public var position: UInt32
+    /**
+     * Cleared by successful whole-message ingestion or explicit reset.
+     * Raw append calls and cancellation controls leave it unchanged.
+     */
+    public var lastIngestRecovery: IngestRecovery?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * False requires a successful checked reset or recreation.
+         */usable: Bool, 
+        /**
+         * Meaningful as reusable context only when `usable` is true.
+         */position: UInt32, 
+        /**
+         * Cleared by successful whole-message ingestion or explicit reset.
+         * Raw append calls and cancellation controls leave it unchanged.
+         */lastIngestRecovery: IngestRecovery?) {
+        self.usable = usable
+        self.position = position
+        self.lastIngestRecovery = lastIngestRecovery
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionRecoveryStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionRecoveryStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionRecoveryStatus {
+        return
+            try SessionRecoveryStatus(
+                usable: FfiConverterBool.read(from: &buf), 
+                position: FfiConverterUInt32.read(from: &buf), 
+                lastIngestRecovery: FfiConverterOptionTypeIngestRecovery.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionRecoveryStatus, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.usable, into: &buf)
+        FfiConverterUInt32.write(value.position, into: &buf)
+        FfiConverterOptionTypeIngestRecovery.write(value.lastIngestRecovery, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionRecoveryStatus_lift(_ buf: RustBuffer) throws -> SessionRecoveryStatus {
+    return try FfiConverterTypeSessionRecoveryStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionRecoveryStatus_lower(_ value: SessionRecoveryStatus) -> RustBuffer {
+    return FfiConverterTypeSessionRecoveryStatus.lower(value)
 }
 
 
@@ -7209,6 +8068,92 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum GenerationDefaults: Equatable, Hashable {
+    
+    case text(sampling: SamplingDefaults
+    )
+    case audio(sampling: SamplingDefaults, numberOfDecodingThreads: UInt32?, audioTemperature: Float?, audioTopK: UInt32?
+    )
+    case other(rawJson: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension GenerationDefaults: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGenerationDefaults: FfiConverterRustBuffer {
+    typealias SwiftType = GenerationDefaults
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenerationDefaults {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text(sampling: try FfiConverterTypeSamplingDefaults.read(from: &buf)
+        )
+        
+        case 2: return .audio(sampling: try FfiConverterTypeSamplingDefaults.read(from: &buf), numberOfDecodingThreads: try FfiConverterOptionUInt32.read(from: &buf), audioTemperature: try FfiConverterOptionFloat.read(from: &buf), audioTopK: try FfiConverterOptionUInt32.read(from: &buf)
+        )
+        
+        case 3: return .other(rawJson: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: GenerationDefaults, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .text(sampling):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeSamplingDefaults.write(sampling, into: &buf)
+            
+        
+        case let .audio(sampling,numberOfDecodingThreads,audioTemperature,audioTopK):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeSamplingDefaults.write(sampling, into: &buf)
+            FfiConverterOptionUInt32.write(numberOfDecodingThreads, into: &buf)
+            FfiConverterOptionFloat.write(audioTemperature, into: &buf)
+            FfiConverterOptionUInt32.write(audioTopK, into: &buf)
+            
+        
+        case let .other(rawJson):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(rawJson, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerationDefaults_lift(_ buf: RustBuffer) throws -> GenerationDefaults {
+    return try FfiConverterTypeGenerationDefaults.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerationDefaults_lower(_ value: GenerationDefaults) -> RustBuffer {
+    return FfiConverterTypeGenerationDefaults.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
  * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
@@ -7306,6 +8251,490 @@ public func FfiConverterTypeKvCompression_lift(_ buf: RustBuffer) throws -> KvCo
 #endif
 public func FfiConverterTypeKvCompression_lower(_ value: KvCompression) -> RustBuffer {
     return FfiConverterTypeKvCompression.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why checked tail rewind was unavailable. Numeric positions are token counts.
+ */
+
+public enum KvRewindFailure: Equatable, Hashable {
+    
+    case outOfBounds(requested: UInt64, current: UInt64
+    )
+    case compressed
+    case nonCausal
+    case missingConvolutionCheckpoint(layer: UInt64, position: UInt64
+    )
+    case invalidCacheLayout(layer: UInt64, detail: String
+    )
+    case backendUnsupported
+    case unknown(detail: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension KvRewindFailure: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKvRewindFailure: FfiConverterRustBuffer {
+    typealias SwiftType = KvRewindFailure
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KvRewindFailure {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .outOfBounds(requested: try FfiConverterUInt64.read(from: &buf), current: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 2: return .compressed
+        
+        case 3: return .nonCausal
+        
+        case 4: return .missingConvolutionCheckpoint(layer: try FfiConverterUInt64.read(from: &buf), position: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 5: return .invalidCacheLayout(layer: try FfiConverterUInt64.read(from: &buf), detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .backendUnsupported
+        
+        case 7: return .unknown(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: KvRewindFailure, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .outOfBounds(requested,current):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt64.write(requested, into: &buf)
+            FfiConverterUInt64.write(current, into: &buf)
+            
+        
+        case .compressed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .nonCausal:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .missingConvolutionCheckpoint(layer,position):
+            writeInt(&buf, Int32(4))
+            FfiConverterUInt64.write(layer, into: &buf)
+            FfiConverterUInt64.write(position, into: &buf)
+            
+        
+        case let .invalidCacheLayout(layer,detail):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt64.write(layer, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case .backendUnsupported:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .unknown(detail):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(detail, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKvRewindFailure_lift(_ buf: RustBuffer) throws -> KvRewindFailure {
+    return try FfiConverterTypeKvRewindFailure.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKvRewindFailure_lower(_ value: KvRewindFailure) -> RustBuffer {
+    return FfiConverterTypeKvRewindFailure.lower(value)
+}
+
+
+
+public enum LoadError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    case KindMismatch(expected: String, actual: String, architecture: String
+    )
+    case UnsupportedArchitecture(architecture: String
+    )
+    case UnsupportedInferenceType(inferenceType: String
+    )
+    case Source(sourceKind: String, detail: String
+    )
+    case Assembly(backend: String, detail: String
+    )
+    case InvalidConfig(field: String, value: String, reason: String, detail: String
+    )
+    case Engine(detail: String
+    )
+    case Consumed
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension LoadError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoadError: FfiConverterRustBuffer {
+    typealias SwiftType = LoadError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoadError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .KindMismatch(
+            expected: try FfiConverterString.read(from: &buf), 
+            actual: try FfiConverterString.read(from: &buf), 
+            architecture: try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .UnsupportedArchitecture(
+            architecture: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .UnsupportedInferenceType(
+            inferenceType: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .Source(
+            sourceKind: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 5: return .Assembly(
+            backend: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 6: return .InvalidConfig(
+            field: try FfiConverterString.read(from: &buf), 
+            value: try FfiConverterString.read(from: &buf), 
+            reason: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 7: return .Engine(
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .Consumed
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LoadError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .KindMismatch(expected,actual,architecture):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(expected, into: &buf)
+            FfiConverterString.write(actual, into: &buf)
+            FfiConverterString.write(architecture, into: &buf)
+            
+        
+        case let .UnsupportedArchitecture(architecture):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(architecture, into: &buf)
+            
+        
+        case let .UnsupportedInferenceType(inferenceType):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(inferenceType, into: &buf)
+            
+        
+        case let .Source(sourceKind,detail):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(sourceKind, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .Assembly(backend,detail):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(backend, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .InvalidConfig(field,value,reason,detail):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(field, into: &buf)
+            FfiConverterString.write(value, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .Engine(detail):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case .Consumed:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadError_lift(_ buf: RustBuffer) throws -> LoadError {
+    return try FfiConverterTypeLoadError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadError_lower(_ value: LoadError) -> RustBuffer {
+    return FfiConverterTypeLoadError.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ModelSource: Equatable, Hashable {
+    
+    case bundleId(id: String, quant: String
+    )
+    case huggingFace(spec: String, quant: String?, strategy: String?
+    )
+    case bytes(bytes: Data
+    )
+    case parts(parts: ModelParts
+    )
+    case path(path: String
+    )
+    case files(files: ModelFiles
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ModelSource: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelSource: FfiConverterRustBuffer {
+    typealias SwiftType = ModelSource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelSource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bundleId(id: try FfiConverterString.read(from: &buf), quant: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .huggingFace(spec: try FfiConverterString.read(from: &buf), quant: try FfiConverterOptionString.read(from: &buf), strategy: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 3: return .bytes(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 4: return .parts(parts: try FfiConverterTypeModelParts.read(from: &buf)
+        )
+        
+        case 5: return .path(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .files(files: try FfiConverterTypeModelFiles.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ModelSource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .bundleId(id,quant):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(quant, into: &buf)
+            
+        
+        case let .huggingFace(spec,quant,strategy):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(spec, into: &buf)
+            FfiConverterOptionString.write(quant, into: &buf)
+            FfiConverterOptionString.write(strategy, into: &buf)
+            
+        
+        case let .bytes(bytes):
+            writeInt(&buf, Int32(3))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        
+        case let .parts(parts):
+            writeInt(&buf, Int32(4))
+            FfiConverterTypeModelParts.write(parts, into: &buf)
+            
+        
+        case let .path(path):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case let .files(files):
+            writeInt(&buf, Int32(6))
+            FfiConverterTypeModelFiles.write(files, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSource_lift(_ buf: RustBuffer) throws -> ModelSource {
+    return try FfiConverterTypeModelSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSource_lower(_ value: ModelSource) -> RustBuffer {
+    return FfiConverterTypeModelSource.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Execution state after a failed whole-message append.
+ */
+
+public enum RecoveryOutcome: Equatable, Hashable {
+    
+    case unchanged
+    case restored
+    case reset
+    case unusable
+    /**
+     * A newer core outcome; conservatively recreate the session.
+     */
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RecoveryOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRecoveryOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = RecoveryOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecoveryOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unchanged
+        
+        case 2: return .restored
+        
+        case 3: return .reset
+        
+        case 4: return .unusable
+        
+        case 5: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RecoveryOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unchanged:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .restored:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .reset:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unusable:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecoveryOutcome_lift(_ buf: RustBuffer) throws -> RecoveryOutcome {
+    return try FfiConverterTypeRecoveryOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecoveryOutcome_lower(_ value: RecoveryOutcome) -> RustBuffer {
+    return FfiConverterTypeRecoveryOutcome.lower(value)
 }
 
 
@@ -7537,6 +8966,30 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeGenerativeModel: FfiConverterRustBuffer {
+    typealias SwiftType = GenerativeModel?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGenerativeModel.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGenerativeModel.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
     typealias SwiftType = AudioInput?
 
@@ -7657,6 +9110,30 @@ fileprivate struct FfiConverterOptionTypeFfiWhisperTranscribeOpts: FfiConverterR
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeIngestRecovery: FfiConverterRustBuffer {
+    typealias SwiftType = IngestRecovery?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeIngestRecovery.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeIngestRecovery.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffer {
     typealias SwiftType = SpecDecodeConfig?
 
@@ -7673,6 +9150,30 @@ fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSpecDecodeConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiError: FfiConverterRustBuffer {
+    typealias SwiftType = FfiError?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiError.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiError.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7705,6 +9206,30 @@ fileprivate struct FfiConverterOptionTypeFfiVadEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeGenerationDefaults: FfiConverterRustBuffer {
+    typealias SwiftType = GenerationDefaults?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGenerationDefaults.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGenerationDefaults.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
     typealias SwiftType = KvCompression?
 
@@ -7721,6 +9246,30 @@ fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeKvCompression.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeKvRewindFailure: FfiConverterRustBuffer {
+    typealias SwiftType = KvRewindFailure?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKvRewindFailure.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKvRewindFailure.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7997,6 +9546,32 @@ fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
             seq.append(try FfiConverterTypeToolDef.read(from: &buf))
         }
         return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
+    public static func write(_ value: [String: String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterString.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: String] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: String]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterString.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
     }
 }
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
@@ -8356,10 +9931,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -8455,6 +10030,27 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8519,6 +10115,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
         return InitializationResult.apiChecksumMismatch
     }
 

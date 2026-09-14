@@ -16,6 +16,70 @@
 > code stabilizes against the same shape the JVM/Apple bindings
 > expose.
 
+## Explicit CPU model loading
+
+This checkout exports `ModelSource`, `ModelLoader`, `ModelHandle` and
+`GenerativeModel` alongside the existing engine, browser factories and WebGPU API.
+Package releases have not been updated by this work. The loader accepts owned
+GGUF bytes or `ModelParts` containing companion bytes, inference type, chat
+template and complete Text/Audio/Other generation defaults.
+
+For a module generated with `wasm-bindgen --target nodejs`:
+
+```javascript
+const loader = new api.ModelLoader(
+    api.ModelSource.bytes(bytes), new api.LoadConfig(4096, 'cpu'));
+const model = loader.buildGenerative();
+const engine = model.engine();
+const config = new api.SessionConfig();
+config.seed = 42n;
+const session = model.createSession(config);
+config.free();
+// Session resources survive the release of the loading and engine handles.
+loader.free();
+model.free();
+const tokenizer = engine.tokenizer;
+engine.free();
+try {
+    session.appendTokens(tokenizer.encode('The capital of France is'));
+    const options = new api.GenerateOpts();
+    Object.assign(options, {maxTokens: 32, temperature: 0.7});
+    try {
+        const tokens = [];
+        const summary = session.generate(options, batch => tokens.push(...batch));
+        summary.free();
+        console.log(tokenizer.decode(new Uint32Array(tokens)));
+    } finally { options.free(); }
+} finally {
+    tokenizer.free();
+    session.free();
+}
+```
+
+The [complete Node example](examples/explicit_loading.cjs) includes module/file
+loading and cleanup for partial construction failures. Run it from the repo root:
+
+```sh
+cargo build -p cera-wasm --target wasm32-unknown-unknown
+wasm-bindgen --target nodejs --out-dir /tmp/cera-wasm-node \
+  target/wasm32-unknown-unknown/debug/cera_wasm.wasm
+node cera-wasm/examples/explicit_loading.cjs \
+  /tmp/cera-wasm-node/cera_wasm.js model.gguf "The capital of France is"
+```
+
+Loading is synchronous; use a worker in a browser UI. Source/config handles move
+into `ModelLoader` and must not be reused or freed after that transfer. Both build
+methods consume the loader's source even on failure; subsequent attempts throw
+an Error with `code === 'Consumed'`. Other loading errors carry structured `code`
+and variant-specific properties. Session methods retain their existing Error
+messages. This is raw prompt completion without a chat template. Reuse a Session
+for live KV continuation; the example does not establish performance budgets.
+
+`LoadConfig` and multipart/default fields retain their existing probe spelling;
+`buildGenerative`, `asGenerative`, `createSession` and `toJson` follow the production
+JavaScript method style. `ModelSource.bytes` and `.parts` are the new CPU sources.
+Existing async browser resolution and WebGPU loading use their existing APIs.
+
 ## Install
 
 ```sh

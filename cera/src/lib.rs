@@ -66,7 +66,8 @@ pub use classifier::{
     BioesPrefix, EntitySpan, detect_pii, extract_spans, parse_bioes, viterbi_decode,
 };
 pub use engine::{
-    BackendPreference, CeraEngine, EngineConfig, ModelBytes, ModelFiles, ModelMetadata,
+    BackendPreference, CeraEngine, EngineConfig, GenerativeModel, LoadConfig, LoadError,
+    ModelBytes, ModelFiles, ModelHandle, ModelKind, ModelLoader, ModelMetadata, ModelSource,
 };
 pub use hotword::{
     HotwordConfig, HotwordDetector, HotwordEvent, HotwordIterator, HotwordScore, LogMelFrontEnd,

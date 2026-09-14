@@ -19,10 +19,17 @@ use thiserror::Error;
 use crate::time::{Duration, Instant};
 
 use crate::kv_cache::{InferenceState, KvCompression};
-use crate::model::Model;
 use crate::model::audio_encoder::AudioEncoderWeights;
+use crate::model::{Model, ModelSessionLease};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
+
+#[cfg(test)]
+mod chat;
+mod decode;
+mod recovery;
+use decode::{DecodeObservation, ObservedGeneration};
+pub use recovery::{IngestRecovery, RecoveryOutcome};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -640,6 +647,11 @@ pub struct Session {
     /// hidden-states scratch) so the CPU projection helpers pick it up.
     /// Preserved across [`Self::reset`], like the vision/audio encoders.
     lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
+    usable: bool,
+    ingest_mutation: Option<recovery::Mutation>,
+    last_ingest_recovery: Option<IngestRecovery>,
+    // Declared last so other fields drop before a successor acquires live KV.
+    _model_session_lease: Option<ModelSessionLease>,
 }
 
 impl Session {
@@ -651,6 +663,10 @@ impl Session {
     /// `capabilities` declares what the loaded model accepts / emits.
     /// Direct callers (tests, standalone Model loaders) that don't have
     /// a Manifest handy can pass [`ModalityCapabilities::text_only`].
+    ///
+    /// Returns [`CeraError::Busy`] if the model's live GPU state belongs to an
+    /// existing session. Drop that session or load a separate model to proceed.
+    /// CPU models with caller-owned state permit multiple live sessions.
     pub fn new(
         model: Arc<dyn Model>,
         tokenizer: Arc<BpeTokenizer>,
@@ -664,6 +680,9 @@ impl Session {
             config.gpu_depthformer = true;
         }
 
+        // Acquire before configuration can allocate or mutate model-owned KV.
+        // The local lease releases on every early return or unwinding path.
+        let model_session_lease = model.acquire_session()?;
         let model_cfg = model.config();
         let max_seq_len = config
             .max_seq_len
@@ -771,6 +790,10 @@ impl Session {
             hs_scratch: None,
             hs_scratch_cap: 0,
             lora: None,
+            usable: true,
+            ingest_mutation: None,
+            last_ingest_recovery: None,
+            _model_session_lease: model_session_lease,
         })
     }
 
@@ -994,8 +1017,17 @@ impl Session {
     /// Clear KV state and reset position to 0. Rebuilds the sampler from
     /// `SessionConfig::seed` so a seeded session is fully reproducible after
     /// reset. Does NOT touch the engine-level disk prefix cache (which lives
-    /// on `CeraEngine`, not `Session`).
+    /// on `CeraEngine`, not `Session`). Retains exclusive model ownership.
+    /// After failed recovery, this requires a complete checked backend reset;
+    /// unsupported backends require session recreation.
     pub fn reset(&mut self) -> Result<(), CeraError> {
+        if !self.usable {
+            self.reset_execution_checked()?;
+            self.usable = true;
+            self.last_ingest_recovery = None;
+            self.cancel.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         // Re-assert the mode (a no-op for an unchanged one) so a GPU backend
         // that was somehow reset out of its compressed configuration rebuilds
         // before the next forward.
@@ -1004,29 +1036,21 @@ impl Session {
         let model_cfg = self.model.config();
         // Match `Session::new`: cap KV to the session's `max_seq_len`, not the
         // model's full context, so reset doesn't re-inflate to the full cache.
-        self.state = InferenceState::from_config_capped(
+        let fresh = InferenceState::from_config_capped(
             model_cfg,
             &self.config.kv_compression,
             self.max_seq_len,
         )?;
+        // Once replacement starts, an unwind during metadata/drafter cleanup
+        // requires checked recovery before another inference operation.
+        self.usable = false;
+        self.state = fresh;
         // Re-apply the attached adapter to the rebuilt state (preserved across reset).
         self.state.lora = self.lora.clone();
-        self.current_pos = 0;
-        self.token_history.clear();
-        self.position_atomic.store(0, Ordering::Relaxed);
-        self.last_logits = None;
-        self.prefill_tokens = 0;
-        self.prefill_elapsed = Duration::ZERO;
+        self.clear_execution_metadata();
+        self.usable = true;
         self.cancel.store(false, Ordering::Relaxed);
-        if let Some(drafter) = &mut self.drafter {
-            drafter.reset();
-        }
-        // Re-seed the sampler so deterministic runs stay deterministic after reset().
-        let sampler_cfg = SamplerConfig {
-            seed: self.config.seed,
-            ..SamplerConfig::default()
-        };
-        self.sampler = Sampler::new(sampler_cfg);
+        self.last_ingest_recovery = None;
         Ok(())
     }
 
@@ -1062,6 +1086,7 @@ impl Session {
     /// hidden-state extraction (probe via [`Model::supports_hidden_states`]);
     /// [`CeraError::InvalidToken`] if any id is `>= vocab_size`.
     pub fn hidden_states_for_tokens(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
+        self.ensure_usable()?;
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1131,6 +1156,7 @@ impl Session {
     /// path (their head consumes the mean-pooled hidden state) and avoids
     /// shipping the full `[T*D]` matrix across an FFI/WASM boundary.
     pub fn hidden_states_mean_pooled(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
+        self.ensure_usable()?;
         let d = self.hidden_size();
         let flat = self.hidden_states_for_tokens(tokens)?;
         let t = flat.len() / d;
@@ -1149,12 +1175,14 @@ impl Session {
     /// Tokenize `text` and return its per-token hidden states. Convenience over
     /// [`Self::hidden_states_for_tokens`] (Swift `hiddenStates(for:)`).
     pub fn hidden_states_for_text(&mut self, text: &str) -> Result<Vec<f32>, CeraError> {
+        self.ensure_usable()?;
         let tokens = self.tokenizer.encode(text);
         self.hidden_states_for_tokens(&tokens)
     }
 
     /// Tokenize text and append. Convenience over `append_tokens`.
     pub fn append_text(&mut self, text: &str) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         if text.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1192,6 +1220,7 @@ impl Session {
     ///    propagated from the underlying [`Self::append_embeddings`]
     ///    call.
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         if !self.capabilities.audio_in {
             return Err(CeraError::UnsupportedModality);
         }
@@ -1304,6 +1333,7 @@ impl Session {
     ///   }
     ///   ```
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1340,6 +1370,7 @@ impl Session {
                     by: (new_end - self.max_seq_len) as u32,
                 });
             }
+            self.note_ingest_mutation(true);
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
@@ -1381,6 +1412,7 @@ impl Session {
         // 0 as "no chunking" (single chunk = whole input), matching the
         // CLI `--ubatch-size 0` opt-out.
         let prefill_start = Instant::now();
+        self.note_ingest_mutation(false);
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
             self.current_pos,
@@ -1446,6 +1478,7 @@ impl Session {
         embeddings: &[f32],
         n_tokens: usize,
     ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         if n_tokens == 0 {
             return Err(CeraError::EmptyInput);
         }
@@ -1486,6 +1519,7 @@ impl Session {
                     by: (new_end - self.max_seq_len) as u32,
                 });
             }
+            self.note_ingest_mutation(true);
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
             self.current_pos -= shift_needed;
@@ -1534,6 +1568,7 @@ impl Session {
             let end = (ti + chunk_size).min(n_tokens);
             let chunk = &embeddings[ti * hidden_size..end * hidden_size];
             let prefill_start = Instant::now();
+            self.note_ingest_mutation(false);
             let logits = self.model.forward_prefill_from_embeddings(
                 chunk,
                 end - ti,
@@ -1626,6 +1661,7 @@ impl Session {
     /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
     ///    propagated from [`Self::append_embeddings`].
     pub fn append_image(&mut self, bytes: &[u8]) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         self.append_image_with_opts(bytes, self.image_max_long_size)
     }
 
@@ -1653,6 +1689,7 @@ impl Session {
         bytes: &[u8],
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         // No empty-bytes check here: an empty input is caught by
         // `preprocess_image_with_opts` below (which returns
         // `EmptyInput`), so a third copy of the guard would be
@@ -1746,6 +1783,7 @@ impl Session {
         _bytes: &[u8],
         _max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         Err(CeraError::UnsupportedModality)
     }
 
@@ -1786,6 +1824,7 @@ impl Session {
         images: &[&[u8]],
         add_generation_prompt: bool,
     ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
@@ -1876,12 +1915,25 @@ impl Session {
         _images: &[&[u8]],
         _add_generation_prompt: bool,
     ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
         Err(CeraError::UnsupportedModality)
     }
 
     /// Append a user multimodal message to the session's context,
     /// automatically placing media in the model's canonical order.
+    ///
+    /// On failure, preserves the original error and records checked recovery in
+    /// [`Self::last_ingest_recovery`]. Reset recovery discards context; unusable
+    /// recovery requires checked reset or recreation. Automatic recovery never
+    /// clears external cancellation. Raw append helpers retain partial progress.
     pub fn append_user_message(
+        &mut self,
+        message: &crate::tokenizer::UserMessage,
+    ) -> Result<(), CeraError> {
+        self.with_ingest_recovery(|this| this.append_user_message_inner(message))
+    }
+
+    fn append_user_message_inner(
         &mut self,
         message: &crate::tokenizer::UserMessage,
     ) -> Result<(), CeraError> {
@@ -1921,12 +1973,6 @@ impl Session {
                 ));
             }
         }
-
-        let initial_pos = self.current_pos;
-        let initial_history_len = self.token_history.len();
-        let initial_logits = self.last_logits.clone();
-        let initial_prefill_tokens = self.prefill_tokens;
-        let initial_prefill_elapsed = self.prefill_elapsed;
 
         let run_append = |this: &mut Self| -> Result<(), CeraError> {
             // 1. Audio input:
@@ -2030,19 +2076,7 @@ impl Session {
             Ok(())
         };
 
-        if let Err(err) = run_append(self) {
-            self.model.truncate_kv(&mut self.state, initial_pos);
-            self.current_pos = initial_pos;
-            self.position_atomic
-                .store(initial_pos as u32, std::sync::atomic::Ordering::Relaxed);
-            self.token_history.truncate(initial_history_len);
-            self.last_logits = initial_logits;
-            self.prefill_tokens = initial_prefill_tokens;
-            self.prefill_elapsed = initial_prefill_elapsed;
-            return Err(err);
-        }
-
-        Ok(())
+        run_append(self)
     }
 
     /// Run autoregressive decode, emitting token chunks through the sink.
@@ -2054,6 +2088,33 @@ impl Session {
         opts: &GenerateOpts,
         sink: &mut S,
     ) -> Result<GenerateSummary, CeraError> {
+        let observed = self.generate_observed(opts, sink);
+        observed.observation.trace();
+        observed.result
+    }
+
+    // The caller owns the failure guard: an unwind produces no observation.
+    // Returning the observation avoids a stale query after intervening raw calls.
+    fn generate_observed<S: ModalitySink + ?Sized>(
+        &mut self,
+        opts: &GenerateOpts,
+        sink: &mut S,
+    ) -> ObservedGeneration {
+        let mut observation = DecodeObservation::Unproven;
+        let result = self.generate_inner(opts, sink, &mut observation);
+        ObservedGeneration {
+            result,
+            observation,
+        }
+    }
+
+    fn generate_inner<S: ModalitySink + ?Sized>(
+        &mut self,
+        opts: &GenerateOpts,
+        sink: &mut S,
+        observation: &mut DecodeObservation,
+    ) -> Result<GenerateSummary, CeraError> {
+        self.ensure_usable()?;
         // Prefill happened in `append_*`, which accumulated its token count and
         // wall time on the session. Consume them here — unconditionally, so
         // EVERY `generate()` call (including the no-op early exits below)
@@ -2085,6 +2146,7 @@ impl Session {
         if self.cancel.load(Ordering::Relaxed) {
             sink.on_done(FinishReason::Cancelled);
             let decode_ms = duration_ms_u32(decode_start.elapsed());
+            *observation = DecodeObservation::NoProgress;
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -2110,6 +2172,7 @@ impl Session {
         if opts.max_tokens == 0 {
             sink.on_done(FinishReason::MaxTokens);
             let decode_ms = duration_ms_u32(decode_start.elapsed());
+            *observation = DecodeObservation::NoProgress;
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -2121,6 +2184,7 @@ impl Session {
         if self.current_pos >= self.max_seq_len {
             sink.on_done(FinishReason::ContextFull);
             let decode_ms = duration_ms_u32(decode_start.elapsed());
+            *observation = DecodeObservation::NoProgress;
             return Ok(GenerateSummary {
                 tokens_generated: 0,
                 prompt_eval_tokens,
@@ -2137,7 +2201,13 @@ impl Session {
         // `forward_greedy()` which skips the vocab-sized GPU→CPU readback
         // and returns the argmax token directly — a real win on Metal
         // (~hundreds of μs per token saved at 64 K vocab).
-        let mut logits = self.last_logits.take().ok_or(CeraError::EmptyInput)?;
+        let mut logits = match self.last_logits.take() {
+            Some(logits) => logits,
+            None => {
+                *observation = DecodeObservation::NoProgress;
+                return Err(CeraError::EmptyInput);
+            }
+        };
         tracing::info!(
             "[cera:session] generate starting: current_pos={}, max_seq_len={}, audio_vocoder_attached={}",
             self.current_pos,
@@ -2192,6 +2262,7 @@ impl Session {
                 prompt_eval_tokens,
                 prompt_eval_ms,
                 decode_start,
+                observation,
             );
         }
 
@@ -2276,6 +2347,9 @@ impl Session {
         // That preserves seeded-split-generation reproducibility: a
         // single `generate(N)` advances RNG the same number of steps as
         // two `generate(N/2)` calls with the same seed.
+        let mut stopped_token = None;
+        let mut used_audio = false;
+        let mut began_step = false;
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
                 let gpu_ref = self.gpu_audio_decoder.as_deref();
@@ -2306,6 +2380,7 @@ impl Session {
                 break;
             }
 
+            began_step = true;
             let token = if greedy {
                 greedy_next
             } else {
@@ -2360,6 +2435,7 @@ impl Session {
                 && (self.tokenizer.eos_token() == Some(token) || opts.stop_tokens.contains(&token))
             {
                 finish = FinishReason::Stop;
+                stopped_token = Some(token);
                 break;
             }
 
@@ -2415,6 +2491,7 @@ impl Session {
                 && (is_audio_transition || (modality_budget == 0 || text_done))
                 && pos < self.max_seq_len
             {
+                used_audio = true;
                 if !pending.is_empty() {
                     sink.on_text_tokens(&pending);
                     pending.clear();
@@ -2590,6 +2667,15 @@ impl Session {
         sink.on_done(finish.clone());
 
         let decode_ms = duration_ms_u32(decode_start.elapsed());
+        *observation = if used_audio {
+            DecodeObservation::Audio
+        } else if let Some(token) = stopped_token {
+            DecodeObservation::TokenStop { token }
+        } else if !began_step {
+            DecodeObservation::NoProgress
+        } else {
+            DecodeObservation::Interrupted
+        };
         Ok(GenerateSummary {
             tokens_generated: generated,
             prompt_eval_tokens,
@@ -2625,6 +2711,7 @@ impl Session {
         prompt_eval_tokens: u32,
         prompt_eval_ms: u32,
         decode_start: Instant,
+        observation: &mut DecodeObservation,
     ) -> Result<GenerateSummary, CeraError> {
         use crate::sampler::argmax;
 
@@ -2642,6 +2729,9 @@ impl Session {
         let mut generated: u32 = 0;
         let mut finish = FinishReason::MaxTokens;
         let mut stats = crate::spec::SpecStats::default();
+        let mut stopped_token = None;
+        let mut began_step = false;
+        let mut rewinds_proven = true;
 
         // Emit one token to the stream: buffer it, flush on the count/time
         // threshold. Returns nothing — stop/budget decisions stay in the loop.
@@ -2682,9 +2772,11 @@ impl Session {
             // difference between the spec and plain-greedy token streams. (The
             // batched verify forward can still flip a near-tie elsewhere — see
             // `crate::spec`.)
+            began_step = true;
             let t = argmax(&next_logits);
             if is_stop(t) {
                 finish = FinishReason::Stop;
+                stopped_token = Some(t);
                 break;
             }
             // `t`'s KV is not in the cache yet; a forward below (plain or the
@@ -2733,8 +2825,14 @@ impl Session {
             let old = self.current_pos;
             stats.rounds += 1;
             stats.drafted += draft.len();
-            let vr =
-                crate::spec::verify_draft(self.model.as_ref(), &mut self.state, t, &draft, vocab);
+            let vr = crate::spec::verify_draft_observed(
+                self.model.as_ref(),
+                &mut self.state,
+                t,
+                &draft,
+                vocab,
+                &mut rewinds_proven,
+            );
 
             // Emit accepted drafts under the stop / budget policy. On an early
             // stop, roll the KV back to the tokens actually kept.
@@ -2755,6 +2853,7 @@ impl Session {
                 // excludes it so the rewind below drops its KV cell.
                 if is_stop(q) {
                     finish = FinishReason::Stop;
+                    stopped_token = Some(q);
                     stopped = true;
                     break;
                 }
@@ -2764,9 +2863,14 @@ impl Session {
             }
             if kept < vr.accepted.len() {
                 // `truncate_kv`, not `state.truncate_to`: see the trait method.
-                // No test covers this line; the reason is recorded on
-                // `session_spec_matches_standalone_driver`.
+                // Decode observation tests cover both accepted stops and
+                // unproven legacy convolution/counter-only rewinds.
+                rewinds_proven &= self
+                    .model
+                    .check_kv_rewind(&self.state, old + 1 + kept)
+                    .is_ok();
                 self.model.truncate_kv(&mut self.state, old + 1 + kept);
+                rewinds_proven &= self.state.seq_len == old + 1 + kept;
             }
             self.current_pos = old + 1 + kept;
             // Publish progress per round (not just once at the end) so external
@@ -2815,6 +2919,12 @@ impl Session {
         sink.on_done(finish.clone());
 
         let decode_ms = duration_ms_u32(decode_start.elapsed());
+        *observation = match stopped_token {
+            _ if !rewinds_proven => DecodeObservation::Unproven,
+            Some(token) => DecodeObservation::TokenStop { token },
+            None if !began_step => DecodeObservation::NoProgress,
+            None => DecodeObservation::Interrupted,
+        };
         Ok(GenerateSummary {
             tokens_generated: generated,
             prompt_eval_tokens,
@@ -3237,3 +3347,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session/session_ownership_tests.rs"]
+mod session_ownership_tests;

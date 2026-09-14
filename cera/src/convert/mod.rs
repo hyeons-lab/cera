@@ -1,5 +1,9 @@
 //! SafeTensors -> GGUF model conversion and on-the-fly streaming quantization.
 
+#[cfg(feature = "remote")]
+mod cache;
+#[cfg(feature = "remote")]
+mod checkpoint;
 pub mod config;
 #[cfg(feature = "remote")]
 pub mod pipeline;

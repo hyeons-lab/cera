@@ -1012,6 +1012,20 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_generativemodel_create_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_generativemodel_engine(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelhandle_as_generative(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelhandle_kind(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelloader_build(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelloader_build_generative(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_new(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress(): Int
@@ -1055,6 +1069,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_modelloader_new(): Int
 
     external fun ffi_cera_ffi_uniffi_contract_version(): Int
 }
@@ -1748,6 +1764,78 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_recovery_status(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_generativemodel(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_generativemodel(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_generativemodel_create_session(
+        `ptr`: Long,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_generativemodel_engine(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_clone_modelhandle(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_modelhandle(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_modelhandle_kind(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_modelloader(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_modelloader(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_modelloader_new(
+        `source`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_modelloader_build(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_modelloader_build_generative(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
     external fun uniffi_cera_ffi_fn_func_cera_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_cpu_backend_report(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
@@ -2143,10 +2231,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -2242,6 +2330,27 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2306,6 +2415,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -6088,6 +6200,7 @@ public interface FfiWhisperModelInterface {
 
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     fun `transcribe`(
         `pcm`: List<kotlin.Float>,
@@ -6096,6 +6209,8 @@ public interface FfiWhisperModelInterface {
 
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     suspend fun `transcribeAsync`(
         `pcm`: List<kotlin.Float>,
@@ -6239,6 +6354,7 @@ open class FfiWhisperModel :
 
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     @Throws(FfiException::class)
     override fun `transcribe`(
@@ -6260,6 +6376,8 @@ open class FfiWhisperModel :
 
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     @Throws(FfiException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -6323,6 +6441,281 @@ public object FfiConverterTypeFfiWhisperModel : FfiConverter<FfiWhisperModel, Lo
 
     override fun write(
         value: FfiWhisperModel,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+public interface GenerativeModelInterface {
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    fun `createSession`(`config`: SessionConfig): Session
+
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    fun `engine`(): CeraEngine
+
+    companion object
+}
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+open class GenerativeModel :
+    Disposable,
+    AutoCloseable,
+    GenerativeModelInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_generativemodel(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel(handle, status)
+        }
+    }
+
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    @Throws(FfiException::class)
+    override fun `createSession`(`config`: SessionConfig): Session =
+        FfiConverterTypeSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session(
+                        it,
+                        FfiConverterTypeSessionConfig.lower(`config`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    override fun `engine`(): CeraEngine =
+        FfiConverterTypeCeraEngine.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeGenerativeModel : FfiConverter<GenerativeModel, Long> {
+    override fun lower(value: GenerativeModel): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): GenerativeModel = GenerativeModel(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): GenerativeModel = lift(buf.getLong())
+
+    override fun allocationSize(value: GenerativeModel) = 8UL
+
+    override fun write(
+        value: GenerativeModel,
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
@@ -7188,6 +7581,564 @@ public object FfiConverterTypeModalitySink : FfiConverter<ModalitySink, Long> {
 //
 
 /**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+public interface ModelHandleInterface {
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    fun `asGenerative`(): GenerativeModel?
+
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    fun `kind`(): kotlin.String
+
+    companion object
+}
+
+/**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+open class ModelHandle :
+    Disposable,
+    AutoCloseable,
+    ModelHandleInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_modelhandle(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle(handle, status)
+        }
+    }
+
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    override fun `asGenerative`(): GenerativeModel? =
+        FfiConverterOptionalTypeGenerativeModel.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    override fun `kind`(): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelHandle : FfiConverter<ModelHandle, Long> {
+    override fun lower(value: ModelHandle): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ModelHandle = ModelHandle(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ModelHandle = lift(buf.getLong())
+
+    override fun allocationSize(value: ModelHandle) = 8UL
+
+    override fun write(
+        value: ModelHandle,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+public interface ModelLoaderInterface {
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    fun `build`(): ModelHandle
+
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    fun `buildGenerative`(): GenerativeModel
+
+    companion object
+}
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+open class ModelLoader :
+    Disposable,
+    AutoCloseable,
+    ModelLoaderInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    /**
+     * Retain explicit source data and the existing production engine options.
+     * Construction does not load weights or contact a remote service.
+     */
+    constructor(`source`: ModelSource, `config`: EngineConfig) :
+        this(
+            UniffiWithHandle,
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new(
+                    FfiConverterTypeModelSource.lower(`source`),
+                    FfiConverterTypeEngineConfig.lower(`config`),
+                    _status,
+                )
+            },
+        )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_modelloader(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_modelloader(handle, status)
+        }
+    }
+
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    @Throws(LoadException::class)
+    override fun `build`(): ModelHandle =
+        FfiConverterTypeModelHandle.lift(
+            callWithHandle {
+                uniffiRustCallWithError(LoadException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    @Throws(LoadException::class)
+    override fun `buildGenerative`(): GenerativeModel =
+        FfiConverterTypeGenerativeModel.lift(
+            callWithHandle {
+                uniffiRustCallWithError(LoadException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelLoader : FfiConverter<ModelLoader, Long> {
+    override fun lower(value: ModelLoader): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ModelLoader = ModelLoader(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ModelLoader = lift(buf.getLong())
+
+    override fun allocationSize(value: ModelLoader) = 8UL
+
+    override fun write(
+        value: ModelLoader,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
  * Zero-dependency PII Classifier for named entity recognition.
  */
 public interface PiiClassifierInterface {
@@ -7859,6 +8810,19 @@ public interface SessionInterface {
      * precedence over the model's minimum-resolution floor).
      */
     fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
+
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    fun `recoveryStatus`(): SessionRecoveryStatus
 
     companion object
 }
@@ -8637,6 +9601,30 @@ open class Session :
         }
 
     /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    @Throws(FfiException::class)
+    override fun `recoveryStatus`(): SessionRecoveryStatus =
+        FfiConverterTypeSessionRecoveryStatus.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_recovery_status(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * @suppress
      */
     companion object
@@ -8978,15 +9966,16 @@ data class FfiHotwordEvent(
      */
     var `keyword`: kotlin.String,
     /**
-     * Exact audio stream sample index where the keyword completed.
+     * Exclusive end sample of the window evaluated when detection triggered.
+     * This is a detection-hop boundary; it does not locate the spoken word's end.
      */
     var `sampleOffset`: kotlin.ULong,
     /**
-     * Audio stream sample index including pre-roll safety margin for downstream ASR.
+     * `sample_offset` minus the configured pre-roll samples, saturating at zero.
      */
     var `commandStartSample`: kotlin.ULong,
     /**
-     * Timestamp in milliseconds from stream origin where keyword completed.
+     * `sample_offset` converted to milliseconds using the model sample rate.
      */
     var `timestampMs`: kotlin.Float,
     /**
@@ -9455,6 +10444,47 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
 }
 
 /**
+ * Recovery diagnostic retained after a failed `send_message` ingestion.
+ * The call's original error is still returned separately. Generation failures
+ * after successful ingestion do not create this report.
+ */
+data class IngestRecovery(
+    var `outcome`: RecoveryOutcome,
+    var `rewindError`: KvRewindFailure?,
+    var `resetError`: FfiException?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIngestRecovery : FfiConverterRustBuffer<IngestRecovery> {
+    override fun read(buf: ByteBuffer): IngestRecovery =
+        IngestRecovery(
+            FfiConverterTypeRecoveryOutcome.read(buf),
+            FfiConverterOptionalTypeKvRewindFailure.read(buf),
+            FfiConverterOptionalTypeFfiError.read(buf),
+        )
+
+    override fun allocationSize(value: IngestRecovery) =
+        (
+            FfiConverterTypeRecoveryOutcome.allocationSize(value.`outcome`) +
+                FfiConverterOptionalTypeKvRewindFailure.allocationSize(value.`rewindError`) +
+                FfiConverterOptionalTypeFfiError.allocationSize(value.`resetError`)
+        )
+
+    override fun write(
+        value: IngestRecovery,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeRecoveryOutcome.write(value.`outcome`, buf)
+        FfiConverterOptionalTypeKvRewindFailure.write(value.`rewindError`, buf)
+        FfiConverterOptionalTypeFfiError.write(value.`resetError`, buf)
+    }
+}
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -9543,6 +10573,62 @@ public object FfiConverterTypeModalityCapabilities : FfiConverterRustBuffer<Moda
     }
 }
 
+data class ModelFiles(
+    var `model`: kotlin.String,
+    var `multimodalProjector`: kotlin.String?,
+    var `audioDecoder`: kotlin.String?,
+    var `audioTokenizer`: kotlin.String?,
+    var `draftModel`: kotlin.String?,
+    var `extras`: Map<kotlin.String, kotlin.String>,
+    var `inferenceType`: kotlin.String?,
+    var `chatTemplate`: kotlin.String?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelFiles : FfiConverterRustBuffer<ModelFiles> {
+    override fun read(buf: ByteBuffer): ModelFiles =
+        ModelFiles(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterMapStringString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+
+    override fun allocationSize(value: ModelFiles) =
+        (
+            FfiConverterString.allocationSize(value.`model`) +
+                FfiConverterOptionalString.allocationSize(value.`multimodalProjector`) +
+                FfiConverterOptionalString.allocationSize(value.`audioDecoder`) +
+                FfiConverterOptionalString.allocationSize(value.`audioTokenizer`) +
+                FfiConverterOptionalString.allocationSize(value.`draftModel`) +
+                FfiConverterMapStringString.allocationSize(value.`extras`) +
+                FfiConverterOptionalString.allocationSize(value.`inferenceType`) +
+                FfiConverterOptionalString.allocationSize(value.`chatTemplate`)
+        )
+
+    override fun write(
+        value: ModelFiles,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`model`, buf)
+        FfiConverterOptionalString.write(value.`multimodalProjector`, buf)
+        FfiConverterOptionalString.write(value.`audioDecoder`, buf)
+        FfiConverterOptionalString.write(value.`audioTokenizer`, buf)
+        FfiConverterOptionalString.write(value.`draftModel`, buf)
+        FfiConverterMapStringString.write(value.`extras`, buf)
+        FfiConverterOptionalString.write(value.`inferenceType`, buf)
+        FfiConverterOptionalString.write(value.`chatTemplate`, buf)
+    }
+}
+
 /**
  * Short summary of a loaded model. Mirrors [`cera::ModelMetadata`].
  */
@@ -9618,6 +10704,106 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
     }
 }
 
+data class ModelParts(
+    var `model`: kotlin.ByteArray,
+    var `multimodalProjector`: kotlin.ByteArray?,
+    var `audioDecoder`: kotlin.ByteArray?,
+    var `audioTokenizer`: kotlin.ByteArray?,
+    var `draftModel`: kotlin.ByteArray?,
+    var `inferenceType`: kotlin.String?,
+    var `chatTemplate`: kotlin.String?,
+    var `generationDefaults`: GenerationDefaults?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelParts : FfiConverterRustBuffer<ModelParts> {
+    override fun read(buf: ByteBuffer): ModelParts =
+        ModelParts(
+            FfiConverterByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeGenerationDefaults.read(buf),
+        )
+
+    override fun allocationSize(value: ModelParts) =
+        (
+            FfiConverterByteArray.allocationSize(value.`model`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`multimodalProjector`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`audioDecoder`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`audioTokenizer`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`draftModel`) +
+                FfiConverterOptionalString.allocationSize(value.`inferenceType`) +
+                FfiConverterOptionalString.allocationSize(value.`chatTemplate`) +
+                FfiConverterOptionalTypeGenerationDefaults.allocationSize(value.`generationDefaults`)
+        )
+
+    override fun write(
+        value: ModelParts,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterByteArray.write(value.`model`, buf)
+        FfiConverterOptionalByteArray.write(value.`multimodalProjector`, buf)
+        FfiConverterOptionalByteArray.write(value.`audioDecoder`, buf)
+        FfiConverterOptionalByteArray.write(value.`audioTokenizer`, buf)
+        FfiConverterOptionalByteArray.write(value.`draftModel`, buf)
+        FfiConverterOptionalString.write(value.`inferenceType`, buf)
+        FfiConverterOptionalString.write(value.`chatTemplate`, buf)
+        FfiConverterOptionalTypeGenerationDefaults.write(value.`generationDefaults`, buf)
+    }
+}
+
+data class SamplingDefaults(
+    var `temperature`: kotlin.Float?,
+    var `topP`: kotlin.Float?,
+    var `topK`: kotlin.UInt?,
+    var `minP`: kotlin.Float?,
+    var `repetitionPenalty`: kotlin.Float?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSamplingDefaults : FfiConverterRustBuffer<SamplingDefaults> {
+    override fun read(buf: ByteBuffer): SamplingDefaults =
+        SamplingDefaults(
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+        )
+
+    override fun allocationSize(value: SamplingDefaults) =
+        (
+            FfiConverterOptionalFloat.allocationSize(value.`temperature`) +
+                FfiConverterOptionalFloat.allocationSize(value.`topP`) +
+                FfiConverterOptionalUInt.allocationSize(value.`topK`) +
+                FfiConverterOptionalFloat.allocationSize(value.`minP`) +
+                FfiConverterOptionalFloat.allocationSize(value.`repetitionPenalty`)
+        )
+
+    override fun write(
+        value: SamplingDefaults,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterOptionalFloat.write(value.`temperature`, buf)
+        FfiConverterOptionalFloat.write(value.`topP`, buf)
+        FfiConverterOptionalUInt.write(value.`topK`, buf)
+        FfiConverterOptionalFloat.write(value.`minP`, buf)
+        FfiConverterOptionalFloat.write(value.`repetitionPenalty`, buf)
+    }
+}
+
 /**
  * Per-session configuration. Mirrors [`cera::SessionConfig`].
  */
@@ -9686,6 +10872,56 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
         FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
+    }
+}
+
+/**
+ * Coherent snapshot of a session at the instant the lock was acquired.
+ * Another thread may change the session after this method returns.
+ */
+data class SessionRecoveryStatus(
+    /**
+     * False requires a successful checked reset or recreation.
+     */
+    var `usable`: kotlin.Boolean,
+    /**
+     * Meaningful as reusable context only when `usable` is true.
+     */
+    var `position`: kotlin.UInt,
+    /**
+     * Cleared by successful whole-message ingestion or explicit reset.
+     * Raw append calls and cancellation controls leave it unchanged.
+     */
+    var `lastIngestRecovery`: IngestRecovery?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionRecoveryStatus : FfiConverterRustBuffer<SessionRecoveryStatus> {
+    override fun read(buf: ByteBuffer): SessionRecoveryStatus =
+        SessionRecoveryStatus(
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeIngestRecovery.read(buf),
+        )
+
+    override fun allocationSize(value: SessionRecoveryStatus) =
+        (
+            FfiConverterBoolean.allocationSize(value.`usable`) +
+                FfiConverterUInt.allocationSize(value.`position`) +
+                FfiConverterOptionalTypeIngestRecovery.allocationSize(value.`lastIngestRecovery`)
+        )
+
+    override fun write(
+        value: SessionRecoveryStatus,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterBoolean.write(value.`usable`, buf)
+        FfiConverterUInt.write(value.`position`, buf)
+        FfiConverterOptionalTypeIngestRecovery.write(value.`lastIngestRecovery`, buf)
     }
 }
 
@@ -10700,6 +11936,122 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
     }
 }
 
+sealed class GenerationDefaults {
+    data class Text(
+        val `sampling`: uniffi.cera_ffi.SamplingDefaults,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    data class Audio(
+        val `sampling`: uniffi.cera_ffi.SamplingDefaults,
+        val `numberOfDecodingThreads`: kotlin.UInt?,
+        val `audioTemperature`: kotlin.Float?,
+        val `audioTopK`: kotlin.UInt?,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    data class Other(
+        val `rawJson`: kotlin.String,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeGenerationDefaults : FfiConverterRustBuffer<GenerationDefaults> {
+    override fun read(buf: ByteBuffer): GenerationDefaults =
+        when (buf.getInt()) {
+            1 -> {
+                GenerationDefaults.Text(
+                    FfiConverterTypeSamplingDefaults.read(buf),
+                )
+            }
+
+            2 -> {
+                GenerationDefaults.Audio(
+                    FfiConverterTypeSamplingDefaults.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                    FfiConverterOptionalFloat.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                )
+            }
+
+            3 -> {
+                GenerationDefaults.Other(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: GenerationDefaults) =
+        when (value) {
+            is GenerationDefaults.Text -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSamplingDefaults.allocationSize(value.`sampling`)
+                )
+            }
+
+            is GenerationDefaults.Audio -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSamplingDefaults.allocationSize(value.`sampling`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`numberOfDecodingThreads`) +
+                        FfiConverterOptionalFloat.allocationSize(value.`audioTemperature`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`audioTopK`)
+                )
+            }
+
+            is GenerationDefaults.Other -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`rawJson`)
+                )
+            }
+        }
+
+    override fun write(
+        value: GenerationDefaults,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is GenerationDefaults.Text -> {
+                buf.putInt(1)
+                FfiConverterTypeSamplingDefaults.write(value.`sampling`, buf)
+                Unit
+            }
+
+            is GenerationDefaults.Audio -> {
+                buf.putInt(2)
+                FfiConverterTypeSamplingDefaults.write(value.`sampling`, buf)
+                FfiConverterOptionalUInt.write(value.`numberOfDecodingThreads`, buf)
+                FfiConverterOptionalFloat.write(value.`audioTemperature`, buf)
+                FfiConverterOptionalUInt.write(value.`audioTopK`, buf)
+                Unit
+            }
+
+            is GenerationDefaults.Other -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`rawJson`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
  * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
@@ -10816,6 +12168,690 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Why checked tail rewind was unavailable. Numeric positions are token counts.
+ */
+sealed class KvRewindFailure {
+    data class OutOfBounds(
+        val `requested`: kotlin.ULong,
+        val `current`: kotlin.ULong,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    object Compressed : KvRewindFailure()
+
+    object NonCausal : KvRewindFailure()
+
+    data class MissingConvolutionCheckpoint(
+        val `layer`: kotlin.ULong,
+        val `position`: kotlin.ULong,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    data class InvalidCacheLayout(
+        val `layer`: kotlin.ULong,
+        val `detail`: kotlin.String,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    object BackendUnsupported : KvRewindFailure()
+
+    data class Unknown(
+        val `detail`: kotlin.String,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeKvRewindFailure : FfiConverterRustBuffer<KvRewindFailure> {
+    override fun read(buf: ByteBuffer): KvRewindFailure =
+        when (buf.getInt()) {
+            1 -> {
+                KvRewindFailure.OutOfBounds(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            2 -> {
+                KvRewindFailure.Compressed
+            }
+
+            3 -> {
+                KvRewindFailure.NonCausal
+            }
+
+            4 -> {
+                KvRewindFailure.MissingConvolutionCheckpoint(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            5 -> {
+                KvRewindFailure.InvalidCacheLayout(
+                    FfiConverterULong.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                KvRewindFailure.BackendUnsupported
+            }
+
+            7 -> {
+                KvRewindFailure.Unknown(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: KvRewindFailure) =
+        when (value) {
+            is KvRewindFailure.OutOfBounds -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`requested`) +
+                        FfiConverterULong.allocationSize(value.`current`)
+                )
+            }
+
+            is KvRewindFailure.Compressed -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.NonCausal -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.MissingConvolutionCheckpoint -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`layer`) +
+                        FfiConverterULong.allocationSize(value.`position`)
+                )
+            }
+
+            is KvRewindFailure.InvalidCacheLayout -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`layer`) +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+
+            is KvRewindFailure.BackendUnsupported -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.Unknown -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+        }
+
+    override fun write(
+        value: KvRewindFailure,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is KvRewindFailure.OutOfBounds -> {
+                buf.putInt(1)
+                FfiConverterULong.write(value.`requested`, buf)
+                FfiConverterULong.write(value.`current`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.Compressed -> {
+                buf.putInt(2)
+                Unit
+            }
+
+            is KvRewindFailure.NonCausal -> {
+                buf.putInt(3)
+                Unit
+            }
+
+            is KvRewindFailure.MissingConvolutionCheckpoint -> {
+                buf.putInt(4)
+                FfiConverterULong.write(value.`layer`, buf)
+                FfiConverterULong.write(value.`position`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.InvalidCacheLayout -> {
+                buf.putInt(5)
+                FfiConverterULong.write(value.`layer`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.BackendUnsupported -> {
+                buf.putInt(6)
+                Unit
+            }
+
+            is KvRewindFailure.Unknown -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+sealed class LoadException : kotlin.Exception() {
+    class KindMismatch(
+        val `expected`: kotlin.String,
+        val `actual`: kotlin.String,
+        val `architecture`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "expected=${ `expected` }, actual=${ `actual` }, architecture=${ `architecture` }"
+    }
+
+    class UnsupportedArchitecture(
+        val `architecture`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "architecture=${ `architecture` }"
+    }
+
+    class UnsupportedInferenceType(
+        val `inferenceType`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "inferenceType=${ `inferenceType` }"
+    }
+
+    class Source(
+        val `sourceKind`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "sourceKind=${ `sourceKind` }, detail=${ `detail` }"
+    }
+
+    class Assembly(
+        val `backend`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "backend=${ `backend` }, detail=${ `detail` }"
+    }
+
+    class InvalidConfig(
+        val `field`: kotlin.String,
+        val `value`: kotlin.String,
+        val `reason`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "field=${ `field` }, value=${ `value` }, reason=${ `reason` }, detail=${ `detail` }"
+    }
+
+    class Engine(
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
+    class Consumed : LoadException() {
+        override val message
+            get() = ""
+    }
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<LoadException> {
+        override fun lift(error_buf: RustBuffer.ByValue): LoadException = FfiConverterTypeLoadError.lift(error_buf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLoadError : FfiConverterRustBuffer<LoadException> {
+    override fun read(buf: ByteBuffer): LoadException =
+        when (buf.getInt()) {
+            1 -> {
+                LoadException.KindMismatch(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            2 -> {
+                LoadException.UnsupportedArchitecture(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            3 -> {
+                LoadException.UnsupportedInferenceType(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            4 -> {
+                LoadException.Source(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            5 -> {
+                LoadException.Assembly(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                LoadException.InvalidConfig(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            7 -> {
+                LoadException.Engine(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            8 -> {
+                LoadException.Consumed()
+            }
+
+            else -> {
+                throw RuntimeException("invalid error enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: LoadException): ULong =
+        when (value) {
+            is LoadException.KindMismatch -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`expected`) +
+                    FfiConverterString.allocationSize(value.`actual`) +
+                    FfiConverterString.allocationSize(value.`architecture`)
+            )
+
+            is LoadException.UnsupportedArchitecture -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`architecture`)
+            )
+
+            is LoadException.UnsupportedInferenceType -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`inferenceType`)
+            )
+
+            is LoadException.Source -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`sourceKind`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Assembly -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`backend`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.InvalidConfig -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`field`) +
+                    FfiConverterString.allocationSize(value.`value`) +
+                    FfiConverterString.allocationSize(value.`reason`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Engine -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Consumed -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+        }
+
+    override fun write(
+        value: LoadException,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is LoadException.KindMismatch -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`expected`, buf)
+                FfiConverterString.write(value.`actual`, buf)
+                FfiConverterString.write(value.`architecture`, buf)
+                Unit
+            }
+
+            is LoadException.UnsupportedArchitecture -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`architecture`, buf)
+                Unit
+            }
+
+            is LoadException.UnsupportedInferenceType -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`inferenceType`, buf)
+                Unit
+            }
+
+            is LoadException.Source -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`sourceKind`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Assembly -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`backend`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.InvalidConfig -> {
+                buf.putInt(6)
+                FfiConverterString.write(value.`field`, buf)
+                FfiConverterString.write(value.`value`, buf)
+                FfiConverterString.write(value.`reason`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Engine -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Consumed -> {
+                buf.putInt(8)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+sealed class ModelSource {
+    data class BundleId(
+        val `id`: kotlin.String,
+        val `quant`: kotlin.String,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class HuggingFace(
+        val `spec`: kotlin.String,
+        val `quant`: kotlin.String?,
+        val `strategy`: kotlin.String?,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Bytes(
+        val `bytes`: kotlin.ByteArray,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Parts(
+        val `parts`: uniffi.cera_ffi.ModelParts,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Path(
+        val `path`: kotlin.String,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Files(
+        val `files`: uniffi.cera_ffi.ModelFiles,
+    ) : ModelSource() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelSource : FfiConverterRustBuffer<ModelSource> {
+    override fun read(buf: ByteBuffer): ModelSource =
+        when (buf.getInt()) {
+            1 -> {
+                ModelSource.BundleId(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            2 -> {
+                ModelSource.HuggingFace(
+                    FfiConverterString.read(buf),
+                    FfiConverterOptionalString.read(buf),
+                    FfiConverterOptionalString.read(buf),
+                )
+            }
+
+            3 -> {
+                ModelSource.Bytes(
+                    FfiConverterByteArray.read(buf),
+                )
+            }
+
+            4 -> {
+                ModelSource.Parts(
+                    FfiConverterTypeModelParts.read(buf),
+                )
+            }
+
+            5 -> {
+                ModelSource.Path(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                ModelSource.Files(
+                    FfiConverterTypeModelFiles.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: ModelSource) =
+        when (value) {
+            is ModelSource.BundleId -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`id`) +
+                        FfiConverterString.allocationSize(value.`quant`)
+                )
+            }
+
+            is ModelSource.HuggingFace -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`spec`) +
+                        FfiConverterOptionalString.allocationSize(value.`quant`) +
+                        FfiConverterOptionalString.allocationSize(value.`strategy`)
+                )
+            }
+
+            is ModelSource.Bytes -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterByteArray.allocationSize(value.`bytes`)
+                )
+            }
+
+            is ModelSource.Parts -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeModelParts.allocationSize(value.`parts`)
+                )
+            }
+
+            is ModelSource.Path -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`path`)
+                )
+            }
+
+            is ModelSource.Files -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeModelFiles.allocationSize(value.`files`)
+                )
+            }
+        }
+
+    override fun write(
+        value: ModelSource,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is ModelSource.BundleId -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`id`, buf)
+                FfiConverterString.write(value.`quant`, buf)
+                Unit
+            }
+
+            is ModelSource.HuggingFace -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`spec`, buf)
+                FfiConverterOptionalString.write(value.`quant`, buf)
+                FfiConverterOptionalString.write(value.`strategy`, buf)
+                Unit
+            }
+
+            is ModelSource.Bytes -> {
+                buf.putInt(3)
+                FfiConverterByteArray.write(value.`bytes`, buf)
+                Unit
+            }
+
+            is ModelSource.Parts -> {
+                buf.putInt(4)
+                FfiConverterTypeModelParts.write(value.`parts`, buf)
+                Unit
+            }
+
+            is ModelSource.Path -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+
+            is ModelSource.Files -> {
+                buf.putInt(6)
+                FfiConverterTypeModelFiles.write(value.`files`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Execution state after a failed whole-message append.
+ */
+
+enum class RecoveryOutcome {
+    UNCHANGED,
+    RESTORED,
+    RESET,
+    UNUSABLE,
+
+    /**
+     * A newer core outcome; conservatively recreate the session.
+     */
+    UNKNOWN,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRecoveryOutcome : FfiConverterRustBuffer<RecoveryOutcome> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            RecoveryOutcome.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: RecoveryOutcome) = 4UL
+
+    override fun write(
+        value: RecoveryOutcome,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -11060,6 +13096,38 @@ public object FfiConverterOptionalTypeBundleRepo : FfiConverterRustBuffer<Bundle
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeGenerativeModel : FfiConverterRustBuffer<GenerativeModel?> {
+    override fun read(buf: ByteBuffer): GenerativeModel? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeGenerativeModel.read(buf)
+    }
+
+    override fun allocationSize(value: GenerativeModel?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeGenerativeModel.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: GenerativeModel?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeGenerativeModel.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeAudioInput : FfiConverterRustBuffer<AudioInput?> {
     override fun read(buf: ByteBuffer): AudioInput? {
         if (buf.get().toInt() == 0) {
@@ -11220,6 +13288,38 @@ public object FfiConverterOptionalTypeFfiWhisperTranscribeOpts : FfiConverterRus
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeIngestRecovery : FfiConverterRustBuffer<IngestRecovery?> {
+    override fun read(buf: ByteBuffer): IngestRecovery? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeIngestRecovery.read(buf)
+    }
+
+    override fun allocationSize(value: IngestRecovery?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeIngestRecovery.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: IngestRecovery?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeIngestRecovery.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<SpecDecodeConfig?> {
     override fun read(buf: ByteBuffer): SpecDecodeConfig? {
         if (buf.get().toInt() == 0) {
@@ -11245,6 +13345,38 @@ public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<
         } else {
             buf.put(1)
             FfiConverterTypeSpecDecodeConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiError : FfiConverterRustBuffer<FfiException?> {
+    override fun read(buf: ByteBuffer): FfiException? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiError.read(buf)
+    }
+
+    override fun allocationSize(value: FfiException?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiError.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiException?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiError.write(value, buf)
         }
     }
 }
@@ -11284,6 +13416,38 @@ public object FfiConverterOptionalTypeFfiVadEvent : FfiConverterRustBuffer<FfiVa
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeGenerationDefaults : FfiConverterRustBuffer<GenerationDefaults?> {
+    override fun read(buf: ByteBuffer): GenerationDefaults? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeGenerationDefaults.read(buf)
+    }
+
+    override fun allocationSize(value: GenerationDefaults?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeGenerationDefaults.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: GenerationDefaults?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeGenerationDefaults.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeKvCompression : FfiConverterRustBuffer<KvCompression?> {
     override fun read(buf: ByteBuffer): KvCompression? {
         if (buf.get().toInt() == 0) {
@@ -11309,6 +13473,38 @@ public object FfiConverterOptionalTypeKvCompression : FfiConverterRustBuffer<KvC
         } else {
             buf.put(1)
             FfiConverterTypeKvCompression.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeKvRewindFailure : FfiConverterRustBuffer<KvRewindFailure?> {
+    override fun read(buf: ByteBuffer): KvRewindFailure? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeKvRewindFailure.read(buf)
+    }
+
+    override fun allocationSize(value: KvRewindFailure?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeKvRewindFailure.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: KvRewindFailure?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeKvRewindFailure.write(value, buf)
         }
     }
 }
@@ -11621,6 +13817,47 @@ public object FfiConverterSequenceTypeToolDef : FfiConverterRustBuffer<List<Tool
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeToolDef.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringString : FfiConverterRustBuffer<Map<kotlin.String, kotlin.String>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, kotlin.String> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, kotlin.String>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterString.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, kotlin.String>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren =
+            value
+                .map { (k, v) ->
+                    FfiConverterString.allocationSize(k) +
+                        FfiConverterString.allocationSize(v)
+                }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(
+        value: Map<kotlin.String, kotlin.String>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterString.write(v, buf)
         }
     }
 }

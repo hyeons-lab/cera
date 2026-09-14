@@ -27,17 +27,25 @@ cera = "0.5"
 - **DSpark: Neural Speculative Decoding ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608))**: Neural speculative drafting via lightweight sidecars (`cera::spec::dspark`), parallel multi-token GPU verification on Metal and WebGPU, and batched LM-head verification.
 - **TurboQuant KV-Cache Compression ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874))**: Pure-Rust PolarQuant + QJL compression achieving ~12x KV-cache memory reduction across CPU, Metal, and WebGPU backends.
 - **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`SileroVad`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
-- **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with on-the-fly zero-disk streaming quantization of remote SafeTensors models directly to GGUF in memory.
+- **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with streaming conversion of remote SafeTensors tensors into a cached GGUF file without storing complete source shards.
 - **WebGPU Depthformer Acceleration & Voice Modes**: High-performance compute shaders for Depthformer audio decoder, unified web runtime, and 4 dedicated voice interaction modes.
 - **Multimodal Vision ViT Optimization**: High-resolution image encoding improvements and async WebGPU readbacks.
-- **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection with zero dependencies. Includes parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model container parsing with folded BatchNorm layers, zero-heap forward inference (`HotwordDetector`), 30.0x AGC peak normalization, and Silero VAD gating state machine (`HotwordIterator`).
+- **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection in Rust. Includes a parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model containers, reusable forward scratch buffers (`HotwordDetector`), 30.0x AGC peak normalization, and the Silero VAD gating state machine (`HotwordIterator`). Process chunks serially on a background audio worker; event creation and stream buffer growth can allocate.
 - **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
+
+The additive API work also includes a [checked raw KV rewind example](examples/checked_rewind.rs)
+and a [backend recovery matrix](../docs/internals/API_RESHAPE_RECOVERY.md).
+CPU Llama/LFM2 support checked user-message recovery. The runnable
+[ingestion recovery example](examples/ingestion_recovery.rs) demonstrates cancellation,
+restoration/reset diagnostics and retry. Select native device reset with `--metal`
+or `--wgpu` and the matching Cargo feature; `--compressed` exercises TurboQuant.
+The full chat contract and richer foreign/browser recovery remain under development.
 
 ## Breaking changes in 0.4.0
 
 0.4.0 adds public fields and enum variants to public types, so it is a minor
 (not patch) release; a `cargo update` from 0.3.x will not pull it in
-automatically. No type in `cera` is `#[non_exhaustive]`, so these break any code
+automatically. The affected 0.4.0 types were not `#[non_exhaustive]`, so these break any code
 that writes exhaustive struct literals or exhaustive `match`es. Code that keeps
 the default settings sees no behavior change; the one exception is the new
 `KvCompressionConflict` below, which turns a previously-silent mismatch into an
@@ -160,7 +168,91 @@ mmproj encoder for VL bundles, and `Session::append_image` (or
 Verified against LFM2.5-VL-450M. The ViT encode runs on the GPU (native Metal or
 wgpu, selected by `BackendPreference`) with a CPU fallback.
 
+## Sharing a loaded GPU model
+
+Metal and wgpu permit one live `Session` per loaded model. A second session
+returns `Busy` until the first is dropped; reset and cancellation keep ownership.
+CPU models continue to support shared weights across concurrent sessions. Load
+separate GPU models for simultaneous conversations. The
+[session ownership walkthrough](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
+and executable CPU/Metal/wgpu checks.
+
+LFM2-Audio transcription during a live GPU conversation uses a cached secondary
+model built from retained weights. This preserves conversation KV and costs
+additional model memory and first-use setup; the walkthrough includes a native
+Dart consumer for transcription and seeded generation.
+
+## Standalone Whisper
+
+`WhisperModel::from_file` and `WhisperModel::from_bytes` return the model and its
+tokenizer. Supply 16 kHz mono float PCM to `model.transcribe`:
+
+```rust,no_run
+use cera::{WhisperModel, WhisperTranscribeOpts};
+
+fn transcribe_recording(path: &str, pcm_16k_mono: &[f32]) -> anyhow::Result<String> {
+    let (model, tokenizer) = WhisperModel::from_file(path)?;
+    model.transcribe(&tokenizer, pcm_16k_mono, &WhisperTranscribeOpts {
+        language: Some("en".into()),
+        ..Default::default()
+    })
+}
+```
+
+This synchronous CPU path handles one 30-second chunk. The
+[Swift/Kotlin guide](../docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md) uses the
+standalone FFI object and its background decode method. The unified typed
+Whisper/VAD/hotword loader remains planned separately from the generative API refactor.
+
+## API refactor examples
+
+The `ModelLoader` / `GenerativeModel` API is public in this checkout; its generated
+foreign loaders remain isolated candidates.
+[Run the Rust, Swift and Kotlin examples](../docs/internals/API_RESHAPE_EXAMPLES.md)
+to load a fixture, create a session and generate, or exercise paired vision and
+DSpark companions. The guide links complete executable sources and explains
+which APIs are implemented. The quick start below shows both explicit loading
+and the existing `CeraEngine` API.
+The [audio walkthrough](../docs/internals/API_RESHAPE_AUDIO_EXAMPLE.md) loads an encoder/vocoder, ingests PCM and captures 24 kHz output using synthetic CPU weights.
+The [remote companion examples](../docs/internals/API_RESHAPE_REMOTE_EXAMPLES.md) exercise discovery, integrity and retained CPU execution through loopback HTTP.
+The [HF revision examples](../docs/internals/API_RESHAPE_HF_EXAMPLES.md) load changed GGUF revisions into separate cache entries, verify defaults and keep a CPU session live across another revision load. They also exercise failed metadata resolution and explicit commit checks.
+The [SafeTensors conversion examples](../docs/internals/API_RESHAPE_CONVERSION_EXAMPLES.md) exercise real conversion, corruption repair and option-sensitive cached reloads. The examples verify checkpoint bytes, pin inputs to one upstream commit, and refresh changed revisions. Retained models execute after replacement, and sessions continue after their parent model is released.
+The [persistent cache examples](../docs/internals/API_RESHAPE_CACHE_EXAMPLES.md) demonstrate same-path weight replacement, unchanged-weight disk reuse and retained live sessions.
+
 ## Quick start
+
+This checkout includes explicit model loading alongside `CeraEngine` constructors:
+
+```rust
+use cera::{BackendPreference, LoadConfig, ModelLoader, ModelSource, SessionConfig};
+
+let model = ModelLoader::new(ModelSource::path("model.gguf"))
+    .config(LoadConfig { backend: BackendPreference::Cpu, ..LoadConfig::default() })
+    .build_generative()?;
+let engine = model.engine(); // Shares the loaded engine and weights.
+let mut session = model.create_session(SessionConfig::default())?;
+drop(model);
+session.append_tokens(&engine.tokenizer().encode("Once upon a time"))?;
+```
+
+`ModelSource::bytes` and `reader` work without `mmap`; `path` and `files` require
+`mmap`, and `bundle_id`/`hugging_face` additionally require `remote`. `LoadConfig`
+is an alias of the existing `EngineConfig`. Use `.build()` for a dynamic
+`ModelHandle`, then `.as_generative()` to share its generative model. Other
+recognized kinds return `LoadError::KindMismatch` before generative assembly;
+their existing standalone constructors remain available.
+
+The complete [raw text-completion example](examples/explicit_loading.rs) tokenizes
+the prompt and decodes generated tokens:
+
+```bash
+cargo run -p cera --example explicit_loading -- model.gguf "Once upon a time"
+```
+
+For chat models, supply a prompt rendered with that model's template. This is a
+raw completion example; the new high-level chat workflow remains in progress.
+The explicit loading exports are available in this checkout and are not claimed
+as part of an already published release.
 
 Load a local GGUF and stream tokens to stdout as they decode:
 
@@ -197,9 +289,10 @@ fn main() -> Result<(), cera::CeraError> {
 }
 ```
 
-`Session` keeps the KV cache alive across `append_text` / `generate` calls, so a
-chat loop reuses the prefix cache instead of re-prefilling each turn. Render a
-model's chat template with `cera::tokenizer::apply_chat_template`.
+`Session` retains live KV across `append_text` / `generate` calls. Continue by
+appending new input to the same session. For chat, supply the model's required
+template boundaries using `cera::tokenizer::apply_chat_template`. Reusable model
+prefix caches are separate and are implemented only by some backends.
 
 ### Auto-downloading LeapBundles
 

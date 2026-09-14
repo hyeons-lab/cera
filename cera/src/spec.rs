@@ -133,6 +133,30 @@ pub fn verify_draft(
     draft: &[u32],
     vocab: usize,
 ) -> VerifyResult {
+    verify_draft_inner(model, state, guaranteed, draft, vocab, None)
+}
+
+// Observe rewind eligibility after the forward, immediately before the legacy
+// rewind. Convolution checkpoints checked before the forward may have expired.
+pub(crate) fn verify_draft_observed(
+    model: &dyn crate::model::Model,
+    state: &mut crate::kv_cache::InferenceState,
+    guaranteed: u32,
+    draft: &[u32],
+    vocab: usize,
+    rewinds_proven: &mut bool,
+) -> VerifyResult {
+    verify_draft_inner(model, state, guaranteed, draft, vocab, Some(rewinds_proven))
+}
+
+fn verify_draft_inner(
+    model: &dyn crate::model::Model,
+    state: &mut crate::kv_cache::InferenceState,
+    guaranteed: u32,
+    draft: &[u32],
+    vocab: usize,
+    mut rewinds_proven: Option<&mut bool>,
+) -> VerifyResult {
     use crate::sampler::argmax;
 
     let old = state.seq_len;
@@ -167,7 +191,13 @@ pub fn verify_draft(
     let m = accepted.len();
     // Keep the guaranteed token + m accepted drafts; drop the rejected tail.
     // Through the model, not `state.truncate_to`: see `Model::truncate_kv`.
+    if let Some(proven) = rewinds_proven.as_deref_mut() {
+        *proven &= model.check_kv_rewind(state, old + 1 + m).is_ok();
+    }
     model.truncate_kv(state, old + 1 + m);
+    if let Some(proven) = rewinds_proven {
+        *proven &= state.seq_len == old + 1 + m;
+    }
     // Row m holds the logits for the position after the last kept token.
     let follow_logits = all[m * vocab..(m + 1) * vocab].to_vec();
     VerifyResult {

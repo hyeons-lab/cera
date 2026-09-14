@@ -41,6 +41,17 @@ pub trait GpuWeightSource {
     fn config(&self) -> &ModelConfig;
     fn gguf(&self) -> &GgufFile;
 
+    /// Backing sources that identify this source's weights, in a stable order.
+    /// Built-in sources opt in so named disk caches include every backing file.
+    /// Return `Some` only when all weight accessors are determined by these
+    /// files. Configuration overrides still need a distinct caller namespace.
+    ///
+    /// `None` preserves caller-managed identity for custom sources: their
+    /// supplied model ID must uniquely identify all effective weights/config.
+    fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
+        None
+    }
+
     // ── Small pre-dequantized F32 weights ──────────────────────────────────
     fn output_norm_weight(&self) -> &[f32];
     fn attn_norm_weight(&self, layer: usize) -> &[f32];

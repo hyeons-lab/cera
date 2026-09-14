@@ -49,7 +49,7 @@ const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
 enum MetalBacking {
     #[cfg(feature = "mmap")]
-    Mmap(memmap2::Mmap),
+    Mmap(std::sync::Arc<memmap2::Mmap>),
     Bytes,
 }
 
@@ -589,20 +589,12 @@ pub struct MetalLfm2Model {
     profile_timer: Option<CategoryTimer>,
     gpu_timer: Option<GpuTimer>,
     pub prefix_cache: Mutex<crate::kv_cache::KvPrefixCache>,
-    /// Serializes Model trait calls on this instance. Without it,
-    /// two `Session`s sharing this `Arc<dyn Model>` and running
-    /// `forward()` / `forward_prefill()` concurrently would race on
-    /// the per-instance scratch buffers (`prefill_batch_buf`,
-    /// `q_buf`, `k_buf`, `attn_out_buf`, etc.) and on the GPU KV
-    /// caches in `MetalState`. The `Model` trait doc historically
-    /// pushed the "one model per concurrent Session" invariant onto
-    /// callers; this lock makes the Metal backend self-defending so
-    /// a contract violation serializes cleanly instead of corrupting
-    /// state. Lock cost is ~50ns uncontended (negligible vs Metal
-    /// dispatch ~ms+), and the GPU command queue already serializes
-    /// work — this just synchronizes the CPU-side bookkeeping that
-    /// stages and awaits each command buffer.
+    /// Serializes individual raw calls and their shared scratch access.
+    /// Session lifetime isolation is enforced separately by `session_gate`;
+    /// this mutex alone cannot protect interleaved conversation histories.
     infer_lock: Mutex<()>,
+    /// Reserves live KV/conv state for one Session until its destruction.
+    session_gate: super::ModelSessionGate,
     /// Cached env var values: read once at init to avoid per-dispatch syscalls.
     force_flash: bool,
     attn_mode: String,
@@ -616,8 +608,8 @@ pub struct MetalLfm2Model {
     /// falls back to 8). Always ∈ {8,16,32} and always fits the device. Honored
     /// only for head_dim=64; the dispatch forces 8 for hd=128.
     prefill_qpt: u32,
-    /// Unique model identifier (GGUF file path). Used as part of the cache
-    /// fingerprint so different models with the same architecture don't collide.
+    /// Path namespace plus loaded-byte identity when disk caching is compiled in.
+    /// Empty for pathless loads, which use only the private warm cache.
     model_id: String,
 
     /// GPU-uploaded LoRA adapters keyed by their source CPU adapter, most-
@@ -648,9 +640,9 @@ pub struct MetalLfm2Model {
 
 impl MetalLfm2Model {
     /// LFM2 entry point. Builds the CPU `Lfm2Model` (config + weight refs) and
-    /// drives the shared loader. The CPU model is borrowed only for metadata;
-    /// it is dropped on return (the Metal model opens its own second mmap or
-    /// creates a shared Metal buffer from in-memory bytes).
+    /// drives the shared loader. The CPU source is dropped on return; Metal
+    /// retains its exact parsed mapping or copies owned bytes into a shared
+    /// Metal buffer.
     pub fn from_gguf(
         gguf: GgufFile,
         path: Option<&std::path::Path>,
@@ -832,13 +824,11 @@ impl MetalLfm2Model {
             moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine")?,
         };
 
-        // Open a second mmap of the same file for the no-copy Metal buffer,
-        // or allocate a shared Metal buffer from in-memory bytes if path is None.
-        let (backing, mmap_buf) = match path {
+        // Share the exact parsed mapping with Metal; a second open could select
+        // a replaced file. Owned sources are copied into a shared Metal buffer.
+        let (backing, mmap_buf) = match src.gguf().mapped_backing() {
             #[cfg(feature = "mmap")]
-            Some(p) => {
-                let mmap_file = std::fs::File::open(p)?;
-                let mmap = unsafe { memmap2::Mmap::map(&mmap_file)? };
+            Some(mmap) => {
                 let mmap_len = mmap.len() as u64;
                 // Page-align the buffer length for Metal's newBufferWithBytesNoCopy.
                 // Apple Silicon uses 16KB pages while Intel macOS uses 4KB pages.
@@ -1224,24 +1214,20 @@ impl MetalLfm2Model {
                 .upload_bytes(bytemuck::cast_slice(&[config.vocab_size as u32, hs as u32])),
         };
 
-        // Use the GGUF file path as the model identifier so different model
-        // files (even with the same architecture) don't share cache entries.
+        // Bind the path namespace to the loaded bytes before dropping the CPU
+        // source. Without a path, keep only warm caching.
         // The `"metal:"` prefix keeps this backend's disk entries away from the
         // CPU's and wgpu's: it stores f16 KV in the nominally-f32
         // `LayerSnapshot::Attention` variant, so a cross-backend load would read
         // half-width data as f32.
         let model_id = path
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                let sample_len = emb_data.len().min(8192);
-                emb_data[..sample_len].hash(&mut hasher);
-                format!("in-memory:{:016x}", hasher.finish())
-            });
-        let prefix_cache = Mutex::new(KvPrefixCache::new(
+            .unwrap_or_default();
+        let model_id = super::cache_identity::for_gpu_source(src, &model_id);
+        let prefix_cache = Mutex::new(KvPrefixCache::for_model(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
+            &model_id,
             // No compression configured yet: the f16 (empty) tag. A session that
             // asks for TurboQuant re-namespaces in `configure_kv_compression`.
             &Self::namespace_for("", &model_id),
@@ -1369,6 +1355,7 @@ impl MetalLfm2Model {
             gpu_timer,
             prefix_cache,
             infer_lock: Mutex::new(()),
+            session_gate: super::ModelSessionGate::default(),
             force_flash: std::env::var("CERA_FLASH").as_deref() == Ok("1"),
             attn_mode: std::env::var("CERA_ATTN").unwrap_or_default(),
             skip_attn: std::env::var("CERA_PROFILE").as_deref() == Ok("noattn"),
@@ -3834,7 +3821,22 @@ impl MetalLfm2Model {
     }
 }
 
+mod recovery;
+
 impl Model for MetalLfm2Model {
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &crate::kv_cache::KvCompression,
+        max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        self.reset_kv_checked(state, compression, max_seq_len)
+    }
+
+    fn acquire_session(&self) -> Result<Option<super::ModelSessionLease>, CeraError> {
+        self.session_gate.try_acquire().map(Some)
+    }
+
     fn supports_all_logits(&self) -> bool {
         true
     }
@@ -4133,7 +4135,13 @@ impl Model for MetalLfm2Model {
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
         let id = self.cache_namespace();
         *self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            KvPrefixCache::new(config, &self.config, &id);
+            KvPrefixCache::for_model(config, &self.config, &self.model_id, &id);
+    }
+
+    #[cfg(test)]
+    fn warm_cache_usage(&self) -> Option<(usize, u64)> {
+        let cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Some((cache.warm_count(), cache.warm_bytes()))
     }
 
     fn clear_warm_cache(&self) {
@@ -4259,7 +4267,7 @@ impl Model for MetalLfm2Model {
             let id = self.cache_namespace();
             let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
             let cache_config = cache.config.clone();
-            *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+            *cache = KvPrefixCache::for_model(cache_config, &self.config, &self.model_id, &id);
         }
         Ok(())
     }

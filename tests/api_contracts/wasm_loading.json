@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "generator": "wasm-bindgen 0.2.117",
+  "scope": "Selected additive CPU WASM loading class signatures; runtime ownership and errors are separate gates",
+  "classes": {
+    "GenerationDefaults": "private constructor();\nfree(): void;\n[Symbol.dispose](): void;\nstatic audio(sampling: SamplingDefaults, number_of_decoding_threads?: number | null, audio_temperature?: number | null, audio_top_k?: number | null): GenerationDefaults;\nstatic other(raw_json: string): GenerationDefaults;\nstatic text(sampling: SamplingDefaults): GenerationDefaults;\ntoJson(): string;",
+    "GenerativeModel": "private constructor();\nfree(): void;\n[Symbol.dispose](): void;\ncreateSession(config: SessionConfig): Session;\nengine(): CeraEngine;",
+    "LoadConfig": "free(): void;\n[Symbol.dispose](): void;\nconstructor(context_size: number, backend: string);\nbackend: string;\ncontext_size: number;\nget draft_model(): string | undefined;\nset draft_model(value: string | null | undefined);\ngpu_depthformer: boolean;",
+    "ModelHandle": "private constructor();\nfree(): void;\n[Symbol.dispose](): void;\nasGenerative(): GenerativeModel | undefined;\nkind(): string;",
+    "ModelLoader": "free(): void;\n[Symbol.dispose](): void;\nbuild(): ModelHandle;\nbuildGenerative(): GenerativeModel;\nconstructor(source: ModelSource, config: LoadConfig);",
+    "ModelParts": "free(): void;\n[Symbol.dispose](): void;\nconstructor(model: Uint8Array);\nget audio_decoder(): Uint8Array | undefined;\nset audio_decoder(value: Uint8Array | null | undefined);\nget audio_tokenizer(): Uint8Array | undefined;\nset audio_tokenizer(value: Uint8Array | null | undefined);\nget chat_template(): string | undefined;\nset chat_template(value: string | null | undefined);\nget draft_model(): Uint8Array | undefined;\nset draft_model(value: Uint8Array | null | undefined);\nget generation_defaults(): GenerationDefaults | undefined;\nset generation_defaults(value: GenerationDefaults | null | undefined);\nget inference_type(): string | undefined;\nset inference_type(value: string | null | undefined);\nmodel: Uint8Array;\nget multimodal_projector(): Uint8Array | undefined;\nset multimodal_projector(value: Uint8Array | null | undefined);",
+    "ModelSource": "private constructor();\nfree(): void;\n[Symbol.dispose](): void;\nstatic bytes(bytes: Uint8Array): ModelSource;\nstatic parts(parts: ModelParts): ModelSource;",
+    "SamplingDefaults": "free(): void;\n[Symbol.dispose](): void;\nconstructor();\nget min_p(): number | undefined;\nset min_p(value: number | null | undefined);\nget repetition_penalty(): number | undefined;\nset repetition_penalty(value: number | null | undefined);\nget temperature(): number | undefined;\nset temperature(value: number | null | undefined);\nget top_k(): number | undefined;\nset top_k(value: number | null | undefined);\nget top_p(): number | undefined;\nset top_p(value: number | null | undefined);"
+  }
+}

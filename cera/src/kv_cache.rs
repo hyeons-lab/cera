@@ -11,6 +11,9 @@ use crate::turboquant::{
     TurboQuantConfig,
 };
 
+mod rewind;
+pub use rewind::KvRewindError;
+
 /// Reserve capacity for `len` values of `T`, returning [`CeraError::OutOfMemory`]
 /// instead of aborting the process when the allocation can't be satisfied. Used
 /// for the config-driven KV-cache buffers — the uncompressed per-layer f32
@@ -1674,6 +1677,12 @@ impl StateSnapshot {
 #[derive(Clone)]
 pub struct KvCacheConfig {
     /// Directory for cold-tier (disk) cache files. None = disk caching disabled.
+    /// Built-in models loaded without a path or explicit model ID ignore this
+    /// field: anonymous models use only the warm tier to avoid sharing another
+    /// model's persisted state. Live session KV is unaffected.
+    /// Named built-in prefix caches also bind their namespace to the loaded
+    /// GGUF bytes. CPU LFM2 resolves that identity on first disk configuration;
+    /// wgpu/Metal resolve it during loading while source bytes are available.
     pub cache_dir: Option<PathBuf>,
     /// Max warm-tier (memory) entries.
     pub max_warm_entries: usize,
@@ -1714,6 +1723,8 @@ pub struct KvPrefixCache {
 }
 
 impl KvPrefixCache {
+    /// Construct a cache with a caller-managed namespace. For disk caching, the
+    /// caller must identify the weights as well as the backend and KV format.
     pub fn new(config: KvCacheConfig, model_config: &ModelConfig, model_id: &str) -> Self {
         Self {
             warm: HashMap::new(),
@@ -1722,6 +1733,21 @@ impl KvPrefixCache {
             warm_bytes: 0,
             tick: Cell::new(0),
         }
+    }
+
+    /// Built-in model policy: a backend/format namespace is insufficient to
+    /// identify anonymous weights. Keep warm reuse but prevent all cold-tier
+    /// access, including clearing files written by older anonymous loads.
+    pub(crate) fn for_model(
+        mut config: KvCacheConfig,
+        model_config: &ModelConfig,
+        model_id: &str,
+        namespace: &str,
+    ) -> Self {
+        if model_id.is_empty() {
+            config.cache_dir = None;
+        }
+        Self::new(config, model_config, namespace)
     }
 
     fn next_tick(&self) -> u64 {
@@ -2318,7 +2344,7 @@ fn hash_tokens(tokens: &[u32]) -> u64 {
 /// Compute a fingerprint for a model configuration.
 /// Two models with different fingerprints have incompatible KV cache layouts.
 /// Callers should pass a `model_id` that uniquely identifies the specific
-/// model weights (e.g. a hash of the GGUF file or the model name from metadata),
+/// model weights (e.g. a hash of the GGUF file),
 /// so different models with the same architecture don't share cache entries.
 pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
     // Build a stable byte representation and hash it via FNV-1a. Using
@@ -2378,6 +2404,90 @@ mod tests {
             moe: None,
             is_causal: true,
             class_labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anonymous_model_policy_keeps_warm_hits_and_limits() {
+        let cfg = tiny_config(2, 16);
+        for backend in ["cpu:", "wgpu:", "metal:"] {
+            for compression in [
+                KvCompression::None,
+                KvCompression::F16,
+                KvCompression::turboquant(7),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let namespace = format!("{backend}{}", compression.cache_tag());
+                let mut cache = KvPrefixCache::for_model(
+                    KvCacheConfig {
+                        cache_dir: Some(dir.path().join("must-not-create")),
+                        max_warm_entries: 1,
+                        max_warm_bytes: 1234,
+                        max_cold_bytes: 5678,
+                        max_warm_anchors: 1,
+                    },
+                    &cfg,
+                    "",
+                    &namespace,
+                );
+                assert!(cache.config.cache_dir.is_none());
+                assert_eq!(cache.config.max_warm_entries, 1);
+                assert_eq!(cache.config.max_warm_bytes, 1234);
+                assert_eq!(cache.config.max_cold_bytes, 5678);
+                assert_eq!(cache.config.max_warm_anchors, 1);
+                let snapshot = || StateSnapshot::new(Vec::new(), 2);
+                cache.insert(&[1, 2], snapshot());
+                assert_eq!(cache.warm_count(), 1);
+                assert_eq!(cache.find_longest_prefix(&[1, 2, 3]).unwrap().1, 2);
+                cache.insert(&[3, 4], snapshot());
+                assert_eq!(cache.warm_count(), 1);
+                assert!(cache.find_longest_prefix(&[1, 2, 3]).is_none());
+                assert_eq!(cache.find_longest_prefix(&[3, 4, 5]).unwrap().1, 2);
+                cache.clear_warm();
+                assert!(cache.find_longest_prefix(&[3, 4, 5]).is_none());
+                cache.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn named_model_policy_preserves_cold_namespaces() {
+        let cfg = tiny_config(2, 16);
+        for backend in ["cpu:", "wgpu:", "metal:"] {
+            for compression in [
+                KvCompression::None,
+                KvCompression::F16,
+                KvCompression::turboquant(7),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let config = KvCacheConfig {
+                    cache_dir: Some(dir.path().to_owned()),
+                    ..KvCacheConfig::default()
+                };
+                let namespace = format!("{backend}{}model-a", compression.cache_tag());
+                // The public constructor supplies the historical on-disk format.
+                let mut old = KvPrefixCache::new(config.clone(), &cfg, &namespace);
+                old.insert(&[1, 2], StateSnapshot::new(Vec::new(), 2));
+                drop(old);
+                let mut same =
+                    KvPrefixCache::for_model(config.clone(), &cfg, "model-a", &namespace);
+                assert_eq!(same.config.cache_dir.as_deref(), Some(dir.path()));
+                assert_eq!(same.warm_count(), 0);
+                assert_eq!(same.find_longest_prefix(&[1, 2, 3]).unwrap().1, 2);
+                let other_namespace = format!("{backend}{}model-b", compression.cache_tag());
+                let mut other = KvPrefixCache::for_model(config, &cfg, "model-b", &other_namespace);
+                assert!(other.find_longest_prefix(&[1, 2, 3]).is_none());
+                other.insert(&[1, 2], StateSnapshot::new(Vec::new(), 2));
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+                same.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+                other.clear_warm();
+                assert!(other.find_longest_prefix(&[1, 2, 3]).is_some());
+                other.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
         }
     }
 

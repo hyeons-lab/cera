@@ -19,6 +19,11 @@ use crate::tensor::DType;
 use crate::time::{Duration, Instant};
 use crate::turboquant;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREFILLED_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(has_blas)]
 thread_local! {
     static PAR_EXPERT_GATE_UP_ROWS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -156,15 +161,13 @@ pub struct Lfm2Model {
     // Pre-resolved quantized weight refs
     embd_ref: WeightRef,
     layer_refs: Vec<LayerWeightRefs>,
-    /// Identifier passed into `KvPrefixCache::new`. CPU prefixes the
-    /// caller-supplied id with `"cpu:"` so disk-cache files don't
-    /// collide with Metal's f16-byte snapshots of the same model file
-    /// (model_fingerprint doesn't include element width). Empty string
-    /// when constructed via `from_gguf` (path-less case): warm cache
-    /// still works, but disk-cache files for different path-less
-    /// from_bytes loads of distinct models would namespace-collide —
-    /// acceptable since `from_bytes` is documented as "testing".
+    /// Caller namespace, typically a GGUF path. Cold use also binds it to the
+    /// loaded bytes; CPU and KV-format prefixes separate incompatible snapshots.
+    /// An empty ID disables the cold tier while keeping the private warm cache.
     model_id: String,
+    /// Resolved only when the caller enables disk caching; never on decode.
+    #[cfg(feature = "disk-cache")]
+    persistent_id: std::sync::OnceLock<String>,
     /// Two-tier prefix cache (warm in-memory + cold on-disk via
     /// FlatBuffers). Replaced wholesale by `Model::configure_cache`.
     /// Defaults to `KvCacheConfig::default()` (warm-only) at
@@ -279,13 +282,27 @@ fn validate_conv_kernel_size(v: Option<usize>) -> anyhow::Result<Option<usize>> 
 }
 
 impl Lfm2Model {
-    /// Prefix-cache namespace: the `"cpu:"` backend prefix, the KV-mode tag, and
-    /// the model id. The backend prefix keeps CPU entries away from wgpu's and
-    /// Metal's (their state shapes differ even where the byte format matches); the
-    /// mode tag keeps f32, f16, and each TurboQuant configuration apart.
-    fn cache_namespace(&self) -> String {
-        let tag = self.kv_cache_tag.lock().unwrap_or_else(|p| p.into_inner());
-        Self::namespace_for(tag.as_deref().unwrap_or(""), &self.model_id)
+    fn check_rewind_mode(
+        &self,
+        state: &InferenceState,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        if !self.config.is_causal || state.lora.as_ref().is_some_and(|l| l.is_classifier()) {
+            return Err(crate::kv_cache::KvRewindError::NonCausal);
+        }
+        Ok(())
+    }
+
+    /// Warm-only use needs no content scan. Resolve the loaded-byte identity
+    /// once when disk caching is enabled, reusing the model's retained GGUF.
+    fn cache_model_id(&self, cold: bool) -> &str {
+        #[cfg(feature = "disk-cache")]
+        if cold && !self.model_id.is_empty() {
+            return self.persistent_id.get_or_init(|| {
+                super::cache_identity::for_loaded_weights(&self.gguf, &self.model_id)
+            });
+        }
+        let _ = cold;
+        &self.model_id
     }
 
     /// The namespace string itself, taking the tag by value so a caller already
@@ -296,11 +313,8 @@ impl Lfm2Model {
     }
 
     /// Construct without a model identifier. Equivalent to
-    /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
-    /// works after `Model::configure_cache`; disk cache (when
-    /// configured) would namespace-collide between path-less loads of
-    /// different models, which is acceptable for the `from_bytes`
-    /// testing use case the doc calls out.
+    /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix caching works;
+    /// cold caching is disabled even when a directory is configured.
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
         Self::from_gguf_with_id(gguf, context_size, String::new())
     }
@@ -594,6 +608,9 @@ impl Lfm2Model {
         Ok(layer_refs)
     }
 
+    /// Construct with a caller-supplied identity for persistent prefix caching.
+    /// A nonempty ID names a cache namespace, bound to the loaded GGUF bytes when
+    /// disk caching is enabled. An empty ID keeps only warm caching.
     pub fn from_gguf_with_id(
         gguf: GgufFile,
         context_size: usize,
@@ -672,9 +689,10 @@ impl Lfm2Model {
         let layer_refs = Self::resolve_all_layer_refs(&gguf, &config)?;
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
 
-        let prefix_cache = Mutex::new(KvPrefixCache::new(
+        let prefix_cache = Mutex::new(KvPrefixCache::for_model(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
+            &model_id,
             &format!("cpu:{model_id}"),
         ));
 
@@ -720,6 +738,8 @@ impl Lfm2Model {
             embd_ref,
             layer_refs,
             model_id,
+            #[cfg(feature = "disk-cache")]
+            persistent_id: std::sync::OnceLock::new(),
             prefix_cache,
             kv_cache_tag: Mutex::new(None),
             classifier_weight,
@@ -3996,6 +4016,8 @@ impl Lfm2Model {
             !tokens.is_empty(),
             "forward_prefill_inner requires at least one token"
         );
+        #[cfg(test)]
+        PREFILLED_TOKENS.with(|count| count.set(count.get() + n));
 
         let mut hidden = vec![0.0f32; hs * n];
         for (j, &token_id) in tokens.iter().enumerate() {
@@ -4047,6 +4069,33 @@ impl Lfm2Model {
 }
 
 impl Model for Lfm2Model {
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &crate::kv_cache::KvCompression,
+        max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        super::reset_cpu_kv(self, state, compression, max_seq_len)
+    }
+
+    fn check_kv_rewind(
+        &self,
+        state: &InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        self.check_rewind_mode(state)?;
+        state.check_truncate_to(len)
+    }
+
+    fn try_truncate_kv(
+        &self,
+        state: &mut InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        self.check_rewind_mode(state)?;
+        state.try_truncate_to(len)
+    }
+
     fn supports_all_logits(&self) -> bool {
         true
     }
@@ -4491,9 +4540,15 @@ impl Model for Lfm2Model {
     }
 
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
-        let id = self.cache_namespace();
-        *self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            KvPrefixCache::new(config, &self.config, &id);
+        // Content identity is independent of cache/compression state. Resolve
+        // it before locking so a first scan does not block other sessions.
+        let model_id = self.cache_model_id(config.cache_dir.is_some());
+        // Use the same lock order as compression configuration. The tag must
+        // remain stable while resolving the identity and replacing the cache.
+        let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = self.kv_cache_tag.lock().unwrap_or_else(|e| e.into_inner());
+        let id = Self::namespace_for(tag.as_deref().unwrap_or(""), model_id);
+        *cache = KvPrefixCache::for_model(config, &self.config, &self.model_id, &id);
     }
 
     fn clear_warm_cache(&self) {
@@ -4536,9 +4591,9 @@ impl Model for Lfm2Model {
 
         // Cache lock outside, tag lock inside, so the tag and the cache's namespace
         // move as one unit. Dropping the tag guard before rebuilding would let two
-        // concurrent calls land tag=Y with the cache fingerprinted X — the
-        // cross-mode collision this exists to prevent. `configure_cache` takes the
-        // tag lock and releases it before taking the cache lock, so no cycle.
+        // concurrent calls land tag=Y with the cache fingerprinted X: the
+        // cross-mode collision this exists to prevent. `configure_cache` takes
+        // these locks in the same order.
         let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut tag = self.kv_cache_tag.lock().unwrap_or_else(|e| e.into_inner());
         match tag.as_deref() {
@@ -4551,10 +4606,13 @@ impl Model for Lfm2Model {
             }
             None => {}
         }
-        let id = Self::namespace_for(&resolved, &self.model_id);
+        let id = Self::namespace_for(
+            &resolved,
+            self.cache_model_id(cache.config.cache_dir.is_some()),
+        );
         *tag = Some(resolved);
         let cache_config = cache.config.clone();
-        *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+        *cache = KvPrefixCache::for_model(cache_config, &self.config, &self.model_id, &id);
         Ok(())
     }
 
@@ -4630,6 +4688,9 @@ impl Model for Lfm2Model {
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
+    fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
+        Some(vec![&self.gguf])
+    }
     fn config(&self) -> &ModelConfig {
         &self.config
     }

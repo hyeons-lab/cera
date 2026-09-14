@@ -1,8 +1,16 @@
 pub mod bert;
+#[cfg(any(
+    feature = "disk-cache",
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+pub(crate) mod cache_identity;
 pub mod dspark;
 pub mod lfm2;
 pub mod llama;
 pub mod pii;
+mod session_gate;
+pub use session_gate::{ModelSessionGate, ModelSessionLease};
 pub mod transformer;
 pub mod whisper;
 pub mod whisper_preprocessor;
@@ -198,23 +206,27 @@ pub struct MoeConfig {
 /// Kotlin/Swift wrappers move the `Arc` between threads and require
 /// both bounds).
 ///
-/// **GPU backends keep per-instance scratch buffers + GPU-resident
-/// KV caches in their own state.** `MetalLfm2Model` self-defends with
-/// an internal `Mutex<()>` (`infer_lock`) that serializes every Model
-/// trait call: two threads cloning the same `Arc<dyn Model>` and
-/// running `forward()` / `forward_prefill()` concurrently are safe —
-/// the second call blocks until the first releases. The lock is
-/// uncontended in the single-Session-per-Model case, costing ~50 ns
-/// per call (negligible vs Metal dispatch). For genuine throughput
-/// across concurrent Sessions, prefer one `MetalLfm2Model` per
-/// Session: their KV caches and scratch are still shared and the
-/// lock just turns a races-to-corruption into a serial bottleneck.
+/// GPU backends keep live KV/conv state and scratch on the model. Their
+/// per-call mutex protects execution, but cannot isolate interleaved sessions.
+/// Built-in Metal/wgpu models therefore allow one live [`crate::Session`] per
+/// model instance through [`Self::acquire_session`]. CPU models keep live state
+/// in the caller's `InferenceState` and remain shareable across sessions.
 ///
-/// `GpuLfm2Model` (wgpu) carries the same `infer_lock` for the same
-/// reason — its per-instance scratch buffers and GPU KV caches share
-/// the same shape. CPU `Lfm2Model` has no such shared state and is
-/// safely shareable across concurrent Sessions without any lock.
+/// Raw forward/cache/configuration calls remain caller-managed: a session lease
+/// does not make arbitrary calls through another model handle safe to interleave
+/// with a live session. Use separate model instances for independent GPU contexts.
 pub trait Model: Send + Sync {
+    /// Reserve model-owned live state for a new [`crate::Session`].
+    ///
+    /// The default needs no reservation because the caller owns its inference
+    /// state. Stateful backends override this and return a lease from a retained
+    /// [`ModelSessionGate`]. Return [`crate::CeraError::Busy`] when already held.
+    /// Session construction acquires before configuring the backend, retains the
+    /// lease through reset, and releases it on construction failure or drop.
+    fn acquire_session(&self) -> Result<Option<ModelSessionLease>, crate::CeraError> {
+        Ok(None)
+    }
+
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
 
@@ -296,6 +308,55 @@ pub trait Model: Send + Sync {
     /// every model whose KV lives entirely in `state`.
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
         state.truncate_to(len);
+    }
+
+    /// Check current backend rewind capability without mutating execution state.
+    ///
+    /// Defaults to unsupported: a CPU-only check cannot establish the safety of
+    /// model-owned device caches or convolution buffers. Implementors must check
+    /// every mutable backend component under the applicable operation lock.
+    /// A successful check does not reserve a checkpoint across later forwards.
+    /// Callers must retain the same causal prefix: changing execution mode or
+    /// replacing/shifting context can invalidate it even when lengths match.
+    fn check_kv_rewind(
+        &self,
+        _state: &InferenceState,
+        _len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        Err(crate::kv_cache::KvRewindError::BackendUnsupported)
+    }
+
+    /// Fallible backend-aware tail rewind. On error, leave all state unchanged.
+    ///
+    /// Defaults to unsupported, independently of the legacy `truncate_kv`
+    /// implementation. Supporting a read-only check alone does not enable this
+    /// operation. Implementors must revalidate every component immediately
+    /// before mutation under the same lock/borrow. Success restores only KV;
+    /// complete Session recovery also requires its execution metadata.
+    fn try_truncate_kv(
+        &self,
+        _state: &mut InferenceState,
+        _len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        Err(crate::kv_cache::KvRewindError::BackendUnsupported)
+    }
+
+    /// Reset every live KV/convolution component, including model-owned state.
+    ///
+    /// Defaults to unsupported. Implementations must establish a fresh execution
+    /// state for the requested compression/context under the backend operation
+    /// lock and preserve the attached adapter. An error may leave state invalid;
+    /// callers must not infer readiness from a zero position. This operation does
+    /// not reset Session metadata or touch its external cancellation latch.
+    fn try_reset_kv(
+        &self,
+        _state: &mut InferenceState,
+        _compression: &crate::kv_cache::KvCompression,
+        _max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        Err(crate::session::CeraError::Backend(
+            "checked KV reset is not supported by this backend".into(),
+        ))
     }
 
     /// Cancelable chunked prefill. Splits `tokens` into `ubatch`-sized slices,
@@ -526,6 +587,12 @@ pub trait Model: Send + Sync {
     /// Clear the KV prefix cache (both warm and cold tiers). No-op for backends without caching.
     fn clear_cache(&self) {}
 
+    /// Test-only observation of retained warm entries and bytes.
+    #[cfg(test)]
+    fn warm_cache_usage(&self) -> Option<(usize, u64)> {
+        None
+    }
+
     /// Snapshot the current KV and conv state for prefix caching.
     ///
     /// Implemented by GPU backends whose state lives on the model
@@ -662,8 +729,8 @@ pub trait Model: Send + Sync {
 /// values reduce startup memory; larger values allow longer prompts/decodes.
 ///
 /// `path` (when supplied) is used as the model identifier for prefix-cache
-/// namespacing. `None` is the path-less `from_bytes` case — warm cache works
-/// but disk-cache files would namespace-collide between distinct models.
+/// namespacing. With `None`, warm caching still works but cold caching is
+/// disabled even when a cache directory is configured.
 pub fn load_model(
     gguf: GgufFile,
     path: Option<&std::path::Path>,
@@ -721,8 +788,8 @@ pub fn load_model(
 /// Load a model with GPU acceleration.
 ///
 /// `path` (when supplied) is used as the model identifier for prefix-cache
-/// namespacing. `None` is the path-less from_bytes case — warm cache works
-/// but disk-cache files would namespace-collide between distinct models.
+/// namespacing. With `None`, warm caching still works but cold caching is
+/// disabled even when a cache directory is configured.
 #[cfg(feature = "gpu")]
 pub fn load_model_gpu(
     gguf: GgufFile,
@@ -758,6 +825,9 @@ pub fn load_model_gpu(
 }
 
 /// Load a model with native Metal acceleration.
+///
+/// `path` supplies the persistent-cache model identity. Without a path, warm
+/// caching still works but cold caching is disabled even with a cache directory.
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub fn load_model_metal(
     gguf: GgufFile,
@@ -810,4 +880,20 @@ pub mod weights;
 fn _assert_arc_dyn_model_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<std::sync::Arc<dyn Model>>();
+}
+
+// Only models whose live execution cache is entirely in InferenceState may use
+// this helper. Rebuilding also clears compressed payloads, unlike the scratch
+// state's uncompressed clear_for_reuse operation.
+pub(crate) fn reset_cpu_kv(
+    model: &dyn Model,
+    state: &mut InferenceState,
+    compression: &crate::kv_cache::KvCompression,
+    max_seq_len: usize,
+) -> Result<(), crate::session::CeraError> {
+    let mut fresh = InferenceState::from_config_capped(model.config(), compression, max_seq_len)?;
+    model.configure_kv_compression(compression)?;
+    fresh.lora = state.lora.clone();
+    *state = fresh;
+    Ok(())
 }

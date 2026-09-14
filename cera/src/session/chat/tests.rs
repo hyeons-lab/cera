@@ -1,0 +1,1136 @@
+use super::*;
+use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
+use crate::model::ModelConfig;
+use crate::session::{FinishReason, ModalityCapabilities, RecoveryOutcome, SessionConfig};
+use contract::{CompleteError, ContentPart, Message, Role};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+// Injected faults, armed through `StateModel::fault`.
+const NO_FAULT: u8 = 0;
+const PARTIAL_PREFILL: u8 = 1;
+const FORWARD_PANIC: u8 = 2;
+const RESET_ERROR: u8 = 3;
+
+struct StateModel {
+    config: ModelConfig,
+    answer: u32,
+    calls: Mutex<Vec<(usize, Vec<u32>)>>,
+    rewinds: AtomicUsize,
+    resets: AtomicUsize,
+    rewind_supported: AtomicBool,
+    fault: AtomicU8,
+}
+
+fn state_model(tokenizer: &BpeTokenizer) -> Arc<StateModel> {
+    Arc::new(StateModel {
+        config: fixtures::model_config("chat-transaction-test", tokenizer.vocab_size()),
+        answer: tokenizer.encode("a")[0],
+        calls: Mutex::new(Vec::new()),
+        rewinds: AtomicUsize::new(0),
+        resets: AtomicUsize::new(0),
+        rewind_supported: AtomicBool::new(true),
+        fault: AtomicU8::new(NO_FAULT),
+    })
+}
+
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        seed: Some(42),
+        ..Default::default()
+    }
+}
+
+fn setup(tokenizer: Arc<BpeTokenizer>) -> (Arc<StateModel>, Chat<CoreExecution>) {
+    let model = state_model(&tokenizer);
+    let session = Session::new(
+        model.clone(),
+        tokenizer,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+    (model, core_chat(session).unwrap())
+}
+
+/// The chat and its Session are both disabled and every entry point except
+/// reset is refused. Clears the injected fault, then proves a successful
+/// checked reset is the one way back to Idle.
+fn assert_unusable_until_reset(chat: &mut Chat<CoreExecution>, model: &StateModel) {
+    assert_eq!(chat.phase(), SessionPhase::Unusable);
+    assert!(!chat.execution_for_test().session.is_usable());
+    assert!(chat.raw().is_err());
+    assert!(chat.ingest(&user("refused")).is_err());
+    assert!(chat.replace_messages(&[user("refused")]).is_err());
+    assert!(chat.complete(&opts(0.0)).is_err());
+    model.fault.store(NO_FAULT, Ordering::Relaxed);
+    chat.reset().unwrap();
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert!(chat.execution_for_test().session.is_usable());
+}
+
+impl Model for StateModel {
+    fn is_classifier(&self) -> bool {
+        !self.config.class_labels.is_empty()
+    }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        assert_eq!(pos, state.seq_len);
+        self.calls.lock().unwrap().push((pos, tokens.to_vec()));
+        let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &mut state.layers[0]
+        else {
+            unreachable!()
+        };
+        key_cache.extend(
+            tokens
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &token)| [token as f32, (pos + i) as f32]),
+        );
+        value_cache.extend(tokens.iter().flat_map(|&token| [token as f32, 1.0]));
+        state.seq_len += tokens.len();
+        assert_ne!(
+            self.fault.load(Ordering::Relaxed),
+            FORWARD_PANIC,
+            "injected forward panic"
+        );
+        fixtures::scripted_logits(tokens, self.answer, self.config.vocab_size)
+    }
+    fn forward_prefill_chunked(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+        _: usize,
+        cancel: &AtomicBool,
+    ) -> (usize, Option<Vec<f32>>) {
+        let mut last = None;
+        for (i, &token) in tokens.iter().enumerate() {
+            last = Some(self.forward(&[token], pos + i, state));
+            if self.fault.load(Ordering::Relaxed) == PARTIAL_PREFILL {
+                return (0, last);
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return (i + 1, last);
+            }
+        }
+        (tokens.len(), last)
+    }
+    fn supports_all_logits(&self) -> bool {
+        true
+    }
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        tokens
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| self.forward(&[*t], pos + i, state))
+            .collect()
+    }
+    fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
+        if !self.rewind_supported.load(Ordering::Relaxed) {
+            return Err(KvRewindError::BackendUnsupported);
+        }
+        state.check_truncate_to(len)
+    }
+    fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
+        self.rewinds.fetch_add(1, Ordering::Relaxed);
+        self.check_kv_rewind(state, len)?;
+        state.try_truncate_to(len)
+    }
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &KvCompression,
+        max: usize,
+    ) -> Result<(), CeraError> {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+        if self.fault.load(Ordering::Relaxed) == RESET_ERROR {
+            return Err(CeraError::OutOfMemory {
+                requested_bytes: 1234,
+            });
+        }
+        crate::model::reset_cpu_kv(self, state, compression, max)
+    }
+}
+
+fn opts(temperature: f32) -> GenerateOpts {
+    GenerateOpts {
+        temperature,
+        max_tokens: 8,
+        flush_every_tokens: 1,
+        flush_every_ms: 0,
+        ..Default::default()
+    }
+}
+fn user(text: &str) -> Message {
+    Message::text(Role::User, text)
+}
+/// Physical forward inputs recorded since call index `from`, as owned data so
+/// no lock is held while the chat runs the next operation.
+fn calls_since(model: &StateModel, from: usize) -> Vec<(usize, Vec<u32>)> {
+    model.calls.lock().unwrap()[from..].to_vec()
+}
+fn resident(chat: &mut Chat<CoreExecution>) -> Vec<u32> {
+    let session = &chat.execution_for_test().session;
+    let LayerState::Attention { key_cache, .. } = &session.state.layers[0] else {
+        unreachable!()
+    };
+    let (rows, rest) = key_cache.as_chunks::<2>();
+    assert!(rest.is_empty());
+    let tokens: Vec<_> = rows.iter().map(|r| r[0] as u32).collect();
+    assert_eq!(tokens, session.token_history);
+    assert_eq!(tokens.len(), session.current_pos);
+    tokens
+}
+fn snapshot(chat: &mut Chat<CoreExecution>) -> String {
+    let s = &chat.execution_for_test().session;
+    format!(
+        "{:?}",
+        (
+            s.state.snapshot(),
+            &s.token_history,
+            &s.last_logits,
+            s.current_pos,
+            s.prefill_tokens,
+            s.prefill_elapsed
+        )
+    )
+}
+
+#[test]
+fn actual_ten_turns_append_only_new_boundary_and_input() {
+    run_ten_turns(fixtures::tokenizer(), false);
+}
+
+fn run_ten_turns(tokenizer: Arc<BpeTokenizer>, unicode: bool) {
+    for temperature in [0.0, 0.7] {
+        let (model, mut chat) = setup(tokenizer.clone());
+        let mut expected = Vec::new();
+        for turn in 0..10 {
+            let text = if unicode {
+                format!("turn{turn}: café 日本語")
+            } else {
+                format!("turn{turn}")
+            };
+            let rendered = format!(
+                "{}<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n",
+                if turn == 0 {
+                    "<|startoftext|>"
+                } else {
+                    "<|im_end|>\n"
+                }
+            );
+            let delta = tokenizer.encode(&rendered);
+            let before = chat.position();
+            let calls_before = model.calls.lock().unwrap().len();
+            let input = chat.ingest(&user(&text)).unwrap();
+            assert_eq!(input.input_tokens, delta.len());
+            assert_eq!(input.position_before, before);
+            expected.extend(&delta);
+            assert_eq!(resident(&mut chat), expected);
+            let calls = calls_since(&model, calls_before);
+            let added: Vec<_> = calls.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+            assert_eq!(added, delta);
+            assert_eq!(calls[0].0, before);
+            let result = chat.complete(&opts(temperature)).unwrap();
+            assert_eq!(result.text, "a");
+            assert_eq!(result.tokens, [model.answer]);
+            assert_eq!(result.summary.finish_reason, FinishReason::Stop);
+            assert_eq!(result.summary.prompt_eval_tokens as usize, delta.len());
+            assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+            expected.push(model.answer);
+            assert_eq!(resident(&mut chat), expected);
+            assert!(matches!(
+                chat.complete(&opts(temperature)),
+                Err(CompleteError::Validation(ValidationError::Phase(
+                    SessionPhase::TurnComplete
+                )))
+            ));
+        }
+        assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+        assert_eq!(model.rewinds.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn actual_recovery_restores_pending_boundary_and_full_metadata() {
+    for temperature in [0.0, 0.7] {
+        let (model, mut chat) = setup(fixtures::tokenizer());
+        chat.ingest(&user("first")).unwrap();
+        chat.complete(&opts(temperature)).unwrap();
+        let before = snapshot(&mut chat);
+        model.fault.store(PARTIAL_PREFILL, Ordering::Relaxed);
+        let error = chat.ingest(&user("next")).unwrap_err();
+        assert!(matches!(
+            error.cause,
+            IngestCause::Execution(CeraError::Cancelled)
+        ));
+        assert_eq!(error.recovery, RecoveryOutcome::Restored);
+        assert!(error.rewind_error.is_none() && error.recovery_error.is_none());
+        assert_eq!(snapshot(&mut chat), before);
+        assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+        model.fault.store(NO_FAULT, Ordering::Relaxed);
+        let pos = chat.position();
+        chat.ingest(&user("next")).unwrap();
+        // Exactly one pending EOS, the template newline, then `<|im_start|>`.
+        assert_eq!(resident(&mut chat)[pos..pos + 3], [7, 9, 6]);
+    }
+}
+
+#[test]
+fn actual_cancelled_prefill_resets_honestly_and_preserves_handle_identity() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    chat.complete(&opts(0.0)).unwrap();
+    model.rewind_supported.store(false, Ordering::Relaxed);
+    let cancel = chat.execution_for_test().session.cancel_handle();
+    let position = chat.execution_for_test().session.position_handle();
+    cancel.store(true, Ordering::Relaxed);
+    let error = chat.ingest(&user("next")).unwrap_err();
+    assert_eq!(error.recovery, RecoveryOutcome::Reset);
+    assert_eq!(
+        error.rewind_error.as_deref(),
+        Some(&KvRewindError::BackendUnsupported)
+    );
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert!(resident(&mut chat).is_empty());
+    assert_eq!(position.load(Ordering::Relaxed), 0);
+    assert!(cancel.load(Ordering::Relaxed));
+    // The chat surface has no cancellation entry points yet; the application
+    // clears its own latch through the handle it cancelled with.
+    cancel.store(false, Ordering::Relaxed);
+    chat.ingest(&user("retry")).unwrap();
+    assert!(position.load(Ordering::Relaxed) > 0);
+    assert!(Arc::ptr_eq(
+        &cancel,
+        &chat.execution_for_test().session.cancel_handle()
+    ));
+}
+
+#[test]
+fn actual_reset_failure_keeps_primary_and_typed_secondary_errors() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    chat.complete(&opts(0.0)).unwrap();
+    model.rewind_supported.store(false, Ordering::Relaxed);
+    model.fault.store(RESET_ERROR, Ordering::Relaxed);
+    chat.execution_for_test().session.cancel();
+    let error = chat.ingest(&user("next")).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        IngestCause::Execution(CeraError::Cancelled)
+    ));
+    assert_eq!(error.recovery, RecoveryOutcome::Unusable);
+    assert_eq!(
+        error.rewind_error.as_deref(),
+        Some(&KvRewindError::BackendUnsupported)
+    );
+    assert!(matches!(
+        error.recovery_error,
+        Some(CeraError::OutOfMemory {
+            requested_bytes: 1234
+        })
+    ));
+    assert_unusable_until_reset(&mut chat, &model);
+}
+
+#[test]
+fn direct_reset_failure_from_a_healthy_turn_is_unusable_until_reset_succeeds() {
+    for through_replacement in [false, true] {
+        let (model, mut chat) = setup(fixtures::tokenizer());
+        chat.ingest(&user("first")).unwrap();
+        chat.complete(&opts(0.0)).unwrap();
+        model.fault.store(RESET_ERROR, Ordering::Relaxed);
+        if through_replacement {
+            let error = chat.replace_messages(&[user("replacement")]).unwrap_err();
+            assert!(matches!(
+                error.cause,
+                IngestCause::Execution(CeraError::OutOfMemory {
+                    requested_bytes: 1234
+                })
+            ));
+            assert_eq!(error.recovery, RecoveryOutcome::Unusable);
+            assert!(error.rewind_error.is_none() && error.recovery_error.is_none());
+        } else {
+            assert!(matches!(
+                chat.reset(),
+                Err(CeraError::OutOfMemory {
+                    requested_bytes: 1234
+                })
+            ));
+        }
+        // The backend contract allows a failed checked reset to leave state
+        // invalid, so the intact CPU rows are not certified either, and the
+        // stale prefill logits are dropped as in the recovery path.
+        assert!(chat.execution_for_test().session.last_logits.is_none());
+        assert_eq!(model.resets.load(Ordering::Relaxed), 1);
+        assert_unusable_until_reset(&mut chat, &model);
+        // Only the helper's successful reset reached the backend again.
+        assert_eq!(model.resets.load(Ordering::Relaxed), 2);
+        assert!(resident(&mut chat).is_empty());
+        chat.ingest(&user("next")).unwrap();
+        assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+    }
+}
+
+#[test]
+fn actual_validation_and_replacement_preserve_old_context_until_reset() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    let before = snapshot(&mut chat);
+    for messages in [
+        vec![],
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentPart::Image(vec![1])],
+        }],
+    ] {
+        assert!(chat.replace_messages(&messages).is_err());
+        assert_eq!(snapshot(&mut chat), before);
+        assert_eq!(chat.phase(), SessionPhase::PromptReady);
+        assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+    }
+    chat.execution_for_test().session.cancel();
+    let error = chat.replace_messages(&[user("replacement")]).unwrap_err();
+    assert_eq!(error.recovery, RecoveryOutcome::Reset);
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert!(resident(&mut chat).is_empty());
+    assert!(
+        chat.execution_for_test()
+            .session
+            .cancel
+            .load(Ordering::Relaxed)
+    );
+    chat.reset().unwrap();
+    assert!(
+        !chat
+            .execution_for_test()
+            .session
+            .cancel
+            .load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn raw_replacement_cannot_reuse_the_old_profile_identity() {
+    // One shared tokenizer, so only the model identity distinguishes the two.
+    let tokenizer = fixtures::tokenizer();
+    let (_, mut chat) = setup(tokenizer.clone());
+    let (other_model, mut other) = setup(tokenizer);
+    std::mem::swap(
+        &mut chat.raw().unwrap().session,
+        &mut other.raw().unwrap().session,
+    );
+    let error = chat.replace_messages(&[user("next")]).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        IngestCause::Validation(ValidationError::UnsupportedProfile)
+    ));
+    assert_eq!(error.recovery, RecoveryOutcome::Unchanged);
+    assert_eq!(chat.phase(), SessionPhase::RawContext);
+    assert!(other_model.calls.lock().unwrap().is_empty());
+    assert_eq!(other_model.resets.load(Ordering::Relaxed), 0);
+    // An explicit reset does not consult the stale profile, so the chat is not
+    // stranded; the classifier-adapter case below exercises the full undo path.
+    chat.reset().unwrap();
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert_eq!(other_model.resets.load(Ordering::Relaxed), 1);
+    assert!(other_model.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn raw_swap_cannot_install_a_sliding_context_under_the_same_identity() {
+    // Same model and tokenizer Arcs, so only the re-checked `n_keep` differs.
+    let tokenizer = fixtures::tokenizer();
+    let (model, mut chat) = setup(tokenizer.clone());
+    chat.ingest(&user("first")).unwrap();
+    let mut sliding = Session::new(
+        model.clone(),
+        tokenizer,
+        ModalityCapabilities::text_only(),
+        SessionConfig {
+            n_keep: 4,
+            ..session_config()
+        },
+    )
+    .unwrap();
+    std::mem::swap(&mut chat.raw().unwrap().session, &mut sliding);
+    let error = chat.replace_messages(&[user("next")]).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        IngestCause::Validation(ValidationError::SlidingContext)
+    ));
+    assert_eq!(error.recovery, RecoveryOutcome::Unchanged);
+    assert_eq!(chat.phase(), SessionPhase::RawContext);
+    assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+    std::mem::swap(&mut chat.raw().unwrap().session, &mut sliding);
+    chat.replace_messages(&[user("next")]).unwrap();
+    assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+}
+
+#[test]
+fn construction_rejects_unsupported_profiles_before_inference() {
+    let tokenizer = fixtures::tokenizer();
+    let text = ModalityCapabilities::text_only();
+    type Case = (
+        fn(&mut ModelConfig),
+        ModalityCapabilities,
+        SessionConfig,
+        ValidationError,
+    );
+    let cases: [Case; 6] = [
+        (
+            |config| config.is_causal = false,
+            text,
+            session_config(),
+            ValidationError::UnsupportedProfile,
+        ),
+        (
+            |config| config.class_labels.push("class".into()),
+            text,
+            session_config(),
+            ValidationError::UnsupportedProfile,
+        ),
+        (
+            // A model vocabulary smaller than the tokenizer's can index out of range.
+            |config| config.vocab_size -= 1,
+            text,
+            session_config(),
+            ValidationError::UnsupportedProfile,
+        ),
+        (
+            |_| {},
+            ModalityCapabilities {
+                text_in: false,
+                ..text
+            },
+            session_config(),
+            ValidationError::UnsupportedProfile,
+        ),
+        (
+            |_| {},
+            ModalityCapabilities {
+                text_out: false,
+                ..text
+            },
+            session_config(),
+            ValidationError::UnsupportedProfile,
+        ),
+        (
+            |_| {},
+            text,
+            SessionConfig {
+                n_keep: 4,
+                ..session_config()
+            },
+            ValidationError::SlidingContext,
+        ),
+    ];
+    for (mutate, capabilities, config, expected) in cases {
+        let mut model = state_model(&tokenizer);
+        mutate(&mut Arc::get_mut(&mut model).unwrap().config);
+        let session = Session::new(model.clone(), tokenizer.clone(), capabilities, config).unwrap();
+        assert_eq!(core_chat(session).err(), Some(expected));
+        assert!(model.calls.lock().unwrap().is_empty());
+        assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn no_progress_error_keeps_execution_usable_and_opens_replacement() {
+    // A prompt whose logits vanished cannot be certified, but the observation
+    // proves nothing was mutated: the cursor is stale, the Session is fine.
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    let before = resident(&mut chat);
+    chat.execution_for_test().session.last_logits = None;
+    assert!(matches!(
+        chat.complete(&opts(0.0)),
+        Err(CompleteError::Execution(CeraError::EmptyInput))
+    ));
+    assert_eq!(chat.phase(), SessionPhase::RawContext);
+    assert!(chat.execution_for_test().session.is_usable());
+    assert_eq!(resident(&mut chat), before);
+    assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+    chat.replace_messages(&[user("again")]).unwrap();
+    assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+}
+
+#[test]
+#[ignore = "requires pinned public GGUF; run tests/api_chat/run.py --core-transactions"]
+fn public_tokenizer_actual_session_ten_turns() {
+    let path =
+        std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
+    let gguf = crate::gguf::GgufFile::from_bytes(std::fs::read(path).unwrap().into()).unwrap();
+    run_ten_turns(Arc::new(BpeTokenizer::from_gguf(&gguf).unwrap()), true);
+}
+
+fn load_real_lfm2(bytes: &[u8]) -> (Arc<dyn Model>, Arc<BpeTokenizer>) {
+    let gguf_tok = crate::gguf::GgufFile::from_bytes(bytes.to_vec().into()).unwrap();
+    let tokenizer = Arc::new(BpeTokenizer::from_gguf(&gguf_tok).unwrap());
+    let gguf_model = crate::gguf::GgufFile::from_bytes(bytes.to_vec().into()).unwrap();
+    let model: Arc<dyn Model> =
+        Arc::from(crate::model::load_model(gguf_model, None, 4096).unwrap());
+    (model, tokenizer)
+}
+
+fn real_lfm2_session_from_model(
+    model: Arc<dyn Model>,
+    tokenizer: Arc<BpeTokenizer>,
+    seed: Option<u64>,
+) -> Session {
+    Session::new(
+        model,
+        tokenizer,
+        ModalityCapabilities::text_only(),
+        SessionConfig {
+            seed,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn real_lfm2_session(bytes: &[u8], seed: Option<u64>) -> (Session, Arc<BpeTokenizer>) {
+    let (model, tokenizer) = load_real_lfm2(bytes);
+    let session = real_lfm2_session_from_model(model, tokenizer.clone(), seed);
+    (session, tokenizer)
+}
+
+#[test]
+#[ignore = "requires pinned public GGUF; run tests/api_chat/run.py --core-transactions"]
+fn real_model_r1_ten_warm_turns_and_kv_retention() {
+    let path =
+        std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
+    let bytes = std::fs::read(path).unwrap();
+    let (model, tokenizer) = load_real_lfm2(&bytes);
+    let session = real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(42));
+    let mut chat = core_chat(session).unwrap();
+
+    let kv_dim = model.config().n_kv_heads * model.config().head_dim;
+    let mut prior_kv_snapshots: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+    let mut turn_outputs: Vec<(String, Vec<u32>, String)> = Vec::new();
+    let grammar = Arc::new(crate::grammar::Grammar::parse(r#"root ::= [a-zA-Z]+ "\n""#).unwrap());
+    let opts = GenerateOpts {
+        max_tokens: 64,
+        temperature: 0.7,
+        grammar: Some(grammar),
+        ..Default::default()
+    };
+
+    let prompts = [
+        "Say hi.",
+        "Say ok.",
+        "Say yes.",
+        "Say cool.",
+        "Say wow.",
+        "Say done.",
+        "Say bye.",
+        "Say hello.",
+        "Say fine.",
+        "Say good.",
+    ];
+
+    for (turn, prompt) in prompts.iter().enumerate() {
+        let pos_before = chat.position();
+        let user_msg = user(prompt);
+        let summary = if turn == 0 {
+            chat.ingest_messages(&[Message::text(Role::System, "Be concise."), user_msg.clone()])
+                .unwrap()
+        } else {
+            chat.ingest(&user_msg).unwrap()
+        };
+        assert_eq!(summary.position_before, pos_before);
+        assert!(summary.input_tokens > 0);
+        assert_eq!(chat.position(), pos_before + summary.input_tokens);
+        assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+        if turn == 0 {
+            // Verify cold reference prefill parity on turn 0:
+            let cold_session =
+                real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(42));
+            let mut cold_chat = core_chat(cold_session).unwrap();
+            cold_chat
+                .ingest_messages(&[Message::text(Role::System, "Be concise."), user_msg.clone()])
+                .unwrap();
+            let warm_logits = chat
+                .execution_for_test()
+                .session
+                .last_logits()
+                .unwrap()
+                .to_vec();
+            let cold_logits = cold_chat
+                .execution_for_test()
+                .session
+                .last_logits()
+                .unwrap()
+                .to_vec();
+            assert_eq!(
+                warm_logits, cold_logits,
+                "turn 0 warm prefill logits must be identical to cold reference"
+            );
+        } else {
+            // Verify physical KV immutability: delta ingestion must leave prior KV intact:
+            let warm_sess = &chat.execution_for_test().session;
+            let mut attn_layer_idx = 0;
+            for layer in &warm_sess.state.layers {
+                if let LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } = layer
+                {
+                    let (prev_k, prev_v) = &prior_kv_snapshots[attn_layer_idx];
+                    assert!(
+                        key_cache.len() >= pos_before * kv_dim,
+                        "layer {attn_layer_idx} key cache must contain all prior positions"
+                    );
+                    assert_eq!(
+                        &key_cache[..pos_before * kv_dim],
+                        &prev_k[..pos_before * kv_dim],
+                        "layer {attn_layer_idx} key cache before position {pos_before} must be bitwise identical"
+                    );
+                    assert_eq!(
+                        &value_cache[..pos_before * kv_dim],
+                        &prev_v[..pos_before * kv_dim],
+                        "layer {attn_layer_idx} value cache before position {pos_before} must be bitwise identical"
+                    );
+                    attn_layer_idx += 1;
+                }
+            }
+        }
+
+        let result = chat.complete(&opts).unwrap();
+        assert!(result.summary.tokens_generated > 0);
+        assert_eq!(result.summary.finish_reason, FinishReason::Stop);
+        assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+        assert_eq!(
+            chat.position(),
+            pos_before + summary.input_tokens + result.summary.tokens_generated as usize
+        );
+        turn_outputs.push((prompt.to_string(), result.tokens, result.text));
+
+        // Snapshot full KV cache for all attention layers up to the end of this turn:
+        let warm_sess = &chat.execution_for_test().session;
+        prior_kv_snapshots = warm_sess
+            .state
+            .layers
+            .iter()
+            .filter_map(|layer| match layer {
+                LayerState::Attention {
+                    key_cache,
+                    value_cache,
+                    ..
+                } => Some((key_cache.clone(), value_cache.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !prior_kv_snapshots.is_empty(),
+            "model must have attention layers"
+        );
+    }
+
+    // Proof of determinism across consecutive runs with identical seed:
+    let session2 = real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(42));
+    let mut chat2 = core_chat(session2).unwrap();
+    for (turn, (prompt, expected_tokens, expected_text)) in turn_outputs.iter().enumerate() {
+        let summary2 = if turn == 0 {
+            chat2
+                .ingest_messages(&[Message::text(Role::System, "Be concise."), user(prompt)])
+                .unwrap()
+        } else {
+            chat2.ingest(&user(prompt)).unwrap()
+        };
+        assert!(summary2.input_tokens > 0);
+        let result = chat2.complete(&opts).unwrap();
+        assert_eq!(&result.tokens, expected_tokens, "turn {turn} tokens match");
+        assert_eq!(&result.text, expected_text, "turn {turn} text matches");
+        assert_eq!(result.summary.finish_reason, FinishReason::Stop);
+    }
+    assert_eq!(chat2.position(), chat.position());
+}
+
+#[test]
+#[ignore = "requires pinned public GGUF; run tests/api_chat/run.py --core-transactions"]
+fn real_model_r1_stochastic_rng_determinism_and_divergence() {
+    let path =
+        std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
+    let bytes = std::fs::read(path).unwrap();
+
+    let opts = GenerateOpts {
+        max_tokens: 16,
+        temperature: 0.7,
+        ..Default::default()
+    };
+
+    let (s1, _) = real_lfm2_session(&bytes, Some(777));
+    let mut chat1 = core_chat(s1).unwrap();
+    chat1.ingest(&user("Tell me an interesting fact.")).unwrap();
+    let r1 = chat1.complete(&opts).unwrap();
+
+    let (s2, _) = real_lfm2_session(&bytes, Some(777));
+    let mut chat2 = core_chat(s2).unwrap();
+    chat2.ingest(&user("Tell me an interesting fact.")).unwrap();
+    let r2 = chat2.complete(&opts).unwrap();
+
+    assert_eq!(
+        r1.tokens, r2.tokens,
+        "identical seeds must produce identical stochastic tokens"
+    );
+    assert_eq!(r1.text, r2.text);
+
+    let (s3, _) = real_lfm2_session(&bytes, Some(888));
+    let mut chat3 = core_chat(s3).unwrap();
+    chat3.ingest(&user("Tell me an interesting fact.")).unwrap();
+    let r3 = chat3.complete(&opts).unwrap();
+
+    assert_ne!(
+        r1.tokens, r3.tokens,
+        "different seeds must produce divergent stochastic tokens"
+    );
+}
+
+#[test]
+#[ignore = "requires pinned public GGUF; run tests/api_chat/run.py --core-transactions"]
+fn real_model_r1_interrupted_turn_and_replacement_recovery() {
+    let path =
+        std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
+    let bytes = std::fs::read(path).unwrap();
+
+    let (session, _) = real_lfm2_session(&bytes, Some(42));
+    let mut chat = core_chat(session).unwrap();
+
+    // 1. Ingest turn and execute with max_tokens: 2, causing FinishReason::MaxTokens:
+    let _summary = chat.ingest(&user("What is 2 + 2?")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    let opts_short = GenerateOpts {
+        max_tokens: 2,
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let result = chat.complete(&opts_short).unwrap();
+    assert_eq!(result.tokens.len(), 2);
+    assert_eq!(result.summary.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(chat.phase(), SessionPhase::Interrupted);
+
+    // 2. Interrupted turn rejects subsequent ingest:
+    let err = chat.ingest(&user("Next question")).unwrap_err();
+    assert!(matches!(
+        err.cause,
+        IngestCause::Validation(ValidationError::Phase(SessionPhase::Interrupted))
+    ));
+    assert_eq!(chat.phase(), SessionPhase::Interrupted);
+
+    // 3. Replacement reset cleanly restores prompt ready state and rewinds KV cache:
+    let interrupted_pos = chat.position();
+    let rep_summary = chat
+        .replace_messages(&[Message::text(Role::System, "Be concise."), user("Say hi.")])
+        .unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert_eq!(rep_summary.position_before, interrupted_pos);
+    assert_eq!(rep_summary.position_after, rep_summary.input_tokens);
+    assert_eq!(chat.position(), rep_summary.input_tokens);
+
+    let opts_full = GenerateOpts {
+        max_tokens: 64,
+        temperature: 0.7,
+        ..Default::default()
+    };
+    let fresh_result = chat.complete(&opts_full).unwrap();
+    assert_eq!(fresh_result.summary.finish_reason, FinishReason::Stop);
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+
+    // Verify against a cold independent session with the same replacement prompt:
+    let (cold_sess, _) = real_lfm2_session(&bytes, Some(42));
+    let mut cold_chat = core_chat(cold_sess).unwrap();
+    cold_chat
+        .ingest_messages(&[Message::text(Role::System, "Be concise."), user("Say hi.")])
+        .unwrap();
+    let cold_result = cold_chat.complete(&opts_full).unwrap();
+
+    assert_eq!(fresh_result.tokens, cold_result.tokens);
+    assert_eq!(fresh_result.text, cold_result.text);
+    assert_eq!(cold_result.summary.finish_reason, FinishReason::Stop);
+}
+
+#[test]
+fn no_progress_keeps_prompt_ready_and_preserves_future_rng() {
+    for temperature in [0.0, 0.7] {
+        let (_, mut chat) = setup(fixtures::tokenizer());
+        let (_, mut reference) = setup(fixtures::tokenizer());
+        for c in [&mut chat, &mut reference] {
+            c.ingest(&user("first")).unwrap();
+        }
+        let before = resident(&mut chat);
+        let logits = chat.execution_for_test().session.last_logits.clone();
+        let zero = GenerateOpts {
+            max_tokens: 0,
+            ..opts(temperature)
+        };
+        let result = chat.complete(&zero).unwrap();
+        assert_eq!(result.summary.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(chat.phase(), SessionPhase::PromptReady);
+        chat.execution_for_test().session.cancel();
+        let result = chat.complete(&opts(temperature)).unwrap();
+        assert_eq!(result.summary.finish_reason, FinishReason::Cancelled);
+        assert_eq!(chat.phase(), SessionPhase::PromptReady);
+        assert!(
+            !chat
+                .execution_for_test()
+                .session
+                .cancel
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(resident(&mut chat), before);
+        assert_eq!(chat.execution_for_test().session.last_logits, logits);
+        for c in [&mut chat, &mut reference] {
+            assert_eq!(c.complete(&opts(temperature)).unwrap().text, "a");
+        }
+        for _ in 0..16 {
+            let left = chat
+                .execution_for_test()
+                .session
+                .sampler
+                .sample(&mut [0.0, 0.0]);
+            let right = reference
+                .execution_for_test()
+                .session
+                .sampler
+                .sample(&mut [0.0, 0.0]);
+            assert_eq!(left, right);
+        }
+    }
+}
+
+struct PanicSink {
+    tokens: bool,
+    done: bool,
+}
+impl ModalitySink for PanicSink {
+    fn on_text_tokens(&mut self, _: &[u32]) {
+        assert!(!self.tokens, "injected token callback panic");
+    }
+    fn on_done(&mut self, _: FinishReason) {
+        assert!(!self.done, "injected done callback panic");
+    }
+}
+
+#[test]
+fn actual_decode_unwinds_disable_chat_and_raw_execution() {
+    for case in ["forward", "tokens", "done"] {
+        let (model, mut chat) = setup(fixtures::tokenizer());
+        chat.ingest(&user("first")).unwrap();
+        if case == "forward" {
+            model.fault.store(FORWARD_PANIC, Ordering::Relaxed);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            chat.generate_into(
+                &opts(0.0),
+                &mut PanicSink {
+                    tokens: case == "tokens",
+                    done: case == "done",
+                },
+            )
+        }));
+        assert!(result.is_err());
+        assert_unusable_until_reset(&mut chat, &model);
+    }
+}
+
+#[test]
+fn actual_prefill_unwind_disables_chat_and_raw_execution() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    chat.complete(&opts(0.0)).unwrap();
+    model.fault.store(FORWARD_PANIC, Ordering::Relaxed);
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.ingest(&user("next"))));
+    assert!(result.is_err());
+    // The recovery guard recorded the unwind; the adapter never got to take it.
+    assert_eq!(
+        chat.execution_for_test()
+            .session
+            .last_ingest_recovery()
+            .map(|r| r.outcome),
+        Some(RecoveryOutcome::Unusable)
+    );
+    assert_unusable_until_reset(&mut chat, &model);
+    assert!(
+        chat.execution_for_test()
+            .session
+            .last_ingest_recovery()
+            .is_none()
+    );
+}
+
+#[derive(Clone)]
+struct Draft {
+    tokens: Vec<u32>,
+    resets: Arc<AtomicUsize>,
+}
+impl crate::spec::Drafter for Draft {
+    fn clone_drafter(&self) -> Box<dyn crate::spec::Drafter> {
+        Box::new(self.clone())
+    }
+    fn draft(&mut self, _: &[u32], max: usize) -> Vec<u32> {
+        self.tokens.iter().copied().take(max).collect()
+    }
+    fn reset(&mut self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn actual_speculative_observation_and_recovery_preserve_drafter_contract() {
+    for checked in [true, false] {
+        let (model, mut chat) = setup(fixtures::tokenizer());
+        chat.ingest(&user("first")).unwrap();
+        let resets = Arc::new(AtomicUsize::new(0));
+        chat.execution_for_test().session.attach_drafter(&Draft {
+            tokens: vec![7, model.answer, 9],
+            resets: resets.clone(),
+        });
+        model.rewind_supported.store(checked, Ordering::Relaxed);
+        let result = chat.complete(&opts(0.0)).unwrap();
+        assert_eq!(result.text, "a");
+        assert_eq!(result.summary.finish_reason, FinishReason::Stop);
+        if checked {
+            assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+            model.fault.store(PARTIAL_PREFILL, Ordering::Relaxed);
+            let error = chat.ingest(&user("next")).unwrap_err();
+            assert_eq!(error.recovery, RecoveryOutcome::Restored);
+            assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+            assert_eq!(resets.load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(chat.phase(), SessionPhase::Unusable);
+            assert!(!chat.execution_for_test().session.is_usable());
+            assert!(chat.ingest(&user("next")).is_err());
+        }
+        model.fault.store(NO_FAULT, Ordering::Relaxed);
+        chat.reset().unwrap();
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+        assert_eq!(chat.phase(), SessionPhase::Idle);
+    }
+}
+
+#[test]
+fn actual_batch_has_one_final_prefix_and_rejects_a_second_ingest() {
+    let tokenizer = fixtures::tokenizer();
+    let (model, mut chat) = setup(tokenizer.clone());
+    let messages = [
+        Message::text(Role::System, "system"),
+        user("one"),
+        Message::text(Role::Assistant, "answer"),
+        user("two"),
+    ];
+    let raw = [
+        ("system", "system"),
+        ("user", "one"),
+        ("assistant", "answer"),
+        ("user", "two"),
+    ]
+    .map(|(role, content)| crate::tokenizer::ChatMessage {
+        role: role.into(),
+        content: content.into(),
+    });
+    let expected =
+        tokenizer.encode(&crate::tokenizer::apply_chat_template(&tokenizer, &raw, true).unwrap());
+    let summary = chat.ingest_messages(&messages).unwrap();
+    assert_eq!(summary.input_tokens, expected.len());
+    assert_eq!(resident(&mut chat), expected);
+    let calls = model.calls.lock().unwrap().len();
+    assert!(chat.ingest(&user("extra")).is_err());
+    assert_eq!(model.calls.lock().unwrap().len(), calls);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+}
+
+#[test]
+fn actual_raw_append_requires_replacement_before_chat() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    chat.raw()
+        .unwrap()
+        .session
+        .append_tokens(&[model.answer])
+        .unwrap();
+    assert_eq!(chat.phase(), SessionPhase::RawContext);
+    assert!(chat.ingest(&user("next")).is_err());
+    assert!(chat.complete(&opts(0.0)).is_err());
+    chat.replace_messages(&[user("replacement")]).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+}
+
+#[test]
+fn a_zero_output_custom_stop_is_interrupted_in_both_sampling_modes() {
+    for temperature in [0.0, 0.7] {
+        let (model, mut chat) = setup(fixtures::tokenizer());
+        chat.ingest(&user("first")).unwrap();
+        let config = GenerateOpts {
+            stop_tokens: vec![model.answer],
+            ..opts(temperature)
+        };
+        let result = chat.complete(&config).unwrap();
+        assert!(result.tokens.is_empty());
+        assert_eq!(result.summary.finish_reason, FinishReason::Stop);
+        assert_eq!(chat.phase(), SessionPhase::Interrupted);
+        assert!(chat.ingest(&user("next")).is_err());
+        assert!(chat.complete(&opts(temperature)).is_err());
+    }
+}
+
+#[test]
+fn classifier_adapter_is_rejected_before_replacement_reset() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    let adapter = crate::lora::LoraAdapterWeights::new_classifier_for_testing(
+        vec![0.0; 2],
+        None,
+        vec!["class".into()],
+    );
+    chat.raw()
+        .unwrap()
+        .session
+        .attach_lora_adapters(adapter)
+        .unwrap();
+    let before = snapshot(&mut chat);
+    let calls = model.calls.lock().unwrap().len();
+    let error = chat.replace_messages(&[user("next")]).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        IngestCause::Validation(ValidationError::UnsupportedProfile)
+    ));
+    assert_eq!(error.recovery, RecoveryOutcome::Unchanged);
+    assert_eq!(chat.phase(), SessionPhase::RawContext);
+    assert_eq!(snapshot(&mut chat), before);
+    assert_eq!(model.calls.lock().unwrap().len(), calls);
+    assert_eq!(model.resets.load(Ordering::Relaxed), 0);
+    // Identity drift must not strand the chat: an explicit reset still runs
+    // the checked KV reset, and Idle keeps raw access open to remove the adapter.
+    chat.reset().unwrap();
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert_eq!(model.resets.load(Ordering::Relaxed), 1);
+    assert!(chat.execution_for_test().session.has_lora_adapters());
+    let error = chat.ingest(&user("next")).unwrap_err();
+    assert!(matches!(
+        error.cause,
+        IngestCause::Validation(ValidationError::UnsupportedProfile)
+    ));
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    chat.raw().unwrap().session.remove_lora_adapters();
+    chat.replace_messages(&[user("next")]).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+}

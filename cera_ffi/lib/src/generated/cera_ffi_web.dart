@@ -408,11 +408,12 @@ class FfiHotwordEvent {
   const FfiHotwordEvent({
     /// The matched keyword string.
     required this.keyword,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     required this.sampleOffset,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     required this.commandStartSample,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     required this.timestampMs,
     /// Model confidence probability (0.0 to 1.0).
     required this.confidence,
@@ -420,11 +421,12 @@ class FfiHotwordEvent {
 
   /// The matched keyword string.
   final String keyword;
-  /// Exact audio stream sample index where the keyword completed.
+  /// Exclusive end sample of the window evaluated when detection triggered.
+  /// This is a detection-hop boundary; it does not locate the spoken word's end.
   final int sampleOffset;
-  /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+  /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
   final int commandStartSample;
-  /// Timestamp in milliseconds from stream origin where keyword completed.
+  /// `sample_offset` converted to milliseconds using the model sample rate.
   final double timestampMs;
   /// Model confidence probability (0.0 to 1.0).
   final double confidence;
@@ -1579,6 +1581,356 @@ class UserMessage {
   int get hashCode => Object.hash(text, images, audio);
 }
 
+class ModelFiles {
+  const ModelFiles({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.extras,
+    required this.inferenceType,
+    required this.chatTemplate,
+  });
+
+  final String model;
+  final String? multimodalProjector;
+  final String? audioDecoder;
+  final String? audioTokenizer;
+  final String? draftModel;
+  final Map<String, String> extras;
+  final String? inferenceType;
+  final String? chatTemplate;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': this.model,
+      'multimodalProjector': this.multimodalProjector,
+      'audioDecoder': this.audioDecoder,
+      'audioTokenizer': this.audioTokenizer,
+      'draftModel': this.draftModel,
+      'extras': this.extras,
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+    };
+  }
+
+  factory ModelFiles.fromJson(Map<String, dynamic> json) {
+    return ModelFiles(
+      model: json['model'] as String,
+      multimodalProjector: json['multimodalProjector'] == null ? null : json['multimodalProjector'] as String,
+      audioDecoder: json['audioDecoder'] == null ? null : json['audioDecoder'] as String,
+      audioTokenizer: json['audioTokenizer'] == null ? null : json['audioTokenizer'] as String,
+      draftModel: json['draftModel'] == null ? null : json['draftModel'] as String,
+      extras: (json['extras'] as Map<String, dynamic>).map((key, value) => MapEntry(key, value as String)),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+    );
+  }
+
+  ModelFiles copyWith({
+    String? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Map<String, String>? extras,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+  }) {
+    return ModelFiles(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as String?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as String?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as String?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
+      extras: extras ?? this.extras,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelFiles(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, extras: $extras, inferenceType: $inferenceType, chatTemplate: $chatTemplate)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelFiles && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && extras == other.extras && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, extras, inferenceType, chatTemplate);
+}
+
+class ModelParts {
+  const ModelParts({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.inferenceType,
+    required this.chatTemplate,
+    required this.generationDefaults,
+  });
+
+  final Uint8List model;
+  final Uint8List? multimodalProjector;
+  final Uint8List? audioDecoder;
+  final Uint8List? audioTokenizer;
+  final Uint8List? draftModel;
+  final String? inferenceType;
+  final String? chatTemplate;
+  final GenerationDefaults? generationDefaults;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': base64Encode(this.model),
+      'multimodalProjector': this.multimodalProjector == null ? null : (() { final __tmp = this.multimodalProjector!; return base64Encode(__tmp); })(),
+      'audioDecoder': this.audioDecoder == null ? null : (() { final __tmp = this.audioDecoder!; return base64Encode(__tmp); })(),
+      'audioTokenizer': this.audioTokenizer == null ? null : (() { final __tmp = this.audioTokenizer!; return base64Encode(__tmp); })(),
+      'draftModel': this.draftModel == null ? null : (() { final __tmp = this.draftModel!; return base64Encode(__tmp); })(),
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+      'generationDefaults': this.generationDefaults == null ? null : (() { final __tmp = this.generationDefaults!; return GenerationDefaultsFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory ModelParts.fromJson(Map<String, dynamic> json) {
+    return ModelParts(
+      model: base64Decode(json['model'] as String),
+      multimodalProjector: json['multimodalProjector'] == null ? null : (() { final __tmp = json['multimodalProjector']; return base64Decode(__tmp as String); })(),
+      audioDecoder: json['audioDecoder'] == null ? null : (() { final __tmp = json['audioDecoder']; return base64Decode(__tmp as String); })(),
+      audioTokenizer: json['audioTokenizer'] == null ? null : (() { final __tmp = json['audioTokenizer']; return base64Decode(__tmp as String); })(),
+      draftModel: json['draftModel'] == null ? null : (() { final __tmp = json['draftModel']; return base64Decode(__tmp as String); })(),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+      generationDefaults: json['generationDefaults'] == null ? null : (() { final __tmp = json['generationDefaults']; return GenerationDefaultsFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  ModelParts copyWith({
+    Uint8List? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+    Object? generationDefaults = _sentinel,
+  }) {
+    return ModelParts(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as Uint8List?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as Uint8List?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as Uint8List?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as Uint8List?,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+      generationDefaults: generationDefaults == _sentinel ? this.generationDefaults : generationDefaults as GenerationDefaults?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelParts(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, inferenceType: $inferenceType, chatTemplate: $chatTemplate, generationDefaults: $generationDefaults)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelParts && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate && generationDefaults == other.generationDefaults;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, inferenceType, chatTemplate, generationDefaults);
+}
+
+class SamplingDefaults {
+  const SamplingDefaults({
+    required this.temperature,
+    required this.topP,
+    required this.topK,
+    required this.minP,
+    required this.repetitionPenalty,
+  });
+
+  final double? temperature;
+  final double? topP;
+  final int? topK;
+  final double? minP;
+  final double? repetitionPenalty;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'temperature': this.temperature,
+      'topP': this.topP,
+      'topK': this.topK,
+      'minP': this.minP,
+      'repetitionPenalty': this.repetitionPenalty,
+    };
+  }
+
+  factory SamplingDefaults.fromJson(Map<String, dynamic> json) {
+    return SamplingDefaults(
+      temperature: json['temperature'] == null ? null : (json['temperature'] as num).toDouble(),
+      topP: json['topP'] == null ? null : (json['topP'] as num).toDouble(),
+      topK: json['topK'] == null ? null : (json['topK'] as num).toInt(),
+      minP: json['minP'] == null ? null : (json['minP'] as num).toDouble(),
+      repetitionPenalty: json['repetitionPenalty'] == null ? null : (json['repetitionPenalty'] as num).toDouble(),
+    );
+  }
+
+  SamplingDefaults copyWith({
+    Object? temperature = _sentinel,
+    Object? topP = _sentinel,
+    Object? topK = _sentinel,
+    Object? minP = _sentinel,
+    Object? repetitionPenalty = _sentinel,
+  }) {
+    return SamplingDefaults(
+      temperature: temperature == _sentinel ? this.temperature : temperature as double?,
+      topP: topP == _sentinel ? this.topP : topP as double?,
+      topK: topK == _sentinel ? this.topK : topK as int?,
+      minP: minP == _sentinel ? this.minP : minP as double?,
+      repetitionPenalty: repetitionPenalty == _sentinel ? this.repetitionPenalty : repetitionPenalty as double?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SamplingDefaults(temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SamplingDefaults && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty;
+
+  @override
+  int get hashCode => Object.hash(temperature, topP, topK, minP, repetitionPenalty);
+}
+
+/// Recovery diagnostic retained after a failed `send_message` ingestion.
+/// The call's original error is still returned separately. Generation failures
+/// after successful ingestion do not create this report.
+class IngestRecovery {
+  const IngestRecovery({
+    required this.outcome,
+    required this.rewindError,
+    required this.resetError,
+  });
+
+  final RecoveryOutcome outcome;
+  final KvRewindFailure? rewindError;
+  final FfiError? resetError;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'outcome': RecoveryOutcomeFfiCodec.encode(this.outcome),
+      'rewindError': this.rewindError == null ? null : (() { final __tmp = this.rewindError!; return KvRewindFailureFfiCodec.encode(__tmp); })(),
+      'resetError': this.resetError == null ? null : (() { final __tmp = this.resetError!; return FfiErrorFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory IngestRecovery.fromJson(Map<String, dynamic> json) {
+    return IngestRecovery(
+      outcome: RecoveryOutcomeFfiCodec.decode(json['outcome'] as String),
+      rewindError: json['rewindError'] == null ? null : (() { final __tmp = json['rewindError']; return KvRewindFailureFfiCodec.decode(__tmp as String); })(),
+      resetError: json['resetError'] == null ? null : (() { final __tmp = json['resetError']; return FfiErrorFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  IngestRecovery copyWith({
+    RecoveryOutcome? outcome,
+    Object? rewindError = _sentinel,
+    Object? resetError = _sentinel,
+  }) {
+    return IngestRecovery(
+      outcome: outcome ?? this.outcome,
+      rewindError: rewindError == _sentinel ? this.rewindError : rewindError as KvRewindFailure?,
+      resetError: resetError == _sentinel ? this.resetError : resetError as FfiError?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'IngestRecovery(outcome: $outcome, rewindError: $rewindError, resetError: $resetError)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IngestRecovery && outcome == other.outcome && rewindError == other.rewindError && resetError == other.resetError;
+
+  @override
+  int get hashCode => Object.hash(outcome, rewindError, resetError);
+}
+
+/// Coherent snapshot of a session at the instant the lock was acquired.
+/// Another thread may change the session after this method returns.
+class SessionRecoveryStatus {
+  const SessionRecoveryStatus({
+    /// False requires a successful checked reset or recreation.
+    required this.usable,
+    /// Meaningful as reusable context only when `usable` is true.
+    required this.position,
+    /// Cleared by successful whole-message ingestion or explicit reset.
+    /// Raw append calls and cancellation controls leave it unchanged.
+    required this.lastIngestRecovery,
+  });
+
+  /// False requires a successful checked reset or recreation.
+  final bool usable;
+  /// Meaningful as reusable context only when `usable` is true.
+  final int position;
+  /// Cleared by successful whole-message ingestion or explicit reset.
+  /// Raw append calls and cancellation controls leave it unchanged.
+  final IngestRecovery? lastIngestRecovery;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'usable': this.usable,
+      'position': this.position,
+      'lastIngestRecovery': this.lastIngestRecovery == null ? null : (() { final __tmp = this.lastIngestRecovery!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory SessionRecoveryStatus.fromJson(Map<String, dynamic> json) {
+    return SessionRecoveryStatus(
+      usable: json['usable'] as bool,
+      position: (json['position'] as num).toInt(),
+      lastIngestRecovery: json['lastIngestRecovery'] == null ? null : (() { final __tmp = json['lastIngestRecovery']; return IngestRecovery.fromJson(__tmp as Map<String, dynamic>); })(),
+    );
+  }
+
+  SessionRecoveryStatus copyWith({
+    bool? usable,
+    int? position,
+    Object? lastIngestRecovery = _sentinel,
+  }) {
+    return SessionRecoveryStatus(
+      usable: usable ?? this.usable,
+      position: position ?? this.position,
+      lastIngestRecovery: lastIngestRecovery == _sentinel ? this.lastIngestRecovery : lastIngestRecovery as IngestRecovery?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SessionRecoveryStatus(usable: $usable, position: $position, lastIngestRecovery: $lastIngestRecovery)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SessionRecoveryStatus && usable == other.usable && position == other.position && lastIngestRecovery == other.lastIngestRecovery;
+
+  @override
+  int get hashCode => Object.hash(usable, position, lastIngestRecovery);
+}
+
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
@@ -2247,6 +2599,533 @@ enum ToolFormat {
   hermes,
 }
 
+sealed class LoadError {
+  const LoadError();
+}
+
+final class LoadErrorKindMismatch extends LoadError {
+  const LoadErrorKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorKindMismatch && expected == other.expected && actual == other.actual && architecture == other.architecture;
+
+  @override
+  int get hashCode => Object.hash(expected, actual, architecture);
+}
+
+final class LoadErrorUnsupportedArchitecture extends LoadError {
+  const LoadErrorUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedArchitecture(architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedArchitecture && architecture == other.architecture;
+
+  @override
+  int get hashCode => architecture.hashCode;
+}
+
+final class LoadErrorUnsupportedInferenceType extends LoadError {
+  const LoadErrorUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedInferenceType && inferenceType == other.inferenceType;
+
+  @override
+  int get hashCode => inferenceType.hashCode;
+}
+
+final class LoadErrorSource extends LoadError {
+  const LoadErrorSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorSource && sourceKind == other.sourceKind && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(sourceKind, detail);
+}
+
+final class LoadErrorAssembly extends LoadError {
+  const LoadErrorAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorAssembly(backend: $backend, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorAssembly && backend == other.backend && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(backend, detail);
+}
+
+final class LoadErrorInvalidConfig extends LoadError {
+  const LoadErrorInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorInvalidConfig && field == other.field && value == other.value && reason == other.reason && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(field, value, reason, detail);
+}
+
+final class LoadErrorEngine extends LoadError {
+  const LoadErrorEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorEngine(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorEngine && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+final class LoadErrorConsumed extends LoadError {
+  const LoadErrorConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorConsumed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorConsumed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+sealed class ModelSource {
+  const ModelSource();
+}
+
+final class ModelSourceBundleId extends ModelSource {
+  const ModelSourceBundleId({
+    required this.id,
+    required this.quant,
+  });
+  final String id;
+  final String quant;
+
+  @override
+  String toString() {
+    return 'ModelSourceBundleId(id: $id, quant: $quant)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBundleId && id == other.id && quant == other.quant;
+
+  @override
+  int get hashCode => Object.hash(id, quant);
+}
+
+final class ModelSourceHuggingFace extends ModelSource {
+  const ModelSourceHuggingFace({
+    required this.spec,
+    required this.quant,
+    required this.strategy,
+  });
+  final String spec;
+  final String? quant;
+  final String? strategy;
+
+  @override
+  String toString() {
+    return 'ModelSourceHuggingFace(spec: $spec, quant: $quant, strategy: $strategy)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceHuggingFace && spec == other.spec && quant == other.quant && strategy == other.strategy;
+
+  @override
+  int get hashCode => Object.hash(spec, quant, strategy);
+}
+
+final class ModelSourceBytes extends ModelSource {
+  const ModelSourceBytes({
+    required this.bytes,
+  });
+  final Uint8List bytes;
+
+  @override
+  String toString() {
+    return 'ModelSourceBytes(bytes: $bytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBytes && bytes == other.bytes;
+
+  @override
+  int get hashCode => bytes.hashCode;
+}
+
+final class ModelSourceParts extends ModelSource {
+  const ModelSourceParts({
+    required this.parts,
+  });
+  final ModelParts parts;
+
+  @override
+  String toString() {
+    return 'ModelSourceParts(parts: $parts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceParts && parts == other.parts;
+
+  @override
+  int get hashCode => parts.hashCode;
+}
+
+final class ModelSourcePath extends ModelSource {
+  const ModelSourcePath({
+    required this.path,
+  });
+  final String path;
+
+  @override
+  String toString() {
+    return 'ModelSourcePath(path: $path)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourcePath && path == other.path;
+
+  @override
+  int get hashCode => path.hashCode;
+}
+
+final class ModelSourceFiles extends ModelSource {
+  const ModelSourceFiles({
+    required this.files,
+  });
+  final ModelFiles files;
+
+  @override
+  String toString() {
+    return 'ModelSourceFiles(files: $files)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceFiles && files == other.files;
+
+  @override
+  int get hashCode => files.hashCode;
+}
+
+sealed class GenerationDefaults {
+  const GenerationDefaults();
+}
+
+final class GenerationDefaultsText extends GenerationDefaults {
+  const GenerationDefaultsText({
+    required this.sampling,
+  });
+  final SamplingDefaults sampling;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsText(sampling: $sampling)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsText && sampling == other.sampling;
+
+  @override
+  int get hashCode => sampling.hashCode;
+}
+
+final class GenerationDefaultsAudio extends GenerationDefaults {
+  const GenerationDefaultsAudio({
+    required this.sampling,
+    required this.numberOfDecodingThreads,
+    required this.audioTemperature,
+    required this.audioTopK,
+  });
+  final SamplingDefaults sampling;
+  final int? numberOfDecodingThreads;
+  final double? audioTemperature;
+  final int? audioTopK;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsAudio(sampling: $sampling, numberOfDecodingThreads: $numberOfDecodingThreads, audioTemperature: $audioTemperature, audioTopK: $audioTopK)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsAudio && sampling == other.sampling && numberOfDecodingThreads == other.numberOfDecodingThreads && audioTemperature == other.audioTemperature && audioTopK == other.audioTopK;
+
+  @override
+  int get hashCode => Object.hash(sampling, numberOfDecodingThreads, audioTemperature, audioTopK);
+}
+
+final class GenerationDefaultsOther extends GenerationDefaults {
+  const GenerationDefaultsOther({
+    required this.rawJson,
+  });
+  final String rawJson;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsOther(rawJson: $rawJson)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsOther && rawJson == other.rawJson;
+
+  @override
+  int get hashCode => rawJson.hashCode;
+}
+
+/// Why checked tail rewind was unavailable. Numeric positions are token counts.
+sealed class KvRewindFailure {
+  const KvRewindFailure();
+}
+
+final class KvRewindFailureOutOfBounds extends KvRewindFailure {
+  const KvRewindFailureOutOfBounds({
+    required this.requested,
+    required this.current,
+  });
+  final int requested;
+  final int current;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureOutOfBounds(requested: $requested, current: $current)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureOutOfBounds && requested == other.requested && current == other.current;
+
+  @override
+  int get hashCode => Object.hash(requested, current);
+}
+
+final class KvRewindFailureCompressed extends KvRewindFailure {
+  const KvRewindFailureCompressed();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureCompressed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureCompressed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureNonCausal extends KvRewindFailure {
+  const KvRewindFailureNonCausal();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureNonCausal()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureNonCausal;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureMissingConvolutionCheckpoint extends KvRewindFailure {
+  const KvRewindFailureMissingConvolutionCheckpoint({
+    required this.layer,
+    required this.position,
+  });
+  final int layer;
+  final int position;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureMissingConvolutionCheckpoint(layer: $layer, position: $position)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureMissingConvolutionCheckpoint && layer == other.layer && position == other.position;
+
+  @override
+  int get hashCode => Object.hash(layer, position);
+}
+
+final class KvRewindFailureInvalidCacheLayout extends KvRewindFailure {
+  const KvRewindFailureInvalidCacheLayout({
+    required this.layer,
+    required this.detail,
+  });
+  final int layer;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureInvalidCacheLayout(layer: $layer, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureInvalidCacheLayout && layer == other.layer && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(layer, detail);
+}
+
+final class KvRewindFailureBackendUnsupported extends KvRewindFailure {
+  const KvRewindFailureBackendUnsupported();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureBackendUnsupported()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureBackendUnsupported;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureUnknown extends KvRewindFailure {
+  const KvRewindFailureUnknown({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureUnknown(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureUnknown && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// Execution state after a failed whole-message append.
+enum RecoveryOutcome {
+  unchanged,
+  restored,
+  reset,
+  unusable,
+  /// A newer core outcome; conservatively recreate the session.
+  unknown,
+}
+
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
 /// to-one so foreign callers can pattern-match on error class (Kotlin
 /// `when`, Swift `switch`, Python `match`) instead of string-sniffing
@@ -2525,6 +3404,117 @@ final class FfiErrorExceptionLoraUnsupportedByBackend extends FfiErrorException 
   @override
   String toString() {
     return 'FfiErrorExceptionLoraUnsupportedByBackend(detail: $detail)';
+  }
+}
+
+sealed class LoadErrorException implements Exception {
+  const LoadErrorException();
+}
+
+final class LoadErrorExceptionKindMismatch extends LoadErrorException {
+  const LoadErrorExceptionKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedArchitecture extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedArchitecture(architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedInferenceType extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+}
+
+final class LoadErrorExceptionSource extends LoadErrorException {
+  const LoadErrorExceptionSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionAssembly extends LoadErrorException {
+  const LoadErrorExceptionAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionAssembly(backend: $backend, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionInvalidConfig extends LoadErrorException {
+  const LoadErrorExceptionInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionEngine extends LoadErrorException {
+  const LoadErrorExceptionEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionEngine(detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionConsumed extends LoadErrorException {
+  const LoadErrorExceptionConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionConsumed()';
   }
 }
 
@@ -2875,6 +3865,343 @@ ToolFormat _decodeToolFormat(String raw) {
   };
 }
 
+String _encodeLoadError(LoadError value) {
+  if (value is LoadErrorKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadError variant instance: $value');
+}
+
+LoadError _decodeLoadError(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return LoadErrorConsumed(
+      );
+    default:
+      throw StateError('Unknown LoadError variant tag: $tag');
+  }
+}
+
+String _encodeModelSource(ModelSource value) {
+  if (value is ModelSourceBundleId) {
+    return jsonEncode({
+      'tag': 'bundleId',
+      'id': value.id,
+      'quant': value.quant,
+    });
+  }
+  if (value is ModelSourceHuggingFace) {
+    return jsonEncode({
+      'tag': 'huggingFace',
+      'spec': value.spec,
+      'quant': value.quant,
+      'strategy': value.strategy,
+    });
+  }
+  if (value is ModelSourceBytes) {
+    return jsonEncode({
+      'tag': 'bytes',
+      'bytes': base64Encode(value.bytes),
+    });
+  }
+  if (value is ModelSourceParts) {
+    return jsonEncode({
+      'tag': 'parts',
+      'parts': value.parts.toJson(),
+    });
+  }
+  if (value is ModelSourcePath) {
+    return jsonEncode({
+      'tag': 'path',
+      'path': value.path,
+    });
+  }
+  if (value is ModelSourceFiles) {
+    return jsonEncode({
+      'tag': 'files',
+      'files': value.files.toJson(),
+    });
+  }
+  throw StateError('Unknown ModelSource variant instance: $value');
+}
+
+ModelSource _decodeModelSource(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'bundleId':
+      return ModelSourceBundleId(
+        id: map['id'] as String,
+        quant: map['quant'] as String,
+      );
+    case 'huggingFace':
+      return ModelSourceHuggingFace(
+        spec: map['spec'] as String,
+        quant: map['quant'] == null ? null : map['quant'] as String,
+        strategy: map['strategy'] == null ? null : map['strategy'] as String,
+      );
+    case 'bytes':
+      return ModelSourceBytes(
+        bytes: base64Decode(map['bytes'] as String),
+      );
+    case 'parts':
+      return ModelSourceParts(
+        parts: ModelParts.fromJson(map['parts'] as Map<String, dynamic>),
+      );
+    case 'path':
+      return ModelSourcePath(
+        path: map['path'] as String,
+      );
+    case 'files':
+      return ModelSourceFiles(
+        files: ModelFiles.fromJson(map['files'] as Map<String, dynamic>),
+      );
+    default:
+      throw StateError('Unknown ModelSource variant tag: $tag');
+  }
+}
+
+String _encodeGenerationDefaults(GenerationDefaults value) {
+  if (value is GenerationDefaultsText) {
+    return jsonEncode({
+      'tag': 'text',
+      'sampling': value.sampling.toJson(),
+    });
+  }
+  if (value is GenerationDefaultsAudio) {
+    return jsonEncode({
+      'tag': 'audio',
+      'sampling': value.sampling.toJson(),
+      'numberOfDecodingThreads': value.numberOfDecodingThreads,
+      'audioTemperature': value.audioTemperature,
+      'audioTopK': value.audioTopK,
+    });
+  }
+  if (value is GenerationDefaultsOther) {
+    return jsonEncode({
+      'tag': 'other',
+      'rawJson': value.rawJson,
+    });
+  }
+  throw StateError('Unknown GenerationDefaults variant instance: $value');
+}
+
+GenerationDefaults _decodeGenerationDefaults(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'text':
+      return GenerationDefaultsText(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+      );
+    case 'audio':
+      return GenerationDefaultsAudio(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+        numberOfDecodingThreads: map['numberOfDecodingThreads'] == null ? null : (map['numberOfDecodingThreads'] as num).toInt(),
+        audioTemperature: map['audioTemperature'] == null ? null : (map['audioTemperature'] as num).toDouble(),
+        audioTopK: map['audioTopK'] == null ? null : (map['audioTopK'] as num).toInt(),
+      );
+    case 'other':
+      return GenerationDefaultsOther(
+        rawJson: map['rawJson'] as String,
+      );
+    default:
+      throw StateError('Unknown GenerationDefaults variant tag: $tag');
+  }
+}
+
+String _encodeKvRewindFailure(KvRewindFailure value) {
+  if (value is KvRewindFailureOutOfBounds) {
+    return jsonEncode({
+      'tag': 'outOfBounds',
+      'requested': value.requested,
+      'current': value.current,
+    });
+  }
+  if (value is KvRewindFailureCompressed) {
+    return jsonEncode({
+      'tag': 'compressed',
+    });
+  }
+  if (value is KvRewindFailureNonCausal) {
+    return jsonEncode({
+      'tag': 'nonCausal',
+    });
+  }
+  if (value is KvRewindFailureMissingConvolutionCheckpoint) {
+    return jsonEncode({
+      'tag': 'missingConvolutionCheckpoint',
+      'layer': value.layer,
+      'position': value.position,
+    });
+  }
+  if (value is KvRewindFailureInvalidCacheLayout) {
+    return jsonEncode({
+      'tag': 'invalidCacheLayout',
+      'layer': value.layer,
+      'detail': value.detail,
+    });
+  }
+  if (value is KvRewindFailureBackendUnsupported) {
+    return jsonEncode({
+      'tag': 'backendUnsupported',
+    });
+  }
+  if (value is KvRewindFailureUnknown) {
+    return jsonEncode({
+      'tag': 'unknown',
+      'detail': value.detail,
+    });
+  }
+  throw StateError('Unknown KvRewindFailure variant instance: $value');
+}
+
+KvRewindFailure _decodeKvRewindFailure(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'outOfBounds':
+      return KvRewindFailureOutOfBounds(
+        requested: (map['requested'] as num).toInt(),
+        current: (map['current'] as num).toInt(),
+      );
+    case 'compressed':
+      return KvRewindFailureCompressed(
+      );
+    case 'nonCausal':
+      return KvRewindFailureNonCausal(
+      );
+    case 'missingConvolutionCheckpoint':
+      return KvRewindFailureMissingConvolutionCheckpoint(
+        layer: (map['layer'] as num).toInt(),
+        position: (map['position'] as num).toInt(),
+      );
+    case 'invalidCacheLayout':
+      return KvRewindFailureInvalidCacheLayout(
+        layer: (map['layer'] as num).toInt(),
+        detail: map['detail'] as String,
+      );
+    case 'backendUnsupported':
+      return KvRewindFailureBackendUnsupported(
+      );
+    case 'unknown':
+      return KvRewindFailureUnknown(
+        detail: map['detail'] as String,
+      );
+    default:
+      throw StateError('Unknown KvRewindFailure variant tag: $tag');
+  }
+}
+
+String _encodeRecoveryOutcome(RecoveryOutcome value) {
+  return switch (value) {
+    RecoveryOutcome.unchanged => 'unchanged',
+    RecoveryOutcome.restored => 'restored',
+    RecoveryOutcome.reset => 'reset',
+    RecoveryOutcome.unusable => 'unusable',
+    RecoveryOutcome.unknown => 'unknown',
+  };
+}
+
+RecoveryOutcome _decodeRecoveryOutcome(String raw) {
+  return switch (raw) {
+    'unchanged' => RecoveryOutcome.unchanged,
+    'restored' => RecoveryOutcome.restored,
+    'reset' => RecoveryOutcome.reset,
+    'unusable' => RecoveryOutcome.unusable,
+    'unknown' => RecoveryOutcome.unknown,
+    _ => throw StateError('Unknown RecoveryOutcome variant: $raw'),
+  };
+}
+
 String _encodeFfiErrorException(FfiErrorException value) {
   if (value is FfiErrorExceptionUnsupportedModality) {
     return jsonEncode({
@@ -3022,6 +4349,110 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
   }
 }
 
+String _encodeLoadErrorException(LoadErrorException value) {
+  if (value is LoadErrorExceptionKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorExceptionSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadErrorException exception instance: $value');
+}
+
+LoadErrorException _decodeLoadErrorException(Object? raw) {
+  final Map<String, dynamic> map = raw is String ? (jsonDecode(raw) as Map<String, dynamic>) : (raw as Map<String, dynamic>);
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorExceptionKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorExceptionUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorExceptionUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorExceptionSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorExceptionAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorExceptionInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorExceptionEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return const LoadErrorExceptionConsumed();
+    default:
+      throw StateError('Unknown LoadErrorException exception tag: $tag');
+  }
+}
+
 final class BackendPreferenceFfiCodec {
   const BackendPreferenceFfiCodec._();
 
@@ -3078,12 +4509,60 @@ final class ToolFormatFfiCodec {
   static ToolFormat decode(String raw) => _decodeToolFormat(raw);
 }
 
+final class LoadErrorFfiCodec {
+  const LoadErrorFfiCodec._();
+
+  static String encode(LoadError value) => _encodeLoadError(value);
+
+  static LoadError decode(String raw) => _decodeLoadError(raw);
+}
+
+final class ModelSourceFfiCodec {
+  const ModelSourceFfiCodec._();
+
+  static String encode(ModelSource value) => _encodeModelSource(value);
+
+  static ModelSource decode(String raw) => _decodeModelSource(raw);
+}
+
+final class GenerationDefaultsFfiCodec {
+  const GenerationDefaultsFfiCodec._();
+
+  static String encode(GenerationDefaults value) => _encodeGenerationDefaults(value);
+
+  static GenerationDefaults decode(String raw) => _decodeGenerationDefaults(raw);
+}
+
+final class KvRewindFailureFfiCodec {
+  const KvRewindFailureFfiCodec._();
+
+  static String encode(KvRewindFailure value) => _encodeKvRewindFailure(value);
+
+  static KvRewindFailure decode(String raw) => _decodeKvRewindFailure(raw);
+}
+
+final class RecoveryOutcomeFfiCodec {
+  const RecoveryOutcomeFfiCodec._();
+
+  static String encode(RecoveryOutcome value) => _encodeRecoveryOutcome(value);
+
+  static RecoveryOutcome decode(String raw) => _decodeRecoveryOutcome(raw);
+}
+
 final class FfiErrorExceptionFfiCodec {
   const FfiErrorExceptionFfiCodec._();
 
   static String encode(FfiErrorException value) => _encodeFfiErrorException(value);
 
   static FfiErrorException decode(Object? raw) => _decodeFfiErrorException(raw);
+}
+
+final class LoadErrorExceptionFfiCodec {
+  const LoadErrorExceptionFfiCodec._();
+
+  static String encode(LoadErrorException value) => _encodeLoadErrorException(value);
+
+  static LoadErrorException decode(Object? raw) => _decodeLoadErrorException(raw);
 }
 
 
@@ -3663,9 +5142,12 @@ final class FfiWhisperModel {
   List<String> languages() => _unsupportedOnWeb('FfiWhisperModel.languages');
 
   /// Transcribe 16 kHz mono PCM audio samples synchronously.
+  /// Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
   String transcribe(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribe');
 
   /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+  /// Dropping the returned future aborts queued work and signals an already-running decoder
+  /// to stop at its next cooperative cancellation check.
   Future<String> transcribeAsync(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribeAsync');
 }
 
@@ -4067,6 +5549,17 @@ final class Session {
   /// `generate()` is in flight.
   int position() => _unsupportedOnWeb('Session.position');
 
+  /// Observe recovery after a failed whole-message call without changing KV,
+  /// cancellation or the retained report. Returns `Busy` if any call holds
+  /// the session lock, including a streaming callback's enclosing operation.
+  /// A poisoned lock returns `Backend`; recreate that session.
+  ///
+  /// `Reset` requires replaying prior context. `Restored` and `Unchanged`
+  /// retain it when `usable` is true. Clear cancellation explicitly before
+  /// retrying a cancelled append. A missing report gives no recovery guarantee
+  /// for raw append operations, which retain their partial-prefill behavior.
+  SessionRecoveryStatus recoveryStatus() => _unsupportedOnWeb('Session.recoveryStatus');
+
   /// Remove any attached LoRA adapter, returning to base-model inference.
   void removeLora() => _unsupportedOnWeb('Session.removeLora');
 
@@ -4104,6 +5597,73 @@ final class Session {
 final class SessionFfiCodec {
   static int lower(Session value) => _unsupportedOnWeb('SessionFfiCodec.lower');
   static Session lift(int handle) => _unsupportedOnWeb('SessionFfiCodec.lift');
+}
+
+/// A shared generative engine. Creating handles never reloads the source or copies live KV.
+final class GenerativeModel {
+  GenerativeModel._();
+
+  bool get isClosed => _unsupportedOnWeb('GenerativeModel.isClosed');
+
+  void close() => _unsupportedOnWeb('GenerativeModel.close');
+
+  /// Create an existing production Session with the caller's full configuration.
+  /// Sessions retain their resources after all loader/model/engine handles close.
+  /// Existing backend sharing restrictions and Session/FfiError behavior apply.
+  Session createSession(SessionConfig config) => _unsupportedOnWeb('GenerativeModel.createSession');
+
+  /// Access all retained engine operations through the already loaded engine.
+  CeraEngine engine() => _unsupportedOnWeb('GenerativeModel.engine');
+}
+
+final class GenerativeModelFfiCodec {
+  static int lower(GenerativeModel value) => _unsupportedOnWeb('GenerativeModelFfiCodec.lower');
+  static GenerativeModel lift(int handle) => _unsupportedOnWeb('GenerativeModelFfiCodec.lift');
+}
+
+/// Dynamic loaded-model handle. Typed accessors share ownership.
+final class ModelHandle {
+  ModelHandle._();
+
+  bool get isClosed => _unsupportedOnWeb('ModelHandle.isClosed');
+
+  void close() => _unsupportedOnWeb('ModelHandle.close');
+
+  /// Share a generative model if present; the result can outlive this handle.
+  GenerativeModel? asGenerative() => _unsupportedOnWeb('ModelHandle.asGenerative');
+
+  /// Kind of the loaded model. A string allows future kinds without enum decoding.
+  String kind() => _unsupportedOnWeb('ModelHandle.kind');
+}
+
+final class ModelHandleFfiCodec {
+  static int lower(ModelHandle value) => _unsupportedOnWeb('ModelHandleFfiCodec.lower');
+  static ModelHandle lift(int handle) => _unsupportedOnWeb('ModelHandleFfiCodec.lift');
+}
+
+/// Synchronous, single-use model loader. Both build methods consume the source,
+/// including on failure. Dispatch remote or expensive loads off the UI thread.
+final class ModelLoader {
+  ModelLoader._();
+
+  bool get isClosed => _unsupportedOnWeb('ModelLoader.isClosed');
+
+  void close() => _unsupportedOnWeb('ModelLoader.close');
+
+  /// Retain explicit source data and the existing production engine options.
+  /// Construction does not load weights or contact a remote service.
+  static ModelLoader create(ModelSource source, EngineConfig config) => _unsupportedOnWeb('ModelLoader.create');
+
+  /// Load a dynamic model handle. Generative loading is currently supported.
+  ModelHandle build() => _unsupportedOnWeb('ModelLoader.build');
+
+  /// Load a generative model, reporting other known kinds before assembly.
+  GenerativeModel buildGenerative() => _unsupportedOnWeb('ModelLoader.buildGenerative');
+}
+
+final class ModelLoaderFfiCodec {
+  static int lower(ModelLoader value) => _unsupportedOnWeb('ModelLoaderFfiCodec.lower');
+  static ModelLoader lift(int handle) => _unsupportedOnWeb('ModelLoaderFfiCodec.lift');
 }
 
 /// Mirrors the native entry point. `dynamicLibrary` is `Object?` here

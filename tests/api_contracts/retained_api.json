@@ -1,0 +1,822 @@
+{
+  "version": 1,
+  "baseline": "2477a6830dc50c05b25fa19fe4681ebbc69f47c2 plus completed increments through Plan29",
+  "scope": "Reviewed existing loading and engine-related declaration homes; not a generated ABI or feature-availability test",
+  "surfaces": [
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "methods",
+      "owner": "CeraEngine",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": {
+        "AUDIO_MARKER_CANDIDATES": "pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4]",
+        "audio_encoder": "pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>>",
+        "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
+        "clear_cache": "pub fn clear_cache(&self)",
+        "clear_warm_cache": "pub fn clear_warm_cache(&self)",
+        "config": "pub fn config(&self) -> &EngineConfig",
+        "configure_cache": "pub fn configure_cache(&self, cfg: KvCacheConfig)",
+        "default_generate_opts": "pub fn default_generate_opts(&self) -> crate::session::GenerateOpts",
+        "detect_pii": "pub fn detect_pii(&self, text: &str) -> Result<Vec<crate::classifier::EntitySpan>, CeraError>",
+        "detect_pii_with_lora": "pub fn detect_pii_with_lora( &self, text: &str, lora: Option<Arc<crate::lora::LoraAdapterWeights>>, ) -> Result<Vec<crate::classifier::EntitySpan>, CeraError>",
+        "from_bundle_id": "pub fn from_bundle_id( bundle_id: &str, quant: &str, cfg: EngineConfig, ) -> Result<Self, CeraError>",
+        "from_bytes": "pub fn from_bytes(bytes: impl Into<Arc<[u8]>>, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "from_files": "pub fn from_files(files: ModelFiles, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "from_hf": "pub fn from_hf( spec_or_url: &str, quant: Option<&str>, cfg: EngineConfig, ) -> Result<Self, CeraError>",
+        "from_hf_url": "pub fn from_hf_url( url: &str, quant: Option<&str>, cfg: EngineConfig, ) -> Result<Self, CeraError>",
+        "from_hf_with_strategy": "pub fn from_hf_with_strategy( spec_or_url: &str, quant: Option<&str>, quant_strategy: Option<&str>, cfg: EngineConfig, ) -> Result<Self, CeraError>",
+        "from_parts": "pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "from_path": "pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "from_reader": "pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "has_gpu_audio_decoder": "pub fn has_gpu_audio_decoder(&self) -> bool",
+        "has_gpu_audio_encoder": "pub fn has_gpu_audio_encoder(&self) -> bool",
+        "has_gpu_vision_encoder": "pub fn has_gpu_vision_encoder(&self) -> bool",
+        "manifest": "pub fn manifest(&self) -> &Manifest",
+        "metadata": "pub fn metadata(&self) -> &ModelMetadata",
+        "model": "pub fn model(&self) -> &dyn Model",
+        "model_arc": "pub fn model_arc(&self) -> Arc<dyn Model>",
+        "new_session": "pub fn new_session(&self, cfg: SessionConfig) -> Result<Session, CeraError>",
+        "split_tokens_at_marker": "pub fn split_tokens_at_marker( tokens: &[u32], marker_id: u32, marker_name: &str, ) -> Result<usize, CeraError>",
+        "tokenizer": "pub fn tokenizer(&self) -> &BpeTokenizer",
+        "tokenizer_arc": "pub fn tokenizer_arc(&self) -> Arc<BpeTokenizer>",
+        "transcribe": "pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, CeraError>",
+        "vision_encoder": "pub fn vision_encoder(&self) -> Option<&Arc<VisionEncoderWeights>>",
+        "vision_encoder_gguf": "pub fn vision_encoder_gguf(&self) -> Option<&Arc<GgufFile>>"
+      }
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "methods",
+      "owner": "BackendPreference",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": {
+        "parse_str": "pub fn parse_str(s: &str) -> Result<Self, CeraError>"
+      }
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "methods",
+      "owner": "ModelFiles",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": {
+        "text": "pub fn text(path: impl Into<PathBuf>) -> Self"
+      }
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "methods",
+      "owner": "ModelBytes",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": {
+        "text": "pub fn text(model: impl Into<Arc<[u8]>>) -> Self"
+      }
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "record",
+      "owner": "BackendPreference",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, }"
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "record",
+      "owner": "EngineConfig",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct EngineConfig { pub context_size: usize, pub backend: BackendPreference, pub draft_model: Option<PathBuf>, pub gpu_depthformer: bool, #[cfg(feature = \"remote\")] pub bundle_repo: Option<crate::bundle::BundleRepo>, }"
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "record",
+      "owner": "ModelFiles",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct ModelFiles { pub model: PathBuf, pub multimodal_projector: Option<PathBuf>, pub audio_decoder: Option<PathBuf>, pub audio_tokenizer: Option<PathBuf>, pub draft_model: Option<PathBuf>, pub extras: std::collections::HashMap<String, PathBuf>, pub inference_type: Option<InferenceType>, pub chat_template: Option<String>, }"
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "record",
+      "owner": "ModelBytes",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct ModelBytes { pub model: Arc<[u8]>, pub multimodal_projector: Option<Arc<[u8]>>, pub audio_decoder: Option<Arc<[u8]>>, pub audio_tokenizer: Option<Arc<[u8]>>, pub draft_model: Option<Arc<[u8]>>, pub inference_type: Option<InferenceType>, pub chat_template: Option<String>, pub generation_defaults: Option<crate::manifest::GenerationDefaults>, }"
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "record",
+      "owner": "ModelMetadata",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct ModelMetadata { pub architecture: String, pub max_seq_len: u32, pub vocab_size: u32, pub has_chat_template: bool, pub quantization: String, pub add_bos_token: bool, pub add_eos_token: bool, }"
+    },
+    {
+      "source": "cera/src/engine.rs",
+      "kind": "functions",
+      "owner": "<module>",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": {
+        "init_dspark_drafter": "pub fn init_dspark_drafter( draft_gguf: Arc<GgufFile>, base_gguf: &Arc<GgufFile>, source_label: &str, ) -> Option<Arc<dyn crate::spec::Drafter>>"
+      }
+    },
+    {
+      "source": "cera/src/bundle/repo.rs",
+      "kind": "methods",
+      "owner": "BundleRepo",
+      "retained_home": "Rust remote repository; remote feature",
+      "expected": {
+        "cache_size": "pub fn cache_size(&self) -> Result<u64, CeraError>",
+        "clear_cache": "pub fn clear_cache(&self) -> Result<(), CeraError>",
+        "download_bundle": "pub fn download_bundle(&self, bundle_id: &str, quant: &str) -> Result<(), CeraError>",
+        "new": "pub fn new(store_dir: impl Into<PathBuf>) -> Self",
+        "progress": "pub fn progress(&self) -> Option<Arc<dyn DownloadProgress>>",
+        "resolve_url": "pub fn resolve_url( &self, url: &str, expected_sha256: Option<&str>, ) -> Result<PathBuf, CeraError>",
+        "store_dir": "pub fn store_dir(&self) -> &Path",
+        "with_progress": "pub fn with_progress( store_dir: impl Into<PathBuf>, progress: Arc<dyn DownloadProgress>, ) -> Self"
+      }
+    },
+    {
+      "source": "cera/src/bundle/repo.rs",
+      "kind": "functions",
+      "owner": "<module>",
+      "retained_home": "Rust remote repository; remote feature",
+      "expected": {
+        "list_leap_bundles": "pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, CeraError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "CeraEngine",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "apply_chat_template": "pub fn apply_chat_template( &self, messages: Vec<ChatMessage>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
+        "apply_chat_template_with_tools": "pub fn apply_chat_template_with_tools( &self, messages: Vec<ChatMessage>, tools: Vec<ToolDef>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
+        "bos_token": "pub fn bos_token(&self) -> Option<u32>",
+        "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
+        "clear_prefix_cache": "pub fn clear_prefix_cache(&self)",
+        "context_size": "pub fn context_size(&self) -> u64",
+        "decode_tokens": "pub fn decode_tokens(&self, tokens: Vec<u32>) -> String",
+        "default_generate_opts": "pub fn default_generate_opts(&self) -> GenerateOpts",
+        "detect_pii": "pub fn detect_pii(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError>",
+        "encode_text": "pub fn encode_text(&self, text: String) -> Vec<u32>",
+        "encode_text_special": "pub fn encode_text_special(&self, text: String, add_special: bool) -> Vec<u32>",
+        "eos_token": "pub fn eos_token(&self) -> Option<u32>",
+        "from_bundle_id": "pub fn from_bundle_id( bundle_id: String, quant: String, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_bundle_id_async": "pub async fn from_bundle_id_async( bundle_id: String, quant: String, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_bytes": "pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError>",
+        "from_bytes_async": "pub async fn from_bytes_async( bytes: Vec<u8>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_parts": "pub fn from_parts( bytes: Vec<u8>, multimodal_projector: Option<Vec<u8>>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_parts_async": "pub async fn from_parts_async( bytes: Vec<u8>, multimodal_projector: Option<Vec<u8>>, inference_type: Option<String>, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "from_path": "pub fn from_path(path: String, config: EngineConfig) -> Result<Arc<Self>, FfiError>",
+        "from_path_async": "pub async fn from_path_async( path: String, config: EngineConfig, ) -> Result<Arc<Self>, FfiError>",
+        "has_chat_template": "pub fn has_chat_template(&self) -> bool",
+        "is_special_token": "pub fn is_special_token(&self, id: u32) -> bool",
+        "metadata": "pub fn metadata(&self) -> ModelMetadata",
+        "new_session": "pub fn new_session(&self, config: SessionConfig) -> Result<Arc<Session>, FfiError>",
+        "special_token_id": "pub fn special_token_id(&self, name: String) -> Option<u32>",
+        "tool_call_start_token": "pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32>",
+        "tool_format": "pub fn tool_format(&self) -> Option<ToolFormat>",
+        "transcribe": "pub fn transcribe(&self, pcm: Vec<f32>, sample_rate: u32) -> Result<String, FfiError>",
+        "vocab_size": "pub fn vocab_size(&self) -> u32",
+        "wipe_all_prefix_caches": "pub fn wipe_all_prefix_caches(&self)"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "BundleRepo",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "cache_size": "pub fn cache_size(&self) -> Result<u64, FfiError>",
+        "clear_cache": "pub fn clear_cache(&self) -> Result<(), FfiError>",
+        "download_bundle": "pub fn download_bundle(&self, bundle_id: String, quant: String) -> Result<(), FfiError>",
+        "new": "pub fn new(store_dir: String) -> Arc<Self>",
+        "store_dir": "pub fn store_dir(&self) -> String",
+        "with_progress": "pub fn with_progress(store_dir: String, progress: Arc<dyn DownloadProgressSink>) -> Arc<Self>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "Session",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "append_audio": "pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError>",
+        "append_image": "pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError>",
+        "append_text": "pub fn append_text(&self, text: String) -> Result<(), FfiError>",
+        "append_tokens": "pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError>",
+        "attach_lora": "pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError>",
+        "cancel": "pub fn cancel(&self)",
+        "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
+        "clear_cancel": "pub fn clear_cancel(&self)",
+        "default_generate_opts": "pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError>",
+        "generate": "pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError>",
+        "generate_async": "pub async fn generate_async( self: Arc<Self>, opts: GenerateOpts, ) -> Result<GenerateOutput, FfiError>",
+        "generate_streaming": "pub fn generate_streaming( &self, opts: GenerateOpts, sink: Arc<dyn ModalitySink>, ) -> Result<GenerateSummary, FfiError>",
+        "generate_streaming_async": "pub async fn generate_streaming_async( self: Arc<Self>, opts: GenerateOpts, sink: Arc<dyn ModalitySink>, ) -> Result<GenerateSummary, FfiError>",
+        "has_lora": "pub fn has_lora(&self) -> Result<bool, FfiError>",
+        "hidden_size": "pub fn hidden_size(&self) -> u32",
+        "hidden_states_for_text": "pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError>",
+        "hidden_states_for_tokens": "pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError>",
+        "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError>",
+        "position": "pub fn position(&self) -> u32",
+        "remove_lora": "pub fn remove_lora(&self) -> Result<(), FfiError>",
+        "reset": "pub fn reset(&self) -> Result<(), FfiError>",
+        "send_message": "pub fn send_message(&self, message: UserMessage) -> Result<(), FfiError>",
+        "send_message_and_generate": "pub fn send_message_and_generate( &self, message: UserMessage, opts: GenerateOpts, ) -> Result<GenerateOutput, FfiError>",
+        "send_message_streaming": "pub fn send_message_streaming( &self, message: UserMessage, opts: GenerateOpts, sink: Arc<dyn ModalitySink>, ) -> Result<GenerateSummary, FfiError>",
+        "set_image_max_long_size": "pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "LoraAdapters",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "from_gguf": "pub fn from_gguf(path: String) -> Result<Arc<Self>, FfiError>",
+        "from_safetensors": "pub fn from_safetensors(path: String, alpha: Option<f32>) -> Result<Arc<Self>, FfiError>",
+        "target_count": "pub fn target_count(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "FfiSileroVad",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "from_bytes": "pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError>",
+        "from_file": "pub fn from_file(path: String) -> Result<Arc<Self>, FfiError>",
+        "get_speech_timestamps": "pub fn get_speech_timestamps( &self, audio: Vec<f32>, rate: FfiVadSampleRate, config: Option<FfiVadConfig>, ) -> Result<Vec<FfiSpeechTimestamp>, FfiError>",
+        "process_chunk": "pub fn process_chunk(&self, chunk: Vec<f32>, rate: FfiVadSampleRate) -> Result<f32, FfiError>",
+        "reset": "pub fn reset(&self) -> Result<(), FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "FfiVadIterator",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "flush": "pub fn flush(&self) -> Result<Option<FfiVadEvent>, FfiError>",
+        "new": "pub fn new(rate: FfiVadSampleRate, config: Option<FfiVadConfig>) -> Arc<Self>",
+        "process_chunk": "pub fn process_chunk( &self, vad: &FfiSileroVad, chunk: Vec<f32>, ) -> Result<Option<FfiVadEvent>, FfiError>",
+        "reset": "pub fn reset(&self) -> Result<(), FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "FfiHotwordDetector",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "default_config": "pub fn default_config(&self) -> Result<FfiHotwordConfig, FfiError>",
+        "from_bytes": "pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError>",
+        "from_file": "pub fn from_file(path: String) -> Result<Arc<Self>, FfiError>",
+        "keywords": "pub fn keywords(&self) -> Result<Vec<String>, FfiError>",
+        "process_window": "pub fn process_window(&self, window: Vec<f32>) -> Result<Vec<f32>, FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "FfiHotwordIterator",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "from_files": "pub fn from_files( model_path: String, vad_model_path: Option<String>, config: Option<FfiHotwordConfig>, ) -> Result<Arc<Self>, FfiError>",
+        "process_chunk": "pub fn process_chunk(&self, chunk: Vec<f32>) -> Result<Option<FfiHotwordEvent>, FfiError>",
+        "reset": "pub fn reset(&self) -> Result<(), FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "FfiWhisperModel",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "from_bytes": "pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, FfiError>",
+        "from_file": "pub fn from_file(path: String) -> Result<Arc<Self>, FfiError>",
+        "is_multilingual": "pub fn is_multilingual(&self) -> bool",
+        "languages": "pub fn languages(&self) -> Vec<String>",
+        "transcribe": "pub fn transcribe( &self, pcm: Vec<f32>, opts: Option<FfiWhisperTranscribeOpts>, ) -> Result<String, FfiError>",
+        "transcribe_async": "pub async fn transcribe_async( self: Arc<Self>, pcm: Vec<f32>, opts: Option<FfiWhisperTranscribeOpts>, ) -> Result<String, FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "methods",
+      "owner": "PiiClassifier",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "detect": "pub fn detect(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError>",
+        "from_base_and_adapter": "pub fn from_base_and_adapter( base_path: String, adapter_path: String, ) -> Result<Arc<Self>, FfiError>",
+        "from_path": "pub fn from_path(path: String) -> Result<Arc<Self>, FfiError>"
+      }
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "BackendPreference",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "EngineConfig",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct EngineConfig { #[uniffi(default = 4096)] pub context_size: u64, pub backend: BackendPreference, #[uniffi(default = None)] pub bundle_repo: Option<Arc<BundleRepo>>, #[uniffi(default = None)] pub draft_model: Option<String>, #[uniffi(default = false)] pub gpu_depthformer: bool, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ModelMetadata",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct ModelMetadata { pub architecture: String, pub max_seq_len: u32, pub vocab_size: u32, pub has_chat_template: bool, pub quantization: String, pub add_bos_token: bool, pub add_eos_token: bool, pub cpu_backend: String, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ModalityCapabilities",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct ModalityCapabilities { pub text_in: bool, pub text_out: bool, pub image_in: bool, pub audio_in: bool, pub audio_out: bool, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ChatMessage",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct ChatMessage { pub role: String, pub content: String, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ToolDef",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct ToolDef { pub name: String, pub description: Option<String>, pub parameters_json: String, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ToolCall",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct ToolCall { pub name: String, pub arguments_json: String, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "LeapBundleEntry",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct LeapBundleEntry { pub name: String, pub quants: Vec<String>, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "KvCompression",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum KvCompression { #[default] None, F16, TurboQuant { seed: u64, keys: bool, values: bool }, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "SessionConfig",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct SessionConfig { #[uniffi(default = None)] pub max_seq_len: Option<u32>, #[uniffi(default = None)] pub kv_compression: Option<KvCompression>, #[uniffi(default = 0)] pub n_keep: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 512)] pub ubatch_size: u32, #[uniffi(default = false)] pub gpu_depthformer: bool, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "SpecDecodeConfig",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct SpecDecodeConfig { #[uniffi(default = 2)] pub ngram: u32, #[uniffi(default = 6)] pub k: u32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "GenerateOpts",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct GenerateOpts { #[uniffi(default = 256)] pub max_tokens: u32, #[uniffi(default = 0.7)] pub temperature: f32, #[uniffi(default = 0.9)] pub top_p: f32, #[uniffi(default = 40)] pub top_k: u32, #[uniffi(default = 0.05)] pub min_p: f32, #[uniffi(default = 1.1)] pub repetition_penalty: f32, #[uniffi(default = [])] pub stop_tokens: Vec<u32>, #[uniffi(default = false)] pub ignore_eos: bool, #[uniffi(default = None)] pub grammar: Option<String>, #[uniffi(default = [])] pub grammar_trigger_tokens: Vec<u32>, #[uniffi(default = 16)] pub flush_every_tokens: u32, #[uniffi(default = 50)] pub flush_every_ms: u32, #[uniffi(default = None)] pub spec: Option<SpecDecodeConfig>, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FinishReason",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum FinishReason { MaxTokens, Stop, Cancelled, ContextFull, GrammarDeadEnd, Error { message: String, }, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "GenerateSummary",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct GenerateSummary { pub tokens_generated: u32, pub prompt_eval_tokens: u32, pub prompt_eval_ms: u32, pub decode_ms: u32, pub total_duration_ms: u32, pub decode_tok_per_sec: f64, pub prompt_eval_tok_per_sec: f64, pub finish_reason: FinishReason, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "GenerateOutput",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct GenerateOutput { pub text: String, pub tokens: Vec<u32>, pub summary: GenerateSummary, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "AudioInput",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct AudioInput { pub pcm: Vec<f32>, #[uniffi(default = 16000)] pub sample_rate: u32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "UserMessage",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct UserMessage { #[uniffi(default = None)] pub text: Option<String>, #[uniffi(default = [])] pub images: Vec<Vec<u8>>, #[uniffi(default = None)] pub audio: Option<AudioInput>, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiVadSampleRate",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum FfiVadSampleRate { Rate16kHz, Rate8kHz, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiSpeechTimestamp",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiSpeechTimestamp { pub start_sample: u64, pub end_sample: u64, pub start_ms: f32, pub end_ms: f32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiVadConfig",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiVadConfig { #[uniffi(default = 0.5)] pub threshold: f32, #[uniffi(default = 0.35)] pub neg_threshold: f32, #[uniffi(default = 64)] pub min_speech_duration_ms: u32, #[uniffi(default = 100)] pub min_silence_duration_ms: u32, #[uniffi(default = 30)] pub speech_pad_ms: u32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiVadEvent",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum FfiVadEvent { SpeechStart { sample: u64, ms: f32, }, SpeechEnd { start_sample: u64, end_sample: u64, start_ms: f32, end_ms: f32, }, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiHotwordConfig",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiHotwordConfig { pub threshold: f32, pub cooldown_ms: u32, pub step_ms: u32, pub window_ms: u32, pub pre_roll_ms: u32, pub vad_threshold: f32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiHotwordScore",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiHotwordScore { pub keyword: String, pub score: f32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiHotwordEvent",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiHotwordEvent { pub keyword: String, pub sample_offset: u64, pub command_start_sample: u64, pub timestamp_ms: f32, pub confidence: f32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiWhisperTranscribeOpts",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiWhisperTranscribeOpts { pub language: Option<String>, pub translate: bool, pub timestamps: bool, pub max_tokens: Option<u32>, pub temperature: Option<f32>, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiEntitySpan",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct FfiEntitySpan { pub entity_type: String, pub start_char: u64, pub end_char: u64, pub start_token: u64, pub end_token: u64, pub text: String, pub score: f32, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "FfiError",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum FfiError { #[error(\"modality not supported by this model\")] UnsupportedModality, #[error(\"inference_type `{inference_type}` is not supported in this version of cera\")] UnsupportedInferenceType { inference_type: String }, #[error(\"session is busy with another operation\")] Busy, #[error(\"cancelled\")] Cancelled, #[error(\"context window ({max_seq_len}) exceeded by {by} tokens\")] ContextOverflow { max_seq_len: u32, by: u32 }, #[error(\"empty input\")] EmptyInput, #[error(\"io: {detail}\")] Io { detail: String }, #[error(\"backend: {detail}\")] Backend { detail: String }, #[error(\"grammar: {detail}\")] GrammarParse { detail: String }, #[error(\"token id {id} out of range (vocab_size {vocab_size})\")] InvalidToken { id: u32, vocab_size: u32 }, #[error(\"lora: {detail}\")] LoraParse { detail: String }, #[error(\"out of memory: could not allocate {requested_bytes} bytes\")] OutOfMemory { requested_bytes: u64 }, #[error( \"model already configured for KV compression mode `{configured}`; \\\n         cannot reconfigure to `{requested}` \u2014 create a separate model instance\" )] KvCompressionConflict { configured: String, requested: String, }, #[error(\"LoRA adapter not supported by this backend: {detail}\")] LoraUnsupportedByBackend { detail: String }, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "ToolFormat",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "functions",
+      "owner": "<module>",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": {
+        "cera_ffi_version": "pub fn cera_ffi_version() -> String",
+        "cpu_backend_report": "pub fn cpu_backend_report() -> String",
+        "detect_tool_format": "pub fn detect_tool_format(architecture: String) -> Option<ToolFormat>",
+        "hotword_default_config": "pub fn hotword_default_config() -> FfiHotwordConfig",
+        "list_leap_bundles": "pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, FfiError>",
+        "list_leap_bundles_async": "pub async fn list_leap_bundles_async() -> Result<Vec<LeapBundleEntry>, FfiError>",
+        "parse_tool_calls": "pub fn parse_tool_calls(text: String, format: ToolFormat) -> Result<Vec<ToolCall>, FfiError>",
+        "silero_vad_default_config": "pub fn silero_vad_default_config() -> FfiVadConfig",
+        "tool_grammar": "pub fn tool_grammar(tools: Vec<ToolDef>, format: ToolFormat) -> Result<String, FfiError>",
+        "whisper_default_transcribe_opts": "pub fn whisper_default_transcribe_opts() -> FfiWhisperTranscribeOpts"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "Manifest",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "audio_decoder_url": "pub fn audio_decoder_url(&self) -> Option<String>",
+        "audio_tokenizer_url": "pub fn audio_tokenizer_url(&self) -> Option<String>",
+        "chat_template": "pub fn chat_template(&self) -> Option<String>",
+        "draft_model_url": "pub fn draft_model_url(&self) -> Option<String>",
+        "inference_type": "pub fn inference_type(&self) -> String",
+        "model_url": "pub fn model_url(&self) -> String",
+        "multimodal_projector_url": "pub fn multimodal_projector_url(&self) -> Option<String>",
+        "parse": "pub fn parse(json_bytes: &[u8]) -> Result<Manifest, JsError>",
+        "schema_version": "pub fn schema_version(&self) -> String"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "CeraEngine",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "add_bos_token": "pub fn add_bos_token(&self) -> bool",
+        "add_eos_token": "pub fn add_eos_token(&self) -> bool",
+        "architecture": "pub fn architecture(&self) -> String",
+        "capabilities": "pub fn capabilities(&self) -> Capabilities",
+        "context_size": "pub fn context_size(&self) -> u32",
+        "default_generate_opts": "pub fn default_generate_opts(&self) -> GenerateOpts",
+        "from_bundle_id": "pub async fn from_bundle_id( repo: &bundle::BundleRepo, bundle_id: String, quant: String, context_size: Option<u32>, on_progress: Option<js_sys::Function>, ) -> Result<CeraEngine, JsError>",
+        "from_gguf_bytes": "pub fn from_gguf_bytes( bytes: Vec<u8>, context_size: Option<u32>, ) -> Result<CeraEngine, JsError>",
+        "from_gguf_parts": "pub fn from_gguf_parts( bytes: Vec<u8>, mmproj: Option<Vec<u8>>, context_size: Option<u32>, inference_type: Option<String>, ) -> Result<CeraEngine, JsError>",
+        "from_manifest_url": "pub async fn from_manifest_url( repo: &bundle::BundleRepo, manifest_url: String, context_size: Option<u32>, on_progress: Option<js_sys::Function>, ) -> Result<CeraEngine, JsError>",
+        "has_chat_template": "pub fn has_chat_template(&self) -> bool",
+        "max_seq_len": "pub fn max_seq_len(&self) -> u32",
+        "metadata": "pub fn metadata(&self) -> ModelMetadata",
+        "new_session": "pub fn new_session(&self, config: &SessionConfig) -> Result<Session, JsError>",
+        "quantization": "pub fn quantization(&self) -> String",
+        "tokenizer": "pub fn tokenizer(&self) -> Tokenizer",
+        "tool_call_start_token": "pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32>",
+        "tool_format": "pub fn tool_format(&self) -> Option<ToolFormat>",
+        "transcribe": "pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, JsError>",
+        "vocab_size": "pub fn vocab_size(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "Tokenizer",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "add_bos_token": "pub fn add_bos_token(&self) -> bool",
+        "apply_chat_template": "pub fn apply_chat_template( &self, messages: ChatMessageArray, add_generation_prompt: Option<bool>, ) -> Result<String, JsError>",
+        "apply_chat_template_with_tools": "pub fn apply_chat_template_with_tools( &self, messages: ChatMessageArray, tools_json: &str, add_generation_prompt: Option<bool>, ) -> Result<String, JsError>",
+        "bos_token": "pub fn bos_token(&self) -> Option<u32>",
+        "chat_template": "pub fn chat_template(&self) -> Option<String>",
+        "decode": "pub fn decode(&self, tokens: &[u32]) -> String",
+        "encode": "pub fn encode(&self, text: &str) -> Vec<u32>",
+        "encode_special": "pub fn encode_special(&self, text: &str, add_special: bool) -> Vec<u32>",
+        "eos_token": "pub fn eos_token(&self) -> Option<u32>",
+        "is_special_token": "pub fn is_special_token(&self, id: u32) -> bool",
+        "special_token_id": "pub fn special_token_id(&self, name: &str) -> Option<u32>",
+        "vocab_size": "pub fn vocab_size(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "SessionConfig",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "kv_compression": "pub fn kv_compression(&self) -> Option<TurboQuantConfig>",
+        "max_seq_len": "pub fn max_seq_len(&self) -> Option<u32>",
+        "n_keep": "pub fn n_keep(&self) -> u32",
+        "new": "pub fn new() -> Self",
+        "seed": "pub fn seed(&self) -> Option<u64>",
+        "set_kv_compression": "pub fn set_kv_compression(&mut self, v: Option<TurboQuantConfig>)",
+        "set_max_seq_len": "pub fn set_max_seq_len(&mut self, v: Option<u32>)",
+        "set_n_keep": "pub fn set_n_keep(&mut self, v: u32)",
+        "set_seed": "pub fn set_seed(&mut self, v: Option<u64>)",
+        "set_ubatch_size": "pub fn set_ubatch_size(&mut self, v: u32)",
+        "ubatch_size": "pub fn ubatch_size(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "TurboQuantConfig",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "keys": "pub fn keys(&self) -> bool",
+        "new": "pub fn new(seed: u64) -> Self",
+        "seed": "pub fn seed(&self) -> u64",
+        "set_keys": "pub fn set_keys(&mut self, v: bool)",
+        "set_seed": "pub fn set_seed(&mut self, v: u64)",
+        "set_values": "pub fn set_values(&mut self, v: bool)",
+        "values": "pub fn values(&self) -> bool"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "GenerateOpts",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "clear_grammar": "pub fn clear_grammar(&mut self)",
+        "clear_spec_decode": "pub fn clear_spec_decode(&mut self)",
+        "flush_every_ms": "pub fn flush_every_ms(&self) -> u32",
+        "flush_every_tokens": "pub fn flush_every_tokens(&self) -> u32",
+        "grammar_trigger_tokens": "pub fn grammar_trigger_tokens(&self) -> Vec<u32>",
+        "has_grammar": "pub fn has_grammar(&self) -> bool",
+        "has_spec_decode": "pub fn has_spec_decode(&self) -> bool",
+        "ignore_eos": "pub fn ignore_eos(&self) -> bool",
+        "max_tokens": "pub fn max_tokens(&self) -> u32",
+        "min_p": "pub fn min_p(&self) -> f32",
+        "new": "pub fn new() -> Self",
+        "repetition_penalty": "pub fn repetition_penalty(&self) -> f32",
+        "set_flush_every_ms": "pub fn set_flush_every_ms(&mut self, v: u32)",
+        "set_flush_every_tokens": "pub fn set_flush_every_tokens(&mut self, v: u32)",
+        "set_grammar": "pub fn set_grammar(&mut self, gbnf: &str) -> Result<(), JsError>",
+        "set_grammar_trigger_tokens": "pub fn set_grammar_trigger_tokens(&mut self, v: Vec<u32>)",
+        "set_ignore_eos": "pub fn set_ignore_eos(&mut self, v: bool)",
+        "set_max_tokens": "pub fn set_max_tokens(&mut self, v: u32)",
+        "set_min_p": "pub fn set_min_p(&mut self, v: f32)",
+        "set_repetition_penalty": "pub fn set_repetition_penalty(&mut self, v: f32)",
+        "set_spec_decode": "pub fn set_spec_decode(&mut self, ngram: u32, k: u32)",
+        "set_stop_tokens": "pub fn set_stop_tokens(&mut self, v: Vec<u32>)",
+        "set_temperature": "pub fn set_temperature(&mut self, v: f32)",
+        "set_top_k": "pub fn set_top_k(&mut self, v: u32)",
+        "set_top_p": "pub fn set_top_p(&mut self, v: f32)",
+        "stop_tokens": "pub fn stop_tokens(&self) -> Vec<u32>",
+        "temperature": "pub fn temperature(&self) -> f32",
+        "top_k": "pub fn top_k(&self) -> u32",
+        "top_p": "pub fn top_p(&self) -> f32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "GenerateSummary",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "decode_ms": "pub fn decode_ms(&self) -> u32",
+        "finish_reason": "pub fn finish_reason(&self) -> String",
+        "prompt_eval_ms": "pub fn prompt_eval_ms(&self) -> u32",
+        "prompt_eval_tokens": "pub fn prompt_eval_tokens(&self) -> u32",
+        "tokens_generated": "pub fn tokens_generated(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "LoraAdapters",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "from_gguf_bytes": "pub fn from_gguf_bytes(bytes: &[u8]) -> Result<LoraAdapters, JsError>",
+        "from_safetensors_bytes": "pub fn from_safetensors_bytes( bytes: &[u8], alpha: Option<f32>, ) -> Result<LoraAdapters, JsError>",
+        "target_count": "pub fn target_count(&self) -> u32"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "Session",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "append_audio": "pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError>",
+        "append_image": "pub fn append_image( &mut self, bytes: &[u8], max_long_size: Option<u32>, ) -> Result<(), JsError>",
+        "append_text": "pub fn append_text(&mut self, text: &str) -> Result<(), JsError>",
+        "append_tokens": "pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), JsError>",
+        "attach_lora": "pub fn attach_lora(&mut self, adapters: &LoraAdapters) -> Result<(), JsError>",
+        "cancel": "pub fn cancel(&self)",
+        "capabilities": "pub fn capabilities(&self) -> Capabilities",
+        "clear_cancel": "pub fn clear_cancel(&self)",
+        "generate": "pub fn generate( &mut self, opts: &GenerateOpts, on_text_tokens: &js_sys::Function, on_audio_frames: Option<js_sys::Function>, ) -> Result<GenerateSummary, JsError>",
+        "has_lora": "pub fn has_lora(&self) -> bool",
+        "hidden_size": "pub fn hidden_size(&self) -> u32",
+        "hidden_states_for_text": "pub fn hidden_states_for_text(&mut self, text: &str) -> Result<js_sys::Float32Array, JsError>",
+        "hidden_states_for_tokens": "pub fn hidden_states_for_tokens( &mut self, tokens: &[u32], ) -> Result<js_sys::Float32Array, JsError>",
+        "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled( &mut self, tokens: &[u32], ) -> Result<js_sys::Float32Array, JsError>",
+        "position": "pub fn position(&self) -> u32",
+        "remove_lora": "pub fn remove_lora(&mut self)",
+        "reset": "pub fn reset(&mut self) -> Result<(), JsError>",
+        "set_image_max_long_size": "pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>)"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "WebGpuSession",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "adapter": "pub fn adapter(&self) -> String",
+        "append_audio": "pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), JsError>",
+        "append_image": "pub async fn append_image( &mut self, bytes: &[u8], max_long_size: Option<u32>, ) -> Result<(), JsError>",
+        "append_tokens": "pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError>",
+        "audio_in": "pub fn audio_in(&self) -> bool",
+        "audio_out": "pub fn audio_out(&self) -> bool",
+        "cancel": "pub fn cancel(&self)",
+        "cancel_handle": "pub fn cancel_handle(&self) -> WebGpuCancelHandle",
+        "capabilities": "pub fn capabilities(&self) -> Capabilities",
+        "clear_cancel": "pub fn clear_cancel(&self)",
+        "create": "pub async fn create( bytes: Vec<u8>, context_size: Option<u32>, kv_compression: Option<crate::TurboQuantConfig>, ) -> Result<WebGpuSession, JsError>",
+        "create_with_parts": "pub async fn create_with_parts( bytes: Vec<u8>, mmproj: Vec<u8>, context_size: Option<u32>, kv_compression: Option<crate::TurboQuantConfig>, ) -> Result<WebGpuSession, JsError>",
+        "from_bundle_id": "pub async fn from_bundle_id( repo: &crate::bundle::BundleRepo, bundle_id: String, quant: String, context_size: Option<u32>, kv_compression: Option<crate::TurboQuantConfig>, on_progress: Option<js_sys::Function>, ) -> Result<WebGpuSession, JsError>",
+        "generate": "pub async fn generate( &mut self, prompt: &str, max_tokens: u32, temperature: Option<f32>, top_p: Option<f32>, top_k: Option<u32>, seed: Option<u64>, on_token: &js_sys::Function, ) -> Result<String, JsError>",
+        "generate_tokens": "pub async fn generate_tokens( &mut self, tokens: Vec<u32>, max_tokens: u32, temperature: Option<f32>, top_p: Option<f32>, top_k: Option<u32>, seed: Option<u64>, on_token: &js_sys::Function, on_audio: Option<js_sys::Function>, ) -> Result<String, JsError>",
+        "image_in": "pub fn image_in(&self) -> bool",
+        "kv_compression": "pub fn kv_compression(&self) -> String",
+        "position": "pub fn position(&self) -> u32",
+        "set_image_max_long_size": "pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>)",
+        "tokenizer": "pub fn tokenizer(&self) -> Tokenizer"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "methods",
+      "owner": "WebGpuCancelHandle",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "cancel": "pub fn cancel(&self)",
+        "clear_cancel": "pub fn clear_cancel(&self)"
+      }
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "record",
+      "owner": "ToolFormat",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, }"
+    },
+    {
+      "source": "cera-wasm/src/lib.rs",
+      "kind": "functions",
+      "owner": "<module>",
+      "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
+      "expected": {
+        "cera_version": "pub fn cera_version() -> String",
+        "cpu_backend_report": "pub fn cpu_backend_report() -> String",
+        "detect_tool_format": "pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat>",
+        "parse_tool_calls": "pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsError>",
+        "tool_grammar": "pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsError>",
+        "wasm_init": "pub fn wasm_init()"
+      }
+    },
+    {
+      "source": "cera-wasm/src/bundle.rs",
+      "kind": "methods",
+      "owner": "BundleRepo",
+      "retained_home": "Existing browser OPFS repository, not native BundleRepo",
+      "expected": {
+        "bytes": "pub async fn bytes( &self, url: String, expected_sha256: Option<String>, on_progress: Option<Function>, ) -> Result<Uint8Array, JsError>",
+        "cache_size": "pub async fn cache_size(&self) -> Result<f64, JsError>",
+        "clear_cache": "pub async fn clear_cache(&self) -> Result<(), JsError>",
+        "download": "pub async fn download( &self, url: String, expected_sha256: Option<String>, on_progress: Option<Function>, ) -> Result<(), JsError>",
+        "is_cached": "pub async fn is_cached(&self, url: String) -> Result<bool, JsError>",
+        "new": "pub fn new(store_dir: Option<String>) -> Result<BundleRepo, JsError>",
+        "remove": "pub async fn remove(&self, url: String) -> Result<bool, JsError>",
+        "store_dir": "pub fn store_dir(&self) -> String",
+        "text": "pub async fn text(&self, url: String) -> Result<String, JsError>"
+      }
+    },
+    {
+      "source": "cera-wasm/src/bundle.rs",
+      "kind": "functions",
+      "owner": "<module>",
+      "retained_home": "Existing browser OPFS repository, not native BundleRepo",
+      "expected": {
+        "list_leap_bundles": "pub async fn list_leap_bundles() -> Result<JsValue, JsError>",
+        "persist_storage": "pub async fn persist_storage() -> Result<bool, JsError>",
+        "read_gguf_header_from_sync_handle": "pub fn read_gguf_header_from_sync_handle( sync: &FileSystemSyncAccessHandle, ) -> Result<cera::gguf::GgufFile, JsError>"
+      }
+    },
+    {
+      "source": "cera/src/bundle/repo.rs",
+      "kind": "trait",
+      "owner": "DownloadProgress",
+      "retained_home": "Rust repository progress callback",
+      "expected": "pub trait DownloadProgress: Send + Sync + std::fmt::Debug { fn on_progress(&self, url: &str, bytes_downloaded: u64, total_bytes: Option<u64>); }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "trait",
+      "owner": "DownloadProgressSink",
+      "retained_home": "Existing native foreign download callback",
+      "expected": "pub trait DownloadProgressSink: Send + Sync { fn on_progress(&self, url: String, bytes_downloaded: u64, total_bytes: Option<u64>); }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "trait",
+      "owner": "ModalitySink",
+      "retained_home": "Existing native foreign generation callback",
+      "expected": "pub trait ModalitySink: Send + Sync { fn on_thought_chunk(&self, text: String); fn on_text_chunk(&self, text: String); fn on_audio_frames(&self, pcm: Vec<f32>, sample_rate: u32); fn on_done(&self, reason: FinishReason); }"
+    }
+  ]
+}

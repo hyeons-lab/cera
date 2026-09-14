@@ -1,0 +1,20 @@
+[package]
+name = "loading-native"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["native"]
+native = []
+web = []
+
+[dependencies]
+cera = { path = "../cera", default-features = false, features = ["mmap", "remote"] }
+cera-ffi = { path = "../cera-ffi" }
+uniffi = { workspace = true, features = ["cli"] }
+thiserror.workspace = true
+serde_json.workspace = true

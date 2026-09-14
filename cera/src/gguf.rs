@@ -157,6 +157,25 @@ impl Clone for GgufFile {
     }
 }
 
+// Count real parser entries in loading regressions without cross-test races or
+// any instrumentation in production builds.
+#[cfg(test)]
+pub(crate) mod parse_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        COUNT.set(COUNT.get() + 1);
+    }
+
+    pub(crate) fn count() -> usize {
+        COUNT.get()
+    }
+}
+
 // ── Reader helper ───────────────────────────────────────────────────────────
 
 /// Buffered reader that tracks position for error reporting.
@@ -439,6 +458,9 @@ impl GgufFile {
     }
 
     fn from_backing_with_file_size(backing: Backing, file_size: u64) -> Result<Self> {
+        #[cfg(test)]
+        parse_probe::record();
+
         // Derive a stable byte view of the backing. NonNull from a slice
         // of at least one byte is guaranteed non-null; for a zero-byte
         // buffer we bail early with a nicer error than the "magic
@@ -712,6 +734,16 @@ impl GgufFile {
             Backing::Owned(b) => Some(Arc::clone(b)),
             #[cfg(feature = "mmap")]
             Backing::Mmap(_) => None,
+        }
+    }
+
+    /// Share the exact parsed mapping with Metal's no-copy buffer. Reopening a
+    /// path could select replacement weights after metadata was already parsed.
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    pub(crate) fn mapped_backing(&self) -> Option<Arc<Mmap>> {
+        match &self._backing {
+            Backing::Mmap(mapping) => Some(mapping.clone()),
+            Backing::Owned(_) => None,
         }
     }
 

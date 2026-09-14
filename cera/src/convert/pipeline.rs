@@ -1,12 +1,16 @@
 //! Streaming SafeTensors to GGUF quantization pipeline with HTTP retries & checkpoint resumption.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::bundle::{DownloadProgress, HfSpec, fetch_model_info};
+use crate::bundle::hf::fetch_model_snapshot;
+use crate::bundle::{DownloadProgress, HfSpec};
+use crate::convert::cache::{ConversionReceipt, ConversionRequest, RECEIPT_NAME};
+use crate::convert::checkpoint::{HashingWriter, hash_prefix};
 use crate::convert::config::HfModelConfig;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
@@ -77,6 +81,12 @@ impl Drop for TempFileGuard {
 /// Checkpoint metadata for resuming interrupted streaming quantization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuantCheckpoint {
+    #[serde(default)]
+    request: Option<ConversionRequest>,
+    #[serde(default)]
+    prefix_sha256: Option<String>,
+    #[serde(default)]
+    header_sha256: Option<String>,
     quant: String,
     strategy: String,
     completed_tensors: usize,
@@ -119,15 +129,31 @@ pub fn stream_quantize_hf_repo(
     let target_gguf_path = store_dir.join("model.gguf");
     let tmp_gguf_path = store_dir.join("model.gguf.tmp");
     let ckpt_path = store_dir.join("model.gguf.checkpoint.json");
+    let receipt_path = store_dir.join(RECEIPT_NAME);
+    // Resolve even on a completed-cache hit: a branch or tag may have moved.
+    // Failure leaves existing artifacts intact but cannot serve stale remote output.
+    let (info, pinned_spec) = fetch_model_snapshot(spec, opts.auth_token.as_deref())?;
+    let request = ConversionRequest::new(spec, &opts, &pinned_spec.revision);
 
-    // Check if previously converted and cached
-    if manifest_path.exists()
-        && target_gguf_path.exists()
-        && let Ok(manifest_text) = fs::read_to_string(&manifest_path)
-        && let Ok(mut manifest) = Manifest::from_bytes(manifest_text.as_bytes())
-    {
-        manifest.files.model = target_gguf_path.to_string_lossy().to_string();
+    if let Some(manifest) = ConversionReceipt::verified_manifest(
+        &receipt_path,
+        &manifest_path,
+        &target_gguf_path,
+        &request,
+    ) {
         return Ok(manifest);
+    }
+
+    // An interrupted repair must not leave an old completion record in place.
+    match fs::remove_file(&receipt_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CeraError::Backend(format!(
+                "failed to invalidate conversion receipt `{}`: {e}",
+                receipt_path.display()
+            )));
+        }
     }
 
     fs::create_dir_all(&store_dir).map_err(|e| {
@@ -137,25 +163,22 @@ pub fn stream_quantize_hf_repo(
         ))
     })?;
 
-    // 1. Fetch Repo Metadata from HF API (with automatic retries)
-    let info = fetch_model_info(spec)?;
-
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| CeraError::Backend(format!("failed to build reqwest client: {e}")))?;
 
     // 1. Fetch config.json, tokenizer.json, and optional generation_config.json
-    let config_url = spec.file_download_url("config.json");
+    let config_url = pinned_spec.file_download_url("config.json");
     let config_bytes = fetch_hf_file_bytes(&client, &config_url, opts.auth_token.as_deref())?;
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
 
-    let tokenizer_url = spec.file_download_url("tokenizer.json");
+    let tokenizer_url = pinned_spec.file_download_url("tokenizer.json");
     let tokenizer_bytes = fetch_hf_file_bytes(&client, &tokenizer_url, opts.auth_token.as_deref())?;
     let tokenizer = HfTokenizerJson::parse_from_bytes(&tokenizer_bytes)?;
 
     // Optional chat template & generation config
-    let template_url = spec.file_download_url("tokenizer_config.json");
+    let template_url = pinned_spec.file_download_url("tokenizer_config.json");
     let chat_template = fetch_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -164,7 +187,7 @@ pub fn stream_quantize_hf_repo(
                 .and_then(|t| t.as_str().map(str::to_string))
         });
 
-    let gen_url = spec.file_download_url("generation_config.json");
+    let gen_url = pinned_spec.file_download_url("generation_config.json");
     let gen_defaults = fetch_hf_file_bytes(&client, &gen_url, opts.auth_token.as_deref())
         .ok()
         .and_then(|b| {
@@ -206,7 +229,7 @@ pub fn stream_quantize_hf_repo(
     // 4. Read headers of each SafeTensors shard
     let mut shard_headers = Vec::new();
     for file_name in &safetensors_files {
-        let header_url = spec.file_download_url(file_name);
+        let header_url = pinned_spec.file_download_url(file_name);
         // Read 8-byte header size first
         let len_bytes =
             fetch_hf_file_range(&client, &header_url, 0, 7, opts.auth_token.as_deref())?;
@@ -306,86 +329,94 @@ pub fn stream_quantize_hf_repo(
 
     let total_tensors = pending_tensors.len();
 
-    // 6. Check for valid existing checkpoint to resume from
-    let mut start_tensor_idx = 0;
-    let mut should_write_header = true;
-    let mut resume_bytes = 0u64;
+    // Regenerate the header/layout without allocating a second metadata buffer.
+    let mut header_hash = HashingWriter {
+        inner: std::io::sink(),
+        hasher: Sha256::new(),
+    };
+    let header_bytes = writer.write_header_and_tensor_info(&mut header_hash)?;
+    let header_sha256 = format!("{:x}", header_hash.hasher.finalize());
+    let align = writer.alignment() as u64;
+    let align_mask = align - 1;
 
-    if tmp_gguf_path.exists()
-        && ckpt_path.exists()
-        && let Ok(ckpt_str) = fs::read_to_string(&ckpt_path)
-        && let Ok(ckpt) = serde_json::from_str::<QuantCheckpoint>(&ckpt_str)
+    // 6. Verify the exact saved boundary, layout and bytes before resuming.
+    // Keep the verified handle for truncation/writing; do not reopen by path.
+    let mut resumed = None;
+    if let Ok(ckpt_bytes) = fs::read(&ckpt_path)
+        && let Ok(ckpt) = serde_json::from_slice::<QuantCheckpoint>(&ckpt_bytes)
+        && ckpt.request.as_ref() == Some(&request)
         && ckpt.quant == quant_str
         && ckpt.strategy == strat_str
+        && ckpt.header_sha256.as_ref() == Some(&header_sha256)
         && ckpt.total_tensors == total_tensors
+        && ckpt.completed_tensors > 0
         && ckpt.completed_tensors < total_tensors
-        && let Ok(meta) = fs::metadata(&tmp_gguf_path)
-        && meta.len() >= ckpt.file_bytes
+        && let Some(last) = writer.tensors().get(ckpt.completed_tensors - 1)
+        && let Some(boundary) = header_bytes
+            .checked_add(last.offset)
+            .and_then(|n| n.checked_add((last.size_bytes as u64 + align_mask) & !align_mask))
+        && ckpt.file_bytes == boundary
+        && let Some(prefix_sha256) = ckpt.prefix_sha256.as_ref()
+        && prefix_sha256.len() == 64
+        && let Ok(mut file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp_gguf_path)
+        && let Ok(hasher) = hash_prefix(&mut file, boundary)
+        && prefix_sha256 == &format!("{:x}", hasher.clone().finalize())
     {
-        start_tensor_idx = ckpt.completed_tensors;
-        should_write_header = false;
-        resume_bytes = ckpt.file_bytes;
         tracing::info!(
             "Resuming quantization of `{}/{}` ({quant_str}) from tensor {}/{}…",
             spec.owner,
             spec.repo,
-            start_tensor_idx,
+            ckpt.completed_tensors,
             total_tensors
         );
+        resumed = Some((file, ckpt, hasher));
     }
 
-    // Open file (create fresh or append for resume)
-    let (out_file, mut current_bytes_written) = if should_write_header {
-        let _ = fs::remove_file(&ckpt_path);
-        let file = File::create(&tmp_gguf_path).map_err(|e| {
-            CeraError::Backend(format!(
-                "failed to create `{}`: {e}",
-                tmp_gguf_path.display()
-            ))
-        })?;
-        (file, 0u64)
-    } else {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&tmp_gguf_path)
-            .map_err(|e| {
+    let (out_file, mut current_bytes_written, start_tensor_idx, hasher) =
+        if let Some((mut file, ckpt, hasher)) = resumed {
+            file.set_len(ckpt.file_bytes).map_err(|e| {
                 CeraError::Backend(format!(
-                    "failed to open `{}` for resume: {e}",
+                    "failed to truncate `{}` to resume boundary {} bytes: {e}",
+                    tmp_gguf_path.display(),
+                    ckpt.file_bytes
+                ))
+            })?;
+            file.seek(SeekFrom::Start(ckpt.file_bytes)).map_err(|e| {
+                CeraError::Backend(format!(
+                    "failed to seek `{}` to resume boundary: {e}",
                     tmp_gguf_path.display()
                 ))
             })?;
-        file.set_len(resume_bytes).map_err(|e| {
-            CeraError::Backend(format!(
-                "failed to truncate `{}` to resume boundary {resume_bytes} bytes: {e}",
-                tmp_gguf_path.display()
-            ))
-        })?;
-        let len = file.seek(SeekFrom::Start(resume_bytes)).map_err(|e| {
-            CeraError::Backend(format!(
-                "failed to seek `{}` to resume boundary: {e}",
-                tmp_gguf_path.display()
-            ))
-        })?;
-        (file, len)
+            (file, ckpt.file_bytes, ckpt.completed_tensors, hasher)
+        } else {
+            let _ = fs::remove_file(&ckpt_path);
+            let file = File::create(&tmp_gguf_path).map_err(|e| {
+                CeraError::Backend(format!(
+                    "failed to create `{}`: {e}",
+                    tmp_gguf_path.display()
+                ))
+            })?;
+            (file, 0, 0, Sha256::new())
+        };
+
+    let mut buf_writer = HashingWriter {
+        inner: BufWriter::with_capacity(1024 * 1024 * 4, out_file),
+        hasher,
     };
-
-    let mut buf_writer = BufWriter::with_capacity(1024 * 1024 * 4, out_file);
-
-    if should_write_header {
-        let _data_start_offset = writer.write_header_and_tensor_info(&mut buf_writer)?;
+    if start_tensor_idx == 0 {
+        current_bytes_written = writer.write_header_and_tensor_info(&mut buf_writer)?;
         buf_writer.flush().map_err(|e| {
             CeraError::Backend(format!(
                 "failed to flush `{}`: {e}",
                 tmp_gguf_path.display()
             ))
         })?;
-        current_bytes_written = fs::metadata(&tmp_gguf_path).map(|m| m.len()).unwrap_or(0);
     }
 
     // Estimate total output file bytes accurately
-    let align = writer.alignment() as u64;
-    let align_mask = align - 1;
     let total_estimated_bytes: u64 = current_bytes_written
         + pending_tensors
             .iter()
@@ -400,7 +431,7 @@ pub fn stream_quantize_hf_repo(
     // 7. Stream tensors from SafeTensors shards, quantize on-the-fly, and write to GGUF
     let shard_download_urls: Vec<String> = shard_headers
         .iter()
-        .map(|(name, _)| spec.file_download_url(name))
+        .map(|(name, _)| pinned_spec.file_download_url(name))
         .collect();
 
     let mut quant_buf = Vec::new();
@@ -468,6 +499,9 @@ pub fn stream_quantize_hf_repo(
                 ))
             })?;
             let ckpt = QuantCheckpoint {
+                request: Some(request.clone()),
+                prefix_sha256: Some(format!("{:x}", buf_writer.hasher.clone().finalize())),
+                header_sha256: Some(header_sha256.clone()),
                 quant: quant_str.to_string(),
                 strategy: strat_str.to_string(),
                 completed_tensors: i + 1,
@@ -496,7 +530,7 @@ pub fn stream_quantize_hf_repo(
 
     if let Some(p) = &opts.progress {
         p.on_progress(
-            &spec.file_download_url("model.gguf"),
+            &pinned_spec.file_download_url("model.gguf"),
             current_bytes_written,
             Some(current_bytes_written),
         );
@@ -508,7 +542,7 @@ pub fn stream_quantize_hf_repo(
             tmp_gguf_path.display()
         ))
     })?;
-    if let Ok(file) = buf_writer.into_inner() {
+    if let Ok(file) = buf_writer.inner.into_inner() {
         let _ = file.sync_all();
     }
 
@@ -570,6 +604,22 @@ pub fn stream_quantize_hf_repo(
             manifest_path.display()
         ))
     })?;
+
+    // Publish completion last. Without this record the next load reconverts.
+    let receipt = ConversionReceipt::new(request, manifest_json.as_bytes(), final_digest);
+    let receipt_json = serde_json::to_vec(&receipt)
+        .map_err(|e| CeraError::Backend(format!("failed to serialize conversion receipt: {e}")))?;
+    let receipt_tmp = store_dir.join(format!("{RECEIPT_NAME}.{}", unique_temp_suffix()));
+    let receipt_guard = TempFileGuard::new(receipt_tmp.clone());
+    fs::write(&receipt_tmp, receipt_json)
+        .and_then(|()| fs::rename(&receipt_tmp, &receipt_path))
+        .map_err(|e| {
+            CeraError::Backend(format!(
+                "failed to publish conversion receipt `{}`: {e}",
+                receipt_path.display()
+            ))
+        })?;
+    receipt_guard.disarm();
 
     let manifest = Manifest {
         inference_type: InferenceType::LlamaCppTextToText,
