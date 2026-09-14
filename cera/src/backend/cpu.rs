@@ -1913,11 +1913,9 @@ pub fn gemv_with_preq(
                 gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None);
             }
         }
-        // NOTE: no Q4KM arm here on purpose. Routing Q4_K through a pre-quantized
-        // dispatcher measured a consistent ~5% *regression* vs re-quantizing in
-        // `gemv_dispatch` (interleaved A/B, LFM2.5-350M-Q4_K_M decode) — the
-        // per-call Q8_0 quantization is cheap next to the GEMV, and the shared-
-        // buffer path loses activation cache locality. Q4_K falls through below.
+        DType::Q4KM => unsafe {
+            crate::backend::simd::neon::gemv_q4k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
         _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
     }
 }
@@ -2760,6 +2758,11 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     }
 }
 
+thread_local! {
+    static GEMV_DISPATCH_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i8>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
 /// Dispatch GEMV based on dtype: `y[m] = W[m,k] @ x[k]`.
 /// For Q4_0, pass scratch buffers to avoid per-call allocation.
 pub fn gemv_dispatch(
@@ -2789,9 +2792,9 @@ pub fn gemv_dispatch(
             match q8_scratch {
                 Some((scales, quants)) => unsafe { $f(data, x, y, m, k, scales, quants) },
                 None => {
-                    let mut s = Vec::new();
-                    let mut q = Vec::new();
-                    unsafe { $f(data, x, y, m, k, &mut s, &mut q) }
+                    GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| unsafe {
+                        $f(data, x, y, m, k, s, q)
+                    });
                 }
             }
             return;
@@ -2803,27 +2806,27 @@ pub fn gemv_dispatch(
             if let Some((scales, quants)) = q8_scratch {
                 gemv_q4_0_f32(data, x, y, m, k, scales, quants);
             } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q4_0_f32(data, x, y, m, k, &mut s, &mut q);
+                GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| {
+                    gemv_q4_0_f32(data, x, y, m, k, s, q);
+                });
             }
         }
         DType::Q8_0 => {
             if let Some((scales, quants)) = q8_scratch {
                 gemv_q8_0_f32(data, x, y, m, k, scales, quants);
             } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
+                GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| {
+                    gemv_q8_0_f32(data, x, y, m, k, s, q);
+                });
             }
         }
         DType::Q4_1 => {
             if let Some((scales, quants)) = q8_scratch {
                 gemv_q4_1_f32(data, x, y, m, k, scales, quants);
             } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q4_1_f32(data, x, y, m, k, &mut s, &mut q);
+                GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| {
+                    gemv_q4_1_f32(data, x, y, m, k, s, q);
+                });
             }
         }
         DType::F32 => gemv_f32(data, x, y, m, k),
@@ -2848,9 +2851,9 @@ pub fn gemv_dispatch(
                 if avx2_int8_available() {
                     kq_gemv!(crate::backend::simd::avx2_int8::gemv_q6k_f32);
                 }
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
+                GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| {
+                    gemv_q6k_f32(data, x, y, m, k, s, q);
+                });
             }
         }
         DType::Q4KM => {

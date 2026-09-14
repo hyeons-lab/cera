@@ -1594,6 +1594,82 @@ impl Model for LlamaModel {
         self.project_logits(&hidden, state)
     }
 
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        if transformer::oracle_dump::is_active() {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
+        assert_eq!(tokens.len(), 1, "LlamaModel forward expects single token");
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        assert!(
+            token_id < cfg.vocab_size,
+            "token_id {token_id} out of range (vocab_size={})",
+            cfg.vocab_size
+        );
+
+        let mut hidden_stack = [0.0f32; 4096];
+        let mut hidden_heap;
+        let hidden = if cfg.hidden_size <= 4096 {
+            &mut hidden_stack[..cfg.hidden_size]
+        } else {
+            hidden_heap = vec![0.0f32; cfg.hidden_size];
+            &mut hidden_heap[..]
+        };
+        transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, hidden);
+        if self.config.scalars.embedding != 1.0 {
+            cpu::scale_inplace(hidden, self.config.scalars.embedding);
+        }
+        self.run_layers(hidden, pos, state);
+
+        let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
+        #[cfg(target_arch = "aarch64")]
+        {
+            if out_ref.dtype == crate::tensor::DType::Q6K {
+                transformer::quantize_to_scratch(hidden, state);
+                return transformer::gemv_preq_argmax(
+                    &self.gguf,
+                    out_ref,
+                    hidden,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                ) as u32;
+            }
+        }
+
+        if state.scratch.logits.len() < cfg.vocab_size {
+            state.scratch.logits.resize(cfg.vocab_size, 0.0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            transformer::quantize_to_scratch(hidden, state);
+            transformer::gemv_preq(
+                &self.gguf,
+                out_ref,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.logits[..cfg.vocab_size],
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            transformer::gemv(
+                &self.gguf,
+                out_ref,
+                hidden,
+                &mut state.scratch.logits[..cfg.vocab_size],
+            );
+        }
+        if self.config.scalars.logit != 1.0 {
+            cpu::scale_inplace(
+                &mut state.scratch.logits[..cfg.vocab_size],
+                1.0 / self.config.scalars.logit,
+            );
+        }
+        crate::sampler::argmax(&state.scratch.logits[..cfg.vocab_size])
+    }
+
     fn forward_prefill(
         &self,
         tokens: &[u32],

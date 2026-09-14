@@ -1434,32 +1434,13 @@ impl Lfm2Model {
         // in_proj: hidden → 3*hidden (uses pre-quantized Q8_0 data when available)
         let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
         #[cfg(target_arch = "aarch64")]
-        if in_proj.dtype == DType::Q4_0 || in_proj.dtype == DType::Q8_0 {
-            let data = self.weight_data(in_proj);
-            if in_proj.dtype == DType::Q4_0 {
-                cpu::gemv_q4_0_with_q8(
-                    data,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    proj,
-                    in_proj.m,
-                    in_proj.k,
-                );
-            } else {
-                unsafe {
-                    crate::backend::simd::neon::gemv_q8_0_q8_0_neon(
-                        data,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        proj,
-                        in_proj.m,
-                        in_proj.k,
-                    );
-                }
-            }
-        } else {
-            self.gemv(in_proj, hidden, proj);
-        }
+        self.gemv_preq(
+            in_proj,
+            hidden,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            proj,
+        );
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(in_proj, hidden, proj);
 
@@ -4287,6 +4268,17 @@ impl Model for Lfm2Model {
         };
         self.dequantize_row_into(&self.embd_ref, token_id, hidden);
         self.run_layers(hidden, pos, state);
+
+        #[cfg(target_arch = "aarch64")]
+        if self.embd_ref.dtype == DType::Q6K {
+            return transformer::gemv_preq_argmax(
+                &self.gguf,
+                &self.embd_ref,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+            ) as u32;
+        }
 
         if state.scratch.logits.len() < cfg.vocab_size {
             state.scratch.logits.resize(cfg.vocab_size, 0.0);
