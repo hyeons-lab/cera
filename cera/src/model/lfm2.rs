@@ -4627,6 +4627,7 @@ impl Model for Lfm2Model {
 // scalars, and supports the batched-prefill GPU path.
 #[cfg(any(
     feature = "gpu",
+    feature = "cuda",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {

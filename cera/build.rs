@@ -28,10 +28,28 @@ fn main() {
     });
     println!("cargo:rustc-env=CERA_GIT_SHA={sha}");
     println!("cargo:rerun-if-env-changed=CERA_GIT_SHA");
-    // Cargo picks this up through the build script's dep-info, but the
-    // dependency is declared explicitly so that editing the post-pass visibly
-    // regenerates the shader rather than relying on that inference.
     println!("cargo:rerun-if-changed=build_support/msl_postpass.rs");
+
+    println!("cargo:rustc-check-cfg=cfg(cera_nightly)");
+    let is_nightly = std::env::var_os("RUSTC_BOOTSTRAP").is_some() || {
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        Command::new(rustc)
+            .arg("-vV")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| {
+                s.lines()
+                    .find(|line| line.starts_with("release: "))
+                    .map(|line| line.contains("-nightly") || line.contains("-dev"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    };
+    if is_nightly {
+        println!("cargo:rustc-cfg=cera_nightly");
+    }
 
     // Compile the Slang SPIR-V passthrough kernels (gpu feature only). Each is
     // written to OUT_DIR and `include_spirv_raw!`d from there, so slangc is the
