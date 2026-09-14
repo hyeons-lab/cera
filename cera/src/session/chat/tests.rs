@@ -577,9 +577,10 @@ fn public_tokenizer_actual_session_ten_turns() {
 }
 
 fn load_real_lfm2(bytes: &[u8]) -> (Arc<dyn Model>, Arc<BpeTokenizer>) {
-    let gguf_tok = crate::gguf::GgufFile::from_bytes(bytes.to_vec().into()).unwrap();
+    let arc_bytes: Arc<[u8]> = Arc::from(bytes);
+    let gguf_tok = crate::gguf::GgufFile::from_bytes(arc_bytes.clone()).unwrap();
     let tokenizer = Arc::new(BpeTokenizer::from_gguf(&gguf_tok).unwrap());
-    let gguf_model = crate::gguf::GgufFile::from_bytes(bytes.to_vec().into()).unwrap();
+    let gguf_model = crate::gguf::GgufFile::from_bytes(arc_bytes).unwrap();
     let model: Arc<dyn Model> =
         Arc::from(crate::model::load_model(gguf_model, None, 4096).unwrap());
     (model, tokenizer)
@@ -621,7 +622,8 @@ fn real_model_r1_ten_warm_turns_and_kv_retention() {
     let kv_dim = model.config().n_kv_heads * model.config().head_dim;
     let mut prior_kv_snapshots: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
     let mut turn_outputs: Vec<(String, Vec<u32>, String)> = Vec::new();
-    let grammar = Arc::new(crate::grammar::Grammar::parse(r#"root ::= [a-zA-Z]+ "\n""#).unwrap());
+    let grammar =
+        Arc::new(crate::grammar::Grammar::parse(r#"root ::= [a-zA-Z]{1,16} "\n""#).unwrap());
     let opts = GenerateOpts {
         max_tokens: 64,
         temperature: 0.7,
@@ -740,6 +742,27 @@ fn real_model_r1_ten_warm_turns_and_kv_retention() {
             !prior_kv_snapshots.is_empty(),
             "model must have attention layers"
         );
+
+        // Verify that convolution layers retain live recurrent state across turns:
+        let conv_layers: Vec<&Vec<f32>> = warm_sess
+            .state
+            .layers
+            .iter()
+            .filter_map(|layer| match layer {
+                LayerState::Conv { buffer, .. } => Some(buffer),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !conv_layers.is_empty(),
+            "model must have convolution layers"
+        );
+        for (idx, buf) in conv_layers.iter().enumerate() {
+            assert!(
+                buf.iter().any(|&x| x != 0.0),
+                "conv layer {idx} buffer must maintain live recurrent activation state across turns"
+            );
+        }
     }
 
     // Proof of determinism across consecutive runs with identical seed:
@@ -768,6 +791,7 @@ fn real_model_r1_stochastic_rng_determinism_and_divergence() {
     let path =
         std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
     let bytes = std::fs::read(path).unwrap();
+    let (model, tokenizer) = load_real_lfm2(&bytes);
 
     let opts = GenerateOpts {
         max_tokens: 16,
@@ -775,14 +799,19 @@ fn real_model_r1_stochastic_rng_determinism_and_divergence() {
         ..Default::default()
     };
 
-    let (s1, _) = real_lfm2_session(&bytes, Some(777));
+    let prompt = [
+        Message::text(Role::System, "You are a creative storyteller."),
+        user("Once upon a time in a distant galaxy, there was a"),
+    ];
+
+    let s1 = real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(777));
     let mut chat1 = core_chat(s1).unwrap();
-    chat1.ingest(&user("Tell me an interesting fact.")).unwrap();
+    chat1.ingest_messages(&prompt).unwrap();
     let r1 = chat1.complete(&opts).unwrap();
 
-    let (s2, _) = real_lfm2_session(&bytes, Some(777));
+    let s2 = real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(777));
     let mut chat2 = core_chat(s2).unwrap();
-    chat2.ingest(&user("Tell me an interesting fact.")).unwrap();
+    chat2.ingest_messages(&prompt).unwrap();
     let r2 = chat2.complete(&opts).unwrap();
 
     assert_eq!(
@@ -791,9 +820,9 @@ fn real_model_r1_stochastic_rng_determinism_and_divergence() {
     );
     assert_eq!(r1.text, r2.text);
 
-    let (s3, _) = real_lfm2_session(&bytes, Some(888));
+    let s3 = real_lfm2_session_from_model(model.clone(), tokenizer.clone(), Some(888));
     let mut chat3 = core_chat(s3).unwrap();
-    chat3.ingest(&user("Tell me an interesting fact.")).unwrap();
+    chat3.ingest_messages(&prompt).unwrap();
     let r3 = chat3.complete(&opts).unwrap();
 
     assert_ne!(
@@ -808,8 +837,9 @@ fn real_model_r1_interrupted_turn_and_replacement_recovery() {
     let path =
         std::env::var("CERA_CHAT_PROFILE_MODEL").expect("runner must supply the pinned model");
     let bytes = std::fs::read(path).unwrap();
+    let (model, tokenizer) = load_real_lfm2(&bytes);
 
-    let (session, _) = real_lfm2_session(&bytes, Some(42));
+    let session = real_lfm2_session_from_model(model, tokenizer, Some(42));
     let mut chat = core_chat(session).unwrap();
 
     // 1. Ingest turn and execute with max_tokens: 2, causing FinishReason::MaxTokens:

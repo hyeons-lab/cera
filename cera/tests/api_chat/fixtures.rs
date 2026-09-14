@@ -8,11 +8,9 @@ use super::core_api::session::{
 };
 use super::core_api::tokenizer::BpeTokenizer;
 
-use super::contract::TEMPLATE;
+use super::contract::{LFM2_5_TEMPLATE, TEMPLATE};
 
-/// Small ASCII vocabulary for offline contract tests. Public-tokenizer tests
-/// separately load the exact full GGUF, including all vocabulary and merges.
-pub fn tokenizer() -> Arc<BpeTokenizer> {
+fn make_fixture_tokenizer(template: &str) -> Arc<BpeTokenizer> {
     let mut bytes = b"GGUF".to_vec();
     bytes.extend(3u32.to_le_bytes());
     bytes.extend(0u64.to_le_bytes());
@@ -47,9 +45,20 @@ pub fn tokenizer() -> Arc<BpeTokenizer> {
         .insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(7));
     gguf.metadata.insert(
         "tokenizer.chat_template".into(),
-        GgufValue::String(TEMPLATE.into()),
+        GgufValue::String(template.into()),
     );
     Arc::new(BpeTokenizer::from_gguf(&gguf).unwrap())
+}
+
+/// Small ASCII vocabulary for offline contract tests. Public-tokenizer tests
+/// separately load the exact full GGUF, including all vocabulary and merges.
+pub fn tokenizer() -> Arc<BpeTokenizer> {
+    make_fixture_tokenizer(TEMPLATE)
+}
+
+/// Small ASCII vocabulary configured with the canonical LFM2.5 chat template.
+pub fn lfm2_5_tokenizer() -> Arc<BpeTokenizer> {
+    make_fixture_tokenizer(LFM2_5_TEMPLATE)
 }
 
 #[derive(Default)]

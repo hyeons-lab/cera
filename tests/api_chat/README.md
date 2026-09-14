@@ -14,15 +14,13 @@ cargo test -p cera --test chat_contract --locked --offline
 python3 tests/api_chat/test_runner.py
 ```
 
-Run **all** fixtures, including the complete public tokenizer, using the exact
-artifact pinned in [profile.json](profile.json):
+Run **all** fixtures, including the complete public tokenizer and real model weights,
+using either artifact pinned in [profile.json](profile.json) (LFM2-350M or LFM2.5-350M):
 
 ```sh
-curl --fail --location \
-  'https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/8fdc9d526b7ed346b19257551b05816c7912ecc2/LFM2-350M-Q4_0.gguf' \
-  --output /tmp/LFM2-350M-Q4_0.gguf
+# Example with LFM2-350M or LFM2.5-350M:
 python3 tests/api_chat/run.py \
-  --model /tmp/LFM2-350M-Q4_0.gguf \
+  --model /path/to/LFM2-350M-Q4_0.gguf \
   --output /tmp/cera-chat-contract \
   --target-dir /tmp/cera-chat-target \
   --target aarch64-apple-darwin
