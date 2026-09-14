@@ -56,45 +56,39 @@ __global__ void gemv_q8_0(
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
 
-        // Row 0: lane 0 loads FP16 scale and broadcasts via shuffle
-        float d0 = 0.0f;
+        // Parallel scale loads: lanes 0..3 load FP16 scales for rows 0..3 concurrently
+        const size_t block_offset = (size_t)ib * 34;
+        float d_lane = 0.0f;
         if (lane == 0) {
-            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + (size_t)ib * 34));
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+        } else if (lane == 1 && row1_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
+        } else if (lane == 2 && row2_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
+        } else if (lane == 3 && row3_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
         }
-        d0 = __shfl_sync(0xffffffff, d0, 0);
-        const int8_t q0 = *(const int8_t*)(row0_ptr + (size_t)ib * 34 + 2 + lane);
+
+        const float d0 = __shfl_sync(0xffffffff, d_lane, 0);
+        const float d1 = __shfl_sync(0xffffffff, d_lane, 1);
+        const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
+        const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
+
+        const int8_t q0 = *(const int8_t*)(row0_ptr + block_offset + 2 + lane);
         sum0 = fmaf((float)q0 * d0, x_val, sum0);
 
-        // Row 1
         if (row1_ptr) {
-            float d1 = 0.0f;
-            if (lane == 0) {
-                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + (size_t)ib * 34));
-            }
-            d1 = __shfl_sync(0xffffffff, d1, 0);
-            const int8_t q1 = *(const int8_t*)(row1_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q1 = *(const int8_t*)(row1_ptr + block_offset + 2 + lane);
             sum1 = fmaf((float)q1 * d1, x_val, sum1);
         }
 
-        // Row 2
         if (row2_ptr) {
-            float d2 = 0.0f;
-            if (lane == 0) {
-                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + (size_t)ib * 34));
-            }
-            d2 = __shfl_sync(0xffffffff, d2, 0);
-            const int8_t q2 = *(const int8_t*)(row2_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q2 = *(const int8_t*)(row2_ptr + block_offset + 2 + lane);
             sum2 = fmaf((float)q2 * d2, x_val, sum2);
         }
 
-        // Row 3
         if (row3_ptr) {
-            float d3 = 0.0f;
-            if (lane == 0) {
-                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + (size_t)ib * 34));
-            }
-            d3 = __shfl_sync(0xffffffff, d3, 0);
-            const int8_t q3 = *(const int8_t*)(row3_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q3 = *(const int8_t*)(row3_ptr + block_offset + 2 + lane);
             sum3 = fmaf((float)q3 * d3, x_val, sum3);
         }
     }
@@ -161,41 +155,39 @@ __global__ void gemv_q8_0_accum(
     for (uint32_t ib = 0; ib < nb; ib++) {
         const float x_val = x[ib * 32 + lane];
 
-        float d0 = 0.0f;
+        // Parallel scale loads: lanes 0..3 load FP16 scales for rows 0..3 concurrently
+        const size_t block_offset = (size_t)ib * 34;
+        float d_lane = 0.0f;
         if (lane == 0) {
-            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + (size_t)ib * 34));
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+        } else if (lane == 1 && row1_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
+        } else if (lane == 2 && row2_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
+        } else if (lane == 3 && row3_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
         }
-        d0 = __shfl_sync(0xffffffff, d0, 0);
-        const int8_t q0 = *(const int8_t*)(row0_ptr + (size_t)ib * 34 + 2 + lane);
+
+        const float d0 = __shfl_sync(0xffffffff, d_lane, 0);
+        const float d1 = __shfl_sync(0xffffffff, d_lane, 1);
+        const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
+        const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
+
+        const int8_t q0 = *(const int8_t*)(row0_ptr + block_offset + 2 + lane);
         sum0 = fmaf((float)q0 * d0, x_val, sum0);
 
         if (row1_ptr) {
-            float d1 = 0.0f;
-            if (lane == 0) {
-                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + (size_t)ib * 34));
-            }
-            d1 = __shfl_sync(0xffffffff, d1, 0);
-            const int8_t q1 = *(const int8_t*)(row1_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q1 = *(const int8_t*)(row1_ptr + block_offset + 2 + lane);
             sum1 = fmaf((float)q1 * d1, x_val, sum1);
         }
 
         if (row2_ptr) {
-            float d2 = 0.0f;
-            if (lane == 0) {
-                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + (size_t)ib * 34));
-            }
-            d2 = __shfl_sync(0xffffffff, d2, 0);
-            const int8_t q2 = *(const int8_t*)(row2_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q2 = *(const int8_t*)(row2_ptr + block_offset + 2 + lane);
             sum2 = fmaf((float)q2 * d2, x_val, sum2);
         }
 
         if (row3_ptr) {
-            float d3 = 0.0f;
-            if (lane == 0) {
-                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + (size_t)ib * 34));
-            }
-            d3 = __shfl_sync(0xffffffff, d3, 0);
-            const int8_t q3 = *(const int8_t*)(row3_ptr + (size_t)ib * 34 + 2 + lane);
+            const int8_t q3 = *(const int8_t*)(row3_ptr + block_offset + 2 + lane);
             sum3 = fmaf((float)q3 * d3, x_val, sum3);
         }
     }

@@ -58,6 +58,15 @@ impl CudaBuffer {
         Ok(())
     }
 
+    /// Asynchronously zero the device buffer.
+    pub fn zero(&mut self) -> Result<()> {
+        let stream = self.slice.stream().clone();
+        stream
+            .memset_zeros(&mut self.slice)
+            .context("failed to zero device buffer")?;
+        Ok(())
+    }
+
     /// Copy device buffer data to host slice.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
         let stream = self.slice.stream().clone();
