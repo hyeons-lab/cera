@@ -168,7 +168,7 @@ pub struct CudaLfm2Model {
     pub embedding_dtype: DType,
     pub embedding_table: Option<CudaBuffer>,
     pub embedding_hidden_size: usize,
-    pub freq_factors: Option<CudaBuffer>,
+    pub rope_inv_freq: CudaBuffer,
     pub workspace: Mutex<CudaWorkspace>,
     pub seq_len: AtomicUsize,
     pub max_seq_len: usize,
@@ -354,8 +354,20 @@ impl CudaLfm2Model {
             None
         };
 
-        // RoPE frequency factors
-        let freq_factors = src.rope_freqs().map(|w| ctx.upload_f32(w)).transpose()?;
+        // Precompute RoPE inverse frequencies once on CPU, incorporating optional LLaMA-3 freq factors
+        let half_dim = (head_dim / 2).min(64);
+        let theta_scale = config.rope_theta.powf(-2.0 / head_dim as f32);
+        let mut inv_freqs = Vec::with_capacity(half_dim);
+        for i in 0..half_dim {
+            let mut f = theta_scale.powf(i as f32);
+            if let Some(factors) = src.rope_freqs() {
+                if i < factors.len() {
+                    f /= factors[i];
+                }
+            }
+            inv_freqs.push(f);
+        }
+        let rope_inv_freq = ctx.upload_f32(&inv_freqs)?;
 
         // Allocate static execution workspace (zero runtime allocations)
         let f32_size = std::mem::size_of::<f32>();
@@ -389,7 +401,7 @@ impl CudaLfm2Model {
             embedding_dtype,
             embedding_table,
             embedding_hidden_size,
-            freq_factors,
+            rope_inv_freq,
             workspace: Mutex::new(workspace),
             seq_len: AtomicUsize::new(0),
             max_seq_len,
@@ -416,6 +428,12 @@ impl CudaLfm2Model {
         ws: &mut CudaWorkspace,
         compute_logits: bool,
     ) -> Result<()> {
+        ensure!(
+            token_id < self.config.vocab_size,
+            "token_id {token_id} out of range (vocab_size={})",
+            self.config.vocab_size
+        );
+
         let hs = self.config.hidden_size as u32;
         let is = self.config.intermediate_size as u32;
         let eps = self.config.rms_norm_eps;
@@ -465,7 +483,7 @@ impl CudaLfm2Model {
                         eps,
                         freq_base: self.config.rope_theta,
                         rope_type: 0, // NeoX
-                        has_freq_factors: self.freq_factors.is_some() as u32,
+                        has_freq_factors: 0,
                         has_qk_norm: attn.q_norm.is_some() as u32,
                     };
                     self.ctx.qk_norm_rope(
@@ -473,7 +491,7 @@ impl CudaLfm2Model {
                         &mut ws.k,
                         attn.q_norm.as_ref(),
                         attn.k_norm.as_ref(),
-                        self.freq_factors.as_ref(),
+                        Some(&self.rope_inv_freq),
                         qk_params,
                     )?;
 
@@ -585,7 +603,9 @@ impl CudaLfm2Model {
 impl Model for CudaLfm2Model {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!tokens.is_empty(), "forward requires at least one token");
+        if tokens.is_empty() {
+            return vec![0.0f32; self.config.vocab_size];
+        }
 
         if pos == 0 {
             self.seq_len.store(0, Ordering::Relaxed);
@@ -599,11 +619,10 @@ impl Model for CudaLfm2Model {
         for (i, &token) in tokens.iter().enumerate() {
             let cur_pos = pos + i;
             let is_last = i == tokens.len() - 1;
-            assert!(
-                cur_pos < self.max_seq_len,
-                "cur_pos {cur_pos} exceeds max_seq_len {}",
-                self.max_seq_len
-            );
+            if cur_pos >= self.max_seq_len {
+                tracing::error!("cur_pos {cur_pos} exceeds max_seq_len {}", self.max_seq_len);
+                return vec![0.0f32; vocab_size];
+            }
 
             if let Err(e) = self.forward_step_device(token as usize, cur_pos, &mut ws, is_last) {
                 tracing::error!("CUDA forward step failed at pos {cur_pos}: {e:?}");
@@ -639,14 +658,15 @@ impl Model for CudaLfm2Model {
 
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(tokens.len(), 1, "CUDA forward_greedy expects single token");
+        if tokens.is_empty() {
+            return 0;
+        }
         let token = tokens[0];
         let cur_pos = pos;
-        assert!(
-            cur_pos < self.max_seq_len,
-            "cur_pos {cur_pos} exceeds max_seq_len {}",
-            self.max_seq_len
-        );
+        if cur_pos >= self.max_seq_len {
+            tracing::error!("cur_pos {cur_pos} exceeds max_seq_len {}", self.max_seq_len);
+            return 0;
+        }
 
         if cur_pos == 0 {
             self.seq_len.store(0, Ordering::Relaxed);
