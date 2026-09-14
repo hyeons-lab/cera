@@ -1,5 +1,6 @@
 pub mod bert;
 pub mod dspark;
+pub mod gemma4;
 pub mod hybrid;
 pub mod lfm2;
 pub mod llama;
@@ -721,6 +722,11 @@ pub fn load_model(
         "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
             hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
         ),
+        "gemma4" | "gemma4-assistant" => Box::new(gemma4::Gemma4Model::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
         other => bail!("unsupported architecture: {other}"),
     };
 
