@@ -1269,7 +1269,7 @@ impl GpuLfm2Model {
     /// Construct a GPU model with an externally-built [`GpuContext`].
     /// The wasm/WebGPU entry point: callers build the context with
     /// `GpuContext::new_async().await` (browser init is async) and hand it in.
-    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, with classic Mistral served under `llama`).
+    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, with classic Mistral served under `llama`).
     pub fn from_gguf_with_ctx(
         gguf: GgufFile,
         context_size: usize,
@@ -1278,7 +1278,7 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" => {
+            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" => {
                 let cpu_model = super::llama::LlamaModel::from_gguf_with_id(
                     gguf,
                     context_size,
@@ -1303,10 +1303,10 @@ impl GpuLfm2Model {
     }
 
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
-    /// Mistral/Granite): the `LlamaModel` family. Mirrors `from_gguf_with_id`
+    /// Mistral/Granite/MiniCPM): the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of
     /// `Lfm2Model`. The GPU forward path is arch-generic; per-arch behavior
-    /// (NEOX/NORM rope, QK-norm, QKV bias, untied output, Granite scalars) is
+    /// (NEOX/NORM rope, QK-norm, QKV bias, untied output, Granite/MiniCPM scalars) is
     /// driven by the `GpuWeightSource` accessors + `config`.
     pub fn from_llama_with_id(
         gguf: GgufFile,
