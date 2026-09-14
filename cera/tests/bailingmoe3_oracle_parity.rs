@@ -729,3 +729,66 @@ fn bailingmoe3_prefill_rejects_divergent_start_pos() {
         "state.seq_len must remain untouched on sequence monotonicity failure"
     );
 }
+
+#[test]
+fn bailingmoe3_rejects_kv_heads_greater_than_one() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+
+    let mut gguf = GgufFile::open(&path).expect("open test_bailingmoe3.gguf");
+    let mut head_count_kv = gguf
+        .get_i32_array("bailingmoe3.attention.head_count_kv")
+        .unwrap_or_else(|| vec![0, 0, 0, 1]);
+    head_count_kv[3] = 2;
+    gguf.metadata.insert(
+        "bailingmoe3.attention.head_count_kv".to_string(),
+        cera::gguf::GgufValue::Array(
+            head_count_kv
+                .into_iter()
+                .map(cera::gguf::GgufValue::I32)
+                .collect(),
+        ),
+    );
+
+    let res = BailingMoe3Model::from_gguf(gguf, 256);
+    assert!(res.is_err(), "should reject head_count_kv > 1 for MLA");
+}
+
+#[test]
+fn bailingmoe3_rejects_malformed_token_embd_shape() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+
+    let mut gguf = GgufFile::open(&path).expect("open test_bailingmoe3.gguf");
+    if let Some(t) = gguf.tensors.get_mut("token_embd.weight") {
+        t.shape = vec![32, 260];
+    }
+
+    let res = BailingMoe3Model::from_gguf(gguf, 256);
+    assert!(res.is_err(), "should reject mismatched token_embd shape");
+}
+
+#[test]
+fn bailingmoe3_rejects_malformed_output_shape() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+
+    let mut gguf = GgufFile::open(&path).expect("open test_bailingmoe3.gguf");
+    if let Some(t) = gguf.tensors.get_mut("output.weight") {
+        t.shape = vec![64, 100];
+    }
+
+    let res = BailingMoe3Model::from_gguf(gguf, 256);
+    assert!(res.is_err(), "should reject mismatched output shape");
+}
+
+#[test]
+fn rmsnorm_empty_slice_does_not_panic_or_nan() {
+    let mut x: [f32; 0] = [];
+    let w: [f32; 0] = [];
+    cera::backend::cpu::rmsnorm(&mut x, &w, 1e-5);
+    cera::backend::cpu::rmsnorm_unweighted(&mut x, 1e-5);
+}

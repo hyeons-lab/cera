@@ -148,10 +148,10 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `minicpm` | MiniCPM / MiniCPM5 (MiniCPM-1B / 2B) |
 | `nanbeige` | Nanbeige 4.2 (looped-layer dense transformer) |
 | `phi3`, `phi` | Microsoft Phi-3-mini, Phi-3.5-mini, and Phi-4-mini (fused QKV, packed SwiGLU FFN) |
+| `mistral3` | Ministral 3 (Norm YaRN RoPE, attention temperature scaling, Tekken BPE) |
 | `bailingmoe3`, `bailingmoe` | Ling 3.0 Tiny (hybrid KDA linear, MLA latent attention, and MoE) |
 
-Any other architecture errors out with `unsupported architecture: <name>` (this
-includes the newer `mistral3`/`mistral4` layouts). No Granite 4.0 model loads
+Any other architecture errors out with `unsupported architecture: <name>`. No Granite 4.0 model loads
 today: the 4.0-H hybrids convert to the separate arch `granitehybrid`; the
 non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do convert to `granite`,
 but write `attention.head_count_kv` as a per-layer array the loader does not yet

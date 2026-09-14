@@ -128,7 +128,7 @@ impl BailingMoe3Model {
 
         ensure!(
             arch == "bailingmoe3" || arch == "bailingmoe" || arch == "bailingmoe2",
-            "expected architecture 'bailingmoe3', got '{arch}'"
+            "expected architecture 'bailingmoe', 'bailingmoe2', or 'bailingmoe3', got '{arch}'"
         );
 
         let prefix = ["bailingmoe3", "bailingmoe2", "bailingmoe", arch.as_str()]
@@ -276,6 +276,10 @@ impl BailingMoe3Model {
                 block_types.push(BlockType::DeltaNet);
                 kv_heads_per_layer.push(0);
             } else {
+                ensure!(
+                    kv_heads == 1,
+                    "bailingmoe3 MLA attention requires head_count_kv == 1, got {kv_heads}"
+                );
                 block_types.push(BlockType::Attention);
                 kv_heads_per_layer.push(1);
             }
@@ -301,7 +305,16 @@ impl BailingMoe3Model {
         let embd_tensor = gguf
             .get_tensor("token_embd.weight")
             .context("missing token_embd.weight")?;
-        let vocab_size = embd_tensor.shape()[1];
+        let embd_shape = embd_tensor.shape();
+        ensure!(
+            embd_shape.len() >= 2 && embd_shape[0] == hidden_size,
+            "invalid token_embd.weight shape: {embd_shape:?}, expected [{hidden_size}, vocab_size]"
+        );
+        let vocab_size = embd_shape[1];
+        ensure!(
+            vocab_size > 0,
+            "token_embd.weight vocab_size must be positive"
+        );
         let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
 
         let output_norm_weight = gguf
@@ -315,6 +328,14 @@ impl BailingMoe3Model {
         );
 
         let output_ref = if gguf.tensors.contains_key("output.weight") {
+            let out_tensor = gguf
+                .get_tensor("output.weight")
+                .context("missing output.weight")?;
+            let out_shape = out_tensor.shape();
+            ensure!(
+                out_shape.len() >= 2 && out_shape[0] == hidden_size && out_shape[1] == vocab_size,
+                "invalid output.weight shape: {out_shape:?}, expected [{hidden_size}, {vocab_size}]"
+            );
             Some(transformer::resolve_weight(&gguf, "output.weight")?)
         } else {
             None

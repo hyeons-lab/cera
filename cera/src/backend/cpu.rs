@@ -2978,6 +2978,9 @@ unsafe fn rmsnorm_unweighted_neon(ptr: *mut f32, n: usize, eps: f32) {
 
 /// RMS normalization in-place: x = x / rms(x) * weight.
 pub fn rmsnorm(x: &mut [f32], weight: &[f32], eps: f32) {
+    if x.is_empty() {
+        return;
+    }
     debug_assert_eq!(x.len(), weight.len());
     #[cfg(target_arch = "aarch64")]
     unsafe {
