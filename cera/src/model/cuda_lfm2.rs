@@ -573,12 +573,28 @@ impl CudaLfm2Model {
 
         Ok(())
     }
+
+    /// Zero out all recurrent convolution rolling buffers in device memory.
+    pub fn zero_conv_buffers(&self) -> Result<()> {
+        for layer in &self.layers {
+            if let CudaLayerOperator::Conv(conv) = &layer.op {
+                let mut rbuffer = conv.rbuffer.lock().unwrap_or_else(|e| e.into_inner());
+                rbuffer.zero()?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Model for CudaLfm2Model {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!tokens.is_empty(), "forward requires at least one token");
+
+        if pos == 0 {
+            self.seq_len.store(0, Ordering::Relaxed);
+            let _ = self.zero_conv_buffers();
+        }
 
         let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let vocab_size = self.config.vocab_size;
@@ -621,6 +637,15 @@ impl Model for CudaLfm2Model {
         last_logits
     }
 
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        self.forward(tokens, start_pos, state)
+    }
+
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(tokens.len(), 1, "CUDA forward_greedy expects single token");
@@ -631,6 +656,11 @@ impl Model for CudaLfm2Model {
             "cur_pos {cur_pos} exceeds max_seq_len {}",
             self.max_seq_len
         );
+
+        if cur_pos == 0 {
+            self.seq_len.store(0, Ordering::Relaxed);
+            let _ = self.zero_conv_buffers();
+        }
 
         let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let vocab_size = self.config.vocab_size as u32;

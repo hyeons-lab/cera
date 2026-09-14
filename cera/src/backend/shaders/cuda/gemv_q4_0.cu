@@ -61,23 +61,30 @@ __global__ void gemv_q4_0(
         const float x_val = x[ib * 32 + lane];
         const size_t block_offset = (size_t)ib * 18;
 
-        // Row 0
-        float d0 = 0.0f;
+        // Parallel scale loads: lanes 0..3 load FP16 scales for rows 0..3 concurrently
+        float d_lane = 0.0f;
         if (lane == 0) {
-            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+        } else if (lane == 1 && row1_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
+        } else if (lane == 2 && row2_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
+        } else if (lane == 3 && row3_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
         }
-        d0 = __shfl_sync(0xffffffff, d0, 0);
+
+        const float d0 = __shfl_sync(0xffffffff, d_lane, 0);
+        const float d1 = __shfl_sync(0xffffffff, d_lane, 1);
+        const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
+        const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
+
+        // Row 0
         const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
         const float q0 = (float)(is_hi ? (byte0 >> 4) : (byte0 & 0x0F)) - 8.0f;
         sum0 = fmaf(q0 * d0, x_val, sum0);
 
         // Row 1
         if (row1_ptr) {
-            float d1 = 0.0f;
-            if (lane == 0) {
-                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
-            }
-            d1 = __shfl_sync(0xffffffff, d1, 0);
             const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
             const float q1 = (float)(is_hi ? (byte1 >> 4) : (byte1 & 0x0F)) - 8.0f;
             sum1 = fmaf(q1 * d1, x_val, sum1);
@@ -85,11 +92,6 @@ __global__ void gemv_q4_0(
 
         // Row 2
         if (row2_ptr) {
-            float d2 = 0.0f;
-            if (lane == 0) {
-                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
-            }
-            d2 = __shfl_sync(0xffffffff, d2, 0);
             const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
             const float q2 = (float)(is_hi ? (byte2 >> 4) : (byte2 & 0x0F)) - 8.0f;
             sum2 = fmaf(q2 * d2, x_val, sum2);
@@ -97,11 +99,6 @@ __global__ void gemv_q4_0(
 
         // Row 3
         if (row3_ptr) {
-            float d3 = 0.0f;
-            if (lane == 0) {
-                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
-            }
-            d3 = __shfl_sync(0xffffffff, d3, 0);
             const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
             const float q3 = (float)(is_hi ? (byte3 >> 4) : (byte3 & 0x0F)) - 8.0f;
             sum3 = fmaf(q3 * d3, x_val, sum3);
@@ -163,23 +160,30 @@ __global__ void gemv_q4_0_accum(
         const float x_val = x[ib * 32 + lane];
         const size_t block_offset = (size_t)ib * 18;
 
-        // Row 0
-        float d0 = 0.0f;
+        // Parallel scale loads: lanes 0..3 load FP16 scales for rows 0..3 concurrently
+        float d_lane = 0.0f;
         if (lane == 0) {
-            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + block_offset));
+        } else if (lane == 1 && row1_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
+        } else if (lane == 2 && row2_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
+        } else if (lane == 3 && row3_ptr) {
+            d_lane = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
         }
-        d0 = __shfl_sync(0xffffffff, d0, 0);
+
+        const float d0 = __shfl_sync(0xffffffff, d_lane, 0);
+        const float d1 = __shfl_sync(0xffffffff, d_lane, 1);
+        const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
+        const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
+
+        // Row 0
         const uint8_t byte0 = *(row0_ptr + block_offset + 2 + byte_idx);
         const float q0 = (float)(is_hi ? (byte0 >> 4) : (byte0 & 0x0F)) - 8.0f;
         sum0 = fmaf(q0 * d0, x_val, sum0);
 
         // Row 1
         if (row1_ptr) {
-            float d1 = 0.0f;
-            if (lane == 0) {
-                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + block_offset));
-            }
-            d1 = __shfl_sync(0xffffffff, d1, 0);
             const uint8_t byte1 = *(row1_ptr + block_offset + 2 + byte_idx);
             const float q1 = (float)(is_hi ? (byte1 >> 4) : (byte1 & 0x0F)) - 8.0f;
             sum1 = fmaf(q1 * d1, x_val, sum1);
@@ -187,11 +191,6 @@ __global__ void gemv_q4_0_accum(
 
         // Row 2
         if (row2_ptr) {
-            float d2 = 0.0f;
-            if (lane == 0) {
-                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + block_offset));
-            }
-            d2 = __shfl_sync(0xffffffff, d2, 0);
             const uint8_t byte2 = *(row2_ptr + block_offset + 2 + byte_idx);
             const float q2 = (float)(is_hi ? (byte2 >> 4) : (byte2 & 0x0F)) - 8.0f;
             sum2 = fmaf(q2 * d2, x_val, sum2);
@@ -199,11 +198,6 @@ __global__ void gemv_q4_0_accum(
 
         // Row 3
         if (row3_ptr) {
-            float d3 = 0.0f;
-            if (lane == 0) {
-                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + block_offset));
-            }
-            d3 = __shfl_sync(0xffffffff, d3, 0);
             const uint8_t byte3 = *(row3_ptr + block_offset + 2 + byte_idx);
             const float q3 = (float)(is_hi ? (byte3 >> 4) : (byte3 & 0x0F)) - 8.0f;
             sum3 = fmaf(q3 * d3, x_val, sum3);

@@ -32,8 +32,9 @@ __global__ void gemm_q4_0(
     float* __restrict__ y,
     GemmParams params
 ) {
-    __shared__ float s_x[TILE_M][32];
-    __shared__ int8_t s_w[TILE_N][32];
+    // Pad s_x to 33 floats and s_w to 36 int8 to eliminate shared memory bank conflicts
+    __shared__ float s_x[TILE_M][33];
+    __shared__ int8_t s_w[TILE_N][36];
     __shared__ float s_d[TILE_N];
 
     const uint32_t tx = threadIdx.x; // 0..15 (output row within tile)
@@ -124,8 +125,9 @@ __global__ void gemm_q4_0_accum(
     float* __restrict__ y,
     GemmParams params
 ) {
-    __shared__ float s_x[TILE_M][32];
-    __shared__ int8_t s_w[TILE_N][32];
+    // Pad s_x to 33 floats and s_w to 36 int8 to eliminate shared memory bank conflicts
+    __shared__ float s_x[TILE_M][33];
+    __shared__ int8_t s_w[TILE_N][36];
     __shared__ float s_d[TILE_N];
 
     const uint32_t tx = threadIdx.x;
