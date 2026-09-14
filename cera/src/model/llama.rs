@@ -215,6 +215,11 @@ impl LlamaModel {
                 || gguf.metadata.keys().any(|k| k.starts_with("mistral3.")))
         {
             "mistral3"
+        } else if arch == "phi"
+            && (!gguf.metadata.contains_key("phi.block_count")
+                && gguf.metadata.contains_key("phi3.block_count"))
+        {
+            "phi3"
         } else {
             arch.as_str()
         };
@@ -222,7 +227,7 @@ impl LlamaModel {
 
         // RoPE layout per arch. Qwen, Gemma 2, Olmo 2, and Olmo 3 GGUFs are NEOX (split-halves);
         let rope_type = match prefix {
-            "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
+            "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" | "phi3" | "phi" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
             "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3"
             | "ministral3" | "ministral" => RopeType::Norm,
@@ -504,7 +509,7 @@ impl LlamaModel {
             .unwrap_or(128000) as usize;
         let max_seq_len = context_size.min(gguf_max_seq_len);
         let default_rope_theta = match prefix {
-            "gemma2" | "minicpm" | "minicpm5" | "nanbeige" => 10_000.0,
+            "gemma2" | "minicpm" | "minicpm5" | "nanbeige" | "phi3" | "phi" => 10_000.0,
             _ => 1_000_000.0,
         };
         let rope_theta = gguf
@@ -569,12 +574,33 @@ impl LlamaModel {
         };
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
-        let output_norm_weight = gguf.get_tensor("output_norm.weight")?.to_f32_vec();
+        let output_norm_weight = gguf.get_tensor("output_norm.weight")?.try_to_f32_vec()?;
         ensure!(
             output_norm_weight.len() == hidden_size,
             "output_norm length {} != hidden_size ({hidden_size})",
             output_norm_weight.len()
         );
+
+        let q_dim = config
+            .n_heads
+            .checked_mul(head_dim)
+            .context("q_dim overflow")?;
+        let k_dim = config
+            .n_kv_heads
+            .checked_mul(head_dim)
+            .context("k_dim overflow")?;
+        let v_dim = config
+            .n_kv_heads
+            .checked_mul(head_dim)
+            .context("v_dim overflow")?;
+        let qkv_dim = q_dim
+            .checked_add(k_dim)
+            .and_then(|s| s.checked_add(v_dim))
+            .context("qkv dimension overflow")?;
+        let double_intermediate = config
+            .intermediate_size
+            .checked_mul(2)
+            .context("intermediate size overflow")?;
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
@@ -598,7 +624,7 @@ impl LlamaModel {
             // cpu::rmsnorm without runtime offset addition matches upstream GGUF semantics.
             let attn_norm_name = format!("blk.{i}.attn_norm.weight");
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
-                gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
+                gguf.get_tensor(&attn_norm_name)?.try_to_f32_vec()?
             } else if norm_order == NormOrder::PostNorm {
                 Vec::new()
             } else {
@@ -615,7 +641,7 @@ impl LlamaModel {
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
-                gguf.get_tensor(&ffn_norm_name)?.to_f32_vec()
+                gguf.get_tensor(&ffn_norm_name)?.try_to_f32_vec()?
             } else if norm_order == NormOrder::PostNorm {
                 Vec::new()
             } else {
@@ -637,7 +663,10 @@ impl LlamaModel {
             ]
             .into_iter()
             .find(|name| gguf.tensors.contains_key(name))
-            .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
+            .map(|name| -> anyhow::Result<Vec<f32>> {
+                let t = gguf.get_tensor(&name)?;
+                Ok(t.try_to_f32_vec()?)
+            })
             .transpose()?;
             if norm_order == NormOrder::PostNorm {
                 ensure!(
@@ -660,7 +689,10 @@ impl LlamaModel {
             ]
             .into_iter()
             .find(|name| gguf.tensors.contains_key(name))
-            .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
+            .map(|name| -> anyhow::Result<Vec<f32>> {
+                let t = gguf.get_tensor(&name)?;
+                Ok(t.try_to_f32_vec()?)
+            })
             .transpose()?;
             if norm_order == NormOrder::PostNorm {
                 ensure!(
@@ -686,8 +718,8 @@ impl LlamaModel {
                 "layer {i} asymmetric QK-norm: `{q_norm_name}` and `{k_norm_name}` must both be present or both absent"
             );
             if gguf.tensors.contains_key(&q_norm_name) {
-                let q_w = gguf.get_tensor(&q_norm_name)?.to_f32_vec();
-                let k_w = gguf.get_tensor(&k_norm_name)?.to_f32_vec();
+                let q_w = gguf.get_tensor(&q_norm_name)?.try_to_f32_vec()?;
+                let k_w = gguf.get_tensor(&k_norm_name)?.try_to_f32_vec()?;
                 let q_dim = n_heads * head_dim;
                 let kv_dim = n_kv_heads * head_dim;
                 ensure!(
@@ -715,21 +747,56 @@ impl LlamaModel {
                 attn_k_norm_weights.push(None);
             }
 
-            // Qwen2 Q/K/V biases: gate on tensor presence.
+            // Attention Q/K/V biases: support both fused `attn_qkv.bias` (Phi-3) and
+            // separate `attn_q.bias`, `attn_k.bias`, `attn_v.bias` (Qwen2).
+            let qkv_bias_name = format!("blk.{i}.attn_qkv.bias");
             let q_bias_name = format!("blk.{i}.attn_q.bias");
             let k_bias_name = format!("blk.{i}.attn_k.bias");
             let v_bias_name = format!("blk.{i}.attn_v.bias");
-            if gguf.tensors.contains_key(&q_bias_name) {
-                attn_q_bias.push(Some(gguf.get_tensor(&q_bias_name)?.to_f32_vec()));
-                attn_k_bias.push(Some(gguf.get_tensor(&k_bias_name)?.to_f32_vec()));
-                attn_v_bias.push(Some(gguf.get_tensor(&v_bias_name)?.to_f32_vec()));
+            if gguf.tensors.contains_key(&qkv_bias_name) {
+                let qkv_b = gguf.get_tensor(&qkv_bias_name)?.try_to_f32_vec()?;
+                ensure!(
+                    qkv_b.len() == qkv_dim,
+                    "invalid {qkv_bias_name} length {} for layer {i} (expected {qkv_dim})",
+                    qkv_b.len()
+                );
+                ensure!(
+                    qkv_b.iter().all(|v| v.is_finite()),
+                    "non-finite value detected in {qkv_bias_name} for layer {i}"
+                );
+                attn_q_bias.push(Some(qkv_b[..q_dim].to_vec()));
+                attn_k_bias.push(Some(qkv_b[q_dim..q_dim + k_dim].to_vec()));
+                attn_v_bias.push(Some(qkv_b[q_dim + k_dim..qkv_dim].to_vec()));
+            } else if gguf.tensors.contains_key(&q_bias_name) {
+                let qb = gguf.get_tensor(&q_bias_name)?.try_to_f32_vec()?;
+                let kb = gguf.get_tensor(&k_bias_name)?.try_to_f32_vec()?;
+                let vb = gguf.get_tensor(&v_bias_name)?.try_to_f32_vec()?;
+                ensure!(
+                    qb.len() == q_dim && kb.len() == k_dim && vb.len() == v_dim,
+                    "invalid Q/K/V bias lengths ({}, {}, {}) for layer {i} (expected {}, {}, {})",
+                    qb.len(),
+                    kb.len(),
+                    vb.len(),
+                    q_dim,
+                    k_dim,
+                    v_dim
+                );
+                ensure!(
+                    qb.iter().all(|v| v.is_finite())
+                        && kb.iter().all(|v| v.is_finite())
+                        && vb.iter().all(|v| v.is_finite()),
+                    "non-finite value detected in Q/K/V bias for layer {i}"
+                );
+                attn_q_bias.push(Some(qb));
+                attn_k_bias.push(Some(kb));
+                attn_v_bias.push(Some(vb));
             } else {
                 attn_q_bias.push(None);
                 attn_k_bias.push(None);
                 attn_v_bias.push(None);
             }
 
-            // Optional projection and FFN biases (Mistral 3).
+            // Optional projection and FFN biases (Mistral 3 / Phi-3).
             let load_optional_bias =
                 |name: &str, expected_len: usize| -> Result<Option<Vec<f32>>> {
                     if gguf.tensors.contains_key(name) {
@@ -753,42 +820,166 @@ impl LlamaModel {
                 &format!("blk.{i}.attn_output.bias"),
                 config.hidden_size,
             )?);
-            ffn_gate_bias.push(load_optional_bias(
-                &format!("blk.{i}.ffn_gate.bias"),
-                config.intermediate_size,
-            )?);
-            ffn_up_bias.push(load_optional_bias(
-                &format!("blk.{i}.ffn_up.bias"),
-                config.intermediate_size,
-            )?);
+            let ffn_gate_bias_name = format!("blk.{i}.ffn_gate.bias");
+            let ffn_up_bias_name = format!("blk.{i}.ffn_up.bias");
+            if gguf.tensors.contains_key(&ffn_gate_bias_name) {
+                ffn_gate_bias.push(load_optional_bias(
+                    &ffn_gate_bias_name,
+                    config.intermediate_size,
+                )?);
+                ffn_up_bias.push(load_optional_bias(
+                    &ffn_up_bias_name,
+                    config.intermediate_size,
+                )?);
+            } else if gguf.tensors.contains_key(&ffn_up_bias_name) {
+                let b = gguf.get_tensor(&ffn_up_bias_name)?.try_to_f32_vec()?;
+                ensure!(
+                    b.iter().all(|v| v.is_finite()),
+                    "non-finite value detected in {ffn_up_bias_name} for layer {i}"
+                );
+                if b.len() == double_intermediate {
+                    ffn_gate_bias.push(Some(b[..config.intermediate_size].to_vec()));
+                    ffn_up_bias.push(Some(b[config.intermediate_size..].to_vec()));
+                } else if b.len() == config.intermediate_size {
+                    ffn_gate_bias.push(None);
+                    ffn_up_bias.push(Some(b));
+                } else {
+                    bail!(
+                        "invalid {ffn_up_bias_name} length {} for layer {i} (expected {} or {})",
+                        b.len(),
+                        config.intermediate_size,
+                        double_intermediate
+                    );
+                }
+            } else {
+                ffn_gate_bias.push(None);
+                ffn_up_bias.push(None);
+            }
+
             ffn_down_bias.push(load_optional_bias(
                 &format!("blk.{i}.ffn_down.bias"),
                 config.hidden_size,
             )?);
 
+            // Projection weights: support both fused `attn_qkv.weight` (Phi-3) and
+            // separate `attn_q.weight`, `attn_k.weight`, `attn_v.weight`.
+            let qkv_weight_name = format!("blk.{i}.attn_qkv.weight");
+            let (attn_q, attn_k, attn_v) = if gguf.tensors.contains_key(&qkv_weight_name) {
+                let qkv_ref = transformer::resolve_weight(&gguf, &qkv_weight_name)?;
+                ensure!(
+                    qkv_ref.m == qkv_dim,
+                    "fused {qkv_weight_name} row count {} does not match expected {qkv_dim}",
+                    qkv_ref.m
+                );
+                ensure!(
+                    qkv_ref.k == config.hidden_size,
+                    "fused {qkv_weight_name} inner dimension k={} does not match hidden_size={}",
+                    qkv_ref.k,
+                    config.hidden_size
+                );
+                let q = qkv_ref.slice_rows(0, q_dim)?;
+                let k = qkv_ref.slice_rows(q_dim, k_dim)?;
+                let v = qkv_ref.slice_rows(q_dim + k_dim, v_dim)?;
+                (q, k, v)
+            } else {
+                let q = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?;
+                let k = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?;
+                let v = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?;
+                ensure!(
+                    q.m == q_dim && k.m == k_dim && v.m == v_dim,
+                    "mismatched Q/K/V rows for layer {i}: q={}, k={}, v={} (expected {}, {}, {})",
+                    q.m,
+                    k.m,
+                    v.m,
+                    q_dim,
+                    k_dim,
+                    v_dim
+                );
+                ensure!(
+                    q.k == config.hidden_size
+                        && k.k == config.hidden_size
+                        && v.k == config.hidden_size,
+                    "mismatched Q/K/V inner dimension k for layer {i}: q={}, k={}, v={} (expected {})",
+                    q.k,
+                    k.k,
+                    v.k,
+                    config.hidden_size
+                );
+                (q, k, v)
+            };
+
+            // FFN weights: support both separate `ffn_gate.weight` and `ffn_up.weight` or
+            // packed `ffn_up.weight` containing both gate and up stacked row-wise (Phi-3).
+            let ffn_gate_name = format!("blk.{i}.ffn_gate.weight");
+            let ffn_up_name = format!("blk.{i}.ffn_up.weight");
+            let (ffn_gate, ffn_up) = if gguf.tensors.contains_key(&ffn_gate_name) {
+                let gate = transformer::resolve_weight(&gguf, &ffn_gate_name)?;
+                let up = transformer::resolve_weight(&gguf, &ffn_up_name)?;
+                ensure!(
+                    gate.m == config.intermediate_size && up.m == config.intermediate_size,
+                    "mismatched FFN gate/up rows for layer {i}: gate={}, up={} (expected {})",
+                    gate.m,
+                    up.m,
+                    config.intermediate_size
+                );
+                ensure!(
+                    gate.k == config.hidden_size && up.k == config.hidden_size,
+                    "mismatched FFN gate/up inner dimension k for layer {i}: gate={}, up={} (expected {})",
+                    gate.k,
+                    up.k,
+                    config.hidden_size
+                );
+                (gate, up)
+            } else {
+                let packed_up = transformer::resolve_weight(&gguf, &ffn_up_name)?;
+                ensure!(
+                    packed_up.m == double_intermediate,
+                    "packed {ffn_up_name} row count {} does not match expected {double_intermediate}",
+                    packed_up.m
+                );
+                ensure!(
+                    packed_up.k == config.hidden_size,
+                    "packed {ffn_up_name} inner dimension k={} does not match hidden_size={}",
+                    packed_up.k,
+                    config.hidden_size
+                );
+                let gate = packed_up.slice_rows(0, config.intermediate_size)?;
+                let up =
+                    packed_up.slice_rows(config.intermediate_size, config.intermediate_size)?;
+                (gate, up)
+            };
+
+            let attn_output =
+                transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_output.weight"))?;
+            ensure!(
+                attn_output.m == config.hidden_size && attn_output.k == q_dim,
+                "mismatched attn_output dimensions for layer {i}: m={}, k={} (expected m={}, k={})",
+                attn_output.m,
+                attn_output.k,
+                config.hidden_size,
+                q_dim
+            );
+            let ffn_down = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?;
+            ensure!(
+                ffn_down.m == config.hidden_size && ffn_down.k == config.intermediate_size,
+                "mismatched ffn_down dimensions for layer {i}: m={}, k={} (expected m={}, k={})",
+                ffn_down.m,
+                ffn_down.k,
+                config.hidden_size,
+                config.intermediate_size
+            );
+
             // `.with_repack` on the projection weights only: these are the ones
             // that hit the batched prefill GEMM at `n > 1`. token_embd / output
-            // stay excluded, though no longer because the head runs at `n = 1` (see
-            // `WeightRef::with_repack` for why that reason expired and what would
-            // have to be measured to change this).
+            // stay excluded.
             layer_refs.push(LayerWeightRefs {
-                attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
-                    .with_repack(&gguf),
-                attn_k: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
-                    .with_repack(&gguf),
-                attn_v: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?
-                    .with_repack(&gguf),
-                attn_output: transformer::resolve_weight(
-                    &gguf,
-                    &format!("blk.{i}.attn_output.weight"),
-                )?
-                .with_repack(&gguf),
-                ffn_gate: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                    .with_repack(&gguf),
-                ffn_up: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?
-                    .with_repack(&gguf),
-                ffn_down: transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?
-                    .with_repack(&gguf),
+                attn_q: attn_q.with_repack(&gguf),
+                attn_k: attn_k.with_repack(&gguf),
+                attn_v: attn_v.with_repack(&gguf),
+                attn_output: attn_output.with_repack(&gguf),
+                ffn_gate: ffn_gate.with_repack(&gguf),
+                ffn_up: ffn_up.with_repack(&gguf),
+                ffn_down: ffn_down.with_repack(&gguf),
             });
         }
 
@@ -885,7 +1076,7 @@ impl LlamaModel {
         let rope_freqs = gguf
             .get_tensor("rope_freqs.weight")
             .ok()
-            .map(|t| t.to_f32_vec());
+            .and_then(|t| t.try_to_f32_vec().ok());
         if let Some(rf) = &rope_freqs {
             ensure!(
                 rf.len() == head_dim / 2,
@@ -947,7 +1138,19 @@ impl LlamaModel {
         }
     }
 
-    /// Return sliding window size for layer `il`, or `None` if it is a full attention layer.
+    /// Return the global sliding window size if configured.
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
+    }
+
+    /// Return whether any layer specifies projection or FFN biases.
+    pub fn has_projection_or_ffn_biases(&self) -> bool {
+        self.attn_output_bias.iter().any(Option::is_some)
+            || self.ffn_gate_bias.iter().any(Option::is_some)
+            || self.ffn_up_bias.iter().any(Option::is_some)
+            || self.ffn_down_bias.iter().any(Option::is_some)
+    }
+
     pub fn layer_sliding_window(&self, il: usize) -> Option<usize> {
         if self.is_swa_layer(il) {
             self.sliding_window

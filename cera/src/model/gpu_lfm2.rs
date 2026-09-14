@@ -1281,12 +1281,23 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" | "nanbeige" => {
+            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" | "nanbeige"
+            | "phi3" | "phi" => {
                 let cpu_model = super::llama::LlamaModel::from_gguf_with_id(
                     gguf,
                     context_size,
                     model_id.clone(),
                 )?;
+                if let Some(sw) = cpu_model.sliding_window() {
+                    tracing::warn!(
+                        "Model specifies sliding window attention ({sw} tokens), which is not accelerated on WebGPU; full dense attention will be applied"
+                    );
+                }
+                if cpu_model.has_projection_or_ffn_biases() {
+                    tracing::warn!(
+                        "Model specifies projection or FFN biases, which are not accelerated on WebGPU; biases will be omitted in GPU forward passes"
+                    );
+                }
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
             "lfm2" | "lfm2moe" => {
@@ -1319,6 +1330,16 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let cpu_model =
             super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id.clone())?;
+        if let Some(sw) = cpu_model.sliding_window() {
+            tracing::warn!(
+                "Model specifies sliding window attention ({sw} tokens), which is not accelerated on WebGPU; full dense attention will be applied"
+            );
+        }
+        if cpu_model.has_projection_or_ffn_biases() {
+            tracing::warn!(
+                "Model specifies projection or FFN biases, which are not accelerated on WebGPU; biases will be omitted in GPU forward passes"
+            );
+        }
         Self::from_weight_source(&cpu_model, context_size, model_id)
     }
 
@@ -1626,11 +1647,12 @@ impl GpuLfm2Model {
         }
         let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
-        let mut uploaded_weights: std::collections::HashMap<u64, GpuWeight> =
+        let mut uploaded_weights: std::collections::HashMap<(u64, usize), GpuWeight> =
             std::collections::HashMap::new();
 
         let mut upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
-            if let Some(existing) = uploaded_weights.get(&wref.start) {
+            let key = (wref.start, wref.size);
+            if let Some(existing) = uploaded_weights.get(&key) {
                 return existing.clone();
             }
             let (buf, dtype) = if matches!(
@@ -1678,7 +1700,7 @@ impl GpuLfm2Model {
                 params_buf,
                 cached_bg: None,
             };
-            uploaded_weights.insert(wref.start, weight.clone());
+            uploaded_weights.insert(key, weight.clone());
             weight
         };
 
