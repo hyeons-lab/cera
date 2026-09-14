@@ -147,6 +147,7 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
 | `minicpm` | MiniCPM / MiniCPM5 (MiniCPM-1B / 2B) |
 | `nanbeige` | Nanbeige 4.2 (looped-layer dense transformer) |
+| `phi3`, `phi` | Microsoft Phi-3-mini, Phi-3.5-mini, and Phi-4-mini (fused QKV, packed SwiGLU FFN) |
 
 Any other architecture errors out with `unsupported architecture: <name>` (this
 includes the newer `mistral3`/`mistral4` layouts). No Granite 4.0 model loads

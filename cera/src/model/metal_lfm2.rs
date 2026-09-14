@@ -676,6 +676,11 @@ impl MetalLfm2Model {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cpu = super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?;
+        if let Some(sw) = cpu.sliding_window() {
+            tracing::warn!(
+                "Model specifies sliding window attention ({sw} tokens), which is not accelerated on Metal; full dense attention will be applied"
+            );
+        }
         Self::from_weight_source(&cpu, path, context_size)
     }
 
