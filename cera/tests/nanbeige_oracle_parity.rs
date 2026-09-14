@@ -134,7 +134,7 @@ fn nanbeige_matches_llama_cpp_oracle() {
         let diff = rel_diff(got, exp);
         eprintln!("[nanbeige] {node}: cera={got:.6} llama={exp:.6} rel_diff={diff:.6}");
         assert!(
-            diff < 0.01,
+            diff < 0.0002,
             "node {node} diverged: cera={got} llama={exp} diff={diff}"
         );
     }

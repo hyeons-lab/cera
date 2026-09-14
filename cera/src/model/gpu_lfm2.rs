@@ -309,6 +309,7 @@ fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_
 }
 
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
+#[derive(Clone)]
 struct GpuWeight {
     tensor: GpuTensor,
     /// Pre-allocated params buffer with [m, k, row_base, 0] — eliminates per-dispatch allocation.
@@ -1624,7 +1625,13 @@ impl GpuLfm2Model {
         }
         let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
-        let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
+        let mut uploaded_weights: std::collections::HashMap<u64, GpuWeight> =
+            std::collections::HashMap::new();
+
+        let mut upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
+            if let Some(existing) = uploaded_weights.get(&wref.start) {
+                return existing.clone();
+            }
             let (buf, dtype) = if matches!(
                 wref.dtype,
                 DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
@@ -1661,7 +1668,7 @@ impl GpuLfm2Model {
                 bytemuck::cast_slice(&[wref.m as u32, wref.k as u32, 0u32, 0u32]),
                 &format!("{name}.params"),
             );
-            GpuWeight {
+            let weight = GpuWeight {
                 tensor: GpuTensor {
                     buffer: buf,
                     dtype,
@@ -1669,7 +1676,9 @@ impl GpuLfm2Model {
                 },
                 params_buf,
                 cached_bg: None,
-            }
+            };
+            uploaded_weights.insert(wref.start, weight.clone());
+            weight
         };
 
         // Optional per-head QK-norm (Qwen3) and QKV bias (Qwen2) upload helpers.

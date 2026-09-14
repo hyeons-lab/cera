@@ -233,6 +233,7 @@ impl Clone for GpuContext {
 }
 
 /// A tensor stored on the GPU.
+#[derive(Clone)]
 pub struct GpuTensor {
     pub buffer: wgpu::Buffer,
     pub dtype: DType,

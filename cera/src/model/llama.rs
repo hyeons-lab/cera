@@ -1954,13 +1954,25 @@ impl LlamaModel {
                 .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
                 && (layer + 1) < cfg.n_layers
             {
-                for j in 0..n {
-                    for i in 0..hs {
-                        norm_col[i] = hidden[i * n + j];
-                    }
-                    cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
-                    for i in 0..hs {
-                        hidden[i * n + j] = norm_col[i];
+                if n == 1 {
+                    cpu::rmsnorm(
+                        &mut hidden[..hs],
+                        &self.output_norm_weight,
+                        cfg.rms_norm_eps,
+                    );
+                } else {
+                    const TILE_TOKENS: usize = 32;
+                    for j_start in (0..n).step_by(TILE_TOKENS) {
+                        let j_end = (j_start + TILE_TOKENS).min(n);
+                        for j in j_start..j_end {
+                            for i in 0..hs {
+                                norm_col[i] = hidden[i * n + j];
+                            }
+                            cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
+                            for i in 0..hs {
+                                hidden[i * n + j] = norm_col[i];
+                            }
+                        }
                     }
                 }
             }
