@@ -469,6 +469,7 @@ impl Lfm2Model {
             rms_norm_eps,
             block_types,
             conv_kernel_size,
+            ssm: None,
             kv_heads_per_layer,
             scalars: ScalarMultipliers::default(),
             moe,
