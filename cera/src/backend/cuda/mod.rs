@@ -429,7 +429,7 @@ impl CudaContext {
             "gather_embedding",
             "gather_embedding_q8_0",
         )?;
-        let threads = 128u32.min(hidden_size / 32).max(32);
+        let threads = (hidden_size / 32 * 32).clamp(32, 256);
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (threads, 1, 1),
@@ -460,7 +460,7 @@ impl CudaContext {
             "gather_embedding",
             "gather_embedding_q4_0",
         )?;
-        let threads = 128u32.min(hidden_size / 32).max(32);
+        let threads = (hidden_size / 32 * 32).clamp(32, 256);
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (threads, 1, 1),
