@@ -2001,6 +2001,25 @@ pub fn gemv_q4_0_gate_up_swiglu_with_q8(
     }
 }
 
+/// Fused Gate + Up Q4_K GEMV with in-register SwiGLU:
+/// `out[r] = silu(gate[r] * x) * (up[r] * x)`.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q4k_gate_up_swiglu_with_q8(
+    gate_quant: &[u8],
+    up_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q4k_gate_up_swiglu_neon(
+            gate_quant, up_quant, x_scales, x_quants, out, m, k,
+        );
+    }
+}
+
 /// Unified 3-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
 /// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
 #[cfg(target_arch = "aarch64")]

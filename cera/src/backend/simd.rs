@@ -1871,6 +1871,284 @@ pub(crate) mod neon {
         }
     }
 
+    /// Fused Q4_K gate + up GEMV + SwiGLU:
+    /// `out[r] = silu(gate[r] @ x) * (up[r] @ x)`.
+    /// Shares activation loads and precomputed column sums across both projections,
+    /// eliminating intermediate buffers and the separate silu_mul pass.
+    pub unsafe fn gemv_q4k_gate_up_swiglu_neon(
+        gate_quant: &[u8],
+        up_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        out: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
+
+        if cpu_features().tier < CpuTier::NeonDotprod {
+            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
+            let mut up_tmp = vec![0.0f32; out.len()];
+            crate::backend::cpu::gemv_q4km_f32(gate_quant, &xf, out, out.len(), k);
+            crate::backend::cpu::gemv_q4km_f32(up_quant, &xf, &mut up_tmp, out.len(), k);
+            crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
+            return;
+        }
+
+        let nb32 = k / 32;
+        let mut stack_xqs = [0i32; 1024];
+        let mut heap_xqs;
+        let xqs: &[i32] = if nb32 <= 1024 {
+            unsafe { q8_0_col_sums_slice(x_quants, 1, k, &mut stack_xqs[..nb32]) };
+            &stack_xqs[..nb32]
+        } else {
+            heap_xqs = vec![0i32; nb32];
+            unsafe { q8_0_col_sums_slice(x_quants, 1, k, &mut heap_xqs) };
+            &heap_xqs
+        };
+
+        struct FusedQ4kPtrs {
+            g: usize,
+            u: usize,
+            xq: usize,
+            xs: usize,
+            xqs: usize,
+        }
+        impl FusedQ4kPtrs {
+            #[inline(always)]
+            fn g(&self) -> *const u8 {
+                self.g as *const u8
+            }
+            #[inline(always)]
+            fn u(&self) -> *const u8 {
+                self.u as *const u8
+            }
+            #[inline(always)]
+            fn xq(&self) -> *const i8 {
+                self.xq as *const i8
+            }
+            #[inline(always)]
+            fn xs(&self) -> *const f32 {
+                self.xs as *const f32
+            }
+            #[inline(always)]
+            fn xqs(&self) -> *const i32 {
+                self.xqs as *const i32
+            }
+        }
+
+        let ptrs = FusedQ4kPtrs {
+            g: gate_quant.as_ptr() as usize,
+            u: up_quant.as_ptr() as usize,
+            xq: x_quants.as_ptr() as usize,
+            xs: x_scales.as_ptr() as usize,
+            xqs: xqs.as_ptr() as usize,
+        };
+
+        let compute_slice = move |(start_row, chunk): (usize, &mut [f32])| unsafe {
+            let mask_0f = vdupq_n_u8(0x0F);
+            let z = vdupq_n_s32(0);
+            let num_rows = chunk.len();
+            let mut r = 0usize;
+
+            while r + 1 < num_rows {
+                let r0 = start_row + r;
+                let r1 = start_row + r + 1;
+                let row0_start = r0 * row_bytes;
+                let row1_start = r1 * row_bytes;
+
+                let mut sum_g0 = 0.0f32;
+                let mut sum_u0 = 0.0f32;
+                let mut sum_g1 = 0.0f32;
+                let mut sum_u1 = 0.0f32;
+
+                for bi in 0..blocks_per_row {
+                    let gblk0 = &*((ptrs.g().add(row0_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+                    let ublk0 = &*((ptrs.u().add(row0_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+                    let gblk1 = &*((ptrs.g().add(row1_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+                    let ublk1 = &*((ptrs.u().add(row1_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{0}, #256]",
+                        "prfm pldl1keep, [{1}, #256]",
+                        "prfm pldl1keep, [{2}, #256]",
+                        "prfm pldl1keep, [{3}, #256]",
+                        in(reg) (gblk0 as *const BlockQ4KM),
+                        in(reg) (ublk0 as *const BlockQ4KM),
+                        in(reg) (gblk1 as *const BlockQ4KM),
+                        in(reg) (ublk1 as *const BlockQ4KM),
+                        options(nostack, preserves_flags)
+                    );
+
+                    let dg0 = crate::quant::f16_to_f32(gblk0.d);
+                    let dming0 = crate::quant::f16_to_f32(gblk0.dmin);
+                    let (sc_g0, mn_g0) = crate::quant::decode_q4km_scales(&gblk0.scales);
+
+                    let du0 = crate::quant::f16_to_f32(ublk0.d);
+                    let dminu0 = crate::quant::f16_to_f32(ublk0.dmin);
+                    let (sc_u0, mn_u0) = crate::quant::decode_q4km_scales(&ublk0.scales);
+
+                    let dg1 = crate::quant::f16_to_f32(gblk1.d);
+                    let dming1 = crate::quant::f16_to_f32(gblk1.dmin);
+                    let (sc_g1, mn_g1) = crate::quant::decode_q4km_scales(&gblk1.scales);
+
+                    let du1 = crate::quant::f16_to_f32(ublk1.d);
+                    let dminu1 = crate::quant::f16_to_f32(ublk1.dmin);
+                    let (sc_u1, mn_u1) = crate::quant::decode_q4km_scales(&ublk1.scales);
+
+                    let qs_g0 = gblk0.qs.as_ptr();
+                    let qs_u0 = ublk0.qs.as_ptr();
+                    let qs_g1 = gblk1.qs.as_ptr();
+                    let qs_u1 = ublk1.qs.as_ptr();
+                    let xq_off = bi * 256;
+
+                    for j in 0..4 {
+                        let sblo = 2 * j;
+                        let sbhi = 2 * j + 1;
+                        let xlo0 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32));
+                        let xlo1 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32 + 16));
+                        let xhi0 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32));
+                        let xhi1 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32 + 16));
+
+                        let sx_lo = *ptrs.xqs().add(xq_off / 32 + sblo);
+                        let sx_hi = *ptrs.xqs().add(xq_off / 32 + sbhi);
+
+                        let xs_lo = *ptrs.xs().add((xq_off + sblo * 32) / 32);
+                        let xs_hi = *ptrs.xs().add((xq_off + sbhi * 32) / 32);
+
+                        // Gate 0
+                        let qb_g0_0 = vld1q_u8(qs_g0.add(j * 32));
+                        let qb_g0_1 = vld1q_u8(qs_g0.add(j * 32 + 16));
+                        let wlo_g0_0 = vreinterpretq_s8_u8(vandq_u8(qb_g0_0, mask_0f));
+                        let wlo_g0_1 = vreinterpretq_s8_u8(vandq_u8(qb_g0_1, mask_0f));
+                        let whi_g0_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g0_0));
+                        let whi_g0_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g0_1));
+                        let dp_g0_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_g0_0, xlo0), wlo_g0_1, xlo1));
+                        let dp_g0_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_g0_0, xhi0), whi_g0_1, xhi1));
+                        sum_g0 += xs_lo * (dg0 * sc_g0[sblo] as f32 * dp_g0_lo as f32 - dming0 * mn_g0[sblo] as f32 * sx_lo as f32);
+                        sum_g0 += xs_hi * (dg0 * sc_g0[sbhi] as f32 * dp_g0_hi as f32 - dming0 * mn_g0[sbhi] as f32 * sx_hi as f32);
+
+                        // Up 0
+                        let qb_u0_0 = vld1q_u8(qs_u0.add(j * 32));
+                        let qb_u0_1 = vld1q_u8(qs_u0.add(j * 32 + 16));
+                        let wlo_u0_0 = vreinterpretq_s8_u8(vandq_u8(qb_u0_0, mask_0f));
+                        let wlo_u0_1 = vreinterpretq_s8_u8(vandq_u8(qb_u0_1, mask_0f));
+                        let whi_u0_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u0_0));
+                        let whi_u0_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u0_1));
+                        let dp_u0_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_u0_0, xlo0), wlo_u0_1, xlo1));
+                        let dp_u0_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_u0_0, xhi0), whi_u0_1, xhi1));
+                        sum_u0 += xs_lo * (du0 * sc_u0[sblo] as f32 * dp_u0_lo as f32 - dminu0 * mn_u0[sblo] as f32 * sx_lo as f32);
+                        sum_u0 += xs_hi * (du0 * sc_u0[sbhi] as f32 * dp_u0_hi as f32 - dminu0 * mn_u0[sbhi] as f32 * sx_hi as f32);
+
+                        // Gate 1
+                        let qb_g1_0 = vld1q_u8(qs_g1.add(j * 32));
+                        let qb_g1_1 = vld1q_u8(qs_g1.add(j * 32 + 16));
+                        let wlo_g1_0 = vreinterpretq_s8_u8(vandq_u8(qb_g1_0, mask_0f));
+                        let wlo_g1_1 = vreinterpretq_s8_u8(vandq_u8(qb_g1_1, mask_0f));
+                        let whi_g1_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g1_0));
+                        let whi_g1_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g1_1));
+                        let dp_g1_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_g1_0, xlo0), wlo_g1_1, xlo1));
+                        let dp_g1_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_g1_0, xhi0), whi_g1_1, xhi1));
+                        sum_g1 += xs_lo * (dg1 * sc_g1[sblo] as f32 * dp_g1_lo as f32 - dming1 * mn_g1[sblo] as f32 * sx_lo as f32);
+                        sum_g1 += xs_hi * (dg1 * sc_g1[sbhi] as f32 * dp_g1_hi as f32 - dming1 * mn_g1[sbhi] as f32 * sx_hi as f32);
+
+                        // Up 1
+                        let qb_u1_0 = vld1q_u8(qs_u1.add(j * 32));
+                        let qb_u1_1 = vld1q_u8(qs_u1.add(j * 32 + 16));
+                        let wlo_u1_0 = vreinterpretq_s8_u8(vandq_u8(qb_u1_0, mask_0f));
+                        let wlo_u1_1 = vreinterpretq_s8_u8(vandq_u8(qb_u1_1, mask_0f));
+                        let whi_u1_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u1_0));
+                        let whi_u1_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u1_1));
+                        let dp_u1_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_u1_0, xlo0), wlo_u1_1, xlo1));
+                        let dp_u1_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_u1_0, xhi0), whi_u1_1, xhi1));
+                        sum_u1 += xs_lo * (du1 * sc_u1[sblo] as f32 * dp_u1_lo as f32 - dminu1 * mn_u1[sblo] as f32 * sx_lo as f32);
+                        sum_u1 += xs_hi * (du1 * sc_u1[sbhi] as f32 * dp_u1_hi as f32 - dminu1 * mn_u1[sbhi] as f32 * sx_hi as f32);
+                    }
+                }
+
+                chunk[r] = (sum_g0 / (1.0 + crate::backend::cpu::ggml_expf(-sum_g0))) * sum_u0;
+                chunk[r + 1] = (sum_g1 / (1.0 + crate::backend::cpu::ggml_expf(-sum_g1))) * sum_u1;
+                r += 2;
+            }
+
+            while r < num_rows {
+                let r0 = start_row + r;
+                let row0_start = r0 * row_bytes;
+                let mut sum_g0 = 0.0f32;
+                let mut sum_u0 = 0.0f32;
+
+                for bi in 0..blocks_per_row {
+                    let gblk0 = &*((ptrs.g().add(row0_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+                    let ublk0 = &*((ptrs.u().add(row0_start + bi * size_of::<BlockQ4KM>())) as *const BlockQ4KM);
+
+                    let dg0 = crate::quant::f16_to_f32(gblk0.d);
+                    let dming0 = crate::quant::f16_to_f32(gblk0.dmin);
+                    let (sc_g0, mn_g0) = crate::quant::decode_q4km_scales(&gblk0.scales);
+
+                    let du0 = crate::quant::f16_to_f32(ublk0.d);
+                    let dminu0 = crate::quant::f16_to_f32(ublk0.dmin);
+                    let (sc_u0, mn_u0) = crate::quant::decode_q4km_scales(&ublk0.scales);
+
+                    let qs_g0 = gblk0.qs.as_ptr();
+                    let qs_u0 = ublk0.qs.as_ptr();
+                    let xq_off = bi * 256;
+
+                    for j in 0..4 {
+                        let sblo = 2 * j;
+                        let sbhi = 2 * j + 1;
+                        let xlo0 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32));
+                        let xlo1 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32 + 16));
+                        let xhi0 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32));
+                        let xhi1 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32 + 16));
+
+                        let sx_lo = *ptrs.xqs().add(xq_off / 32 + sblo);
+                        let sx_hi = *ptrs.xqs().add(xq_off / 32 + sbhi);
+
+                        let xs_lo = *ptrs.xs().add((xq_off + sblo * 32) / 32);
+                        let xs_hi = *ptrs.xs().add((xq_off + sbhi * 32) / 32);
+
+                        let qb_g0_0 = vld1q_u8(qs_g0.add(j * 32));
+                        let qb_g0_1 = vld1q_u8(qs_g0.add(j * 32 + 16));
+                        let wlo_g0_0 = vreinterpretq_s8_u8(vandq_u8(qb_g0_0, mask_0f));
+                        let wlo_g0_1 = vreinterpretq_s8_u8(vandq_u8(qb_g0_1, mask_0f));
+                        let whi_g0_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g0_0));
+                        let whi_g0_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_g0_1));
+                        let dp_g0_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_g0_0, xlo0), wlo_g0_1, xlo1));
+                        let dp_g0_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_g0_0, xhi0), whi_g0_1, xhi1));
+                        sum_g0 += xs_lo * (dg0 * sc_g0[sblo] as f32 * dp_g0_lo as f32 - dming0 * mn_g0[sblo] as f32 * sx_lo as f32);
+                        sum_g0 += xs_hi * (dg0 * sc_g0[sbhi] as f32 * dp_g0_hi as f32 - dming0 * mn_g0[sbhi] as f32 * sx_hi as f32);
+
+                        let qb_u0_0 = vld1q_u8(qs_u0.add(j * 32));
+                        let qb_u0_1 = vld1q_u8(qs_u0.add(j * 32 + 16));
+                        let wlo_u0_0 = vreinterpretq_s8_u8(vandq_u8(qb_u0_0, mask_0f));
+                        let wlo_u0_1 = vreinterpretq_s8_u8(vandq_u8(qb_u0_1, mask_0f));
+                        let whi_u0_0 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u0_0));
+                        let whi_u0_1 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qb_u0_1));
+                        let dp_u0_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_u0_0, xlo0), wlo_u0_1, xlo1));
+                        let dp_u0_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_u0_0, xhi0), whi_u0_1, xhi1));
+                        sum_u0 += xs_lo * (du0 * sc_u0[sblo] as f32 * dp_u0_lo as f32 - dminu0 * mn_u0[sblo] as f32 * sx_lo as f32);
+                        sum_u0 += xs_hi * (du0 * sc_u0[sbhi] as f32 * dp_u0_hi as f32 - dminu0 * mn_u0[sbhi] as f32 * sx_hi as f32);
+                    }
+                }
+
+                chunk[r] = (sum_g0 / (1.0 + crate::backend::cpu::ggml_expf(-sum_g0))) * sum_u0;
+                r += 1;
+            }
+        };
+
+        if out.len() >= super::super::cpu::gemv_par_threshold() {
+            crate::backend::cpu::par_rows_slice(
+                out,
+                crate::backend::cpu::gemv_min_rows(),
+                compute_slice,
+            );
+        } else {
+            compute_slice((0, out));
+        }
+    }
+
     /// Unified 3-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_q4_0_q8_0_concat3_neon(
@@ -7053,6 +7331,48 @@ pub(crate) mod neon {
             let mut y_fb = vec![0.0f32; m];
             crate::backend::cpu::gemv_q4km_f32(&a, &xf, &mut y_fb, m, k);
             assert_close(&y_dot, &y_fb);
+        }
+
+        #[test]
+        fn q4k_gate_up_swiglu_matches_separate_gemv() {
+            if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
+                return;
+            }
+            // 2 super-blocks/row (k=512) * 7 rows: exercises multi-block accumulation,
+            // 2-row unrolling (3 pairs), and single remainder row.
+            let (m, k, nb) = (7usize, 512usize, 2usize);
+            let mut st = 0xbeef_cafeu64;
+            let g_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+            let u_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+            let g_bytes = blocks_to_bytes(&g_blocks);
+            let u_bytes = blocks_to_bytes(&u_blocks);
+            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+            let (xs, xq) = quantize_col(&x);
+
+            let mut out_fused = vec![0.0f32; m];
+            unsafe {
+                gemv_q4k_gate_up_swiglu_neon(
+                    &g_bytes, &u_bytes, &xs, &xq, &mut out_fused, m, k,
+                );
+            }
+
+            let mut y_gate = vec![0.0f32; m];
+            let mut y_up = vec![0.0f32; m];
+            unsafe {
+                gemv_q4k_q8_0_neon_dotprod(&g_bytes, &xs, &xq, &mut y_gate, m, k);
+                gemv_q4k_q8_0_neon_dotprod(&u_bytes, &xs, &xq, &mut y_up, m, k);
+            }
+            crate::backend::cpu::silu_mul_inplace(&mut y_gate, &y_up);
+
+            for i in 0..m {
+                let diff = (out_fused[i] - y_gate[i]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "row {i}: fused {} vs separate {}, diff={diff}",
+                    out_fused[i],
+                    y_gate[i]
+                );
+            }
         }
 
         #[test]
