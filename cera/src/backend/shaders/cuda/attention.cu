@@ -107,16 +107,16 @@ __global__ void flash_attention(
     __shared__ float s_scores[256];
     __shared__ float s_warp_scratch[8];
 
-    // Load Q vector into shared memory
+    // Load Q vector into shared memory pre-scaled by attention scale,
+    // eliminating redundant multiplications across all tokens in the inner loop.
     if (tid < head_dim) {
-        s_q[tid] = q[(size_t)head * head_dim + tid];
+        s_q[tid] = q[(size_t)head * head_dim + tid] * params.scale;
         s_out[tid] = 0.0f;
     }
     __syncthreads();
 
     float running_max = -1e30f;
     float running_sum = 0.0f;
-    const float scale = params.scale;
 
     const uint32_t TILE = 256;
     for (uint32_t t_start = 0; t_start < seq_len; t_start += TILE) {
@@ -139,25 +139,25 @@ __global__ void flash_attention(
             if (head_dim & 1) {
                 dot = fmaf(s_q[head_dim - 1], half_to_float(k_ptr[head_dim - 1]), dot);
             }
-            score = dot * scale;
+            score = dot;
         }
 
         // Compute tile maximum
         float tile_max = block_reduce_max(score, s_warp_scratch);
 
-        // Rescaling terms for online softmax
+        // Rescaling terms for online softmax using hardware SFU intrinsic __expf
         float new_max = fmaxf(running_max, tile_max);
-        float alpha = expf(running_max - new_max);
+        float alpha = (running_max <= -1e20f) ? 0.0f : __expf(running_max - new_max);
 
         // Rescale output accumulator
         if (tid < head_dim) {
             s_out[tid] *= alpha;
         }
 
-        // Exponentiate scores
+        // Exponentiate scores using hardware SFU intrinsic __expf
         float exp_score = 0.0f;
         if (t < seq_len) {
-            exp_score = expf(score - new_max);
+            exp_score = __expf(score - new_max);
         }
         s_scores[tid] = exp_score;
         __syncthreads();
@@ -172,6 +172,7 @@ __global__ void flash_attention(
         const uint32_t tile_count = (seq_len - t_start < TILE) ? (seq_len - t_start) : TILE;
         if (tid < head_dim) {
             float v_acc = 0.0f;
+            #pragma unroll 4
             for (uint32_t it = 0; it < tile_count; it++) {
                 const uint32_t tok_idx = t_start + it;
                 const uint16_t* v_ptr = v_cache + (size_t)tok_idx * kv_dim + kv_h_offset;

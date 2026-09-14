@@ -38,11 +38,14 @@ __global__ void rmsnorm(
     const float4* row_x4 = reinterpret_cast<const float4*>(row_x);
     for (uint32_t i = tid; i < n4; i += blockDim.x) {
         float4 val = row_x4[i];
-        sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+        sum_sq = fmaf(val.x, val.x, sum_sq);
+        sum_sq = fmaf(val.y, val.y, sum_sq);
+        sum_sq = fmaf(val.z, val.z, sum_sq);
+        sum_sq = fmaf(val.w, val.w, sum_sq);
     }
     for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         float val = row_x[i];
-        sum_sq += val * val;
+        sum_sq = fmaf(val, val, sum_sq);
     }
 
     // Reduce within warp
@@ -122,12 +125,15 @@ __global__ void fused_add_rmsnorm(
         val.z += res.z;
         val.w += res.w;
         row_x4[i] = val;
-        sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+        sum_sq = fmaf(val.x, val.x, sum_sq);
+        sum_sq = fmaf(val.y, val.y, sum_sq);
+        sum_sq = fmaf(val.z, val.z, sum_sq);
+        sum_sq = fmaf(val.w, val.w, sum_sq);
     }
     for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         const float val = row_x[i] + row_res[i];
         row_x[i] = val;
-        sum_sq += val * val;
+        sum_sq = fmaf(val, val, sum_sq);
     }
 
     // Reduce within warp
