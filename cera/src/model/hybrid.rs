@@ -509,6 +509,8 @@ impl HybridModel {
             attn_scale: self.config.scalars.attn,
             rope_freqs: self.rope_freqs.as_deref(),
             attn_logit_softcapping: None,
+            sliding_window: None,
+            yarn: None,
         }
     }
 
