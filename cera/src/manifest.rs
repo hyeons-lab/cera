@@ -31,9 +31,9 @@ pub struct Manifest {
     pub inference_type: InferenceType,
     pub schema_version: String,
     pub files: ManifestFiles,
-    /// Jinja chat template override. When `Some`, supersedes the template
-    /// embedded in the primary GGUF's metadata; when `None`, the GGUF's
-    /// own template is used.
+    /// Optional Jinja template override retained as manifest metadata. The
+    /// core loader keeps this separate from the tokenizer; its rendering
+    /// helpers currently use the template embedded in the primary GGUF.
     pub chat_template: Option<String>,
     pub generation_defaults: GenerationDefaults,
     /// Pristine JSON for consumers that need fields cera hasn't typed yet.

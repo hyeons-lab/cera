@@ -142,8 +142,8 @@ pub struct ModelFiles {
     /// Explicit inference type. `None` → auto-detect from GGUF
     /// `general.architecture` metadata + aux-file heuristic.
     pub inference_type: Option<InferenceType>,
-    /// Optional chat-template override. If set, replaces any template
-    /// embedded in the GGUF.
+    /// Optional template override retained on the manifest. The core loader
+    /// does not replace the tokenizer's embedded GGUF template.
     pub chat_template: Option<String>,
 }
 
@@ -175,7 +175,8 @@ pub struct ModelBytes {
     /// `general.architecture`, then upgrades text → VL when an mmproj is
     /// present (see [`CeraEngine::from_parts`] for why).
     pub inference_type: Option<InferenceType>,
-    /// Chat-template override. When set, replaces the GGUF's own template.
+    /// Template override retained on the manifest, separately from the
+    /// tokenizer's embedded GGUF template.
     pub chat_template: Option<String>,
     /// Generation defaults from the bundle manifest (if loaded from a bundle).
     pub generation_defaults: Option<crate::manifest::GenerationDefaults>,
@@ -266,6 +267,11 @@ pub struct ModelMetadata {
 pub struct CeraEngine {
     manifest: Manifest,
     model: Arc<dyn Model>,
+    /// Retained only with an audio encoder, for transcription without reopening files.
+    primary_gguf: Option<Arc<GgufFile>>,
+    /// Lazily loaded when a conversation owns the primary GPU context.
+    /// Held through transcription and Session destruction to serialize helper reuse.
+    transcription_model: std::sync::Mutex<Option<Arc<dyn Model>>>,
     tokenizer: Arc<BpeTokenizer>,
     metadata: ModelMetadata,
     config: EngineConfig,
@@ -327,51 +333,8 @@ impl CeraEngine {
     /// [`Self::from_bytes`] with externally-sourced bytes.
     #[cfg(feature = "mmap")]
     pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, CeraError> {
-        let path = path.as_ref();
-        if path.is_dir() {
-            let manifest_path = find_single_manifest(path)?;
-            Self::from_manifest_file(&manifest_path, cfg)
-        } else if has_extension(path, "json") {
-            Self::from_manifest_file(path, cfg)
-        } else if has_extension(path, "gguf") {
-            // Bare `.gguf` → peek at `general.architecture`. Text +
-            // audio go through the synthetic-text manifest path; aux
-            // files for audio (mmproj) are manifest-driven and
-            // consumers who need them must load via manifest or
-            // `from_files`. VL is refused at this gate because a
-            // bare GGUF can't possibly carry the vision tower —
-            // silently downgrading to text would surprise users who
-            // later reach for `--image`. Today this arm is
-            // unreachable (every published VL main GGUF reports
-            // `architecture = "lfm2"` and auto-detect lands on
-            // text); if Liquid ever ships `architecture = "lfm2vl"`
-            // the typed error tells the user what to do. Unknown
-            // arches fall back to text per auto-detect's existing
-            // policy.
-            let detected = auto_detect_inference_type(path)?;
-            match detected {
-                InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => {
-                    let manifest = Manifest::synthetic_text(path);
-                    Self::from_manifest(manifest, cfg)
-                }
-                InferenceType::LlamaCppImageToText => Err(CeraError::Backend(format!(
-                    "bare-GGUF VL load is not supported (file `{}`); load via a \
-                     `.json` manifest, a directory containing one, \
-                     `from_files`, or `from_bundle_id` so the vision mmproj \
-                     can be attached",
-                    path.display()
-                ))),
-                // `auto_detect_inference_type` defaults unknown arches to
-                // Text, so this arm is unreachable today — matched for
-                // exhaustiveness if the policy changes.
-                InferenceType::Unknown(s) => Err(CeraError::UnsupportedInferenceType(s)),
-            }
-        } else {
-            Err(CeraError::Backend(format!(
-                "don't know how to load `{}` — expected a .gguf file, a .json manifest, or a directory containing one",
-                path.display()
-            )))
-        }
+        let source = resolve_path_source(path.as_ref(), &cfg)?;
+        Self::from_resolved_source(source, cfg)
     }
 
     /// Load from an in-memory byte buffer. Text-only; for multi-file loads
@@ -428,7 +391,16 @@ impl CeraEngine {
     pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError> {
         let gguf = GgufFile::from_bytes(Arc::clone(&parts.model))
             .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
+        Self::from_parts_with_primary(gguf, parts, cfg)
+    }
 
+    // The typed loader has already parsed and classified this primary. Share
+    // all auxiliary selection and assembly with the public multipart entry point.
+    fn from_parts_with_primary(
+        gguf: GgufFile,
+        parts: ModelBytes,
+        cfg: EngineConfig,
+    ) -> Result<Self, CeraError> {
         // Parse the mmproj *before* resolving the modality, because the
         // upgrade below is only sound if the sidecar is real. Deciding
         // "VL" from the mere presence of a buffer and then discovering it is
@@ -609,21 +581,8 @@ impl CeraEngine {
     /// manually and use [`Self::from_reader`].
     #[cfg(feature = "mmap")]
     pub fn from_files(files: ModelFiles, cfg: EngineConfig) -> Result<Self, CeraError> {
-        let mut manifest = synthesize_manifest_from_files(&files)?;
-        // Match `from_manifest_file`'s behavior: relative paths in
-        // `multimodal_projector` / `audio_decoder` / etc. are resolved
-        // relative to the primary model's directory. Absolute paths and
-        // URLs pass through unchanged. Without this, downstream code
-        // that expects manifest paths to be normalized (e.g.
-        // `try_load_audio_encoder`) would see un-resolved relative
-        // paths and could fail to open aux files that happen to live
-        // next to the primary GGUF.
-        resolve_all_manifest_files(&mut manifest, files.model.parent(), &cfg)?;
-        // If the caller overrode the chat template, apply it by threading
-        // it through the manifest; the text loader doesn't need to know.
-        // (The tokenizer will still be built from the GGUF; template
-        // precedence lives on the manifest for downstream consumers.)
-        Self::from_manifest_with_primary(manifest, files.model.as_path(), cfg)
+        let source = resolve_files_source(&files, &cfg)?;
+        Self::from_resolved_source(source, cfg)
     }
 
     /// Load from a LeapBundles ID + quantization selector, e.g.
@@ -645,47 +604,8 @@ impl CeraEngine {
         quant: &str,
         cfg: EngineConfig,
     ) -> Result<Self, CeraError> {
-        let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
-            CeraError::Backend(
-                "`CeraEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set — \
-                 construct a `BundleRepo` rooted at your desired store directory and assign it \
-                 before calling this constructor."
-                    .to_string(),
-            )
-        })?;
-        let want_dspark = quant.to_ascii_lowercase().contains("dspark");
-        let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
-        let (mut manifest, manifest_dir) = if let Some(known) =
-            crate::bundle::known_bundle_manifest(bundle_id, clean_quant)
-        {
-            (known, None)
-        } else {
-            let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, clean_quant)?;
-            // No caller-supplied hash for manifest JSONs (LeapBundles schema
-            // doesn't carry one, and the file is tiny: etag fallback is
-            // sufficient). Manifest-level per-file hashes, when they land,
-            // would be threaded through from inside `from_manifest_file`.
-            let manifest_path = repo.resolve_url(&manifest_url, None)?;
-            let m = Manifest::from_file(&manifest_path).map_err(|e| {
-                CeraError::Backend(format!(
-                    "parsing manifest `{}`: {e}",
-                    manifest_path.display()
-                ))
-            })?;
-            (m, manifest_path.parent().map(|p| p.to_path_buf()))
-        };
-
-        if want_dspark
-            && manifest.files.draft_model.is_none()
-            && let Some(draft_url) =
-                crate::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
-        {
-            manifest.files.draft_model = Some(draft_url);
-        }
-
-        resolve_all_manifest_files(&mut manifest, manifest_dir.as_deref(), &cfg)?;
-        let primary = PathBuf::from(&manifest.files.model);
-        Self::from_manifest_with_primary(manifest, &primary, cfg)
+        let source = resolve_bundle_source(bundle_id, quant, &cfg)?;
+        Self::from_resolved_source(source, cfg)
     }
 
     /// Load from a Hugging Face repository spec or URL, e.g.
@@ -719,22 +639,8 @@ impl CeraEngine {
         quant_strategy: Option<&str>,
         cfg: EngineConfig,
     ) -> Result<Self, CeraError> {
-        let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
-            CeraError::Backend(
-                "`CeraEngine::from_hf` requires `EngineConfig::bundle_repo` to be set — \
-                 construct a `BundleRepo` rooted at your desired store directory and assign it \
-                 before calling this constructor."
-                    .to_string(),
-            )
-        })?;
-        let manifest = crate::bundle::hf::inspect_and_resolve_manifest(
-            spec_or_url,
-            quant,
-            quant_strategy,
-            Some(repo.store_dir()),
-            repo.progress(),
-        )?;
-        Self::from_manifest(manifest, cfg)
+        let source = resolve_hf_source(spec_or_url, quant, quant_strategy, &cfg)?;
+        Self::from_resolved_source(source, cfg)
     }
 
     /// Alias for [`Self::from_hf`] when loading from a full Hugging Face URL.
@@ -755,7 +661,7 @@ impl CeraEngine {
     ///
     /// - `from_bytes` / `from_reader` pass `path = None` — no on-disk
     ///   file to hand to backends.
-    /// - `from_manifest_with_primary` (via `from_path` / `from_files`)
+    /// - `from_resolved_source` (via `from_path` / `from_files`)
     ///   passes `Some(primary)` — Metal and wgpu's auto-dispatch may
     ///   reopen the file by path for their own mmap, so they need the
     ///   original filesystem path even though we also hand them the
@@ -786,7 +692,7 @@ impl CeraEngine {
         crate::backend::cpu::ensure_rayon_global_pool();
 
         // Covers `from_bytes` / `from_reader`, which skip the pre-filter
-        // in `from_manifest_with_primary`. Text LLMs AND LFM2-audio
+        // in `from_resolved_source`. Text LLMs AND LFM2-audio
         // models both load the primary GGUF through the same path;
         // audio aux files (decoder, mmproj, safetensors tokenizer) stay
         // on the manifest for the audio pipeline to pick up separately.
@@ -805,6 +711,9 @@ impl CeraEngine {
         let drafter = aux
             .drafter
             .or_else(|| try_load_drafter(&manifest, &cfg, &gguf_arc));
+        let primary_gguf = (aux.audio_encoder.is_some()
+            || (path.is_some() && manifest.inference_type == InferenceType::LlamaCppLfm2AudioV1))
+            .then(|| Arc::clone(&gguf_arc));
         let model_gguf = Arc::try_unwrap(gguf_arc).unwrap_or_else(|a| (*a).clone());
         // `load_text_model` returns `Box<dyn Model>`; convert to `Arc`
         // at the engine boundary. `Arc::from(Box<T>)` is documented on
@@ -830,6 +739,9 @@ impl CeraEngine {
                 None
             }
         });
+        // An unavailable encoder cannot use the helper. In particular, text/VL
+        // GPU byte loads must release their host staging bytes after upload.
+        let primary_gguf = primary_gguf.filter(|_| audio_encoder.is_some());
         let vision_encoder_gguf = aux.vision_mmproj.or_else(|| {
             if path.is_some() {
                 try_load_vision_encoder_gguf(&manifest)
@@ -883,6 +795,8 @@ impl CeraEngine {
         Ok(Self {
             manifest,
             model,
+            primary_gguf,
+            transcription_model: std::sync::Mutex::new(None),
             tokenizer: Arc::new(tokenizer),
             metadata,
             config: cfg,
@@ -898,44 +812,24 @@ impl CeraEngine {
         })
     }
 
-    #[cfg(feature = "mmap")]
-    fn from_manifest_file(path: &Path, cfg: EngineConfig) -> Result<Self, CeraError> {
-        let mut manifest = Manifest::from_file(path).map_err(|e| {
-            CeraError::Backend(format!("parsing manifest `{}`: {e}", path.display()))
-        })?;
-        resolve_all_manifest_files(&mut manifest, path.parent(), &cfg)?;
-        let primary = PathBuf::from(&manifest.files.model);
-        Self::from_manifest_with_primary(manifest, &primary, cfg)
-    }
-
     /// Opens the primary GGUF at `primary` and delegates assembly to
     /// [`Self::from_gguf`] with `Some(primary)` so Metal/GPU backends
     /// can reach the on-disk file.
     ///
     /// Requires `mmap` because it opens the primary via `GgufFile::open`.
     #[cfg(feature = "mmap")]
-    fn from_manifest_with_primary(
-        manifest: Manifest,
-        primary: &Path,
+    fn from_resolved_source(
+        mut source: ResolvedPathSource,
         cfg: EngineConfig,
     ) -> Result<Self, CeraError> {
-        // Pre-filter on inference_type so VL / Unknown manifests fail
-        // fast without paying for the GGUF mmap + header parse. `from_gguf`
-        // checks again for the in-memory constructors that skip this path.
-        check_inference_type_supported(&manifest.inference_type)?;
-        let gguf = GgufFile::open(primary)
-            .map_err(|e| CeraError::Backend(format!("opening `{}`: {e}", primary.display())))?;
-        Self::from_gguf(gguf, manifest, cfg, Some(primary), AuxWeights::default())
-    }
-
-    /// Convergence point for `from_path(.gguf)`. Re-resolves the primary
-    /// from the synthetic manifest and dispatches through
-    /// [`Self::from_manifest_with_primary`].
-    #[cfg(feature = "mmap")]
-    fn from_manifest(mut manifest: Manifest, cfg: EngineConfig) -> Result<Self, CeraError> {
-        resolve_all_manifest_files(&mut manifest, None, &cfg)?;
-        let primary = PathBuf::from(&manifest.files.model);
-        Self::from_manifest_with_primary(manifest, &primary, cfg)
+        let gguf = source.open_primary()?;
+        Self::from_gguf(
+            gguf,
+            source.manifest,
+            cfg,
+            Some(&source.primary),
+            AuxWeights::default(),
+        )
     }
 
     // --- accessors ---
@@ -945,16 +839,24 @@ impl CeraEngine {
     /// `&self`; the engine keeps the originals live for every session
     /// it handed out. The session's [`ModalityCapabilities`] is derived
     /// from the manifest's `inference_type`.
-    pub fn new_session(&self, mut cfg: SessionConfig) -> Result<Session, CeraError> {
+    ///
+    /// Built-in Metal/wgpu models allow one live session per loaded model:
+    /// a second returns [`CeraError::Busy`] until the first is dropped. CPU
+    /// models with caller-owned state can back multiple concurrent sessions.
+    pub fn new_session(&self, cfg: SessionConfig) -> Result<Session, CeraError> {
+        self.new_session_with_model(Arc::clone(&self.model), cfg)
+    }
+
+    fn new_session_with_model(
+        &self,
+        model: Arc<dyn Model>,
+        mut cfg: SessionConfig,
+    ) -> Result<Session, CeraError> {
         if !cfg.gpu_depthformer && self.config.gpu_depthformer {
             cfg.gpu_depthformer = true;
         }
-        let mut session = Session::new(
-            Arc::clone(&self.model),
-            Arc::clone(&self.tokenizer),
-            self.capabilities(),
-            cfg,
-        )?;
+        let mut session =
+            Session::new(model, Arc::clone(&self.tokenizer), self.capabilities(), cfg)?;
         // Auto-attach the eagerly-loaded audio encoder so callers
         // can `session.append_audio(...)` directly without first
         // loading + attaching the mmproj GGUF. Encoder is shared
@@ -1049,6 +951,13 @@ impl CeraEngine {
     /// [`CeraError::UnsupportedModality`].
     ///
     /// `sample_rate` must match the audio encoder's expected rate (resample beforehand if needed).
+    ///
+    /// If a live GPU session owns the primary context, transcription lazily loads
+    /// a separate model/context from the retained weights and reuses it on later
+    /// calls. This costs additional model memory and first-use setup, but leaves
+    /// the conversation's KV state intact and never reopens the original files.
+    /// Only engines with an attached audio encoder retain this source backing.
+    /// The private helper disables prefix caching; it retains no warm or disk entries.
     pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, CeraError> {
         use crate::session::{FinishReason, GenerateOpts, ModalitySink};
         use crate::tokenizer::{ChatMessage, apply_chat_template};
@@ -1080,7 +989,40 @@ impl CeraEngine {
 
         let split = Self::split_tokens_at_marker(&toks, marker_id, marker_name)?;
 
-        let mut session = self.new_session(SessionConfig::default())?;
+        // Declare the guard first so the helper Session drops before unlocking.
+        // Another transcription must not acquire the helper's still-held lease.
+        let mut transcription_model;
+        let mut session = match self.new_session(SessionConfig::default()) {
+            Ok(session) => session,
+            Err(CeraError::Busy) if self.primary_gguf.is_some() => {
+                transcription_model = self
+                    .transcription_model
+                    .lock()
+                    .map_err(|_| CeraError::Backend("transcription model mutex poisoned".into()))?;
+                let model = match transcription_model.as_ref() {
+                    Some(model) => Arc::clone(model),
+                    None => {
+                        // Pass no path: the original may have been deleted or
+                        // replaced, and the helper must use the retained bytes.
+                        let model: Arc<dyn Model> = Arc::from(load_text_model(
+                            self.primary_gguf.as_deref().unwrap().clone(),
+                            None,
+                            &self.config,
+                        )?);
+                        // Keep this private context outside the public prefix
+                        // cache budget: no hidden warm snapshots or disk tier.
+                        model.configure_cache(KvCacheConfig {
+                            max_warm_entries: 0,
+                            ..KvCacheConfig::default()
+                        });
+                        *transcription_model = Some(Arc::clone(&model));
+                        model
+                    }
+                };
+                self.new_session_with_model(model, SessionConfig::default())?
+            }
+            Err(error) => return Err(error),
+        };
         if split > 0 {
             session.append_tokens(&toks[..split])?;
         }
@@ -1236,6 +1178,13 @@ impl CeraEngine {
     /// Configure the model's KV prefix cache. Passthrough to
     /// `Model::configure_cache`; exposed here so callers that only hold
     /// a `CeraEngine` don't need to reach into `engine.model()`.
+    ///
+    /// Engines loaded from bytes, readers or byte parts use only warm caching:
+    /// `cfg.cache_dir` is ignored because those sources supply no persistent
+    /// model identity. This does not change live session KV.
+    /// Named built-in prefix caches bind disk entries to their loaded GGUF bytes.
+    /// CPU LFM2 hashes those bytes once on first disk configuration; GPU backends
+    /// resolve that identity during loading when `disk-cache` is compiled in.
     pub fn configure_cache(&self, cfg: KvCacheConfig) {
         self.model.configure_cache(cfg);
     }
@@ -1275,6 +1224,237 @@ impl CeraEngine {
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+// Resolution is shared by legacy constructors and the private typed-load probes.
+// Keep the primary path separate: backend dispatch may reopen it, and from_files
+// preserves the caller's original primary even when manifest paths are normalized.
+// Remote sources share discovery and file resolution with the legacy constructors.
+#[cfg(all(feature = "remote", feature = "mmap"))]
+fn resolve_bundle_source(
+    bundle_id: &str,
+    quant: &str,
+    cfg: &EngineConfig,
+) -> Result<ResolvedPathSource, CeraError> {
+    let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
+        CeraError::Backend(
+            "`CeraEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set — \
+             construct a `BundleRepo` rooted at your desired store directory and assign it \
+             before calling this constructor."
+                .to_string(),
+        )
+    })?;
+    let want_dspark = quant.to_ascii_lowercase().contains("dspark");
+    let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
+    let (mut manifest, manifest_dir) =
+        if let Some(known) = crate::bundle::known_bundle_manifest(bundle_id, clean_quant) {
+            (known, None)
+        } else {
+            let manifest_url = crate::bundle::leap_bundles_manifest_url(bundle_id, clean_quant)?;
+            // No caller-supplied hash for manifest JSONs (LeapBundles schema
+            // doesn't carry one, and the file is tiny: etag fallback is
+            // sufficient). Manifest-level per-file hashes, when they land,
+            // would be threaded through from manifest-file resolution.
+            let manifest_path = repo.resolve_url(&manifest_url, None)?;
+            let m = Manifest::from_file(&manifest_path).map_err(|e| {
+                CeraError::Backend(format!(
+                    "parsing manifest `{}`: {e}",
+                    manifest_path.display()
+                ))
+            })?;
+            (m, manifest_path.parent().map(|p| p.to_path_buf()))
+        };
+
+    if want_dspark
+        && manifest.files.draft_model.is_none()
+        && let Some(draft_url) =
+            crate::bundle::hf::known_companion_dspark_url(bundle_id, clean_quant)
+    {
+        manifest.files.draft_model = Some(draft_url);
+    }
+
+    resolve_manifest_source(manifest, manifest_dir.as_deref(), cfg)
+}
+
+#[cfg(all(feature = "remote", feature = "mmap"))]
+fn resolve_hf_source(
+    spec_or_url: &str,
+    quant: Option<&str>,
+    quant_strategy: Option<&str>,
+    cfg: &EngineConfig,
+) -> Result<ResolvedPathSource, CeraError> {
+    let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
+        CeraError::Backend(
+            "`CeraEngine::from_hf` requires `EngineConfig::bundle_repo` to be set — \
+             construct a `BundleRepo` rooted at your desired store directory and assign it \
+             before calling this constructor."
+                .to_string(),
+        )
+    })?;
+    let manifest = crate::bundle::hf::inspect_and_resolve_manifest(
+        spec_or_url,
+        quant,
+        quant_strategy,
+        Some(repo.store_dir()),
+        repo.progress(),
+    )?;
+    resolve_manifest_source(manifest, None, cfg)
+}
+
+#[cfg(feature = "mmap")]
+struct ResolvedPathSource {
+    manifest: Manifest,
+    primary: PathBuf,
+    // Auto-detection can pass its mapped primary through to assembly.
+    gguf: Option<GgufFile>,
+}
+
+#[cfg(feature = "mmap")]
+impl ResolvedPathSource {
+    fn open_primary(&mut self) -> Result<GgufFile, CeraError> {
+        // Explicit unsupported inference types still fail before a primary open.
+        check_inference_type_supported(&self.manifest.inference_type)?;
+        match self.gguf.take() {
+            Some(gguf) => Ok(gguf),
+            None => GgufFile::open(&self.primary).map_err(|e| {
+                CeraError::Backend(format!("opening `{}`: {e}", self.primary.display()))
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "mmap")]
+fn resolve_path_source(path: &Path, cfg: &EngineConfig) -> Result<ResolvedPathSource, CeraError> {
+    resolve_path_source_checked(path, cfg, |_| Ok(()))
+}
+
+// Check at the first parse, before inferred-type rejection or auxiliary
+// resolution. Explicit manifests keep their existing resolution/pre-open gate.
+#[cfg(feature = "mmap")]
+fn resolve_path_source_checked<E: From<CeraError>>(
+    path: &Path,
+    cfg: &EngineConfig,
+    check: impl FnOnce(&GgufFile) -> Result<(), E>,
+) -> Result<ResolvedPathSource, E> {
+    if path.is_dir() {
+        let manifest_path = find_single_manifest(path)?;
+        Ok(resolve_manifest_file_source(&manifest_path, cfg)?)
+    } else if has_extension(path, "json") {
+        Ok(resolve_manifest_file_source(path, cfg)?)
+    } else if has_extension(path, "gguf") {
+        // Bare `.gguf` → peek at `general.architecture`. Text +
+        // audio go through the synthetic-text manifest path; aux
+        // files for audio (mmproj) are manifest-driven and
+        // consumers who need them must load via manifest or
+        // `from_files`. VL is refused at this gate because a
+        // bare GGUF can't possibly carry the vision tower —
+        // silently downgrading to text would surprise users who
+        // later reach for `--image`. Today this arm is
+        // unreachable (every published VL main GGUF reports
+        // `architecture = "lfm2"` and auto-detect lands on
+        // text); if Liquid ever ships `architecture = "lfm2vl"`
+        // the typed error tells the user what to do. Unknown
+        // arches fall back to text per auto-detect's existing
+        // policy.
+        let gguf = open_for_inference_type(path)?;
+        check(&gguf)?;
+        let detected = inference_type_for_arch(gguf.get_str("general.architecture").unwrap_or(""));
+        match detected {
+            InferenceType::LlamaCppTextToText | InferenceType::LlamaCppLfm2AudioV1 => {
+                let manifest = Manifest::synthetic_text(path);
+                let mut source = resolve_manifest_source(manifest, None, cfg)?;
+                // Manifest paths are strings. Preserve legacy lossy-path failures
+                // instead of using a mapping of a different original path.
+                if source.primary == path {
+                    source.gguf = Some(gguf);
+                }
+                Ok(source)
+            }
+            InferenceType::LlamaCppImageToText => Err(CeraError::Backend(format!(
+                "bare-GGUF VL load is not supported (file `{}`); load via a \
+                     `.json` manifest, a directory containing one, \
+                     `from_files`, or `from_bundle_id` so the vision mmproj \
+                     can be attached",
+                path.display()
+            ))
+            .into()),
+            InferenceType::Unknown(s) => Err(CeraError::UnsupportedInferenceType(s).into()),
+        }
+    } else {
+        Err(CeraError::Backend(format!(
+            "don't know how to load `{}` — expected a .gguf file, a .json manifest, or a directory containing one",
+            path.display()
+        )).into())
+    }
+}
+
+#[cfg(feature = "mmap")]
+fn resolve_files_source(
+    files: &ModelFiles,
+    cfg: &EngineConfig,
+) -> Result<ResolvedPathSource, CeraError> {
+    resolve_files_source_checked(files, cfg, |_| Ok(()))
+}
+
+#[cfg(feature = "mmap")]
+fn resolve_files_source_checked<E: From<CeraError>>(
+    files: &ModelFiles,
+    cfg: &EngineConfig,
+    check: impl FnOnce(&GgufFile) -> Result<(), E>,
+) -> Result<ResolvedPathSource, E> {
+    let (inference_type, gguf) = match files.inference_type.clone() {
+        Some(it) => (it, None),
+        None => {
+            let gguf = open_for_inference_type(&files.model)?;
+            check(&gguf)?;
+            let it = inference_type_for_arch(gguf.get_str("general.architecture").unwrap_or(""));
+            (it, Some(gguf))
+        }
+    };
+    let mut manifest = synthesize_manifest_from_files(files, inference_type);
+    // Match manifest-file resolution behavior: relative paths in
+    // `multimodal_projector` / `audio_decoder` / etc. are resolved
+    // relative to the primary model's directory. Absolute paths and
+    // URLs pass through unchanged. Without this, downstream code
+    // that expects manifest paths to be normalized (e.g.
+    // `try_load_audio_encoder`) would see un-resolved relative
+    // paths and could fail to open aux files that happen to live
+    // next to the primary GGUF.
+    resolve_all_manifest_files(&mut manifest, files.model.parent(), cfg)?;
+    // If the caller overrode the chat template, apply it by threading
+    // it through the manifest; the text loader doesn't need to know.
+    // (The tokenizer will still be built from the GGUF; template
+    // precedence lives on the manifest for downstream consumers.)
+    Ok(ResolvedPathSource {
+        manifest,
+        primary: files.model.clone(),
+        gguf,
+    })
+}
+
+#[cfg(feature = "mmap")]
+fn resolve_manifest_file_source(
+    path: &Path,
+    cfg: &EngineConfig,
+) -> Result<ResolvedPathSource, CeraError> {
+    let manifest = Manifest::from_file(path)
+        .map_err(|e| CeraError::Backend(format!("parsing manifest `{}`: {e}", path.display())))?;
+    resolve_manifest_source(manifest, path.parent(), cfg)
+}
+
+#[cfg(feature = "mmap")]
+fn resolve_manifest_source(
+    mut manifest: Manifest,
+    base: Option<&Path>,
+    cfg: &EngineConfig,
+) -> Result<ResolvedPathSource, CeraError> {
+    resolve_all_manifest_files(&mut manifest, base, cfg)?;
+    let primary = PathBuf::from(&manifest.files.model);
+    Ok(ResolvedPathSource {
+        manifest,
+        primary,
+        gguf: None,
+    })
+}
 
 // Only used on `mmap` builds (by `from_path` + `find_single_manifest`).
 #[cfg(feature = "mmap")]
@@ -1340,7 +1520,7 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, CeraError> {
 /// read back from `engine.manifest().files.*` and expect local paths,
 /// so every URL must be rewritten before we hand the manifest on.
 ///
-/// Gated on `mmap` — the callers (`from_manifest_file`, `from_manifest`)
+/// Gated on `mmap` — the callers (`resolve_manifest_source`, `resolve_files_source`)
 /// are both `mmap`-only. `from_bytes` / `from_reader` skip path
 /// resolution entirely since they receive bytes.
 #[cfg(feature = "mmap")]
@@ -1446,12 +1626,7 @@ fn strip_file_scheme(s: &str) -> Option<&str> {
 
 /// Build a minimal `Manifest` from an explicit `ModelFiles`.
 #[cfg(feature = "mmap")]
-fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraError> {
-    let inference_type = match files.inference_type.clone() {
-        Some(it) => it,
-        None => auto_detect_inference_type(&files.model)?,
-    };
-
+fn synthesize_manifest_from_files(files: &ModelFiles, inference_type: InferenceType) -> Manifest {
     let model_str = files.model.to_string_lossy().into_owned();
     let mmproj = files
         .multimodal_projector
@@ -1518,7 +1693,7 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
     );
 
     let defaults_shape = inference_type_defaults_shape(&inference_type);
-    Ok(Manifest {
+    Manifest {
         inference_type,
         schema_version: "1.0.0".into(),
         files: ManifestFiles {
@@ -1561,7 +1736,7 @@ fn synthesize_manifest_from_files(files: &ModelFiles) -> Result<Manifest, CeraEr
             },
         },
         raw: serde_json::Value::Object(raw_map),
-    })
+    }
 }
 
 // Only used by `synthesize_manifest_from_files` (mmap-gated).
@@ -1902,21 +2077,14 @@ fn check_inference_type_supported(it: &InferenceType) -> Result<(), CeraError> {
     }
 }
 
-/// Peek at the GGUF header and guess an inference type. Minimal mapping
-/// for v1 — only `lfm2` is actually loadable today; the other arches
-/// are listed so auto-detect doesn't silently confuse a future non-text
-/// model for text.
 #[cfg(feature = "mmap")]
-fn auto_detect_inference_type(model_path: &Path) -> Result<InferenceType, CeraError> {
-    let gguf = GgufFile::open(model_path).map_err(|e| {
+fn open_for_inference_type(model_path: &Path) -> Result<GgufFile, CeraError> {
+    GgufFile::open(model_path).map_err(|e| {
         CeraError::Backend(format!(
             "opening `{}` for inference-type auto-detect: {e}",
             model_path.display()
         ))
-    })?;
-    Ok(inference_type_for_arch(
-        gguf.get_str("general.architecture").unwrap_or(""),
-    ))
+    })
 }
 
 /// Decide a [`ModelBytes`] bundle's inference type. See
@@ -1942,10 +2110,8 @@ fn resolve_parts_inference_type(
     }
 }
 
-/// The arch → `InferenceType` mapping, split out of
-/// [`auto_detect_inference_type`] so the in-memory constructors can reuse it.
-/// They already hold a parsed [`GgufFile`] and must not touch the filesystem,
-/// which is the only thing the mmap-gated wrapper adds.
+/// Shared architecture policy for parsed memory and filesystem primaries.
+/// Resolution retains the same `GgufFile` for assembly.
 fn inference_type_for_arch(arch: &str) -> InferenceType {
     match arch {
         "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5"
@@ -2048,10 +2214,9 @@ fn build_metadata(
     quantization: String,
 ) -> ModelMetadata {
     let cfg = model.config();
-    // Reflect the effective template availability: a manifest override
-    // OR a GGUF-embedded template (the common case for bare `.gguf`
-    // loads). Consumers asking `metadata().has_chat_template` expect a
-    // truthful answer, not just "does the manifest have one".
+    // Report declared template availability from either source. A manifest
+    // override is metadata only: tokenizer-based rendering still requires a
+    // GGUF-embedded template, so this flag alone does not guarantee rendering.
     let has_chat_template = manifest.chat_template.is_some() || tokenizer.chat_template().is_some();
     ModelMetadata {
         architecture: cfg.architecture.clone(),
@@ -2115,6 +2280,11 @@ fn ftype_label(ftype: u32) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+mod loading_prototype;
+pub use loading_prototype::{
+    GenerativeModel, LoadConfig, LoadError, ModelHandle, ModelKind, ModelLoader, ModelSource,
+};
 
 #[cfg(test)]
 mod tests {
@@ -2364,7 +2534,7 @@ mod tests {
                 inference_type: Some(InferenceType::LlamaCppLfm2AudioV1),
                 chat_template: None,
             };
-            let m = synthesize_manifest_from_files(&files).unwrap();
+            let m = synthesize_manifest_from_files(&files, files.inference_type.clone().unwrap());
             assert_eq!(m.inference_type, InferenceType::LlamaCppLfm2AudioV1);
             assert_eq!(m.files.model, "/m/model.gguf");
             assert_eq!(

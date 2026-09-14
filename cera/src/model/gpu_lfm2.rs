@@ -972,15 +972,11 @@ impl Drop for LoraGuard<'_> {
 
 /// GPU-accelerated LFM2 model.
 ///
-/// NOTE: This model is stateful — KV caches and conv rolling buffers live on
-/// the GPU and persist across forward() calls. This is inherent to GPU backends
-/// (GPU-resident state can't live in the CPU-side InferenceState). Consequence:
-/// one GpuLfm2Model instance = one session for throughput. The internal
-/// `infer_lock` makes the backend self-defending: two `Session`s sharing this
-/// `Arc<dyn Model>` and running `forward()` / `forward_prefill()` concurrently
-/// will serialize cleanly on the lock instead of racing on per-instance scratch
-/// buffers + GPU KV caches. For genuine throughput across concurrent Sessions,
-/// create multiple model instances.
+/// KV and convolution buffers persist on the model between calls. Only one
+/// live Session may own this state; a second Session returns `CeraError::Busy`.
+/// The per-call `infer_lock` still protects scratch and raw-call bookkeeping.
+/// Use independently loaded models for concurrent GPU conversations. Direct raw
+/// methods remain caller-managed and must not interfere with a live Session.
 pub struct GpuLfm2Model {
     ctx: GpuContext,
     config: ModelConfig,
@@ -1107,16 +1103,12 @@ pub struct GpuLfm2Model {
     prefill_all_logits_buf: wgpu::Buffer,
     // GPU state
     gpu_state: GpuState,
-    /// Serializes Model trait calls on this instance. Without it, two
-    /// `Session`s sharing this `Arc<dyn Model>` and running `forward()` /
-    /// `forward_prefill()` concurrently would race on the per-instance
-    /// scratch buffers (`hidden_buf`, `q_buf`, `k_buf`, etc.) and on the
-    /// GPU KV caches in `gpu_state`. Mirrors the equivalent guard on
-    /// `MetalLfm2Model`. Lock cost is ~50 ns uncontended (negligible vs
-    /// wgpu dispatch); the wgpu queue already serializes GPU work — this
-    /// just synchronizes the CPU-side bookkeeping that stages each
-    /// command encoder and reads back logits.
+    /// Serializes individual raw calls and their shared scratch access.
+    /// Session lifetime isolation is enforced separately by `session_gate`;
+    /// this mutex alone cannot protect interleaved conversation histories.
     infer_lock: Mutex<()>,
+    /// Reserves live KV/conv state for one Session until its destruction.
+    session_gate: super::ModelSessionGate,
     /// Lazily-allocated scratch KV/conv for [`Self::hidden_states`] (see
     /// `HsScratch`). Built on first use via [`Self::hs_scratch`] so a
     /// generation-only load pays no extra KV VRAM. Selected over the generation
@@ -1140,8 +1132,8 @@ pub struct GpuLfm2Model {
     /// (`KvCompression::cache_tag`). Empty until configured, which is the correct
     /// tag for the f32 default.
     kv_cache_tag: OnceLock<String>,
-    /// Caller-supplied identifier (typically the GGUF file path) used to
-    /// namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
+    /// Caller namespace plus loaded-byte identity when disk caching is compiled
+    /// in, used to namespace prefix-cache disk files. Prefixed with `"wgpu:"` before
     /// being fed to `model_fingerprint` so wgpu's f32 disk-cache files
     /// don't collide with Metal's f16 nor CPU's f32 ones at the same
     /// model path. CPU's f32 layout matches wgpu's, but the CPU model's
@@ -1246,16 +1238,15 @@ enum DecodeTail {
 
 impl GpuLfm2Model {
     /// Construct without a model identifier. Equivalent to
-    /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix cache
-    /// works after `Model::configure_cache`; disk cache (when
-    /// configured) would namespace-collide between path-less loads of
-    /// different models.
+    /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix caching works;
+    /// cold caching is disabled even when a directory is configured.
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
         Self::from_gguf_with_id(gguf, context_size, String::new())
     }
 
     /// Construct with an explicit model identifier (typically the GGUF
-    /// path) used to namespace prefix-cache disk files. The id is
+    /// path) used to namespace prefix-cache disk files. An empty ID disables
+    /// cold caching. A nonempty ID is bound to the loaded GGUF bytes. The id is
     /// prefixed with `"wgpu:"` before being fed to `model_fingerprint`
     /// so different backends (cpu / metal / wgpu) sharing a
     /// `--cache-dir` don't collide on file names — see CPU's `"cpu:"`
@@ -2122,9 +2113,13 @@ impl GpuLfm2Model {
         // Build the prefix cache before constructing `Self` so we can
         // borrow `&config` here without conflicting with the upcoming
         // move of `config` into the struct literal.
-        let prefix_cache = Mutex::new(KvPrefixCache::new(
+        // The temporary CPU source is dropped after upload. Resolve the named
+        // identity now without retaining another CPU copy solely for hashing.
+        let model_id = super::cache_identity::for_gpu_source(src, &model_id);
+        let prefix_cache = Mutex::new(KvPrefixCache::for_model(
             crate::kv_cache::KvCacheConfig::default(),
             &config,
+            &model_id,
             &format!("wgpu:{model_id}"),
         ));
 
@@ -2190,6 +2185,7 @@ impl GpuLfm2Model {
             prefill_all_logits_buf,
             gpu_state,
             infer_lock: Mutex::new(()),
+            session_gate: super::ModelSessionGate::default(),
             hs_scratch: OnceLock::new(),
             use_hs_scratch: AtomicBool::new(false),
             tq: OnceLock::new(),
@@ -7001,7 +6997,24 @@ impl GpuLfm2Model {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+mod recovery;
+
 impl Model for GpuLfm2Model {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &crate::kv_cache::KvCompression,
+        max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        self.reset_kv_checked(state, compression, max_seq_len)
+    }
+
+    fn acquire_session(&self) -> Result<Option<super::ModelSessionLease>, CeraError> {
+        self.session_gate.try_acquire().map(Some)
+    }
+
     fn supports_all_logits(&self) -> bool {
         self.batched_prefill && self.unbatchable_matmul_weight().is_none()
     }
@@ -7470,7 +7483,13 @@ impl Model for GpuLfm2Model {
     fn configure_cache(&self, config: crate::kv_cache::KvCacheConfig) {
         let id = self.cache_namespace();
         *self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            KvPrefixCache::new(config, &self.config, &id);
+            KvPrefixCache::for_model(config, &self.config, &self.model_id, &id);
+    }
+
+    #[cfg(test)]
+    fn warm_cache_usage(&self) -> Option<(usize, u64)> {
+        let cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Some((cache.warm_count(), cache.warm_bytes()))
     }
 
     fn clear_warm_cache(&self) {
@@ -7598,7 +7617,7 @@ impl Model for GpuLfm2Model {
             let id = self.cache_namespace();
             let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
             let cache_config = cache.config.clone();
-            *cache = KvPrefixCache::new(cache_config, &self.config, &id);
+            *cache = KvPrefixCache::for_model(cache_config, &self.config, &self.model_id, &id);
         }
         Ok(())
     }

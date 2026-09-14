@@ -43,6 +43,7 @@ wasm-bindgen.workspace = true
 # Tool calling: parse tool schemas (JSON strings from JS) and serialize parsed
 # tool calls back to JSON strings across the wasm boundary.
 serde_json.workspace = true
+thiserror.workspace = true
 # Used only by the JsError mapping helper to format cera's anyhow-typed
 # errors with `{:#}` (full chain). No native heuristics or backtraces;
 # wasm builds get the same compact `e: cause: …` output JS callers

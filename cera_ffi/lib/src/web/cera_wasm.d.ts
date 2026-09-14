@@ -1470,6 +1470,96 @@ export function toolGrammar(tools_json: string, format: ToolFormat): string;
 
 export function wasm_init(): void;
 
+export class GenerationDefaults {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static audio(sampling: SamplingDefaults, number_of_decoding_threads?: number | null, audio_temperature?: number | null, audio_top_k?: number | null): GenerationDefaults;
+    static other(raw_json: string): GenerationDefaults;
+    static text(sampling: SamplingDefaults): GenerationDefaults;
+    toJson(): string;
+}
+
+export class GenerativeModel {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    createSession(config: SessionConfig): Session;
+    engine(): CeraEngine;
+}
+
+export class LoadConfig {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor(context_size: number, backend: string);
+    backend: string;
+    context_size: number;
+    get draft_model(): string | undefined;
+    set draft_model(value: string | null | undefined);
+    gpu_depthformer: boolean;
+}
+
+export class ModelHandle {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    asGenerative(): GenerativeModel | undefined;
+    kind(): string;
+}
+
+export class ModelLoader {
+    free(): void;
+    [Symbol.dispose](): void;
+    build(): ModelHandle;
+    buildGenerative(): GenerativeModel;
+    constructor(source: ModelSource, config: LoadConfig);
+}
+
+export class ModelParts {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor(model: Uint8Array);
+    get audio_decoder(): Uint8Array | undefined;
+    set audio_decoder(value: Uint8Array | null | undefined);
+    get audio_tokenizer(): Uint8Array | undefined;
+    set audio_tokenizer(value: Uint8Array | null | undefined);
+    get chat_template(): string | undefined;
+    set chat_template(value: string | null | undefined);
+    get draft_model(): Uint8Array | undefined;
+    set draft_model(value: Uint8Array | null | undefined);
+    get generation_defaults(): GenerationDefaults | undefined;
+    set generation_defaults(value: GenerationDefaults | null | undefined);
+    get inference_type(): string | undefined;
+    set inference_type(value: string | null | undefined);
+    model: Uint8Array;
+    get multimodal_projector(): Uint8Array | undefined;
+    set multimodal_projector(value: Uint8Array | null | undefined);
+}
+
+export class ModelSource {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static bytes(bytes: Uint8Array): ModelSource;
+    static parts(parts: ModelParts): ModelSource;
+}
+
+export class SamplingDefaults {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    get min_p(): number | undefined;
+    set min_p(value: number | null | undefined);
+    get repetition_penalty(): number | undefined;
+    set repetition_penalty(value: number | null | undefined);
+    get temperature(): number | undefined;
+    set temperature(value: number | null | undefined);
+    get top_k(): number | undefined;
+    set top_k(value: number | null | undefined);
+    get top_p(): number | undefined;
+    set top_p(value: number | null | undefined);
+}
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {

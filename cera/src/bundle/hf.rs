@@ -11,8 +11,8 @@
 //!    - [`resolve_hf_manifest`]: Matches the requested or default quantization, auto-pairs modality aux files, and produces a dynamic [`Manifest`].
 //!
 //! 2. **Network inspection client** (gated under `#[cfg(feature = "remote")]`):
-//!    - [`fetch_model_info`]: Queries `https://huggingface.co/api/models/{owner}/{repo}` with optional `HF_TOKEN` authentication.
-//!    - [`inspect_and_resolve_manifest`]: End-to-end resolution from a spec string to a loadable [`Manifest`].
+//!    - `fetch_model_info`: Queries `https://huggingface.co/api/models/{owner}/{repo}` with optional `HF_TOKEN` authentication.
+//!    - `inspect_and_resolve_manifest`: End-to-end resolution from a spec string to a loadable [`Manifest`].
 
 use std::collections::HashMap;
 
@@ -206,7 +206,7 @@ impl HfSpec {
         let base = hf_base_endpoint();
         if self.revision != "main" {
             format!(
-                "{base}/api/models/{}/{}?revision={}",
+                "{base}/api/models/{}/{}/revision/{}",
                 self.owner, self.repo, self.revision
             )
         } else {
@@ -893,6 +893,50 @@ pub fn resolve_hf_manifest(
 /// Fetch model repository info from the Hugging Face API.
 #[cfg(feature = "remote")]
 pub fn fetch_model_info(spec: &HfSpec) -> Result<HfModelInfo, CeraError> {
+    fetch_model_info_payload(spec, get_hf_auth_token().as_deref())
+}
+
+/// Loading needs the resolved commit without adding fields to public HfModelInfo.
+#[cfg(feature = "remote")]
+pub(crate) fn fetch_model_snapshot(
+    spec: &HfSpec,
+    auth_token: Option<&str>,
+) -> Result<(HfModelInfo, HfSpec), CeraError> {
+    #[derive(serde::Deserialize)]
+    struct Snapshot {
+        #[serde(flatten)]
+        info: HfModelInfo,
+        sha: Option<String>,
+    }
+    let snapshot: Snapshot = fetch_model_info_payload(spec, auth_token)?;
+    let sha = snapshot
+        .sha
+        .filter(|sha| is_commit_sha(sha))
+        .ok_or_else(|| {
+            CeraError::Backend(
+                "HF model info lacks a valid full commit SHA; cannot pin model inputs".into(),
+            )
+        })?;
+    if is_commit_sha(&spec.revision) && !spec.revision.eq_ignore_ascii_case(&sha) {
+        return Err(CeraError::Backend(
+            "HF model info commit does not match the requested commit".into(),
+        ));
+    }
+    let mut pinned = spec.clone();
+    pinned.revision = sha.to_ascii_lowercase();
+    Ok((snapshot.info, pinned))
+}
+
+#[cfg(feature = "remote")]
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(feature = "remote")]
+fn fetch_model_info_payload<T: serde::de::DeserializeOwned>(
+    spec: &HfSpec,
+    auth_token: Option<&str>,
+) -> Result<T, CeraError> {
     let client = Client::builder()
         .timeout(HF_API_TIMEOUT)
         .build()
@@ -907,7 +951,7 @@ pub fn fetch_model_info(spec: &HfSpec) -> Result<HfModelInfo, CeraError> {
         }
 
         let mut req = client.get(&url);
-        if let Some(token) = get_hf_auth_token() {
+        if let Some(token) = auth_token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
 
@@ -932,7 +976,7 @@ pub fn fetch_model_info(spec: &HfSpec) -> Result<HfModelInfo, CeraError> {
                     let body = resp.text().map_err(|e| {
                         CeraError::Backend(format!("failed to read HF API response body: {e}"))
                     })?;
-                    return serde_json::from_str::<HfModelInfo>(&body).map_err(|e| {
+                    return serde_json::from_str::<T>(&body).map_err(|e| {
                         CeraError::Backend(format!("failed to parse HF API model info JSON: {e}"))
                     });
                 }
@@ -1075,6 +1119,11 @@ pub fn get_hf_auth_token() -> Option<String> {
 }
 
 /// End-to-end inspect and resolve a Hugging Face model spec or URL to a [`Manifest`].
+///
+/// Direct GGUF files and defaults in each repository use one resolved commit;
+/// external draft repositories are resolved separately. Metadata resolution is
+/// required even for cached files; load a local path for offline use.
+/// SafeTensors conversion performs its own resolution before verifying cached output.
 #[cfg(feature = "remote")]
 pub fn inspect_and_resolve_manifest(
     spec_or_url: &str,
@@ -1084,48 +1133,94 @@ pub fn inspect_and_resolve_manifest(
     progress: Option<std::sync::Arc<dyn crate::bundle::DownloadProgress>>,
 ) -> Result<Manifest, CeraError> {
     let spec = HfSpec::parse(spec_or_url)?;
-    let info = fetch_model_info(&spec)?;
+    let (info, pinned_spec) = fetch_model_snapshot(&spec, get_hf_auth_token().as_deref())?;
     let contents = classify_repo_siblings(&info.siblings);
 
     let requested_quant = quant.or(spec.quant.as_deref());
     if contents.primary_ggufs.is_empty() && contents.has_safetensors {
-        let target_quant = match requested_quant {
-            Some(q) => crate::convert::TargetQuant::parse_str(q).ok_or_else(|| {
-                CeraError::Backend(format!(
-                    "unsupported quantization format `{q}`. Supported formats: Q4_K_M, Q5_K_M, Q6_K, Q8_0, Q4_0, F16, F32"
-                ))
-            })?,
-            None => crate::convert::TargetQuant::Q4_K_M,
-        };
-
-        let strategy = quant_strategy
-            .and_then(crate::convert::QuantStrategy::parse_str)
-            .unwrap_or(crate::convert::QuantStrategy::Auto);
-
-        let base_cache = cache_dir
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(default_cache_dir);
-
-        let opts = crate::convert::QuantizeOptions {
-            target_quant,
-            strategy,
-            cache_dir: base_cache,
-            auth_token: get_hf_auth_token(),
+        let opts = streaming_quantize_options(
+            requested_quant,
+            quant_strategy,
+            cache_dir,
             progress,
-            cancel: None,
-            tensor_overrides: Vec::new(),
-        };
+            get_hf_auth_token,
+        )?;
 
         return crate::convert::stream_quantize_hf_repo(&spec, opts);
     }
 
     let gen_defaults = if contents.generation_config.is_some() {
-        fetch_generation_defaults(&spec)
+        fetch_generation_defaults(&pinned_spec)
     } else {
         None
     };
-    resolve_hf_manifest(&spec, &info, requested_quant, gen_defaults)
+    let mut manifest = resolve_hf_manifest(&pinned_spec, &info, requested_quant, gen_defaults)?;
+    // The pure resolver can select a known draft in a different repository. Its
+    // revision must be resolved independently; the primary commit cannot pin it.
+    if let Some(url) = &mut manifest.files.draft_model {
+        // Generated URLs include the configured base, which may have a path
+        // prefix. Parse only the repository path using the canonical host; the
+        // pinned spec's downloads will still use the original configured base.
+        let endpoint = format!("{}/", hf_base_endpoint());
+        let repository_path = url.strip_prefix(&endpoint).ok_or_else(|| {
+            CeraError::Backend("HF draft URL does not use the configured endpoint".into())
+        })?;
+        let draft_spec = HfSpec::parse(&format!("https://huggingface.co/{repository_path}"))?;
+        if draft_spec.owner != pinned_spec.owner
+            || draft_spec.repo != pinned_spec.repo
+            || draft_spec.revision != pinned_spec.revision
+        {
+            let file = draft_spec
+                .subpath
+                .as_deref()
+                .ok_or_else(|| CeraError::Backend("HF draft URL lacks a file path".into()))?;
+            let (_, pinned_draft) =
+                fetch_model_snapshot(&draft_spec, get_hf_auth_token().as_deref())?;
+            *url = pinned_draft.file_download_url(file);
+        }
+    }
+    Ok(manifest)
 }
+
+// Keep option policy shared with the discovery path; conversion remains unchanged.
+#[cfg(feature = "remote")]
+fn streaming_quantize_options(
+    requested_quant: Option<&str>,
+    quant_strategy: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+    progress: Option<std::sync::Arc<dyn crate::bundle::DownloadProgress>>,
+    auth_token: impl FnOnce() -> Option<String>,
+) -> Result<crate::convert::QuantizeOptions, CeraError> {
+    let target_quant = match requested_quant {
+        Some(q) => crate::convert::TargetQuant::parse_str(q).ok_or_else(|| {
+            CeraError::Backend(format!(
+                "unsupported quantization format `{q}`. Supported formats: Q4_K_M, Q5_K_M, Q6_K, Q8_0, Q4_0, F16, F32"
+            ))
+        })?,
+        None => crate::convert::TargetQuant::Q4_K_M,
+    };
+
+    let strategy = quant_strategy
+        .and_then(crate::convert::QuantStrategy::parse_str)
+        .unwrap_or(crate::convert::QuantStrategy::Auto);
+
+    let base_cache = cache_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(default_cache_dir);
+
+    Ok(crate::convert::QuantizeOptions {
+        target_quant,
+        strategy,
+        cache_dir: base_cache,
+        auth_token: auth_token(),
+        progress,
+        cancel: None,
+        tensor_overrides: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod loading_contracts;
 
 #[cfg(test)]
 mod tests {
@@ -1275,7 +1370,7 @@ mod tests {
         let spec_rev = HfSpec::parse("LiquidAI/LFM2.5-VL-3B-GGUF@v1.0").unwrap();
         assert_eq!(
             spec_rev.api_url(),
-            "https://huggingface.co/api/models/LiquidAI/LFM2.5-VL-3B-GGUF?revision=v1.0"
+            "https://huggingface.co/api/models/LiquidAI/LFM2.5-VL-3B-GGUF/revision/v1.0"
         );
     }
 

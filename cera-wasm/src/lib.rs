@@ -16,6 +16,12 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+mod loading;
+pub use loading::{
+    GenerationDefaults, GenerativeModel, LoadConfig, ModelHandle, ModelLoader, ModelParts,
+    ModelSource, SamplingDefaults,
+};
+
 #[wasm_bindgen(start)]
 pub fn wasm_init() {
     console_error_panic_hook::set_once();
@@ -348,7 +354,7 @@ pub(crate) fn console_warn(msg: &str) {
 /// model lives until the page unloads.
 #[wasm_bindgen]
 pub struct CeraEngine {
-    inner: cera::CeraEngine,
+    inner: std::sync::Arc<cera::CeraEngine>,
 }
 
 #[wasm_bindgen]
@@ -383,7 +389,9 @@ impl CeraEngine {
             ..cera::EngineConfig::default()
         };
         cera::CeraEngine::from_bytes(bytes, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 
@@ -443,7 +451,9 @@ impl CeraEngine {
             generation_defaults: None,
         };
         cera::CeraEngine::from_parts(parts, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 
@@ -507,7 +517,9 @@ impl CeraEngine {
             ..cera::EngineConfig::default()
         };
         cera::CeraEngine::from_parts(parts, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 

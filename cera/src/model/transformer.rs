@@ -131,7 +131,7 @@ pub struct WeightRef {
     pub dtype: DType,
     pub m: usize,
     pub k: usize,
-    /// Set by [`WeightRef::with_repack`] for Q4_0 / Q4_K projection weights on
+    /// Set by `WeightRef::with_repack` for Q4_0 / Q4_K projection weights on
     /// hosts with the int8 kernels. `None` when unset (other dtypes, ragged
     /// row counts, or weights that never hit the batched GEMM). The field exists
     /// only on the target/feature combo whose `gemm_preq` reads it.

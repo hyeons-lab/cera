@@ -15,6 +15,28 @@ This one exists for Dart without Flutter: a CLI, a server, a test. It is also
 where the bindings live so that they *can* be resolved without Flutter, since a
 package declaring `flutter.plugin.platforms` is one `dart pub get` refuses.
 
+Native `Session.recoveryStatus()` exposes usability and the retained whole-message
+recovery report, including typed rewind/reset errors. Read it after a failed
+`sendMessage` call; `Reset` requires context replay and `Unusable` requires a
+successful reset or recreation. The report does not cover raw append failures.
+See the [recovery contract](../docs/internals/API_RESHAPE_RECOVERY.md#native-recovery-status).
+
+## Explicit loading in this checkout
+
+The regenerated native bindings also expose `ModelLoader`, `ModelSource` and
+`GenerativeModel`. The [complete raw completion example](example/explicit_loading.dart)
+loads a local GGUF and closes every native handle. With a matching library built
+from this branch, run from `cera_ffi/`:
+
+```sh
+CERA_FFI_LIB=/absolute/path/to/libcera_ffi.dylib \
+  dart run example/explicit_loading.dart /absolute/path/to/model.gguf "The capital of France is"
+```
+
+This synchronous path belongs on a worker in UI applications. Released packages
+have not been updated by this work; the portable async `Cera` facade retains its
+existing API. The native loader's web stubs do not load models in a browser.
+
 ## Install
 
 ```sh
@@ -126,6 +148,20 @@ void main() {
 `generate` returns token IDs plus a summary; `decodeTokens` turns them back into
 text. For streaming and the async variants that keep the isolate responsive, see
 `example/`.
+
+Native Metal/wgpu models permit one live session per loaded model. Close a raw
+session before creating another on that model; reset and cancellation retain
+ownership. CPU sessions can share a model. The portable `Cera` adapter handles
+replacement when applying a seed to an empty conversation and keeps the current
+session for continuation.
+
+`Cera.transcribe` preserves that conversation. When its GPU context is occupied,
+the core lazily loads and caches a separate model/context from retained weights,
+without reopening the original files or copying conversation KV. This costs
+extra model memory and first-use setup. See the
+[GPU ownership guide](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md)
+and [native consumer](example/gpu_ownership_probe.dart) for runnable fixtures and
+seeded generation, transcription, recovery and continuation checks.
 
 ### Voice Activity Detection (Silero VAD v5)
 

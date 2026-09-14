@@ -93,6 +93,14 @@ use std::sync::Arc;
 
 uniffi::setup_scaffolding!();
 
+mod loading;
+mod recovery;
+pub use loading::{
+    GenerationDefaults, GenerativeModel, LoadError, ModelFiles, ModelHandle, ModelLoader,
+    ModelParts, ModelSource, SamplingDefaults,
+};
+pub use recovery::{IngestRecovery, KvRewindFailure, RecoveryOutcome, SessionRecoveryStatus};
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -264,38 +272,46 @@ pub enum FfiError {
 }
 
 impl From<cera::CeraError> for FfiError {
-    fn from(e: cera::CeraError) -> Self {
+    fn from(error: cera::CeraError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&cera::CeraError> for FfiError {
+    fn from(e: &cera::CeraError) -> Self {
         // Match exhaustively on the upstream enum so a future cera
         // variant-add breaks compilation here loudly rather than
         // silently routing through the `Backend` catch-all.
         match e {
             cera::CeraError::UnsupportedModality => FfiError::UnsupportedModality,
-            cera::CeraError::UnsupportedInferenceType(s) => {
-                FfiError::UnsupportedInferenceType { inference_type: s }
-            }
+            cera::CeraError::UnsupportedInferenceType(s) => FfiError::UnsupportedInferenceType {
+                inference_type: s.clone(),
+            },
             cera::CeraError::Busy => FfiError::Busy,
             cera::CeraError::Cancelled => FfiError::Cancelled,
-            cera::CeraError::ContextOverflow { max_seq_len, by } => {
-                FfiError::ContextOverflow { max_seq_len, by }
-            }
+            cera::CeraError::ContextOverflow { max_seq_len, by } => FfiError::ContextOverflow {
+                max_seq_len: *max_seq_len,
+                by: *by,
+            },
             cera::CeraError::EmptyInput => FfiError::EmptyInput,
-            cera::CeraError::InvalidToken { id, vocab_size } => {
-                FfiError::InvalidToken { id, vocab_size }
-            }
-            cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
-            cera::CeraError::OutOfMemory { requested_bytes } => {
-                FfiError::OutOfMemory { requested_bytes }
-            }
+            cera::CeraError::InvalidToken { id, vocab_size } => FfiError::InvalidToken {
+                id: *id,
+                vocab_size: *vocab_size,
+            },
+            cera::CeraError::Backend(s) => FfiError::Backend { detail: s.clone() },
+            cera::CeraError::OutOfMemory { requested_bytes } => FfiError::OutOfMemory {
+                requested_bytes: *requested_bytes,
+            },
             cera::CeraError::KvCompressionConflict {
                 configured,
                 requested,
             } => FfiError::KvCompressionConflict {
-                configured,
-                requested,
+                configured: configured.clone(),
+                requested: requested.clone(),
             },
-            cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
+            cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s.clone() },
             cera::CeraError::LoraUnsupportedByBackend(s) => {
-                FfiError::LoraUnsupportedByBackend { detail: s }
+                FfiError::LoraUnsupportedByBackend { detail: s.clone() }
             }
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
@@ -914,7 +930,7 @@ impl cera::bundle::DownloadProgress for DownloadProgressAdapter {
 /// the underlying engine is already used internally.
 #[derive(uniffi::Object)]
 pub struct CeraEngine {
-    inner: cera::CeraEngine,
+    inner: Arc<cera::CeraEngine>,
 }
 
 #[uniffi::export]
@@ -931,7 +947,9 @@ impl CeraEngine {
     #[uniffi::constructor]
     pub fn from_path(path: String, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_path(&path, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a model from GGUF bytes already in memory.
@@ -965,7 +983,9 @@ impl CeraEngine {
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_bytes(bytes, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a multi-file bundle from memory: the model GGUF plus its
@@ -1024,7 +1044,9 @@ impl CeraEngine {
             generation_defaults: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a model by LeapBundles ID + quantization selector, e.g.
@@ -1050,7 +1072,9 @@ impl CeraEngine {
         config: EngineConfig,
     ) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_bundle_id(&bundle_id, &quant, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Short summary of the loaded model (architecture, vocab size,
@@ -2618,8 +2642,9 @@ impl Drop for AsyncCancelGuard {
 /// Lighter-weight sibling of [`AsyncCancelGuard`] for `spawn_blocking`
 /// tasks that don't share mutable state with anything the caller can
 /// signal. Reached through `spawn_blocking_guarded`, so it covers the
-/// three async [`CeraEngine`] constructors (via `spawn_engine_build`)
-/// and `list_leap_bundles_async`: engine construction holds no cross-thread
+/// four async [`CeraEngine`] constructors (via `spawn_engine_build`)
+/// and `list_leap_bundles_async`: engine
+/// construction holds no cross-thread
 /// cancel flag, and neither the tokenizer build nor (for
 /// `from_bundle_id`) the `reqwest::blocking` download can be
 /// cooperatively cancelled, so there's nothing like `Session::cancel`
@@ -2744,7 +2769,8 @@ impl Session {
 /// The one place the `spawn_blocking` + guard + join-error-mapping sequence
 /// lives, for the exports whose blocking work has no cooperative cancel point:
 /// the async engine constructors (via [`spawn_engine_build`]) and
-/// [`list_leap_bundles_async`]. They differ only in `what`, the name in the
+/// [`list_leap_bundles_async`]. They differ
+/// only in `what`, the name in the
 /// join-error message, and in what they do with the value.
 ///
 /// Not for [`Session::generate_async`] or `generate_streaming_async`. Those
@@ -2774,9 +2800,9 @@ where
 
 /// Runs a blocking engine construction on tokio and wraps the result.
 ///
-/// The three async constructors differ only in the call they make and the name
+/// The four async constructors differ only in the call they make and the name
 /// in their join-error message, so this adds the one thing they share on top of
-/// [`spawn_blocking_guarded`]: the `Arc` wrap. Three copies of it is how
+/// [`spawn_blocking_guarded`]: the `Arc` wrap. Separate copies of it are how
 /// families of near-identical methods start to diverge, so there is one.
 ///
 /// Cancellation is the weak form the constructors document: dropping the
@@ -2788,7 +2814,11 @@ where
 {
     spawn_blocking_guarded(what, move || build().map_err(FfiError::from))
         .await
-        .map(|inner| Arc::new(CeraEngine { inner }))
+        .map(|inner| {
+            Arc::new(CeraEngine {
+                inner: Arc::new(inner),
+            })
+        })
 }
 
 // Async CeraEngine constructors (PR 11).
@@ -3345,11 +3375,12 @@ impl From<cera::hotword::HotwordScore> for FfiHotwordScore {
 pub struct FfiHotwordEvent {
     /// The matched keyword string.
     pub keyword: String,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     pub sample_offset: u64,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     pub command_start_sample: u64,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     pub timestamp_ms: f32,
     /// Model confidence probability (0.0 to 1.0).
     pub confidence: f32,
@@ -3549,7 +3580,8 @@ impl From<cera::WhisperTranscribeOpts> for FfiWhisperTranscribeOpts {
             language: opts.language,
             translate: opts.translate,
             timestamps: opts.timestamps,
-            max_tokens: Some(opts.max_tokens as u32),
+            // GGUF text context is u32-sized; saturating preserves the effective cap.
+            max_tokens: Some(u32::try_from(opts.max_tokens).unwrap_or(u32::MAX)),
             temperature: Some(opts.temperature),
         }
     }
@@ -3592,6 +3624,7 @@ impl FfiWhisperModel {
     }
 
     /// Transcribe 16 kHz mono PCM audio samples synchronously.
+    /// Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
     pub fn transcribe(
         &self,
         pcm: Vec<f32>,
@@ -3628,6 +3661,8 @@ impl FfiWhisperModel {
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiWhisperModel {
     /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+    /// Dropping the returned future aborts queued work and signals an already-running decoder
+    /// to stop at its next cooperative cancellation check.
     pub async fn transcribe_async(
         self: Arc<Self>,
         pcm: Vec<f32>,

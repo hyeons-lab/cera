@@ -623,9 +623,13 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -640,6 +644,16 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 37695:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -684,6 +698,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_position() != 13264:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1040,6 +1056,16 @@ _UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1060,6 +1086,26 @@ _UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1540,6 +1586,17 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.argtypes =
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1581,6 +1638,32 @@ _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_done.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_done.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_as_generative.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_as_generative.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter.argtypes = (
     _UniffiRustBuffer,
     _UniffiRustBuffer,
@@ -1707,6 +1790,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_position.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_position.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_fn_method_session_recovery_status.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_recovery_status.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_remove_lora.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1969,6 +2057,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.restype = 
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.restype = ctypes.c_uint16
@@ -1990,6 +2084,21 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.restype 
 _UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.restype = ctypes.c_uint16
@@ -2056,6 +2165,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.res
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.restype = ctypes.c_uint16
@@ -4327,6 +4439,487 @@ class _UniffiFfiConverterTypeGenerateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
         _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
 
+
+
+
+
+
+class RecoveryOutcome(enum.Enum):
+    """
+    Execution state after a failed whole-message append.
+"""
+    
+    UNCHANGED = 0
+    
+    RESTORED = 1
+    
+    RESET = 2
+    
+    UNUSABLE = 3
+    
+    UNKNOWN = 4
+    """
+    A newer core outcome; conservatively recreate the session.
+"""
+    
+
+
+class _UniffiFfiConverterTypeRecoveryOutcome(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return RecoveryOutcome.UNCHANGED
+        if variant == 2:
+            return RecoveryOutcome.RESTORED
+        if variant == 3:
+            return RecoveryOutcome.RESET
+        if variant == 4:
+            return RecoveryOutcome.UNUSABLE
+        if variant == 5:
+            return RecoveryOutcome.UNKNOWN
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == RecoveryOutcome.UNCHANGED:
+            return
+        if value == RecoveryOutcome.RESTORED:
+            return
+        if value == RecoveryOutcome.RESET:
+            return
+        if value == RecoveryOutcome.UNUSABLE:
+            return
+        if value == RecoveryOutcome.UNKNOWN:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == RecoveryOutcome.UNCHANGED:
+            buf.write_i32(1)
+        if value == RecoveryOutcome.RESTORED:
+            buf.write_i32(2)
+        if value == RecoveryOutcome.RESET:
+            buf.write_i32(3)
+        if value == RecoveryOutcome.UNUSABLE:
+            buf.write_i32(4)
+        if value == RecoveryOutcome.UNKNOWN:
+            buf.write_i32(5)
+
+
+
+
+
+
+
+
+class KvRewindFailure:
+    """
+    Why checked tail rewind was unavailable. Numeric positions are token counts.
+"""
+    def __init__(self):
+        raise RuntimeError("KvRewindFailure cannot be instantiated directly")
+
+    # Each enum variant is a nested class of the enum itself.
+    @dataclass
+    class OUT_OF_BOUNDS:
+        
+        def __init__(self, requested:int, current:int):
+            self.requested = requested
+            
+            
+            self.current = current
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.OUT_OF_BOUNDS(requested={}, current={})".format(self.requested, self.current)
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_OUT_OF_BOUNDS():
+                return False
+            if self.requested != other.requested:
+                return False
+            if self.current != other.current:
+                return False
+            return True
+
+    @dataclass
+    class COMPRESSED:
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.COMPRESSED()".format()
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_COMPRESSED():
+                return False
+            return True
+
+    @dataclass
+    class NON_CAUSAL:
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.NON_CAUSAL()".format()
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_NON_CAUSAL():
+                return False
+            return True
+
+    @dataclass
+    class MISSING_CONVOLUTION_CHECKPOINT:
+        
+        def __init__(self, layer:int, position:int):
+            self.layer = layer
+            
+            
+            self.position = position
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT(layer={}, position={})".format(self.layer, self.position)
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_MISSING_CONVOLUTION_CHECKPOINT():
+                return False
+            if self.layer != other.layer:
+                return False
+            if self.position != other.position:
+                return False
+            return True
+
+    @dataclass
+    class INVALID_CACHE_LAYOUT:
+        
+        def __init__(self, layer:int, detail:str):
+            self.layer = layer
+            
+            
+            self.detail = detail
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.INVALID_CACHE_LAYOUT(layer={}, detail={})".format(self.layer, self.detail)
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_INVALID_CACHE_LAYOUT():
+                return False
+            if self.layer != other.layer:
+                return False
+            if self.detail != other.detail:
+                return False
+            return True
+
+    @dataclass
+    class BACKEND_UNSUPPORTED:
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.BACKEND_UNSUPPORTED()".format()
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_BACKEND_UNSUPPORTED():
+                return False
+            return True
+
+    @dataclass
+    class UNKNOWN:
+        
+        def __init__(self, detail:str):
+            self.detail = detail
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "KvRewindFailure.UNKNOWN(detail={})".format(self.detail)
+        def __eq__(self, other):
+            if not isinstance(other, KvRewindFailure):
+                return NotImplemented
+            if not other.is_UNKNOWN():
+                return False
+            if self.detail != other.detail:
+                return False
+            return True
+
+    
+
+    # For each variant, we have `is_NAME` and `is_name` methods for easily checking
+    # whether an instance is that variant.
+    def is_OUT_OF_BOUNDS(self) -> bool:
+        return isinstance(self, KvRewindFailure.OUT_OF_BOUNDS)
+    def is_out_of_bounds(self) -> bool:
+        return isinstance(self, KvRewindFailure.OUT_OF_BOUNDS)
+    def is_COMPRESSED(self) -> bool:
+        return isinstance(self, KvRewindFailure.COMPRESSED)
+    def is_compressed(self) -> bool:
+        return isinstance(self, KvRewindFailure.COMPRESSED)
+    def is_NON_CAUSAL(self) -> bool:
+        return isinstance(self, KvRewindFailure.NON_CAUSAL)
+    def is_non_causal(self) -> bool:
+        return isinstance(self, KvRewindFailure.NON_CAUSAL)
+    def is_MISSING_CONVOLUTION_CHECKPOINT(self) -> bool:
+        return isinstance(self, KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT)
+    def is_missing_convolution_checkpoint(self) -> bool:
+        return isinstance(self, KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT)
+    def is_INVALID_CACHE_LAYOUT(self) -> bool:
+        return isinstance(self, KvRewindFailure.INVALID_CACHE_LAYOUT)
+    def is_invalid_cache_layout(self) -> bool:
+        return isinstance(self, KvRewindFailure.INVALID_CACHE_LAYOUT)
+    def is_BACKEND_UNSUPPORTED(self) -> bool:
+        return isinstance(self, KvRewindFailure.BACKEND_UNSUPPORTED)
+    def is_backend_unsupported(self) -> bool:
+        return isinstance(self, KvRewindFailure.BACKEND_UNSUPPORTED)
+    def is_UNKNOWN(self) -> bool:
+        return isinstance(self, KvRewindFailure.UNKNOWN)
+    def is_unknown(self) -> bool:
+        return isinstance(self, KvRewindFailure.UNKNOWN)
+    
+
+# Now, a little trick - we make each nested variant class be a subclass of the main
+# enum class, so that method calls and instance checks etc will work intuitively.
+# We might be able to do this a little more neatly with a metaclass, but this'll do.
+KvRewindFailure.OUT_OF_BOUNDS = type("KvRewindFailure.OUT_OF_BOUNDS", (KvRewindFailure.OUT_OF_BOUNDS, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.COMPRESSED = type("KvRewindFailure.COMPRESSED", (KvRewindFailure.COMPRESSED, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.NON_CAUSAL = type("KvRewindFailure.NON_CAUSAL", (KvRewindFailure.NON_CAUSAL, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT = type("KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT", (KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.INVALID_CACHE_LAYOUT = type("KvRewindFailure.INVALID_CACHE_LAYOUT", (KvRewindFailure.INVALID_CACHE_LAYOUT, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.BACKEND_UNSUPPORTED = type("KvRewindFailure.BACKEND_UNSUPPORTED", (KvRewindFailure.BACKEND_UNSUPPORTED, KvRewindFailure,), {})  # type: ignore
+KvRewindFailure.UNKNOWN = type("KvRewindFailure.UNKNOWN", (KvRewindFailure.UNKNOWN, KvRewindFailure,), {})  # type: ignore
+
+
+
+
+class _UniffiFfiConverterTypeKvRewindFailure(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return KvRewindFailure.OUT_OF_BOUNDS(
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterUInt64.read(buf),
+            )
+        if variant == 2:
+            return KvRewindFailure.COMPRESSED(
+            )
+        if variant == 3:
+            return KvRewindFailure.NON_CAUSAL(
+            )
+        if variant == 4:
+            return KvRewindFailure.MISSING_CONVOLUTION_CHECKPOINT(
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterUInt64.read(buf),
+            )
+        if variant == 5:
+            return KvRewindFailure.INVALID_CACHE_LAYOUT(
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 6:
+            return KvRewindFailure.BACKEND_UNSUPPORTED(
+            )
+        if variant == 7:
+            return KvRewindFailure.UNKNOWN(
+                _UniffiFfiConverterString.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value.is_OUT_OF_BOUNDS():
+            _UniffiFfiConverterUInt64.check_lower(value.requested)
+            _UniffiFfiConverterUInt64.check_lower(value.current)
+            return
+        if value.is_COMPRESSED():
+            return
+        if value.is_NON_CAUSAL():
+            return
+        if value.is_MISSING_CONVOLUTION_CHECKPOINT():
+            _UniffiFfiConverterUInt64.check_lower(value.layer)
+            _UniffiFfiConverterUInt64.check_lower(value.position)
+            return
+        if value.is_INVALID_CACHE_LAYOUT():
+            _UniffiFfiConverterUInt64.check_lower(value.layer)
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if value.is_BACKEND_UNSUPPORTED():
+            return
+        if value.is_UNKNOWN():
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value.is_OUT_OF_BOUNDS():
+            buf.write_i32(1)
+            _UniffiFfiConverterUInt64.write(value.requested, buf)
+            _UniffiFfiConverterUInt64.write(value.current, buf)
+        if value.is_COMPRESSED():
+            buf.write_i32(2)
+        if value.is_NON_CAUSAL():
+            buf.write_i32(3)
+        if value.is_MISSING_CONVOLUTION_CHECKPOINT():
+            buf.write_i32(4)
+            _UniffiFfiConverterUInt64.write(value.layer, buf)
+            _UniffiFfiConverterUInt64.write(value.position, buf)
+        if value.is_INVALID_CACHE_LAYOUT():
+            buf.write_i32(5)
+            _UniffiFfiConverterUInt64.write(value.layer, buf)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if value.is_BACKEND_UNSUPPORTED():
+            buf.write_i32(6)
+        if value.is_UNKNOWN():
+            buf.write_i32(7)
+            _UniffiFfiConverterString.write(value.detail, buf)
+
+
+
+class _UniffiFfiConverterOptionalTypeKvRewindFailure(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeKvRewindFailure.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeKvRewindFailure.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeKvRewindFailure.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalTypeFfiError(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiError.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiError.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiError.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class IngestRecovery:
+    """
+    Recovery diagnostic retained after a failed `send_message` ingestion.
+    The call's original error is still returned separately. Generation failures
+    after successful ingestion do not create this report.
+"""
+    def __init__(self, *, outcome:RecoveryOutcome, rewind_error:typing.Optional[KvRewindFailure], reset_error:typing.Optional[FfiError]):
+        self.outcome = outcome
+        self.rewind_error = rewind_error
+        self.reset_error = reset_error
+        
+        
+
+    
+    def __str__(self):
+        return "IngestRecovery(outcome={}, rewind_error={}, reset_error={})".format(self.outcome, self.rewind_error, self.reset_error)
+    def __eq__(self, other):
+        if self.outcome != other.outcome:
+            return False
+        if self.rewind_error != other.rewind_error:
+            return False
+        if self.reset_error != other.reset_error:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeIngestRecovery(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return IngestRecovery(
+            outcome=_UniffiFfiConverterTypeRecoveryOutcome.read(buf),
+            rewind_error=_UniffiFfiConverterOptionalTypeKvRewindFailure.read(buf),
+            reset_error=_UniffiFfiConverterOptionalTypeFfiError.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeRecoveryOutcome.check_lower(value.outcome)
+        _UniffiFfiConverterOptionalTypeKvRewindFailure.check_lower(value.rewind_error)
+        _UniffiFfiConverterOptionalTypeFfiError.check_lower(value.reset_error)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeRecoveryOutcome.write(value.outcome, buf)
+        _UniffiFfiConverterOptionalTypeKvRewindFailure.write(value.rewind_error, buf)
+        _UniffiFfiConverterOptionalTypeFfiError.write(value.reset_error, buf)
+
 class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -4453,6 +5046,109 @@ class _UniffiFfiConverterTypeModalityCapabilities(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.audio_in, buf)
         _UniffiFfiConverterBoolean.write(value.audio_out, buf)
 
+class _UniffiFfiConverterMapStringString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, items):
+        for (key, value) in items.items():
+            _UniffiFfiConverterString.check_lower(key)
+            _UniffiFfiConverterString.check_lower(value)
+
+    @classmethod
+    def write(cls, items, buf):
+        buf.write_i32(len(items))
+        for (key, value) in items.items():
+            _UniffiFfiConverterString.write(key, buf)
+            _UniffiFfiConverterString.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative map size")
+
+        # It would be nice to use a dict comprehension,
+        # but in Python 3.7 and before the evaluation order is not according to spec,
+        # so we we're reading the value before the key.
+        # This loop makes the order explicit: first reading the key, then the value.
+        d = {}
+        for i in range(count):
+            key = _UniffiFfiConverterString.read(buf)
+            val = _UniffiFfiConverterString.read(buf)
+            d[key] = val
+        return d
+
+@dataclass
+class ModelFiles:
+    def __init__(self, *, model:str, multimodal_projector:typing.Optional[str], audio_decoder:typing.Optional[str], audio_tokenizer:typing.Optional[str], draft_model:typing.Optional[str], extras:dict[str, str], inference_type:typing.Optional[str], chat_template:typing.Optional[str]):
+        self.model = model
+        self.multimodal_projector = multimodal_projector
+        self.audio_decoder = audio_decoder
+        self.audio_tokenizer = audio_tokenizer
+        self.draft_model = draft_model
+        self.extras = extras
+        self.inference_type = inference_type
+        self.chat_template = chat_template
+        
+        
+
+    
+    def __str__(self):
+        return "ModelFiles(model={}, multimodal_projector={}, audio_decoder={}, audio_tokenizer={}, draft_model={}, extras={}, inference_type={}, chat_template={})".format(self.model, self.multimodal_projector, self.audio_decoder, self.audio_tokenizer, self.draft_model, self.extras, self.inference_type, self.chat_template)
+    def __eq__(self, other):
+        if self.model != other.model:
+            return False
+        if self.multimodal_projector != other.multimodal_projector:
+            return False
+        if self.audio_decoder != other.audio_decoder:
+            return False
+        if self.audio_tokenizer != other.audio_tokenizer:
+            return False
+        if self.draft_model != other.draft_model:
+            return False
+        if self.extras != other.extras:
+            return False
+        if self.inference_type != other.inference_type:
+            return False
+        if self.chat_template != other.chat_template:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeModelFiles(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return ModelFiles(
+            model=_UniffiFfiConverterString.read(buf),
+            multimodal_projector=_UniffiFfiConverterOptionalString.read(buf),
+            audio_decoder=_UniffiFfiConverterOptionalString.read(buf),
+            audio_tokenizer=_UniffiFfiConverterOptionalString.read(buf),
+            draft_model=_UniffiFfiConverterOptionalString.read(buf),
+            extras=_UniffiFfiConverterMapStringString.read(buf),
+            inference_type=_UniffiFfiConverterOptionalString.read(buf),
+            chat_template=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.model)
+        _UniffiFfiConverterOptionalString.check_lower(value.multimodal_projector)
+        _UniffiFfiConverterOptionalString.check_lower(value.audio_decoder)
+        _UniffiFfiConverterOptionalString.check_lower(value.audio_tokenizer)
+        _UniffiFfiConverterOptionalString.check_lower(value.draft_model)
+        _UniffiFfiConverterMapStringString.check_lower(value.extras)
+        _UniffiFfiConverterOptionalString.check_lower(value.inference_type)
+        _UniffiFfiConverterOptionalString.check_lower(value.chat_template)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.model, buf)
+        _UniffiFfiConverterOptionalString.write(value.multimodal_projector, buf)
+        _UniffiFfiConverterOptionalString.write(value.audio_decoder, buf)
+        _UniffiFfiConverterOptionalString.write(value.audio_tokenizer, buf)
+        _UniffiFfiConverterOptionalString.write(value.draft_model, buf)
+        _UniffiFfiConverterMapStringString.write(value.extras, buf)
+        _UniffiFfiConverterOptionalString.write(value.inference_type, buf)
+        _UniffiFfiConverterOptionalString.write(value.chat_template, buf)
+
 @dataclass
 class ModelMetadata:
     """
@@ -4527,6 +5223,381 @@ class _UniffiFfiConverterTypeModelMetadata(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.add_bos_token, buf)
         _UniffiFfiConverterBoolean.write(value.add_eos_token, buf)
         _UniffiFfiConverterString.write(value.cpu_backend, buf)
+
+class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative byte string length")
+        return buf.read(size)
+
+    @staticmethod
+    def check_lower(value):
+        try:
+            memoryview(value)
+        except TypeError:
+            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i32(len(value))
+        buf.write(value)
+
+class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBytes.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBytes.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBytes.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class SamplingDefaults:
+    def __init__(self, *, temperature:typing.Optional[float], top_p:typing.Optional[float], top_k:typing.Optional[int], min_p:typing.Optional[float], repetition_penalty:typing.Optional[float]):
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.min_p = min_p
+        self.repetition_penalty = repetition_penalty
+        
+        
+
+    
+    def __str__(self):
+        return "SamplingDefaults(temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={})".format(self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty)
+    def __eq__(self, other):
+        if self.temperature != other.temperature:
+            return False
+        if self.top_p != other.top_p:
+            return False
+        if self.top_k != other.top_k:
+            return False
+        if self.min_p != other.min_p:
+            return False
+        if self.repetition_penalty != other.repetition_penalty:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSamplingDefaults(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SamplingDefaults(
+            temperature=_UniffiFfiConverterOptionalFloat32.read(buf),
+            top_p=_UniffiFfiConverterOptionalFloat32.read(buf),
+            top_k=_UniffiFfiConverterOptionalUInt32.read(buf),
+            min_p=_UniffiFfiConverterOptionalFloat32.read(buf),
+            repetition_penalty=_UniffiFfiConverterOptionalFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.temperature)
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.top_p)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.top_k)
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.min_p)
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.repetition_penalty)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalFloat32.write(value.temperature, buf)
+        _UniffiFfiConverterOptionalFloat32.write(value.top_p, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.top_k, buf)
+        _UniffiFfiConverterOptionalFloat32.write(value.min_p, buf)
+        _UniffiFfiConverterOptionalFloat32.write(value.repetition_penalty, buf)
+
+
+
+
+
+
+class GenerationDefaults:
+    def __init__(self):
+        raise RuntimeError("GenerationDefaults cannot be instantiated directly")
+
+    # Each enum variant is a nested class of the enum itself.
+    @dataclass
+    class TEXT:
+        
+        def __init__(self, sampling:SamplingDefaults):
+            self.sampling = sampling
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "GenerationDefaults.TEXT(sampling={})".format(self.sampling)
+        def __eq__(self, other):
+            if not isinstance(other, GenerationDefaults):
+                return NotImplemented
+            if not other.is_TEXT():
+                return False
+            if self.sampling != other.sampling:
+                return False
+            return True
+
+    @dataclass
+    class AUDIO:
+        
+        def __init__(self, sampling:SamplingDefaults, number_of_decoding_threads:typing.Optional[int], audio_temperature:typing.Optional[float], audio_top_k:typing.Optional[int]):
+            self.sampling = sampling
+            
+            
+            self.number_of_decoding_threads = number_of_decoding_threads
+            
+            
+            self.audio_temperature = audio_temperature
+            
+            
+            self.audio_top_k = audio_top_k
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "GenerationDefaults.AUDIO(sampling={}, number_of_decoding_threads={}, audio_temperature={}, audio_top_k={})".format(self.sampling, self.number_of_decoding_threads, self.audio_temperature, self.audio_top_k)
+        def __eq__(self, other):
+            if not isinstance(other, GenerationDefaults):
+                return NotImplemented
+            if not other.is_AUDIO():
+                return False
+            if self.sampling != other.sampling:
+                return False
+            if self.number_of_decoding_threads != other.number_of_decoding_threads:
+                return False
+            if self.audio_temperature != other.audio_temperature:
+                return False
+            if self.audio_top_k != other.audio_top_k:
+                return False
+            return True
+
+    @dataclass
+    class OTHER:
+        
+        def __init__(self, raw_json:str):
+            self.raw_json = raw_json
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "GenerationDefaults.OTHER(raw_json={})".format(self.raw_json)
+        def __eq__(self, other):
+            if not isinstance(other, GenerationDefaults):
+                return NotImplemented
+            if not other.is_OTHER():
+                return False
+            if self.raw_json != other.raw_json:
+                return False
+            return True
+
+    
+
+    # For each variant, we have `is_NAME` and `is_name` methods for easily checking
+    # whether an instance is that variant.
+    def is_TEXT(self) -> bool:
+        return isinstance(self, GenerationDefaults.TEXT)
+    def is_text(self) -> bool:
+        return isinstance(self, GenerationDefaults.TEXT)
+    def is_AUDIO(self) -> bool:
+        return isinstance(self, GenerationDefaults.AUDIO)
+    def is_audio(self) -> bool:
+        return isinstance(self, GenerationDefaults.AUDIO)
+    def is_OTHER(self) -> bool:
+        return isinstance(self, GenerationDefaults.OTHER)
+    def is_other(self) -> bool:
+        return isinstance(self, GenerationDefaults.OTHER)
+    
+
+# Now, a little trick - we make each nested variant class be a subclass of the main
+# enum class, so that method calls and instance checks etc will work intuitively.
+# We might be able to do this a little more neatly with a metaclass, but this'll do.
+GenerationDefaults.TEXT = type("GenerationDefaults.TEXT", (GenerationDefaults.TEXT, GenerationDefaults,), {})  # type: ignore
+GenerationDefaults.AUDIO = type("GenerationDefaults.AUDIO", (GenerationDefaults.AUDIO, GenerationDefaults,), {})  # type: ignore
+GenerationDefaults.OTHER = type("GenerationDefaults.OTHER", (GenerationDefaults.OTHER, GenerationDefaults,), {})  # type: ignore
+
+
+
+
+class _UniffiFfiConverterTypeGenerationDefaults(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return GenerationDefaults.TEXT(
+                _UniffiFfiConverterTypeSamplingDefaults.read(buf),
+            )
+        if variant == 2:
+            return GenerationDefaults.AUDIO(
+                _UniffiFfiConverterTypeSamplingDefaults.read(buf),
+                _UniffiFfiConverterOptionalUInt32.read(buf),
+                _UniffiFfiConverterOptionalFloat32.read(buf),
+                _UniffiFfiConverterOptionalUInt32.read(buf),
+            )
+        if variant == 3:
+            return GenerationDefaults.OTHER(
+                _UniffiFfiConverterString.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value.is_TEXT():
+            _UniffiFfiConverterTypeSamplingDefaults.check_lower(value.sampling)
+            return
+        if value.is_AUDIO():
+            _UniffiFfiConverterTypeSamplingDefaults.check_lower(value.sampling)
+            _UniffiFfiConverterOptionalUInt32.check_lower(value.number_of_decoding_threads)
+            _UniffiFfiConverterOptionalFloat32.check_lower(value.audio_temperature)
+            _UniffiFfiConverterOptionalUInt32.check_lower(value.audio_top_k)
+            return
+        if value.is_OTHER():
+            _UniffiFfiConverterString.check_lower(value.raw_json)
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value.is_TEXT():
+            buf.write_i32(1)
+            _UniffiFfiConverterTypeSamplingDefaults.write(value.sampling, buf)
+        if value.is_AUDIO():
+            buf.write_i32(2)
+            _UniffiFfiConverterTypeSamplingDefaults.write(value.sampling, buf)
+            _UniffiFfiConverterOptionalUInt32.write(value.number_of_decoding_threads, buf)
+            _UniffiFfiConverterOptionalFloat32.write(value.audio_temperature, buf)
+            _UniffiFfiConverterOptionalUInt32.write(value.audio_top_k, buf)
+        if value.is_OTHER():
+            buf.write_i32(3)
+            _UniffiFfiConverterString.write(value.raw_json, buf)
+
+
+
+class _UniffiFfiConverterOptionalTypeGenerationDefaults(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeGenerationDefaults.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeGenerationDefaults.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeGenerationDefaults.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class ModelParts:
+    def __init__(self, *, model:bytes, multimodal_projector:typing.Optional[bytes], audio_decoder:typing.Optional[bytes], audio_tokenizer:typing.Optional[bytes], draft_model:typing.Optional[bytes], inference_type:typing.Optional[str], chat_template:typing.Optional[str], generation_defaults:typing.Optional[GenerationDefaults]):
+        self.model = model
+        self.multimodal_projector = multimodal_projector
+        self.audio_decoder = audio_decoder
+        self.audio_tokenizer = audio_tokenizer
+        self.draft_model = draft_model
+        self.inference_type = inference_type
+        self.chat_template = chat_template
+        self.generation_defaults = generation_defaults
+        
+        
+
+    
+    def __str__(self):
+        return "ModelParts(model={}, multimodal_projector={}, audio_decoder={}, audio_tokenizer={}, draft_model={}, inference_type={}, chat_template={}, generation_defaults={})".format(self.model, self.multimodal_projector, self.audio_decoder, self.audio_tokenizer, self.draft_model, self.inference_type, self.chat_template, self.generation_defaults)
+    def __eq__(self, other):
+        if self.model != other.model:
+            return False
+        if self.multimodal_projector != other.multimodal_projector:
+            return False
+        if self.audio_decoder != other.audio_decoder:
+            return False
+        if self.audio_tokenizer != other.audio_tokenizer:
+            return False
+        if self.draft_model != other.draft_model:
+            return False
+        if self.inference_type != other.inference_type:
+            return False
+        if self.chat_template != other.chat_template:
+            return False
+        if self.generation_defaults != other.generation_defaults:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeModelParts(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return ModelParts(
+            model=_UniffiFfiConverterBytes.read(buf),
+            multimodal_projector=_UniffiFfiConverterOptionalBytes.read(buf),
+            audio_decoder=_UniffiFfiConverterOptionalBytes.read(buf),
+            audio_tokenizer=_UniffiFfiConverterOptionalBytes.read(buf),
+            draft_model=_UniffiFfiConverterOptionalBytes.read(buf),
+            inference_type=_UniffiFfiConverterOptionalString.read(buf),
+            chat_template=_UniffiFfiConverterOptionalString.read(buf),
+            generation_defaults=_UniffiFfiConverterOptionalTypeGenerationDefaults.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterBytes.check_lower(value.model)
+        _UniffiFfiConverterOptionalBytes.check_lower(value.multimodal_projector)
+        _UniffiFfiConverterOptionalBytes.check_lower(value.audio_decoder)
+        _UniffiFfiConverterOptionalBytes.check_lower(value.audio_tokenizer)
+        _UniffiFfiConverterOptionalBytes.check_lower(value.draft_model)
+        _UniffiFfiConverterOptionalString.check_lower(value.inference_type)
+        _UniffiFfiConverterOptionalString.check_lower(value.chat_template)
+        _UniffiFfiConverterOptionalTypeGenerationDefaults.check_lower(value.generation_defaults)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterBytes.write(value.model, buf)
+        _UniffiFfiConverterOptionalBytes.write(value.multimodal_projector, buf)
+        _UniffiFfiConverterOptionalBytes.write(value.audio_decoder, buf)
+        _UniffiFfiConverterOptionalBytes.write(value.audio_tokenizer, buf)
+        _UniffiFfiConverterOptionalBytes.write(value.draft_model, buf)
+        _UniffiFfiConverterOptionalString.write(value.inference_type, buf)
+        _UniffiFfiConverterOptionalString.write(value.chat_template, buf)
+        _UniffiFfiConverterOptionalTypeGenerationDefaults.write(value.generation_defaults, buf)
 
 
 
@@ -4828,6 +5899,77 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.ubatch_size, buf)
         _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
 
+class _UniffiFfiConverterOptionalTypeIngestRecovery(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeIngestRecovery.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeIngestRecovery.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeIngestRecovery.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class SessionRecoveryStatus:
+    """
+    Coherent snapshot of a session at the instant the lock was acquired.
+    Another thread may change the session after this method returns.
+"""
+    def __init__(self, *, usable:bool, position:int, last_ingest_recovery:typing.Optional[IngestRecovery]):
+        self.usable = usable
+        self.position = position
+        self.last_ingest_recovery = last_ingest_recovery
+        
+        
+
+    
+    def __str__(self):
+        return "SessionRecoveryStatus(usable={}, position={}, last_ingest_recovery={})".format(self.usable, self.position, self.last_ingest_recovery)
+    def __eq__(self, other):
+        if self.usable != other.usable:
+            return False
+        if self.position != other.position:
+            return False
+        if self.last_ingest_recovery != other.last_ingest_recovery:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSessionRecoveryStatus(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SessionRecoveryStatus(
+            usable=_UniffiFfiConverterBoolean.read(buf),
+            position=_UniffiFfiConverterUInt32.read(buf),
+            last_ingest_recovery=_UniffiFfiConverterOptionalTypeIngestRecovery.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterBoolean.check_lower(value.usable)
+        _UniffiFfiConverterUInt32.check_lower(value.position)
+        _UniffiFfiConverterOptionalTypeIngestRecovery.check_lower(value.last_ingest_recovery)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterBoolean.write(value.usable, buf)
+        _UniffiFfiConverterUInt32.write(value.position, buf)
+        _UniffiFfiConverterOptionalTypeIngestRecovery.write(value.last_ingest_recovery, buf)
+
 @dataclass
 class ToolCall:
     """
@@ -4915,26 +6057,6 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.name, buf)
         _UniffiFfiConverterOptionalString.write(value.description, buf)
         _UniffiFfiConverterString.write(value.parameters_json, buf)
-
-class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative byte string length")
-        return buf.read(size)
-
-    @staticmethod
-    def check_lower(value):
-        try:
-            memoryview(value)
-        except TypeError:
-            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_i32(len(value))
-        buf.write(value)
 
 class _UniffiFfiConverterSequenceBytes(_UniffiConverterRustBuffer):
     @classmethod
@@ -5229,6 +6351,531 @@ class _UniffiFfiConverterTypeFfiVadSampleRate(_UniffiConverterRustBuffer):
             buf.write_i32(1)
         if value == FfiVadSampleRate.RATE8K_HZ:
             buf.write_i32(2)
+
+
+
+
+
+# LoadError
+# We want to define each variant as a nested class that's also a subclass,
+# which is tricky in Python.  To accomplish this we're going to create each
+# class separately, then manually add the child classes to the base class's
+# __dict__.  All of this happens in dummy class to avoid polluting the module
+# namespace.
+class LoadError(Exception):
+    pass
+
+_UniffiTempLoadError = LoadError
+
+class LoadError:  # type: ignore
+    
+    class KindMismatch(_UniffiTempLoadError):
+        
+        def __init__(self, expected, actual, architecture):
+            super().__init__(", ".join([
+                "expected={!r}".format(expected),
+                "actual={!r}".format(actual),
+                "architecture={!r}".format(architecture),
+            ]))
+            self.expected = expected
+            self.actual = actual
+            self.architecture = architecture
+
+        def __repr__(self):
+            return "LoadError.KindMismatch({})".format(str(self))
+    _UniffiTempLoadError.KindMismatch = KindMismatch # type: ignore
+    class UnsupportedArchitecture(_UniffiTempLoadError):
+        
+        def __init__(self, architecture):
+            super().__init__(", ".join([
+                "architecture={!r}".format(architecture),
+            ]))
+            self.architecture = architecture
+
+        def __repr__(self):
+            return "LoadError.UnsupportedArchitecture({})".format(str(self))
+    _UniffiTempLoadError.UnsupportedArchitecture = UnsupportedArchitecture # type: ignore
+    class UnsupportedInferenceType(_UniffiTempLoadError):
+        
+        def __init__(self, inference_type):
+            super().__init__(", ".join([
+                "inference_type={!r}".format(inference_type),
+            ]))
+            self.inference_type = inference_type
+
+        def __repr__(self):
+            return "LoadError.UnsupportedInferenceType({})".format(str(self))
+    _UniffiTempLoadError.UnsupportedInferenceType = UnsupportedInferenceType # type: ignore
+    class Source(_UniffiTempLoadError):
+        
+        def __init__(self, source_kind, detail):
+            super().__init__(", ".join([
+                "source_kind={!r}".format(source_kind),
+                "detail={!r}".format(detail),
+            ]))
+            self.source_kind = source_kind
+            self.detail = detail
+
+        def __repr__(self):
+            return "LoadError.Source({})".format(str(self))
+    _UniffiTempLoadError.Source = Source # type: ignore
+    class Assembly(_UniffiTempLoadError):
+        
+        def __init__(self, backend, detail):
+            super().__init__(", ".join([
+                "backend={!r}".format(backend),
+                "detail={!r}".format(detail),
+            ]))
+            self.backend = backend
+            self.detail = detail
+
+        def __repr__(self):
+            return "LoadError.Assembly({})".format(str(self))
+    _UniffiTempLoadError.Assembly = Assembly # type: ignore
+    class InvalidConfig(_UniffiTempLoadError):
+        
+        def __init__(self, field, value, reason, detail):
+            super().__init__(", ".join([
+                "field={!r}".format(field),
+                "value={!r}".format(value),
+                "reason={!r}".format(reason),
+                "detail={!r}".format(detail),
+            ]))
+            self.field = field
+            self.value = value
+            self.reason = reason
+            self.detail = detail
+
+        def __repr__(self):
+            return "LoadError.InvalidConfig({})".format(str(self))
+    _UniffiTempLoadError.InvalidConfig = InvalidConfig # type: ignore
+    class Engine(_UniffiTempLoadError):
+        
+        def __init__(self, detail):
+            super().__init__(", ".join([
+                "detail={!r}".format(detail),
+            ]))
+            self.detail = detail
+
+        def __repr__(self):
+            return "LoadError.Engine({})".format(str(self))
+    _UniffiTempLoadError.Engine = Engine # type: ignore
+    class Consumed(_UniffiTempLoadError):
+        
+        def __init__(self):
+            pass
+
+        def __repr__(self):
+            return "LoadError.Consumed({})".format(str(self))
+    _UniffiTempLoadError.Consumed = Consumed # type: ignore
+
+LoadError = _UniffiTempLoadError # type: ignore
+del _UniffiTempLoadError
+
+
+class _UniffiFfiConverterTypeLoadError(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return LoadError.KindMismatch(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 2:
+            return LoadError.UnsupportedArchitecture(
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 3:
+            return LoadError.UnsupportedInferenceType(
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 4:
+            return LoadError.Source(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 5:
+            return LoadError.Assembly(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 6:
+            return LoadError.InvalidConfig(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 7:
+            return LoadError.Engine(
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 8:
+            return LoadError.Consumed(
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if isinstance(value, LoadError.KindMismatch):
+            _UniffiFfiConverterString.check_lower(value.expected)
+            _UniffiFfiConverterString.check_lower(value.actual)
+            _UniffiFfiConverterString.check_lower(value.architecture)
+            return
+        if isinstance(value, LoadError.UnsupportedArchitecture):
+            _UniffiFfiConverterString.check_lower(value.architecture)
+            return
+        if isinstance(value, LoadError.UnsupportedInferenceType):
+            _UniffiFfiConverterString.check_lower(value.inference_type)
+            return
+        if isinstance(value, LoadError.Source):
+            _UniffiFfiConverterString.check_lower(value.source_kind)
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if isinstance(value, LoadError.Assembly):
+            _UniffiFfiConverterString.check_lower(value.backend)
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if isinstance(value, LoadError.InvalidConfig):
+            _UniffiFfiConverterString.check_lower(value.field)
+            _UniffiFfiConverterString.check_lower(value.value)
+            _UniffiFfiConverterString.check_lower(value.reason)
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if isinstance(value, LoadError.Engine):
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if isinstance(value, LoadError.Consumed):
+            return
+
+    @staticmethod
+    def write(value, buf):
+        if isinstance(value, LoadError.KindMismatch):
+            buf.write_i32(1)
+            _UniffiFfiConverterString.write(value.expected, buf)
+            _UniffiFfiConverterString.write(value.actual, buf)
+            _UniffiFfiConverterString.write(value.architecture, buf)
+        if isinstance(value, LoadError.UnsupportedArchitecture):
+            buf.write_i32(2)
+            _UniffiFfiConverterString.write(value.architecture, buf)
+        if isinstance(value, LoadError.UnsupportedInferenceType):
+            buf.write_i32(3)
+            _UniffiFfiConverterString.write(value.inference_type, buf)
+        if isinstance(value, LoadError.Source):
+            buf.write_i32(4)
+            _UniffiFfiConverterString.write(value.source_kind, buf)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if isinstance(value, LoadError.Assembly):
+            buf.write_i32(5)
+            _UniffiFfiConverterString.write(value.backend, buf)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if isinstance(value, LoadError.InvalidConfig):
+            buf.write_i32(6)
+            _UniffiFfiConverterString.write(value.field, buf)
+            _UniffiFfiConverterString.write(value.value, buf)
+            _UniffiFfiConverterString.write(value.reason, buf)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if isinstance(value, LoadError.Engine):
+            buf.write_i32(7)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if isinstance(value, LoadError.Consumed):
+            buf.write_i32(8)
+
+
+
+
+
+
+class ModelSource:
+    def __init__(self):
+        raise RuntimeError("ModelSource cannot be instantiated directly")
+
+    # Each enum variant is a nested class of the enum itself.
+    @dataclass
+    class BUNDLE_ID:
+        
+        def __init__(self, id:str, quant:str):
+            self.id = id
+            
+            
+            self.quant = quant
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.BUNDLE_ID(id={}, quant={})".format(self.id, self.quant)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_BUNDLE_ID():
+                return False
+            if self.id != other.id:
+                return False
+            if self.quant != other.quant:
+                return False
+            return True
+
+    @dataclass
+    class HUGGING_FACE:
+        
+        def __init__(self, spec:str, quant:typing.Optional[str], strategy:typing.Optional[str]):
+            self.spec = spec
+            
+            
+            self.quant = quant
+            
+            
+            self.strategy = strategy
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.HUGGING_FACE(spec={}, quant={}, strategy={})".format(self.spec, self.quant, self.strategy)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_HUGGING_FACE():
+                return False
+            if self.spec != other.spec:
+                return False
+            if self.quant != other.quant:
+                return False
+            if self.strategy != other.strategy:
+                return False
+            return True
+
+    @dataclass
+    class BYTES:
+        
+        def __init__(self, bytes:bytes):
+            self.bytes = bytes
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.BYTES(bytes={})".format(self.bytes)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_BYTES():
+                return False
+            if self.bytes != other.bytes:
+                return False
+            return True
+
+    @dataclass
+    class PARTS:
+        
+        def __init__(self, parts:ModelParts):
+            self.parts = parts
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.PARTS(parts={})".format(self.parts)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_PARTS():
+                return False
+            if self.parts != other.parts:
+                return False
+            return True
+
+    @dataclass
+    class PATH:
+        
+        def __init__(self, path:str):
+            self.path = path
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.PATH(path={})".format(self.path)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_PATH():
+                return False
+            if self.path != other.path:
+                return False
+            return True
+
+    @dataclass
+    class FILES:
+        
+        def __init__(self, files:ModelFiles):
+            self.files = files
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ModelSource.FILES(files={})".format(self.files)
+        def __eq__(self, other):
+            if not isinstance(other, ModelSource):
+                return NotImplemented
+            if not other.is_FILES():
+                return False
+            if self.files != other.files:
+                return False
+            return True
+
+    
+
+    # For each variant, we have `is_NAME` and `is_name` methods for easily checking
+    # whether an instance is that variant.
+    def is_BUNDLE_ID(self) -> bool:
+        return isinstance(self, ModelSource.BUNDLE_ID)
+    def is_bundle_id(self) -> bool:
+        return isinstance(self, ModelSource.BUNDLE_ID)
+    def is_HUGGING_FACE(self) -> bool:
+        return isinstance(self, ModelSource.HUGGING_FACE)
+    def is_hugging_face(self) -> bool:
+        return isinstance(self, ModelSource.HUGGING_FACE)
+    def is_BYTES(self) -> bool:
+        return isinstance(self, ModelSource.BYTES)
+    def is_bytes(self) -> bool:
+        return isinstance(self, ModelSource.BYTES)
+    def is_PARTS(self) -> bool:
+        return isinstance(self, ModelSource.PARTS)
+    def is_parts(self) -> bool:
+        return isinstance(self, ModelSource.PARTS)
+    def is_PATH(self) -> bool:
+        return isinstance(self, ModelSource.PATH)
+    def is_path(self) -> bool:
+        return isinstance(self, ModelSource.PATH)
+    def is_FILES(self) -> bool:
+        return isinstance(self, ModelSource.FILES)
+    def is_files(self) -> bool:
+        return isinstance(self, ModelSource.FILES)
+    
+
+# Now, a little trick - we make each nested variant class be a subclass of the main
+# enum class, so that method calls and instance checks etc will work intuitively.
+# We might be able to do this a little more neatly with a metaclass, but this'll do.
+ModelSource.BUNDLE_ID = type("ModelSource.BUNDLE_ID", (ModelSource.BUNDLE_ID, ModelSource,), {})  # type: ignore
+ModelSource.HUGGING_FACE = type("ModelSource.HUGGING_FACE", (ModelSource.HUGGING_FACE, ModelSource,), {})  # type: ignore
+ModelSource.BYTES = type("ModelSource.BYTES", (ModelSource.BYTES, ModelSource,), {})  # type: ignore
+ModelSource.PARTS = type("ModelSource.PARTS", (ModelSource.PARTS, ModelSource,), {})  # type: ignore
+ModelSource.PATH = type("ModelSource.PATH", (ModelSource.PATH, ModelSource,), {})  # type: ignore
+ModelSource.FILES = type("ModelSource.FILES", (ModelSource.FILES, ModelSource,), {})  # type: ignore
+
+
+
+
+class _UniffiFfiConverterTypeModelSource(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ModelSource.BUNDLE_ID(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 2:
+            return ModelSource.HUGGING_FACE(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterOptionalString.read(buf),
+                _UniffiFfiConverterOptionalString.read(buf),
+            )
+        if variant == 3:
+            return ModelSource.BYTES(
+                _UniffiFfiConverterBytes.read(buf),
+            )
+        if variant == 4:
+            return ModelSource.PARTS(
+                _UniffiFfiConverterTypeModelParts.read(buf),
+            )
+        if variant == 5:
+            return ModelSource.PATH(
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 6:
+            return ModelSource.FILES(
+                _UniffiFfiConverterTypeModelFiles.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value.is_BUNDLE_ID():
+            _UniffiFfiConverterString.check_lower(value.id)
+            _UniffiFfiConverterString.check_lower(value.quant)
+            return
+        if value.is_HUGGING_FACE():
+            _UniffiFfiConverterString.check_lower(value.spec)
+            _UniffiFfiConverterOptionalString.check_lower(value.quant)
+            _UniffiFfiConverterOptionalString.check_lower(value.strategy)
+            return
+        if value.is_BYTES():
+            _UniffiFfiConverterBytes.check_lower(value.bytes)
+            return
+        if value.is_PARTS():
+            _UniffiFfiConverterTypeModelParts.check_lower(value.parts)
+            return
+        if value.is_PATH():
+            _UniffiFfiConverterString.check_lower(value.path)
+            return
+        if value.is_FILES():
+            _UniffiFfiConverterTypeModelFiles.check_lower(value.files)
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value.is_BUNDLE_ID():
+            buf.write_i32(1)
+            _UniffiFfiConverterString.write(value.id, buf)
+            _UniffiFfiConverterString.write(value.quant, buf)
+        if value.is_HUGGING_FACE():
+            buf.write_i32(2)
+            _UniffiFfiConverterString.write(value.spec, buf)
+            _UniffiFfiConverterOptionalString.write(value.quant, buf)
+            _UniffiFfiConverterOptionalString.write(value.strategy, buf)
+        if value.is_BYTES():
+            buf.write_i32(3)
+            _UniffiFfiConverterBytes.write(value.bytes, buf)
+        if value.is_PARTS():
+            buf.write_i32(4)
+            _UniffiFfiConverterTypeModelParts.write(value.parts, buf)
+        if value.is_PATH():
+            buf.write_i32(5)
+            _UniffiFfiConverterString.write(value.path, buf)
+        if value.is_FILES():
+            buf.write_i32(6)
+            _UniffiFfiConverterTypeModelFiles.write(value.files, buf)
 
 
 
@@ -6145,6 +7792,19 @@ class SessionProtocol(typing.Protocol):
         `generate()` is in flight.
 """
         raise NotImplementedError
+    def recovery_status(self, ) -> SessionRecoveryStatus:
+        """
+        Observe recovery after a failed whole-message call without changing KV,
+        cancellation or the retained report. Returns `Busy` if any call holds
+        the session lock, including a streaming callback's enclosing operation.
+        A poisoned lock returns `Backend`; recreate that session.
+
+        `Reset` requires replaying prior context. `Restored` and `Unchanged`
+        retain it when `usable` is true. Clear cancellation explicitly before
+        retrying a cancelled append. A missing report gives no recovery guarantee
+        for raw append operations, which retain their partial-prefill behavior.
+"""
+        raise NotImplementedError
     def remove_lora(self, ) -> None:
         """
         Remove any attached LoRA adapter, returning to base-model inference.
@@ -6785,6 +8445,29 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_position,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def recovery_status(self, ) -> SessionRecoveryStatus:
+        """
+        Observe recovery after a failed whole-message call without changing KV,
+        cancellation or the retained report. Returns `Busy` if any call holds
+        the session lock, including a streaming callback's enclosing operation.
+        A poisoned lock returns `Backend`; recreate that session.
+
+        `Reset` requires replaying prior context. `Restored` and `Unchanged`
+        retain it when `usable` is true. Clear cancellation explicitly before
+        retrying a cancelled append. A missing report gives no recovery guarantee
+        for raw append operations, which retain their partial-prefill behavior.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeSessionRecoveryStatus.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_recovery_status,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -9071,11 +10754,14 @@ class FfiWhisperModelProtocol(typing.Protocol):
     def transcribe(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
         """
         Transcribe 16 kHz mono PCM audio samples synchronously.
+        Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
 """
         raise NotImplementedError
     async def transcribe_async(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
         """
         Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+        Dropping the returned future aborts queued work and signals an already-running decoder
+        to stop at its next cooperative cancellation check.
 """
         raise NotImplementedError
 
@@ -9175,6 +10861,7 @@ class FfiWhisperModel(FfiWhisperModelProtocol):
     def transcribe(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
         """
         Transcribe 16 kHz mono PCM audio samples synchronously.
+        Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(pcm)
@@ -9196,6 +10883,8 @@ class FfiWhisperModel(FfiWhisperModelProtocol):
     async def transcribe_async(self, pcm: typing.List[float],opts: typing.Optional[FfiWhisperTranscribeOpts]) -> str:
         """
         Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+        Dropping the returned future aborts queued work and signals an already-running decoder
+        to stop at its next cooperative cancellation check.
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(pcm)
@@ -9244,6 +10933,370 @@ class _UniffiFfiConverterTypeFfiWhisperModel:
 
     @classmethod
     def write(cls, value: FfiWhisperModel, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+
+class GenerativeModelProtocol(typing.Protocol):
+    """
+    A shared generative engine. Creating handles never reloads the source or copies live KV.
+"""
+    
+    def create_session(self, config: SessionConfig) -> Session:
+        """
+        Create an existing production Session with the caller's full configuration.
+        Sessions retain their resources after all loader/model/engine handles close.
+        Existing backend sharing restrictions and Session/FfiError behavior apply.
+"""
+        raise NotImplementedError
+    def engine(self, ) -> CeraEngine:
+        """
+        Access all retained engine operations through the already loaded engine.
+"""
+        raise NotImplementedError
+
+class GenerativeModel(GenerativeModelProtocol):
+    """
+    A shared generative engine. Creating handles never reloads the source or copies live KV.
+"""
+    
+    _handle: ctypes.c_uint64
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def create_session(self, config: SessionConfig) -> Session:
+        """
+        Create an existing production Session with the caller's full configuration.
+        Sessions retain their resources after all loader/model/engine handles close.
+        Existing backend sharing restrictions and Session/FfiError behavior apply.
+"""
+        
+        _UniffiFfiConverterTypeSessionConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeSessionConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeSession.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def engine(self, ) -> CeraEngine:
+        """
+        Access all retained engine operations through the already loaded engine.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeCeraEngine.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeGenerativeModel:
+    @staticmethod
+    def lift(value: int) -> GenerativeModel:
+        return GenerativeModel._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: GenerativeModel):
+        if not isinstance(value, GenerativeModel):
+            raise TypeError("Expected GenerativeModel instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: GenerativeModel) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> GenerativeModel:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: GenerativeModel, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+class _UniffiFfiConverterOptionalTypeGenerativeModel(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeGenerativeModel.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeGenerativeModel.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeGenerativeModel.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+class ModelHandleProtocol(typing.Protocol):
+    """
+    Dynamic loaded-model handle. Typed accessors share ownership.
+"""
+    
+    def as_generative(self, ) -> typing.Optional[GenerativeModel]:
+        """
+        Share a generative model if present; the result can outlive this handle.
+"""
+        raise NotImplementedError
+    def kind(self, ) -> str:
+        """
+        Kind of the loaded model. A string allows future kinds without enum decoding.
+"""
+        raise NotImplementedError
+
+class ModelHandle(ModelHandleProtocol):
+    """
+    Dynamic loaded-model handle. Typed accessors share ownership.
+"""
+    
+    _handle: ctypes.c_uint64
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def as_generative(self, ) -> typing.Optional[GenerativeModel]:
+        """
+        Share a generative model if present; the result can outlive this handle.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalTypeGenerativeModel.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_as_generative,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def kind(self, ) -> str:
+        """
+        Kind of the loaded model. A string allows future kinds without enum decoding.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeModelHandle:
+    @staticmethod
+    def lift(value: int) -> ModelHandle:
+        return ModelHandle._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: ModelHandle):
+        if not isinstance(value, ModelHandle):
+            raise TypeError("Expected ModelHandle instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: ModelHandle) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> ModelHandle:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: ModelHandle, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+
+class ModelLoaderProtocol(typing.Protocol):
+    """
+    Synchronous, single-use model loader. Both build methods consume the source,
+    including on failure. Dispatch remote or expensive loads off the UI thread.
+"""
+    
+    def build(self, ) -> ModelHandle:
+        """
+        Load a dynamic model handle. Generative loading is currently supported.
+"""
+        raise NotImplementedError
+    def build_generative(self, ) -> GenerativeModel:
+        """
+        Load a generative model, reporting other known kinds before assembly.
+"""
+        raise NotImplementedError
+
+class ModelLoader(ModelLoaderProtocol):
+    """
+    Synchronous, single-use model loader. Both build methods consume the source,
+    including on failure. Dispatch remote or expensive loads off the UI thread.
+"""
+    
+    _handle: ctypes.c_uint64
+    def __init__(self, source: ModelSource,config: EngineConfig):
+        """
+        Retain explicit source data and the existing production engine options.
+        Construction does not load weights or contact a remote service.
+"""
+        
+        _UniffiFfiConverterTypeModelSource.check_lower(source)
+
+        _UniffiFfiConverterTypeEngineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterTypeModelSource.lower(source),
+            _UniffiFfiConverterTypeEngineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeModelLoader.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new,
+            *_uniffi_lowered_args,
+        )
+        self._handle = _uniffi_ffi_result
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_modelloader, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def build(self, ) -> ModelHandle:
+        """
+        Load a dynamic model handle. Generative loading is currently supported.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeModelHandle.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeLoadError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def build_generative(self, ) -> GenerativeModel:
+        """
+        Load a generative model, reporting other known kinds before assembly.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerativeModel.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeLoadError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeModelLoader:
+    @staticmethod
+    def lift(value: int) -> ModelLoader:
+        return ModelLoader._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: ModelLoader):
+        if not isinstance(value, ModelLoader):
+            raise TypeError("Expected ModelLoader instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: ModelLoader) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> ModelLoader:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: ModelLoader, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
 
@@ -9430,31 +11483,6 @@ class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
     @staticmethod
     def write(value, buf):
         buf.write_u8(value)
-
-class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBytes.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBytes.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBytes.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
     @classmethod
@@ -9683,9 +11711,14 @@ __all__ = [
     "BackendPreference",
     "FfiError",
     "FinishReason",
+    "RecoveryOutcome",
+    "KvRewindFailure",
+    "GenerationDefaults",
     "KvCompression",
     "FfiVadEvent",
     "FfiVadSampleRate",
+    "LoadError",
+    "ModelSource",
     "ToolFormat",
     "AudioInput",
     "ChatMessage",
@@ -9701,10 +11734,15 @@ __all__ = [
     "GenerateOpts",
     "GenerateSummary",
     "GenerateOutput",
+    "IngestRecovery",
     "LeapBundleEntry",
     "ModalityCapabilities",
+    "ModelFiles",
     "ModelMetadata",
+    "SamplingDefaults",
+    "ModelParts",
     "SessionConfig",
+    "SessionRecoveryStatus",
     "ToolCall",
     "ToolDef",
     "UserMessage",
@@ -9740,6 +11778,12 @@ __all__ = [
     "FfiVadIteratorProtocol",
     "FfiWhisperModel",
     "FfiWhisperModelProtocol",
+    "GenerativeModel",
+    "GenerativeModelProtocol",
+    "ModelHandle",
+    "ModelHandleProtocol",
+    "ModelLoader",
+    "ModelLoaderProtocol",
     "PiiClassifier",
     "PiiClassifierProtocol",
 ]

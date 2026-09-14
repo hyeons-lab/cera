@@ -218,7 +218,7 @@ SessionConfig _sessionConfigOf(CeraOptions options, {int? seed}) =>
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
-    : _session = _engine.newSession(_sessionConfigOf(_options)),
+    : _sessionHandle = _engine.newSession(_sessionConfigOf(_options)),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
@@ -238,7 +238,12 @@ class _NativeCera implements Cera {
   @override
   CeraCapabilities get capabilities => _capabilities;
 
-  Session _session;
+  Session? _sessionHandle;
+
+  // A failed replacement leaves no closed handle behind. The conversation was
+  // empty before reseeding, so a later operation can safely create a fresh one.
+  Session get _session =>
+      _sessionHandle ??= _engine.newSession(_sessionConfigOf(_options));
   bool _closed = false;
   List<int>? _pendingAudioSuffixTokens;
 
@@ -357,7 +362,7 @@ class _NativeCera implements Cera {
     var started = false;
 
     controller.onCancel = () async {
-      if (started && !finished && !_closed) _session.cancel();
+      if (started && !finished && !_closed) _sessionHandle?.cancel();
     };
 
     // Kick off after the caller has had a chance to subscribe; `onListen` is
@@ -406,20 +411,16 @@ class _NativeCera implements Cera {
       try {
         // `seed` is per session, not per call, so honoring it means a new
         // session. That also clears the conversation, so it is only honored on
-        // a fresh engine. Inside the try because it closes the old session
-        // before opening the new one, and a throw in between would otherwise
-        // leave the engine holding a closed handle.
+        // a fresh engine. Clear the stored handle before releasing it so a
+        // constructor failure leaves a recoverable empty slot.
         if (seed != null && _session.position() == 0) {
-          // Build the replacement BEFORE closing the old one. The other order
-          // leaves `_session` a closed handle if `newSession` throws, and
-          // `close()` calls `cancel()` on it first, which throws in turn and
-          // skips `_engine.close()`: the model weights, the largest allocation
-          // in the app, would leak until the finalizer ran.
-          final reseeded = _engine.newSession(
+          // A GPU model permits one live Session, including an empty one.
+          final previous = _sessionHandle;
+          _sessionHandle = null;
+          previous?.close();
+          _sessionHandle = _engine.newSession(
             _sessionConfigOf(_options, seed: seed),
           );
-          _session.close();
-          _session = reseeded;
         }
         List<int> tokens;
         final pendingSuffix = _pendingAudioSuffixTokens;
@@ -591,9 +592,9 @@ class _NativeCera implements Cera {
 
   @override
   Future<String> transcribe(List<double> pcm, {required int sampleRate}) async {
-    // Queued despite not touching the session: it is a full prefill plus decode
-    // on the shared engine, so running it under a generation would contend on
-    // the same model for the length of the clip.
+    // Keep operations ordered. The core uses a separate retained-weight GPU
+    // context when our conversation Session owns the primary context, preserving
+    // that conversation without replaying or resetting its KV state.
     final ahead = _queue;
     final mine = Completer<void>();
     _queue = mine.future;
@@ -616,7 +617,7 @@ class _NativeCera implements Cera {
     // Wait for any running decode first: resetting under one would leave it
     // emitting into a session state it no longer matches, and a GPU-backed
     // model shares KV state across sessions besides.
-    _session.cancel();
+    _sessionHandle?.cancel();
     final ahead = _queue;
     final mine = Completer<void>();
     _queue = mine.future;
@@ -642,7 +643,7 @@ class _NativeCera implements Cera {
   @override
   Future<void> cancel() async {
     if (_closed) return;
-    _session.cancel();
+    _sessionHandle?.cancel();
     // A running decode lowers the flag from its terminal callback. With
     // nothing running there is no such callback, and leaving it raised would
     // fail the NEXT prompt's prefill rather than anything the caller did. The
@@ -660,7 +661,7 @@ class _NativeCera implements Cera {
   /// operation, and this is the second step; the worker's `cancel` op pairs
   /// them the same way.
   void _clearCancel() {
-    if (!_closed) _session.clearCancel();
+    if (!_closed) _sessionHandle?.clearCancel();
   }
 
   @override
@@ -671,9 +672,17 @@ class _NativeCera implements Cera {
     // asks it to stop at its next between-token check, and the sink's
     // `isOpen` guard covers the window until it does.
     _closed = true;
-    _session.cancel();
-    _session.close();
-    _engine.close();
+    final session = _sessionHandle;
+    _sessionHandle = null;
+    try {
+      session?.cancel();
+    } finally {
+      try {
+        session?.close();
+      } finally {
+        _engine.close();
+      }
+    }
   }
 
   @override

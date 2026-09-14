@@ -1,0 +1,27 @@
+{
+  "swift-stable": {
+    "file": "LeapSDK-0.10.9.zip",
+    "url": "https://github.com/Liquid4All/leap-sdk/releases/download/v0.10.9/LeapSDK.xcframework.zip",
+    "sha256": "1fdea67fe208ee56db3aba4313809b03a469e6520a49a855c212ebcfef4cea2e"
+  },
+  "swift-snapshot": {
+    "file": "LeapSDK-0.10.13-SNAPSHOT.zip",
+    "url": "https://github.com/Liquid4All/leap-sdk/releases/download/v0.10.13-SNAPSHOT/LeapSDK.xcframework.zip",
+    "sha256": "99abbed6967de43dfa2b3ad03350f4146bf9ab9194a2fbc719d239066e6becc3"
+  },
+  "kotlin-stable": {
+    "file": "leap-sdk-jvm-0.10.9.jar",
+    "url": "https://repo.maven.apache.org/maven2/ai/liquid/leap/leap-sdk-jvm/0.10.9/leap-sdk-jvm-0.10.9.jar",
+    "sha256": "215ac792f2aab3b0b796fb0d0f95df479a43d88fc753e90b2be39aac227f977c"
+  },
+  "coroutines": {
+    "file": "kotlinx-coroutines-core-jvm-1.10.2.jar",
+    "url": "https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.10.2/kotlinx-coroutines-core-jvm-1.10.2.jar",
+    "sha256": "5ca175b38df331fd64155b35cd8cae1251fa9ee369709b36d42e0a288ccce3fd"
+  },
+  "jna": {
+    "file": "jna-5.16.0.jar",
+    "url": "https://repo.maven.apache.org/maven2/net/java/dev/jna/jna/5.16.0/jna-5.16.0.jar",
+    "sha256": "3f5233589a799eb66dc2969afa3433fb56859d3d787c58b9bc7dd9e86f0a250c"
+  }
+}

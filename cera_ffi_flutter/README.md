@@ -172,9 +172,9 @@ final kwsIterator = FfiHotwordIterator.fromFiles(
   '/path/to/silero_vad.gguf',
   kwsConfig,
 );
-final event = kwsIterator.processChunk(audioChunk16kHz);
-if (event != null) {
-  print('Wake word detected: ${event.keyword} (confidence: ${event.confidence})');
+final wakeEvent = kwsIterator.processChunk(audioChunk16kHz);
+if (wakeEvent != null) {
+  print('Wake word detected: ${wakeEvent.keyword} (confidence: ${wakeEvent.confidence})');
 }
 
 // Whisper Speech-to-Text Transcription

@@ -476,11 +476,12 @@ class FfiHotwordEvent {
   const FfiHotwordEvent({
     /// The matched keyword string.
     required this.keyword,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     required this.sampleOffset,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     required this.commandStartSample,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     required this.timestampMs,
     /// Model confidence probability (0.0 to 1.0).
     required this.confidence,
@@ -488,11 +489,12 @@ class FfiHotwordEvent {
 
   /// The matched keyword string.
   final String keyword;
-  /// Exact audio stream sample index where the keyword completed.
+  /// Exclusive end sample of the window evaluated when detection triggered.
+  /// This is a detection-hop boundary; it does not locate the spoken word's end.
   final int sampleOffset;
-  /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+  /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
   final int commandStartSample;
-  /// Timestamp in milliseconds from stream origin where keyword completed.
+  /// `sample_offset` converted to milliseconds using the model sample rate.
   final double timestampMs;
   /// Model confidence probability (0.0 to 1.0).
   final double confidence;
@@ -1653,6 +1655,356 @@ class UserMessage {
   int get hashCode => Object.hash(text, images, audio);
 }
 
+class ModelFiles {
+  const ModelFiles({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.extras,
+    required this.inferenceType,
+    required this.chatTemplate,
+  });
+
+  final String model;
+  final String? multimodalProjector;
+  final String? audioDecoder;
+  final String? audioTokenizer;
+  final String? draftModel;
+  final Map<String, String> extras;
+  final String? inferenceType;
+  final String? chatTemplate;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': this.model,
+      'multimodalProjector': this.multimodalProjector,
+      'audioDecoder': this.audioDecoder,
+      'audioTokenizer': this.audioTokenizer,
+      'draftModel': this.draftModel,
+      'extras': this.extras,
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+    };
+  }
+
+  factory ModelFiles.fromJson(Map<String, dynamic> json) {
+    return ModelFiles(
+      model: json['model'] as String,
+      multimodalProjector: json['multimodalProjector'] == null ? null : json['multimodalProjector'] as String,
+      audioDecoder: json['audioDecoder'] == null ? null : json['audioDecoder'] as String,
+      audioTokenizer: json['audioTokenizer'] == null ? null : json['audioTokenizer'] as String,
+      draftModel: json['draftModel'] == null ? null : json['draftModel'] as String,
+      extras: (json['extras'] as Map<String, dynamic>).map((key, value) => MapEntry(key, value as String)),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+    );
+  }
+
+  ModelFiles copyWith({
+    String? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Map<String, String>? extras,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+  }) {
+    return ModelFiles(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as String?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as String?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as String?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
+      extras: extras ?? this.extras,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelFiles(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, extras: $extras, inferenceType: $inferenceType, chatTemplate: $chatTemplate)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelFiles && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && extras == other.extras && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, extras, inferenceType, chatTemplate);
+}
+
+class ModelParts {
+  const ModelParts({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.inferenceType,
+    required this.chatTemplate,
+    required this.generationDefaults,
+  });
+
+  final Uint8List model;
+  final Uint8List? multimodalProjector;
+  final Uint8List? audioDecoder;
+  final Uint8List? audioTokenizer;
+  final Uint8List? draftModel;
+  final String? inferenceType;
+  final String? chatTemplate;
+  final GenerationDefaults? generationDefaults;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': base64Encode(this.model),
+      'multimodalProjector': this.multimodalProjector == null ? null : (() { final __tmp = this.multimodalProjector!; return base64Encode(__tmp); })(),
+      'audioDecoder': this.audioDecoder == null ? null : (() { final __tmp = this.audioDecoder!; return base64Encode(__tmp); })(),
+      'audioTokenizer': this.audioTokenizer == null ? null : (() { final __tmp = this.audioTokenizer!; return base64Encode(__tmp); })(),
+      'draftModel': this.draftModel == null ? null : (() { final __tmp = this.draftModel!; return base64Encode(__tmp); })(),
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+      'generationDefaults': this.generationDefaults == null ? null : (() { final __tmp = this.generationDefaults!; return GenerationDefaultsFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory ModelParts.fromJson(Map<String, dynamic> json) {
+    return ModelParts(
+      model: base64Decode(json['model'] as String),
+      multimodalProjector: json['multimodalProjector'] == null ? null : (() { final __tmp = json['multimodalProjector']; return base64Decode(__tmp as String); })(),
+      audioDecoder: json['audioDecoder'] == null ? null : (() { final __tmp = json['audioDecoder']; return base64Decode(__tmp as String); })(),
+      audioTokenizer: json['audioTokenizer'] == null ? null : (() { final __tmp = json['audioTokenizer']; return base64Decode(__tmp as String); })(),
+      draftModel: json['draftModel'] == null ? null : (() { final __tmp = json['draftModel']; return base64Decode(__tmp as String); })(),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+      generationDefaults: json['generationDefaults'] == null ? null : (() { final __tmp = json['generationDefaults']; return GenerationDefaultsFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  ModelParts copyWith({
+    Uint8List? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+    Object? generationDefaults = _sentinel,
+  }) {
+    return ModelParts(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as Uint8List?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as Uint8List?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as Uint8List?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as Uint8List?,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+      generationDefaults: generationDefaults == _sentinel ? this.generationDefaults : generationDefaults as GenerationDefaults?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelParts(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, inferenceType: $inferenceType, chatTemplate: $chatTemplate, generationDefaults: $generationDefaults)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelParts && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate && generationDefaults == other.generationDefaults;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, inferenceType, chatTemplate, generationDefaults);
+}
+
+class SamplingDefaults {
+  const SamplingDefaults({
+    required this.temperature,
+    required this.topP,
+    required this.topK,
+    required this.minP,
+    required this.repetitionPenalty,
+  });
+
+  final double? temperature;
+  final double? topP;
+  final int? topK;
+  final double? minP;
+  final double? repetitionPenalty;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'temperature': this.temperature,
+      'topP': this.topP,
+      'topK': this.topK,
+      'minP': this.minP,
+      'repetitionPenalty': this.repetitionPenalty,
+    };
+  }
+
+  factory SamplingDefaults.fromJson(Map<String, dynamic> json) {
+    return SamplingDefaults(
+      temperature: json['temperature'] == null ? null : (json['temperature'] as num).toDouble(),
+      topP: json['topP'] == null ? null : (json['topP'] as num).toDouble(),
+      topK: json['topK'] == null ? null : (json['topK'] as num).toInt(),
+      minP: json['minP'] == null ? null : (json['minP'] as num).toDouble(),
+      repetitionPenalty: json['repetitionPenalty'] == null ? null : (json['repetitionPenalty'] as num).toDouble(),
+    );
+  }
+
+  SamplingDefaults copyWith({
+    Object? temperature = _sentinel,
+    Object? topP = _sentinel,
+    Object? topK = _sentinel,
+    Object? minP = _sentinel,
+    Object? repetitionPenalty = _sentinel,
+  }) {
+    return SamplingDefaults(
+      temperature: temperature == _sentinel ? this.temperature : temperature as double?,
+      topP: topP == _sentinel ? this.topP : topP as double?,
+      topK: topK == _sentinel ? this.topK : topK as int?,
+      minP: minP == _sentinel ? this.minP : minP as double?,
+      repetitionPenalty: repetitionPenalty == _sentinel ? this.repetitionPenalty : repetitionPenalty as double?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SamplingDefaults(temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SamplingDefaults && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty;
+
+  @override
+  int get hashCode => Object.hash(temperature, topP, topK, minP, repetitionPenalty);
+}
+
+/// Recovery diagnostic retained after a failed `send_message` ingestion.
+/// The call's original error is still returned separately. Generation failures
+/// after successful ingestion do not create this report.
+class IngestRecovery {
+  const IngestRecovery({
+    required this.outcome,
+    required this.rewindError,
+    required this.resetError,
+  });
+
+  final RecoveryOutcome outcome;
+  final KvRewindFailure? rewindError;
+  final FfiError? resetError;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'outcome': RecoveryOutcomeFfiCodec.encode(this.outcome),
+      'rewindError': this.rewindError == null ? null : (() { final __tmp = this.rewindError!; return KvRewindFailureFfiCodec.encode(__tmp); })(),
+      'resetError': this.resetError == null ? null : (() { final __tmp = this.resetError!; return FfiErrorFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory IngestRecovery.fromJson(Map<String, dynamic> json) {
+    return IngestRecovery(
+      outcome: RecoveryOutcomeFfiCodec.decode(json['outcome'] as String),
+      rewindError: json['rewindError'] == null ? null : (() { final __tmp = json['rewindError']; return KvRewindFailureFfiCodec.decode(__tmp as String); })(),
+      resetError: json['resetError'] == null ? null : (() { final __tmp = json['resetError']; return FfiErrorFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  IngestRecovery copyWith({
+    RecoveryOutcome? outcome,
+    Object? rewindError = _sentinel,
+    Object? resetError = _sentinel,
+  }) {
+    return IngestRecovery(
+      outcome: outcome ?? this.outcome,
+      rewindError: rewindError == _sentinel ? this.rewindError : rewindError as KvRewindFailure?,
+      resetError: resetError == _sentinel ? this.resetError : resetError as FfiError?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'IngestRecovery(outcome: $outcome, rewindError: $rewindError, resetError: $resetError)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IngestRecovery && outcome == other.outcome && rewindError == other.rewindError && resetError == other.resetError;
+
+  @override
+  int get hashCode => Object.hash(outcome, rewindError, resetError);
+}
+
+/// Coherent snapshot of a session at the instant the lock was acquired.
+/// Another thread may change the session after this method returns.
+class SessionRecoveryStatus {
+  const SessionRecoveryStatus({
+    /// False requires a successful checked reset or recreation.
+    required this.usable,
+    /// Meaningful as reusable context only when `usable` is true.
+    required this.position,
+    /// Cleared by successful whole-message ingestion or explicit reset.
+    /// Raw append calls and cancellation controls leave it unchanged.
+    required this.lastIngestRecovery,
+  });
+
+  /// False requires a successful checked reset or recreation.
+  final bool usable;
+  /// Meaningful as reusable context only when `usable` is true.
+  final int position;
+  /// Cleared by successful whole-message ingestion or explicit reset.
+  /// Raw append calls and cancellation controls leave it unchanged.
+  final IngestRecovery? lastIngestRecovery;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'usable': this.usable,
+      'position': this.position,
+      'lastIngestRecovery': this.lastIngestRecovery == null ? null : (() { final __tmp = this.lastIngestRecovery!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory SessionRecoveryStatus.fromJson(Map<String, dynamic> json) {
+    return SessionRecoveryStatus(
+      usable: json['usable'] as bool,
+      position: (json['position'] as num).toInt(),
+      lastIngestRecovery: json['lastIngestRecovery'] == null ? null : (() { final __tmp = json['lastIngestRecovery']; return IngestRecovery.fromJson(__tmp as Map<String, dynamic>); })(),
+    );
+  }
+
+  SessionRecoveryStatus copyWith({
+    bool? usable,
+    int? position,
+    Object? lastIngestRecovery = _sentinel,
+  }) {
+    return SessionRecoveryStatus(
+      usable: usable ?? this.usable,
+      position: position ?? this.position,
+      lastIngestRecovery: lastIngestRecovery == _sentinel ? this.lastIngestRecovery : lastIngestRecovery as IngestRecovery?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SessionRecoveryStatus(usable: $usable, position: $position, lastIngestRecovery: $lastIngestRecovery)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SessionRecoveryStatus && usable == other.usable && position == other.position && lastIngestRecovery == other.lastIngestRecovery;
+
+  @override
+  int get hashCode => Object.hash(usable, position, lastIngestRecovery);
+}
+
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
@@ -2321,6 +2673,533 @@ enum ToolFormat {
   hermes,
 }
 
+sealed class LoadError {
+  const LoadError();
+}
+
+final class LoadErrorKindMismatch extends LoadError {
+  const LoadErrorKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorKindMismatch && expected == other.expected && actual == other.actual && architecture == other.architecture;
+
+  @override
+  int get hashCode => Object.hash(expected, actual, architecture);
+}
+
+final class LoadErrorUnsupportedArchitecture extends LoadError {
+  const LoadErrorUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedArchitecture(architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedArchitecture && architecture == other.architecture;
+
+  @override
+  int get hashCode => architecture.hashCode;
+}
+
+final class LoadErrorUnsupportedInferenceType extends LoadError {
+  const LoadErrorUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedInferenceType && inferenceType == other.inferenceType;
+
+  @override
+  int get hashCode => inferenceType.hashCode;
+}
+
+final class LoadErrorSource extends LoadError {
+  const LoadErrorSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorSource && sourceKind == other.sourceKind && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(sourceKind, detail);
+}
+
+final class LoadErrorAssembly extends LoadError {
+  const LoadErrorAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorAssembly(backend: $backend, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorAssembly && backend == other.backend && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(backend, detail);
+}
+
+final class LoadErrorInvalidConfig extends LoadError {
+  const LoadErrorInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorInvalidConfig && field == other.field && value == other.value && reason == other.reason && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(field, value, reason, detail);
+}
+
+final class LoadErrorEngine extends LoadError {
+  const LoadErrorEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorEngine(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorEngine && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+final class LoadErrorConsumed extends LoadError {
+  const LoadErrorConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorConsumed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorConsumed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+sealed class ModelSource {
+  const ModelSource();
+}
+
+final class ModelSourceBundleId extends ModelSource {
+  const ModelSourceBundleId({
+    required this.id,
+    required this.quant,
+  });
+  final String id;
+  final String quant;
+
+  @override
+  String toString() {
+    return 'ModelSourceBundleId(id: $id, quant: $quant)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBundleId && id == other.id && quant == other.quant;
+
+  @override
+  int get hashCode => Object.hash(id, quant);
+}
+
+final class ModelSourceHuggingFace extends ModelSource {
+  const ModelSourceHuggingFace({
+    required this.spec,
+    required this.quant,
+    required this.strategy,
+  });
+  final String spec;
+  final String? quant;
+  final String? strategy;
+
+  @override
+  String toString() {
+    return 'ModelSourceHuggingFace(spec: $spec, quant: $quant, strategy: $strategy)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceHuggingFace && spec == other.spec && quant == other.quant && strategy == other.strategy;
+
+  @override
+  int get hashCode => Object.hash(spec, quant, strategy);
+}
+
+final class ModelSourceBytes extends ModelSource {
+  const ModelSourceBytes({
+    required this.bytes,
+  });
+  final Uint8List bytes;
+
+  @override
+  String toString() {
+    return 'ModelSourceBytes(bytes: $bytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBytes && bytes == other.bytes;
+
+  @override
+  int get hashCode => bytes.hashCode;
+}
+
+final class ModelSourceParts extends ModelSource {
+  const ModelSourceParts({
+    required this.parts,
+  });
+  final ModelParts parts;
+
+  @override
+  String toString() {
+    return 'ModelSourceParts(parts: $parts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceParts && parts == other.parts;
+
+  @override
+  int get hashCode => parts.hashCode;
+}
+
+final class ModelSourcePath extends ModelSource {
+  const ModelSourcePath({
+    required this.path,
+  });
+  final String path;
+
+  @override
+  String toString() {
+    return 'ModelSourcePath(path: $path)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourcePath && path == other.path;
+
+  @override
+  int get hashCode => path.hashCode;
+}
+
+final class ModelSourceFiles extends ModelSource {
+  const ModelSourceFiles({
+    required this.files,
+  });
+  final ModelFiles files;
+
+  @override
+  String toString() {
+    return 'ModelSourceFiles(files: $files)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceFiles && files == other.files;
+
+  @override
+  int get hashCode => files.hashCode;
+}
+
+sealed class GenerationDefaults {
+  const GenerationDefaults();
+}
+
+final class GenerationDefaultsText extends GenerationDefaults {
+  const GenerationDefaultsText({
+    required this.sampling,
+  });
+  final SamplingDefaults sampling;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsText(sampling: $sampling)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsText && sampling == other.sampling;
+
+  @override
+  int get hashCode => sampling.hashCode;
+}
+
+final class GenerationDefaultsAudio extends GenerationDefaults {
+  const GenerationDefaultsAudio({
+    required this.sampling,
+    required this.numberOfDecodingThreads,
+    required this.audioTemperature,
+    required this.audioTopK,
+  });
+  final SamplingDefaults sampling;
+  final int? numberOfDecodingThreads;
+  final double? audioTemperature;
+  final int? audioTopK;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsAudio(sampling: $sampling, numberOfDecodingThreads: $numberOfDecodingThreads, audioTemperature: $audioTemperature, audioTopK: $audioTopK)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsAudio && sampling == other.sampling && numberOfDecodingThreads == other.numberOfDecodingThreads && audioTemperature == other.audioTemperature && audioTopK == other.audioTopK;
+
+  @override
+  int get hashCode => Object.hash(sampling, numberOfDecodingThreads, audioTemperature, audioTopK);
+}
+
+final class GenerationDefaultsOther extends GenerationDefaults {
+  const GenerationDefaultsOther({
+    required this.rawJson,
+  });
+  final String rawJson;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsOther(rawJson: $rawJson)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsOther && rawJson == other.rawJson;
+
+  @override
+  int get hashCode => rawJson.hashCode;
+}
+
+/// Why checked tail rewind was unavailable. Numeric positions are token counts.
+sealed class KvRewindFailure {
+  const KvRewindFailure();
+}
+
+final class KvRewindFailureOutOfBounds extends KvRewindFailure {
+  const KvRewindFailureOutOfBounds({
+    required this.requested,
+    required this.current,
+  });
+  final int requested;
+  final int current;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureOutOfBounds(requested: $requested, current: $current)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureOutOfBounds && requested == other.requested && current == other.current;
+
+  @override
+  int get hashCode => Object.hash(requested, current);
+}
+
+final class KvRewindFailureCompressed extends KvRewindFailure {
+  const KvRewindFailureCompressed();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureCompressed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureCompressed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureNonCausal extends KvRewindFailure {
+  const KvRewindFailureNonCausal();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureNonCausal()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureNonCausal;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureMissingConvolutionCheckpoint extends KvRewindFailure {
+  const KvRewindFailureMissingConvolutionCheckpoint({
+    required this.layer,
+    required this.position,
+  });
+  final int layer;
+  final int position;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureMissingConvolutionCheckpoint(layer: $layer, position: $position)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureMissingConvolutionCheckpoint && layer == other.layer && position == other.position;
+
+  @override
+  int get hashCode => Object.hash(layer, position);
+}
+
+final class KvRewindFailureInvalidCacheLayout extends KvRewindFailure {
+  const KvRewindFailureInvalidCacheLayout({
+    required this.layer,
+    required this.detail,
+  });
+  final int layer;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureInvalidCacheLayout(layer: $layer, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureInvalidCacheLayout && layer == other.layer && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(layer, detail);
+}
+
+final class KvRewindFailureBackendUnsupported extends KvRewindFailure {
+  const KvRewindFailureBackendUnsupported();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureBackendUnsupported()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureBackendUnsupported;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureUnknown extends KvRewindFailure {
+  const KvRewindFailureUnknown({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureUnknown(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureUnknown && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// Execution state after a failed whole-message append.
+enum RecoveryOutcome {
+  unchanged,
+  restored,
+  reset,
+  unusable,
+  /// A newer core outcome; conservatively recreate the session.
+  unknown,
+}
+
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
 /// to-one so foreign callers can pattern-match on error class (Kotlin
 /// `when`, Swift `switch`, Python `match`) instead of string-sniffing
@@ -2662,6 +3541,165 @@ FfiErrorException _uniffiLiftFfiErrorException(Uint8List bytes) {
     );
   }
   throw StateError('Unknown FfiError error variant while lifting exception: $value');
+}
+
+sealed class LoadErrorException implements Exception {
+  const LoadErrorException();
+}
+
+final class LoadErrorExceptionKindMismatch extends LoadErrorException {
+  const LoadErrorExceptionKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedArchitecture extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedArchitecture(architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedInferenceType extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+}
+
+final class LoadErrorExceptionSource extends LoadErrorException {
+  const LoadErrorExceptionSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionAssembly extends LoadErrorException {
+  const LoadErrorExceptionAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionAssembly(backend: $backend, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionInvalidConfig extends LoadErrorException {
+  const LoadErrorExceptionInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionEngine extends LoadErrorException {
+  const LoadErrorExceptionEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionEngine(detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionConsumed extends LoadErrorException {
+  const LoadErrorExceptionConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionConsumed()';
+  }
+}
+
+LoadErrorException _uniffiLiftLoadErrorException(Uint8List bytes) {
+  final LoadError value = _uniffiDecodeLoadError(bytes);
+  if (value is LoadErrorKindMismatch) {
+    return LoadErrorExceptionKindMismatch(
+      expected: value.expected,
+      actual: value.actual,
+      architecture: value.architecture,
+    );
+  }
+  if (value is LoadErrorUnsupportedArchitecture) {
+    return LoadErrorExceptionUnsupportedArchitecture(
+      architecture: value.architecture,
+    );
+  }
+  if (value is LoadErrorUnsupportedInferenceType) {
+    return LoadErrorExceptionUnsupportedInferenceType(
+      inferenceType: value.inferenceType,
+    );
+  }
+  if (value is LoadErrorSource) {
+    return LoadErrorExceptionSource(
+      sourceKind: value.sourceKind,
+      detail: value.detail,
+    );
+  }
+  if (value is LoadErrorAssembly) {
+    return LoadErrorExceptionAssembly(
+      backend: value.backend,
+      detail: value.detail,
+    );
+  }
+  if (value is LoadErrorInvalidConfig) {
+    return LoadErrorExceptionInvalidConfig(
+      field: value.field,
+      value: value.value,
+      reason: value.reason,
+      detail: value.detail,
+    );
+  }
+  if (value is LoadErrorEngine) {
+    return LoadErrorExceptionEngine(
+      detail: value.detail,
+    );
+  }
+  if (value is LoadErrorConsumed) return const LoadErrorExceptionConsumed();
+  throw StateError('Unknown LoadError error variant while lifting exception: $value');
 }
 
 String _encodeBackendPreference(BackendPreference value) {
@@ -3011,6 +4049,343 @@ ToolFormat _decodeToolFormat(String raw) {
   };
 }
 
+String _encodeLoadError(LoadError value) {
+  if (value is LoadErrorKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadError variant instance: $value');
+}
+
+LoadError _decodeLoadError(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return LoadErrorConsumed(
+      );
+    default:
+      throw StateError('Unknown LoadError variant tag: $tag');
+  }
+}
+
+String _encodeModelSource(ModelSource value) {
+  if (value is ModelSourceBundleId) {
+    return jsonEncode({
+      'tag': 'bundleId',
+      'id': value.id,
+      'quant': value.quant,
+    });
+  }
+  if (value is ModelSourceHuggingFace) {
+    return jsonEncode({
+      'tag': 'huggingFace',
+      'spec': value.spec,
+      'quant': value.quant,
+      'strategy': value.strategy,
+    });
+  }
+  if (value is ModelSourceBytes) {
+    return jsonEncode({
+      'tag': 'bytes',
+      'bytes': base64Encode(value.bytes),
+    });
+  }
+  if (value is ModelSourceParts) {
+    return jsonEncode({
+      'tag': 'parts',
+      'parts': value.parts.toJson(),
+    });
+  }
+  if (value is ModelSourcePath) {
+    return jsonEncode({
+      'tag': 'path',
+      'path': value.path,
+    });
+  }
+  if (value is ModelSourceFiles) {
+    return jsonEncode({
+      'tag': 'files',
+      'files': value.files.toJson(),
+    });
+  }
+  throw StateError('Unknown ModelSource variant instance: $value');
+}
+
+ModelSource _decodeModelSource(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'bundleId':
+      return ModelSourceBundleId(
+        id: map['id'] as String,
+        quant: map['quant'] as String,
+      );
+    case 'huggingFace':
+      return ModelSourceHuggingFace(
+        spec: map['spec'] as String,
+        quant: map['quant'] == null ? null : map['quant'] as String,
+        strategy: map['strategy'] == null ? null : map['strategy'] as String,
+      );
+    case 'bytes':
+      return ModelSourceBytes(
+        bytes: base64Decode(map['bytes'] as String),
+      );
+    case 'parts':
+      return ModelSourceParts(
+        parts: ModelParts.fromJson(map['parts'] as Map<String, dynamic>),
+      );
+    case 'path':
+      return ModelSourcePath(
+        path: map['path'] as String,
+      );
+    case 'files':
+      return ModelSourceFiles(
+        files: ModelFiles.fromJson(map['files'] as Map<String, dynamic>),
+      );
+    default:
+      throw StateError('Unknown ModelSource variant tag: $tag');
+  }
+}
+
+String _encodeGenerationDefaults(GenerationDefaults value) {
+  if (value is GenerationDefaultsText) {
+    return jsonEncode({
+      'tag': 'text',
+      'sampling': value.sampling.toJson(),
+    });
+  }
+  if (value is GenerationDefaultsAudio) {
+    return jsonEncode({
+      'tag': 'audio',
+      'sampling': value.sampling.toJson(),
+      'numberOfDecodingThreads': value.numberOfDecodingThreads,
+      'audioTemperature': value.audioTemperature,
+      'audioTopK': value.audioTopK,
+    });
+  }
+  if (value is GenerationDefaultsOther) {
+    return jsonEncode({
+      'tag': 'other',
+      'rawJson': value.rawJson,
+    });
+  }
+  throw StateError('Unknown GenerationDefaults variant instance: $value');
+}
+
+GenerationDefaults _decodeGenerationDefaults(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'text':
+      return GenerationDefaultsText(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+      );
+    case 'audio':
+      return GenerationDefaultsAudio(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+        numberOfDecodingThreads: map['numberOfDecodingThreads'] == null ? null : (map['numberOfDecodingThreads'] as num).toInt(),
+        audioTemperature: map['audioTemperature'] == null ? null : (map['audioTemperature'] as num).toDouble(),
+        audioTopK: map['audioTopK'] == null ? null : (map['audioTopK'] as num).toInt(),
+      );
+    case 'other':
+      return GenerationDefaultsOther(
+        rawJson: map['rawJson'] as String,
+      );
+    default:
+      throw StateError('Unknown GenerationDefaults variant tag: $tag');
+  }
+}
+
+String _encodeKvRewindFailure(KvRewindFailure value) {
+  if (value is KvRewindFailureOutOfBounds) {
+    return jsonEncode({
+      'tag': 'outOfBounds',
+      'requested': value.requested,
+      'current': value.current,
+    });
+  }
+  if (value is KvRewindFailureCompressed) {
+    return jsonEncode({
+      'tag': 'compressed',
+    });
+  }
+  if (value is KvRewindFailureNonCausal) {
+    return jsonEncode({
+      'tag': 'nonCausal',
+    });
+  }
+  if (value is KvRewindFailureMissingConvolutionCheckpoint) {
+    return jsonEncode({
+      'tag': 'missingConvolutionCheckpoint',
+      'layer': value.layer,
+      'position': value.position,
+    });
+  }
+  if (value is KvRewindFailureInvalidCacheLayout) {
+    return jsonEncode({
+      'tag': 'invalidCacheLayout',
+      'layer': value.layer,
+      'detail': value.detail,
+    });
+  }
+  if (value is KvRewindFailureBackendUnsupported) {
+    return jsonEncode({
+      'tag': 'backendUnsupported',
+    });
+  }
+  if (value is KvRewindFailureUnknown) {
+    return jsonEncode({
+      'tag': 'unknown',
+      'detail': value.detail,
+    });
+  }
+  throw StateError('Unknown KvRewindFailure variant instance: $value');
+}
+
+KvRewindFailure _decodeKvRewindFailure(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'outOfBounds':
+      return KvRewindFailureOutOfBounds(
+        requested: (map['requested'] as num).toInt(),
+        current: (map['current'] as num).toInt(),
+      );
+    case 'compressed':
+      return KvRewindFailureCompressed(
+      );
+    case 'nonCausal':
+      return KvRewindFailureNonCausal(
+      );
+    case 'missingConvolutionCheckpoint':
+      return KvRewindFailureMissingConvolutionCheckpoint(
+        layer: (map['layer'] as num).toInt(),
+        position: (map['position'] as num).toInt(),
+      );
+    case 'invalidCacheLayout':
+      return KvRewindFailureInvalidCacheLayout(
+        layer: (map['layer'] as num).toInt(),
+        detail: map['detail'] as String,
+      );
+    case 'backendUnsupported':
+      return KvRewindFailureBackendUnsupported(
+      );
+    case 'unknown':
+      return KvRewindFailureUnknown(
+        detail: map['detail'] as String,
+      );
+    default:
+      throw StateError('Unknown KvRewindFailure variant tag: $tag');
+  }
+}
+
+String _encodeRecoveryOutcome(RecoveryOutcome value) {
+  return switch (value) {
+    RecoveryOutcome.unchanged => 'unchanged',
+    RecoveryOutcome.restored => 'restored',
+    RecoveryOutcome.reset => 'reset',
+    RecoveryOutcome.unusable => 'unusable',
+    RecoveryOutcome.unknown => 'unknown',
+  };
+}
+
+RecoveryOutcome _decodeRecoveryOutcome(String raw) {
+  return switch (raw) {
+    'unchanged' => RecoveryOutcome.unchanged,
+    'restored' => RecoveryOutcome.restored,
+    'reset' => RecoveryOutcome.reset,
+    'unusable' => RecoveryOutcome.unusable,
+    'unknown' => RecoveryOutcome.unknown,
+    _ => throw StateError('Unknown RecoveryOutcome variant: $raw'),
+  };
+}
+
 String _encodeFfiErrorException(FfiErrorException value) {
   if (value is FfiErrorExceptionUnsupportedModality) {
     return jsonEncode({
@@ -3158,6 +4533,110 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
   }
 }
 
+String _encodeLoadErrorException(LoadErrorException value) {
+  if (value is LoadErrorExceptionKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorExceptionSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadErrorException exception instance: $value');
+}
+
+LoadErrorException _decodeLoadErrorException(Object? raw) {
+  final Map<String, dynamic> map = raw is String ? (jsonDecode(raw) as Map<String, dynamic>) : (raw as Map<String, dynamic>);
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorExceptionKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorExceptionUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorExceptionUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorExceptionSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorExceptionAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorExceptionInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorExceptionEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return const LoadErrorExceptionConsumed();
+    default:
+      throw StateError('Unknown LoadErrorException exception tag: $tag');
+  }
+}
+
 final class BackendPreferenceFfiCodec {
   const BackendPreferenceFfiCodec._();
 
@@ -3214,12 +4693,60 @@ final class ToolFormatFfiCodec {
   static ToolFormat decode(String raw) => _decodeToolFormat(raw);
 }
 
+final class LoadErrorFfiCodec {
+  const LoadErrorFfiCodec._();
+
+  static String encode(LoadError value) => _encodeLoadError(value);
+
+  static LoadError decode(String raw) => _decodeLoadError(raw);
+}
+
+final class ModelSourceFfiCodec {
+  const ModelSourceFfiCodec._();
+
+  static String encode(ModelSource value) => _encodeModelSource(value);
+
+  static ModelSource decode(String raw) => _decodeModelSource(raw);
+}
+
+final class GenerationDefaultsFfiCodec {
+  const GenerationDefaultsFfiCodec._();
+
+  static String encode(GenerationDefaults value) => _encodeGenerationDefaults(value);
+
+  static GenerationDefaults decode(String raw) => _decodeGenerationDefaults(raw);
+}
+
+final class KvRewindFailureFfiCodec {
+  const KvRewindFailureFfiCodec._();
+
+  static String encode(KvRewindFailure value) => _encodeKvRewindFailure(value);
+
+  static KvRewindFailure decode(String raw) => _decodeKvRewindFailure(raw);
+}
+
+final class RecoveryOutcomeFfiCodec {
+  const RecoveryOutcomeFfiCodec._();
+
+  static String encode(RecoveryOutcome value) => _encodeRecoveryOutcome(value);
+
+  static RecoveryOutcome decode(String raw) => _decodeRecoveryOutcome(raw);
+}
+
 final class FfiErrorExceptionFfiCodec {
   const FfiErrorExceptionFfiCodec._();
 
   static String encode(FfiErrorException value) => _encodeFfiErrorException(value);
 
   static FfiErrorException decode(Object? raw) => _decodeFfiErrorException(raw);
+}
+
+final class LoadErrorExceptionFfiCodec {
+  const LoadErrorExceptionFfiCodec._();
+
+  static String encode(LoadErrorException value) => _encodeLoadErrorException(value);
+
+  static LoadErrorException decode(Object? raw) => _decodeLoadErrorException(raw);
 }
 
 final class _UniFfiBinaryWriter {
@@ -4093,6 +5620,289 @@ UserMessage _uniffiDecodeUserMessage(Uint8List bytes) {
   return value;
 }
 
+void _uniffiWriteModelFiles(ModelFiles value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.model);
+  if (value.multimodalProjector == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.multimodalProjector!);
+  }
+  if (value.audioDecoder == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.audioDecoder!);
+  }
+  if (value.audioTokenizer == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.audioTokenizer!);
+  }
+  if (value.draftModel == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.draftModel!);
+  }
+  writer.writeI32(value.extras.length);
+  for (final entry in value.extras.entries) {
+    writer.writeString(entry.key);
+    writer.writeString(entry.value);
+  }
+  if (value.inferenceType == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.inferenceType!);
+  }
+  if (value.chatTemplate == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.chatTemplate!);
+  }
+}
+
+Uint8List _uniffiEncodeModelFiles(ModelFiles value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteModelFiles(value, writer);
+  return writer.toBytes();
+}
+
+ModelFiles _uniffiReadModelFiles(_UniFfiBinaryReader reader) {
+  return ModelFiles(
+    model: reader.readString(),
+    multimodalProjector: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    audioDecoder: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    audioTokenizer: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    draftModel: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    extras: (() { final int __len = reader.readI32(); final out = <String, String>{}; for (var i = 0; i < __len; i++) { final key = reader.readString(); final value = reader.readString(); out[key] = value; } return out; })(),
+    inferenceType: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    chatTemplate: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+  );
+}
+
+ModelFiles _uniffiDecodeModelFiles(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadModelFiles(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ModelFiles');
+  }
+  return value;
+}
+
+void _uniffiWriteModelParts(ModelParts value, _UniFfiBinaryWriter writer) {
+  writer.writeI32(value.model.length);
+  writer.writeBytes(value.model);
+  if (value.multimodalProjector == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.multimodalProjector!.length);
+    writer.writeBytes(value.multimodalProjector!);
+  }
+  if (value.audioDecoder == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.audioDecoder!.length);
+    writer.writeBytes(value.audioDecoder!);
+  }
+  if (value.audioTokenizer == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.audioTokenizer!.length);
+    writer.writeBytes(value.audioTokenizer!);
+  }
+  if (value.draftModel == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.draftModel!.length);
+    writer.writeBytes(value.draftModel!);
+  }
+  if (value.inferenceType == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.inferenceType!);
+  }
+  if (value.chatTemplate == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeString(value.chatTemplate!);
+  }
+  if (value.generationDefaults == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteGenerationDefaults(value.generationDefaults!, writer);
+  }
+}
+
+Uint8List _uniffiEncodeModelParts(ModelParts value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteModelParts(value, writer);
+  return writer.toBytes();
+}
+
+ModelParts _uniffiReadModelParts(_UniFfiBinaryReader reader) {
+  return ModelParts(
+    model: (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(),
+    multimodalProjector: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(); })(),
+    audioDecoder: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(); })(),
+    audioTokenizer: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(); })(),
+    draftModel: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(); })(),
+    inferenceType: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    chatTemplate: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+    generationDefaults: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadGenerationDefaults(reader); })(),
+  );
+}
+
+ModelParts _uniffiDecodeModelParts(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadModelParts(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ModelParts');
+  }
+  return value;
+}
+
+void _uniffiWriteSamplingDefaults(SamplingDefaults value, _UniFfiBinaryWriter writer) {
+  if (value.temperature == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeF32(value.temperature!);
+  }
+  if (value.topP == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeF32(value.topP!);
+  }
+  if (value.topK == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeU32(value.topK!);
+  }
+  if (value.minP == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeF32(value.minP!);
+  }
+  if (value.repetitionPenalty == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeF32(value.repetitionPenalty!);
+  }
+}
+
+Uint8List _uniffiEncodeSamplingDefaults(SamplingDefaults value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteSamplingDefaults(value, writer);
+  return writer.toBytes();
+}
+
+SamplingDefaults _uniffiReadSamplingDefaults(_UniFfiBinaryReader reader) {
+  return SamplingDefaults(
+    temperature: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
+    topP: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
+    topK: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
+    minP: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
+    repetitionPenalty: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
+  );
+}
+
+SamplingDefaults _uniffiDecodeSamplingDefaults(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadSamplingDefaults(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding SamplingDefaults');
+  }
+  return value;
+}
+
+void _uniffiWriteIngestRecovery(IngestRecovery value, _UniFfiBinaryWriter writer) {
+  _uniffiWriteRecoveryOutcome(value.outcome, writer);
+  if (value.rewindError == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteKvRewindFailure(value.rewindError!, writer);
+  }
+  if (value.resetError == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteFfiError(value.resetError!, writer);
+  }
+}
+
+Uint8List _uniffiEncodeIngestRecovery(IngestRecovery value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteIngestRecovery(value, writer);
+  return writer.toBytes();
+}
+
+IngestRecovery _uniffiReadIngestRecovery(_UniFfiBinaryReader reader) {
+  return IngestRecovery(
+    outcome: _uniffiReadRecoveryOutcome(reader),
+    rewindError: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadKvRewindFailure(reader); })(),
+    resetError: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadFfiError(reader); })(),
+  );
+}
+
+IngestRecovery _uniffiDecodeIngestRecovery(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadIngestRecovery(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding IngestRecovery');
+  }
+  return value;
+}
+
+void _uniffiWriteSessionRecoveryStatus(SessionRecoveryStatus value, _UniFfiBinaryWriter writer) {
+  writer.writeBool(value.usable);
+  writer.writeU32(value.position);
+  if (value.lastIngestRecovery == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    _uniffiWriteIngestRecovery(value.lastIngestRecovery!, writer);
+  }
+}
+
+Uint8List _uniffiEncodeSessionRecoveryStatus(SessionRecoveryStatus value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteSessionRecoveryStatus(value, writer);
+  return writer.toBytes();
+}
+
+SessionRecoveryStatus _uniffiReadSessionRecoveryStatus(_UniFfiBinaryReader reader) {
+  return SessionRecoveryStatus(
+    usable: reader.readBool(),
+    position: reader.readU32(),
+    lastIngestRecovery: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadIngestRecovery(reader); })(),
+  );
+}
+
+SessionRecoveryStatus _uniffiDecodeSessionRecoveryStatus(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadSessionRecoveryStatus(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding SessionRecoveryStatus');
+  }
+  return value;
+}
+
 void _uniffiWriteBackendPreference(BackendPreference value, _UniFfiBinaryWriter writer) {
   final int tag = switch (value) {
     BackendPreference.auto => 1,
@@ -4501,6 +6311,404 @@ ToolFormat _uniffiDecodeToolFormat(Uint8List bytes) {
   final value = _uniffiReadToolFormat(reader);
   if (!reader.isDone) {
     throw StateError('extra bytes remaining while decoding ToolFormat');
+  }
+  return value;
+}
+
+void _uniffiWriteLoadError(LoadError value, _UniFfiBinaryWriter writer) {
+  if (value is LoadErrorKindMismatch) {
+    writer.writeI32(1);
+    writer.writeString(value.expected);
+    writer.writeString(value.actual);
+    writer.writeString(value.architecture);
+  }
+  else if (value is LoadErrorUnsupportedArchitecture) {
+    writer.writeI32(2);
+    writer.writeString(value.architecture);
+  }
+  else if (value is LoadErrorUnsupportedInferenceType) {
+    writer.writeI32(3);
+    writer.writeString(value.inferenceType);
+  }
+  else if (value is LoadErrorSource) {
+    writer.writeI32(4);
+    writer.writeString(value.sourceKind);
+    writer.writeString(value.detail);
+  }
+  else if (value is LoadErrorAssembly) {
+    writer.writeI32(5);
+    writer.writeString(value.backend);
+    writer.writeString(value.detail);
+  }
+  else if (value is LoadErrorInvalidConfig) {
+    writer.writeI32(6);
+    writer.writeString(value.field);
+    writer.writeString(value.value);
+    writer.writeString(value.reason);
+    writer.writeString(value.detail);
+  }
+  else if (value is LoadErrorEngine) {
+    writer.writeI32(7);
+    writer.writeString(value.detail);
+  }
+  else if (value is LoadErrorConsumed) {
+    writer.writeI32(8);
+  }
+  else {
+    throw StateError('Unknown LoadError variant instance: $value');
+  }
+}
+
+Uint8List _uniffiEncodeLoadError(LoadError value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteLoadError(value, writer);
+  return writer.toBytes();
+}
+
+LoadError _uniffiReadLoadError(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return LoadErrorKindMismatch(
+        expected: reader.readString(),
+        actual: reader.readString(),
+        architecture: reader.readString(),
+      );
+    case 2:
+      return LoadErrorUnsupportedArchitecture(
+        architecture: reader.readString(),
+      );
+    case 3:
+      return LoadErrorUnsupportedInferenceType(
+        inferenceType: reader.readString(),
+      );
+    case 4:
+      return LoadErrorSource(
+        sourceKind: reader.readString(),
+        detail: reader.readString(),
+      );
+    case 5:
+      return LoadErrorAssembly(
+        backend: reader.readString(),
+        detail: reader.readString(),
+      );
+    case 6:
+      return LoadErrorInvalidConfig(
+        field: reader.readString(),
+        value: reader.readString(),
+        reason: reader.readString(),
+        detail: reader.readString(),
+      );
+    case 7:
+      return LoadErrorEngine(
+        detail: reader.readString(),
+      );
+    case 8:
+      return const LoadErrorConsumed();
+    default:
+      throw StateError('Unknown LoadError variant tag: $tag');
+  }
+}
+
+LoadError _uniffiDecodeLoadError(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadLoadError(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding LoadError');
+  }
+  return value;
+}
+
+void _uniffiWriteModelSource(ModelSource value, _UniFfiBinaryWriter writer) {
+  if (value is ModelSourceBundleId) {
+    writer.writeI32(1);
+    writer.writeString(value.id);
+    writer.writeString(value.quant);
+  }
+  else if (value is ModelSourceHuggingFace) {
+    writer.writeI32(2);
+    writer.writeString(value.spec);
+    if (value.quant == null) {
+      writer.writeI8(0);
+    } else {
+      writer.writeI8(1);
+      writer.writeString(value.quant!);
+    }
+    if (value.strategy == null) {
+      writer.writeI8(0);
+    } else {
+      writer.writeI8(1);
+      writer.writeString(value.strategy!);
+    }
+  }
+  else if (value is ModelSourceBytes) {
+    writer.writeI32(3);
+    writer.writeI32(value.bytes.length);
+    writer.writeBytes(value.bytes);
+  }
+  else if (value is ModelSourceParts) {
+    writer.writeI32(4);
+    _uniffiWriteModelParts(value.parts, writer);
+  }
+  else if (value is ModelSourcePath) {
+    writer.writeI32(5);
+    writer.writeString(value.path);
+  }
+  else if (value is ModelSourceFiles) {
+    writer.writeI32(6);
+    _uniffiWriteModelFiles(value.files, writer);
+  }
+  else {
+    throw StateError('Unknown ModelSource variant instance: $value');
+  }
+}
+
+Uint8List _uniffiEncodeModelSource(ModelSource value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteModelSource(value, writer);
+  return writer.toBytes();
+}
+
+ModelSource _uniffiReadModelSource(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return ModelSourceBundleId(
+        id: reader.readString(),
+        quant: reader.readString(),
+      );
+    case 2:
+      return ModelSourceHuggingFace(
+        spec: reader.readString(),
+        quant: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+        strategy: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readString(); })(),
+      );
+    case 3:
+      return ModelSourceBytes(
+        bytes: (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(),
+      );
+    case 4:
+      return ModelSourceParts(
+        parts: _uniffiReadModelParts(reader),
+      );
+    case 5:
+      return ModelSourcePath(
+        path: reader.readString(),
+      );
+    case 6:
+      return ModelSourceFiles(
+        files: _uniffiReadModelFiles(reader),
+      );
+    default:
+      throw StateError('Unknown ModelSource variant tag: $tag');
+  }
+}
+
+ModelSource _uniffiDecodeModelSource(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadModelSource(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding ModelSource');
+  }
+  return value;
+}
+
+void _uniffiWriteGenerationDefaults(GenerationDefaults value, _UniFfiBinaryWriter writer) {
+  if (value is GenerationDefaultsText) {
+    writer.writeI32(1);
+    _uniffiWriteSamplingDefaults(value.sampling, writer);
+  }
+  else if (value is GenerationDefaultsAudio) {
+    writer.writeI32(2);
+    _uniffiWriteSamplingDefaults(value.sampling, writer);
+    if (value.numberOfDecodingThreads == null) {
+      writer.writeI8(0);
+    } else {
+      writer.writeI8(1);
+      writer.writeU32(value.numberOfDecodingThreads!);
+    }
+    if (value.audioTemperature == null) {
+      writer.writeI8(0);
+    } else {
+      writer.writeI8(1);
+      writer.writeF32(value.audioTemperature!);
+    }
+    if (value.audioTopK == null) {
+      writer.writeI8(0);
+    } else {
+      writer.writeI8(1);
+      writer.writeU32(value.audioTopK!);
+    }
+  }
+  else if (value is GenerationDefaultsOther) {
+    writer.writeI32(3);
+    writer.writeString(value.rawJson);
+  }
+  else {
+    throw StateError('Unknown GenerationDefaults variant instance: $value');
+  }
+}
+
+Uint8List _uniffiEncodeGenerationDefaults(GenerationDefaults value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteGenerationDefaults(value, writer);
+  return writer.toBytes();
+}
+
+GenerationDefaults _uniffiReadGenerationDefaults(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return GenerationDefaultsText(
+        sampling: _uniffiReadSamplingDefaults(reader),
+      );
+    case 2:
+      return GenerationDefaultsAudio(
+        sampling: _uniffiReadSamplingDefaults(reader),
+        numberOfDecodingThreads: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
+        audioTemperature: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
+        audioTopK: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
+      );
+    case 3:
+      return GenerationDefaultsOther(
+        rawJson: reader.readString(),
+      );
+    default:
+      throw StateError('Unknown GenerationDefaults variant tag: $tag');
+  }
+}
+
+GenerationDefaults _uniffiDecodeGenerationDefaults(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadGenerationDefaults(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding GenerationDefaults');
+  }
+  return value;
+}
+
+void _uniffiWriteKvRewindFailure(KvRewindFailure value, _UniFfiBinaryWriter writer) {
+  if (value is KvRewindFailureOutOfBounds) {
+    writer.writeI32(1);
+    writer.writeU64(value.requested);
+    writer.writeU64(value.current);
+  }
+  else if (value is KvRewindFailureCompressed) {
+    writer.writeI32(2);
+  }
+  else if (value is KvRewindFailureNonCausal) {
+    writer.writeI32(3);
+  }
+  else if (value is KvRewindFailureMissingConvolutionCheckpoint) {
+    writer.writeI32(4);
+    writer.writeU64(value.layer);
+    writer.writeU64(value.position);
+  }
+  else if (value is KvRewindFailureInvalidCacheLayout) {
+    writer.writeI32(5);
+    writer.writeU64(value.layer);
+    writer.writeString(value.detail);
+  }
+  else if (value is KvRewindFailureBackendUnsupported) {
+    writer.writeI32(6);
+  }
+  else if (value is KvRewindFailureUnknown) {
+    writer.writeI32(7);
+    writer.writeString(value.detail);
+  }
+  else {
+    throw StateError('Unknown KvRewindFailure variant instance: $value');
+  }
+}
+
+Uint8List _uniffiEncodeKvRewindFailure(KvRewindFailure value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteKvRewindFailure(value, writer);
+  return writer.toBytes();
+}
+
+KvRewindFailure _uniffiReadKvRewindFailure(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return KvRewindFailureOutOfBounds(
+        requested: reader.readU64(),
+        current: reader.readU64(),
+      );
+    case 2:
+      return const KvRewindFailureCompressed();
+    case 3:
+      return const KvRewindFailureNonCausal();
+    case 4:
+      return KvRewindFailureMissingConvolutionCheckpoint(
+        layer: reader.readU64(),
+        position: reader.readU64(),
+      );
+    case 5:
+      return KvRewindFailureInvalidCacheLayout(
+        layer: reader.readU64(),
+        detail: reader.readString(),
+      );
+    case 6:
+      return const KvRewindFailureBackendUnsupported();
+    case 7:
+      return KvRewindFailureUnknown(
+        detail: reader.readString(),
+      );
+    default:
+      throw StateError('Unknown KvRewindFailure variant tag: $tag');
+  }
+}
+
+KvRewindFailure _uniffiDecodeKvRewindFailure(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadKvRewindFailure(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding KvRewindFailure');
+  }
+  return value;
+}
+
+void _uniffiWriteRecoveryOutcome(RecoveryOutcome value, _UniFfiBinaryWriter writer) {
+  final int tag = switch (value) {
+    RecoveryOutcome.unchanged => 1,
+    RecoveryOutcome.restored => 2,
+    RecoveryOutcome.reset => 3,
+    RecoveryOutcome.unusable => 4,
+    RecoveryOutcome.unknown => 5,
+  };
+  writer.writeI32(tag);
+}
+
+Uint8List _uniffiEncodeRecoveryOutcome(RecoveryOutcome value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteRecoveryOutcome(value, writer);
+  return writer.toBytes();
+}
+
+RecoveryOutcome _uniffiReadRecoveryOutcome(_UniFfiBinaryReader reader) {
+  final int tag = reader.readI32();
+  switch (tag) {
+    case 1:
+      return RecoveryOutcome.unchanged;
+    case 2:
+      return RecoveryOutcome.restored;
+    case 3:
+      return RecoveryOutcome.reset;
+    case 4:
+      return RecoveryOutcome.unusable;
+    case 5:
+      return RecoveryOutcome.unknown;
+    default:
+      throw StateError('Unknown RecoveryOutcome variant tag: $tag');
+  }
+}
+
+RecoveryOutcome _uniffiDecodeRecoveryOutcome(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadRecoveryOutcome(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding RecoveryOutcome');
   }
   return value;
 }
@@ -5082,8 +7290,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe != 20385) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: expected 20385, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe != 11943) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: expected 11943, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async;
     try {
@@ -5092,8 +7300,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async != 33011) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: expected 33011, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async != 5318) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: expected 5318, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count;
     try {
@@ -5405,6 +7613,76 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size != 36283) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_image_max_long_size`: expected 36283, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_recovery_status;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_recovery_status');
+      _checksum_uniffi_cera_ffi_checksum_method_session_recovery_status = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_recovery_status`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status != 30068) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_recovery_status`: expected 30068, got $_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_generativemodel_create_session');
+      _checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_generativemodel_create_session`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session != 60817) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_create_session`: expected 60817, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_generativemodel_engine');
+      _checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_generativemodel_engine`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine != 55922) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_engine`: expected 55922, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_modelhandle_as_generative');
+      _checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelhandle_as_generative`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative != 6141) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_as_generative`: expected 6141, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_modelhandle_kind');
+      _checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelhandle_kind`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind != 52976) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_kind`: expected 52976, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_modelloader_build;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_modelloader_build');
+      _checksum_uniffi_cera_ffi_checksum_method_modelloader_build = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelloader_build`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build != 37695) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build`: expected 37695, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_modelloader_build_generative');
+      _checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelloader_build_generative`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative != 14372) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build_generative`: expected 14372, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_bundlerepo_new');
@@ -5624,6 +7902,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path != 60671) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path`: expected 60671, got $_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_modelloader_new');
+      _checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_modelloader_new`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new != 6200) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_modelloader_new`: expected 6200, got $_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new');
     }
   }
 
@@ -16066,6 +18354,81 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionRecoveryStatusFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_recovery_status');
+
+  SessionRecoveryStatus sessionInvokeRecoveryStatus(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionRecoveryStatusFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeSessionRecoveryStatus(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionRemoveLoraFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_remove_lora');
 
   void sessionInvokeRemoveLora(int handle) {
@@ -16653,6 +19016,589 @@ class CeraFfiFfi {
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _generativeModelFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_generativemodel');
+  late final void Function(int handle) _generativeModelFree = (int handle) {
+    final statusPtr = calloc<_UniFfiRustCallStatus>();
+    statusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    statusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _generativeModelFreeRaw(handle, statusPtr);
+    calloc.free(statusPtr);
+  };
+
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _generativeModelClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_generativemodel');
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _generativeModelCreateSessionFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_generativemodel_create_session');
+
+  Session generativeModelInvokeCreateSession(int handle, SessionConfig config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _generativeModelClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List configBytes = _uniffiEncodeSessionConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = configRustBuffer.len;
+      (argBuf + 3).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _generativeModelCreateSessionFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return Session._(this, (returnBuf + 0).ref.u64);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _generativeModelEngineFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_generativemodel_engine');
+
+  CeraEngine generativeModelInvokeEngine(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _generativeModelClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _generativeModelEngineFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return CeraEngine._(this, (returnBuf + 0).ref.u64);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _modelHandleFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_modelhandle');
+  late final void Function(int handle) _modelHandleFree = (int handle) {
+    final statusPtr = calloc<_UniFfiRustCallStatus>();
+    statusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    statusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _modelHandleFreeRaw(handle, statusPtr);
+    calloc.free(statusPtr);
+  };
+
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _modelHandleClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_modelhandle');
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modelHandleAsGenerativeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modelhandle_as_generative');
+
+  GenerativeModel? modelHandleInvokeAsGenerative(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _modelHandleClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _modelHandleAsGenerativeFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int resultHandle = (returnBuf + 0).ref.u64;
+      if (resultHandle == 0) {
+        return null;
+      }
+      return GenerativeModel._(this, resultHandle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modelHandleKindFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modelhandle_kind');
+
+  String modelHandleInvokeKind(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _modelHandleClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _modelHandleKindFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _modelLoaderFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_modelloader');
+  late final void Function(int handle) _modelLoaderFree = (int handle) {
+    final statusPtr = calloc<_UniFfiRustCallStatus>();
+    statusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    statusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _modelLoaderFreeRaw(handle, statusPtr);
+    calloc.free(statusPtr);
+  };
+
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _modelLoaderClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_modelloader');
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modelLoaderCtorNewFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_modelloader_new');
+
+  ModelLoader modelLoaderCreateNew(ModelSource source, EngineConfig config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List sourceBytes = _uniffiEncodeModelSource(source);
+      final ffi.Pointer<ffi.Uint8> sourcePtr = sourceBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(sourceBytes.length);
+      if (sourceBytes.isNotEmpty) { sourcePtr.asTypedList(sourceBytes.length).setAll(0, sourceBytes); }
+      foreignArgPtrs.add(sourcePtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> sourceFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      sourceFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      sourceFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> sourceForeignPtr = calloc<_UniFfiForeignBytes>();
+      sourceForeignPtr.ref
+        ..len = sourceBytes.length
+        ..data = sourcePtr;
+      final _UniFfiRustBuffer sourceRustBuffer = _uniFfiRustBufferFromBytes(sourceForeignPtr.ref, sourceFromBytesStatusPtr);
+      calloc.free(sourceForeignPtr);
+      final int sourceFromBytesCode = sourceFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer sourceFromBytesErrBuf = sourceFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(sourceFromBytesStatusPtr);
+      if (sourceFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> sourceFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        sourceFromBytesErrBufPtr.ref
+          ..capacity = sourceFromBytesErrBuf.capacity
+          ..len = sourceFromBytesErrBuf.len
+          ..data = sourceFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(sourceFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $sourceFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = sourceRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = sourceRustBuffer.len;
+      (argBuf + 2).ref.ptr = sourceRustBuffer.data.cast<ffi.Void>();
+      final Uint8List configBytes = _uniffiEncodeEngineConfig(config);
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = configRustBuffer.len;
+      (argBuf + 5).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _modelLoaderCtorNewFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return ModelLoader._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modelLoaderBuildFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modelloader_build');
+
+  ModelHandle modelLoaderInvokeBuild(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _modelLoaderClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _modelLoaderBuildFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftLoadErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return ModelHandle._(this, (returnBuf + 0).ref.u64);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _modelLoaderBuildGenerativeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_modelloader_build_generative');
+
+  GenerativeModel modelLoaderInvokeBuildGenerative(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _modelLoaderClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _modelLoaderBuildGenerativeFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftLoadErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return GenerativeModel._(this, (returnBuf + 0).ref.u64);
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -17822,12 +20768,15 @@ final class FfiWhisperModel {
   }
 
   /// Transcribe 16 kHz mono PCM audio samples synchronously.
+  /// Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
   String transcribe(List<double> pcm, FfiWhisperTranscribeOpts? opts) {
     _ensureOpen();
     return _ffi.ffiWhisperModelInvokeTranscribe(_handle, pcm, opts);
   }
 
   /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+  /// Dropping the returned future aborts queued work and signals an already-running decoder
+  /// to stop at its next cooperative cancellation check.
   Future<String> transcribeAsync(List<double> pcm, FfiWhisperTranscribeOpts? opts) {
     _ensureOpen();
     return _ffi.ffiWhisperModelInvokeTranscribeAsync(_handle, pcm, opts);
@@ -18639,6 +21588,20 @@ final class Session {
     return _ffi.sessionInvokePosition(_handle);
   }
 
+  /// Observe recovery after a failed whole-message call without changing KV,
+  /// cancellation or the retained report. Returns `Busy` if any call holds
+  /// the session lock, including a streaming callback's enclosing operation.
+  /// A poisoned lock returns `Backend`; recreate that session.
+  ///
+  /// `Reset` requires replaying prior context. `Restored` and `Unchanged`
+  /// retain it when `usable` is true. Clear cancellation explicitly before
+  /// retrying a cancelled append. A missing report gives no recovery guarantee
+  /// for raw append operations, which retain their partial-prefill behavior.
+  SessionRecoveryStatus recoveryStatus() {
+    _ensureOpen();
+    return _ffi.sessionInvokeRecoveryStatus(_handle);
+  }
+
   /// Remove any attached LoRA adapter, returning to base-model inference.
   void removeLora() {
     _ensureOpen();
@@ -18698,6 +21661,192 @@ final class SessionFfiCodec {
   static int lower(Session value) => value._handle;
 
   static Session lift(int handle) => Session._(_bindings(), handle);
+}
+
+final class _GenerativeModelFinalizerToken {
+  const _GenerativeModelFinalizerToken(this.free, this.handle);
+  final void Function(int) free;
+  final int handle;
+}
+
+/// A shared generative engine. Creating handles never reloads the source or copies live KV.
+final class GenerativeModel {
+  GenerativeModel._(this._ffi, this._handle) {
+    _finalizer.attach(this, _GenerativeModelFinalizerToken(_ffi._generativeModelFree, _handle), detach: this);
+  }
+
+  final CeraFfiFfi _ffi;
+  int _handle;
+  bool _closed = false;
+
+  static final Finalizer<_GenerativeModelFinalizerToken> _finalizer = Finalizer((token) {
+    token.free(token.handle);
+  });
+
+  bool get isClosed => _closed;
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _finalizer.detach(this);
+    _ffi._generativeModelFree(_handle);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('GenerativeModel is closed');
+    }
+  }
+
+  /// Create an existing production Session with the caller's full configuration.
+  /// Sessions retain their resources after all loader/model/engine handles close.
+  /// Existing backend sharing restrictions and Session/FfiError behavior apply.
+  Session createSession(SessionConfig config) {
+    _ensureOpen();
+    return _ffi.generativeModelInvokeCreateSession(_handle, config);
+  }
+
+  /// Access all retained engine operations through the already loaded engine.
+  CeraEngine engine() {
+    _ensureOpen();
+    return _ffi.generativeModelInvokeEngine(_handle);
+  }
+
+}
+
+final class GenerativeModelFfiCodec {
+  const GenerativeModelFfiCodec._();
+
+  static int lower(GenerativeModel value) => value._handle;
+
+  static GenerativeModel lift(int handle) => GenerativeModel._(_bindings(), handle);
+}
+
+final class _ModelHandleFinalizerToken {
+  const _ModelHandleFinalizerToken(this.free, this.handle);
+  final void Function(int) free;
+  final int handle;
+}
+
+/// Dynamic loaded-model handle. Typed accessors share ownership.
+final class ModelHandle {
+  ModelHandle._(this._ffi, this._handle) {
+    _finalizer.attach(this, _ModelHandleFinalizerToken(_ffi._modelHandleFree, _handle), detach: this);
+  }
+
+  final CeraFfiFfi _ffi;
+  int _handle;
+  bool _closed = false;
+
+  static final Finalizer<_ModelHandleFinalizerToken> _finalizer = Finalizer((token) {
+    token.free(token.handle);
+  });
+
+  bool get isClosed => _closed;
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _finalizer.detach(this);
+    _ffi._modelHandleFree(_handle);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('ModelHandle is closed');
+    }
+  }
+
+  /// Share a generative model if present; the result can outlive this handle.
+  GenerativeModel? asGenerative() {
+    _ensureOpen();
+    return _ffi.modelHandleInvokeAsGenerative(_handle);
+  }
+
+  /// Kind of the loaded model. A string allows future kinds without enum decoding.
+  String kind() {
+    _ensureOpen();
+    return _ffi.modelHandleInvokeKind(_handle);
+  }
+
+}
+
+final class ModelHandleFfiCodec {
+  const ModelHandleFfiCodec._();
+
+  static int lower(ModelHandle value) => value._handle;
+
+  static ModelHandle lift(int handle) => ModelHandle._(_bindings(), handle);
+}
+
+final class _ModelLoaderFinalizerToken {
+  const _ModelLoaderFinalizerToken(this.free, this.handle);
+  final void Function(int) free;
+  final int handle;
+}
+
+/// Synchronous, single-use model loader. Both build methods consume the source,
+/// including on failure. Dispatch remote or expensive loads off the UI thread.
+final class ModelLoader {
+  ModelLoader._(this._ffi, this._handle) {
+    _finalizer.attach(this, _ModelLoaderFinalizerToken(_ffi._modelLoaderFree, _handle), detach: this);
+  }
+
+  final CeraFfiFfi _ffi;
+  int _handle;
+  bool _closed = false;
+
+  static final Finalizer<_ModelLoaderFinalizerToken> _finalizer = Finalizer((token) {
+    token.free(token.handle);
+  });
+
+  bool get isClosed => _closed;
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _finalizer.detach(this);
+    _ffi._modelLoaderFree(_handle);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('ModelLoader is closed');
+    }
+  }
+
+  /// Retain explicit source data and the existing production engine options.
+  /// Construction does not load weights or contact a remote service.
+  static ModelLoader create(ModelSource source, EngineConfig config) {
+    return _bindings().modelLoaderCreateNew(source, config);
+  }
+
+  /// Load a dynamic model handle. Generative loading is currently supported.
+  ModelHandle build() {
+    _ensureOpen();
+    return _ffi.modelLoaderInvokeBuild(_handle);
+  }
+
+  /// Load a generative model, reporting other known kinds before assembly.
+  GenerativeModel buildGenerative() {
+    _ensureOpen();
+    return _ffi.modelLoaderInvokeBuildGenerative(_handle);
+  }
+
+}
+
+final class ModelLoaderFfiCodec {
+  const ModelLoaderFfiCodec._();
+
+  static int lower(ModelLoader value) => value._handle;
+
+  static ModelLoader lift(int handle) => ModelLoader._(_bindings(), handle);
 }
 
 CeraFfiFfi? _defaultBindings;

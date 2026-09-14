@@ -924,6 +924,76 @@ RustBuffer uniffi_cera_ffi_fn_method_session_send_message_streaming(uint64_t ptr
 void uniffi_cera_ffi_fn_method_session_set_image_max_long_size(uint64_t ptr, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RECOVERY_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RECOVERY_STATUS
+RustBuffer uniffi_cera_ffi_fn_method_session_recovery_status(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_GENERATIVEMODEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_GENERATIVEMODEL
+uint64_t uniffi_cera_ffi_fn_clone_generativemodel(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_GENERATIVEMODEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_GENERATIVEMODEL
+void uniffi_cera_ffi_fn_free_generativemodel(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_GENERATIVEMODEL_CREATE_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_GENERATIVEMODEL_CREATE_SESSION
+uint64_t uniffi_cera_ffi_fn_method_generativemodel_create_session(uint64_t ptr, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_GENERATIVEMODEL_ENGINE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_GENERATIVEMODEL_ENGINE
+uint64_t uniffi_cera_ffi_fn_method_generativemodel_engine(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODELHANDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODELHANDLE
+uint64_t uniffi_cera_ffi_fn_clone_modelhandle(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_MODELHANDLE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_MODELHANDLE
+void uniffi_cera_ffi_fn_free_modelhandle(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELHANDLE_AS_GENERATIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELHANDLE_AS_GENERATIVE
+RustBuffer uniffi_cera_ffi_fn_method_modelhandle_as_generative(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELHANDLE_KIND
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELHANDLE_KIND
+RustBuffer uniffi_cera_ffi_fn_method_modelhandle_kind(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODELLOADER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_MODELLOADER
+uint64_t uniffi_cera_ffi_fn_clone_modelloader(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_MODELLOADER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_MODELLOADER
+void uniffi_cera_ffi_fn_free_modelloader(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_MODELLOADER_NEW
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_MODELLOADER_NEW
+uint64_t uniffi_cera_ffi_fn_constructor_modelloader_new(RustBuffer source, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELLOADER_BUILD
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELLOADER_BUILD
+uint64_t uniffi_cera_ffi_fn_method_modelloader_build(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELLOADER_BUILD_GENERATIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_MODELLOADER_BUILD_GENERATIVE
+uint64_t uniffi_cera_ffi_fn_method_modelloader_build_generative(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CERA_FFI_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CERA_FFI_VERSION
 RustBuffer uniffi_cera_ffi_fn_func_cera_ffi_version(RustCallStatus *_Nonnull out_status
@@ -1763,6 +1833,48 @@ uint16_t uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RECOVERY_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RECOVERY_STATUS
+uint16_t uniffi_cera_ffi_checksum_method_session_recovery_status(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_GENERATIVEMODEL_CREATE_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_GENERATIVEMODEL_CREATE_SESSION
+uint16_t uniffi_cera_ffi_checksum_method_generativemodel_create_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_GENERATIVEMODEL_ENGINE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_GENERATIVEMODEL_ENGINE
+uint16_t uniffi_cera_ffi_checksum_method_generativemodel_engine(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELHANDLE_AS_GENERATIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELHANDLE_AS_GENERATIVE
+uint16_t uniffi_cera_ffi_checksum_method_modelhandle_as_generative(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELHANDLE_KIND
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELHANDLE_KIND
+uint16_t uniffi_cera_ffi_checksum_method_modelhandle_kind(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELLOADER_BUILD
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELLOADER_BUILD
+uint16_t uniffi_cera_ffi_checksum_method_modelloader_build(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELLOADER_BUILD_GENERATIVE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_MODELLOADER_BUILD_GENERATIVE
+uint16_t uniffi_cera_ffi_checksum_method_modelloader_build_generative(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_BUNDLEREPO_NEW
 uint16_t uniffi_cera_ffi_checksum_constructor_bundlerepo_new(void
@@ -1892,6 +2004,12 @@ uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapte
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
 uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_MODELLOADER_NEW
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_MODELLOADER_NEW
+uint16_t uniffi_cera_ffi_checksum_constructor_modelloader_new(void
     
 );
 #endif
