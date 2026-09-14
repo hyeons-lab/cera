@@ -37,6 +37,7 @@ impl CudaWeight {
         match self.dtype {
             DType::Q4_0 => ctx.gemv_q4_0(out, &self.buf, x, self.m, self.k),
             DType::Q8_0 => ctx.gemv_q8_0(out, &self.buf, x, self.m, self.k),
+            DType::Q4KM => ctx.gemv_q4k(out, &self.buf, x, self.m, self.k),
             _ => anyhow::bail!("unsupported CUDA GEMV weight dtype {:?}", self.dtype),
         }
     }
@@ -51,6 +52,7 @@ impl CudaWeight {
         match self.dtype {
             DType::Q4_0 => ctx.gemv_q4_0_accum(out, &self.buf, x, self.m, self.k),
             DType::Q8_0 => ctx.gemv_q8_0_accum(out, &self.buf, x, self.m, self.k),
+            DType::Q4KM => ctx.gemv_q4k_accum(out, &self.buf, x, self.m, self.k),
             _ => anyhow::bail!("unsupported CUDA GEMV accum weight dtype {:?}", self.dtype),
         }
     }
@@ -66,6 +68,7 @@ impl CudaWeight {
         match self.dtype {
             DType::Q4_0 => ctx.gemm_q4_0(out, &self.buf, x, batch_size, self.m, self.k),
             DType::Q8_0 => ctx.gemm_q8_0(out, &self.buf, x, batch_size, self.m, self.k),
+            DType::Q4KM => ctx.gemm_q4k(out, &self.buf, x, batch_size, self.m, self.k),
             _ => anyhow::bail!("unsupported CUDA GEMM weight dtype {:?}", self.dtype),
         }
     }
@@ -81,6 +84,7 @@ impl CudaWeight {
         match self.dtype {
             DType::Q4_0 => ctx.gemm_q4_0_accum(out, &self.buf, x, batch_size, self.m, self.k),
             DType::Q8_0 => ctx.gemm_q8_0_accum(out, &self.buf, x, batch_size, self.m, self.k),
+            DType::Q4KM => ctx.gemm_q4k_accum(out, &self.buf, x, batch_size, self.m, self.k),
             _ => anyhow::bail!("unsupported CUDA GEMM accum weight dtype {:?}", self.dtype),
         }
     }
@@ -348,7 +352,10 @@ impl CudaLfm2Model {
         let embd_data = src.embedding_tensor_data()?;
         let embedding_bytes = embd_data.into_owned();
         let embedding_hidden_size = hs;
-        let embedding_table = if embedding_dtype == DType::Q8_0 || embedding_dtype == DType::Q4_0 {
+        let embedding_table = if embedding_dtype == DType::Q8_0
+            || embedding_dtype == DType::Q4_0
+            || embedding_dtype == DType::Q4KM
+        {
             Some(ctx.upload_bytes(&embedding_bytes)?)
         } else {
             None
@@ -360,10 +367,8 @@ impl CudaLfm2Model {
         let mut inv_freqs = Vec::with_capacity(half_dim);
         for i in 0..half_dim {
             let mut f = theta_scale.powf(i as f32);
-            if let Some(factors) = src.rope_freqs() {
-                if i < factors.len() {
-                    f /= factors[i];
-                }
+            if let Some(factor) = src.rope_freqs().and_then(|facs| facs.get(i).copied()) {
+                f /= factor;
             }
             inv_freqs.push(f);
         }
@@ -449,6 +454,10 @@ impl CudaLfm2Model {
                     self.ctx
                         .gather_embedding_q4_0(&mut ws.hidden, table, token_id as u32, hs)?;
                 }
+                DType::Q4KM => {
+                    self.ctx
+                        .gather_embedding_q4k(&mut ws.hidden, table, token_id as u32, hs)?;
+                }
                 _ => {
                     self.dequant_embedding_row(token_id, &mut ws.embd_scratch);
                     ws.hidden
@@ -469,10 +478,65 @@ impl CudaLfm2Model {
 
             match &layer.op {
                 CudaLayerOperator::Attention(attn) => {
-                    // Q, K, V projections
-                    attn.wq.dispatch(&self.ctx, &mut ws.q, &ws.normed)?;
-                    attn.wk.dispatch(&self.ctx, &mut ws.k, &ws.normed)?;
-                    attn.wv.dispatch(&self.ctx, &mut ws.v, &ws.normed)?;
+                    // Q, K, V projections (fused when dtypes match)
+                    if attn.wq.dtype == attn.wk.dtype && attn.wq.dtype == attn.wv.dtype {
+                        match attn.wq.dtype {
+                            DType::Q4_0 => {
+                                self.ctx.gemv_q4_0_concat3(
+                                    &mut ws.q,
+                                    &mut ws.k,
+                                    &mut ws.v,
+                                    &attn.wq.buf,
+                                    &attn.wk.buf,
+                                    &attn.wv.buf,
+                                    &ws.normed,
+                                    attn.wq.m,
+                                    attn.wk.m,
+                                    attn.wv.m,
+                                    attn.wq.k,
+                                )?;
+                            }
+                            DType::Q8_0 => {
+                                self.ctx.gemv_q8_0_concat3(
+                                    &mut ws.q,
+                                    &mut ws.k,
+                                    &mut ws.v,
+                                    &attn.wq.buf,
+                                    &attn.wk.buf,
+                                    &attn.wv.buf,
+                                    &ws.normed,
+                                    attn.wq.m,
+                                    attn.wk.m,
+                                    attn.wv.m,
+                                    attn.wq.k,
+                                )?;
+                            }
+                            DType::Q4KM => {
+                                self.ctx.gemv_q4k_concat3(
+                                    &mut ws.q,
+                                    &mut ws.k,
+                                    &mut ws.v,
+                                    &attn.wq.buf,
+                                    &attn.wk.buf,
+                                    &attn.wv.buf,
+                                    &ws.normed,
+                                    attn.wq.m,
+                                    attn.wk.m,
+                                    attn.wv.m,
+                                    attn.wq.k,
+                                )?;
+                            }
+                            _ => {
+                                attn.wq.dispatch(&self.ctx, &mut ws.q, &ws.normed)?;
+                                attn.wk.dispatch(&self.ctx, &mut ws.k, &ws.normed)?;
+                                attn.wv.dispatch(&self.ctx, &mut ws.v, &ws.normed)?;
+                            }
+                        }
+                    } else {
+                        attn.wq.dispatch(&self.ctx, &mut ws.q, &ws.normed)?;
+                        attn.wk.dispatch(&self.ctx, &mut ws.k, &ws.normed)?;
+                        attn.wv.dispatch(&self.ctx, &mut ws.v, &ws.normed)?;
+                    }
 
                     // Fused per-head RMSNorm + RoPE
                     let qk_params = QkNormRopeParams {
@@ -561,16 +625,62 @@ impl CudaLfm2Model {
             self.ctx
                 .rmsnorm(&mut ws.ffn_input, &ws.hidden, &layer.ffn_norm, hs, eps)?;
 
-            // SwiGLU FFN
-            layer
-                .ffn
-                .gate
-                .dispatch(&self.ctx, &mut ws.gate, &ws.ffn_input)?;
-            layer
-                .ffn
-                .up
-                .dispatch(&self.ctx, &mut ws.up, &ws.ffn_input)?;
-            self.ctx.silu_mul_inplace(&mut ws.gate, &ws.up, is)?;
+            // SwiGLU FFN (fused gate and up projections with in-register silu_mul when dtypes match)
+            if layer.ffn.gate.dtype == layer.ffn.up.dtype {
+                match layer.ffn.gate.dtype {
+                    DType::Q4_0 => {
+                        self.ctx.gemv_q4_0_swiglu(
+                            &mut ws.gate,
+                            &layer.ffn.gate.buf,
+                            &layer.ffn.up.buf,
+                            &ws.ffn_input,
+                            layer.ffn.gate.m,
+                            layer.ffn.gate.k,
+                        )?;
+                    }
+                    DType::Q8_0 => {
+                        self.ctx.gemv_q8_0_swiglu(
+                            &mut ws.gate,
+                            &layer.ffn.gate.buf,
+                            &layer.ffn.up.buf,
+                            &ws.ffn_input,
+                            layer.ffn.gate.m,
+                            layer.ffn.gate.k,
+                        )?;
+                    }
+                    DType::Q4KM => {
+                        self.ctx.gemv_q4k_swiglu(
+                            &mut ws.gate,
+                            &layer.ffn.gate.buf,
+                            &layer.ffn.up.buf,
+                            &ws.ffn_input,
+                            layer.ffn.gate.m,
+                            layer.ffn.gate.k,
+                        )?;
+                    }
+                    _ => {
+                        layer
+                            .ffn
+                            .gate
+                            .dispatch(&self.ctx, &mut ws.gate, &ws.ffn_input)?;
+                        layer
+                            .ffn
+                            .up
+                            .dispatch(&self.ctx, &mut ws.up, &ws.ffn_input)?;
+                        self.ctx.silu_mul_inplace(&mut ws.gate, &ws.up, is)?;
+                    }
+                }
+            } else {
+                layer
+                    .ffn
+                    .gate
+                    .dispatch(&self.ctx, &mut ws.gate, &ws.ffn_input)?;
+                layer
+                    .ffn
+                    .up
+                    .dispatch(&self.ctx, &mut ws.up, &ws.ffn_input)?;
+                self.ctx.silu_mul_inplace(&mut ws.gate, &ws.up, is)?;
+            }
             layer
                 .ffn
                 .down

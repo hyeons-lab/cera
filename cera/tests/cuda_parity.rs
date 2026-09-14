@@ -555,3 +555,445 @@ fn test_cuda_qk_norm_rope_precomputed_inv_freq() {
         }
     }
 }
+
+#[test]
+fn test_cuda_q4_0_concat3_and_swiglu_parity() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA driver not available on this host; skipping live Q4_0 concat3/swiglu test");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("initialize CUDA context");
+
+    let m1: usize = 4;
+    let m2: usize = 2;
+    let m3: usize = 2;
+    let k: usize = 64;
+    let nb = k / 32;
+
+    let gen_q4_0 = |m: usize, offset: usize| -> (Vec<u8>, Vec<f32>) {
+        let mut raw = Vec::new();
+        let mut floats = Vec::new();
+        for r in 0..m {
+            for b in 0..nb {
+                let d_val = 0.25f32 + ((r + offset) as f32) * 0.05;
+                let d_fp16: u16 = half::f16::from_f32(d_val).to_bits();
+                raw.extend_from_slice(&d_fp16.to_le_bytes());
+
+                let mut q_nibbles = [0i8; 32];
+                for i in 0..32 {
+                    let q = (((r * 32 + b * 32 + i + offset) % 15) as i8) - 7;
+                    q_nibbles[i] = q;
+                    floats.push((q as f32) * d_val);
+                }
+                for i in 0..16 {
+                    let lo = (q_nibbles[i] + 8) as u8 & 0x0F;
+                    let hi = (q_nibbles[i + 16] + 8) as u8 & 0x0F;
+                    raw.push(lo | (hi << 4));
+                }
+            }
+        }
+        (raw, floats)
+    };
+
+    let (q1_raw, _) = gen_q4_0(m1, 1);
+    let (q2_raw, _) = gen_q4_0(m2, 5);
+    let (q3_raw, _) = gen_q4_0(m3, 9);
+
+    let b1 = ctx.upload_bytes(&q1_raw).expect("upload b1");
+    let b2 = ctx.upload_bytes(&q2_raw).expect("upload b2");
+    let b3 = ctx.upload_bytes(&q3_raw).expect("upload b3");
+
+    let x_vec: Vec<f32> = (0..k).map(|i| (i as f32) * 0.02 + 0.1).collect();
+    let x_buf = ctx.upload_f32(&x_vec).expect("upload x");
+
+    let mut sep_y1 = ctx.create_buffer(m1 * 4).expect("alloc sep_y1");
+    let mut sep_y2 = ctx.create_buffer(m2 * 4).expect("alloc sep_y2");
+    let mut sep_y3 = ctx.create_buffer(m3 * 4).expect("alloc sep_y3");
+
+    ctx.gemv_q4_0(&mut sep_y1, &b1, &x_buf, m1 as u32, k as u32)
+        .expect("gemv 1");
+    ctx.gemv_q4_0(&mut sep_y2, &b2, &x_buf, m2 as u32, k as u32)
+        .expect("gemv 2");
+    ctx.gemv_q4_0(&mut sep_y3, &b3, &x_buf, m3 as u32, k as u32)
+        .expect("gemv 3");
+
+    let mut cat_y1 = ctx.create_buffer(m1 * 4).expect("alloc cat_y1");
+    let mut cat_y2 = ctx.create_buffer(m2 * 4).expect("alloc cat_y2");
+    let mut cat_y3 = ctx.create_buffer(m3 * 4).expect("alloc cat_y3");
+
+    ctx.gemv_q4_0_concat3(
+        &mut cat_y1,
+        &mut cat_y2,
+        &mut cat_y3,
+        &b1,
+        &b2,
+        &b3,
+        &x_buf,
+        m1 as u32,
+        m2 as u32,
+        m3 as u32,
+        k as u32,
+    )
+    .expect("gemv_q4_0_concat3");
+    ctx.synchronize().expect("sync");
+
+    let mut r_sep1 = vec![0.0f32; m1];
+    let mut r_cat1 = vec![0.0f32; m1];
+    ctx.download_f32(&sep_y1, &mut r_sep1).expect("dl sep1");
+    ctx.download_f32(&cat_y1, &mut r_cat1).expect("dl cat1");
+    for i in 0..m1 {
+        assert!(
+            (r_sep1[i] - r_cat1[i]).abs() < 1e-4,
+            "concat3 y1 mismatch at {i}: {} vs {}",
+            r_sep1[i],
+            r_cat1[i]
+        );
+    }
+
+    let mut r_sep2 = vec![0.0f32; m2];
+    let mut r_cat2 = vec![0.0f32; m2];
+    ctx.download_f32(&sep_y2, &mut r_sep2).expect("dl sep2");
+    ctx.download_f32(&cat_y2, &mut r_cat2).expect("dl cat2");
+    for i in 0..m2 {
+        assert!(
+            (r_sep2[i] - r_cat2[i]).abs() < 1e-4,
+            "concat3 y2 mismatch at {i}: {} vs {}",
+            r_sep2[i],
+            r_cat2[i]
+        );
+    }
+
+    let mut r_sep3 = vec![0.0f32; m3];
+    let mut r_cat3 = vec![0.0f32; m3];
+    ctx.download_f32(&sep_y3, &mut r_sep3).expect("dl sep3");
+    ctx.download_f32(&cat_y3, &mut r_cat3).expect("dl cat3");
+    for i in 0..m3 {
+        assert!(
+            (r_sep3[i] - r_cat3[i]).abs() < 1e-4,
+            "concat3 y3 mismatch at {i}: {} vs {}",
+            r_sep3[i],
+            r_cat3[i]
+        );
+    }
+
+    // SwiGLU: separate gate, up, silu_mul vs fused gemv_q4_0_swiglu
+    let (gate_raw, _) = gen_q4_0(m1, 2);
+    let (up_raw, _) = gen_q4_0(m1, 7);
+    let gate_buf = ctx.upload_bytes(&gate_raw).expect("upload gate");
+    let up_buf = ctx.upload_bytes(&up_raw).expect("upload up");
+
+    let mut sep_gate = ctx.create_buffer(m1 * 4).expect("alloc sep_gate");
+    let mut sep_up = ctx.create_buffer(m1 * 4).expect("alloc sep_up");
+    ctx.gemv_q4_0(&mut sep_gate, &gate_buf, &x_buf, m1 as u32, k as u32)
+        .expect("gemv gate");
+    ctx.gemv_q4_0(&mut sep_up, &up_buf, &x_buf, m1 as u32, k as u32)
+        .expect("gemv up");
+    ctx.silu_mul_inplace(&mut sep_gate, &sep_up, m1 as u32)
+        .expect("silu_mul");
+
+    let mut fused_swiglu = ctx.create_buffer(m1 * 4).expect("alloc fused_swiglu");
+    ctx.gemv_q4_0_swiglu(
+        &mut fused_swiglu,
+        &gate_buf,
+        &up_buf,
+        &x_buf,
+        m1 as u32,
+        k as u32,
+    )
+    .expect("gemv_q4_0_swiglu");
+    ctx.synchronize().expect("sync");
+
+    let mut r_sep_swiglu = vec![0.0f32; m1];
+    let mut r_fused_swiglu = vec![0.0f32; m1];
+    ctx.download_f32(&sep_gate, &mut r_sep_swiglu)
+        .expect("dl sep swiglu");
+    ctx.download_f32(&fused_swiglu, &mut r_fused_swiglu)
+        .expect("dl fused swiglu");
+    for i in 0..m1 {
+        assert!(
+            (r_sep_swiglu[i] - r_fused_swiglu[i]).abs() < 1e-4,
+            "swiglu mismatch at {i}: {} vs {}",
+            r_sep_swiglu[i],
+            r_fused_swiglu[i]
+        );
+    }
+}
+
+#[test]
+fn test_cuda_q8_0_concat3_and_swiglu_parity() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA driver not available on this host; skipping live Q8_0 concat3/swiglu test");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("initialize CUDA context");
+
+    let m1: usize = 4;
+    let m2: usize = 2;
+    let m3: usize = 2;
+    let k: usize = 64;
+    let nb = k / 32;
+
+    let gen_q8_0 = |m: usize, offset: usize| -> Vec<u8> {
+        let mut raw = Vec::new();
+        for r in 0..m {
+            for b in 0..nb {
+                let d_val = 0.5f32 + ((r + offset) as f32) * 0.02;
+                let d_fp16: u16 = half::f16::from_f32(d_val).to_bits();
+                raw.extend_from_slice(&d_fp16.to_le_bytes());
+
+                for i in 0..32 {
+                    let q = (((r * 32 + b * 32 + i + offset) % 11) as i8) - 5;
+                    raw.push(q as u8);
+                }
+            }
+        }
+        raw
+    };
+
+    let q1_raw = gen_q8_0(m1, 1);
+    let q2_raw = gen_q8_0(m2, 4);
+    let q3_raw = gen_q8_0(m3, 8);
+
+    let b1 = ctx.upload_bytes(&q1_raw).expect("upload b1");
+    let b2 = ctx.upload_bytes(&q2_raw).expect("upload b2");
+    let b3 = ctx.upload_bytes(&q3_raw).expect("upload b3");
+
+    let x_vec: Vec<f32> = (0..k).map(|i| (i as f32) * 0.03 - 0.5).collect();
+    let x_buf = ctx.upload_f32(&x_vec).expect("upload x");
+
+    let mut sep_y1 = ctx.create_buffer(m1 * 4).expect("alloc sep_y1");
+    let mut sep_y2 = ctx.create_buffer(m2 * 4).expect("alloc sep_y2");
+    let mut sep_y3 = ctx.create_buffer(m3 * 4).expect("alloc sep_y3");
+
+    ctx.gemv_q8_0(&mut sep_y1, &b1, &x_buf, m1 as u32, k as u32)
+        .expect("gemv 1");
+    ctx.gemv_q8_0(&mut sep_y2, &b2, &x_buf, m2 as u32, k as u32)
+        .expect("gemv 2");
+    ctx.gemv_q8_0(&mut sep_y3, &b3, &x_buf, m3 as u32, k as u32)
+        .expect("gemv 3");
+
+    let mut cat_y1 = ctx.create_buffer(m1 * 4).expect("alloc cat_y1");
+    let mut cat_y2 = ctx.create_buffer(m2 * 4).expect("alloc cat_y2");
+    let mut cat_y3 = ctx.create_buffer(m3 * 4).expect("alloc cat_y3");
+
+    ctx.gemv_q8_0_concat3(
+        &mut cat_y1,
+        &mut cat_y2,
+        &mut cat_y3,
+        &b1,
+        &b2,
+        &b3,
+        &x_buf,
+        m1 as u32,
+        m2 as u32,
+        m3 as u32,
+        k as u32,
+    )
+    .expect("gemv_q8_0_concat3");
+    ctx.synchronize().expect("sync");
+
+    let mut r_sep1 = vec![0.0f32; m1];
+    let mut r_cat1 = vec![0.0f32; m1];
+    ctx.download_f32(&sep_y1, &mut r_sep1).expect("dl sep1");
+    ctx.download_f32(&cat_y1, &mut r_cat1).expect("dl cat1");
+    for i in 0..m1 {
+        assert!(
+            (r_sep1[i] - r_cat1[i]).abs() < 1e-4,
+            "Q8 concat3 y1 mismatch at {i}: {} vs {}",
+            r_sep1[i],
+            r_cat1[i]
+        );
+    }
+
+    let mut r_sep2 = vec![0.0f32; m2];
+    let mut r_cat2 = vec![0.0f32; m2];
+    ctx.download_f32(&sep_y2, &mut r_sep2).expect("dl sep2");
+    ctx.download_f32(&cat_y2, &mut r_cat2).expect("dl cat2");
+    for i in 0..m2 {
+        assert!(
+            (r_sep2[i] - r_cat2[i]).abs() < 1e-4,
+            "Q8 concat3 y2 mismatch at {i}: {} vs {}",
+            r_sep2[i],
+            r_cat2[i]
+        );
+    }
+
+    let mut r_sep3 = vec![0.0f32; m3];
+    let mut r_cat3 = vec![0.0f32; m3];
+    ctx.download_f32(&sep_y3, &mut r_sep3).expect("dl sep3");
+    ctx.download_f32(&cat_y3, &mut r_cat3).expect("dl cat3");
+    for i in 0..m3 {
+        assert!(
+            (r_sep3[i] - r_cat3[i]).abs() < 1e-4,
+            "Q8 concat3 y3 mismatch at {i}: {} vs {}",
+            r_sep3[i],
+            r_cat3[i]
+        );
+    }
+
+    // SwiGLU
+    let gate_raw = gen_q8_0(m1, 2);
+    let up_raw = gen_q8_0(m1, 6);
+    let gate_buf = ctx.upload_bytes(&gate_raw).expect("upload gate");
+    let up_buf = ctx.upload_bytes(&up_raw).expect("upload up");
+
+    let mut sep_gate = ctx.create_buffer(m1 * 4).expect("alloc sep_gate");
+    let mut sep_up = ctx.create_buffer(m1 * 4).expect("alloc sep_up");
+    ctx.gemv_q8_0(&mut sep_gate, &gate_buf, &x_buf, m1 as u32, k as u32)
+        .expect("gemv gate");
+    ctx.gemv_q8_0(&mut sep_up, &up_buf, &x_buf, m1 as u32, k as u32)
+        .expect("gemv up");
+    ctx.silu_mul_inplace(&mut sep_gate, &sep_up, m1 as u32)
+        .expect("silu_mul");
+
+    let mut fused_swiglu = ctx.create_buffer(m1 * 4).expect("alloc fused_swiglu");
+    ctx.gemv_q8_0_swiglu(
+        &mut fused_swiglu,
+        &gate_buf,
+        &up_buf,
+        &x_buf,
+        m1 as u32,
+        k as u32,
+    )
+    .expect("gemv_q8_0_swiglu");
+    ctx.synchronize().expect("sync");
+
+    let mut r_sep_swiglu = vec![0.0f32; m1];
+    let mut r_fused_swiglu = vec![0.0f32; m1];
+    ctx.download_f32(&sep_gate, &mut r_sep_swiglu)
+        .expect("dl sep swiglu");
+    ctx.download_f32(&fused_swiglu, &mut r_fused_swiglu)
+        .expect("dl fused swiglu");
+    for i in 0..m1 {
+        assert!(
+            (r_sep_swiglu[i] - r_fused_swiglu[i]).abs() < 1e-4,
+            "Q8 swiglu mismatch at {i}: {} vs {}",
+            r_sep_swiglu[i],
+            r_fused_swiglu[i]
+        );
+    }
+}
+
+#[test]
+fn test_cuda_q4k_gemv_gemm_swiglu_and_gather_parity() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA driver not available on this host; skipping live Q4_K parity test");
+        return;
+    }
+
+    use cera::quant::{BlockQ4KM, dequantize_q4_k_m_block};
+
+    let ctx = CudaContext::new(0).expect("initialize CUDA context");
+
+    let m: usize = 4;
+    let k: usize = 256;
+    let nb = k / 256;
+
+    let mut raw_bytes = Vec::with_capacity(m * nb * 144);
+    let mut ref_weights = vec![0.0f32; m * k];
+
+    for r in 0..m {
+        for b in 0..nb {
+            let mut blk = BlockQ4KM {
+                d: half::f16::from_f32(0.025 + (r as f32) * 0.005).to_bits(),
+                dmin: half::f16::from_f32(0.01 + (b as f32) * 0.003).to_bits(),
+                scales: [0u8; 12],
+                qs: [0u8; 128],
+            };
+            for (i, v) in blk.scales.iter_mut().enumerate() {
+                *v = ((r * 5 + b * 7 + i * 3) & 0xFF) as u8;
+            }
+            for (i, v) in blk.qs.iter_mut().enumerate() {
+                *v = ((r * 37 + b * 13 + i) & 0xFF) as u8;
+            }
+            let dq = dequantize_q4_k_m_block(&blk);
+            let row_off = r * k + b * 256;
+            ref_weights[row_off..row_off + 256].copy_from_slice(&dq);
+            raw_bytes.extend_from_slice(&blk.d.to_le_bytes());
+            raw_bytes.extend_from_slice(&blk.dmin.to_le_bytes());
+            raw_bytes.extend_from_slice(&blk.scales);
+            raw_bytes.extend_from_slice(&blk.qs);
+        }
+    }
+
+    let weight_buf = ctx.upload_bytes(&raw_bytes).expect("upload Q4K weights");
+
+    // 1. GEMV: test against CPU reference dot product
+    let x_vec: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 0.2).collect();
+    let x_buf = ctx.upload_f32(&x_vec).expect("upload x");
+    let mut out_gemv = ctx.create_buffer(m * 4).expect("alloc out_gemv");
+
+    ctx.gemv_q4k(&mut out_gemv, &weight_buf, &x_buf, m as u32, k as u32)
+        .expect("gemv_q4k");
+    ctx.synchronize().expect("sync");
+
+    let mut gemv_result = vec![0.0f32; m];
+    ctx.download_f32(&out_gemv, &mut gemv_result)
+        .expect("download gemv");
+
+    for r in 0..m {
+        let expected: f32 = (0..k).map(|c| ref_weights[r * k + c] * x_vec[c]).sum();
+        assert!(
+            (gemv_result[r] - expected).abs() < 1e-3,
+            "Q4K GEMV mismatch at row {r}: got {}, expected {}",
+            gemv_result[r],
+            expected
+        );
+    }
+
+    // 2. Batched GEMM: batch of 2 tokens
+    let batch_m: usize = 2;
+    let mut x_batch = x_vec.clone();
+    x_batch.extend((0..k).map(|i| (i as f32) * -0.015 + 0.3));
+    let x_batch_buf = ctx.upload_f32(&x_batch).expect("upload x_batch");
+    let mut out_gemm = ctx.create_buffer(batch_m * m * 4).expect("alloc out_gemm");
+
+    ctx.gemm_q4k(
+        &mut out_gemm,
+        &weight_buf,
+        &x_batch_buf,
+        batch_m as u32,
+        m as u32,
+        k as u32,
+    )
+    .expect("gemm_q4k");
+    ctx.synchronize().expect("sync");
+
+    let mut gemm_result = vec![0.0f32; batch_m * m];
+    ctx.download_f32(&out_gemm, &mut gemm_result)
+        .expect("download gemm");
+
+    for b in 0..batch_m {
+        for r in 0..m {
+            let expected: f32 = (0..k)
+                .map(|c| ref_weights[r * k + c] * x_batch[b * k + c])
+                .sum();
+            let actual = gemm_result[b * m + r];
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "Q4K GEMM mismatch at batch {b}, row {r}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    // 3. Embedding gather: row 1
+    let mut out_gather = ctx.create_buffer(k * 4).expect("alloc out_gather");
+    ctx.gather_embedding_q4k(&mut out_gather, &weight_buf, 1, k as u32)
+        .expect("gather_embedding_q4k");
+    ctx.synchronize().expect("sync");
+
+    let mut gather_result = vec![0.0f32; k];
+    ctx.download_f32(&out_gather, &mut gather_result)
+        .expect("download gather");
+    for c in 0..k {
+        let expected = ref_weights[1 * k + c];
+        assert!(
+            (gather_result[c] - expected).abs() < 1e-4,
+            "Q4K gather mismatch at col {c}: got {}, expected {}",
+            gather_result[c],
+            expected
+        );
+    }
+}
