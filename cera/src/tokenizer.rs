@@ -143,7 +143,13 @@ impl BpeTokenizer {
             .map(|raw| strip_generation_markers(raw).into_owned());
 
         // Select pretokenizer based on model type
-        let pre_type = gguf.get_str("tokenizer.ggml.pre").unwrap_or("gpt2");
+        let pre_type = gguf
+            .get_str("tokenizer.ggml.pre")
+            .or_else(|| match gguf.architecture()? {
+                "mistral3" | "ministral3" => Some("tekken"),
+                _ => None,
+            })
+            .unwrap_or("gpt2");
         let pretokenize_re = build_pretokenize_regex(pre_type);
         let digits_split_bare = pre_type == "refact";
         let byte_to_unicode = build_byte_to_unicode();
@@ -1059,16 +1065,27 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // Refact pattern: used by Granite 3.x (and Refact/CodeShell/SmolLM);
         // Granite 4.x is `dbrx` on the LLAMA3 arm above, not this one. Matches
         // llama.cpp's `LLAMA_VOCAB_PRE_TYPE_REFACT`: the GPT-2 pattern, but numbers
-        // are split one digit at a time (a leading `\p{N}` expr) — so `\p{N}`
+        // are split one digit at a time (a leading `\p{N}` expr) - so `\p{N}`
         // replaces GPT-2's ` ?\p{N}+`. Whitespace is GPT-2-style (`\s+`, with the
         // `\s+(?!\S)` trailing-space lookahead emulated in `encode`), NOT the
-        // LLAMA3 `\s*[\r\n]+` newline handling — that distinction is what makes
+        // LLAMA3 `\s*[\r\n]+` newline handling - that distinction is what makes
         // indentation (`\n    `) tokenize correctly for code.
         "refact" => concat!(
             r"(?:'s|'t|'re|'ve|'m|'ll|'d)",
             r"| ?\p{L}+",
             r"|\p{N}",
             r"| ?[^\s\p{L}\p{N}]+",
+            r"|\s+",
+        ),
+        // Tekken pattern: used by Mistral 3 (Ministral 3B/8B, Mistral Small 3.1 24B).
+        // Matches llama.cpp's LLAMA_VOCAB_PRE_TYPE_TEKKEN. Splitting numbers one
+        // digit at a time, letter/digit boundaries, contractions, and punctuation.
+        "tekken" | "mistral" | "mistral3" | "ministral" | "ministral3" => concat!(
+            r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+            r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+            r"|\p{N}",
+            r"| ?[^\s\p{L}\p{N}]+[\r\n/]*",
+            r"|\s*[\r\n]+",
             r"|\s+",
         ),
         // Default to LLAMA3 for unknown types (most general pattern)
@@ -1317,6 +1334,32 @@ mod tests {
         assert_eq!(build_pretokenize_regex("qwen35").as_str(), qwen2_pattern);
         assert_eq!(build_pretokenize_regex("qwen3_5").as_str(), qwen2_pattern);
         assert_eq!(build_pretokenize_regex("qwen3.5").as_str(), qwen2_pattern);
+    }
+
+    #[test]
+    fn test_pretokenize_tekken_matches_mistral() {
+        let tekken_re = build_pretokenize_regex("tekken");
+        let tekken_pattern = tekken_re.as_str();
+        assert_eq!(build_pretokenize_regex("mistral").as_str(), tekken_pattern);
+        assert_eq!(build_pretokenize_regex("mistral3").as_str(), tekken_pattern);
+        assert_eq!(
+            build_pretokenize_regex("ministral").as_str(),
+            tekken_pattern
+        );
+        assert_eq!(
+            build_pretokenize_regex("ministral3").as_str(),
+            tekken_pattern
+        );
+    }
+
+    #[test]
+    fn test_pretokenize_tekken_splits_digits_and_words() {
+        let re = build_pretokenize_regex("tekken");
+        let chunks: Vec<&str> = re
+            .find_iter("Hello 123 world!")
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(chunks, vec!["Hello", " ", "1", "2", "3", " world", "!"]);
     }
 
     #[test]

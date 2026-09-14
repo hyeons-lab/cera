@@ -1289,7 +1289,7 @@ impl GpuLfm2Model {
                 )?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
-            _ => {
+            "lfm2" | "lfm2moe" => {
                 let cpu_model = super::lfm2::Lfm2Model::from_gguf_with_id(
                     gguf,
                     context_size,
@@ -1297,6 +1297,7 @@ impl GpuLfm2Model {
                 )?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
+            other => anyhow::bail!("unsupported architecture for GPU: {other}"),
         }
     }
 
