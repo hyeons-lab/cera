@@ -7,7 +7,6 @@
 // - Supports arbitrary batch sizes M and dimensions N, K.
 
 #include <stdint.h>
-#include <string.h>
 
 __device__ __forceinline__ float half_to_float(uint16_t h) {
     float f;
@@ -103,9 +102,7 @@ __global__ void gemm_q8_0(
             const uint32_t global_n = blockIdx.x * TILE_N + tid;
             if (global_n < params.n) {
                 const uint8_t* blk = a + (size_t)global_n * row_bytes + (size_t)ib * 34;
-                uint16_t d_h;
-                memcpy(&d_h, blk, sizeof(uint16_t));
-                s_d[tid] = half_to_float(d_h);
+                s_d[tid] = half_to_float(*reinterpret_cast<const uint16_t*>(blk));
             } else {
                 s_d[tid] = 0.0f;
             }
@@ -118,9 +115,9 @@ __global__ void gemm_q8_0(
             float dot = 0.0f;
             #pragma unroll 8
             for (int i = 0; i < 32; i++) {
-                dot += (float)s_w[tx][i] * s_x[ty][i];
+                dot = fmaf((float)s_w[tx][i], s_x[ty][i], dot);
             }
-            sum += dot * s_d[tx];
+            sum = fmaf(dot, s_d[tx], sum);
         }
 
         __syncthreads();
@@ -204,9 +201,7 @@ __global__ void gemm_q8_0_accum(
             const uint32_t global_n = blockIdx.x * TILE_N + tid;
             if (global_n < params.n) {
                 const uint8_t* blk = a + (size_t)global_n * row_bytes + (size_t)ib * 34;
-                uint16_t d_h;
-                memcpy(&d_h, blk, sizeof(uint16_t));
-                s_d[tid] = half_to_float(d_h);
+                s_d[tid] = half_to_float(*reinterpret_cast<const uint16_t*>(blk));
             } else {
                 s_d[tid] = 0.0f;
             }
@@ -218,9 +213,9 @@ __global__ void gemm_q8_0_accum(
             float dot = 0.0f;
             #pragma unroll 8
             for (int i = 0; i < 32; i++) {
-                dot += (float)s_w[tx][i] * s_x[ty][i];
+                dot = fmaf((float)s_w[tx][i], s_x[ty][i], dot);
             }
-            sum += dot * s_d[tx];
+            sum = fmaf(dot, s_d[tx], sum);
         }
 
         __syncthreads();

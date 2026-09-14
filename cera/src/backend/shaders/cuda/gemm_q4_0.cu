@@ -7,7 +7,6 @@
 // - Supports arbitrary batch sizes M and dimensions N, K.
 
 #include <stdint.h>
-#include <string.h>
 
 __device__ __forceinline__ float half_to_float(uint16_t h) {
     float f;
@@ -94,9 +93,7 @@ __global__ void gemm_q4_0(
             const uint32_t d_row = blockIdx.x * TILE_N + tid;
             if (d_row < params.n) {
                 const uint8_t* blk = a + (size_t)d_row * row_bytes + (size_t)ib * 18;
-                uint16_t d_h;
-                memcpy(&d_h, blk, sizeof(uint16_t));
-                s_d[tid] = half_to_float(d_h);
+                s_d[tid] = half_to_float(*reinterpret_cast<const uint16_t*>(blk));
             } else {
                 s_d[tid] = 0.0f;
             }
@@ -108,9 +105,9 @@ __global__ void gemm_q4_0(
         float dot = 0.0f;
         #pragma unroll
         for (int k = 0; k < 32; k++) {
-            dot += s_x[ty][k] * (float)s_w[tx][k];
+            dot = fmaf(s_x[ty][k], (float)s_w[tx][k], dot);
         }
-        sum += dot * s_d[tx];
+        sum = fmaf(dot, s_d[tx], sum);
 
         __syncthreads();
     }
@@ -183,9 +180,7 @@ __global__ void gemm_q4_0_accum(
             const uint32_t d_row = blockIdx.x * TILE_N + tid;
             if (d_row < params.n) {
                 const uint8_t* blk = a + (size_t)d_row * row_bytes + (size_t)ib * 18;
-                uint16_t d_h;
-                memcpy(&d_h, blk, sizeof(uint16_t));
-                s_d[tid] = half_to_float(d_h);
+                s_d[tid] = half_to_float(*reinterpret_cast<const uint16_t*>(blk));
             } else {
                 s_d[tid] = 0.0f;
             }
@@ -196,9 +191,9 @@ __global__ void gemm_q4_0_accum(
         float dot = 0.0f;
         #pragma unroll
         for (int k = 0; k < 32; k++) {
-            dot += s_x[ty][k] * (float)s_w[tx][k];
+            dot = fmaf(s_x[ty][k], (float)s_w[tx][k], dot);
         }
-        sum += dot * s_d[tx];
+        sum = fmaf(dot, s_d[tx], sum);
 
         __syncthreads();
     }

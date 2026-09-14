@@ -32,9 +32,15 @@ __global__ void rmsnorm(
     const float* row_x = x + (size_t)blockIdx.x * n;
     float* row_y = y + (size_t)blockIdx.x * n;
 
-    // Phase 1: Sum of squares
+    // Phase 1: Sum of squares (vectorized by 4 where possible)
     float sum_sq = 0.0f;
-    for (uint32_t i = tid; i < n; i += blockDim.x) {
+    const uint32_t n4 = n / 4;
+    const float4* row_x4 = reinterpret_cast<const float4*>(row_x);
+    for (uint32_t i = tid; i < n4; i += blockDim.x) {
+        float4 val = row_x4[i];
+        sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+    }
+    for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         float val = row_x[i];
         sum_sq += val * val;
     }
@@ -65,8 +71,20 @@ __global__ void rmsnorm(
 
     const float scale = s_scale;
 
-    // Phase 2: Normalize and scale with weights
-    for (uint32_t i = tid; i < n; i += blockDim.x) {
+    // Phase 2: Normalize and scale with weights (vectorized by 4)
+    const float4* row_w4 = reinterpret_cast<const float4*>(w);
+    float4* row_y4 = reinterpret_cast<float4*>(row_y);
+    for (uint32_t i = tid; i < n4; i += blockDim.x) {
+        float4 val = row_x4[i];
+        float4 wt = row_w4[i];
+        float4 out;
+        out.x = val.x * scale * wt.x;
+        out.y = val.y * scale * wt.y;
+        out.z = val.z * scale * wt.z;
+        out.w = val.w * scale * wt.w;
+        row_y4[i] = out;
+    }
+    for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         row_y[i] = row_x[i] * scale * w[i];
     }
 }
@@ -91,9 +109,22 @@ __global__ void fused_add_rmsnorm(
     const float* row_res = residual + (size_t)blockIdx.x * n;
     float* row_y = y + (size_t)blockIdx.x * n;
 
-    // Phase 1: In-place residual add and sum of squares
+    // Phase 1: In-place residual add and sum of squares (vectorized by 4)
     float sum_sq = 0.0f;
-    for (uint32_t i = tid; i < n; i += blockDim.x) {
+    const uint32_t n4 = n / 4;
+    float4* row_x4 = reinterpret_cast<float4*>(row_x);
+    const float4* row_res4 = reinterpret_cast<const float4*>(row_res);
+    for (uint32_t i = tid; i < n4; i += blockDim.x) {
+        float4 val = row_x4[i];
+        float4 res = row_res4[i];
+        val.x += res.x;
+        val.y += res.y;
+        val.z += res.z;
+        val.w += res.w;
+        row_x4[i] = val;
+        sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
+    }
+    for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         const float val = row_x[i] + row_res[i];
         row_x[i] = val;
         sum_sq += val * val;
@@ -125,8 +156,20 @@ __global__ void fused_add_rmsnorm(
 
     const float scale = s_scale;
 
-    // Phase 2: Normalize and scale with weights
-    for (uint32_t i = tid; i < n; i += blockDim.x) {
+    // Phase 2: Normalize and scale with weights (vectorized by 4)
+    const float4* row_w4 = reinterpret_cast<const float4*>(w);
+    float4* row_y4 = reinterpret_cast<float4*>(row_y);
+    for (uint32_t i = tid; i < n4; i += blockDim.x) {
+        float4 val = row_x4[i];
+        float4 wt = row_w4[i];
+        float4 out;
+        out.x = val.x * scale * wt.x;
+        out.y = val.y * scale * wt.y;
+        out.z = val.z * scale * wt.z;
+        out.w = val.w * scale * wt.w;
+        row_y4[i] = out;
+    }
+    for (uint32_t i = n4 * 4 + tid; i < n; i += blockDim.x) {
         row_y[i] = row_x[i] * scale * w[i];
     }
 }

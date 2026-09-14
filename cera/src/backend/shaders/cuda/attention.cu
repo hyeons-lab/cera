@@ -133,10 +133,11 @@ __global__ void flash_attention(
                 const uint32_t pair = k_ptr32[p];
                 const uint16_t h0 = (uint16_t)(pair & 0xffff);
                 const uint16_t h1 = (uint16_t)(pair >> 16);
-                dot += s_q[p * 2] * half_to_float(h0) + s_q[p * 2 + 1] * half_to_float(h1);
+                dot = fmaf(s_q[p * 2], half_to_float(h0), dot);
+                dot = fmaf(s_q[p * 2 + 1], half_to_float(h1), dot);
             }
             if (head_dim & 1) {
-                dot += s_q[head_dim - 1] * half_to_float(k_ptr[head_dim - 1]);
+                dot = fmaf(s_q[head_dim - 1], half_to_float(k_ptr[head_dim - 1]), dot);
             }
             score = dot * scale;
         }
@@ -175,7 +176,7 @@ __global__ void flash_attention(
             for (uint32_t it = 0; it < tile_count; it++) {
                 const uint32_t tok_idx = t_start + it;
                 const uint16_t* v_ptr = v_cache + (size_t)tok_idx * kv_dim + kv_h_offset;
-                v_acc += s_scores[it] * half_to_float(v_ptr[tid]);
+                v_acc = fmaf(s_scores[it], half_to_float(v_ptr[tid]), v_acc);
             }
             s_out[tid] += v_acc;
         }
