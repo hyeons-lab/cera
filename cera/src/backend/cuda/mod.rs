@@ -753,6 +753,30 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Execute GPU-resident argmax reduction directly into pinned host memory via zero-copy UMA.
+    pub fn argmax_f32_pinned(
+        &self,
+        dst: &mut CudaPinnedBuffer,
+        x: &CudaBuffer,
+        n: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(ARGMAX_F32_SRC, "argmax", "argmax_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = ArgmaxParams { n, _pad: 0 };
+        let dst_ptr = dst.device_ptr();
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(x);
+        builder.arg(&dst_ptr);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }
+            .context("failed to launch argmax_f32 kernel with pinned dst")?;
+        Ok(())
+    }
+
     /// Synchronize the context's default stream.
     pub fn synchronize(&self) -> Result<()> {
         self.stream.synchronize()

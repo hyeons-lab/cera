@@ -611,11 +611,6 @@ impl Model for CudaLfm2Model {
             }
 
             if is_last {
-                if let Err(e) = self.ctx.synchronize() {
-                    tracing::error!("CUDA synchronize failed: {e:?}");
-                    return vec![0.0f32; vocab_size];
-                }
-
                 let ws_ref = &mut *ws;
                 let pinned_slice = ws_ref.pinned_logits.as_mut_slice();
                 if let Err(e) = ws_ref.logits.copy_to_host(pinned_slice) {
@@ -666,11 +661,11 @@ impl Model for CudaLfm2Model {
             return 0;
         }
 
-        // Execute GPU-resident argmax directly into ws.argmax_token
+        // Execute GPU-resident argmax directly into ws.pinned_token via zero-copy UMA
         let ws_ref = &mut *ws;
-        if let Err(e) = self
-            .ctx
-            .argmax_f32(&mut ws_ref.argmax_token, &ws_ref.logits, vocab_size)
+        if let Err(e) =
+            self.ctx
+                .argmax_f32_pinned(&mut ws_ref.pinned_token, &ws_ref.logits, vocab_size)
         {
             tracing::error!("CUDA argmax_f32 failed: {e:?}");
             return 0;
@@ -681,13 +676,8 @@ impl Model for CudaLfm2Model {
             return 0;
         }
 
-        // Read back ONLY 4 bytes (u32 token ID) instead of 512 KB of logits
-        let pinned_slice = ws_ref.pinned_token.as_mut_slice();
-        if let Err(e) = ws_ref.argmax_token.copy_to_host(pinned_slice) {
-            tracing::error!("CUDA token readback failed: {e:?}");
-            return 0;
-        }
-
+        // Read back ONLY 4 bytes directly from pinned host memory without intermediate copies
+        let pinned_slice = ws_ref.pinned_token.as_slice();
         let next_token = u32::from_ne_bytes(pinned_slice[..4].try_into().unwrap_or([0; 4]));
 
         self.seq_len.store(cur_pos + 1, Ordering::Relaxed);

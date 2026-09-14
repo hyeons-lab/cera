@@ -52,6 +52,7 @@ __global__ void gemv_q8_0(
     float sum2 = 0.0f;
     float sum3 = 0.0f;
 
+    #pragma unroll 2
     for (uint32_t ib = 0; ib < nb; ib++) {
         // 128-byte coalesced read of activation vector x (reused across 4 rows)
         const float x_val = x[ib * 32 + lane];
@@ -74,22 +75,27 @@ __global__ void gemv_q8_0(
         const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
         const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
 
+        const float x0 = x_val * d0;
+        const float x1 = x_val * d1;
+        const float x2 = x_val * d2;
+        const float x3 = x_val * d3;
+
         const int8_t q0 = *(const int8_t*)(row0_ptr + block_offset + 2 + lane);
-        sum0 = fmaf((float)q0 * d0, x_val, sum0);
+        sum0 = fmaf((float)q0, x0, sum0);
 
         if (row1_ptr) {
             const int8_t q1 = *(const int8_t*)(row1_ptr + block_offset + 2 + lane);
-            sum1 = fmaf((float)q1 * d1, x_val, sum1);
+            sum1 = fmaf((float)q1, x1, sum1);
         }
 
         if (row2_ptr) {
             const int8_t q2 = *(const int8_t*)(row2_ptr + block_offset + 2 + lane);
-            sum2 = fmaf((float)q2 * d2, x_val, sum2);
+            sum2 = fmaf((float)q2, x2, sum2);
         }
 
         if (row3_ptr) {
             const int8_t q3 = *(const int8_t*)(row3_ptr + block_offset + 2 + lane);
-            sum3 = fmaf((float)q3 * d3, x_val, sum3);
+            sum3 = fmaf((float)q3, x3, sum3);
         }
     }
 
@@ -152,6 +158,7 @@ __global__ void gemv_q8_0_accum(
     float sum2 = 0.0f;
     float sum3 = 0.0f;
 
+    #pragma unroll 2
     for (uint32_t ib = 0; ib < nb; ib++) {
         const float x_val = x[ib * 32 + lane];
 
@@ -173,22 +180,27 @@ __global__ void gemv_q8_0_accum(
         const float d2 = __shfl_sync(0xffffffff, d_lane, 2);
         const float d3 = __shfl_sync(0xffffffff, d_lane, 3);
 
+        const float x0 = x_val * d0;
+        const float x1 = x_val * d1;
+        const float x2 = x_val * d2;
+        const float x3 = x_val * d3;
+
         const int8_t q0 = *(const int8_t*)(row0_ptr + block_offset + 2 + lane);
-        sum0 = fmaf((float)q0 * d0, x_val, sum0);
+        sum0 = fmaf((float)q0, x0, sum0);
 
         if (row1_ptr) {
             const int8_t q1 = *(const int8_t*)(row1_ptr + block_offset + 2 + lane);
-            sum1 = fmaf((float)q1 * d1, x_val, sum1);
+            sum1 = fmaf((float)q1, x1, sum1);
         }
 
         if (row2_ptr) {
             const int8_t q2 = *(const int8_t*)(row2_ptr + block_offset + 2 + lane);
-            sum2 = fmaf((float)q2 * d2, x_val, sum2);
+            sum2 = fmaf((float)q2, x2, sum2);
         }
 
         if (row3_ptr) {
             const int8_t q3 = *(const int8_t*)(row3_ptr + block_offset + 2 + lane);
-            sum3 = fmaf((float)q3 * d3, x_val, sum3);
+            sum3 = fmaf((float)q3, x3, sum3);
         }
     }
 
