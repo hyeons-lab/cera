@@ -1782,6 +1782,9 @@ impl Gemma4Model {
 
 impl Model for Gemma4Model {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
         self.forward_single_token(tokens[0], pos, state)
     }
 

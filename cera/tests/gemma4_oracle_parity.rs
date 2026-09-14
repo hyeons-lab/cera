@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression, LayerState};
@@ -18,34 +19,64 @@ fn get_test_model_path() -> std::path::PathBuf {
     std::env::temp_dir().join("test_gemma4.gguf")
 }
 
-fn ensure_test_model(path: &Path) {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        if !path.exists() {
-            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let script_path = if manifest_dir
-                .join("../scripts/oracle/create_gemma4_test_model.py")
-                .exists()
-            {
-                manifest_dir.join("../scripts/oracle/create_gemma4_test_model.py")
-            } else {
-                manifest_dir.join("scripts/oracle/create_gemma4_test_model.py")
-            };
-            eprintln!("generating {:?} via {:?}", path, script_path);
-            let status = std::process::Command::new("python3")
-                .arg(&script_path)
-                .arg(path)
-                .status()
-                .expect("execute create_gemma4_test_model.py");
-            assert!(status.success(), "failed to generate {:?}", path);
+fn ensure_test_model(path: &Path) -> bool {
+    static INIT: OnceLock<bool> = OnceLock::new();
+    *INIT.get_or_init(|| {
+        if path.exists() && path.metadata().map(|m| m.len() > 1024).unwrap_or(false) {
+            return true;
         }
-    });
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script_path = if manifest_dir
+            .join("../scripts/oracle/create_gemma4_test_model.py")
+            .exists()
+        {
+            manifest_dir.join("../scripts/oracle/create_gemma4_test_model.py")
+        } else {
+            manifest_dir.join("scripts/oracle/create_gemma4_test_model.py")
+        };
+        if !script_path.exists() {
+            eprintln!(
+                "skipping: fixture generator script not found at {}",
+                script_path.display()
+            );
+            return false;
+        }
+        let probe = std::process::Command::new("python3")
+            .args(["-c", "import numpy, gguf"])
+            .output();
+        let python_has_deps = matches!(probe, Ok(out) if out.status.success());
+        if !python_has_deps {
+            eprintln!("skipping: python3 missing numpy/gguf dependencies");
+            return false;
+        }
+        eprintln!("generating {:?} via {:?}", path, script_path);
+        let status = std::process::Command::new("python3")
+            .arg(&script_path)
+            .arg(path)
+            .status();
+        let ok = matches!(status, Ok(st) if st.success())
+            && path.is_file()
+            && path.metadata().map(|m| m.len() > 1024).unwrap_or(false);
+        if !ok {
+            let require_fixture = std::env::var("CERA_REQUIRE_MODEL").as_deref() == Ok("1")
+                || std::env::var("CERA_REQUIRE_ORACLE").as_deref() == Ok("1");
+            if require_fixture
+                || (python_has_deps && matches!(std::env::var("CI").as_deref(), Ok("true" | "1")))
+            {
+                panic!("failed to generate {:?}", path);
+            }
+        }
+        ok
+    })
 }
 
 #[test]
 fn gemma4_matches_llama_cpp_oracle() {
     let path = get_test_model_path();
-    ensure_test_model(&path);
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
 
     let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
     let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
@@ -202,7 +233,10 @@ fn gemma4_matches_llama_cpp_oracle() {
 #[test]
 fn gemma4_truncate_and_resume() {
     let path = get_test_model_path();
-    ensure_test_model(&path);
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
 
     let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
     let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
@@ -243,7 +277,10 @@ fn gemma4_truncate_and_resume() {
 #[test]
 fn gemma4_f16_kv_compression_parity() {
     let path = get_test_model_path();
-    ensure_test_model(&path);
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
 
     let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
     let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
@@ -269,7 +306,10 @@ fn gemma4_f16_kv_compression_parity() {
 #[test]
 fn gemma4_empty_prefill() {
     let path = get_test_model_path();
-    ensure_test_model(&path);
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
 
     let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
     let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
@@ -284,7 +324,10 @@ fn gemma4_empty_prefill() {
 #[test]
 fn gemma4_all_logits_prefill_matches_last() {
     let path = get_test_model_path();
-    ensure_test_model(&path);
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
 
     let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
     let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");

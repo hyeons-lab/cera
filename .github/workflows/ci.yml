@@ -754,7 +754,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3584  # 3.5 MB
+          BUDGET_KB=3776  # 3.6875 MB; PR #430 gemma4 support
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB, so a 2,621,441-byte file reads as
           # "2561 KB" rather than "2560 KB". That keeps the human-readable
@@ -920,7 +920,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3712  # 3.625 MB; see the note above for the measurement
+          BUDGET_KB=3840  # 3.75 MB; PR #430 gemma4 support MT
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
