@@ -41,6 +41,7 @@ of these architectures loads:
 | `lfm2moe` | Liquid **LFM2.5-8B-A1B** (routed mixture-of-experts) | text |
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
+| `qwen35` | **Qwen 3.5 / Ornith 1.0** (interleaved Gated Delta Net hybrid) | text |
 | `granite` | **IBM Granite 3.x**, and the dense **Granite 4.1** line (3b / 8b / 30b) | text |
 | `minicpm` | **MiniCPM / MiniCPM5** (MiniCPM-1B / 2B) | text |
 | `nanbeige` | **Nanbeige 4.2** (looped-layer dense transformer) | text |

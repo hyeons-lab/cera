@@ -142,6 +142,7 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `lfm2` | Liquid LFM2 / LFM2.5 (the canonical LeapBundles family) |
 | `lfm2moe` | Liquid LFM2.5-8B-A1B (routed mixture-of-experts) |
 | `qwen2`, `qwen3` | Qwen2 / Qwen2.5 / Qwen3 |
+| `qwen35` | Qwen 3.5 / Ornith 1.0 (interleaved Gated Delta Net hybrid) |
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
 | `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
 | `minicpm` | MiniCPM / MiniCPM5 (MiniCPM-1B / 2B) |

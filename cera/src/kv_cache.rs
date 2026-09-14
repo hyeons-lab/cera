@@ -323,6 +323,11 @@ pub enum LayerState {
         conv_state: Vec<f32>,
         ssm_state: Vec<f32>,
     },
+    /// State buffers for Gated Delta Net recurrent layers.
+    DeltaNet {
+        conv_state: Vec<f32>,
+        ssm_state: Vec<f32>,
+    },
 }
 
 /// Pre-allocated scratch buffers reused across layers and tokens.
@@ -543,6 +548,13 @@ impl InferenceState {
                     conv_state.fill(0.0);
                     ssm_state.fill(0.0);
                 }
+                LayerState::DeltaNet {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    conv_state.fill(0.0);
+                    ssm_state.fill(0.0);
+                }
             }
         }
     }
@@ -621,7 +633,7 @@ impl InferenceState {
                     BlockType::Attention | BlockType::ParallelAttentionMamba2 => Some(
                         RotationState::try_from_seed(seed ^ layer_idx as u64, head_dim)?,
                     ),
-                    BlockType::GatedConv | BlockType::Mamba2 => None,
+                    BlockType::GatedConv | BlockType::Mamba2 | BlockType::DeltaNet => None,
                 });
             }
             (rotations, Some(TurboQuantConfig::for_head_dim(head_dim)))
@@ -723,6 +735,30 @@ impl InferenceState {
                             checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
                         let ssm_state_len = checked_elems::<f32>(ssm.d_inner, ssm.d_state)?;
                         Ok(LayerState::Mamba2 {
+                            conv_state: zeroed_f32(conv_state_len)?,
+                            ssm_state: zeroed_f32(ssm_state_len)?,
+                        })
+                    }
+                    BlockType::DeltaNet => {
+                        let ssm = config.ssm.as_ref().ok_or_else(|| {
+                            CeraError::Backend("ssm config missing for DeltaNet layer".to_string())
+                        })?;
+                        let key_dim = checked_elems::<f32>(ssm.n_group, ssm.d_state)?;
+                        let value_dim = ssm.d_inner;
+                        let conv_dim = key_dim
+                            .checked_mul(2)
+                            .and_then(|k2| k2.checked_add(value_dim))
+                            .ok_or_else(|| {
+                                CeraError::Backend("ssm conv dimension overflow".to_string())
+                            })?;
+                        let conv_state_len =
+                            checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
+                        let ssm_heads_dim =
+                            ssm.dt_rank.checked_mul(ssm.d_state).ok_or_else(|| {
+                                CeraError::Backend("ssm state heads dimension overflow".to_string())
+                            })?;
+                        let ssm_state_len = checked_elems::<f32>(ssm_heads_dim, ssm.d_state)?;
+                        Ok(LayerState::DeltaNet {
                             conv_state: zeroed_f32(conv_state_len)?,
                             ssm_state: zeroed_f32(ssm_state_len)?,
                         })
@@ -885,7 +921,10 @@ impl InferenceState {
 
     /// Append K and V vectors to an attention layer's cache (uncompressed path).
     pub fn append_kv(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        match &mut self.layers[layer] {
+        let Some(layer_state) = self.layers.get_mut(layer) else {
+            return;
+        };
+        match layer_state {
             LayerState::Attention {
                 key_cache,
                 value_cache,
@@ -906,7 +945,10 @@ impl InferenceState {
     /// Append K and V to an attention layer's f16 cache, converting each f32 to
     /// IEEE-754 half on the way in. Used when `KvCompression::F16` is active.
     pub fn append_kv_f16(&mut self, layer: usize, k: &[f32], v: &[f32]) {
-        match &mut self.layers[layer] {
+        let Some(layer_state) = self.layers.get_mut(layer) else {
+            return;
+        };
+        match layer_state {
             LayerState::Attention {
                 key_cache_f16,
                 value_cache_f16,
@@ -1018,6 +1060,28 @@ impl InferenceState {
         }
     }
 
+    /// Borrow the DeltaNet convolution and SSM states for a layer.
+    pub fn deltanet_state(&self, layer: usize) -> (&[f32], &[f32]) {
+        match &self.layers[layer] {
+            LayerState::DeltaNet {
+                conv_state,
+                ssm_state,
+            } => (conv_state, ssm_state),
+            _ => panic!("deltanet_state called on non-deltanet layer {layer}"),
+        }
+    }
+
+    /// Mutably borrow the DeltaNet convolution and SSM states for a layer.
+    pub fn deltanet_state_mut(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
+        match &mut self.layers[layer] {
+            LayerState::DeltaNet {
+                conv_state,
+                ssm_state,
+            } => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
+            _ => panic!("deltanet_state_mut called on non-deltanet layer {layer}"),
+        }
+    }
+
     /// Is any attention layer's KV currently backed by a compressed
     /// (TurboQuant) cache? Used by `Session::append_tokens` to decide
     /// whether `n_keep` shift is supported for this state: v1 gates
@@ -1036,8 +1100,10 @@ impl InferenceState {
                 compressed_values,
                 ..
             } => compressed_keys.is_some() && compressed_values.is_some(),
-            // Conv and Mamba2 layers are never compressed.
-            LayerState::Conv { .. } | LayerState::Mamba2 { .. } => true,
+            // Conv, Mamba2, and DeltaNet layers are never compressed.
+            LayerState::Conv { .. } | LayerState::Mamba2 { .. } | LayerState::DeltaNet { .. } => {
+                true
+            }
         })
     }
 
@@ -1135,6 +1201,13 @@ impl InferenceState {
                     conv_state,
                     ssm_state,
                 } => layers.push(LayerSnapshot::Mamba2 {
+                    conv_state: bytemuck::cast_slice(conv_state).to_vec(),
+                    ssm_state: bytemuck::cast_slice(ssm_state).to_vec(),
+                }),
+                LayerState::DeltaNet {
+                    conv_state,
+                    ssm_state,
+                } => layers.push(LayerSnapshot::DeltaNet {
                     conv_state: bytemuck::cast_slice(conv_state).to_vec(),
                     ssm_state: bytemuck::cast_slice(ssm_state).to_vec(),
                 }),
@@ -1321,7 +1394,9 @@ impl InferenceState {
                     LayerState::Conv { buffer, history },
                     LayerSnapshot::Conv { buffer: snap_buf },
                 ) => {
+                    let expected_len = buffer.len();
                     decode_f32_into(buffer, snap_buf);
+                    buffer.resize(expected_len, 0.0);
                     history.clear();
                     history.push(snapshot.seq_len, buffer);
                 }
@@ -1335,8 +1410,29 @@ impl InferenceState {
                         ssm_state: snap_ssm,
                     },
                 ) => {
+                    let expected_conv = conv_state.len();
+                    let expected_ssm = ssm_state.len();
                     decode_f32_into(conv_state, snap_conv);
                     decode_f32_into(ssm_state, snap_ssm);
+                    conv_state.resize(expected_conv, 0.0);
+                    ssm_state.resize(expected_ssm, 0.0);
+                }
+                (
+                    LayerState::DeltaNet {
+                        conv_state,
+                        ssm_state,
+                    },
+                    LayerSnapshot::DeltaNet {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    let expected_conv = conv_state.len();
+                    let expected_ssm = ssm_state.len();
+                    decode_f32_into(conv_state, snap_conv);
+                    decode_f32_into(ssm_state, snap_ssm);
+                    conv_state.resize(expected_conv, 0.0);
+                    ssm_state.resize(expected_ssm, 0.0);
                 }
                 (
                     LayerState::ParallelAttentionMamba2 {
@@ -1355,6 +1451,8 @@ impl InferenceState {
                         ssm_state: snap_ssm,
                     },
                 ) => {
+                    let expected_conv = conv_state.len();
+                    let expected_ssm = ssm_state.len();
                     match &**snap {
                         LayerSnapshot::Attention { k_data, v_data } => {
                             assert!(!kv_f16, "f32 Attention snapshot restored into an f16 state");
@@ -1392,6 +1490,8 @@ impl InferenceState {
                     }
                     decode_f32_into(conv_state, snap_conv);
                     decode_f32_into(ssm_state, snap_ssm);
+                    conv_state.resize(expected_conv, 0.0);
+                    ssm_state.resize(expected_ssm, 0.0);
                 }
                 _ => panic!("snapshot layer kind doesn't match state layer kind"),
             }
@@ -1445,11 +1545,13 @@ impl InferenceState {
                             break;
                         }
                     }
-                    LayerState::Mamba2 { .. } | LayerState::ParallelAttentionMamba2 { .. } => {
+                    LayerState::Mamba2 { .. }
+                    | LayerState::ParallelAttentionMamba2 { .. }
+                    | LayerState::DeltaNet { .. } => {
                         tracing::warn!(
                             target: "cera::kv_cache",
                             target_len = safe_len,
-                            "truncate_to called on Mamba-2 state with safe_len > 0; recurrent state lacks intermediate history, forcing full clear"
+                            "truncate_to called on recurrent state with safe_len > 0; recurrent state lacks intermediate history, forcing full clear"
                         );
                         safe_len = 0;
                         break;
@@ -1503,6 +1605,15 @@ impl InferenceState {
                     }
                 }
                 LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    if safe_len == 0 {
+                        conv_state.fill(0.0);
+                        ssm_state.fill(0.0);
+                    }
+                }
+                LayerState::DeltaNet {
                     conv_state,
                     ssm_state,
                 } => {
@@ -1984,6 +2095,10 @@ pub enum LayerSnapshot {
         conv_state: Vec<u8>,
         ssm_state: Vec<u8>,
     },
+    DeltaNet {
+        conv_state: Vec<u8>,
+        ssm_state: Vec<u8>,
+    },
 }
 
 impl LayerSnapshot {
@@ -2025,6 +2140,10 @@ impl StateSnapshot {
                 LayerSnapshot::AttentionF16 { k_data, v_data } => k_data.len() + v_data.len(),
                 LayerSnapshot::Conv { buffer } => buffer.len(),
                 LayerSnapshot::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                } => conv_state.len() + ssm_state.len(),
+                LayerSnapshot::DeltaNet {
                     conv_state,
                     ssm_state,
                 } => conv_state.len() + ssm_state.len(),
@@ -2471,6 +2590,14 @@ impl KvPrefixCache {
                     let v = builder.create_vector(ssm_state);
                     (4u8, Some(k), Some(v))
                 }
+                LayerSnapshot::DeltaNet {
+                    conv_state,
+                    ssm_state,
+                } => {
+                    let k = builder.create_vector(conv_state);
+                    let v = builder.create_vector(ssm_state);
+                    (5u8, Some(k), Some(v))
+                }
                 LayerSnapshot::ParallelAttentionMamba2 { .. } => {
                     // Parallel attention and Mamba-2 layers cannot be serialized
                     // into the 2-vector flatbuffer LayerData schema: skip disk write.
@@ -2673,6 +2800,17 @@ impl KvPrefixCache {
                         ssm_state,
                     });
                 }
+                5 => {
+                    let conv_state = l.k_data()?.bytes().to_vec();
+                    let ssm_state = l.v_data()?.bytes().to_vec();
+                    if !conv_state.len().is_multiple_of(4) || !ssm_state.len().is_multiple_of(4) {
+                        return None;
+                    }
+                    layers.push(LayerSnapshot::DeltaNet {
+                        conv_state,
+                        ssm_state,
+                    });
+                }
                 _ => return None,
             }
         }
@@ -2771,10 +2909,18 @@ pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
             crate::model::BlockType::GatedConv => 1,
             crate::model::BlockType::Mamba2 => 2,
             crate::model::BlockType::ParallelAttentionMamba2 => 3,
+            crate::model::BlockType::DeltaNet => 4,
         });
     }
     for k in &config.kv_heads_per_layer {
         buf.extend_from_slice(&(*k as u64).to_le_bytes());
+    }
+    if let Some(ssm) = &config.ssm {
+        buf.extend_from_slice(&(ssm.d_conv as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.d_inner as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.d_state as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.dt_rank as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.n_group as u64).to_le_bytes());
     }
     fnv1a_u64(&buf)
 }
@@ -3144,6 +3290,9 @@ mod tests {
                 }
                 LayerState::Mamba2 { .. } => {
                     assert!(matches!(l, LayerSnapshot::Mamba2 { .. }))
+                }
+                LayerState::DeltaNet { .. } => {
+                    assert!(matches!(l, LayerSnapshot::DeltaNet { .. }))
                 }
             }
         }

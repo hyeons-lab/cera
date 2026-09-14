@@ -156,6 +156,7 @@ impl HfModelConfig {
     pub fn gguf_architecture(&self) -> &str {
         match self.model_type.to_ascii_lowercase().as_str() {
             "llama" | "llama2" | "llama3" => "llama",
+            "qwen35" | "qwen3_5" | "qwen3.5" => "qwen35",
             "qwen2" | "qwen" => "qwen2",
             "qwen3" => "qwen3",
             "mistral" => "llama", // Mistral maps to llama architecture in GGUF
@@ -178,6 +179,11 @@ impl HfModelConfig {
                         "whisper"
                     } else if arch_lower.contains("lfm") || arch_lower.contains("liquid") {
                         "lfm2"
+                    } else if arch_lower.contains("qwen35")
+                        || arch_lower.contains("qwen3_5")
+                        || arch_lower.contains("qwen3.5")
+                    {
+                        "qwen35"
                     } else if arch_lower.contains("qwen2") || arch_lower.contains("qwen") {
                         "qwen2"
                     } else if arch_lower.contains("nanbeige") {
@@ -426,6 +432,47 @@ impl HfModelConfig {
             writer.add_u32(format!("{arch}.attention.sliding_window"), sw as u32);
         }
 
+        if arch == "qwen35" {
+            if let Some(conv_kernel) = self
+                .extra
+                .get("linear_conv_kernel_dim")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("qwen35.ssm.conv_kernel", conv_kernel as u32);
+            }
+            if let Some(inner_size) = self.extra.get("linear_inner_size").and_then(Value::as_u64) {
+                writer.add_u32("qwen35.ssm.inner_size", inner_size as u32);
+            }
+            if let Some(state_size) = self
+                .extra
+                .get("linear_key_head_dim")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("qwen35.ssm.state_size", state_size as u32);
+            }
+            if let Some(dt_rank) = self
+                .extra
+                .get("linear_num_value_heads")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("qwen35.ssm.time_step_rank", dt_rank as u32);
+            }
+            if let Some(group_count) = self
+                .extra
+                .get("linear_num_key_heads")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("qwen35.ssm.group_count", group_count as u32);
+            }
+            if let Some(full_attn_interval) = self
+                .extra
+                .get("full_attention_interval")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("qwen35.full_attention_interval", full_attn_interval as u32);
+            }
+        }
+
         // Token classification labels (e.g. LiquidAI/pii-detect)
         if let Some(Value::Object(id2label)) = self.extra.get("id2label") {
             let mut label_pairs: Vec<(usize, String)> = Vec::new();
@@ -579,5 +626,50 @@ mod tests {
         }"#;
         let cfg = HfModelConfig::from_json_str(json_data).unwrap();
         assert_eq!(cfg.gguf_architecture(), "olmoe");
+    }
+
+    #[test]
+    fn test_qwen35_config_mapping() {
+        let json_data = r#"{
+            "model_type": "qwen35",
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "linear_conv_kernel_dim": 4,
+            "linear_inner_size": 2048,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 16,
+            "linear_num_key_heads": 8,
+            "full_attention_interval": 4
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "qwen35");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "qwen35-test");
+        assert_eq!(
+            writer.get_metadata("qwen35.ssm.conv_kernel"),
+            Some(&MetadataValue::Uint32(4))
+        );
+        assert_eq!(
+            writer.get_metadata("qwen35.ssm.inner_size"),
+            Some(&MetadataValue::Uint32(2048))
+        );
+        assert_eq!(
+            writer.get_metadata("qwen35.ssm.state_size"),
+            Some(&MetadataValue::Uint32(128))
+        );
+        assert_eq!(
+            writer.get_metadata("qwen35.ssm.time_step_rank"),
+            Some(&MetadataValue::Uint32(16))
+        );
+        assert_eq!(
+            writer.get_metadata("qwen35.ssm.group_count"),
+            Some(&MetadataValue::Uint32(8))
+        );
+        assert_eq!(
+            writer.get_metadata("qwen35.full_attention_interval"),
+            Some(&MetadataValue::Uint32(4))
+        );
     }
 }
