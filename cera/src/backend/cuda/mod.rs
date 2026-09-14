@@ -242,6 +242,78 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Execute unified single-token Q4_0 matrix-vector multiplication for 3 projection matrices (e.g. Q, K, V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4_0_concat3(
+        &self,
+        y1: &mut CudaBuffer,
+        y2: &mut CudaBuffer,
+        y3: &mut CudaBuffer,
+        a1: &CudaBuffer,
+        a2: &CudaBuffer,
+        a3: &CudaBuffer,
+        x: &CudaBuffer,
+        m1: u32,
+        m2: u32,
+        m3: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_concat3")?;
+        let warps_m1 = m1.div_ceil(4);
+        let warps_m2 = m2.div_ceil(4);
+        let warps_m3 = m3.div_ceil(4);
+        let total_warps = warps_m1 + warps_m2 + warps_m3;
+        let warps_per_block = 8u32;
+        let num_blocks = total_warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = Concat3Params { m1, m2, m3, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a1);
+        builder.arg(a2);
+        builder.arg(a3);
+        builder.arg(x);
+        builder.arg(y1);
+        builder.arg(y2);
+        builder.arg(y3);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4_0_concat3 kernel")?;
+        Ok(())
+    }
+
+    /// Execute fused single-token Q4_0 SwiGLU: out = silu(gate * x) * (up * x) evaluated in registers.
+    pub fn gemv_q4_0_swiglu(
+        &self,
+        out: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        up: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_swiglu")?;
+        let warps = m.div_ceil(2);
+        let warps_per_block = 8u32;
+        let num_blocks = warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(gate);
+        builder.arg(up);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4_0_swiglu kernel")?;
+        Ok(())
+    }
+
     /// Execute single-token Q8_0 matrix-vector multiplication (y = A * x).
     pub fn gemv_q8_0(
         &self,
@@ -293,6 +365,205 @@ impl CudaContext {
         builder.arg(out);
         builder.arg(&params);
         unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0_accum kernel")?;
+        Ok(())
+    }
+
+    /// Execute unified single-token Q8_0 matrix-vector multiplication for 3 projection matrices (e.g. Q, K, V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_concat3(
+        &self,
+        y1: &mut CudaBuffer,
+        y2: &mut CudaBuffer,
+        y3: &mut CudaBuffer,
+        a1: &CudaBuffer,
+        a2: &CudaBuffer,
+        a3: &CudaBuffer,
+        x: &CudaBuffer,
+        m1: u32,
+        m2: u32,
+        m3: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_concat3")?;
+        let warps_m1 = m1.div_ceil(4);
+        let warps_m2 = m2.div_ceil(4);
+        let warps_m3 = m3.div_ceil(4);
+        let total_warps = warps_m1 + warps_m2 + warps_m3;
+        let warps_per_block = 8u32;
+        let num_blocks = total_warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = Concat3Params { m1, m2, m3, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a1);
+        builder.arg(a2);
+        builder.arg(a3);
+        builder.arg(x);
+        builder.arg(y1);
+        builder.arg(y2);
+        builder.arg(y3);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0_concat3 kernel")?;
+        Ok(())
+    }
+
+    /// Execute fused single-token Q8_0 SwiGLU: out = silu(gate * x) * (up * x) evaluated in registers.
+    pub fn gemv_q8_0_swiglu(
+        &self,
+        out: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        up: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_swiglu")?;
+        let warps = m.div_ceil(2);
+        let warps_per_block = 8u32;
+        let num_blocks = warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(gate);
+        builder.arg(up);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q8_0_swiglu kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token Q4_K_M matrix-vector multiplication (y = A * x).
+    pub fn gemv_q4k(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k")?;
+        let warps_per_block = 8u32;
+        let warps = m.div_ceil(2);
+        let num_blocks = warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4k kernel")?;
+        Ok(())
+    }
+
+    /// Execute single-token Q4_K_M matrix-vector multiplication with residual accumulation (y += A * x).
+    pub fn gemv_q4k_accum(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_accum")?;
+        let warps_per_block = 8u32;
+        let warps = m.div_ceil(2);
+        let num_blocks = warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4k_accum kernel")?;
+        Ok(())
+    }
+
+    /// Execute unified single-token Q4_K_M matrix-vector multiplication for 3 projection matrices (e.g. Q, K, V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4k_concat3(
+        &self,
+        y1: &mut CudaBuffer,
+        y2: &mut CudaBuffer,
+        y3: &mut CudaBuffer,
+        a1: &CudaBuffer,
+        a2: &CudaBuffer,
+        a3: &CudaBuffer,
+        x: &CudaBuffer,
+        m1: u32,
+        m2: u32,
+        m3: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_concat3")?;
+        let warps_m1 = m1.div_ceil(2);
+        let warps_m2 = m2.div_ceil(2);
+        let warps_m3 = m3.div_ceil(2);
+        let total_warps = warps_m1 + warps_m2 + warps_m3;
+        let warps_per_block = 8u32;
+        let num_blocks = total_warps.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = Concat3Params { m1, m2, m3, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(a1);
+        builder.arg(a2);
+        builder.arg(a3);
+        builder.arg(x);
+        builder.arg(y1);
+        builder.arg(y2);
+        builder.arg(y3);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4k_concat3 kernel")?;
+        Ok(())
+    }
+
+    /// Execute fused single-token Q4_K_M SwiGLU: out = silu(gate * x) * (up * x) evaluated in registers.
+    pub fn gemv_q4k_swiglu(
+        &self,
+        out: &mut CudaBuffer,
+        gate: &CudaBuffer,
+        up: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_swiglu")?;
+        let warps_per_block = 8u32;
+        let num_blocks = m.div_ceil(warps_per_block);
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (warps_per_block * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemvParams { m, k };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(gate);
+        builder.arg(up);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemv_q4k_swiglu kernel")?;
         Ok(())
     }
 
@@ -416,6 +687,66 @@ impl CudaContext {
         Ok(())
     }
 
+    /// Execute batched Q4_K_M matrix-matrix multiplication (Y = X * A^T).
+    pub fn gemm_q4k(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMM_Q4K_SRC, "gemm_q4k", "gemm_q4k")?;
+        let tile_m = 16u32;
+        let tile_n = 16u32;
+        let grid_x = n.div_ceil(tile_n);
+        let grid_y = m.div_ceil(tile_m);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (tile_n, tile_m, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemmParams { m, n, k, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemm_q4k kernel")?;
+        Ok(())
+    }
+
+    /// Execute batched Q4_K_M matrix-matrix multiplication with residual accumulation (Y += X * A^T).
+    pub fn gemm_q4k_accum(
+        &self,
+        out: &mut CudaBuffer,
+        weights: &CudaBuffer,
+        x: &CudaBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(GEMM_Q4K_SRC, "gemm_q4k", "gemm_q4k_accum")?;
+        let tile_m = 16u32;
+        let tile_n = 16u32;
+        let grid_x = n.div_ceil(tile_n);
+        let grid_y = m.div_ceil(tile_m);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (tile_n, tile_m, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GemmParams { m, n, k, _pad: 0 };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(weights);
+        builder.arg(x);
+        builder.arg(out);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gemm_q4k_accum kernel")?;
+        Ok(())
+    }
+
     /// Dequantize token embedding row directly on GPU into activation buffer.
     pub fn gather_embedding_q8_0(
         &self,
@@ -475,6 +806,37 @@ impl CudaContext {
         builder.arg(table);
         builder.arg(&params);
         unsafe { builder.launch(cfg) }.context("failed to launch gather_embedding_q4_0 kernel")?;
+        Ok(())
+    }
+
+    /// Dequantize Q4_K_M token embedding row directly on GPU into activation buffer.
+    pub fn gather_embedding_q4k(
+        &self,
+        out: &mut CudaBuffer,
+        table: &CudaBuffer,
+        token_id: u32,
+        hidden_size: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(
+            GATHER_EMBEDDING_SRC,
+            "gather_embedding",
+            "gather_embedding_q4k",
+        )?;
+        let threads = (hidden_size / 32 * 32).clamp(32, 256);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let params = GatherParams {
+            token_id,
+            hidden_size,
+        };
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(out);
+        builder.arg(table);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch gather_embedding_q4k kernel")?;
         Ok(())
     }
 

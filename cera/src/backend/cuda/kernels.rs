@@ -8,8 +8,10 @@ use cudarc::driver::DeviceRepr;
 // Embedded CUDA source strings
 pub const GEMV_Q4_0_SRC: &str = include_str!("../shaders/cuda/gemv_q4_0.cu");
 pub const GEMV_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemv_q8_0.cu");
+pub const GEMV_Q4K_SRC: &str = include_str!("../shaders/cuda/gemv_q4k.cu");
 pub const GEMM_Q4_0_SRC: &str = include_str!("../shaders/cuda/gemm_q4_0.cu");
 pub const GEMM_Q8_0_SRC: &str = include_str!("../shaders/cuda/gemm_q8_0.cu");
+pub const GEMM_Q4K_SRC: &str = include_str!("../shaders/cuda/gemm_q4k.cu");
 pub const GATHER_EMBEDDING_SRC: &str = include_str!("../shaders/cuda/gather_embedding.cu");
 pub const RMSNORM_SRC: &str = include_str!("../shaders/cuda/rmsnorm.cu");
 pub const QK_NORM_ROPE_SRC: &str = include_str!("../shaders/cuda/qk_norm_rope.cu");
@@ -27,6 +29,17 @@ pub struct GemvParams {
     pub k: u32,
 }
 unsafe impl DeviceRepr for GemvParams {}
+
+/// Parameters for unified 3-matrix GEMV operations (e.g. Q, K, V projections).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Concat3Params {
+    pub m1: u32,
+    pub m2: u32,
+    pub m3: u32,
+    pub k: u32,
+}
+unsafe impl DeviceRepr for Concat3Params {}
 
 /// Parameters for matrix-matrix multiplication kernels (GEMM).
 #[repr(C)]
