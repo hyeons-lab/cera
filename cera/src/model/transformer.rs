@@ -679,13 +679,13 @@ pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
 #[cfg(has_blas)]
 fn blas_cache_weights_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("CERA_BLAS_CACHE_WEIGHTS").as_deref() {
+    *ENABLED.get_or_init(
+        || match std::env::var("CERA_BLAS_CACHE_WEIGHTS").as_deref() {
             Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
             Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
             _ => true,
-        }
-    })
+        },
+    )
 }
 
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
@@ -1620,30 +1620,76 @@ pub(crate) fn forward_attn_block(
     // Q8_0 at the layer level, so the integer dot-product path is used.
     #[cfg(target_arch = "aarch64")]
     {
-        gemv_preq(
-            gguf,
-            weights.attn_q,
-            hidden,
-            &state.scratch.q8_scales,
-            &state.scratch.q8_quants,
-            q,
-        );
-        gemv_preq(
-            gguf,
-            weights.attn_k,
-            hidden,
-            &state.scratch.q8_scales,
-            &state.scratch.q8_quants,
-            k,
-        );
-        gemv_preq(
-            gguf,
-            weights.attn_v,
-            hidden,
-            &state.scratch.q8_scales,
-            &state.scratch.q8_quants,
-            v,
-        );
+        if lora.is_none()
+            && weights.attn_q.dtype == DType::Q4_0
+            && weights.attn_k.dtype == DType::Q4_0
+            && weights.attn_v.dtype == DType::Q4_0
+        {
+            let q_data = weight_data(gguf, weights.attn_q);
+            let k_data = weight_data(gguf, weights.attn_k);
+            let v_data = weight_data(gguf, weights.attn_v);
+            cpu::gemv_q4_0_concat3_with_q8(
+                q_data,
+                k_data,
+                v_data,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                q,
+                k,
+                v,
+                q_dim,
+                kv_dim,
+                kv_dim,
+                weights.attn_q.k,
+            );
+        } else if lora.is_none()
+            && weights.attn_q.dtype == DType::Q4KM
+            && weights.attn_k.dtype == DType::Q4KM
+            && weights.attn_v.dtype == DType::Q4KM
+        {
+            let q_data = weight_data(gguf, weights.attn_q);
+            let k_data = weight_data(gguf, weights.attn_k);
+            let v_data = weight_data(gguf, weights.attn_v);
+            cpu::gemv_q4k_concat3_with_q8(
+                q_data,
+                k_data,
+                v_data,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                q,
+                k,
+                v,
+                q_dim,
+                kv_dim,
+                kv_dim,
+                weights.attn_q.k,
+            );
+        } else {
+            gemv_preq(
+                gguf,
+                weights.attn_q,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                q,
+            );
+            gemv_preq(
+                gguf,
+                weights.attn_k,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                k,
+            );
+            gemv_preq(
+                gguf,
+                weights.attn_v,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                v,
+            );
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {

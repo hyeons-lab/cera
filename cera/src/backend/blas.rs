@@ -80,11 +80,9 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
                 let b = b_ptr as *const f32;
                 let c_t = (c_ptr as *mut f32).add(m_start * n);
 
-                let (Ok(mt_i), Ok(n_i), Ok(k_i)) = (
-                    i32::try_from(m_t),
-                    i32::try_from(n),
-                    i32::try_from(k),
-                ) else {
+                let (Ok(mt_i), Ok(n_i), Ok(k_i)) =
+                    (i32::try_from(m_t), i32::try_from(n), i32::try_from(k))
+                else {
                     return;
                 };
 
@@ -1017,7 +1015,8 @@ mod tests {
         sgemm_rowmajor_nn(m, n, k, &a, &b, &mut c_parallel);
 
         let mut c_serial = vec![0.0f32; m * n];
-        let (Ok(m_i), Ok(n_i), Ok(k_i)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k)) else {
+        let (Ok(m_i), Ok(n_i), Ok(k_i)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k))
+        else {
             panic!("cast failed");
         };
         unsafe {

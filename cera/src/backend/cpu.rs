@@ -2072,6 +2072,55 @@ pub fn gemv_q4_0_concat3_with_q8(
     }
 }
 
+/// Unified 3-matrix Q4_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
+/// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4k_concat3_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    a3_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4KM>();
+    assert!(
+        k.is_multiple_of(256),
+        "gemv_q4k_concat3_with_q8: k must be a multiple of 256"
+    );
+    assert!(
+        a1_quant.len() >= m1 * row_bytes,
+        "a1_quant buffer underflow"
+    );
+    assert!(
+        a2_quant.len() >= m2 * row_bytes,
+        "a2_quant buffer underflow"
+    );
+    assert!(
+        a3_quant.len() >= m3 * row_bytes,
+        "a3_quant buffer underflow"
+    );
+    assert!(x_scales.len() >= k / 32, "x_scales buffer underflow");
+    assert!(x_quants.len() >= k, "x_quants buffer underflow");
+    assert!(y1.len() >= m1, "y1 buffer underflow");
+    assert!(y2.len() >= m2, "y2 buffer underflow");
+    assert!(y3.len() >= m3, "y3 buffer underflow");
+
+    unsafe {
+        crate::backend::simd::neon::gemv_q4k_q8_0_concat3_neon(
+            a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
+        );
+    }
+}
+
 #[allow(clippy::ptr_arg)]
 /// Q8_0 GEMV: `y[m] = A_q8_0[m,k] @ x[k]`.
 /// On aarch64, uses integer dot product (quantize x to Q8_0, then Q8_0 × Q8_0
@@ -2811,9 +2860,8 @@ pub fn gemv_dispatch(
             match q8_scratch {
                 Some((scales, quants)) => unsafe { $f(data, x, y, m, k, scales, quants) },
                 None => {
-                    GEMV_DISPATCH_SCRATCH.with_borrow_mut(|(s, q)| unsafe {
-                        $f(data, x, y, m, k, s, q)
-                    });
+                    GEMV_DISPATCH_SCRATCH
+                        .with_borrow_mut(|(s, q)| unsafe { $f(data, x, y, m, k, s, q) });
                 }
             }
             return;

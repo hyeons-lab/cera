@@ -1670,6 +1670,27 @@ impl Lfm2Model {
                     kv_dim,
                     cfg.hidden_size,
                 );
+            } else if q_ref.dtype == DType::Q4KM
+                && k_ref.dtype == DType::Q4KM
+                && v_ref.dtype == DType::Q4KM
+            {
+                let q_data = self.weight_data(q_ref);
+                let k_data = self.weight_data(k_ref);
+                let v_data = self.weight_data(v_ref);
+                cpu::gemv_q4k_concat3_with_q8(
+                    q_data,
+                    k_data,
+                    v_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                    k,
+                    v,
+                    cfg.hidden_size,
+                    kv_dim,
+                    kv_dim,
+                    cfg.hidden_size,
+                );
             } else {
                 self.gemv_preq(
                     q_ref,

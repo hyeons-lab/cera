@@ -255,7 +255,23 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
         }
     }
 
-    if sizing_enabled()
+    // On macOS/iOS (Apple Silicon), `perf_core_count` already isolates the
+    // physical performance cores. Non-SMT P-cores do not suffer SMT contention;
+    // halving them under shape-based sizing starves the CPU (measured 35-40%
+    // throughput loss on small models). Decline sizing on Darwin unless the user
+    // explicitly opted in with pinned arms (CERA_DECODE_NARROW/CERA_DECODE_WIDE)
+    // or explicit CERA_DECODE_SIZING=1.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let allow_sizing = env_overrides().narrow.is_some()
+        || env_overrides().wide.is_some()
+        || std::env::var("CERA_DECODE_SIZING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let allow_sizing = true;
+
+    if allow_sizing
+        && sizing_enabled()
         && let Some(shape) = decode_shape()
         && let Some(n) = width_for_host(topo, shape, env_overrides(), physical_core_count())
     {
