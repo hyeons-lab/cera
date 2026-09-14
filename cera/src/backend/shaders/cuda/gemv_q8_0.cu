@@ -59,51 +59,43 @@ __global__ void gemv_q8_0(
         // Row 0: lane 0 loads FP16 scale and broadcasts via shuffle
         float d0 = 0.0f;
         if (lane == 0) {
-            uint16_t d0_h;
-            memcpy(&d0_h, row0_ptr + (size_t)ib * 34, sizeof(uint16_t));
-            d0 = half_to_float(d0_h);
+            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + (size_t)ib * 34));
         }
         d0 = __shfl_sync(0xffffffff, d0, 0);
         const int8_t q0 = *(const int8_t*)(row0_ptr + (size_t)ib * 34 + 2 + lane);
-        sum0 += ((float)q0 * x_val) * d0;
+        sum0 = fmaf((float)q0 * d0, x_val, sum0);
 
         // Row 1
         if (row1_ptr) {
             float d1 = 0.0f;
             if (lane == 0) {
-                uint16_t d1_h;
-                memcpy(&d1_h, row1_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d1 = half_to_float(d1_h);
+                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + (size_t)ib * 34));
             }
             d1 = __shfl_sync(0xffffffff, d1, 0);
             const int8_t q1 = *(const int8_t*)(row1_ptr + (size_t)ib * 34 + 2 + lane);
-            sum1 += ((float)q1 * x_val) * d1;
+            sum1 = fmaf((float)q1 * d1, x_val, sum1);
         }
 
         // Row 2
         if (row2_ptr) {
             float d2 = 0.0f;
             if (lane == 0) {
-                uint16_t d2_h;
-                memcpy(&d2_h, row2_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d2 = half_to_float(d2_h);
+                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + (size_t)ib * 34));
             }
             d2 = __shfl_sync(0xffffffff, d2, 0);
             const int8_t q2 = *(const int8_t*)(row2_ptr + (size_t)ib * 34 + 2 + lane);
-            sum2 += ((float)q2 * x_val) * d2;
+            sum2 = fmaf((float)q2 * d2, x_val, sum2);
         }
 
         // Row 3
         if (row3_ptr) {
             float d3 = 0.0f;
             if (lane == 0) {
-                uint16_t d3_h;
-                memcpy(&d3_h, row3_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d3 = half_to_float(d3_h);
+                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + (size_t)ib * 34));
             }
             d3 = __shfl_sync(0xffffffff, d3, 0);
             const int8_t q3 = *(const int8_t*)(row3_ptr + (size_t)ib * 34 + 2 + lane);
-            sum3 += ((float)q3 * x_val) * d3;
+            sum3 = fmaf((float)q3 * d3, x_val, sum3);
         }
     }
 
@@ -171,48 +163,40 @@ __global__ void gemv_q8_0_accum(
 
         float d0 = 0.0f;
         if (lane == 0) {
-            uint16_t d0_h;
-            memcpy(&d0_h, row0_ptr + (size_t)ib * 34, sizeof(uint16_t));
-            d0 = half_to_float(d0_h);
+            d0 = half_to_float(*reinterpret_cast<const uint16_t*>(row0_ptr + (size_t)ib * 34));
         }
         d0 = __shfl_sync(0xffffffff, d0, 0);
         const int8_t q0 = *(const int8_t*)(row0_ptr + (size_t)ib * 34 + 2 + lane);
-        sum0 += ((float)q0 * x_val) * d0;
+        sum0 = fmaf((float)q0 * d0, x_val, sum0);
 
         if (row1_ptr) {
             float d1 = 0.0f;
             if (lane == 0) {
-                uint16_t d1_h;
-                memcpy(&d1_h, row1_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d1 = half_to_float(d1_h);
+                d1 = half_to_float(*reinterpret_cast<const uint16_t*>(row1_ptr + (size_t)ib * 34));
             }
             d1 = __shfl_sync(0xffffffff, d1, 0);
             const int8_t q1 = *(const int8_t*)(row1_ptr + (size_t)ib * 34 + 2 + lane);
-            sum1 += ((float)q1 * x_val) * d1;
+            sum1 = fmaf((float)q1 * d1, x_val, sum1);
         }
 
         if (row2_ptr) {
             float d2 = 0.0f;
             if (lane == 0) {
-                uint16_t d2_h;
-                memcpy(&d2_h, row2_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d2 = half_to_float(d2_h);
+                d2 = half_to_float(*reinterpret_cast<const uint16_t*>(row2_ptr + (size_t)ib * 34));
             }
             d2 = __shfl_sync(0xffffffff, d2, 0);
             const int8_t q2 = *(const int8_t*)(row2_ptr + (size_t)ib * 34 + 2 + lane);
-            sum2 += ((float)q2 * x_val) * d2;
+            sum2 = fmaf((float)q2 * d2, x_val, sum2);
         }
 
         if (row3_ptr) {
             float d3 = 0.0f;
             if (lane == 0) {
-                uint16_t d3_h;
-                memcpy(&d3_h, row3_ptr + (size_t)ib * 34, sizeof(uint16_t));
-                d3 = half_to_float(d3_h);
+                d3 = half_to_float(*reinterpret_cast<const uint16_t*>(row3_ptr + (size_t)ib * 34));
             }
             d3 = __shfl_sync(0xffffffff, d3, 0);
             const int8_t q3 = *(const int8_t*)(row3_ptr + (size_t)ib * 34 + 2 + lane);
-            sum3 += ((float)q3 * x_val) * d3;
+            sum3 = fmaf((float)q3 * d3, x_val, sum3);
         }
     }
 

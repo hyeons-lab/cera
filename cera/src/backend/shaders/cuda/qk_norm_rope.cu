@@ -75,19 +75,13 @@ __device__ inline void head_rope(
     uint32_t tid,
     uint32_t head_dim,
     uint32_t pos,
-    float freq_base,
     uint32_t rope_type,
-    const float* freq_factors,
-    uint32_t has_freq_factors
+    const float* s_inv_freq
 ) {
     const uint32_t half_dim = head_dim / 2;
-    const float theta_scale = powf(freq_base, -2.0f / (float)head_dim);
 
     for (uint32_t d = tid; d < half_dim; d += blockDim.x) {
-        float theta = (float)pos * powf(theta_scale, (float)d);
-        if (has_freq_factors != 0 && freq_factors != nullptr) {
-            theta = theta / freq_factors[d];
-        }
+        float theta = (float)pos * s_inv_freq[d];
 
         float sin_a, cos_a;
         sincosf(theta, &sin_a, &cos_a);
@@ -120,10 +114,23 @@ __global__ void qk_norm_rope(
     QkNormRopeParams params
 ) {
     extern __shared__ float shared_scratch[];
+    __shared__ float s_inv_freq[64];
 
     const uint32_t head = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t head_dim = params.head_dim;
+    const uint32_t half_dim = head_dim / 2;
+
+    // Cooperatively precompute RoPE inverse frequencies once per block
+    if (tid < half_dim && tid < 64) {
+        const float theta_scale = powf(params.freq_base, -2.0f / (float)head_dim);
+        float freq = powf(theta_scale, (float)tid);
+        if (params.has_freq_factors != 0 && freq_factors != nullptr) {
+            freq = freq / freq_factors[tid];
+        }
+        s_inv_freq[tid] = freq;
+    }
+    __syncthreads();
 
     // Process Q head if within n_heads
     if (head < params.n_heads) {
@@ -136,10 +143,8 @@ __global__ void qk_norm_rope(
             tid,
             head_dim,
             params.pos,
-            params.freq_base,
             params.rope_type,
-            freq_factors,
-            params.has_freq_factors
+            s_inv_freq
         );
     }
 
@@ -154,10 +159,8 @@ __global__ void qk_norm_rope(
             tid,
             head_dim,
             params.pos,
-            params.freq_base,
             params.rope_type,
-            freq_factors,
-            params.has_freq_factors
+            s_inv_freq
         );
     }
 }
