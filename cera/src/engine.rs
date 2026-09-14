@@ -1949,9 +1949,8 @@ fn resolve_parts_inference_type(
 fn inference_type_for_arch(arch: &str) -> InferenceType {
     match arch {
         "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5"
-        | "granite" | "minicpm" | "nanbeige" | "mistral3" | "ministral3" | "phi3" | "phi" => {
-            InferenceType::LlamaCppTextToText
-        }
+        | "granite" | "minicpm" | "nanbeige" | "mistral3" | "ministral3" | "phi3" | "phi"
+        | "bailingmoe3" | "bailingmoe" | "bailingmoe2" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
         "bert" | "modernbert" => {

@@ -1,3 +1,4 @@
+pub mod bailingmoe3;
 pub mod bert;
 pub mod dspark;
 pub mod gemma4;
@@ -773,6 +774,9 @@ pub fn load_model(
             context_size,
             model_id,
         )?),
+        "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Box::new(
+            bailingmoe3::BailingMoe3Model::from_gguf_with_id(gguf, context_size, model_id)?,
+        ),
         other => bail!("unsupported architecture: {other}"),
     };
 
