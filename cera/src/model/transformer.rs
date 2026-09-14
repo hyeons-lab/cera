@@ -160,6 +160,63 @@ impl WeightRef {
         }
     }
 
+    /// Create a sub-slice `WeightRef` representing a contiguous subset of rows.
+    ///
+    /// Useful for fused projections (such as `attn_qkv` in Phi-3, or packed `ffn_up` gate and up)
+    /// where multiple projection matrices are stacked row-wise in a single GGUF tensor.
+    pub fn slice_rows(&self, row_start: usize, num_rows: usize) -> Result<Self> {
+        ensure!(num_rows > 0, "slice num_rows must be non-zero");
+        ensure!(self.k > 0, "inner dimension k must be positive");
+        let end_row = row_start
+            .checked_add(num_rows)
+            .context("row slice overflowed usize")?;
+        ensure!(
+            end_row <= self.m,
+            "row slice [{row_start}..{end_row}] out of bounds for weight with {} rows",
+            self.m
+        );
+        let row_bytes = match self.dtype.element_size() {
+            Some(elem_bytes) => self
+                .k
+                .checked_mul(elem_bytes)
+                .context("overflow computing row bytes for unquantized tensor")?,
+            None => {
+                let bs = self.dtype.block_size();
+                ensure!(
+                    bs > 0 && self.k.is_multiple_of(bs),
+                    "inner dimension k={} is not a multiple of block size {bs} for {:?}",
+                    self.k,
+                    self.dtype
+                );
+                (self.k / bs)
+                    .checked_mul(self.dtype.block_bytes())
+                    .context("overflow computing row bytes for quantized tensor")?
+            }
+        };
+        let start_offset = (row_start as u64)
+            .checked_mul(row_bytes as u64)
+            .context("overflow computing byte offset for sliced rows")?;
+        let size = num_rows
+            .checked_mul(row_bytes)
+            .context("overflow computing byte size for sliced rows")?;
+        let end_offset = start_offset
+            .checked_add(size as u64)
+            .context("overflow computing end byte offset for sliced rows")?;
+        ensure!(
+            end_offset <= self.size as u64,
+            "slice byte range [{}..{}] exceeds weight buffer size {}",
+            start_offset,
+            end_offset,
+            self.size
+        );
+        let start = self
+            .start
+            .checked_add(start_offset)
+            .context("overflow computing absolute start byte for sliced rows")?;
+
+        Ok(Self::new(start, size, self.dtype, num_rows, self.k))
+    }
+
     /// Repack this weight for the prefill GEMM if it qualifies, returning the
     /// (possibly augmented) ref. Call at projection-weight resolution sites.
     ///
@@ -2537,5 +2594,60 @@ mod decode_attn_tests {
                 "expected masked attention output 3.0 under softcapping, got {val}",
             );
         }
+    }
+
+    #[test]
+    fn test_weight_ref_slice_rows_f32_and_quantized() {
+        // F32 test
+        let w_f32 = WeightRef::new(1000, 10 * 64 * 4, DType::F32, 10, 64);
+        let s_f32 = w_f32.slice_rows(2, 4).unwrap();
+        assert_eq!(s_f32.start, 1000 + 2 * (64 * 4));
+        assert_eq!(s_f32.size, 4 * (64 * 4));
+        assert_eq!(s_f32.m, 4);
+        assert_eq!(s_f32.k, 64);
+        assert_eq!(s_f32.dtype, DType::F32);
+
+        // Q4_0 test: k = 64 -> 2 blocks of 32 -> 2 * 18 = 36 bytes/row
+        let w_q4 = WeightRef::new(2000, 8 * 36, DType::Q4_0, 8, 64);
+        let s_q4 = w_q4.slice_rows(3, 2).unwrap();
+        assert_eq!(s_q4.start, 2000 + 3 * 36);
+        assert_eq!(s_q4.size, 2 * 36);
+        assert_eq!(s_q4.m, 2);
+        assert_eq!(s_q4.k, 64);
+        assert_eq!(s_q4.dtype, DType::Q4_0);
+
+        // Q8_0 test: k = 64 -> 2 blocks of 32 -> 2 * 34 = 68 bytes/row
+        let w_q8 = WeightRef::new(4000, 4 * 68, DType::Q8_0, 4, 64);
+        let s_q8 = w_q8.slice_rows(1, 2).unwrap();
+        assert_eq!(s_q8.start, 4000 + 68);
+        assert_eq!(s_q8.size, 2 * 68);
+
+        // Q4KM test: k = 256 -> 1 superblock of 256 -> 144 bytes/row
+        let w_q4k = WeightRef::new(5000, 4 * 144, DType::Q4KM, 4, 256);
+        let s_q4k = w_q4k.slice_rows(0, 2).unwrap();
+        assert_eq!(s_q4k.size, 2 * 144);
+        // Q4KM unaligned k (< 256)
+        let w_q4k_bad = WeightRef::new(5000, 4 * 72, DType::Q4KM, 4, 128);
+        assert!(w_q4k_bad.slice_rows(0, 2).is_err());
+
+        // F16 test: k = 64 -> 64 * 2 = 128 bytes/row
+        let w_f16 = WeightRef::new(6000, 4 * 128, DType::F16, 4, 64);
+        let s_f16 = w_f16.slice_rows(1, 2).unwrap();
+        assert_eq!(s_f16.start, 6000 + 128);
+        assert_eq!(s_f16.size, 256);
+
+        // Out of bounds row slice
+        assert!(w_q4.slice_rows(6, 3).is_err());
+        // Zero row count slice rejected
+        assert!(w_q4.slice_rows(0, 0).is_err());
+        // Zero inner dimension rejected
+        let w_zero_k = WeightRef::new(7000, 0, DType::F32, 4, 0);
+        assert!(w_zero_k.slice_rows(0, 2).is_err());
+        // Buffer size overflow rejected
+        let w_short = WeightRef::new(8000, 50, DType::F32, 4, 64);
+        assert!(w_short.slice_rows(0, 2).is_err());
+        // Unaligned k on quantized type
+        let w_unaligned = WeightRef::new(3000, 100, DType::Q4_0, 4, 30);
+        assert!(w_unaligned.slice_rows(0, 2).is_err());
     }
 }

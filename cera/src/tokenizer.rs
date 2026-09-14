@@ -147,6 +147,7 @@ impl BpeTokenizer {
             .get_str("tokenizer.ggml.pre")
             .or_else(|| match gguf.architecture()? {
                 "mistral3" | "ministral3" => Some("tekken"),
+                "phi3" | "phi" => Some("gpt2"),
                 _ => None,
             })
             .unwrap_or("gpt2");
@@ -1054,14 +1055,16 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
             r"|\s*[\r\n]+",
             r"|\s+",
         ),
-        // GPT-2 pattern — simpler, case-sensitive contractions.
-        "gpt2" => concat!(
-            r"(?:'s|'t|'re|'ve|'m|'ll|'d)",
-            r"| ?\p{L}+",
-            r"| ?\p{N}+",
-            r"| ?[^\s\p{L}\p{N}]+",
-            r"|\s+",
-        ),
+        // GPT-2 pattern: simpler, case-sensitive contractions.
+        "gpt2" | "gpt-2" | "phi" | "phi2" | "phi-2" | "phi3" | "phi-3" | "phi4" | "phi-4" => {
+            concat!(
+                r"(?:'s|'t|'re|'ve|'m|'ll|'d)",
+                r"| ?\p{L}+",
+                r"| ?\p{N}+",
+                r"| ?[^\s\p{L}\p{N}]+",
+                r"|\s+",
+            )
+        }
         // Refact pattern: used by Granite 3.x (and Refact/CodeShell/SmolLM);
         // Granite 4.x is `dbrx` on the LLAMA3 arm above, not this one. Matches
         // llama.cpp's `LLAMA_VOCAB_PRE_TYPE_REFACT`: the GPT-2 pattern, but numbers
@@ -1350,6 +1353,20 @@ mod tests {
             build_pretokenize_regex("ministral3").as_str(),
             tekken_pattern
         );
+    }
+
+    #[test]
+    fn test_pretokenize_phi_matches_gpt2() {
+        let gpt2_re = build_pretokenize_regex("gpt2");
+        let gpt2_pattern = gpt2_re.as_str();
+        assert_eq!(build_pretokenize_regex("gpt-2").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi2").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi-2").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi3").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi-3").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi4").as_str(), gpt2_pattern);
+        assert_eq!(build_pretokenize_regex("phi-4").as_str(), gpt2_pattern);
     }
 
     #[test]

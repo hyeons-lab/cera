@@ -267,6 +267,8 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
             "mlp.gate_proj.bias" | "feed_forward.w1.bias" => "ffn_gate.bias",
             "mlp.up_proj.weight" | "feed_forward.w3.weight" => "ffn_up.weight",
             "mlp.up_proj.bias" | "feed_forward.w3.bias" => "ffn_up.bias",
+            "mlp.gate_up_proj.weight" => "ffn_up.weight",
+            "mlp.gate_up_proj.bias" => "ffn_up.bias",
             "mlp.down_proj.weight" | "feed_forward.w2.weight" => "ffn_down.weight",
             "mlp.down_proj.bias" | "feed_forward.w2.bias" => "ffn_down.bias",
             "input_layernorm.weight" | "operator_norm.weight" => "attn_norm.weight",
@@ -501,6 +503,27 @@ mod tests {
                 "qwen35"
             ),
             "blk.0.ssm_a"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.self_attn.qkv_proj.weight",
+                "phi3"
+            ),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.mlp.gate_up_proj.weight",
+                "phi3"
+            ),
+            "blk.0.ffn_up.weight"
+        );
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch(
+                "model.layers.0.post_attention_layernorm.weight",
+                "phi3"
+            ),
+            "blk.0.ffn_norm.weight"
         );
 
         // Whisper mappings
