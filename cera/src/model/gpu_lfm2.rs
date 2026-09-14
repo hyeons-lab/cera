@@ -309,6 +309,7 @@ fn gemv_tile_rows(m: u32, k: u32, max_binding: u64, offset_alignment: u64, elem_
 }
 
 /// A weight matrix on GPU — tracks buffer + dtype + pre-allocated params for dispatch.
+#[derive(Clone)]
 struct GpuWeight {
     tensor: GpuTensor,
     /// Pre-allocated params buffer with [m, k, row_base, 0] — eliminates per-dispatch allocation.
@@ -1002,6 +1003,8 @@ pub struct GpuLfm2Model {
     /// embedding multiplier is pre-folded into `gpu_state.embedding_f32`; the
     /// residual/attention/logit multipliers are applied during the forward pass.
     scalars: ScalarMultipliers,
+    /// Optional physical loop interval for looped architectures (e.g. Nanbeige).
+    loop_norm_interval: Option<usize>,
     /// Whether the batched-prefill GPU path is enabled (LFM2 only today; the
     /// dense transformers prefill via the per-token decode loop).
     batched_prefill: bool,
@@ -1269,7 +1272,7 @@ impl GpuLfm2Model {
     /// Construct a GPU model with an externally-built [`GpuContext`].
     /// The wasm/WebGPU entry point: callers build the context with
     /// `GpuContext::new_async().await` (browser init is async) and hand it in.
-    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, with classic Mistral served under `llama`).
+    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, `nanbeige`, with classic Mistral served under `llama`).
     pub fn from_gguf_with_ctx(
         gguf: GgufFile,
         context_size: usize,
@@ -1278,7 +1281,7 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" => {
+            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "nanbeige" => {
                 let cpu_model = super::llama::LlamaModel::from_gguf_with_id(
                     gguf,
                     context_size,
@@ -1375,6 +1378,7 @@ impl GpuLfm2Model {
         let rope_type = src.rope_type();
         let scalars = config.scalars;
         let batched_prefill = src.supports_batched_prefill();
+        let loop_norm_interval = src.loop_norm_interval();
         // The routed FFN's combine step adds its output into the residual stream
         // unscaled, matching what the dense path's `scaled_add_inplace` does when
         // `residual == 1.0`. No routed architecture also carries Granite's
@@ -1621,7 +1625,13 @@ impl GpuLfm2Model {
         }
         let output_norm = ctx.upload_f32(src.output_norm_weight(), "output_norm");
 
-        let upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
+        let mut uploaded_weights: std::collections::HashMap<u64, GpuWeight> =
+            std::collections::HashMap::new();
+
+        let mut upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
+            if let Some(existing) = uploaded_weights.get(&wref.start) {
+                return existing.clone();
+            }
             let (buf, dtype) = if matches!(
                 wref.dtype,
                 DType::Q4_0 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K
@@ -1658,7 +1668,7 @@ impl GpuLfm2Model {
                 bytemuck::cast_slice(&[wref.m as u32, wref.k as u32, 0u32, 0u32]),
                 &format!("{name}.params"),
             );
-            GpuWeight {
+            let weight = GpuWeight {
                 tensor: GpuTensor {
                     buffer: buf,
                     dtype,
@@ -1666,7 +1676,9 @@ impl GpuLfm2Model {
                 },
                 params_buf,
                 cached_bg: None,
-            }
+            };
+            uploaded_weights.insert(wref.start, weight.clone());
+            weight
         };
 
         // Optional per-head QK-norm (Qwen3) and QKV bias (Qwen2) upload helpers.
@@ -2098,6 +2110,7 @@ impl GpuLfm2Model {
             layers,
             rope_type,
             scalars,
+            loop_norm_interval,
             batched_prefill,
             batched_fallback_warned: AtomicBool::new(false),
             moe_lora_dropped_warned: AtomicBool::new(false),
@@ -4620,6 +4633,20 @@ impl GpuLfm2Model {
                     self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
                 }
             }
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                && (i + 1) < cfg.n_layers
+            {
+                self.encode_rmsnorm(
+                    &mut enc,
+                    &self.hidden_buf,
+                    &self.output_norm,
+                    hs32,
+                    cfg.rms_norm_eps,
+                );
+            }
         }
 
         // 3. Output norm + projection. Untied models project through
@@ -5286,6 +5313,48 @@ impl GpuLfm2Model {
         );
     }
 
+    /// Encode `scaled_add_inplace`: a[i] += scale * b[i] for i in 0..total.
+    fn encode_scaled_add_inplace_batch(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        a: &wgpu::Buffer,
+        b: &wgpu::Buffer,
+        total: u32,
+        scale: f32,
+        label: &'static str,
+    ) {
+        let params: [u32; 2] = [total, scale.to_bits()];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        self.encode(
+            enc,
+            &self.pipelines.scaled_add_inplace,
+            &bg,
+            (total.div_ceil(256), 1, 1),
+            label,
+        );
+    }
+
     /// Encode `add_rmsnorm_batch`: src[t,i] += residual[t,i]; dst[t,i] =
     /// src[t,i] * inv_rms(src[t]) * w[i]. One pass; src is read-write.
     #[allow(clippy::too_many_arguments)]
@@ -5860,23 +5929,64 @@ impl GpuLfm2Model {
             // ─── Phase 1: rmsnorm (or fused add_rmsnorm with prev FFN
             //              residual) → prefill_normed_buf ─────────────────
             if layer > 0 {
-                // Fuse: batch_buf += prev_layer_ffn_down (`prefill_up_buf`),
-                // then rmsnorm into `prefill_normed_buf`.
-                //
-                // Metal aliases dst === residual on `prefill_normed_buf`;
-                // wgpu 24's binding-aliasing validator rejects that
-                // pattern (binding 1 read_write + binding 4 read on the
-                // same buffer in one dispatch). Route FFN down to
-                // `prefill_up_buf` so dst and residual stay distinct.
-                self.encode_add_rmsnorm_batch(
-                    &mut enc,
-                    &self.prefill_batch_buf,
-                    &self.prefill_normed_buf,
-                    &lw.attn_norm,
-                    &self.prefill_up_buf,
-                    n_u,
-                    hs_u,
-                );
+                let is_loop_boundary = self
+                    .loop_norm_interval
+                    .is_some_and(|n_phys| layer % n_phys == 0);
+                if is_loop_boundary {
+                    // Loop boundary: add previous layer FFN down residual to prefill_batch_buf,
+                    // apply loop_norm using output_norm into prefill_up_buf, copy back,
+                    // then apply current layer attn_norm into prefill_normed_buf.
+                    self.encode_scaled_add_inplace_batch(
+                        &mut enc,
+                        &self.prefill_batch_buf,
+                        &self.prefill_up_buf,
+                        n_u * hs_u,
+                        self.scalars.residual,
+                        "loop_add",
+                    );
+                    self.encode_rmsnorm_batch(
+                        &mut enc,
+                        &self.prefill_batch_buf,
+                        &self.prefill_up_buf,
+                        &self.output_norm,
+                        n_u,
+                        hs_u,
+                    );
+                    Self::encode_copy(
+                        &mut enc,
+                        &self.prefill_up_buf,
+                        0,
+                        &self.prefill_batch_buf,
+                        0,
+                        (n * hs) as u64,
+                    );
+                    self.encode_rmsnorm_batch(
+                        &mut enc,
+                        &self.prefill_batch_buf,
+                        &self.prefill_normed_buf,
+                        &lw.attn_norm,
+                        n_u,
+                        hs_u,
+                    );
+                } else {
+                    // Fuse: batch_buf += prev_layer_ffn_down (`prefill_up_buf`),
+                    // then rmsnorm into `prefill_normed_buf`.
+                    //
+                    // Metal aliases dst === residual on `prefill_normed_buf`;
+                    // wgpu 24's binding-aliasing validator rejects that
+                    // pattern (binding 1 read_write + binding 4 read on the
+                    // same buffer in one dispatch). Route FFN down to
+                    // `prefill_up_buf` so dst and residual stay distinct.
+                    self.encode_add_rmsnorm_batch(
+                        &mut enc,
+                        &self.prefill_batch_buf,
+                        &self.prefill_normed_buf,
+                        &lw.attn_norm,
+                        &self.prefill_up_buf,
+                        n_u,
+                        hs_u,
+                    );
+                }
             } else {
                 self.encode_rmsnorm_batch(
                     &mut enc,
@@ -6335,39 +6445,14 @@ impl GpuLfm2Model {
         // Last layer's FFN down residual lives in `prefill_up_buf`; add it back
         // into the running residual stream. `scaled_add_inplace` folds Granite's
         // residual multiplier into the addend (1.0 ⇒ plain add elsewhere).
-        {
-            let total = n_u * hs_u;
-            let params: [u32; 2] = [total, self.scalars.residual.to_bits()];
-            let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-            let bg = self
-                .ctx
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.pipelines.scaled_add_inplace.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.prefill_batch_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: self.prefill_up_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: p_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-            self.encode(
-                &mut enc,
-                &self.pipelines.scaled_add_inplace,
-                &bg,
-                (total.div_ceil(256), 1, 1),
-                "final_add",
-            );
-        }
+        self.encode_scaled_add_inplace_batch(
+            &mut enc,
+            &self.prefill_batch_buf,
+            &self.prefill_up_buf,
+            n_u * hs_u,
+            self.scalars.residual,
+            "final_add",
+        );
 
         // ─── Final output: norm + LM head ────────────────────────────────
         if !need_logits && !all_logits {

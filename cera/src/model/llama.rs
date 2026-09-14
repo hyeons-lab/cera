@@ -44,6 +44,7 @@ pub enum NormOrder {
 // ── Per-layer weight references ─────────────────────────────────────────────
 
 /// Pre-resolved quantized weight refs for one transformer layer.
+#[derive(Clone)]
 struct LayerWeightRefs {
     attn_q: WeightRef,
     attn_k: WeightRef,
@@ -94,6 +95,9 @@ pub struct LlamaModel {
     sliding_window: Option<usize>,
     sliding_window_pattern: Option<Vec<bool>>,
     yarn: Option<cpu::YarnParams>,
+    /// Number of physical layers per loop for models with tied layer loops (e.g. Nanbeige).
+    /// When Some, output_norm is applied between loops.
+    loop_norm_interval: Option<usize>,
     #[allow(dead_code)]
     model_id: String,
 }
@@ -176,14 +180,14 @@ impl LlamaModel {
         let arch = gguf
             .get_str("general.architecture")
             .context("missing general.architecture")?
-            .to_string();
+            .to_lowercase();
         let prefix = arch.as_str();
 
         // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2/3 GGUFs are NEOX (split-halves);
         // the LLaMA-family (incl. Mistral, Granite, and Olmo 1) are NORM (interleaved pairs).
         let rope_type = match prefix {
             "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
-            "llama" | "granite" | "olmo" | "minicpm" => RopeType::Norm,
+            "llama" | "granite" | "olmo" | "minicpm" | "nanbeige" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch: phi3,
@@ -312,9 +316,54 @@ impl LlamaModel {
             );
         }
 
-        let n_layers =
+        let n_phys_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
                 .with_context(|| format!("missing {prefix}.block_count"))? as usize;
+        ensure!(n_phys_layers > 0, "block_count must be > 0");
+
+        let (n_loops, skip_loop_final_norm) = if prefix == "nanbeige" {
+            let loops = match gguf.metadata.get("nanbeige.num_loops") {
+                Some(crate::gguf::GgufValue::U8(v)) => *v as usize,
+                Some(crate::gguf::GgufValue::U16(v)) => *v as usize,
+                Some(crate::gguf::GgufValue::U32(v)) => *v as usize,
+                Some(crate::gguf::GgufValue::I32(v)) => {
+                    ensure!(*v >= 1, "nanbeige.num_loops must be >= 1, got {v}");
+                    *v as usize
+                }
+                Some(crate::gguf::GgufValue::U64(v)) => usize::try_from(*v)
+                    .context("nanbeige.num_loops exceeds platform pointer width")?,
+                Some(crate::gguf::GgufValue::I64(v)) => {
+                    ensure!(*v >= 1, "nanbeige.num_loops must be >= 1, got {v}");
+                    usize::try_from(*v)
+                        .context("nanbeige.num_loops exceeds platform pointer width")?
+                }
+                Some(other) => bail!("nanbeige.num_loops has unexpected metadata type {other:?}"),
+                None => 1,
+            };
+            ensure!(loops >= 1, "nanbeige.num_loops must be >= 1, got {loops}");
+            let skip = match gguf.metadata.get("nanbeige.skip_loop_final_norm") {
+                Some(crate::gguf::GgufValue::Bool(b)) => *b,
+                Some(crate::gguf::GgufValue::U8(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::U32(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::I32(v)) => *v != 0,
+                Some(other) => {
+                    bail!("nanbeige.skip_loop_final_norm has unexpected metadata type {other:?}")
+                }
+                None => false,
+            };
+            (loops, skip)
+        } else {
+            (1, false)
+        };
+
+        let n_layers = n_phys_layers
+            .checked_mul(n_loops)
+            .context("layer count overflow")?;
+        ensure!(
+            n_layers <= 512,
+            "total logical layer count ({n_layers} = {n_phys_layers} phys * {n_loops} loops) \
+             exceeds maximum supported layers (512)"
+        );
         let hidden_size = gguf
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
@@ -441,18 +490,18 @@ impl LlamaModel {
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
         let output_norm_weight = gguf.get_tensor("output_norm.weight")?.to_f32_vec();
 
-        let mut attn_norm_weights = Vec::with_capacity(n_layers);
-        let mut ffn_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
-        let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_q_bias = Vec::with_capacity(n_layers);
-        let mut attn_k_bias = Vec::with_capacity(n_layers);
-        let mut attn_v_bias = Vec::with_capacity(n_layers);
-        let mut layer_refs = Vec::with_capacity(n_layers);
+        let mut phys_attn_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_ffn_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_post_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_ffn_post_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_q_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_k_norm_weights = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_q_bias = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_k_bias = Vec::with_capacity(n_phys_layers);
+        let mut phys_attn_v_bias = Vec::with_capacity(n_phys_layers);
+        let mut phys_layer_refs = Vec::with_capacity(n_phys_layers);
 
-        for i in 0..n_layers {
+        for i in 0..n_phys_layers {
             let attn_norm_name = format!("blk.{i}.attn_norm.weight");
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
                 gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
@@ -461,7 +510,7 @@ impl LlamaModel {
             } else {
                 bail!("missing required tensor `{attn_norm_name}` for PreNorm architecture");
             };
-            attn_norm_weights.push(attn_norm);
+            phys_attn_norm_weights.push(attn_norm);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
@@ -471,7 +520,7 @@ impl LlamaModel {
             } else {
                 bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
             };
-            ffn_norm_weights.push(ffn_norm);
+            phys_ffn_norm_weights.push(ffn_norm);
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
             let attn_post = [
@@ -482,7 +531,7 @@ impl LlamaModel {
             .find(|name| gguf.tensors.contains_key(name))
             .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
             .transpose()?;
-            attn_post_norm_weights.push(attn_post);
+            phys_attn_post_norm_weights.push(attn_post);
 
             let ffn_post = [
                 format!("blk.{i}.post_ffw_norm.weight"),
@@ -492,7 +541,7 @@ impl LlamaModel {
             .find(|name| gguf.tensors.contains_key(name))
             .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
             .transpose()?;
-            ffn_post_norm_weights.push(ffn_post);
+            phys_ffn_post_norm_weights.push(ffn_post);
 
             // Qwen3 / Olmo 2 QK-norm: gate on tensor presence so the same code path
             // serves both archs.
@@ -511,33 +560,33 @@ impl LlamaModel {
                     "invalid K norm length {} for layer {i}",
                     kn.len()
                 );
-                attn_q_norm_weights.push(Some(qn));
-                attn_k_norm_weights.push(Some(kn));
+                phys_attn_q_norm_weights.push(Some(qn));
+                phys_attn_k_norm_weights.push(Some(kn));
             } else {
-                attn_q_norm_weights.push(None);
-                attn_k_norm_weights.push(None);
+                phys_attn_q_norm_weights.push(None);
+                phys_attn_k_norm_weights.push(None);
             }
 
-            // Qwen2 Q/K/V biases — gate on tensor presence.
+            // Qwen2 Q/K/V biases: gate on tensor presence.
             let q_bias_name = format!("blk.{i}.attn_q.bias");
             let k_bias_name = format!("blk.{i}.attn_k.bias");
             let v_bias_name = format!("blk.{i}.attn_v.bias");
             if gguf.tensors.contains_key(&q_bias_name) {
-                attn_q_bias.push(Some(gguf.get_tensor(&q_bias_name)?.to_f32_vec()));
-                attn_k_bias.push(Some(gguf.get_tensor(&k_bias_name)?.to_f32_vec()));
-                attn_v_bias.push(Some(gguf.get_tensor(&v_bias_name)?.to_f32_vec()));
+                phys_attn_q_bias.push(Some(gguf.get_tensor(&q_bias_name)?.to_f32_vec()));
+                phys_attn_k_bias.push(Some(gguf.get_tensor(&k_bias_name)?.to_f32_vec()));
+                phys_attn_v_bias.push(Some(gguf.get_tensor(&v_bias_name)?.to_f32_vec()));
             } else {
-                attn_q_bias.push(None);
-                attn_k_bias.push(None);
-                attn_v_bias.push(None);
+                phys_attn_q_bias.push(None);
+                phys_attn_k_bias.push(None);
+                phys_attn_v_bias.push(None);
             }
 
             // `.with_repack` on the projection weights only: these are the ones
             // that hit the batched prefill GEMM at `n > 1`. token_embd / output
-            // stay excluded, though no longer because the head runs at `n = 1` —
-            // see `WeightRef::with_repack` for why that reason expired and what
-            // would have to be measured to change this.
-            layer_refs.push(LayerWeightRefs {
+            // stay excluded, though no longer because the head runs at `n = 1` (see
+            // `WeightRef::with_repack` for why that reason expired and what would
+            // have to be measured to change this).
+            phys_layer_refs.push(LayerWeightRefs {
                 attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
                     .with_repack(&gguf),
                 attn_k: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
@@ -557,6 +606,36 @@ impl LlamaModel {
                     .with_repack(&gguf),
             });
         }
+
+        let mut attn_norm_weights = Vec::with_capacity(n_layers);
+        let mut ffn_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
+        let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_q_bias = Vec::with_capacity(n_layers);
+        let mut attn_k_bias = Vec::with_capacity(n_layers);
+        let mut attn_v_bias = Vec::with_capacity(n_layers);
+        let mut layer_refs = Vec::with_capacity(n_layers);
+
+        for _ in 0..n_loops {
+            attn_norm_weights.extend(phys_attn_norm_weights.iter().cloned());
+            ffn_norm_weights.extend(phys_ffn_norm_weights.iter().cloned());
+            attn_post_norm_weights.extend(phys_attn_post_norm_weights.iter().cloned());
+            ffn_post_norm_weights.extend(phys_ffn_post_norm_weights.iter().cloned());
+            attn_q_norm_weights.extend(phys_attn_q_norm_weights.iter().cloned());
+            attn_k_norm_weights.extend(phys_attn_k_norm_weights.iter().cloned());
+            attn_q_bias.extend(phys_attn_q_bias.iter().cloned());
+            attn_k_bias.extend(phys_attn_k_bias.iter().cloned());
+            attn_v_bias.extend(phys_attn_v_bias.iter().cloned());
+            layer_refs.extend(phys_layer_refs.iter().cloned());
+        }
+
+        let loop_norm_interval = if n_loops > 1 && !skip_loop_final_norm {
+            Some(n_phys_layers)
+        } else {
+            None
+        };
 
         let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
         // Separate output projection when present, else tied embeddings.
@@ -662,6 +741,7 @@ impl LlamaModel {
             sliding_window,
             sliding_window_pattern,
             yarn,
+            loop_norm_interval,
             model_id,
         })
     }
@@ -698,6 +778,11 @@ impl LlamaModel {
         } else {
             self.yarn
         }
+    }
+
+    /// Physical layer loop interval for looped architectures (e.g. Nanbeige).
+    pub fn loop_norm_interval(&self) -> Option<usize> {
+        self.loop_norm_interval
     }
 
     /// Attention dims for layer `il`.
@@ -833,6 +918,17 @@ impl LlamaModel {
             // the per-token `format!` allocation only happens when dumping.
             if transformer::oracle_dump::is_active() {
                 transformer::oracle_dump::record(&format!("l_out-{i}"), hidden);
+            }
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                && (i + 1) < cfg.n_layers
+            {
+                cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+                if transformer::oracle_dump::is_active() {
+                    transformer::oracle_dump::record(&format!("loop_norm-{i}"), hidden);
+                }
             }
         }
 
@@ -1852,6 +1948,34 @@ impl LlamaModel {
                 cpu::scale_inplace(&mut ffn_out, cfg.scalars.residual);
             }
             cpu::add_inplace(&mut hidden, &ffn_out);
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
+                && (layer + 1) < cfg.n_layers
+            {
+                if n == 1 {
+                    cpu::rmsnorm(
+                        &mut hidden[..hs],
+                        &self.output_norm_weight,
+                        cfg.rms_norm_eps,
+                    );
+                } else {
+                    const TILE_TOKENS: usize = 32;
+                    for j_start in (0..n).step_by(TILE_TOKENS) {
+                        let j_end = (j_start + TILE_TOKENS).min(n);
+                        for j in j_start..j_end {
+                            for i in 0..hs {
+                                norm_col[i] = hidden[i * n + j];
+                            }
+                            cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
+                            for i in 0..hs {
+                                hidden[i * n + j] = norm_col[i];
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Advance seq_len (the block loops appended KV cells without bumping it).
@@ -2211,5 +2335,8 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // YaRN frequency scaling and per-layer sliding window attention
         // patterns are not implemented in the current GPU prefill shaders.
         self.yarn.is_none() && self.sliding_window.is_none()
+    }
+    fn loop_norm_interval(&self) -> Option<usize> {
+        self.loop_norm_interval
     }
 }
