@@ -1,23 +1,30 @@
 //! Streaming SafeTensors to GGUF quantization pipeline with HTTP retries & checkpoint resumption.
 
+#[cfg(feature = "remote")]
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "remote")]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "remote")]
 use std::sync::Arc;
 
+#[cfg(feature = "remote")]
 use crate::bundle::{DownloadProgress, HfSpec, fetch_model_info};
 use crate::convert::config::HfModelConfig;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
-    SafeTensorsHeader, decode_safetensor_to_f32_into, translate_hf_to_gguf_tensor_name,
+    SafeTensorsHeader, decode_safetensor_to_f32_into, translate_hf_to_gguf_tensor_name_with_arch,
 };
 use crate::convert::tokenizer::HfTokenizerJson;
 use crate::convert::writer::GgufWriter;
+#[cfg(feature = "remote")]
 use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
 use crate::session::CeraError;
 
 /// Options controlling model quantization and caching.
+#[cfg(feature = "remote")]
 #[derive(Clone)]
 pub struct QuantizeOptions {
     pub target_quant: TargetQuant,
@@ -29,6 +36,7 @@ pub struct QuantizeOptions {
     pub tensor_overrides: Vec<(String, TargetQuant)>,
 }
 
+#[cfg(feature = "remote")]
 impl Default for QuantizeOptions {
     fn default() -> Self {
         Self {
@@ -75,6 +83,7 @@ impl Drop for TempFileGuard {
 }
 
 /// Checkpoint metadata for resuming interrupted streaming quantization.
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QuantCheckpoint {
     quant: String,
@@ -85,6 +94,7 @@ struct QuantCheckpoint {
 }
 
 /// Stream and quantize a remote Hugging Face SafeTensors repository into a cached GGUF model.
+#[cfg(feature = "remote")]
 pub fn stream_quantize_hf_repo(
     spec: &HfSpec,
     opts: QuantizeOptions,
@@ -246,7 +256,7 @@ pub fn stream_quantize_hf_repo(
     // Register all tensors in GGUF writer
     struct PendingTensor {
         shard_idx: usize,
-        name: String,
+        gguf_name: String,
         dtype: String,
         data_start: usize,
         data_end: usize,
@@ -256,9 +266,10 @@ pub fn stream_quantize_hf_repo(
 
     let mut pending_tensors = Vec::new();
 
+    let arch = config.gguf_architecture();
     for (shard_idx, (_file_name, header)) in shard_headers.iter().enumerate() {
         for (tensor_name, tensor_info) in &header.tensors {
-            let gguf_name = translate_hf_to_gguf_tensor_name(tensor_name);
+            let gguf_name = translate_hf_to_gguf_tensor_name_with_arch(tensor_name, arch);
             let num_elements: usize = tensor_info
                 .shape
                 .iter()
@@ -294,7 +305,7 @@ pub fn stream_quantize_hf_repo(
 
             pending_tensors.push(PendingTensor {
                 shard_idx,
-                name: gguf_name,
+                gguf_name,
                 dtype: tensor_info.dtype.clone(),
                 data_start,
                 data_end,
@@ -445,8 +456,14 @@ pub fn stream_quantize_hf_repo(
         if num_elements != pt.expected_elements {
             return Err(CeraError::Backend(format!(
                 "tensor `{}` element count mismatch: expected {}, got {num_elements}",
-                pt.name, pt.expected_elements
+                pt.gguf_name, pt.expected_elements
             )));
+        }
+
+        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.contains("norm.weight") {
+            for v in f32_data.iter_mut() {
+                *v += 1.0;
+            }
         }
 
         // Quantize to target GGML type
@@ -589,7 +606,13 @@ pub fn quantize_safetensors_to_gguf(
     output_gguf_path: &Path,
     quant: TargetQuant,
 ) -> Result<(), CeraError> {
-    quantize_safetensors_to_gguf_with_overrides(input_path, output_gguf_path, quant, &[])
+    quantize_safetensors_to_gguf_with_strategy(
+        input_path,
+        output_gguf_path,
+        quant,
+        QuantStrategy::Auto,
+        &[],
+    )
 }
 
 /// Quantize a local SafeTensors directory or file to GGUF with per-tensor quantization overrides.
@@ -597,6 +620,23 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
     input_path: &Path,
     output_gguf_path: &Path,
     quant: TargetQuant,
+    overrides: &[(String, TargetQuant)],
+) -> Result<(), CeraError> {
+    quantize_safetensors_to_gguf_with_strategy(
+        input_path,
+        output_gguf_path,
+        quant,
+        QuantStrategy::Auto,
+        overrides,
+    )
+}
+
+/// Quantize a local SafeTensors directory or file to GGUF with explicit strategy and per-tensor overrides.
+pub fn quantize_safetensors_to_gguf_with_strategy(
+    input_path: &Path,
+    output_gguf_path: &Path,
+    quant: TargetQuant,
+    strategy: QuantStrategy,
     overrides: &[(String, TargetQuant)],
 ) -> Result<(), CeraError> {
     if !input_path.exists() {
@@ -629,6 +669,7 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
         CeraError::Backend(format!("failed to read `{}`: {e}", config_path.display()))
     })?;
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
+    let arch = config.gguf_architecture().to_string();
 
     let mut writer = GgufWriter::new();
     let model_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("model");
@@ -688,6 +729,7 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
         data_start: usize,
         data_end: usize,
         ggml_type: u32,
+        gguf_name: String,
     }
 
     let mut pending_tensors = Vec::new();
@@ -698,7 +740,7 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
         })?;
         let header = SafeTensorsHeader::parse_from_reader(&mut file)?;
         for (raw_name, tensor_info) in &header.tensors {
-            let gguf_name = translate_hf_to_gguf_tensor_name(raw_name);
+            let gguf_name = translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch);
             let num_elements: usize = tensor_info
                 .shape
                 .iter()
@@ -738,6 +780,7 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
                 data_start,
                 data_end,
                 ggml_type,
+                gguf_name,
             });
         }
     }
@@ -793,15 +836,16 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
             )));
         }
 
+        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.contains("norm.weight") {
+            for v in f32_data.iter_mut() {
+                *v += 1.0;
+            }
+        }
+
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);
         quant_buf.resize(target_size, 0);
 
-        quantize_tensor_data_with_strategy(
-            &f32_data,
-            pt.ggml_type,
-            QuantStrategy::Auto,
-            &mut quant_buf,
-        )?;
+        quantize_tensor_data_with_strategy(&f32_data, pt.ggml_type, strategy, &mut quant_buf)?;
         writer.write_tensor_data(&mut buf_writer, &quant_buf)?;
     }
 
@@ -824,15 +868,19 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
     Ok(())
 }
 
+#[cfg(feature = "remote")]
 const MAX_RETRIES: u32 = 5;
+#[cfg(feature = "remote")]
 const BASE_RETRY_DELAY_MS: u64 = 1000;
 
+#[cfg(feature = "remote")]
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
 }
 
+#[cfg(feature = "remote")]
 fn fetch_hf_file_bytes(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -841,23 +889,23 @@ fn fetch_hf_file_bytes(
     let mut last_error = String::new();
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1));
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let backoff_ms = BASE_RETRY_DELAY_MS * (1u64 << (attempt - 1));
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
         }
 
         let mut req = client.get(url);
         if let Some(token) = auth_token {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            req = req.bearer_auth(token);
         }
 
         match req.send() {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    match resp.bytes() {
-                        Ok(b) => return Ok(b.to_vec()),
-                        Err(e) => last_error = format!("failed reading body from `{url}`: {e}"),
-                    }
+                    let bytes = resp
+                        .bytes()
+                        .map_err(|e| CeraError::Backend(format!("reading `{url}` bytes: {e}")))?;
+                    return Ok(bytes.to_vec());
                 } else if is_retryable_status(status) {
                     last_error = format!("HTTP {status} when fetching `{url}`");
                 } else {
@@ -877,6 +925,7 @@ fn fetch_hf_file_bytes(
     )))
 }
 
+#[cfg(feature = "remote")]
 fn fetch_hf_file_range_into(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -891,31 +940,32 @@ fn fetch_hf_file_range_into(
     }
 
     let range_val = format!("bytes={start}-{end}");
-    let mut last_error = String::new();
 
+    let mut last_error = String::new();
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            let delay_ms = BASE_RETRY_DELAY_MS * (1 << (attempt - 1));
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let backoff_ms = BASE_RETRY_DELAY_MS * (1u64 << (attempt - 1));
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
         }
 
-        let mut req = client.get(url).header(reqwest::header::RANGE, &range_val);
+        let mut req = client.get(url).header("Range", &range_val);
         if let Some(token) = auth_token {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            req = req.bearer_auth(token);
         }
 
         match req.send() {
             Ok(mut resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::PARTIAL_CONTENT {
-                    let expected_len = end.saturating_sub(start) + 1;
-                    out.reserve(expected_len);
-                    let mut reader = std::io::Read::take(&mut resp, (expected_len + 1) as u64);
+                    let expected_range_len = end.saturating_sub(start) + 1;
+                    out.reserve(expected_range_len);
+                    let mut reader =
+                        std::io::Read::take(&mut resp, (expected_range_len + 1) as u64);
                     match std::io::Read::read_to_end(&mut reader, out) {
                         Ok(n) => {
-                            if n != expected_len {
+                            if n != expected_range_len {
                                 last_error = format!(
-                                    "truncated range body from `{url}`: expected {expected_len} bytes, got {n}"
+                                    "truncated range body from `{url}`: expected {expected_range_len} bytes, got {n}"
                                 );
                                 out.clear();
                                 continue;
@@ -978,6 +1028,7 @@ fn fetch_hf_file_range_into(
     )))
 }
 
+#[cfg(feature = "remote")]
 fn fetch_hf_file_range(
     client: &reqwest::blocking::Client,
     url: &str,
