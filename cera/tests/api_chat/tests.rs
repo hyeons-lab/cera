@@ -672,6 +672,61 @@ fn real_session_legacy_decode_omits_eos_and_repeats_bos() {
 }
 
 #[test]
+fn profile_discovery_and_turn_framing_for_lfm2_5_template() {
+    let tokenizer = fixtures::lfm2_5_tokenizer();
+    let profile = Profile::discover(tokenizer.clone()).unwrap();
+
+    let execution = TraceExecution {
+        decode: VecDeque::from([report(
+            DecodeState::Terminal {
+                token: 7,
+                committed: false,
+            },
+            FinishReason::Stop,
+        )]),
+        ..Default::default()
+    };
+    let mut chat = Chat::new(execution, profile, 0).unwrap();
+
+    let summary = chat
+        .ingest_messages(&[Message::text(Role::System, "Be concise."), user("Hello")])
+        .unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let mut history = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: "Be concise.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        },
+    ];
+    let canonical = tokenizer.encode(&apply_chat_template(&tokenizer, &history, true).unwrap());
+    assert_eq!(chat.tokens(), canonical);
+
+    chat.generate_into(&GenerateOpts::default(), &mut Sink::default())
+        .unwrap();
+    history.push(ChatMessage {
+        role: "assistant".into(),
+        content: String::new(),
+    });
+
+    let cont_summary = chat.ingest(&user("Second turn")).unwrap();
+    assert!(cont_summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    history.push(ChatMessage {
+        role: "user".into(),
+        content: "Second turn".into(),
+    });
+    let canonical2 = tokenizer.encode(&apply_chat_template(&tokenizer, &history, true).unwrap());
+    assert_eq!(chat.tokens(), canonical2);
+}
+
+#[test]
 #[ignore = "requires the pinned public GGUF; tests/api_chat/run.py verifies its SHA-256 and runs this test"]
 fn public_lfm2_tokenizer_boundary_and_ten_turns() {
     let path = std::env::var("CERA_CHAT_PROFILE_MODEL")

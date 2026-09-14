@@ -14,8 +14,8 @@ REPO = ROOT.parents[1]
 
 # Exact case counts per mode. Adding or removing a fixture must update these so
 # a silently dropped test cannot pass as complete evidence.
-ISOLATED_CASES = 12
-CORE_CASES = 34
+ISOLATED_CASES = 13
+CORE_CASES = 35
 
 sys.path.insert(0, str(ROOT.parent / "api_loading"))
 from commands import Commands, cargo_artifact  # noqa: E402
@@ -82,6 +82,33 @@ def file_digest_sha256(path):
         return h.hexdigest()
 
 
+def select_profile(pin_data, model_hash):
+    pins = (
+        pin_data["profiles"]
+        if isinstance(pin_data, dict) and "profiles" in pin_data
+        else (pin_data if isinstance(pin_data, list) else [pin_data])
+    )
+    matched_pin = next(
+        (p for p in pins if isinstance(p, dict) and p.get("sha256") == model_hash),
+        None,
+    )
+    if matched_pin is None:
+        expected = ", ".join(
+            p.get("sha256", "<missing>") for p in pins if isinstance(p, dict)
+        )
+        raise ValueError(f"Model hash mismatch: expected one of [{expected}], got {model_hash}")
+    return matched_pin
+
+
+def execution_scope(pin, *, core_transactions):
+    if core_transactions:
+        return pin["runtime_validation"]
+    return (
+        "Production tokenizer and isolated chat contract; "
+        "no runtime Session or warm KV performance claim"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -99,9 +126,8 @@ def main():
     output = Path(tempfile.mkdtemp(prefix="run-", dir=args.output.resolve()))
     model = args.model.resolve(strict=True)
     model_hash = file_digest_sha256(model)
-    pin = json.loads((ROOT / "profile.json").read_text(encoding="utf-8"))
-    if model_hash != pin["sha256"]:
-        raise ValueError(f"Model hash mismatch: expected {pin['sha256']}, got {model_hash}")
+    pin_data = json.loads((ROOT / "profile.json").read_text(encoding="utf-8"))
+    pin = select_profile(pin_data, model_hash)
     env = probe_environment(os.environ)
     env.update(
         CERA_CHAT_PROFILE_MODEL=str(model),
@@ -110,7 +136,8 @@ def main():
     commands = Commands(output, env, REPO)
     hashes = source_hashes()
     result = {
-        "status": "incomplete", "scope": pin["runtime_validation"],
+        "status": "incomplete",
+        "scope": execution_scope(pin, core_transactions=args.core_transactions),
         "model_sha256": model_hash, "source_sha256": hashes,
         "commands": commands.results,
         "core_transactions": args.core_transactions,

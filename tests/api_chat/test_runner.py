@@ -72,6 +72,27 @@ class RunnerTests(unittest.TestCase):
                 (repo / "cera/src/new.rs").write_text("new module")
                 self.assertNotEqual(after, runner.source_hashes())
 
+    def test_select_profile_matches_candidate_and_rejects_unknown(self):
+        pins = {
+            "profiles": [
+                {"id": "p1", "sha256": "abc111"},
+                {"id": "p2", "sha256": "def222"},
+                "malformed-entry",
+            ]
+        }
+        self.assertEqual(runner.select_profile(pins, "abc111")["id"], "p1")
+        self.assertEqual(runner.select_profile(pins, "def222")["id"], "p2")
+        with self.assertRaisesRegex(ValueError, "Model hash mismatch: expected one of \\[abc111, def222\\], got unknown"):
+            runner.select_profile(pins, "unknown")
+
+    def test_execution_scope_distinguishes_core_transactions_and_isolated_modes(self):
+        pin = {"runtime_validation": "Full warm turns and numerical KV claim"}
+        core_scope = runner.execution_scope(pin, core_transactions=True)
+        self.assertEqual(core_scope, "Full warm turns and numerical KV claim")
+        isolated_scope = runner.execution_scope(pin, core_transactions=False)
+        self.assertIn("isolated chat contract", isolated_scope)
+        self.assertNotIn("Full warm turns", isolated_scope)
+
 
 if __name__ == "__main__":
     unittest.main()

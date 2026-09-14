@@ -1,14 +1,32 @@
 {
-  "id": "lfm2-350m-gguf-simple-text-v1",
-  "repository": "LiquidAI/LFM2-350M-GGUF",
-  "revision": "8fdc9d526b7ed346b19257551b05816c7912ecc2",
-  "file": "LFM2-350M-Q4_0.gguf",
-  "sha256": "8e3ebc1c608dc8683adf8c3b3e6a40e2f4eab22aa33b908bff2ac03a1c16d796",
-  "url": "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/8fdc9d526b7ed346b19257551b05816c7912ecc2/LFM2-350M-Q4_0.gguf",
-  "license": "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/blob/8fdc9d526b7ed346b19257551b05816c7912ecc2/LICENSE",
-  "tokenizer": { "model": "gpt2", "pre": "lfm2", "vocabulary": 65536, "merges": 63683, "bos": 1, "message_start": 6, "eos": 7 },
-  "prototype": "Text only; exact embedded simple template; optional initial system, alternating user/assistant, final user; n_keep=0",
-  "runtime_validation": "Production tokenizer and scripted Model through real Session decode; no numerical model or warm KV performance claim",
-  "required_backends": ["native CPU", "native Metal", "native wgpu", "WASM CPU", "browser WebGPU async"],
-  "production_chat_supported_backends": []
+  "profiles": [
+    {
+      "id": "lfm2-350m-gguf-simple-text-v1",
+      "repository": "LiquidAI/LFM2-350M-GGUF",
+      "revision": "8fdc9d526b7ed346b19257551b05816c7912ecc2",
+      "file": "LFM2-350M-Q4_0.gguf",
+      "sha256": "8e3ebc1c608dc8683adf8c3b3e6a40e2f4eab22aa33b908bff2ac03a1c16d796",
+      "url": "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/resolve/8fdc9d526b7ed346b19257551b05816c7912ecc2/LFM2-350M-Q4_0.gguf",
+      "license": "https://huggingface.co/LiquidAI/LFM2-350M-GGUF/blob/8fdc9d526b7ed346b19257551b05816c7912ecc2/LICENSE",
+      "tokenizer": { "model": "gpt2", "pre": "lfm2", "vocabulary": 65536, "merges": 63683, "bos": 1, "message_start": 6, "eos": 7 },
+      "prototype": "Text only; exact embedded simple template; optional initial system, alternating user/assistant, final user; n_keep=0",
+      "runtime_validation": "Production tokenizer and scripted Model through real Session decode; no numerical model or warm KV performance claim",
+      "required_backends": ["native CPU", "native Metal", "native wgpu", "WASM CPU", "browser WebGPU async"],
+      "production_chat_supported_backends": []
+    },
+    {
+      "id": "lfm2.5-350m-gguf-text-v1",
+      "repository": "LiquidAI/LFM2.5-350M-GGUF",
+      "revision": "9969000761ce34de907bf20017cbfc3d52d6eaf9",
+      "file": "LFM2.5-350M-Q4_0.gguf",
+      "sha256": "85e32858daafad55b7bcd6b97a1343ee0661188e8036f9862d14d6b563142f50",
+      "url": "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/9969000761ce34de907bf20017cbfc3d52d6eaf9/LFM2.5-350M-Q4_0.gguf",
+      "license": "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/blob/9969000761ce34de907bf20017cbfc3d52d6eaf9/LICENSE",
+      "tokenizer": { "model": "gpt2", "pre": "lfm2", "vocabulary": 65536, "bos": 1, "message_start": 6, "eos": 7 },
+      "prototype": "Text only; canonical ChatML template with thinking and multimodal tags; optional initial system, alternating user/assistant, final user; n_keep=0",
+      "runtime_validation": "Production tokenizer and real Model weights through Session decode; numerical KV retention and warm conversational turns",
+      "required_backends": ["native CPU", "native Metal", "native wgpu", "WASM CPU", "browser WebGPU async"],
+      "production_chat_supported_backends": []
+    }
+  ]
 }

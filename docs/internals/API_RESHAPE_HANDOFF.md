@@ -1,7 +1,37 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-13T18:05-0400. This is the current implementation record; the
+Updated: 2026-09-14T07:03-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan44 complete (2026-09-14T07:03-0400)
+
+LFM2.5-350M (`models/LFM2.5-350M-Q4_0.gguf`) chat contract profile discovery and
+numerical warm-turn verification completed across core and isolated contract suites.
+Both LFM2 and LFM2.5 model generations are recognized, verified, and passing.
+
+- [x] Extended `Profile::discover` in `cera/tests/api_chat/contract.rs` to recognize
+      `LFM2_5_TEMPLATE` alongside `TEMPLATE`. Verified identical ChatML turn boundary
+      framing across both model generations.
+- [x] Executed 10 consecutive warm conversational turns on `LFM2.5-350M-Q4_0.gguf`
+      through `Chat<CoreExecution>`, proving physical KV cache retention across turns
+      and delta-only prompt evaluation.
+- [x] Verified cold reference prefill parity at turn 0 on `LFM2.5-350M-Q4_0.gguf`.
+- [x] Bounded repetition grammar (`root ::= [a-zA-Z]{1,16} "\n"`) in warm-turn test,
+      ensuring reliable `FinishReason::Stop` on `self.profile.eos` across model generations.
+- [x] Verified stochastic RNG determinism (identical seeds) and divergence (different seeds)
+      using creative story prompt with system message across both LFM2 and LFM2.5.
+- [x] Verified interrupted turn handling and replacement recovery on `LFM2.5-350M-Q4_0.gguf`.
+- [x] Configured multi-profile support in `tests/api_chat/profile.json` and `tests/api_chat/run.py`
+      to match model hashes against candidate profile pins.
+- [x] All 35 core transaction tests and 13 isolated contract tests pass for both
+      `LFM2-350M-Q4_0.gguf` and `LFM2.5-350M-Q4_0.gguf` in default and minimal
+      (`--no-default-features`) configurations.
+- [x] Verified formatting (`cargo +stable fmt --check`), clippy (`-D warnings`),
+      contract suites (69 surfaces, 8 classes, 5 mutations), and test runner (6 tests).
+
+Evidence: `devlog/artifacts/000341-plan44/` (`lfm25-core`, `lfm25-core-minimal`,
+`lfm25-contract`, `lfm2-core`, `lfm2-contract`). Plan `devlog/plans/000341-44-lfm25-chat-and-warm-turns.md`.
+Forty-one increments are complete (39 core, two Leap). Next unused sequence is 45.
 
 ## Plan43 complete (2026-09-13T18:05-0400)
 
