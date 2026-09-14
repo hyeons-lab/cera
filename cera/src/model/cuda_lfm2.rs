@@ -477,16 +477,12 @@ impl CudaLfm2Model {
                         qk_params,
                     )?;
 
-                    // Append K & V to KV cache at pos * kv_dim
+                    // Append K & V to KV cache at pos * kv_dim in a single fused dispatch
                     let kv_offset = pos * (attn.kv_dim as usize);
-                    self.ctx.cast_f32_to_f16_offset(
+                    self.ctx.append_kv_cache_f16(
                         &ws.k,
-                        &attn.k_cache,
-                        kv_offset,
-                        attn.kv_dim,
-                    )?;
-                    self.ctx.cast_f32_to_f16_offset(
                         &ws.v,
+                        &attn.k_cache,
                         &attn.v_cache,
                         kv_offset,
                         attn.kv_dim,

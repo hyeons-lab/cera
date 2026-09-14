@@ -27,8 +27,21 @@ __global__ void argmax_f32(
     float maxval = -FLT_MAX;
     uint32_t argmax = 0;
 
-    // Grid-stride loop across all elements in the row
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const uint32_t n4 = n / 4;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+
+    // Vectorized grid-stride loop with 128-bit float4 loads
+    for (uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 val4 = x4[i];
+        const uint32_t base_idx = i * 4;
+        if (val4.x > maxval) { maxval = val4.x; argmax = base_idx; }
+        if (val4.y > maxval) { maxval = val4.y; argmax = base_idx + 1; }
+        if (val4.z > maxval) { maxval = val4.z; argmax = base_idx + 2; }
+        if (val4.w > maxval) { maxval = val4.w; argmax = base_idx + 3; }
+    }
+
+    // Scalar remainder loop
+    for (uint32_t i = n4 * 4 + threadIdx.x; i < n; i += blockDim.x) {
         const float val = x[i];
         if (val > maxval) {
             maxval = val;
