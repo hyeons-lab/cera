@@ -37,9 +37,9 @@ __global__ void conv1d_fused(
 
     float sum = 0.0f;
     for (uint32_t k = 0; k < d_conv; k++) {
-        sum += rbuffer[(size_t)k * hs + ch] * weight[(size_t)ch * ks + k];
+        sum = fmaf(rbuffer[(size_t)k * hs + ch], weight[(size_t)ch * ks + k], sum);
     }
-    sum += bx * weight[(size_t)ch * ks + d_conv];
+    sum = fmaf(bx, weight[(size_t)ch * ks + d_conv], sum);
 
     if (d_conv > 1) {
         for (uint32_t k = 0; k < d_conv - 1; k++) {

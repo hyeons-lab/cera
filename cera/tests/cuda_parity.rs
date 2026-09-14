@@ -416,3 +416,49 @@ fn test_cuda_argmax_f32() {
     let token_id = u32::from_ne_bytes(pinned.as_slice()[..4].try_into().unwrap());
     assert_eq!(token_id, 42, "argmax_f32 produced incorrect token ID");
 }
+
+#[test]
+fn test_cuda_append_kv_cache_f16() {
+    if !CudaDevice::is_available() {
+        eprintln!("CUDA not available, skipping test_cuda_append_kv_cache_f16");
+        return;
+    }
+
+    let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
+    let n = 64usize;
+    let k_vec: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+    let v_vec: Vec<f32> = (0..n).map(|i| (i as f32 * -0.2) + 1.0).collect();
+
+    let k_src = ctx.upload_f32(&k_vec).expect("upload k");
+    let v_src = ctx.upload_f32(&v_vec).expect("upload v");
+
+    let max_len = 2;
+    let k_cache = ctx
+        .create_buffer(max_len * n * std::mem::size_of::<u16>())
+        .expect("create k cache");
+    let v_cache = ctx
+        .create_buffer(max_len * n * std::mem::size_of::<u16>())
+        .expect("create v cache");
+
+    let offset = n;
+    ctx.append_kv_cache_f16(&k_src, &v_src, &k_cache, &v_cache, offset, n as u32)
+        .expect("append_kv_cache_f16 failed");
+    ctx.synchronize().expect("synchronize failed");
+
+    let mut k_out = vec![0u16; max_len * n];
+    k_cache
+        .copy_to_host(bytemuck::cast_slice_mut(&mut k_out))
+        .expect("download k_cache");
+
+    let mut v_out = vec![0u16; max_len * n];
+    v_cache
+        .copy_to_host(bytemuck::cast_slice_mut(&mut v_out))
+        .expect("download v_cache");
+
+    for i in 0..n {
+        let expected_k = half::f16::from_f32(k_vec[i]).to_bits();
+        let expected_v = half::f16::from_f32(v_vec[i]).to_bits();
+        assert_eq!(k_out[offset + i], expected_k, "k mismatch at index {i}");
+        assert_eq!(v_out[offset + i], expected_v, "v mismatch at index {i}");
+    }
+}

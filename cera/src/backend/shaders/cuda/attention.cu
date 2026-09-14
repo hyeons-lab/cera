@@ -148,7 +148,6 @@ __global__ void flash_attention(
         // Rescaling terms for online softmax
         float new_max = fmaxf(running_max, tile_max);
         float alpha = expf(running_max - new_max);
-        float beta = expf(tile_max - new_max);
 
         // Rescale output accumulator
         if (tid < head_dim) {

@@ -569,7 +569,7 @@ impl CudaContext {
     /// Execute SwiGLU elementwise operation in-place: `a[i] = silu(a[i]) * b[i]`.
     pub fn silu_mul_inplace(&self, a: &mut CudaBuffer, b: &CudaBuffer, n: u32) -> Result<()> {
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "silu_mul_inplace")?;
-        let cfg = LaunchConfig::for_num_elems(n);
+        let cfg = LaunchConfig::for_num_elems(n.div_ceil(4));
         let params = ElementwiseParams { n, _pad: 0 };
         let mut builder = self.stream.launch_builder(&kernel);
         builder.arg(a);
@@ -644,6 +644,33 @@ impl CudaContext {
         builder.arg(&dst_ptr);
         builder.arg(&params);
         unsafe { builder.launch(cfg) }.context("failed to launch cast_f32_to_f16 kernel")?;
+        Ok(())
+    }
+
+    /// Convert and append both K and V f32 activations into f16 KV caches in a single dispatch.
+    pub fn append_kv_cache_f16(
+        &self,
+        k_src: &CudaBuffer,
+        v_src: &CudaBuffer,
+        k_dst: &CudaBuffer,
+        v_dst: &CudaBuffer,
+        dst_element_offset: usize,
+        n: u32,
+    ) -> Result<()> {
+        let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "append_kv_cache_f16")?;
+        let cfg = LaunchConfig::for_num_elems(n.div_ceil(4));
+        let params = ElementwiseParams { n, _pad: 0 };
+        let k_dst_ptr =
+            k_dst.cu_device_ptr() + (dst_element_offset * std::mem::size_of::<u16>()) as u64;
+        let v_dst_ptr =
+            v_dst.cu_device_ptr() + (dst_element_offset * std::mem::size_of::<u16>()) as u64;
+        let mut builder = self.stream.launch_builder(&kernel);
+        builder.arg(k_src);
+        builder.arg(v_src);
+        builder.arg(&k_dst_ptr);
+        builder.arg(&v_dst_ptr);
+        builder.arg(&params);
+        unsafe { builder.launch(cfg) }.context("failed to launch append_kv_cache_f16 kernel")?;
         Ok(())
     }
 
