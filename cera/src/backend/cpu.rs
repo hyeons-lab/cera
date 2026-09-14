@@ -6749,6 +6749,20 @@ pub fn scale_inplace(a: &mut [f32], s: f32) {
     }
 }
 
+/// Element-wise axpy: a += alpha * b.
+pub fn axpy_inplace(a: &mut [f32], b: &[f32], alpha: f32) {
+    debug_assert_eq!(a.len(), b.len());
+    if alpha == 0.0 {
+        return;
+    }
+    let n = a.len().min(b.len());
+    let a = &mut a[..n];
+    let b = &b[..n];
+    for i in 0..n {
+        a[i] += alpha * b[i];
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -8579,6 +8593,32 @@ mod tests {
         let b = vec![4.0, 5.0, 6.0];
         mul_inplace(&mut a, &b);
         assert_eq!(a, vec![4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn test_axpy_inplace() {
+        let mut a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        axpy_inplace(&mut a, &b, 2.0);
+        assert_eq!(a, vec![9.0, 12.0, 15.0]);
+
+        // Negative scaling
+        let mut a = vec![10.0, 20.0, 30.0];
+        let b = vec![1.0, 2.0, 3.0];
+        axpy_inplace(&mut a, &b, -2.5);
+        assert_eq!(a, vec![7.5, 15.0, 22.5]);
+
+        // Zero scaling early return
+        let mut a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        axpy_inplace(&mut a, &b, 0.0);
+        assert_eq!(a, vec![1.0, 2.0, 3.0]);
+
+        // Empty slices
+        let mut a_empty: Vec<f32> = Vec::new();
+        let b_empty: Vec<f32> = Vec::new();
+        axpy_inplace(&mut a_empty, &b_empty, 1.0);
+        assert!(a_empty.is_empty());
     }
 
     #[test]

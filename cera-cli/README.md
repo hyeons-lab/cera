@@ -29,7 +29,7 @@ directory containing one) or let it auto-download a bundle by id/quant from
 [`huggingface.co/LiquidAI/LeapBundles`](https://huggingface.co/LiquidAI/LeapBundles)
 (cached under `$HOME/.cache/cera`). Supported architectures: `lfm2`,
 `lfm2moe` (routed mixture-of-experts), `qwen2`/`qwen3`, `qwen35`, `llama` (incl. classic
-Mistral), `granite`, `minicpm`, `nanbeige`, and `phi3` (Phi-3 / Phi-3.5 / Phi-4-mini); see the
+Mistral), `granite`, `minicpm`, `nanbeige`, `phi3` (Phi-3 / Phi-3.5 / Phi-4-mini), and `bailingmoe3` (Ling 3.0 Tiny); see the
 [`cera` README](https://github.com/hyeons-lab/cera/tree/main/cera#supported-models)
 for the full list and modality support.
 

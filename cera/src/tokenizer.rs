@@ -148,6 +148,7 @@ impl BpeTokenizer {
             .or_else(|| match gguf.architecture()? {
                 "mistral3" | "ministral3" => Some("tekken"),
                 "phi3" | "phi" => Some("gpt2"),
+                "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Some("bailingmoe"),
                 _ => None,
             })
             .unwrap_or("gpt2");
@@ -1047,7 +1048,8 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // numbers one digit at a time (`\p{N}` rather than `\p{N}{1,3}`). The
         // upstream `\s+(?!\S)` lookahead is emulated in `encode`'s split loop
         // Used by Qwen2, Qwen3, and Qwen3.5 GGUFs.
-        "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5" => concat!(
+        "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5" | "bailingmoe" | "bailingmoe2"
+        | "bailingmoe3" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}",
