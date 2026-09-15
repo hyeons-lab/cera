@@ -118,6 +118,10 @@ impl Qwen35Model {
         let head_dim = if let Some(hd) = gguf.get_u32(&format!("{prefix}.attention.key_length")) {
             hd as usize
         } else {
+            ensure!(
+                hidden_size.is_multiple_of(n_heads),
+                "hidden_size ({hidden_size}) must be a multiple of head_count ({n_heads})"
+            );
             hidden_size.checked_div(n_heads).unwrap_or(0)
         };
 
@@ -159,6 +163,10 @@ impl Qwen35Model {
             ssm_d_state > 0,
             "ssm.state_size must be > 0, got {ssm_d_state}"
         );
+        ensure!(
+            ssm_d_state <= 256,
+            "ssm.state_size must be <= 256, got {ssm_d_state}"
+        );
 
         let ssm_dt_rank = gguf
             .get_u32(&format!("{prefix}.ssm.time_step_rank"))
@@ -166,6 +174,10 @@ impl Qwen35Model {
         ensure!(
             ssm_dt_rank > 0,
             "ssm.time_step_rank must be > 0, got {ssm_dt_rank}"
+        );
+        ensure!(
+            ssm_dt_rank <= 128,
+            "ssm.time_step_rank must be <= 128, got {ssm_dt_rank}"
         );
 
         let ssm_n_group = gguf
@@ -634,11 +646,11 @@ impl Qwen35Model {
         z.resize(value_dim, 0.0);
         core_out.resize(value_dim, 0.0);
 
-        let mut beta_raw_buf = [0.0f32; 64];
-        let mut alpha_raw_buf = [0.0f32; 64];
+        let mut beta_raw_buf = [0.0f32; 128];
+        let mut alpha_raw_buf = [0.0f32; 128];
         let mut beta_raw_heap;
         let mut alpha_raw_heap;
-        let (beta_raw, alpha_raw) = if num_v_heads <= 64 {
+        let (beta_raw, alpha_raw) = if num_v_heads <= 128 {
             (
                 &mut beta_raw_buf[..num_v_heads],
                 &mut alpha_raw_buf[..num_v_heads],
@@ -659,7 +671,7 @@ impl Qwen35Model {
         for (h, a) in alpha_raw.iter_mut().enumerate().take(num_v_heads) {
             let alpha_biased = *a + refs.ssm_dt[h];
             let alpha_sp = cpu::softplus(alpha_biased);
-            let gate_h = (alpha_sp * refs.ssm_a[h]).clamp(-80.0, 10.0);
+            let gate_h = (alpha_sp * refs.ssm_a[h]).clamp(-80.0, 0.0);
             *a = gate_h.exp();
         }
 
@@ -1030,19 +1042,31 @@ impl Qwen35Model {
     /// Project final hidden state to logits.
     fn project_logits(&self, hidden: &[f32], state: &mut InferenceState) -> Vec<f32> {
         let vocab_size = self.config.vocab_size;
-        let mut logits = std::mem::take(&mut state.scratch.logits);
-        logits.resize(vocab_size, 0.0);
-
         let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
-        transformer::gemv(&self.gguf, out_ref, hidden, &mut logits);
+        let rows = out_ref.m.max(vocab_size);
+        if state.scratch.logits.len() < rows {
+            state.scratch.logits.resize(rows, 0.0);
+        }
 
-        logits
+        transformer::gemv(
+            &self.gguf,
+            out_ref,
+            hidden,
+            &mut state.scratch.logits[..rows],
+        );
+
+        state.scratch.logits[..vocab_size].to_vec()
     }
 }
 
 impl Model for Qwen35Model {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "forward() expects exactly 1 token");
+        assert_eq!(
+            pos, state.seq_len,
+            "forward: pos ({pos}) must match state.seq_len ({})",
+            state.seq_len
+        );
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
         assert!(
@@ -1051,9 +1075,18 @@ impl Model for Qwen35Model {
             cfg.vocab_size
         );
 
-        let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
+        if state.scratch.hidden_in.len() < cfg.hidden_size {
+            state.scratch.hidden_in.resize(cfg.hidden_size, 0.0);
+        }
+        let mut hidden = std::mem::take(&mut state.scratch.hidden_in);
+        transformer::dequantize_row_into(
+            &self.gguf,
+            &self.embd_ref,
+            token_id,
+            &mut hidden[..cfg.hidden_size],
+        );
         if transformer::oracle_dump::is_active() {
-            transformer::oracle_dump::record("embd", &hidden);
+            transformer::oracle_dump::record("embd", &hidden[..cfg.hidden_size]);
         }
         self.run_layers(&mut hidden, pos, state);
         cpu::rmsnorm(
@@ -1069,6 +1102,7 @@ impl Model for Qwen35Model {
             transformer::oracle_dump::record("result_output", &logits);
         }
         state.seq_len = pos + 1;
+        state.scratch.hidden_in = hidden;
         logits
     }
 
@@ -1091,19 +1125,31 @@ impl Model for Qwen35Model {
         let n = tokens.len();
         let cfg = &self.config;
 
-        for (i, &token) in tokens[..n - 1].iter().enumerate() {
-            let token_id = token as usize;
-            assert!(
-                token_id < cfg.vocab_size,
-                "token_id {token_id} out of range (vocab_size={})",
-                cfg.vocab_size
-            );
-            let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
-            if transformer::oracle_dump::is_active() {
-                transformer::oracle_dump::record("embd", &hidden);
+        if n > 1 {
+            if state.scratch.hidden_in.len() < cfg.hidden_size {
+                state.scratch.hidden_in.resize(cfg.hidden_size, 0.0);
             }
-            self.run_layers(&mut hidden, start_pos + i, state);
-            state.seq_len = start_pos + i + 1;
+            let mut hidden = std::mem::take(&mut state.scratch.hidden_in);
+            for (i, &token) in tokens[..n - 1].iter().enumerate() {
+                let token_id = token as usize;
+                assert!(
+                    token_id < cfg.vocab_size,
+                    "token_id {token_id} out of range (vocab_size={})",
+                    cfg.vocab_size
+                );
+                transformer::dequantize_row_into(
+                    &self.gguf,
+                    &self.embd_ref,
+                    token_id,
+                    &mut hidden[..cfg.hidden_size],
+                );
+                if transformer::oracle_dump::is_active() {
+                    transformer::oracle_dump::record("embd", &hidden[..cfg.hidden_size]);
+                }
+                self.run_layers(&mut hidden, start_pos + i, state);
+                state.seq_len = start_pos + i + 1;
+            }
+            state.scratch.hidden_in = hidden;
         }
 
         self.forward(&[tokens[n - 1]], start_pos + n - 1, state)

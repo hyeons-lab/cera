@@ -94,6 +94,23 @@ fn mamba2_d_in_proj(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> {
         })
 }
 
+/// Derives the DeltaNet 1D convolution dimension `2 * (n_group * d_state) + d_inner`
+/// using checked arithmetic to protect 32-bit targets from integer overflow.
+fn deltanet_conv_dim(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> {
+    let key_dim = ssm
+        .n_group
+        .checked_mul(ssm.d_state)
+        .ok_or(CeraError::OutOfMemory {
+            requested_bytes: u64::MAX,
+        })?;
+    key_dim
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(ssm.d_inner))
+        .ok_or(CeraError::OutOfMemory {
+            requested_bytes: u64::MAX,
+        })
+}
+
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
 /// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
 /// TurboQuant needs: the per-layer rotation states, the compressed key/value
@@ -766,14 +783,7 @@ impl InferenceState {
                         let ssm = config.ssm.as_ref().ok_or_else(|| {
                             CeraError::Backend("ssm config missing for DeltaNet layer".to_string())
                         })?;
-                        let key_dim = checked_elems::<f32>(ssm.n_group, ssm.d_state)?;
-                        let value_dim = ssm.d_inner;
-                        let conv_dim = key_dim
-                            .checked_mul(2)
-                            .and_then(|k2| k2.checked_add(value_dim))
-                            .ok_or_else(|| {
-                                CeraError::Backend("ssm conv dimension overflow".to_string())
-                            })?;
+                        let conv_dim = deltanet_conv_dim(ssm)?;
                         let conv_state_len =
                             checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
                         let ssm_heads_dim =

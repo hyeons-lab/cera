@@ -892,3 +892,94 @@ fn qwen35_prefix_cache_roundtrip_empty_conv_state() {
     restored_state.restore(&hit_snap);
     assert_eq!(restored_state.seq_len, prefix_tokens.len());
 }
+
+#[test]
+fn qwen35_forward_rejects_divergent_pos() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    // state.seq_len is 0, passing pos = 5 should panic
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = model.forward(&[42], 5, &mut state);
+    }));
+    assert!(
+        res.is_err(),
+        "forward with divergent pos must panic with assertion"
+    );
+}
+
+#[test]
+fn qwen35_decay_factor_bounded_no_explosion() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    // Decode 10 steps and ensure logits and state norms remain strictly finite and bounded
+    for step in 0..10 {
+        let logits = model.forward(&[42 + (step as u32 % 5)], step, &mut state);
+        assert_eq!(logits.len(), model.config().vocab_size);
+        for &val in &logits {
+            assert!(val.is_finite(), "logits must remain finite at step {step}");
+            assert!(val.abs() < 1e6, "logits exploded at step {step}: {val}");
+        }
+    }
+
+    for (l_idx, layer) in state.layers.iter().enumerate() {
+        if let LayerState::DeltaNet { ssm_state, .. } = layer {
+            for &val in ssm_state {
+                assert!(val.is_finite(), "ssm_state in layer {l_idx} is not finite");
+                assert!(
+                    val.abs() < 1e6,
+                    "ssm_state in layer {l_idx} exploded: {val}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn qwen35_multi_turn_truncate_and_prefill_continuation() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    // Step 1: decode 5 tokens
+    for i in 0..5 {
+        let _ = model.forward(&[10 + i], i as usize, &mut state);
+    }
+    assert_eq!(state.seq_len, 5);
+
+    // Step 2: truncate to 0
+    model.truncate_kv(&mut state, 0);
+    assert_eq!(state.seq_len, 0);
+
+    // Step 3: prefill fresh sequence
+    let test_prompt = [42u32, 43, 44, 45];
+    let truncated_logits = model.forward_prefill(&test_prompt, 0, &mut state);
+
+    // Compare with clean fresh state
+    let mut fresh_state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    let fresh_logits = model.forward_prefill(&test_prompt, 0, &mut fresh_state);
+
+    let sim = cosine_similarity(&truncated_logits, &fresh_logits);
+    assert!(
+        sim > 0.99999,
+        "cosine similarity between truncated-and-reprefilled and fresh state should be > 0.99999, got {sim}"
+    );
+}
