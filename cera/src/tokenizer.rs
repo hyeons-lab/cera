@@ -1163,6 +1163,18 @@ impl BpeTokenizer {
             unicode_to_byte: build_unicode_to_byte(),
         }
     }
+
+    /// Creates a minimal test tokenizer satisfying chat profile discovery.
+    pub fn chat_for_test() -> Self {
+        let mut t = Self::empty_for_test();
+        t.bos_id = Some(1);
+        t.eos_id = Some(7);
+        t.special_tokens.insert("<|startoftext|>".to_string(), 1);
+        t.special_tokens.insert("<|im_start|>".to_string(), 6);
+        t.special_tokens.insert("<|im_end|>".to_string(), 7);
+        t.chat_template = Some(crate::session::chat::TEMPLATE.to_string());
+        t
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

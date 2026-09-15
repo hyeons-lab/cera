@@ -260,10 +260,10 @@ Resolved chat design items (Plan 45):
 - Fallback reset for backends without `try_reset_kv`: `CoreExecution::reset` and `Session::reset` attempt checked KV reset first (`reset_execution_checked()`), falling back to state re-allocation (`reset_realloc_state()`) if the backend does not support checked reset (returning `Backend("checked KV reset is not supported by this backend")`). This keeps generic, CPU, and WebGPU backends usable across explicit and replacement resets.
 - Non-destructive Session return: `Chat::new` returns `Result<Self, (E, ValidationError)>` so caller ownership of the underlying `Session` is preserved when validation fails (such as unsupported profiles, sliding context, or audio output). Furthermore, `Chat::into_inner(self) -> E` and `CoreExecution::into_session(self) -> Session` allow extracting the session at any time.
 
-The actual ten-turn fixture uses this flow (private test API):
+The actual ten-turn fixture uses this flow (promoted to public library API in Plan 46):
 
 ```rust
-let mut chat = core_chat(session)?;
+let mut chat = session.into_chat()?; // or core_chat(session)?
 chat.ingest(&Message::text(Role::User, "first"))?;
 let first = chat.complete(&options)?;
 assert_eq!(chat.phase(), SessionPhase::TurnComplete);

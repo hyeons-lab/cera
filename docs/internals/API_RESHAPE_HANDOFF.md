@@ -1,7 +1,31 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-14T17:08-0400. This is the current implementation record; the
+Updated: 2026-09-15T00:10-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan46 complete (2026-09-15T00:10-0400)
+
+Promotion of the core chat contract, transactional coordinator, and Session adapter
+into the public API of the `cera` library crate, preparing for P0.2 foreign language lowering.
+
+- [x] Public chat module: exposed `pub mod chat;` in `cera/src/session.rs` and canonical re-exports
+      in `cera/src/lib.rs` (`Chat`, `SessionChat`, `Message`, `Role`, `ContentPart`, `SessionPhase`,
+      `TurnResult`, `DecodeReport`, `DecodeState`, `Execution`, `Profile`, and error types).
+- [x] Canonical implementation in crate: relocated `Chat`, `Execution`, `Profile`, `Message`, and
+      contract types directly into `cera/src/session/chat.rs`, removing dependencies on `tests/`
+      from production crate sources. `cera/tests/api_chat/contract.rs` re-exports from `cera::session::chat`.
+- [x] Public Session entry point: added `Session::into_chat(self) -> Result<SessionChat, (Session, ValidationError)>`
+      in `cera/src/session.rs`, symmetric with `Chat<CoreExecution>::into_session(self) -> Session`.
+- [x] Default generic parameter: defined `pub struct Chat<E = CoreExecution>` allowing concise un-parameterized
+      usage in downstream code while preserving genericity for custom/mock execution backends.
+- [x] Test harness parity: `cera/tests/api_chat/tests.rs` uses extension trait `ChatTraceExt` to provide
+      `set_failure` and `tokens` helpers on `Chat<TraceExecution>`, conforming to Rust orphan rules.
+- [x] Documentation & gates: full rustdoc comments on public types with zero em dashes; `cargo doc -p cera --no-deps --lib`
+      passes with warnings denied; all 43 core tests, 15 contract tests, 6 runner tests, 69 contract surfaces,
+      and nightly clippy pass cleanly.
+
+Evidence: `devlog/plans/000341-46-public-core-chat-promotion.md`.
+Forty-three increments are complete (41 core, two Leap). Next unused sequence is 47.
 
 ## Plan45 complete (2026-09-14T17:08-0400)
 

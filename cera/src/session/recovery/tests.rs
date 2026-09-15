@@ -514,7 +514,7 @@ fn explicit_reset_unwind_cannot_enable_inference_with_partial_metadata() {
 }
 
 #[test]
-fn default_backend_recovery_requires_recreation_despite_legacy_reset_support() {
+fn default_backend_recovery_succeeds_via_fallback_reset() {
     struct Unproven(Arc<FaultModel>);
     impl Model for Unproven {
         fn config(&self) -> &ModelConfig {
@@ -537,6 +537,8 @@ fn default_backend_recovery_requires_recreation_despite_legacy_reset_support() {
     ));
     assert_eq!(outcome(&active), RecoveryOutcome::Unusable);
     assert!(active.last_ingest_recovery().unwrap().reset_error.is_some());
-    assert!(active.reset().is_err());
-    assert!(!active.is_usable());
+    // Backends without checked reset fall back to state re-allocation on explicit reset:
+    assert!(active.reset().is_ok());
+    assert!(active.is_usable());
+    assert_eq!(active.position(), 0);
 }
