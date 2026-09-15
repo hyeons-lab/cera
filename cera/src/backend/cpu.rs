@@ -6003,8 +6003,14 @@ impl YarnParams {
         orig_ctx_len: usize,
     ) -> Self {
         let mut mscale = attn_factor;
-        if ext_factor != 0.0 && freq_scale > 0.0 {
-            mscale *= 1.0 + 0.1 * (1.0 / freq_scale).ln();
+        if ext_factor != 0.0 && freq_scale.is_finite() && freq_scale > 0.0 {
+            let scale_mult = 1.0 - 0.1 * freq_scale.ln();
+            if scale_mult.is_finite() && scale_mult > 0.0 {
+                mscale *= scale_mult;
+            }
+        }
+        if !mscale.is_finite() || mscale <= 0.0 {
+            mscale = attn_factor.max(1.0);
         }
         Self {
             freq_scale,
@@ -6090,13 +6096,17 @@ fn compute_yarn_cos_sin(
         return;
     }
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
-    let corr_dims = rope_yarn_corr_dims(
-        head_dim,
-        yarn.orig_ctx_len,
-        freq_base,
-        yarn.beta_fast,
-        yarn.beta_slow,
-    );
+    let corr_dims = if yarn.ext_factor != 0.0 {
+        rope_yarn_corr_dims(
+            head_dim,
+            yarn.orig_ctx_len,
+            freq_base,
+            yarn.beta_fast,
+            yarn.beta_slow,
+        )
+    } else {
+        [0.0, 0.0]
+    };
     let mscale = yarn.mscale;
     let mut theta_base = pos as f32;
     for (i, entry) in cos_sin[..half_dim].iter_mut().enumerate() {
@@ -8364,6 +8374,33 @@ mod tests {
                 "dim {i} expected {expected_scale} got {val}",
             );
         }
+    }
+
+    #[test]
+    fn test_yarn_params_non_finite_freq_scale_boundary() {
+        let p_inf = YarnParams::new(f32::INFINITY, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_inf.mscale.is_finite());
+        assert_eq!(p_inf.mscale, 1.0);
+
+        let p_zero = YarnParams::new(0.0, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_zero.mscale.is_finite());
+        assert_eq!(p_zero.mscale, 1.0);
+
+        let p_neg = YarnParams::new(-1.0, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_neg.mscale.is_finite());
+        assert_eq!(p_neg.mscale, 1.0);
+
+        let p_nan = YarnParams::new(f32::NAN, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_nan.mscale.is_finite());
+        assert_eq!(p_nan.mscale, 1.0);
+
+        let p_subnormal = YarnParams::new(1e-40_f32, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_subnormal.mscale.is_finite());
+        assert!(p_subnormal.mscale > 0.0);
+
+        let p_extreme = YarnParams::new(100_000.0, 1.0, 1.0, 32.0, 1.0, 64);
+        assert!(p_extreme.mscale.is_finite());
+        assert!(p_extreme.mscale > 0.0);
     }
 
     #[test]

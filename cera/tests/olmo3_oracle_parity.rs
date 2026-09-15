@@ -20,6 +20,28 @@ fn ensure_test_fixture() -> Option<std::path::PathBuf> {
     static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FIXTURE
         .get_or_init(|| {
+            if let Ok(p) = std::env::var("CERA_TEST_OLMO3_GGUF") {
+                let path = std::path::PathBuf::from(p);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+            if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
+                let path = std::path::PathBuf::from(d).join("test_olmo3.gguf");
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+            let target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/oracle/models/test_olmo3.gguf");
+            if target_path.exists() {
+                return Some(target_path);
+            }
+            let root_target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/oracle/models/test_olmo3.gguf");
+            if root_target_path.exists() {
+                return Some(root_target_path);
+            }
             let dir = std::env::temp_dir().join(format!("cera_test_olmo3_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let path = dir.join("test_olmo3.gguf");

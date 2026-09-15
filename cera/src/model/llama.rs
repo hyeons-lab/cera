@@ -35,7 +35,7 @@ use crate::tensor::DType;
 
 /// Layer normalization ordering (Pre-Norm vs Post-Norm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NormOrder {
+pub(crate) enum NormOrder {
     #[default]
     PreNorm,
     PostNorm,
@@ -226,8 +226,10 @@ impl LlamaModel {
                     .or_else(|| gguf.get_u32("attention.sliding_window_pattern"))
                     .map(|period| {
                         let p = period as usize;
-                        if p <= 1 {
+                        if p == 1 {
                             vec![false]
+                        } else if p == 0 {
+                            vec![true]
                         } else if p > 1024 {
                             tracing::warn!("sliding_window_pattern period {p} exceeds maximum 1024; defaulting to full attention");
                             vec![false]
@@ -252,7 +254,7 @@ impl LlamaModel {
         let rope_scaling_type = gguf
             .get_str(&format!("{prefix}.rope.scaling.type"))
             .or_else(|| gguf.get_str("rope.scaling.type"));
-        let yarn = if rope_scaling_type == Some("yarn") {
+        let yarn = if matches!(rope_scaling_type, Some(s) if s.eq_ignore_ascii_case("yarn")) {
             let factor = gguf
                 .get_f32(&format!("{prefix}.rope.scaling.factor"))
                 .or_else(|| gguf.get_f32("rope.scaling.factor"))
@@ -1632,11 +1634,9 @@ impl LlamaModel {
                         if let Some(cap) = self.attn_logit_softcapping {
                             cpu::softcap_inplace(scores, cap);
                         }
-                        if let Some(w) = layer_swa.filter(|&w| w > 0 && seq_len > w) {
-                            let mask_end = seq_len - w;
-                            for s in &mut scores[..mask_end] {
-                                *s = f32::NEG_INFINITY;
-                            }
+                        if let Some(w) = layer_swa.filter(|&w| w > 0) {
+                            let cutoff = seq_len.saturating_sub(w);
+                            scores[..cutoff].fill(f32::NEG_INFINITY);
                         }
                         cpu::softmax_inplace(scores);
                         cpu::attn_values(
