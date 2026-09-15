@@ -1467,9 +1467,7 @@ fn decode_attn_head(
             }
             if let Some(w) = d.sliding_window.filter(|&w| w > 0) {
                 let cutoff = d.seq_len.saturating_sub(w);
-                for s in &mut scores[..cutoff] {
-                    *s = f32::NEG_INFINITY;
-                }
+                scores[..cutoff].fill(f32::NEG_INFINITY);
             }
             cpu::softmax_inplace(scores);
             cpu::attn_values_f16(
@@ -1498,9 +1496,7 @@ fn decode_attn_head(
             }
             if let Some(w) = d.sliding_window.filter(|&w| w > 0) {
                 let cutoff = d.seq_len.saturating_sub(w);
-                for s in &mut scores[..cutoff] {
-                    *s = f32::NEG_INFINITY;
-                }
+                scores[..cutoff].fill(f32::NEG_INFINITY);
             }
             cpu::softmax_inplace(scores);
             cpu::attn_values(
@@ -2419,6 +2415,39 @@ mod decode_attn_tests {
         decode_attention(&q, &kv, &dims, &mut out, &mut scratch);
 
         // All tokens should contribute valid finite outputs, not NaN.
+        for &val in &out {
+            assert!(val.is_finite(), "expected finite value, got {val}");
+            assert!((val - 1.0).abs() < 1e-4, "expected 1.0, got {val}");
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_larger_than_seq_len_noop() {
+        let head_dim = 16;
+        let n_heads = 1;
+        let n_kv_heads = 1;
+        let seq_len = 4;
+
+        let q = vec![1.0f32; head_dim];
+        let k = vec![1.0f32; seq_len * head_dim];
+        let v = vec![1.0f32; seq_len * head_dim];
+
+        let kv = KvView::F32 { k: &k, v: &v };
+        let dims = DecodeAttnDims {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            scale: 1.0,
+            seq_len,
+            attn_logit_softcapping: None,
+            sliding_window: Some(seq_len + 10), // Window > seq_len: no tokens masked
+        };
+
+        let mut out = vec![0.0f32; head_dim];
+        let mut scratch = Vec::new();
+        decode_attention(&q, &kv, &dims, &mut out, &mut scratch);
+
+        // All tokens contribute equally: average of ones is one.
         for &val in &out {
             assert!(val.is_finite(), "expected finite value, got {val}");
             assert!((val - 1.0).abs() < 1e-4, "expected 1.0, got {val}");

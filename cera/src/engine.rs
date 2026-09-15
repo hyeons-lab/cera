@@ -1948,9 +1948,8 @@ fn resolve_parts_inference_type(
 /// which is the only thing the mmap-gated wrapper adds.
 fn inference_type_for_arch(arch: &str) -> InferenceType {
     match arch {
-        "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "gemma2" | "olmo2" => {
-            InferenceType::LlamaCppTextToText
-        }
+        "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "gemma2" | "olmo2" | "gemma4"
+        | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
         "bert" | "modernbert" => {

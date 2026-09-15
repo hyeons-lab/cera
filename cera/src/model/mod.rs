@@ -725,11 +725,9 @@ pub fn load_model(
         "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
             hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
         ),
-        "gemma4" | "gemma4-assistant" => Box::new(gemma4::Gemma4Model::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
+        "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
+            gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
+        ),
         other => bail!("unsupported architecture: {other}"),
     };
 
