@@ -1028,7 +1028,9 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // until the test corpus covers it.
         // `minicpm` and `minicpm5` map to LLAMA_VOCAB_PRE_TYPE_MINICPM5 in
         // llama.cpp, which shares the identical LLAMA3 regex pattern.
-        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" | "minicpm" | "minicpm5" => concat!(
+        // `default` is used by Nanbeige and standard GGUF converters.
+        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" | "minicpm" | "minicpm5"
+        | "default" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}{1,3}",
@@ -1307,6 +1309,10 @@ mod tests {
         );
         assert_eq!(
             build_pretokenize_regex("minicpm").as_str(),
+            build_pretokenize_regex("llama3").as_str(),
+        );
+        assert_eq!(
+            build_pretokenize_regex("default").as_str(),
             build_pretokenize_regex("llama3").as_str(),
         );
     }

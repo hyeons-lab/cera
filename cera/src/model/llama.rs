@@ -327,7 +327,15 @@ impl LlamaModel {
         let (n_loops, skip_loop_final_norm) = if prefix == "nanbeige" {
             let loops = match gguf.metadata.get("nanbeige.num_loops") {
                 Some(crate::gguf::GgufValue::U8(v)) => *v as usize,
+                Some(crate::gguf::GgufValue::I8(v)) => {
+                    ensure!(*v >= 1, "nanbeige.num_loops must be >= 1, got {v}");
+                    *v as usize
+                }
                 Some(crate::gguf::GgufValue::U16(v)) => *v as usize,
+                Some(crate::gguf::GgufValue::I16(v)) => {
+                    ensure!(*v >= 1, "nanbeige.num_loops must be >= 1, got {v}");
+                    *v as usize
+                }
                 Some(crate::gguf::GgufValue::U32(v)) => *v as usize,
                 Some(crate::gguf::GgufValue::I32(v)) => {
                     ensure!(*v >= 1, "nanbeige.num_loops must be >= 1, got {v}");
@@ -347,8 +355,13 @@ impl LlamaModel {
             let skip = match gguf.metadata.get("nanbeige.skip_loop_final_norm") {
                 Some(crate::gguf::GgufValue::Bool(b)) => *b,
                 Some(crate::gguf::GgufValue::U8(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::I8(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::U16(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::I16(v)) => *v != 0,
                 Some(crate::gguf::GgufValue::U32(v)) => *v != 0,
                 Some(crate::gguf::GgufValue::I32(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::U64(v)) => *v != 0,
+                Some(crate::gguf::GgufValue::I64(v)) => *v != 0,
                 Some(other) => {
                     bail!("nanbeige.skip_loop_final_norm has unexpected metadata type {other:?}")
                 }
@@ -500,16 +513,16 @@ impl LlamaModel {
             output_norm_weight.len()
         );
 
-        let mut phys_attn_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_ffn_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_post_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_ffn_post_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_q_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_k_norm_weights = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_q_bias = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_k_bias = Vec::with_capacity(n_phys_layers);
-        let mut phys_attn_v_bias = Vec::with_capacity(n_phys_layers);
-        let mut phys_layer_refs = Vec::with_capacity(n_phys_layers);
+        let mut attn_norm_weights = Vec::with_capacity(n_layers);
+        let mut ffn_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
+        let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_q_bias = Vec::with_capacity(n_layers);
+        let mut attn_k_bias = Vec::with_capacity(n_layers);
+        let mut attn_v_bias = Vec::with_capacity(n_layers);
+        let mut layer_refs = Vec::with_capacity(n_layers);
 
         for i in 0..n_phys_layers {
             // Note on Gemma 2 RMSNorm: Hugging Face checkpoints store weights with
@@ -531,7 +544,7 @@ impl LlamaModel {
                     attn_norm.len()
                 );
             }
-            phys_attn_norm_weights.push(attn_norm);
+            attn_norm_weights.push(attn_norm);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
@@ -548,7 +561,7 @@ impl LlamaModel {
                     ffn_norm.len()
                 );
             }
-            phys_ffn_norm_weights.push(ffn_norm);
+            ffn_norm_weights.push(ffn_norm);
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
             let attn_post = [
@@ -572,7 +585,7 @@ impl LlamaModel {
                     w.len()
                 );
             }
-            phys_attn_post_norm_weights.push(attn_post);
+            attn_post_norm_weights.push(attn_post);
 
             let ffn_post = [
                 format!("blk.{i}.post_ffw_norm.weight"),
@@ -595,7 +608,7 @@ impl LlamaModel {
                     w.len()
                 );
             }
-            phys_ffn_post_norm_weights.push(ffn_post);
+            ffn_post_norm_weights.push(ffn_post);
 
             // Qwen3 / Olmo 2 QK-norm: gate on tensor presence so the same code path
             // serves both archs.
@@ -628,11 +641,11 @@ impl LlamaModel {
                     q_w.len(),
                     k_w.len()
                 );
-                phys_attn_q_norm_weights.push(Some(q_w));
-                phys_attn_k_norm_weights.push(Some(k_w));
+                attn_q_norm_weights.push(Some(q_w));
+                attn_k_norm_weights.push(Some(k_w));
             } else {
-                phys_attn_q_norm_weights.push(None);
-                phys_attn_k_norm_weights.push(None);
+                attn_q_norm_weights.push(None);
+                attn_k_norm_weights.push(None);
             }
 
             // Qwen2 Q/K/V biases: gate on tensor presence.
@@ -640,13 +653,13 @@ impl LlamaModel {
             let k_bias_name = format!("blk.{i}.attn_k.bias");
             let v_bias_name = format!("blk.{i}.attn_v.bias");
             if gguf.tensors.contains_key(&q_bias_name) {
-                phys_attn_q_bias.push(Some(gguf.get_tensor(&q_bias_name)?.to_f32_vec()));
-                phys_attn_k_bias.push(Some(gguf.get_tensor(&k_bias_name)?.to_f32_vec()));
-                phys_attn_v_bias.push(Some(gguf.get_tensor(&v_bias_name)?.to_f32_vec()));
+                attn_q_bias.push(Some(gguf.get_tensor(&q_bias_name)?.to_f32_vec()));
+                attn_k_bias.push(Some(gguf.get_tensor(&k_bias_name)?.to_f32_vec()));
+                attn_v_bias.push(Some(gguf.get_tensor(&v_bias_name)?.to_f32_vec()));
             } else {
-                phys_attn_q_bias.push(None);
-                phys_attn_k_bias.push(None);
-                phys_attn_v_bias.push(None);
+                attn_q_bias.push(None);
+                attn_k_bias.push(None);
+                attn_v_bias.push(None);
             }
 
             // `.with_repack` on the projection weights only: these are the ones
@@ -654,7 +667,7 @@ impl LlamaModel {
             // stay excluded, though no longer because the head runs at `n = 1` (see
             // `WeightRef::with_repack` for why that reason expired and what would
             // have to be measured to change this).
-            phys_layer_refs.push(LayerWeightRefs {
+            layer_refs.push(LayerWeightRefs {
                 attn_q: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?
                     .with_repack(&gguf),
                 attn_k: transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?
@@ -675,28 +688,19 @@ impl LlamaModel {
             });
         }
 
-        let mut attn_norm_weights = Vec::with_capacity(n_layers);
-        let mut ffn_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
-        let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_k_norm_weights = Vec::with_capacity(n_layers);
-        let mut attn_q_bias = Vec::with_capacity(n_layers);
-        let mut attn_k_bias = Vec::with_capacity(n_layers);
-        let mut attn_v_bias = Vec::with_capacity(n_layers);
-        let mut layer_refs = Vec::with_capacity(n_layers);
-
-        for _ in 0..n_loops {
-            attn_norm_weights.extend(phys_attn_norm_weights.iter().cloned());
-            ffn_norm_weights.extend(phys_ffn_norm_weights.iter().cloned());
-            attn_post_norm_weights.extend(phys_attn_post_norm_weights.iter().cloned());
-            ffn_post_norm_weights.extend(phys_ffn_post_norm_weights.iter().cloned());
-            attn_q_norm_weights.extend(phys_attn_q_norm_weights.iter().cloned());
-            attn_k_norm_weights.extend(phys_attn_k_norm_weights.iter().cloned());
-            attn_q_bias.extend(phys_attn_q_bias.iter().cloned());
-            attn_k_bias.extend(phys_attn_k_bias.iter().cloned());
-            attn_v_bias.extend(phys_attn_v_bias.iter().cloned());
-            layer_refs.extend(phys_layer_refs.iter().cloned());
+        if n_loops > 1 {
+            for _ in 1..n_loops {
+                attn_norm_weights.extend_from_within(..n_phys_layers);
+                ffn_norm_weights.extend_from_within(..n_phys_layers);
+                attn_post_norm_weights.extend_from_within(..n_phys_layers);
+                ffn_post_norm_weights.extend_from_within(..n_phys_layers);
+                attn_q_norm_weights.extend_from_within(..n_phys_layers);
+                attn_k_norm_weights.extend_from_within(..n_phys_layers);
+                attn_q_bias.extend_from_within(..n_phys_layers);
+                attn_k_bias.extend_from_within(..n_phys_layers);
+                attn_v_bias.extend_from_within(..n_phys_layers);
+                layer_refs.extend_from_within(..n_phys_layers);
+            }
         }
 
         let loop_norm_interval = if n_loops > 1 && !skip_loop_final_norm {
@@ -2074,17 +2078,13 @@ impl LlamaModel {
                         cfg.rms_norm_eps,
                     );
                 } else {
-                    const TILE_TOKENS: usize = 32;
-                    for j_start in (0..n).step_by(TILE_TOKENS) {
-                        let j_end = (j_start + TILE_TOKENS).min(n);
-                        for j in j_start..j_end {
-                            for i in 0..hs {
-                                norm_col[i] = hidden[i * n + j];
-                            }
-                            cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
-                            for i in 0..hs {
-                                hidden[i * n + j] = norm_col[i];
-                            }
+                    for j in 0..n {
+                        for i in 0..hs {
+                            norm_col[i] = hidden[i * n + j];
+                        }
+                        cpu::rmsnorm(&mut norm_col, &self.output_norm_weight, cfg.rms_norm_eps);
+                        for i in 0..hs {
+                            hidden[i * n + j] = norm_col[i];
                         }
                     }
                 }
