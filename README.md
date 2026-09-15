@@ -46,6 +46,8 @@ of these architectures loads:
 | `minicpm`, `minicpm5` | **MiniCPM / MiniCPM5** (MiniCPM-1B / 2B) | text |
 | `nanbeige` | **Nanbeige 4.2** (looped-layer dense transformer) | text |
 | `phi3`, `phi` | **Phi-3 / Phi-3.5 / Phi-4-mini** (fused QKV, packed SwiGLU FFN) | text |
+| `mistral3` | **Ministral 3** (Norm YaRN RoPE, attention temperature scaling, Tekken BPE) | text |
+| `bailingmoe3`, `bailingmoe` | **Ling 3.0 Tiny** (hybrid KDA linear, MLA latent attention, and MoE) | text |
 
 No Granite 4.0 model loads today. The 4.0-H hybrids convert to a separate arch
 `granitehybrid`; the non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do

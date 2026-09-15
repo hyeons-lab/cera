@@ -920,7 +920,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=3840  # 3.75 MB; PR #430 gemma4 support MT
+          BUDGET_KB=3904  # 3.8125 MB; PR #443 bailingmoe3 support MT
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

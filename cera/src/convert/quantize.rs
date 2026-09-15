@@ -244,16 +244,15 @@ pub fn compute_rmse(orig: &[f32], dequant: &[f32]) -> f32 {
     if orig.is_empty() {
         return 0.0;
     }
-    let mut sum_sq = 0.0f32;
+    let mut sum_sq = 0.0f64;
     for (o, d) in orig.iter().zip(dequant.iter()) {
-        let diff = o - d;
+        let diff = *o as f64 - *d as f64;
         sum_sq += diff * diff;
     }
-    if sum_sq.is_nan() {
-        f32::NAN
-    } else {
-        (0.0f32.max(sum_sq) / orig.len() as f32).sqrt()
+    if !sum_sq.is_finite() || sum_sq < 0.0 {
+        return f32::NAN;
     }
+    ((sum_sq / orig.len() as f64).sqrt()) as f32
 }
 
 /// Compute Cosine Similarity between original and dequantized tensor.
