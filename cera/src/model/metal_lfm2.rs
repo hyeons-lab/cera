@@ -55,6 +55,7 @@ enum MetalBacking {
 
 /// A weight matrix on GPU: references the shared mmap buffer via byte offset,
 /// or a dedicated custom buffer if dequantized during upload.
+#[derive(Clone)]
 struct MetalWeight {
     /// Byte offset into the shared mmap_buf where this weight's data starts.
     mmap_offset: u64,
@@ -492,6 +493,8 @@ pub struct MetalLfm2Model {
     /// `Some(1.0/logit_scale)` when Granite's `logit_scale != 1.0`; the final
     /// logits are multiplied by it via `scale_f32`. `None` ⇒ no logit scaling.
     logit_scale_recip: Option<f32>,
+    /// Optional physical loop interval for looped architectures (e.g. Nanbeige).
+    loop_norm_interval: Option<usize>,
 
     layers: Vec<MetalLayerWeights>,
     hidden_buf: Buffer,
@@ -660,7 +663,7 @@ impl MetalLfm2Model {
         Self::from_weight_source(&cpu, path, context_size)
     }
 
-    /// Dense-transformer entry point (Qwen2/Qwen3/LLaMA/Mistral/Granite/MiniCPM). Builds
+    /// Dense-transformer entry point (Qwen2/Qwen3/LLaMA/Mistral/Granite/MiniCPM/Nanbeige). Builds
     /// the CPU `LlamaModel` and drives the same shared loader. Per-arch behavior
     /// (NEOX/NORM rope, Llama-3 freq factors, QK-norm, QKV bias, decoupled
     /// head_dim, Granite/MiniCPM scalars, untied output) is surfaced via the
@@ -717,6 +720,7 @@ impl MetalLfm2Model {
             scalars.residual,
         );
         let rope_type = src.rope_type() as u32;
+        let loop_norm_interval = src.loop_norm_interval();
 
         tracing::info!(
             "Metal model: {} layers, hs={hs}, is={is}, vocab={}",
@@ -982,7 +986,14 @@ impl MetalLfm2Model {
         // tensor data region in a usable format (f32 vs mmap'd bytes).
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
+        let uploaded_weights: std::cell::RefCell<std::collections::HashMap<u64, MetalWeight>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+
         let upload_weight = |wref: &WeightRef| -> anyhow::Result<MetalWeight> {
+            if let Some(existing) = uploaded_weights.borrow().get(&wref.start) {
+                return Ok(existing.clone());
+            }
+
             let (mmap_offset, custom_buf, dtype) = if matches!(
                 wref.dtype,
                 DType::Q4_0
@@ -1020,14 +1031,18 @@ impl MetalLfm2Model {
 
             let params_buf =
                 ctx.upload_bytes(bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]));
-            Ok(MetalWeight {
+            let weight = MetalWeight {
                 mmap_offset,
                 custom_buf,
                 dtype,
                 m: wref.m as u32,
                 k: wref.k as u32,
                 params_buf,
-            })
+            };
+            uploaded_weights
+                .borrow_mut()
+                .insert(wref.start, weight.clone());
+            Ok(weight)
         };
         // Optional small-f32 upload (per-head QK-norm / QKV bias).
         let upload_opt_f32 =
@@ -1344,6 +1359,7 @@ impl MetalLfm2Model {
             rope_type,
             scalars,
             logit_scale_recip,
+            loop_norm_interval,
             layers,
             backing,
             mmap_buf,
@@ -3106,6 +3122,7 @@ impl MetalLfm2Model {
         enc.set_buffer(1, Some(dst), dst_off_bytes);
         enc.set_buffer(2, Some(weight), 0);
         params.set(enc, 3);
+        enc.set_buffer(4, Some(src), 0);
         enc.dispatch_thread_groups(sz1d(n_tokens as u64), sz1d(256));
     }
 
@@ -4985,17 +5002,54 @@ impl MetalLfm2Model {
             // Phase 1: fused add(FFN_down residual) + rmsnorm, or plain rmsnorm for layer 0.
             // The previous layer's FFN down GEMM wrote to normed_buf as scratch.
             if layer > 0 {
-                // Fuse: batch_buf += normed_buf (FFN down residual), then rmsnorm → normed_buf
-                self.encode_add_rmsnorm_batch(
-                    enc,
-                    batch_buf,
-                    &self.prefill_normed_buf,
-                    &lw.attn_norm,
-                    &self.prefill_normed_buf, // residual from prev layer's FFN down
-                    n as u32,
-                    hs as u32,
-                    self.scalars.residual,
-                );
+                let is_loop_boundary = self
+                    .loop_norm_interval
+                    .is_some_and(|n_phys| layer % n_phys == 0);
+                if is_loop_boundary {
+                    // Loop boundary: add previous layer FFN down residual to batch_buf,
+                    // apply loop_norm using output_norm, then apply current layer attn_norm.
+                    self.encode_scaled_add_inplace(
+                        enc,
+                        batch_buf,
+                        &self.prefill_normed_buf,
+                        (n * hs) as u32,
+                        self.scalars.residual,
+                    );
+                    self.encode_rmsnorm_batch(
+                        enc,
+                        batch_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.output_norm,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                    self.encode_rmsnorm_batch(
+                        enc,
+                        batch_buf,
+                        0,
+                        &self.prefill_normed_buf,
+                        0,
+                        &lw.attn_norm,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                } else {
+                    // Fuse: batch_buf += normed_buf (FFN down residual), then rmsnorm -> normed_buf
+                    self.encode_add_rmsnorm_batch(
+                        enc,
+                        batch_buf,
+                        &self.prefill_normed_buf,
+                        &lw.attn_norm,
+                        &self.prefill_normed_buf, // residual from prev layer's FFN down
+                        n as u32,
+                        hs as u32,
+                        self.scalars.residual,
+                    );
+                }
             } else {
                 self.encode_rmsnorm_batch(
                     enc,
@@ -6132,6 +6186,26 @@ impl MetalLfm2Model {
                     });
                 }
             }
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
+                && (layer + 1) < cfg.n_layers
+            {
+                run_phase(format!("L{layer}_loop_norm"), &|enc| {
+                    self.encode_rmsnorm_batch(
+                        enc,
+                        batch_buf,
+                        0,
+                        batch_buf,
+                        0,
+                        &self.output_norm,
+                        n as u32,
+                        hs as u32,
+                        hs as u32,
+                    );
+                });
+            }
         }
 
         // Final logits epilogue.
@@ -6940,6 +7014,22 @@ impl MetalLfm2Model {
     fn encode_layers(&self, enc: &metal::ComputeCommandEncoderRef, pos: usize) {
         for i in 0..self.config.n_layers {
             self.encode_single_layer(enc, i, pos);
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                && (i + 1) < self.config.n_layers
+            {
+                self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                self.copy_compute(
+                    enc,
+                    &self.normed_buf,
+                    0,
+                    &self.hidden_buf,
+                    0,
+                    &self.params.elementwise_hs,
+                    self.config.hidden_size as u64,
+                );
+            }
         }
     }
 
@@ -7287,6 +7377,25 @@ impl MetalLfm2Model {
                     });
                 }
             }
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                && (i + 1) < cfg.n_layers
+            {
+                self.gpu_sampled_pass(timer, cb, "loop_norm", |enc| {
+                    self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                    self.copy_compute(
+                        enc,
+                        &self.normed_buf,
+                        0,
+                        &self.hidden_buf,
+                        0,
+                        &self.params.elementwise_hs,
+                        self.config.hidden_size as u64,
+                    );
+                });
+            }
         }
     }
 
@@ -7484,6 +7593,25 @@ impl MetalLfm2Model {
                         );
                     });
                 }
+            }
+
+            if self
+                .loop_norm_interval
+                .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                && (i + 1) < cfg.n_layers
+            {
+                self.profile_segment(timer, "loop_norm", |enc| {
+                    self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
+                    self.copy_compute(
+                        enc,
+                        &self.normed_buf,
+                        0,
+                        &self.hidden_buf,
+                        0,
+                        &self.params.elementwise_hs,
+                        self.config.hidden_size as u64,
+                    );
+                });
             }
         }
     }

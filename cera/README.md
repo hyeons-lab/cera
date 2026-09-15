@@ -145,6 +145,7 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
 | `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
 | `minicpm`, `minicpm5` | MiniCPM / MiniCPM5 (MiniCPM-1B / 2B) |
+| `nanbeige` | Nanbeige 4.2 (looped-layer dense transformer) |
 
 Any other architecture errors out with `unsupported architecture: <name>` (this
 includes the newer `mistral3`/`mistral4` layouts). No Granite 4.0 model loads
