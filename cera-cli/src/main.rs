@@ -1135,6 +1135,45 @@ enum Command {
         #[arg(long)]
         cache_dir: Option<String>,
     },
+
+    /// Compare a Cera-converted GGUF (or on-the-fly SafeTensors conversion) against a reference community GGUF.
+    CompareQuants {
+        /// Path to local SafeTensors directory containing config.json, tokenizer.json, and *.safetensors.
+        #[arg(long, conflicts_with = "cera_gguf")]
+        safetensors: Option<PathBuf>,
+
+        /// Path to already converted Cera GGUF file.
+        #[arg(long, conflicts_with = "safetensors")]
+        cera_gguf: Option<PathBuf>,
+
+        /// Path to reference community-style quantized GGUF file.
+        #[arg(short, long)]
+        reference: PathBuf,
+
+        /// Quantization type (e.g. `Q4_K_M`, `Q4_0`, `Q8_0`, `F16`).
+        #[arg(long, default_value = "Q4_K_M")]
+        quant: String,
+
+        /// Quantization strategy (`auto`, `fast-mse`, `hqq`, `quarot`).
+        #[arg(long, default_value = "auto")]
+        strategy: String,
+
+        /// Optional prompt for inference logit parity testing. Pass empty string to skip.
+        #[arg(long, default_value = "Hello, world!")]
+        prompt: String,
+
+        /// Minimum required cosine similarity across weights (0.0 to 1.0).
+        #[arg(long, default_value_t = 0.99)]
+        min_weight_similarity: f32,
+
+        /// Minimum required cosine similarity across inference logits (0.0 to 1.0).
+        #[arg(long, default_value_t = 0.99)]
+        min_logit_similarity: f32,
+
+        /// Output full audit report as JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3902,6 +3941,114 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::CompareQuants {
+            safetensors,
+            cera_gguf,
+            reference,
+            quant,
+            strategy,
+            prompt,
+            min_weight_similarity,
+            min_logit_similarity,
+            json,
+        } => {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&min_weight_similarity),
+                "--min-weight-similarity must be between 0.0 and 1.0 (got {min_weight_similarity})"
+            );
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&min_logit_similarity),
+                "--min-logit-similarity must be between 0.0 and 1.0 (got {min_logit_similarity})"
+            );
+            anyhow::ensure!(
+                reference.is_file(),
+                "reference GGUF file `{}` does not exist or is not a file",
+                reference.display()
+            );
+            if let Some(ref st_path) = safetensors {
+                anyhow::ensure!(
+                    st_path.exists(),
+                    "safetensors input path `{}` does not exist",
+                    st_path.display()
+                );
+            }
+            if let Some(ref path) = cera_gguf {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "cera GGUF file `{}` does not exist or is not a file",
+                    path.display()
+                );
+            }
+
+            let target_quant = cera::convert::TargetQuant::parse_str(&quant)
+                .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
+            let quant_strategy = cera::convert::QuantStrategy::parse_str(&strategy)
+                .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
+
+            let mut _temp_dir = None;
+            let cera_path = if let Some(ref st_path) = safetensors {
+                let tmp_dir = tempfile::Builder::new()
+                    .prefix("cera-parity-")
+                    .tempdir()
+                    .context("creating temporary directory for SafeTensors conversion")?;
+                let tmp_path = tmp_dir.path().join("cera-converted.gguf");
+                eprintln!(
+                    "Quantizing SafeTensors from `{}` to `{}` (quant: {}, strategy: {})...",
+                    st_path.display(),
+                    tmp_path.display(),
+                    target_quant.as_str(),
+                    quant_strategy.as_str(),
+                );
+                cera::convert::quantize_safetensors_to_gguf_with_strategy(
+                    st_path,
+                    &tmp_path,
+                    target_quant,
+                    quant_strategy,
+                    &[],
+                )
+                .context("converting SafeTensors to quantized GGUF")?;
+                _temp_dir = Some(tmp_dir);
+                tmp_path
+            } else if let Some(ref path) = cera_gguf {
+                path.clone()
+            } else {
+                anyhow::bail!("must provide either --safetensors or --cera-gguf");
+            };
+
+            let prompt_opt = if prompt.trim().is_empty() {
+                None
+            } else {
+                Some(prompt.as_str())
+            };
+
+            let report =
+                cera::convert::parity::audit_gguf_parity(&cera_path, &reference, prompt_opt, None)
+                    .context("auditing GGUF parity")?;
+
+            if json {
+                println!("{}", report.format_json()?);
+            } else {
+                println!("{}", report.format_table());
+            }
+
+            let passing = report.is_passing(min_weight_similarity, min_logit_similarity);
+            if !passing {
+                if let Some(ref err) = report.inference_error {
+                    anyhow::bail!("parity audit failed: inference execution error: {err}");
+                }
+                anyhow::bail!(
+                    "parity audit failed thresholds (min weight sim: {:.4} vs required {:.4}, min logit sim: {} vs required {:.4})",
+                    report.min_cosine_similarity,
+                    min_weight_similarity,
+                    report
+                        .inference_parity
+                        .as_ref()
+                        .map(|i| format!("{:.4}", i.logit_cosine_similarity))
+                        .unwrap_or_else(|| "N/A".into()),
+                    min_logit_similarity,
+                );
+            }
+        }
         Command::Chat {
             model,
             hf,
@@ -6417,5 +6564,57 @@ mod tests {
             repetition_penalty: None,
         };
         assert!(oob_top_p.validate().is_err());
+    }
+
+    #[test]
+    fn compare_quants_command_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "compare-quants",
+            "--safetensors",
+            "models/test_hf",
+            "--reference",
+            "models/reference.gguf",
+            "--quant",
+            "Q4_0",
+            "--strategy",
+            "fast-mse",
+            "--prompt",
+            "Test prompt",
+            "--min-weight-similarity",
+            "0.98",
+            "--min-logit-similarity",
+            "0.95",
+            "--json",
+        ])
+        .expect("compare-quants subcommand should parse");
+
+        match cli.command {
+            Command::CompareQuants {
+                safetensors,
+                cera_gguf,
+                reference,
+                quant,
+                strategy,
+                prompt,
+                min_weight_similarity,
+                min_logit_similarity,
+                json,
+            } => {
+                assert_eq!(
+                    safetensors,
+                    Some(std::path::PathBuf::from("models/test_hf"))
+                );
+                assert!(cera_gguf.is_none());
+                assert_eq!(reference, std::path::PathBuf::from("models/reference.gguf"));
+                assert_eq!(quant, "Q4_0");
+                assert_eq!(strategy, "fast-mse");
+                assert_eq!(prompt, "Test prompt");
+                assert!((min_weight_similarity - 0.98).abs() < 1e-6);
+                assert!((min_logit_similarity - 0.95).abs() < 1e-6);
+                assert!(json);
+            }
+            _ => panic!("expected CompareQuants command"),
+        }
     }
 }
