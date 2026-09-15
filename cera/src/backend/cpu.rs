@@ -1898,21 +1898,9 @@ pub fn gemv_with_preq(
         // full slice to kernels that read `k` elements unchecked, so a slice
         // that panics is the better failure than one that reads past the end.
         // Same treatment `transformer::gemm_preq` applies.
-        DType::Q4_1 if q4_1_gemm_available() => {
-            if !gemm_preq_dispatch(
-                DType::Q4_1,
-                a_quant,
-                &x_scales[..k / 32],
-                &x_quants[..k],
-                y,
-                m,
-                1,
-                k,
-            ) {
-                // Predicate and dispatcher disagreed; see `q4_1_gemm_available`.
-                gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None);
-            }
-        }
+        DType::Q4_1 if q4_1_gemm_available() => unsafe {
+            crate::backend::simd::neon::gemv_q4_1_q8_0_neon(a_quant, x_scales, x_quants, y, m, k);
+        },
         DType::Q4KM => unsafe {
             crate::backend::simd::neon::gemv_q4k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
         },
@@ -2020,6 +2008,25 @@ pub fn gemv_q4k_gate_up_swiglu_with_q8(
     }
 }
 
+/// Fused Q5_K gate + up GEMV and SwiGLU activation:
+/// `out[r] = silu(gate[r] * x) * (up[r] * x)`.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q5k_gate_up_swiglu_with_q8(
+    gate_quant: &[u8],
+    up_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    unsafe {
+        crate::backend::simd::neon::gemv_q5k_gate_up_swiglu_neon(
+            gate_quant, up_quant, x_scales, x_quants, out, m, k,
+        );
+    }
+}
+
 /// Unified 3-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
 /// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
 #[cfg(target_arch = "aarch64")]
@@ -2116,6 +2123,55 @@ pub fn gemv_q4k_concat3_with_q8(
 
     unsafe {
         crate::backend::simd::neon::gemv_q4k_q8_0_concat3_neon(
+            a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
+        );
+    }
+}
+
+/// Unified 3-matrix Q5_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
+/// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q5k_concat3_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    a3_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ5K>();
+    assert!(
+        k.is_multiple_of(256),
+        "gemv_q5k_concat3_with_q8: k must be a multiple of 256"
+    );
+    assert!(
+        a1_quant.len() >= m1 * row_bytes,
+        "a1_quant buffer underflow"
+    );
+    assert!(
+        a2_quant.len() >= m2 * row_bytes,
+        "a2_quant buffer underflow"
+    );
+    assert!(
+        a3_quant.len() >= m3 * row_bytes,
+        "a3_quant buffer underflow"
+    );
+    assert!(x_scales.len() >= k / 32, "x_scales buffer underflow");
+    assert!(x_quants.len() >= k, "x_quants buffer underflow");
+    assert!(y1.len() >= m1, "y1 buffer underflow");
+    assert!(y2.len() >= m2, "y2 buffer underflow");
+    assert!(y3.len() >= m3, "y3 buffer underflow");
+
+    unsafe {
+        crate::backend::simd::neon::gemv_q5k_q8_0_concat3_neon(
             a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
         );
     }
@@ -2415,8 +2471,20 @@ pub fn gemv_q4_1_f32(
         // same function `quantize_columns` calls is what makes the two paths
         // provably identical rather than incidentally close.
         quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
-        if gemm_preq_dispatch(DType::Q4_1, a_quant, q8_scales, q8_quants, y, m, 1, k) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                crate::backend::simd::neon::gemv_q4_1_q8_0_neon(
+                    a_quant, q8_scales, q8_quants, y, m, k,
+                );
+            }
             return;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            if gemm_preq_dispatch(DType::Q4_1, a_quant, q8_scales, q8_quants, y, m, 1, k) {
+                return;
+            }
         }
     }
 

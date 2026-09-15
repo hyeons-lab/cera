@@ -470,13 +470,20 @@ impl LlamaModel {
         normed.resize(hs, 0.0);
         ffn_input.resize(hs, 0.0);
 
+        let nb = hs / 32;
+        state.scratch.q8_scales.resize(nb, 0.0);
+        state.scratch.q8_quants.resize(hs, 0);
+
         for i in 0..cfg.n_layers {
             // Attention pre-norm.
-            normed.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
-
-            #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&normed, state);
+            cpu::rmsnorm_and_quantize_q8_0(
+                hidden,
+                &self.attn_norm_weights[i],
+                cfg.rms_norm_eps,
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+                Some(&mut normed),
+            );
 
             let refs = &self.layer_refs[i];
             let weights = AttnWeights {
@@ -514,11 +521,14 @@ impl LlamaModel {
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             // FFN pre-norm.
-            ffn_input.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
-
-            #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&ffn_input, state);
+            cpu::rmsnorm_and_quantize_q8_0(
+                hidden,
+                &self.ffn_norm_weights[i],
+                cfg.rms_norm_eps,
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+                Some(&mut ffn_input),
+            );
 
             let refs = &self.layer_refs[i];
             let ffn_weights = FfnWeights {

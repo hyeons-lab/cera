@@ -1691,6 +1691,27 @@ impl Lfm2Model {
                     kv_dim,
                     cfg.hidden_size,
                 );
+            } else if q_ref.dtype == DType::Q5KM
+                && k_ref.dtype == DType::Q5KM
+                && v_ref.dtype == DType::Q5KM
+            {
+                let q_data = self.weight_data(q_ref);
+                let k_data = self.weight_data(k_ref);
+                let v_data = self.weight_data(v_ref);
+                cpu::gemv_q5k_concat3_with_q8(
+                    q_data,
+                    k_data,
+                    v_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                    k,
+                    v,
+                    cfg.hidden_size,
+                    kv_dim,
+                    kv_dim,
+                    cfg.hidden_size,
+                );
             } else {
                 self.gemv_preq(
                     q_ref,
@@ -2038,7 +2059,14 @@ impl Lfm2Model {
         state.scratch.q8_scales.resize(nb, 0.0);
         state.scratch.q8_quants.resize(hs, 0);
 
+        let profile = Self::profile_decode_enabled();
+        let mut t_norm = std::time::Duration::ZERO;
+        let mut t_conv = std::time::Duration::ZERO;
+        let mut t_attn = std::time::Duration::ZERO;
+        let mut t_ffn = std::time::Duration::ZERO;
+
         for i in 0..cfg.n_layers {
+            let t0 = std::time::Instant::now();
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.attn_norm_weights[i],
@@ -2047,15 +2075,26 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut normed),
             );
+            if profile {
+                t_norm += t0.elapsed();
+            }
 
+            let t1 = std::time::Instant::now();
             if cfg.block_types[i] == BlockType::GatedConv {
                 self.forward_conv_block(i, &normed, pos, state);
+                if profile {
+                    t_conv += t1.elapsed();
+                }
             } else {
                 self.forward_attn_block(i, &normed, pos, state);
+                if profile {
+                    t_attn += t1.elapsed();
+                }
             }
 
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
+            let t2 = std::time::Instant::now();
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.ffn_norm_weights[i],
@@ -2064,7 +2103,11 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut ffn_input),
             );
+            if profile {
+                t_norm += t2.elapsed();
+            }
 
+            let t3 = std::time::Instant::now();
             match &self.layer_refs[i].ffn {
                 FfnRefs::Dense(dense) => {
                     let ffn_weights = FfnWeights {
@@ -2084,8 +2127,21 @@ impl Lfm2Model {
                 }
                 FfnRefs::Moe(moe) => self.forward_moe_ffn(i, moe, hs, &ffn_input, state),
             }
+            if profile {
+                t_ffn += t3.elapsed();
+            }
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
+        }
+
+        if profile {
+            eprintln!(
+                "[PROFILE DECODE] norm: {:.2}ms | conv: {:.2}ms | attn: {:.2}ms | ffn: {:.2}ms",
+                t_norm.as_secs_f64() * 1000.0,
+                t_conv.as_secs_f64() * 1000.0,
+                t_attn.as_secs_f64() * 1000.0,
+                t_ffn.as_secs_f64() * 1000.0,
+            );
         }
 
         cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
@@ -2119,6 +2175,11 @@ impl Lfm2Model {
     fn profile_prefill_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some())
+    }
+
+    fn profile_decode_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_DECODE").is_some())
     }
 
     /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.
@@ -4290,15 +4351,24 @@ impl Model for Lfm2Model {
         self.dequantize_row_into(&self.embd_ref, token_id, hidden);
         self.run_layers(hidden, pos, state);
 
+        let profile = Self::profile_decode_enabled();
+        let t_lm = std::time::Instant::now();
         #[cfg(target_arch = "aarch64")]
         if self.embd_ref.dtype == DType::Q6K {
-            return transformer::gemv_preq_argmax(
+            let res = transformer::gemv_preq_argmax(
                 &self.gguf,
                 &self.embd_ref,
                 hidden,
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
             ) as u32;
+            if profile {
+                eprintln!(
+                    "[PROFILE DECODE] lm_head (argmax): {:.2}ms",
+                    t_lm.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return res;
         }
 
         if state.scratch.logits.len() < cfg.vocab_size {
