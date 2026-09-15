@@ -93,6 +93,22 @@ struct QuantCheckpoint {
     file_bytes: u64,
 }
 
+fn extract_chat_template(tokenizer_config: &serde_json::Value) -> Option<String> {
+    tokenizer_config.get("chat_template").and_then(|t| match t {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .find(|item| item.get("name").and_then(|n| n.as_str()) == Some("default"))
+            .or_else(|| arr.first())
+            .and_then(|item| {
+                item.get("template")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            }),
+        _ => None,
+    })
+}
+
 /// Stream and quantize a remote Hugging Face SafeTensors repository into a cached GGUF model.
 #[cfg(feature = "remote")]
 pub fn stream_quantize_hf_repo(
@@ -169,10 +185,7 @@ pub fn stream_quantize_hf_repo(
     let chat_template = fetch_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| {
-            v.get("chat_template")
-                .and_then(|t| t.as_str().map(str::to_string))
-        });
+        .and_then(|v| extract_chat_template(&v));
 
     let gen_url = spec.file_download_url("generation_config.json");
     let gen_defaults = fetch_hf_file_bytes(&client, &gen_url, opts.auth_token.as_deref())
@@ -460,7 +473,14 @@ pub fn stream_quantize_hf_repo(
             )));
         }
 
-        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.contains("norm.weight") {
+        // Hugging Face Gemma and Gemma 2 checkpoints store RMSNorm weights as an offset
+        // from 1.0: `x * (1.0 + weight)` (see Hugging Face transformers modeling_gemma.py
+        // and modeling_gemma2.py). Standard GGUF runtime RMSNorm executes standard `x * weight`
+        // without runtime offset addition. Therefore, standard GGUF converters
+        // (including upstream llama.cpp conversion/gemma.py:67) fold the +1.0 offset
+        // directly into the exported tensor weights during conversion so real checkpoints
+        // produce correct activations at inference.
+        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.ends_with("norm.weight") {
             for v in f32_data.iter_mut() {
                 *v += 1.0;
             }
@@ -683,16 +703,10 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             ))
         })?;
         let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
-        let chat_template = dir
-            .join("tokenizer_config.json")
-            .exists()
-            .then(|| fs::read(dir.join("tokenizer_config.json")).ok())
-            .flatten()
+        let chat_template = fs::read(dir.join("tokenizer_config.json"))
+            .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| {
-                v.get("chat_template")
-                    .and_then(|t| t.as_str().map(str::to_string))
-            });
+            .and_then(|v| extract_chat_template(&v));
         tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
     }
 
@@ -836,7 +850,14 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             )));
         }
 
-        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.contains("norm.weight") {
+        // Hugging Face Gemma and Gemma 2 checkpoints store RMSNorm weights as an offset
+        // from 1.0: `x * (1.0 + weight)` (see Hugging Face transformers modeling_gemma.py
+        // and modeling_gemma2.py). Standard GGUF runtime RMSNorm executes standard `x * weight`
+        // without runtime offset addition. Therefore, standard GGUF converters
+        // (including upstream llama.cpp conversion/gemma.py:67) fold the +1.0 offset
+        // directly into the exported tensor weights during conversion so real checkpoints
+        // produce correct activations at inference.
+        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.ends_with("norm.weight") {
             for v in f32_data.iter_mut() {
                 *v += 1.0;
             }
@@ -1039,4 +1060,49 @@ fn fetch_hf_file_range(
     let mut buf = Vec::new();
     fetch_hf_file_range_into(client, url, start, end, auth_token, &mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_chat_template_string_and_array() {
+        // 1. Direct string template
+        let str_val: serde_json::Value = serde_json::json!({ "chat_template": "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}" });
+        assert_eq!(
+            extract_chat_template(&str_val),
+            Some(
+                "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+                    .to_string()
+            )
+        );
+
+        // 2. Array with explicit default name
+        let arr_default: serde_json::Value = serde_json::json!({
+            "chat_template": [
+                { "name": "tool_use", "template": "tools" },
+                { "name": "default", "template": "default_template" }
+            ]
+        });
+        assert_eq!(
+            extract_chat_template(&arr_default),
+            Some("default_template".to_string())
+        );
+
+        // 3. Array without default name falls back to first
+        let arr_first: serde_json::Value = serde_json::json!({
+            "chat_template": [
+                { "name": "custom", "template": "custom_template" }
+            ]
+        });
+        assert_eq!(
+            extract_chat_template(&arr_first),
+            Some("custom_template".to_string())
+        );
+
+        // 4. Missing or invalid
+        let empty_val: serde_json::Value = serde_json::json!({});
+        assert_eq!(extract_chat_template(&empty_val), None);
+    }
 }

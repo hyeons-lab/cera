@@ -137,52 +137,61 @@ impl Tensor {
         bytemuck::cast_slice_mut(&mut self.data)
     }
 
-    /// Convert tensor data to a `Vec<f32>`, dequantizing if necessary.
-    pub fn to_f32_vec(&self) -> Vec<f32> {
+    /// Convert tensor data to a `Vec<f32>`, returning an error if dequantization is unsupported.
+    pub fn try_to_f32_vec(&self) -> Result<Vec<f32>, crate::CeraError> {
         match self.dtype {
-            DType::F32 => self.as_f32_slice().to_vec(),
+            DType::F32 => Ok(self.as_f32_slice().to_vec()),
             DType::F16 => {
                 let f16s: &[half::f16] = bytemuck::cast_slice(&self.data);
-                f16s.iter()
+                Ok(f16s
+                    .iter()
                     .map(|x| crate::quant::f16_to_f32(x.to_bits()))
-                    .collect()
+                    .collect())
             }
             DType::BF16 => {
                 let bf16s: &[half::bf16] = bytemuck::cast_slice(&self.data);
-                bf16s.iter().map(|x| x.to_f32()).collect()
+                Ok(bf16s.iter().map(|x| x.to_f32()).collect())
             }
             DType::Q4_0 => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q4_0_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
             DType::Q4_1 => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q4_1_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
             DType::Q8_0 => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q8_0_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
             DType::Q4KM => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q4_k_m_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
             DType::Q5KM => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q5_k_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
             DType::Q6K => {
                 let mut out = vec![0.0f32; self.numel()];
                 crate::quant::dequantize_q6_k_row(&self.data, &mut out);
-                out
+                Ok(out)
             }
-            _ => unimplemented!("to_f32_vec not implemented for {:?}", self.dtype),
+            _ => Err(crate::CeraError::Backend(format!(
+                "to_f32_vec not implemented for {:?}",
+                self.dtype
+            ))),
         }
+    }
+
+    /// Convert tensor data to a `Vec<f32>`, dequantizing if necessary.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        self.try_to_f32_vec().unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -242,5 +251,11 @@ mod tests {
         assert_eq!(DType::Q5KM.block_bytes(), 176);
         assert_eq!(DType::Q5KM.element_size(), None);
         assert_eq!(DType::F32.element_size(), Some(4));
+    }
+
+    #[test]
+    fn test_try_to_f32_vec_unsupported_dtype() {
+        let t = Tensor::new(vec![0u8; 16], vec![4], DType::I32);
+        assert!(t.try_to_f32_vec().is_err());
     }
 }

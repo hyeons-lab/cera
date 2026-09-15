@@ -178,6 +178,8 @@ impl HfModelConfig {
                         "whisper"
                     } else if arch_lower.contains("lfm") || arch_lower.contains("liquid") {
                         "lfm2"
+                    } else if arch_lower.contains("qwen3") {
+                        "qwen3"
                     } else if arch_lower.contains("qwen2") || arch_lower.contains("qwen") {
                         "qwen2"
                     } else if arch_lower.contains("nanbeige") {
@@ -385,7 +387,7 @@ impl HfModelConfig {
                 writer.add_f32("minicpm.embedding_scale", scale_emb as f32);
             }
             if let Some(scale_depth) = self.extra.get("scale_depth").and_then(|v| v.as_f64()) {
-                let n_layers = self.num_hidden_layers.unwrap_or(1) as f64;
+                let n_layers = self.num_hidden_layers.unwrap_or(1).max(1) as f64;
                 let residual_scale = scale_depth / n_layers.sqrt();
                 writer.add_f32("minicpm.residual_scale", residual_scale as f32);
             }
@@ -415,13 +417,13 @@ impl HfModelConfig {
             {
                 writer.add_f32("gemma2.final_logit_softcapping", cap as f32);
             }
-            if let Some(sw) = self.extra.get("sliding_window").and_then(|v| v.as_u64()) {
-                writer.add_u32("gemma2.attention.sliding_window", sw as u32);
-            }
         }
 
-        if (arch == "olmo" || arch == "olmo2")
-            && let Some(sw) = self.extra.get("sliding_window").and_then(|v| v.as_u64())
+        if let Some(sw) = self
+            .extra
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .filter(|&w| w > 0)
         {
             writer.add_u32(format!("{arch}.attention.sliding_window"), sw as u32);
         }
@@ -579,5 +581,34 @@ mod tests {
         }"#;
         let cfg = HfModelConfig::from_json_str(json_data).unwrap();
         assert_eq!(cfg.gguf_architecture(), "olmoe");
+    }
+
+    #[test]
+    fn test_qwen3_architecture_detection() {
+        let json_data = r#"{
+            "model_type": "custom",
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 2048,
+            "num_hidden_layers": 16
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "qwen3");
+    }
+
+    #[test]
+    fn test_sliding_window_generalized_emission() {
+        let json_data = r#"{
+            "model_type": "qwen2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "sliding_window": 32768
+        }"#;
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "qwen2-test");
+        assert_eq!(
+            writer.get_metadata("qwen2.attention.sliding_window"),
+            Some(&MetadataValue::Uint32(32768))
+        );
     }
 }

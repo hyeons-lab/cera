@@ -3960,6 +3960,25 @@ fn main() -> Result<()> {
                 (0.0..=1.0).contains(&min_logit_similarity),
                 "--min-logit-similarity must be between 0.0 and 1.0 (got {min_logit_similarity})"
             );
+            anyhow::ensure!(
+                reference.is_file(),
+                "reference GGUF file `{}` does not exist or is not a file",
+                reference.display()
+            );
+            if let Some(ref st_path) = safetensors {
+                anyhow::ensure!(
+                    st_path.exists(),
+                    "safetensors input path `{}` does not exist",
+                    st_path.display()
+                );
+            }
+            if let Some(ref path) = cera_gguf {
+                anyhow::ensure!(
+                    path.is_file(),
+                    "cera GGUF file `{}` does not exist or is not a file",
+                    path.display()
+                );
+            }
 
             let target_quant = cera::convert::TargetQuant::parse_str(&quant)
                 .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
