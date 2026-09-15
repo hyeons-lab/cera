@@ -1950,9 +1950,8 @@ fn inference_type_for_arch(arch: &str) -> InferenceType {
     match arch {
         "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5"
         | "granite" | "gemma2" | "olmo2" | "olmo3" | "gemma4" | "gemma-4" | "gemma4-assistant"
-        | "gemma-4-assistant" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" => {
-            InferenceType::LlamaCppTextToText
-        }
+        | "gemma-4-assistant" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3" | "ministral3"
+        | "phi3" | "phi" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
         "bert" | "modernbert" => {

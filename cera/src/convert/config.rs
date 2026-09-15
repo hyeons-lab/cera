@@ -170,7 +170,7 @@ impl HfModelConfig {
             "olmoe" => "olmoe",
             "mamba2" | "falcon_mamba" => "mamba2",
             "mamba" => "mamba",
-            "phi3" | "phi" => "phi3",
+            "phi3" | "phi" | "phi-3" | "phi4" | "phi-4" => "phi3",
             "lfm" | "lfm2" | "lfm2.5" | "liquid" => "lfm2",
             "whisper" => "whisper",
             _ => {
@@ -209,6 +209,16 @@ impl HfModelConfig {
                         "mamba2"
                     } else if arch_lower.contains("mamba") {
                         "mamba"
+                    } else if !arch_lower.contains("moe")
+                        && (arch_lower.contains("phi3")
+                            || arch_lower.contains("phi-3")
+                            || arch_lower.contains("phi4")
+                            || arch_lower.contains("phi-4")
+                            || arch_lower == "phi"
+                            || arch_lower.starts_with("phi-")
+                            || arch_lower.starts_with("phi_"))
+                    {
+                        "phi3"
                     } else {
                         "llama"
                     }
@@ -926,6 +936,46 @@ mod tests {
         assert_eq!(
             writer.get_metadata("mistral3.rope.scaling.yarn_beta_slow"),
             Some(&MetadataValue::Float32(1.0))
+        );
+    }
+
+    #[test]
+    fn test_phi3_hf_model_config() {
+        let json_data = r#"{
+            "model_type": "phi3",
+            "architectures": ["Phi3ForCausalLM"],
+            "hidden_size": 3072,
+            "intermediate_size": 8192,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "num_hidden_layers": 32,
+            "vocab_size": 32064,
+            "max_position_embeddings": 4096,
+            "sliding_window": 2048,
+            "rms_norm_eps": 1e-5
+        }"#;
+
+        let cfg = HfModelConfig::from_json_str(json_data).unwrap();
+        assert_eq!(cfg.gguf_architecture(), "phi3");
+
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "phi3-mini-test");
+
+        assert_eq!(
+            writer.get_metadata("general.architecture"),
+            Some(&MetadataValue::String("phi3".to_string()))
+        );
+        assert_eq!(
+            writer.get_metadata("phi3.embedding_length"),
+            Some(&MetadataValue::Uint32(3072))
+        );
+        assert_eq!(
+            writer.get_metadata("phi3.feed_forward_length"),
+            Some(&MetadataValue::Uint32(8192))
+        );
+        assert_eq!(
+            writer.get_metadata("phi3.attention.sliding_window"),
+            Some(&MetadataValue::Uint32(2048))
         );
     }
 }
