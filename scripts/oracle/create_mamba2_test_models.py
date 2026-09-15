@@ -232,7 +232,7 @@ def create_falcon_h1(out_path, seed=42):
         writer.add_tensor(f"blk.{i}.ssm_out.weight", rand_weight(n_embd, d_inner))
 
         # FFN
-        writer.add_tensor(f"blk.{i}.ffn_norm", np.ones((n_embd,), dtype=np.float32))
+        writer.add_tensor(f"blk.{i}.ffn_norm.weight", np.ones((n_embd,), dtype=np.float32))
         writer.add_tensor(f"blk.{i}.ffn_gate.weight", rand_weight(n_ff, n_embd))
         writer.add_tensor(f"blk.{i}.ffn_up.weight", rand_weight(n_ff, n_embd))
         writer.add_tensor(f"blk.{i}.ffn_down.weight", rand_weight(n_embd, n_ff))
