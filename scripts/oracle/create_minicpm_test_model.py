@@ -13,7 +13,10 @@ def create_minicpm_model(out_path, seed=42):
     arch = "minicpm"
     parent_dir = os.path.dirname(os.path.abspath(out_path))
     os.makedirs(parent_dir, exist_ok=True)
-    tmp_path = f"{out_path}.tmp.{os.getpid()}"
+    if os.path.islink(out_path):
+        os.unlink(out_path)
+    fd, tmp_path = tempfile.mkstemp(prefix="test_minicpm_", suffix=".tmp", dir=parent_dir)
+    os.close(fd)
     writer = gguf.GGUFWriter(tmp_path, arch)
 
     n_embd = 64
@@ -37,7 +40,7 @@ def create_minicpm_model(out_path, seed=42):
     # MiniCPM scalar multipliers
     writer.add_float32(f"{arch}.embedding_scale", 12.0)
     writer.add_float32(f"{arch}.residual_scale", float(1.4 / np.sqrt(n_layer)))
-    writer.add_float32(f"{arch}.logit_scale", float(256.0 / n_embd))
+    writer.add_float32(f"{arch}.logit_scale", float(n_embd / 256.0))
 
     # Vocabulary
     def bytes_to_unicode():

@@ -184,7 +184,7 @@ impl LlamaModel {
         let rope_type = match prefix {
             "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" | "minicpm" => RopeType::Norm,
+            "llama" | "granite" | "minicpm" | "minicpm5" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch: phi3,
@@ -211,6 +211,13 @@ impl LlamaModel {
         let final_logit_softcapping = gguf
             .get_f32(&format!("{prefix}.final_logit_softcapping"))
             .filter(|&c| c.is_finite() && c > 0.0);
+        if (prefix == "minicpm" || prefix == "minicpm5")
+            && (attn_logit_softcapping.is_some() || final_logit_softcapping.is_some())
+        {
+            tracing::warn!(
+                "minicpm model specifies unexpected logit softcapping; softcapping may interact unexpectedly with logit scaling"
+            );
+        }
 
         let sliding_window = gguf
             .get_u32(&format!("{prefix}.attention.sliding_window"))
@@ -387,8 +394,8 @@ impl LlamaModel {
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);
         ensure!(
-            rms_norm_eps.is_finite() && rms_norm_eps > 0.0,
-            "{prefix}.attention.layer_norm_rms_epsilon must be positive and finite"
+            rms_norm_eps.is_finite() && (1e-12..=1e-2).contains(&rms_norm_eps),
+            "{prefix}.attention.layer_norm_rms_epsilon must be finite and within [1e-12, 1e-2]"
         );
 
         // head_dim: default hidden_size / n_heads, overridden by the optional
@@ -406,8 +413,10 @@ impl LlamaModel {
                 hidden_size / n_heads
             }
         };
-        ensure!(head_dim > 0, "head_dim must be > 0");
-
+        ensure!(
+            head_dim > 0 && head_dim.is_multiple_of(2) && head_dim <= 4096,
+            "head_dim ({head_dim}) must be positive, even for RoPE rotation, and <= 4096"
+        );
 
         let block_types = vec![BlockType::Attention; n_layers];
         let kv_heads_per_layer = vec![n_kv_heads; n_layers];

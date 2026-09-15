@@ -1026,6 +1026,8 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // arm, so cera's unknown-type fallback was already correct and naming it
         // only drops the warning. `smaug-bpe` shares that arm but stays out
         // until the test corpus covers it.
+        // `minicpm` and `minicpm5` map to LLAMA_VOCAB_PRE_TYPE_MINICPM5 in
+        // llama.cpp, which shares the identical LLAMA3 regex pattern.
         "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" | "minicpm" | "minicpm5" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",

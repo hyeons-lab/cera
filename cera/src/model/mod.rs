@@ -119,23 +119,24 @@ impl ScalarMultipliers {
         n_layers: usize,
         hidden_size: usize,
     ) -> Result<Self> {
-        let (default_emb, default_res, default_logit) = if prefix == "minicpm" {
-            (
-                12.0,
-                if n_layers > 0 {
-                    1.4 / (n_layers as f32).sqrt()
-                } else {
-                    1.0
-                },
-                if hidden_size > 0 {
-                    256.0 / (hidden_size as f32)
-                } else {
-                    1.0
-                },
-            )
-        } else {
-            (1.0, 1.0, 1.0)
-        };
+        let (default_emb, default_res, default_logit) =
+            if prefix == "minicpm" || prefix == "minicpm5" {
+                (
+                    12.0,
+                    if n_layers > 0 {
+                        1.4 / (n_layers as f32).sqrt()
+                    } else {
+                        1.0
+                    },
+                    if hidden_size > 0 {
+                        (hidden_size as f32) / 256.0
+                    } else {
+                        1.0
+                    },
+                )
+            } else {
+                (1.0, 1.0, 1.0)
+            };
 
         let embedding = gguf
             .get_f32(&format!("{prefix}.embedding_scale"))
@@ -148,7 +149,7 @@ impl ScalarMultipliers {
         // would otherwise zero every attention score).
         let attn = gguf
             .get_f32(&format!("{prefix}.attention.scale"))
-            .filter(|&s| s.is_finite() && s > 0.0);
+            .filter(|&s| s != 0.0);
         let logit = gguf
             .get_f32(&format!("{prefix}.logit_scale"))
             .unwrap_or(default_logit);
@@ -747,13 +748,12 @@ pub fn load_model(
         // Classic Mistral ships as arch "llama" (the `"mistral"` GGUF arch
         // string does not exist in llama.cpp; Mistral 3.x/4.x are the distinct
         // "mistral3"/"mistral4" archs with different layouts, not served here).
-        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm" => {
-            Box::new(llama::LlamaModel::from_gguf_with_id(
-                gguf,
-                context_size,
-                model_id,
-            )?)
-        }
+        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
+        | "minicpm5" => Box::new(llama::LlamaModel::from_gguf_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?),
         "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
             gguf,
             context_size,
@@ -815,7 +815,7 @@ pub fn load_model_gpu(
         // Dense transformers share the generalized wgpu loader (per-arch rope /
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" => Ok(Box::new(
             gpu_lfm2::GpuLfm2Model::from_llama_with_id(gguf, context_size, model_id)?,
         )),
         other => bail!("unsupported architecture for GPU: {other}"),
@@ -844,7 +844,7 @@ pub fn load_model_metal(
             context_size,
         )?)),
         // Dense transformers share the generalized Metal forward path.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" => Ok(Box::new(
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" => Ok(Box::new(
             metal_lfm2::MetalLfm2Model::from_llama(gguf, path, context_size)?,
         )),
         other => bail!("unsupported architecture for Metal: {other}"),
