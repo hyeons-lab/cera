@@ -2627,4 +2627,56 @@ mod decode_attn_tests {
             );
         }
     }
+
+    #[test]
+    fn test_decode_attention_sliding_window_with_softcapping_f16() {
+        let n_heads = 1;
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let seq_len = 4;
+        let window = 2;
+
+        let q = vec![1.0; head_dim];
+        let k_f16: Vec<u16> = vec![1.0; seq_len * head_dim]
+            .into_iter()
+            .map(|x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let mut v = vec![0.0; seq_len * head_dim];
+        for d in 0..head_dim {
+            v[d] = 1000.0;
+            v[head_dim + d] = 1000.0;
+            v[2 * head_dim + d] = 2.0;
+            v[3 * head_dim + d] = 4.0;
+        }
+        let v_f16: Vec<u16> = v
+            .into_iter()
+            .map(|x| half::f16::from_f32(x).to_bits())
+            .collect();
+
+        let kv = KvView::F16 {
+            k: &k_f16,
+            v: &v_f16,
+        };
+        let d = DecodeAttnDims {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            scale: 1.0,
+            seq_len,
+            attn_logit_softcapping: Some(50.0),
+            sliding_window: Some(window),
+        };
+
+        let mut out = vec![0.0f32; head_dim];
+        let mut scratch = Vec::new();
+        decode_attention(&q, &kv, &d, &mut out, &mut scratch);
+
+        // Masked tokens 0 and 1 must evaluate to -inf, yielding ~3.0 from tokens 2 and 3.
+        for &val in &out[..head_dim] {
+            assert!(
+                (val - 3.0).abs() < 1e-3,
+                "expected masked attention output ~3.0 under softcapping and f16, got {val}",
+            );
+        }
+    }
 }

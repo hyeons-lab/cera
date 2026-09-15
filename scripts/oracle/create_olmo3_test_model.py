@@ -10,6 +10,8 @@ def rand_weight(*shape):
 
 def create_olmo3_model(out_path, seed=42):
     np.random.seed(seed)
+    # Olmo 3 models in GGUF reuse the "olmo2" architecture identifier,
+    # augmented with SWA pattern and YaRN RoPE scaling metadata.
     arch = "olmo2"
     tmp_path = f"{out_path}.tmp.{os.getpid()}"
     writer = gguf.GGUFWriter(tmp_path, arch)
@@ -108,12 +110,17 @@ def create_olmo3_model(out_path, seed=42):
         writer.add_tensor(f"blk.{i}.ffn_down.weight", rand_weight(n_embd, n_ff))
         writer.add_tensor(f"blk.{i}.post_ffw_norm.weight", np.ones((n_embd,), dtype=np.float32))
 
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
-    os.replace(tmp_path, out_path)
-    print(f"Created {arch} test model at {out_path}")
+    try:
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        os.replace(tmp_path, out_path)
+        print(f"Created {arch} test model at {out_path}")
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 if __name__ == "__main__":
     out_path = (
