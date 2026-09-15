@@ -60,7 +60,7 @@ pub struct LlamaModel {
     gguf: GgufFile,
     config: ModelConfig,
     head_dim: usize,
-    /// RoPE pair layout: `Neox` for Qwen2/Qwen3/Gemma/Gemma2/Olmo2, `Norm` for LLaMA/Mistral/Granite/Olmo.
+    /// RoPE pair layout: `Neox` for Qwen2/Qwen3/Gemma 2/Olmo 2, `Norm` for LLaMA/Mistral/Granite.
     rope_type: RopeType,
     /// Llama-3 RoPE frequency-scaling factors (`rope_freqs.weight`, `head_dim/2`),
     /// applied per-pair on the NORM path. `None` for archs without the tensor
@@ -176,12 +176,12 @@ impl LlamaModel {
             .to_string();
         let prefix = arch.as_str();
 
-        // RoPE layout per arch. Qwen, Gemma/Gemma 2, and Olmo 2 GGUFs are NEOX (split-halves);
-        // the LLaMA-family (incl. Mistral, Granite, and Olmo 1) are NORM (interleaved pairs).
+        // RoPE layout per arch. Qwen, Gemma 2, and Olmo 2 GGUFs are NEOX (split-halves);
+        // the LLaMA-family (incl. Mistral and Granite) are NORM (interleaved pairs).
         let rope_type = match prefix {
-            "qwen2" | "qwen3" | "gemma" | "gemma2" | "olmo2" => RopeType::Neox,
+            "qwen2" | "qwen3" | "gemma2" | "olmo2" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" | "olmo" => RopeType::Norm,
+            "llama" | "granite" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch: phi3,
@@ -193,12 +193,12 @@ impl LlamaModel {
         };
 
         let norm_order = match prefix {
-            "olmo" | "olmo2" => NormOrder::PostNorm,
+            "olmo2" => NormOrder::PostNorm,
             _ => NormOrder::PreNorm,
         };
 
         let activation = match prefix {
-            "gemma" | "gemma2" => FfnActivation::Geglu,
+            "gemma2" => FfnActivation::Geglu,
             _ => FfnActivation::Swiglu,
         };
 
@@ -222,8 +222,8 @@ impl LlamaModel {
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
 
-        // Gemma scales token embeddings by sqrt(hidden_size).
-        if matches!(prefix, "gemma" | "gemma2") && scalars.embedding == 1.0 {
+        // Gemma 2 scales token embeddings by sqrt(hidden_size).
+        if prefix == "gemma2" && scalars.embedding == 1.0 {
             scalars.embedding = (hidden_size as f32).sqrt();
         }
         let intermediate_size = gguf
