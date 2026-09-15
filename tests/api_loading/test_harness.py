@@ -186,7 +186,9 @@ class HarnessTests(unittest.TestCase):
             result(json.dumps(record) + "\n" + json.dumps(record), False)
 
     def test_source_mirror_preserves_algorithms_and_production_binding_types(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / "build") as temporary:
+        build_dir = ROOT / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=build_dir) as temporary:
             workspace, report = prepare(Path(temporary))
             changed = []
             for name in {
