@@ -50,7 +50,6 @@ pub struct Gemma4Model {
     config: ModelConfig,
     head_dim: usize,
     n_embd_per_layer: usize,
-    _n_kv_shared_layers: usize,
     n_layer_kv_from_start: usize,
     is_swa: Vec<bool>,
     sliding_window: usize,
@@ -83,8 +82,14 @@ impl Gemma4Model {
     ) -> Result<Self> {
         let prefix = if gguf.metadata.contains_key("gemma4.block_count") {
             "gemma4"
+        } else if gguf.metadata.contains_key("gemma-4.block_count") {
+            "gemma-4"
         } else if gguf.metadata.contains_key("gemma4-assistant.block_count") {
             "gemma4-assistant"
+        } else if gguf.metadata.contains_key("gemma-4-assistant.block_count") {
+            "gemma-4-assistant"
+        } else if let Some(GgufValue::String(arch)) = gguf.metadata.get("general.architecture") {
+            arch.as_str()
         } else {
             "gemma4"
         };
@@ -98,11 +103,19 @@ impl Gemma4Model {
             .or_else(|| gguf.get_u32("gemma4-assistant.embedding_length"))
             .context("missing embedding_length")? as usize;
         ensure!(hidden_size > 0, "embedding_length must be > 0");
+        ensure!(
+            hidden_size.is_multiple_of(32),
+            "hidden_size ({hidden_size}) must be a multiple of 32 for Q8_0 scratch quantization"
+        );
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
             .or_else(|| gguf.get_u32("gemma4-assistant.feed_forward_length"))
             .context("missing feed_forward_length")? as usize;
         ensure!(intermediate_size > 0, "feed_forward_length must be > 0");
+        ensure!(
+            intermediate_size.is_multiple_of(32),
+            "intermediate_size ({intermediate_size}) must be a multiple of 32 for Q8_0 scratch quantization"
+        );
         let n_heads = gguf
             .get_u32(&format!("{prefix}.attention.head_count"))
             .or_else(|| gguf.get_u32("gemma4-assistant.attention.head_count"))
@@ -123,9 +136,16 @@ impl Gemma4Model {
             .or_else(|| gguf.get_u32("gemma4-assistant.attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads);
-        ensure!(head_dim > 0, "head_dim must be > 0");
+        ensure!(
+            head_dim > 0 && head_dim.is_multiple_of(2),
+            "head_dim ({head_dim}) must be positive and an even number for RoPE rotation"
+        );
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
+        ensure!(
+            q_dim.is_multiple_of(32),
+            "q_dim ({q_dim}) must be a multiple of 32 for Q8_0 scratch quantization"
+        );
 
         let n_embd_per_layer = gguf
             .get_u32(&format!("{prefix}.embedding_length_per_layer_input"))
@@ -157,7 +177,10 @@ impl Gemma4Model {
         let is_swa = if let Some(GgufValue::Array(arr)) = gguf
             .metadata
             .get(&format!("{prefix}.attention.sliding_window_pattern"))
-        {
+            .or_else(|| {
+                gguf.metadata
+                    .get("gemma4-assistant.attention.sliding_window_pattern")
+            }) {
             arr.iter()
                 .map(|v| match v {
                     GgufValue::Bool(b) => *b,
@@ -167,8 +190,9 @@ impl Gemma4Model {
                     _ => true,
                 })
                 .collect()
-        } else if let Some(period) =
-            gguf.get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+        } else if let Some(period) = gguf
+            .get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+            .or_else(|| gguf.get_u32("gemma4-assistant.attention.sliding_window_pattern"))
         {
             (0..n_layers)
                 .map(|il| period == 0 || (il as u32 % period < (period - 1)))
@@ -192,10 +216,18 @@ impl Gemma4Model {
             .get_f32(&format!("{prefix}.rope.freq_base"))
             .or_else(|| gguf.get_f32("gemma4-assistant.rope.freq_base"))
             .unwrap_or(10000.0);
+        ensure!(
+            rope_theta.is_finite() && rope_theta > 0.0,
+            "rope_theta must be positive and finite: {rope_theta}"
+        );
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .or_else(|| gguf.get_f32("gemma4-assistant.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
+        ensure!(
+            rms_norm_eps.is_finite() && rms_norm_eps > 0.0,
+            "rms_norm_eps must be positive and finite: {rms_norm_eps}"
+        );
 
         let final_logit_softcapping = gguf
             .get_f32(&format!("{prefix}.final_logit_softcapping"))
@@ -505,12 +537,23 @@ impl Gemma4Model {
                 (None, None, None)
             };
 
-            let layer_out_scale = gguf
+            let layer_out_scale = if let Ok(t) = gguf
                 .get_tensor(&format!("blk.{i}.layer_out_scale.weight"))
                 .or_else(|_| gguf.get_tensor(&format!("blk.{i}.layer_scalar.weight")))
-                .ok()
-                .and_then(|t| t.to_f32_vec().first().copied())
-                .filter(|s| s.is_finite());
+            {
+                let val = t
+                    .to_f32_vec()
+                    .first()
+                    .copied()
+                    .with_context(|| format!("empty layer_out_scale tensor for layer {i}"))?;
+                ensure!(
+                    val.is_finite(),
+                    "layer {i} layer_out_scale must be finite: {val}"
+                );
+                Some(val)
+            } else {
+                None
+            };
 
             layers.push(Gemma4LayerWeights {
                 attn_norm,
@@ -538,7 +581,6 @@ impl Gemma4Model {
             config,
             head_dim,
             n_embd_per_layer,
-            _n_kv_shared_layers: n_kv_shared_layers,
             n_layer_kv_from_start,
             is_swa,
             sliding_window,
@@ -562,8 +604,15 @@ impl Gemma4Model {
         let kv_dim = self.config.n_kv_heads * head_dim;
         let eps = self.config.rms_norm_eps;
 
+        let token_id = token as usize;
+        assert!(
+            token_id < self.config.vocab_size,
+            "token_id {token_id} out of range (vocab_size={})",
+            self.config.vocab_size
+        );
+
         // Base token embedding lookup and scale.
-        let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token as usize);
+        let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
         if transformer::oracle_dump::is_active() {
             transformer::oracle_dump::record("embd", &hidden);
         }
@@ -590,6 +639,8 @@ impl Gemma4Model {
         let n_pl = self.n_embd_per_layer;
         let total_pl = self.config.n_layers * n_pl;
         if n_pl > 0 {
+            // Reusing state.scratch.lora_tmp as scratch for per-layer embeddings.
+            // Gemma 4 does not evaluate LoRA adapters, giving PLE exclusive ownership.
             state.scratch.lora_tmp.resize(total_pl * 2, 0.0);
             state.scratch.conv_scratch.resize(n_pl, 0.0);
 
@@ -597,7 +648,7 @@ impl Gemma4Model {
             transformer::dequantize_row_into(
                 &self.gguf,
                 self.per_layer_token_embd.as_ref().unwrap(),
-                token as usize,
+                token_id,
                 combined,
             );
             cpu::scale_inplace(combined, (n_pl as f32).sqrt());
@@ -708,6 +759,11 @@ impl Gemma4Model {
                     );
                 }
 
+                // If V projection is omitted, copy unnormalized K before QK-norm.
+                if layer.attn_v.is_none() {
+                    state.scratch.v[..kv_dim].copy_from_slice(&state.scratch.k[..kv_dim]);
+                }
+
                 // QK norm on K (per head).
                 for h in 0..self.config.n_kv_heads {
                     cpu::rmsnorm(
@@ -745,29 +801,27 @@ impl Gemma4Model {
                 }
 
                 // V projection.
-                let v_ref = layer
-                    .attn_v
-                    .as_ref()
-                    .unwrap_or_else(|| layer.attn_k.as_ref().unwrap());
-                #[cfg(target_arch = "aarch64")]
-                {
-                    gemv_preq(
-                        &self.gguf,
-                        v_ref,
-                        &state.scratch.normed,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        &mut state.scratch.v[..kv_dim],
-                    );
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    gemv(
-                        &self.gguf,
-                        v_ref,
-                        &state.scratch.normed,
-                        &mut state.scratch.v[..kv_dim],
-                    );
+                if let Some(ref v_ref) = layer.attn_v {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        gemv_preq(
+                            &self.gguf,
+                            v_ref,
+                            &state.scratch.normed,
+                            &state.scratch.q8_scales,
+                            &state.scratch.q8_quants,
+                            &mut state.scratch.v[..kv_dim],
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        gemv(
+                            &self.gguf,
+                            v_ref,
+                            &state.scratch.normed,
+                            &mut state.scratch.v[..kv_dim],
+                        );
+                    }
                 }
                 if transformer::oracle_dump::is_active() {
                     transformer::oracle_dump::record(
@@ -864,7 +918,7 @@ impl Gemma4Model {
                         }
                     }
                 }
-                _ => panic!("Gemma 4 expected Attention LayerState"),
+                _ => unreachable!("dense transformer layer is always Attention"),
             };
 
             let sw = if is_swa && self.sliding_window > 0 {
@@ -1178,8 +1232,14 @@ impl Gemma4Model {
         // 1. Base embeddings for all N tokens: [n * hs].
         let mut hidden = vec![0.0f32; n * hs];
         for (j, &tok) in tokens.iter().enumerate() {
+            let token_id = tok as usize;
+            assert!(
+                token_id < self.config.vocab_size,
+                "token_id {token_id} out of range (vocab_size={})",
+                self.config.vocab_size
+            );
             let row = &mut hidden[j * hs..(j + 1) * hs];
-            transformer::dequantize_row_into(&self.gguf, &self.embd_ref, tok as usize, row);
+            transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, row);
             if transformer::oracle_dump::is_active() {
                 transformer::oracle_dump::record("embd", row);
             }
@@ -1191,6 +1251,8 @@ impl Gemma4Model {
 
         // 2. Per-layer embeddings: compute combined representation for all N tokens.
         let combined = if n_pl > 0 {
+            // Reusing state.scratch.lora_tmp as scratch for per-layer embeddings.
+            // Gemma 4 does not evaluate LoRA adapters, giving PLE exclusive ownership.
             state.scratch.lora_tmp.resize(total_pl * 2, 0.0);
             state.scratch.conv_scratch.resize(n_pl, 0.0);
             let mut comb_buf = vec![0.0f32; n * total_pl];
@@ -1342,6 +1404,11 @@ impl Gemma4Model {
                         );
                     }
 
+                    // If V projection is omitted, copy unnormalized K before QK-norm.
+                    if layer.attn_v.is_none() {
+                        state.scratch.v[..kv_dim].copy_from_slice(&state.scratch.k[..kv_dim]);
+                    }
+
                     // QK norm on K (per head).
                     for h in 0..self.config.n_kv_heads {
                         cpu::rmsnorm(
@@ -1379,29 +1446,27 @@ impl Gemma4Model {
                     }
 
                     // V projection.
-                    let v_ref = layer
-                        .attn_v
-                        .as_ref()
-                        .unwrap_or_else(|| layer.attn_k.as_ref().unwrap());
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        gemv_preq(
-                            &self.gguf,
-                            v_ref,
-                            &state.scratch.normed,
-                            &state.scratch.q8_scales,
-                            &state.scratch.q8_quants,
-                            &mut state.scratch.v[..kv_dim],
-                        );
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        gemv(
-                            &self.gguf,
-                            v_ref,
-                            &state.scratch.normed,
-                            &mut state.scratch.v[..kv_dim],
-                        );
+                    if let Some(ref v_ref) = layer.attn_v {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            gemv_preq(
+                                &self.gguf,
+                                v_ref,
+                                &state.scratch.normed,
+                                &state.scratch.q8_scales,
+                                &state.scratch.q8_quants,
+                                &mut state.scratch.v[..kv_dim],
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            gemv(
+                                &self.gguf,
+                                v_ref,
+                                &state.scratch.normed,
+                                &mut state.scratch.v[..kv_dim],
+                            );
+                        }
                     }
                     if transformer::oracle_dump::is_active() {
                         transformer::oracle_dump::record(
@@ -1490,7 +1555,7 @@ impl Gemma4Model {
                             }
                         }
                     }
-                    _ => panic!("Gemma 4 expected Attention LayerState"),
+                    _ => unreachable!("dense transformer layer is always Attention"),
                 };
 
                 let dims = DecodeAttnDims {
@@ -1785,6 +1850,16 @@ impl Model for Gemma4Model {
         if tokens.is_empty() {
             return Vec::new();
         }
+        assert_eq!(
+            tokens.len(),
+            1,
+            "Gemma4Model forward expects exactly 1 token; use forward_prefill for multiple tokens"
+        );
+        assert_eq!(
+            pos, state.seq_len,
+            "Gemma4Model forward: pos ({pos}) must equal state.seq_len ({})",
+            state.seq_len
+        );
         self.forward_single_token(tokens[0], pos, state)
     }
 
@@ -1804,6 +1879,10 @@ impl Model for Gemma4Model {
         );
 
         self.forward_prefill_inner(tokens, start_pos, state, false)
+    }
+
+    fn f16_kv_supported(&self) -> bool {
+        true
     }
 
     fn supports_all_logits(&self) -> bool {

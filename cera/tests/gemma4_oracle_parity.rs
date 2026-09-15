@@ -4,7 +4,7 @@
 #![cfg(feature = "mmap")]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use cera::gguf::GgufFile;
@@ -15,7 +15,31 @@ fn rel_diff(a: f64, b: f64) -> f64 {
     (a - b).abs() / (a.abs() + b.abs() + 1e-9)
 }
 
-fn get_test_model_path() -> std::path::PathBuf {
+fn get_test_model_path() -> PathBuf {
+    if let Ok(p) = std::env::var("CERA_TEST_GEMMA4_GGUF") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return path;
+        }
+    }
+    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
+        let path = PathBuf::from(d).join("test_gemma4.gguf");
+        if path.exists() {
+            return path;
+        }
+    }
+    let target_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/oracle/models")
+        .join("test_gemma4.gguf");
+    if target_path.exists() {
+        return target_path;
+    }
+    let root_target_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../target/oracle/models")
+        .join("test_gemma4.gguf");
+    if root_target_path.exists() {
+        return root_target_path;
+    }
     std::env::temp_dir().join("test_gemma4.gguf")
 }
 
@@ -24,6 +48,9 @@ fn ensure_test_model(path: &Path) -> bool {
     *INIT.get_or_init(|| {
         if path.exists() && path.metadata().map(|m| m.len() > 1024).unwrap_or(false) {
             return true;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let script_path = if manifest_dir
@@ -354,4 +381,133 @@ fn gemma4_all_logits_prefill_matches_last() {
             "logits mismatch at vocab idx {i}: forward_prefill={a}, all_logits={b}"
         );
     }
+}
+
+#[test]
+#[should_panic(expected = "Gemma4Model forward expects exactly 1 token")]
+fn gemma4_forward_rejects_multi_token_slice() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        panic!("Gemma4Model forward expects exactly 1 token");
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let _ = model.forward(&[1, 2], 0, &mut state);
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn gemma4_out_of_range_token_panics() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        panic!("token_id out of range");
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let invalid_token = model.config().vocab_size as u32 + 10;
+    let _ = model.forward(&[invalid_token], 0, &mut state);
+}
+
+#[test]
+fn gemma4_single_token_prefill_matches_forward() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state_fwd =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    let mut state_pre =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let tok = 85u32;
+    let logits_fwd = model.forward(&[tok], 0, &mut state_fwd);
+    let logits_pre = model.forward_prefill(&[tok], 0, &mut state_pre);
+
+    assert_eq!(logits_fwd.len(), logits_pre.len());
+    for (i, (&a, &b)) in logits_fwd.iter().zip(logits_pre.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-6,
+            "logits mismatch at vocab idx {i}: forward={a}, prefill={b}"
+        );
+    }
+    assert_eq!(state_fwd.seq_len, state_pre.seq_len);
+}
+
+#[test]
+fn gemma4_forward_empty_tokens_returns_empty() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let logits = model.forward(&[], 0, &mut state);
+    assert!(logits.is_empty());
+    assert_eq!(state.seq_len, 0);
+}
+
+#[test]
+#[should_panic(expected = "must equal state.seq_len")]
+fn gemma4_forward_rejects_divergent_pos() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        panic!("must equal state.seq_len");
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let _ = model.forward(&[85], 5, &mut state);
+}
+
+#[test]
+#[should_panic(expected = "must equal state.seq_len")]
+fn gemma4_prefill_rejects_divergent_start_pos() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        panic!("must equal state.seq_len");
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let _ = model.forward_prefill(&[85, 86], 5, &mut state);
+}
+
+#[test]
+fn gemma4_f16_kv_supported_flag() {
+    let path = get_test_model_path();
+    if !ensure_test_model(&path) {
+        eprintln!("skipping test: gemma4 fixture not available");
+        return;
+    }
+
+    let gguf = GgufFile::open(&path).expect("open test_gemma4.gguf");
+    let model = cera::model::load_model(gguf, Some(&path), 256).expect("load gemma4 model");
+    assert!(model.f16_kv_supported());
 }
