@@ -4331,14 +4331,27 @@ impl Model for Lfm2Model {
     }
 
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
-        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
+        if tokens.is_empty() {
+            return 0;
+        }
+        if tokens.len() > 1 {
+            for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                let _ = self.forward(&[t], pos + i, state);
+            }
+            let last_token = [tokens[tokens.len() - 1]];
+            let logits = self.forward(&last_token, pos + tokens.len() - 1, state);
+            return crate::sampler::argmax(&logits);
+        }
+        if transformer::oracle_dump::is_active() {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
-        assert!(
-            token_id < cfg.vocab_size,
-            "token_id {token_id} out of range (vocab_size={})",
-            cfg.vocab_size
-        );
+        if token_id >= cfg.vocab_size {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
 
         let mut hidden_stack = [0.0f32; 4096];
         let mut hidden_heap;

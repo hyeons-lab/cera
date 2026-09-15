@@ -75,7 +75,7 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
             let b_ptr = b.as_ptr() as usize;
             let c_ptr = c.as_mut_ptr() as usize;
 
-            crate::backend::cpu::par_range(m, 64, move |m_start, m_t| unsafe {
+            crate::backend::cpu::par_range_prefill(m, 64, move |m_start, m_t| unsafe {
                 let a_t = (a_ptr as *const f32).add(m_start * k);
                 let b = b_ptr as *const f32;
                 let c_t = (c_ptr as *mut f32).add(m_start * n);
@@ -269,7 +269,7 @@ pub fn sgemm_rowmajor_nn_parallel(
         let a_ptr = a.as_ptr() as usize;
         let c_ptr = c.as_mut_ptr() as usize;
 
-        crate::backend::cpu::par_range(m, 1, move |m_start, m_t| unsafe {
+        crate::backend::cpu::par_range_prefill(m, 1, move |m_start, m_t| unsafe {
             let b = b_ptr as *const f32;
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);

@@ -261,13 +261,16 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
     // throughput loss on small models). Decline sizing on Darwin unless the user
     // explicitly opted in with pinned arms (CERA_DECODE_NARROW/CERA_DECODE_WIDE)
     // or explicit CERA_DECODE_SIZING=1.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     let allow_sizing = env_overrides().narrow.is_some()
         || env_overrides().wide.is_some()
         || std::env::var("CERA_DECODE_SIZING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .map(|v| {
+                let s = v.trim();
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on")
+            })
             .unwrap_or(false);
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
     let allow_sizing = true;
 
     if allow_sizing

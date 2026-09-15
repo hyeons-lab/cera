@@ -472,7 +472,6 @@ pub(crate) fn gemv_preq(
 }
 
 /// GEMV with pre-quantized Q8_0 input computing argmax directly without writing logits.
-#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 pub(crate) fn gemv_preq_argmax(
     gguf: &GgufFile,
@@ -492,11 +491,13 @@ pub(crate) fn quantize_to_scratch_bufs(
     q8_scales: &mut Vec<f32>,
     q8_quants: &mut Vec<i8>,
 ) {
-    assert_eq!(
-        x.len() % 32,
-        0,
-        "quantize_to_scratch: x.len() must be divisible by 32"
-    );
+    if !x.len().is_multiple_of(32) {
+        debug_assert!(
+            false,
+            "quantize_to_scratch: x.len() must be divisible by 32"
+        );
+        return;
+    }
     let nb = x.len() / 32;
     q8_scales.resize(nb, 0.0);
     q8_quants.resize(x.len(), 0);
@@ -679,13 +680,17 @@ pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
 #[cfg(has_blas)]
 fn blas_cache_weights_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(
-        || match std::env::var("CERA_BLAS_CACHE_WEIGHTS").as_deref() {
-            Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
-            _ => true,
-        },
-    )
+    *ENABLED.get_or_init(|| {
+        std::env::var("CERA_BLAS_CACHE_WEIGHTS")
+            .map(|v| {
+                let s = v.trim();
+                s == "1"
+                    || s.eq_ignore_ascii_case("true")
+                    || s.eq_ignore_ascii_case("yes")
+                    || s.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
@@ -1620,7 +1625,9 @@ pub(crate) fn forward_attn_block(
     // Q8_0 at the layer level, so the integer dot-product path is used.
     #[cfg(target_arch = "aarch64")]
     {
+        let same_k = weights.attn_k.k == weights.attn_q.k && weights.attn_v.k == weights.attn_q.k;
         if lora.is_none()
+            && same_k
             && weights.attn_q.dtype == DType::Q4_0
             && weights.attn_k.dtype == DType::Q4_0
             && weights.attn_v.dtype == DType::Q4_0
@@ -1643,6 +1650,7 @@ pub(crate) fn forward_attn_block(
                 weights.attn_q.k,
             );
         } else if lora.is_none()
+            && same_k
             && weights.attn_q.dtype == DType::Q4KM
             && weights.attn_k.dtype == DType::Q4KM
             && weights.attn_v.dtype == DType::Q4KM
@@ -1665,6 +1673,7 @@ pub(crate) fn forward_attn_block(
                 weights.attn_q.k,
             );
         } else if lora.is_none()
+            && same_k
             && weights.attn_q.dtype == DType::Q5KM
             && weights.attn_k.dtype == DType::Q5KM
             && weights.attn_v.dtype == DType::Q5KM
@@ -1919,6 +1928,10 @@ pub(crate) fn forward_ffn_block(
     #[cfg(target_arch = "aarch64")]
     {
         let can_fuse_swiglu = lora.is_none()
+            && weights.ffn_gate.m == intermediate_size
+            && weights.ffn_up.m == intermediate_size
+            && weights.ffn_gate.k == hidden_size
+            && weights.ffn_up.k == hidden_size
             && ((weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0)
                 || (weights.ffn_gate.dtype == DType::Q4KM && weights.ffn_up.dtype == DType::Q4KM)
                 || (weights.ffn_gate.dtype == DType::Q5KM && weights.ffn_up.dtype == DType::Q5KM));
