@@ -2032,13 +2032,22 @@ impl Session {
 
         if let Err(err) = run_append(self) {
             self.model.truncate_kv(&mut self.state, initial_pos);
-            self.current_pos = initial_pos;
-            self.position_atomic
-                .store(initial_pos as u32, std::sync::atomic::Ordering::Relaxed);
-            self.token_history.truncate(initial_history_len);
-            self.last_logits = initial_logits;
-            self.prefill_tokens = initial_prefill_tokens;
-            self.prefill_elapsed = initial_prefill_elapsed;
+            self.current_pos = self.state.seq_len;
+            self.position_atomic.store(
+                self.state.seq_len as u32,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.token_history
+                .truncate(self.state.seq_len.min(initial_history_len));
+            if self.state.seq_len == 0 {
+                self.last_logits = None;
+                self.prefill_tokens = 0;
+                self.prefill_elapsed = std::time::Duration::ZERO;
+            } else {
+                self.last_logits = initial_logits;
+                self.prefill_tokens = initial_prefill_tokens;
+                self.prefill_elapsed = initial_prefill_elapsed;
+            }
             return Err(err);
         }
 

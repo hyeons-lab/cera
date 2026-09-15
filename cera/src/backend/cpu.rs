@@ -6131,6 +6131,24 @@ pub fn mamba2_conv1d_step(
         return;
     }
 
+    if d_conv == 4 {
+        let (tap0, tap1, tap2) = (0, conv_dim, 2 * conv_dim);
+        for ch in 0..conv_dim {
+            let w_base = ch * 4;
+            let mut sum = conv_state[tap0 + ch] * conv_weight[w_base]
+                + conv_state[tap1 + ch] * conv_weight[w_base + 1]
+                + conv_state[tap2 + ch] * conv_weight[w_base + 2]
+                + x_bc[ch] * conv_weight[w_base + 3];
+            if let Some(bias) = conv_bias {
+                sum += bias[ch];
+            }
+            out[ch] = sum / (1.0 + (-sum).exp());
+        }
+        conv_state.copy_within(conv_dim.., 0);
+        conv_state[2 * conv_dim..3 * conv_dim].copy_from_slice(&x_bc[..conv_dim]);
+        return;
+    }
+
     for ch in 0..conv_dim {
         let mut sum = 0.0f32;
         let w_ch = &conv_weight[ch * d_conv..ch * d_conv + d_conv];
@@ -6151,7 +6169,7 @@ pub fn mamba2_conv1d_step(
             conv_state.copy_within(conv_dim.., 0);
         }
         let last_slot = (d_conv - 2) * conv_dim;
-        conv_state[last_slot..last_slot + conv_dim].copy_from_slice(x_bc);
+        conv_state[last_slot..last_slot + conv_dim].copy_from_slice(&x_bc[..conv_dim]);
     }
 }
 
@@ -6216,29 +6234,39 @@ pub fn mamba2_ssd_step(
     {
         return;
     }
+    if let Some(norm_weight) = ssm_norm {
+        let group_size = d_inner / n_group;
+        if norm_weight.len() != d_inner && norm_weight.len() != group_size {
+            return;
+        }
+    }
     let head_dim = d_inner / n_head;
     let heads_per_group = n_head / n_group;
 
     for h in 0..n_head {
         let dt_val = dt[h] + dt_bias[h];
         let dt_soft_plus = softplus(dt_val);
-        let da = (dt_soft_plus * ssm_a[h]).exp();
+        let decay_arg = (dt_soft_plus * ssm_a[h]).min(0.0);
+        let da = decay_arg.exp();
         let g = h / heads_per_group;
         let b_g = &b[g * d_state..(g + 1) * d_state];
         let c_g = &c[g * d_state..(g + 1) * d_state];
         let d_val = ssm_d[h];
+
+        debug_assert_eq!(b_g.len(), d_state);
+        debug_assert_eq!(c_g.len(), d_state);
 
         for i1 in 0..head_dim {
             let ii = h * head_dim + i1;
             let x_val = x[ii];
             let x_dt = x_val * dt_soft_plus;
             let state_row = &mut ssm_state[ii * d_state..(ii + 1) * d_state];
+            debug_assert_eq!(state_row.len(), d_state);
 
             let mut dot = 0.0f32;
-            for k in 0..d_state {
-                let s = state_row[k] * da + b_g[k] * x_dt;
-                state_row[k] = s;
-                dot += s * c_g[k];
+            for ((s, &b_val), &c_val) in state_row.iter_mut().zip(b_g).zip(c_g) {
+                *s = *s * da + b_val * x_dt;
+                dot += *s * c_val;
             }
 
             // Skip connection: y = dot + x * D
@@ -8905,5 +8933,48 @@ mod f16_gemv_tests {
         assert!(y[1].is_finite());
         assert!((ssm_state[0] - 0.5 * std::f32::consts::LN_2).abs() < 1e-5);
         assert!((ssm_state[1] - 1.0 * std::f32::consts::LN_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_mamba2_ssd_step_multi_group() {
+        let d_inner = 4;
+        let d_state = 2;
+        let n_head = 2;
+        let n_group = 2;
+
+        let mut ssm_state = vec![0.0f32; d_inner * d_state];
+        let z = vec![1.0, -0.5, 0.5, 1.0];
+        let x = vec![0.5, 1.5, -1.0, 2.0];
+        let b = vec![1.0, 2.0, 0.5, -0.5];
+        let c = vec![0.5, -0.5, 1.0, 2.0];
+        let dt = vec![0.0, 0.0];
+        let dt_bias = vec![0.0, 0.0];
+        let ssm_a = vec![-1.0, -0.5];
+        let ssm_d = vec![0.2, 0.1];
+        let ssm_norm = vec![1.0, 1.0, 1.0, 1.0];
+        let mut y = vec![0.0f32; d_inner];
+
+        mamba2_ssd_step(
+            &z,
+            &x,
+            &b,
+            &c,
+            &dt,
+            &dt_bias,
+            &ssm_a,
+            &ssm_d,
+            Some(&ssm_norm),
+            1e-5,
+            &mut ssm_state,
+            d_inner,
+            d_state,
+            n_head,
+            n_group,
+            &mut y,
+        );
+
+        for val in &y {
+            assert!(val.is_finite());
+        }
     }
 }
