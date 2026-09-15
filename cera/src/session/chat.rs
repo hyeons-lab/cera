@@ -34,19 +34,36 @@ struct CoreExecution {
     model: Weak<dyn Model>,
 }
 
-fn core_chat(session: Session) -> Result<Chat<CoreExecution>, ValidationError> {
+#[allow(clippy::result_large_err)]
+fn core_chat(session: Session) -> Result<Chat<CoreExecution>, (Session, ValidationError)> {
     let tokenizer = session.tokenizer_arc();
-    let profile = Profile::discover(tokenizer.clone())?;
+    let profile = match Profile::discover(tokenizer.clone()) {
+        Ok(p) => p,
+        Err(err) => return Err((session, err)),
+    };
     let keep = session.config.n_keep;
     let execution = CoreExecution {
         tokenizer,
         model: Arc::downgrade(&session.model),
         session,
     };
-    Chat::new(execution, profile, keep)
+    Chat::new(execution, profile, keep).map_err(|(exec, err)| (exec.into_session(), err))
+}
+
+impl std::fmt::Debug for CoreExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreExecution")
+            .field("pos", &self.session.current_pos)
+            .field("usable", &self.session.usable)
+            .finish()
+    }
 }
 
 impl CoreExecution {
+    pub fn into_session(self) -> Session {
+        self.session
+    }
+
     // Holding the `Weak` pins the model allocation without retaining a swapped
     // model's weights, so an address comparison cannot alias a reused block.
     fn validate_identity(&self) -> Result<(), ValidationError> {
@@ -164,9 +181,16 @@ impl Execution for CoreExecution {
         // outlive a cache the backend could not certify, on error or unwind.
         self.session.usable = false;
         self.session.last_logits = None;
-        self.session.reset_execution_checked()?;
-        self.session.usable = true;
-        self.session.last_ingest_recovery = None;
+        match self.session.reset_execution_checked() {
+            Ok(()) => {
+                self.session.usable = true;
+                self.session.last_ingest_recovery = None;
+            }
+            Err(ref err) if err.is_checked_kv_reset_unsupported() => {
+                self.session.reset_realloc_state()?;
+            }
+            Err(err) => return Err(err),
+        }
         if explicit {
             self.session.clear_cancel();
         }
@@ -210,6 +234,21 @@ impl Execution for CoreExecution {
             result: observed.result,
             state,
         }
+    }
+    fn cancel_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.session.cancel_handle())
+    }
+    fn cancel(&self) {
+        self.session.cancel();
+    }
+    fn clear_cancel(&mut self) {
+        self.session.clear_cancel();
+    }
+}
+
+impl Chat<CoreExecution> {
+    pub fn into_session(self) -> Session {
+        self.into_inner().into_session()
     }
 }
 

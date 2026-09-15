@@ -421,6 +421,15 @@ pub enum CeraError {
     Io(#[from] io::Error),
 }
 
+impl CeraError {
+    pub(crate) fn is_checked_kv_reset_unsupported(&self) -> bool {
+        matches!(
+            self,
+            CeraError::Backend(msg) if msg.contains("checked KV reset is not supported")
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -1019,18 +1028,30 @@ impl Session {
     /// reset. Does NOT touch the engine-level disk prefix cache (which lives
     /// on `CeraEngine`, not `Session`). Retains exclusive model ownership.
     /// After failed recovery, this requires a complete checked backend reset;
-    /// unsupported backends require session recreation.
+    /// backends without checked reset fall back to state re-allocation.
     pub fn reset(&mut self) -> Result<(), CeraError> {
         if !self.usable {
-            self.reset_execution_checked()?;
-            self.usable = true;
-            self.last_ingest_recovery = None;
-            self.cancel.store(false, Ordering::Relaxed);
-            return Ok(());
+            match self.reset_execution_checked() {
+                Ok(()) => {
+                    self.usable = true;
+                    self.last_ingest_recovery = None;
+                    self.cancel.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(ref err) if err.is_checked_kv_reset_unsupported() => {
+                    self.reset_realloc_state()?;
+                    self.cancel.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
         }
-        // Re-assert the mode (a no-op for an unchanged one) so a GPU backend
-        // that was somehow reset out of its compressed configuration rebuilds
-        // before the next forward.
+        self.reset_realloc_state()?;
+        self.cancel.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn reset_realloc_state(&mut self) -> Result<(), CeraError> {
         self.model
             .configure_kv_compression(&self.config.kv_compression)?;
         let model_cfg = self.model.config();
@@ -1049,7 +1070,6 @@ impl Session {
         self.state.lora = self.lora.clone();
         self.clear_execution_metadata();
         self.usable = true;
-        self.cancel.store(false, Ordering::Relaxed);
         self.last_ingest_recovery = None;
         Ok(())
     }
@@ -2953,6 +2973,16 @@ impl Session {
         // `generate(N/2)`) hold only at `repetition_penalty == 1.0`; with a
         // penalty active the chained calls see a smaller history window each.
         self.sampler.reset_history();
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("current_pos", &self.current_pos)
+            .field("max_seq_len", &self.max_seq_len)
+            .field("usable", &self.usable)
+            .finish()
     }
 }
 

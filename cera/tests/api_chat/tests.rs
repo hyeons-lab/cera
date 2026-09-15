@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::core_api::CeraError;
 use super::core_api::session::{
@@ -10,6 +11,7 @@ use super::core_api::tokenizer::{BpeTokenizer, ChatMessage, UserMessage, apply_c
 use super::contract::*;
 use super::fixtures::{self, Sink, TraceModel};
 
+#[derive(Debug)]
 struct TraceExecution {
     tokens: Vec<u32>,
     capacity: usize,
@@ -21,6 +23,7 @@ struct TraceExecution {
     panic_append: bool,
     audio: bool,
     invalid_decode: bool,
+    cancel: Arc<AtomicBool>,
     decode: VecDeque<DecodeReport>,
     output: VecDeque<Vec<u32>>,
 }
@@ -38,6 +41,7 @@ impl Default for TraceExecution {
             panic_append: false,
             audio: false,
             invalid_decode: false,
+            cancel: Arc::new(AtomicBool::new(false)),
             decode: VecDeque::new(),
             output: VecDeque::new(),
         }
@@ -113,6 +117,15 @@ impl Execution for TraceExecution {
             sink.on_done(summary.finish_reason.clone());
         }
         report
+    }
+    fn cancel_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.cancel))
+    }
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    fn clear_cancel(&mut self) {
+        self.cancel.store(false, Ordering::Relaxed);
     }
 }
 
@@ -454,29 +467,31 @@ fn unsupported_profile_and_sliding_rejected() {
         Profile::discover(Arc::new(BpeTokenizer::from_vocab(vec![b"a".to_vec()]))),
         Err(ValidationError::UnsupportedProfile)
     ));
-    assert!(matches!(
-        Chat::new(
-            TraceExecution::default(),
-            Profile::discover(fixtures::tokenizer()).unwrap(),
-            1
-        ),
-        Err(ValidationError::SlidingContext)
-    ));
+    let (exec, err) = Chat::new(
+        TraceExecution::default(),
+        Profile::discover(fixtures::tokenizer()).unwrap(),
+        1,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err, ValidationError::SlidingContext);
+    assert_eq!(exec.position(), 0);
 }
 
 #[test]
 fn collection_shares_decode_and_rejects_audio_and_invalid_options() {
-    assert!(matches!(
-        Chat::new(
-            TraceExecution {
-                audio: true,
-                ..Default::default()
-            },
-            Profile::discover(fixtures::tokenizer()).unwrap(),
-            0
-        ),
-        Err(ValidationError::AudioOutput)
-    ));
+    let (exec, err) = Chat::new(
+        TraceExecution {
+            audio: true,
+            ..Default::default()
+        },
+        Profile::discover(fixtures::tokenizer()).unwrap(),
+        0,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err, ValidationError::AudioOutput);
+    assert!(exec.audio);
     let mut active = chat(TraceExecution {
         invalid_decode: true,
         ..Default::default()
@@ -786,6 +801,49 @@ fn public_lfm2_tokenizer_boundary_and_ten_turns() {
     assert_eq!(raw.append_calls, 10);
     assert_eq!(raw.decode_calls, 10);
     assert_eq!(raw.tokens.iter().filter(|&&id| id == 1).count(), 1);
+}
+
+#[test]
+fn non_destructive_session_reclaim_and_into_inner() {
+    let execution = TraceExecution::default();
+    let mut chat = Chat::new(
+        execution,
+        Profile::discover(fixtures::tokenizer()).unwrap(),
+        0,
+    )
+    .ok()
+    .unwrap();
+    let summary = chat.ingest(&user("hello")).unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let reclaimed = chat.into_inner();
+    assert_eq!(reclaimed.position(), summary.input_tokens);
+    assert_eq!(reclaimed.append_calls, 1);
+}
+
+#[test]
+fn cancellation_handle_and_clear_cancel_on_chat() {
+    let execution = TraceExecution::default();
+    let mut chat = Chat::new(
+        execution,
+        Profile::discover(fixtures::tokenizer()).unwrap(),
+        0,
+    )
+    .ok()
+    .unwrap();
+
+    let handle = chat.cancel_handle().expect("cancel handle must exist");
+    assert!(!handle.load(Ordering::Relaxed));
+
+    chat.cancel();
+    assert!(handle.load(Ordering::Relaxed));
+
+    // Clearing cancel does not affect phase or cursor.
+    chat.clear_cancel();
+    assert!(!handle.load(Ordering::Relaxed));
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert_eq!(chat.position(), 0);
 }
 
 // Test-only access does not enter the eventual application-facing contract.
