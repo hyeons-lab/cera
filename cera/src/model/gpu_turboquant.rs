@@ -226,7 +226,7 @@ impl TqGpuCache {
         let mut layers = Vec::with_capacity(n_layers);
         for (i, bt) in config.block_types.iter().enumerate() {
             match bt {
-                BlockType::Attention => {
+                BlockType::Attention | BlockType::ParallelAttentionMamba2 => {
                     let n_kv_heads = config.kv_heads_per_layer[i];
                     // `TqLayout` owns the region formula and guards its own
                     // multiplies, so production and the oracle tests can't drift
@@ -240,7 +240,7 @@ impl TqGpuCache {
                         n_kv_heads,
                     }));
                 }
-                BlockType::GatedConv => layers.push(None),
+                BlockType::GatedConv | BlockType::Mamba2 => layers.push(None),
             }
         }
 
