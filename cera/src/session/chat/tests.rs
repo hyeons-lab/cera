@@ -11,6 +11,7 @@ const NO_FAULT: u8 = 0;
 const PARTIAL_PREFILL: u8 = 1;
 const FORWARD_PANIC: u8 = 2;
 const RESET_ERROR: u8 = 3;
+const RESET_BACKEND_UNSUPPORTED: u8 = 4;
 
 struct StateModel {
     config: ModelConfig,
@@ -160,6 +161,11 @@ impl Model for StateModel {
                 requested_bytes: 1234,
             });
         }
+        if self.fault.load(Ordering::Relaxed) == RESET_BACKEND_UNSUPPORTED {
+            return Err(CeraError::Backend(
+                "checked KV reset is not supported by this backend".into(),
+            ));
+        }
         crate::model::reset_cpu_kv(self, state, compression, max)
     }
 }
@@ -306,10 +312,8 @@ fn actual_cancelled_prefill_resets_honestly_and_preserves_handle_identity() {
     assert_eq!(chat.phase(), SessionPhase::Idle);
     assert!(resident(&mut chat).is_empty());
     assert_eq!(position.load(Ordering::Relaxed), 0);
-    assert!(cancel.load(Ordering::Relaxed));
-    // The chat surface has no cancellation entry points yet; the application
-    // clears its own latch through the handle it cancelled with.
-    cancel.store(false, Ordering::Relaxed);
+    // Clearing cancel through the chat surface restores the latch non-destructively.
+    chat.clear_cancel();
     chat.ingest(&user("retry")).unwrap();
     assert!(position.load(Ordering::Relaxed) > 0);
     assert!(Arc::ptr_eq(
@@ -541,7 +545,9 @@ fn construction_rejects_unsupported_profiles_before_inference() {
         let mut model = state_model(&tokenizer);
         mutate(&mut Arc::get_mut(&mut model).unwrap().config);
         let session = Session::new(model.clone(), tokenizer.clone(), capabilities, config).unwrap();
-        assert_eq!(core_chat(session).err(), Some(expected));
+        let (recovered_session, err) = core_chat(session).unwrap_err();
+        assert_eq!(err, expected);
+        assert!(recovered_session.is_usable());
         assert!(model.calls.lock().unwrap().is_empty());
         assert_eq!(model.resets.load(Ordering::Relaxed), 0);
     }
@@ -912,17 +918,11 @@ fn no_progress_keeps_prompt_ready_and_preserves_future_rng() {
         let result = chat.complete(&zero).unwrap();
         assert_eq!(result.summary.finish_reason, FinishReason::MaxTokens);
         assert_eq!(chat.phase(), SessionPhase::PromptReady);
-        chat.execution_for_test().session.cancel();
+        chat.cancel();
         let result = chat.complete(&opts(temperature)).unwrap();
         assert_eq!(result.summary.finish_reason, FinishReason::Cancelled);
         assert_eq!(chat.phase(), SessionPhase::PromptReady);
-        assert!(
-            !chat
-                .execution_for_test()
-                .session
-                .cancel
-                .load(Ordering::Relaxed)
-        );
+        assert!(!chat.cancel_handle().unwrap().load(Ordering::Relaxed));
         assert_eq!(resident(&mut chat), before);
         assert_eq!(chat.execution_for_test().session.last_logits, logits);
         for c in [&mut chat, &mut reference] {
@@ -1163,4 +1163,130 @@ fn classifier_adapter_is_rejected_before_replacement_reset() {
     chat.replace_messages(&[user("next")]).unwrap();
     assert_eq!(chat.phase(), SessionPhase::PromptReady);
     assert_eq!(chat.complete(&opts(0.0)).unwrap().text, "a");
+}
+
+#[test]
+fn chat_into_session_reclaims_usable_session() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    let summary = chat.ingest(&user("hello world")).unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let session = chat.into_session();
+    assert!(session.is_usable());
+    assert_eq!(session.position() as usize, summary.input_tokens);
+}
+
+#[test]
+fn chat_cancellation_methods_and_handle() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    let handle = chat.cancel_handle().expect("cancel handle must be present");
+    assert!(!handle.load(Ordering::Relaxed));
+
+    chat.cancel();
+    assert!(handle.load(Ordering::Relaxed));
+
+    chat.clear_cancel();
+    assert!(!handle.load(Ordering::Relaxed));
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert_eq!(chat.position(), 0);
+}
+
+#[test]
+fn fallback_reset_for_backend_without_try_reset_kv() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("initial message")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert!(chat.position() > 0);
+
+    // Arm backend fault so try_reset_kv returns the default unsupported Backend error.
+    model
+        .fault
+        .store(RESET_BACKEND_UNSUPPORTED, Ordering::Relaxed);
+
+    // Explicit reset must succeed via fallback re-allocation.
+    chat.reset().unwrap();
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+    assert_eq!(chat.position(), 0);
+    assert!(chat.execution_for_test().session.is_usable());
+
+    // Ingest a fresh message after fallback reset.
+    chat.ingest(&user("after reset")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert!(chat.position() > 0);
+
+    // Replacement reset also uses reset() internally and must succeed via fallback.
+    chat.replace_messages(&[user("replacement message")])
+        .unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+    assert!(chat.execution_for_test().session.is_usable());
+
+    // Verify generation completes successfully.
+    let turn = chat.complete(&opts(0.0)).unwrap();
+    assert_eq!(turn.text, "a");
+}
+
+#[test]
+fn chat_into_session_reclaims_unusable_session_and_recovers_via_reset() {
+    let (model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("first")).unwrap();
+    // Arm forward panic to force SessionPhase::Unusable.
+    model.fault.store(FORWARD_PANIC, Ordering::Relaxed);
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| chat.complete(&opts(0.0))));
+    assert!(result.is_err());
+    assert_eq!(chat.phase(), SessionPhase::Unusable);
+
+    // Reclaim session from unusable chat.
+    let mut session = chat.into_session();
+    assert!(!session.is_usable());
+
+    // Disarm fault and recover session via reset.
+    model.fault.store(NO_FAULT, Ordering::Relaxed);
+    session.reset().unwrap();
+    assert!(session.is_usable());
+    assert_eq!(session.position(), 0);
+}
+
+#[test]
+fn core_chat_refusal_on_unsupported_tokenizer_profile_preserves_session() {
+    let tokenizer = fixtures::tokenizer();
+    let model = state_model(&tokenizer);
+
+    // Create session with minimal tokenizer that has no ChatML template or special tokens.
+    let empty_tokenizer = Arc::new(BpeTokenizer::from_vocab(vec![b"hello".to_vec()]));
+    let empty_session = Session::new(
+        model,
+        empty_tokenizer,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+
+    let (recovered_session, err) = core_chat(empty_session).unwrap_err();
+    assert_eq!(err, ValidationError::UnsupportedProfile);
+    assert!(recovered_session.is_usable());
+    assert_eq!(recovered_session.position(), 0);
+}
+
+#[test]
+fn chat_cancel_handle_mid_turn_cancels_and_recovers() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("long query")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let handle = chat.cancel_handle().expect("cancel handle must exist");
+    // Pre-arm cancellation so decode terminates on first token check.
+    handle.store(true, Ordering::Relaxed);
+
+    let turn = chat.complete(&opts(0.0)).unwrap();
+    assert_eq!(turn.summary.finish_reason, FinishReason::Cancelled);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    // Clear cancel and complete again.
+    chat.clear_cancel();
+    assert!(!handle.load(Ordering::Relaxed));
+    let turn2 = chat.complete(&opts(0.0)).unwrap();
+    assert_eq!(turn2.text, "a");
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
 }

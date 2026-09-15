@@ -5,6 +5,7 @@
 //! This is not a published API or a production decode adapter.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::core_api::CeraError;
 use super::core_api::kv_cache::KvRewindError;
@@ -116,6 +117,7 @@ pub enum DecodeState {
     Unusable,
 }
 
+#[derive(Debug)]
 pub struct DecodeReport {
     pub result: Result<GenerateSummary, CeraError>,
     pub state: DecodeState,
@@ -129,7 +131,7 @@ pub struct DecodeReport {
 /// checked, must not depend on the chat profile, and must preserve external
 /// cancellation when `explicit` is false. A failed reset establishes no usable
 /// state.
-pub trait Execution {
+pub trait Execution: std::fmt::Debug {
     fn position(&self) -> usize;
     fn capacity(&self) -> usize;
     fn audio_output(&self) -> bool;
@@ -140,8 +142,14 @@ pub trait Execution {
     fn append(&mut self, tokens: &[u32]) -> Result<(), IngestError>;
     fn reset(&mut self, explicit: bool) -> Result<(), CeraError>;
     fn decode(&mut self, opts: &GenerateOpts, sink: &mut dyn ModalitySink) -> DecodeReport;
+    fn cancel_handle(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+    fn cancel(&self) {}
+    fn clear_cancel(&mut self) {}
 }
 
+#[derive(Debug)]
 pub struct TurnResult {
     pub text: String,
     pub tokens: Vec<u32>,
@@ -268,14 +276,25 @@ pub struct Chat<E> {
     terminal_committed: Option<bool>,
 }
 
+impl<E: Execution> std::fmt::Debug for Chat<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Chat")
+            .field("execution", &self.execution)
+            .field("phase", &self.phase)
+            .finish()
+    }
+}
+
 impl<E: Execution> Chat<E> {
-    pub fn new(execution: E, profile: Profile, n_keep: u32) -> Result<Self, ValidationError> {
-        execution.validate_prepare()?;
+    pub fn new(execution: E, profile: Profile, n_keep: u32) -> Result<Self, (E, ValidationError)> {
+        if let Err(err) = execution.validate_prepare() {
+            return Err((execution, err));
+        }
         if n_keep != 0 {
-            return Err(ValidationError::SlidingContext);
+            return Err((execution, ValidationError::SlidingContext));
         }
         if execution.audio_output() {
-            return Err(ValidationError::AudioOutput);
+            return Err((execution, ValidationError::AudioOutput));
         }
         let phase = if execution.position() == 0 {
             SessionPhase::Idle
@@ -288,6 +307,22 @@ impl<E: Execution> Chat<E> {
             phase,
             terminal_committed: None,
         })
+    }
+
+    pub fn into_inner(self) -> E {
+        self.execution
+    }
+
+    pub fn cancel_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.execution.cancel_handle()
+    }
+
+    pub fn cancel(&self) {
+        self.execution.cancel();
+    }
+
+    pub fn clear_cancel(&mut self) {
+        self.execution.clear_cancel();
     }
 
     pub fn phase(&self) -> SessionPhase {

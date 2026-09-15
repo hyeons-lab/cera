@@ -255,15 +255,10 @@ the preparation and decode entry points, so both report the same first error.
 Custom nonterminal stops enter Interrupted even
 when no text token was emitted. Both sampling modes reject double completion.
 
-Open design items surfaced by the bridge, deferred to the public facade work:
-the chat surface exposes no cancellation handle and no non-destructive way to
-clear a pending external cancellation (the application keeps the handle it
-cancelled with); replacement and explicit reset always use the checked
-`try_reset_kv` path, so a backend without it (the trait default, including wgpu
-on wasm32) makes replacement fail closed where the legacy `Session::reset` would
-have swapped state, and on such a backend the Unusable phase is terminal because
-`reset()` cannot succeed and the chat cannot hand the consumed Session back; and
-construction consumes the Session on a validation refusal.
+Resolved chat design items (Plan 45):
+- Cancellation management: `Chat` and `Execution` expose `cancel_handle()` (`Option<Arc<AtomicBool>>`), `cancel()`, and `clear_cancel()`, allowing direct thread-safe cancellation and non-destructive clear without altering the chat phase or cursor.
+- Fallback reset for backends without `try_reset_kv`: `CoreExecution::reset` and `Session::reset` attempt checked KV reset first (`reset_execution_checked()`), falling back to state re-allocation (`reset_realloc_state()`) if the backend does not support checked reset (returning `Backend("checked KV reset is not supported by this backend")`). This keeps generic, CPU, and WebGPU backends usable across explicit and replacement resets.
+- Non-destructive Session return: `Chat::new` returns `Result<Self, (E, ValidationError)>` so caller ownership of the underlying `Session` is preserved when validation fails (such as unsupported profiles, sliding context, or audio output). Furthermore, `Chat::into_inner(self) -> E` and `CoreExecution::into_session(self) -> Session` allow extracting the session at any time.
 
 The actual ten-turn fixture uses this flow (private test API):
 

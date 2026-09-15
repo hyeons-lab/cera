@@ -1,7 +1,36 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-14T07:03-0400. This is the current implementation record; the
+Updated: 2026-09-14T17:08-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan45 complete (2026-09-14T17:08-0400)
+
+Resolution of open chat design items prior to foreign lowering: cancellation handle and clear,
+non-destructive session return on refusal and teardown, and fallback reset for backends
+without device-level checked KV reset.
+
+- [x] Cancellation management: Added `cancel_handle()` (`Option<Arc<AtomicBool>>`), `cancel()`,
+      and `clear_cancel()` to `Execution` trait, `Chat<E>`, and `CoreExecution`. Delegated directly
+      to `Session::cancel_handle()`, `Session::cancel()`, and `Session::clear_cancel()`.
+      Clearing cancel is non-destructive, leaving phase and cursor intact.
+- [x] Non-destructive Session return: `Chat::new` returns `Result<Self, (E, ValidationError)>` so
+      callers retain their `Session` on validation refusal (`SlidingContext`, `AudioOutput`,
+      `UnsupportedProfile`). Added `Chat::into_inner(self) -> E`, `CoreExecution::into_session(self) -> Session`,
+      and `Chat<CoreExecution>::into_session(self) -> Session`. Implemented `Debug` for `Session`,
+      `CoreExecution`, `DecodeReport`, and `Chat<E>` to maintain ergonomic `.unwrap()` ergonomics.
+- [x] Fallback reset for models without `try_reset_kv`: `CoreExecution::reset` and `Session::reset`
+      attempt checked KV reset first (`reset_execution_checked()`), falling back to state re-allocation
+      (`reset_realloc_state()`) if the backend returns `Backend("checked KV reset is not supported by this backend")`.
+      This prevents generic architectures and CPU backends from permanent unusable lockout across explicit
+      or replacement resets.
+- [x] Pinned test suites: updated `ISOLATED_CASES` to 15 and `CORE_CASES` to 43 in `tests/api_chat/run.py`.
+- [x] All 43 core transaction tests and 15 isolated contract tests pass; static analysis
+      (`cargo +nightly clippy -p cera --all-targets --all-features -- -D warnings`), formatting
+      (`cargo +stable fmt --check`), API contract checks (`check.py`, 69 surfaces), and runner
+      tests (`test_runner.py`, 6 tests) pass cleanly.
+
+Evidence: `devlog/plans/000341-45-chat-open-design-items.md`.
+Forty-two increments are complete (40 core, two Leap). Next unused sequence is 46.
 
 ## Plan44 complete (2026-09-14T07:03-0400)
 
