@@ -1269,7 +1269,7 @@ impl GpuLfm2Model {
     /// Construct a GPU model with an externally-built [`GpuContext`].
     /// The wasm/WebGPU entry point: callers build the context with
     /// `GpuContext::new_async().await` (browser init is async) and hand it in.
-    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, with classic Mistral served under `llama`).
+    /// Supports LFM2/LFM2-MoE (`lfm2`/`lfm2moe`) and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, `minicpm5`, with classic Mistral served under `llama`).
     pub fn from_gguf_with_ctx(
         gguf: GgufFile,
         context_size: usize,
@@ -1278,7 +1278,7 @@ impl GpuLfm2Model {
     ) -> Result<Self> {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" => {
+            "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" => {
                 let cpu_model = super::llama::LlamaModel::from_gguf_with_id(
                     gguf,
                     context_size,

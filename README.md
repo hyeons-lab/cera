@@ -42,7 +42,7 @@ of these architectures loads:
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
 | `granite` | **IBM Granite 3.x**, and the dense **Granite 4.1** line (3b / 8b / 30b) | text |
-| `minicpm` | **MiniCPM / MiniCPM5** (MiniCPM-1B / 2B) | text |
+| `minicpm`, `minicpm5` | **MiniCPM / MiniCPM5** (MiniCPM-1B / 2B) | text |
 
 No Granite 4.0 model loads today. The 4.0-H hybrids convert to a separate arch
 `granitehybrid`; the non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do

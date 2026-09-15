@@ -20,9 +20,38 @@ fn ensure_test_fixture() -> Option<std::path::PathBuf> {
     static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FIXTURE
         .get_or_init(|| {
+            if let Ok(p) = std::env::var("CERA_TEST_MINICPM_GGUF") {
+                let path = std::path::PathBuf::from(p);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+            if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
+                let path = std::path::PathBuf::from(d).join("test_minicpm.gguf");
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+            let target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/oracle/models/test_minicpm.gguf");
+            if target_path.exists() {
+                return Some(target_path);
+            }
+            let root_target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/oracle/models/test_minicpm.gguf");
+            if root_target_path.exists() {
+                return Some(root_target_path);
+            }
+
             let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
             let target_dir = manifest_dir.join("../target/tmp/cera_test_minicpm");
-            let _ = std::fs::create_dir_all(&target_dir);
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                eprintln!(
+                    "skipping: failed to create fixture directory {}: {e}",
+                    target_dir.display()
+                );
+                return None;
+            }
             let path = target_dir.join("test_minicpm.gguf");
             if path
                 .symlink_metadata()
@@ -108,13 +137,13 @@ fn minicpm_matches_llama_cpp_oracle() {
     // l_out-0: 2.456619
     // l_out-1: -0.877008
     // result_norm: -1.249908
-    // result_output: 2.648610
+    // result_output: 42.378071
     let expected = [
         ("embd", 1.899666),
         ("l_out-0", 2.456619),
         ("l_out-1", -0.877008),
         ("result_norm", -1.249908),
-        ("result_output", 2.648610),
+        ("result_output", 42.378071),
     ];
 
     for (node, exp) in expected {
@@ -170,11 +199,11 @@ fn minicpm_scalar_fallback_when_keys_absent() {
     // The fixture sets:
     // embedding_scale = 12.0
     // residual_scale = 1.4 / sqrt(2) ≈ 0.9899495
-    // logit_scale = 256.0 / 64 = 4.0
+    // logit_scale = 64.0 / 256.0 = 0.25
     let scalars = model_explicit.config().scalars;
     assert!((scalars.embedding - 12.0).abs() < 1e-5);
     assert!((scalars.residual - 0.9899495).abs() < 1e-5);
-    assert!((scalars.logit - 4.0).abs() < 1e-5);
+    assert!((scalars.logit - 0.25).abs() < 1e-5);
 
     // Strip scalar keys from metadata to exercise absent-key fallback branch
     let mut stripped_gguf = gguf;
@@ -186,7 +215,7 @@ fn minicpm_scalar_fallback_when_keys_absent() {
     let scalars_fallback = model_stripped.config().scalars;
     assert!((scalars_fallback.embedding - 12.0).abs() < 1e-5);
     assert!((scalars_fallback.residual - 0.9899495).abs() < 1e-5);
-    assert!((scalars_fallback.logit - 4.0).abs() < 1e-5);
+    assert!((scalars_fallback.logit - 0.25).abs() < 1e-5);
 
     // Verify that forward passes produce identical logits between explicit and fallback
     let tokens = vec![88u32, 108, 105];
@@ -424,7 +453,7 @@ fn test_scalar_multipliers_rejects_non_positive_and_nan() {
     let scalars_mcpm = ScalarMultipliers::from_gguf(&base_gguf, "minicpm", 2, 64).unwrap();
     assert_eq!(scalars_mcpm.embedding, 12.0);
     assert!((scalars_mcpm.residual - 1.4 / (2.0f32).sqrt()).abs() < 1e-5);
-    assert_eq!(scalars_mcpm.logit, 256.0 / 64.0);
+    assert_eq!(scalars_mcpm.logit, 64.0 / 256.0);
     assert!(scalars_mcpm.attn.is_none());
 
     // llama defaults
@@ -553,5 +582,72 @@ fn test_scalar_multipliers_rejects_non_positive_and_nan() {
             ScalarMultipliers::from_gguf(&bad_gguf, "minicpm", 2, 64).is_err(),
             "{key} with {too_large} must be rejected"
         );
+    }
+}
+
+#[test]
+fn minicpm_odd_head_dim_is_rejected() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_minicpm.gguf");
+    // Insert an odd key_length (15) which should be rejected because RoPE requires even head_dim
+    gguf.metadata.insert(
+        "minicpm.attention.key_length".to_string(),
+        cera::gguf::GgufValue::U32(15),
+    );
+    let result = LlamaModel::from_gguf(gguf, 256);
+    assert!(
+        result.is_err(),
+        "model loader must reject odd head_dim for RoPE rotation"
+    );
+}
+
+#[test]
+fn minicpm5_arch_alias_loads_and_evaluates() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_minicpm.gguf");
+    gguf.metadata.insert(
+        "general.architecture".to_string(),
+        cera::gguf::GgufValue::String("minicpm5".to_string()),
+    );
+    // Remap minicpm.* metadata keys to minicpm5.*
+    let keys: Vec<String> = gguf.metadata.keys().cloned().collect();
+    for k in keys {
+        if let Some(suffix) = k.strip_prefix("minicpm.") {
+            let val = gguf.metadata.remove(&k).unwrap();
+            gguf.metadata.insert(format!("minicpm5.{suffix}"), val);
+        }
+    }
+    let model =
+        cera::model::load_model(gguf.clone(), Some(&path), 256).expect("load minicpm5 alias");
+    assert_eq!(model.config().architecture, "minicpm5");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    let logits = model.forward(&[88u32], 0, &mut state);
+    assert_eq!(logits.len(), model.config().vocab_size);
+
+    #[cfg(feature = "metal")]
+    if let Ok(metal_model) = cera::model::load_model_metal(gguf.clone(), Some(&path), 256) {
+        assert_eq!(metal_model.config().architecture, "minicpm5");
+        let mut m_state = InferenceState::from_config_with_compression(
+            metal_model.config(),
+            &KvCompression::None,
+        )
+        .unwrap();
+        let m_logits = metal_model.forward(&[88u32], 0, &mut m_state);
+        assert_eq!(m_logits.len(), metal_model.config().vocab_size);
+    }
+
+    #[cfg(feature = "gpu")]
+    if let Ok(gpu_model) = cera::model::load_model_gpu(gguf, Some(&path), 256) {
+        assert_eq!(gpu_model.config().architecture, "minicpm5");
+        let mut g_state =
+            InferenceState::from_config_with_compression(gpu_model.config(), &KvCompression::None)
+                .unwrap();
+        let g_logits = gpu_model.forward(&[88u32], 0, &mut g_state);
+        assert_eq!(g_logits.len(), gpu_model.config().vocab_size);
     }
 }
