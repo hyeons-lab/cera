@@ -457,6 +457,62 @@ pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) +
     f(0, total_rows);
 }
 
+/// Row-parallel range dispatch for prefill passes: executes `f(start_row, num_rows)` across
+/// the prefill worker pool.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_range_prefill(
+    total_rows: usize,
+    min_rows: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    if total_rows == 0 {
+        return;
+    }
+    let pool = super::threadpool::RowPool::prefill();
+    let nth = pool.num_threads().max(1);
+    let chunk = total_rows.div_ceil(nth).max(min_rows).max(1);
+    let n_chunks = total_rows.div_ceil(chunk);
+    let mut dummy_chunks = [0.0f32; 128];
+    if n_chunks <= dummy_chunks.len() {
+        pool.dispatch_rows_chunked(&mut dummy_chunks[..n_chunks], 1, 1, 1, |t, slice| {
+            let m_start = t * chunk;
+            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
+            if count > 0 {
+                f(m_start, count);
+            }
+        });
+    } else {
+        let mut dummy = vec![0.0f32; n_chunks];
+        pool.dispatch_rows_chunked(&mut dummy, 1, 1, 1, |t, slice| {
+            let m_start = t * chunk;
+            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
+            if count > 0 {
+                f(m_start, count);
+            }
+        });
+    }
+}
+
+/// Wasm32 fallback for `par_range_prefill`: runs serially on the calling thread.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_range_prefill(
+    total_rows: usize,
+    _min_rows: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    f(0, total_rows);
+}
+
+/// Serial fallback for `par_range_prefill` without `parallel`: runs serially on the calling thread.
+#[cfg(not(feature = "parallel"))]
+pub fn par_range_prefill(
+    total_rows: usize,
+    _min_rows: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    f(0, total_rows);
+}
+
 /// On `wasm32` std threads can't spawn, so a `RowPool` would silently degrade
 /// to a single worker. Route through rayon instead — the threaded wasm builds
 /// back it with web workers via `wasm-bindgen-rayon`'s `initThreadPool`.
@@ -1899,31 +1955,23 @@ pub fn gemv_with_preq(
         // that panics is the better failure than one that reads past the end.
         // Same treatment `transformer::gemm_preq` applies.
         DType::Q4_1 if q4_1_gemm_available() => {
-            if !gemm_preq_dispatch(
-                DType::Q4_1,
-                a_quant,
-                &x_scales[..k / 32],
-                &x_quants[..k],
-                y,
-                m,
-                1,
-                k,
-            ) {
-                // Predicate and dispatcher disagreed; see `q4_1_gemm_available`.
+            let ok = unsafe {
+                crate::backend::simd::neon::gemv_q4_1_q8_0_neon(
+                    a_quant, x_scales, x_quants, y, m, k,
+                )
+            };
+            if !ok {
                 gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None);
             }
         }
-        // NOTE: no Q4KM arm here on purpose. Routing Q4_K through a pre-quantized
-        // dispatcher measured a consistent ~5% *regression* vs re-quantizing in
-        // `gemv_dispatch` (interleaved A/B, LFM2.5-350M-Q4_K_M decode) — the
-        // per-call Q8_0 quantization is cheap next to the GEMV, and the shared-
-        // buffer path loses activation cache locality. Q4_K falls through below.
+        DType::Q4KM => unsafe {
+            crate::backend::simd::neon::gemv_q4k_q8_0_neon(a_quant, x_scales, x_quants, y, m, k)
+        },
         _ => gemv_dispatch(dtype, a_quant, x_f32, y, m, k, None),
     }
 }
 
 /// Greedy argmax GEMV: directly computes the argmax over output logits without writing logits to memory.
-#[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 pub fn gemv_with_preq_argmax(
     dtype: DType,
@@ -1934,16 +1982,18 @@ pub fn gemv_with_preq_argmax(
     m: usize,
     k: usize,
 ) -> usize {
-    match dtype {
-        DType::Q6K => unsafe {
+    #[cfg(target_arch = "aarch64")]
+    if dtype == DType::Q6K
+        && crate::backend::cpu_features::cpu_features().tier
+            >= crate::backend::cpu_features::CpuTier::NeonDotprod
+    {
+        return unsafe {
             crate::backend::simd::neon::gemv_q6k_q8_0_argmax_neon(a_quant, x_scales, x_quants, m, k)
-        },
-        _ => {
-            let mut logits = vec![0.0f32; m];
-            gemv_with_preq(dtype, a_quant, x_scales, x_quants, x_f32, &mut logits, m, k);
-            crate::sampler::argmax(&logits) as usize
-        }
+        };
     }
+    let mut logits = vec![0.0f32; m];
+    gemv_with_preq(dtype, a_quant, x_scales, x_quants, x_f32, &mut logits, m, k);
+    crate::sampler::argmax(&logits) as usize
 }
 
 /// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
@@ -1977,15 +2027,39 @@ pub fn gemv_q4_0_fused2_with_q8(
     m: usize,
     k: usize,
 ) {
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4_0>();
+    if k == 0
+        || !k.is_multiple_of(32)
+        || a1_quant.len() < m * row_bytes
+        || a2_quant.len() < m * row_bytes
+        || x_scales.len() < blocks_per_row
+        || x_quants.len() < k
+        || y1.len() < m
+        || y2.len() < m
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_fused2_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_q8_0_fused2_neon(
-            a1_quant, a2_quant, x_scales, x_quants, y1, y2, m, k,
+            a1_quant,
+            a2_quant,
+            x_scales,
+            x_quants,
+            &mut y1[..m],
+            &mut y2[..m],
+            m,
+            k,
         );
     }
 }
 
 /// Fused Gate + Up Q4_0 GEMV with in-register SwiGLU:
-/// `out[r] = silu(gate[r] · x) * (up[r] · x)`.
+/// `out[r] = silu(gate[r] * x) * (up[r] * x)`.
 #[cfg(target_arch = "aarch64")]
 pub fn gemv_q4_0_gate_up_swiglu_with_q8(
     gate_quant: &[u8],
@@ -1996,9 +2070,113 @@ pub fn gemv_q4_0_gate_up_swiglu_with_q8(
     m: usize,
     k: usize,
 ) {
+    let blocks_per_row = k / 32;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4_0>();
+    if k == 0
+        || !k.is_multiple_of(32)
+        || out.len() < m
+        || gate_quant.len() < m * row_bytes
+        || up_quant.len() < m * row_bytes
+        || x_scales.len() < blocks_per_row
+        || x_quants.len() < k
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_gate_up_swiglu_with_q8: buffer bounds mismatch"
+        );
+        return;
+    }
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_gate_up_swiglu_neon(
-            gate_quant, up_quant, x_scales, x_quants, out, m, k,
+            gate_quant,
+            up_quant,
+            x_scales,
+            x_quants,
+            &mut out[..m],
+            m,
+            k,
+        );
+    }
+}
+
+/// Fused Gate + Up Q4_K GEMV with in-register SwiGLU:
+/// `out[r] = silu(gate[r] * x) * (up[r] * x)`.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q4k_gate_up_swiglu_with_q8(
+    gate_quant: &[u8],
+    up_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4KM>();
+    if k == 0
+        || !k.is_multiple_of(256)
+        || out.len() < m
+        || gate_quant.len() < m * row_bytes
+        || up_quant.len() < m * row_bytes
+        || x_scales.len() < k / 32
+        || x_quants.len() < k
+    {
+        debug_assert!(
+            false,
+            "gemv_q4k_gate_up_swiglu_with_q8: buffer bounds mismatch"
+        );
+        return;
+    }
+    unsafe {
+        crate::backend::simd::neon::gemv_q4k_gate_up_swiglu_neon(
+            gate_quant,
+            up_quant,
+            x_scales,
+            x_quants,
+            &mut out[..m],
+            m,
+            k,
+        );
+    }
+}
+
+/// Fused Q5_K gate + up GEMV and SwiGLU activation:
+/// `out[r] = silu(gate[r] * x) * (up[r] * x)`.
+#[cfg(target_arch = "aarch64")]
+pub fn gemv_q5k_gate_up_swiglu_with_q8(
+    gate_quant: &[u8],
+    up_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ5K>();
+    if k == 0
+        || !k.is_multiple_of(256)
+        || out.len() < m
+        || gate_quant.len() < m * row_bytes
+        || up_quant.len() < m * row_bytes
+        || x_scales.len() < k / 32
+        || x_quants.len() < k
+    {
+        debug_assert!(
+            false,
+            "gemv_q5k_gate_up_swiglu_with_q8: buffer bounds mismatch"
+        );
+        return;
+    }
+    unsafe {
+        crate::backend::simd::neon::gemv_q5k_gate_up_swiglu_neon(
+            gate_quant,
+            up_quant,
+            x_scales,
+            x_quants,
+            &mut out[..m],
+            m,
+            k,
         );
     }
 }
@@ -2023,34 +2201,150 @@ pub fn gemv_q4_0_concat3_with_q8(
 ) {
     let blocks_per_row = k / 32;
     let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4_0>();
-    assert!(
-        k.is_multiple_of(32),
-        "gemv_q4_0_concat3_with_q8: k must be a multiple of 32"
-    );
-    assert!(
-        a1_quant.len() >= m1 * row_bytes,
-        "a1_quant buffer underflow"
-    );
-    assert!(
-        a2_quant.len() >= m2 * row_bytes,
-        "a2_quant buffer underflow"
-    );
-    assert!(
-        a3_quant.len() >= m3 * row_bytes,
-        "a3_quant buffer underflow"
-    );
-    assert!(
-        x_scales.len() >= blocks_per_row,
-        "x_scales buffer underflow"
-    );
-    assert!(x_quants.len() >= k, "x_quants buffer underflow");
-    assert!(y1.len() >= m1, "y1 buffer underflow");
-    assert!(y2.len() >= m2, "y2 buffer underflow");
-    assert!(y3.len() >= m3, "y3 buffer underflow");
+    if k == 0
+        || !k.is_multiple_of(32)
+        || a1_quant.len() < m1 * row_bytes
+        || a2_quant.len() < m2 * row_bytes
+        || a3_quant.len() < m3 * row_bytes
+        || x_scales.len() < blocks_per_row
+        || x_quants.len() < k
+        || y1.len() < m1
+        || y2.len() < m2
+        || y3.len() < m3
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_concat3_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
 
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_q8_0_concat3_neon(
-            a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
+            a1_quant,
+            a2_quant,
+            a3_quant,
+            x_scales,
+            x_quants,
+            &mut y1[..m1],
+            &mut y2[..m2],
+            &mut y3[..m3],
+            m1,
+            m2,
+            m3,
+            k,
+        );
+    }
+}
+
+/// Unified 3-matrix Q4_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
+/// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4k_concat3_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    a3_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ4KM>();
+    if k == 0
+        || !k.is_multiple_of(256)
+        || a1_quant.len() < m1 * row_bytes
+        || a2_quant.len() < m2 * row_bytes
+        || a3_quant.len() < m3 * row_bytes
+        || x_scales.len() < k / 32
+        || x_quants.len() < k
+        || y1.len() < m1
+        || y2.len() < m2
+        || y3.len() < m3
+    {
+        debug_assert!(
+            false,
+            "gemv_q4k_concat3_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
+
+    unsafe {
+        crate::backend::simd::neon::gemv_q4k_q8_0_concat3_neon(
+            a1_quant,
+            a2_quant,
+            a3_quant,
+            x_scales,
+            x_quants,
+            &mut y1[..m1],
+            &mut y2[..m2],
+            &mut y3[..m3],
+            m1,
+            m2,
+            m3,
+            k,
+        );
+    }
+}
+
+/// Unified 3-matrix Q5_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
+/// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q5k_concat3_with_q8(
+    a1_quant: &[u8],
+    a2_quant: &[u8],
+    a3_quant: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    let blocks_per_row = k / 256;
+    let row_bytes = blocks_per_row * std::mem::size_of::<crate::quant::BlockQ5K>();
+    if k == 0
+        || !k.is_multiple_of(256)
+        || a1_quant.len() < m1 * row_bytes
+        || a2_quant.len() < m2 * row_bytes
+        || a3_quant.len() < m3 * row_bytes
+        || x_scales.len() < k / 32
+        || x_quants.len() < k
+        || y1.len() < m1
+        || y2.len() < m2
+        || y3.len() < m3
+    {
+        debug_assert!(
+            false,
+            "gemv_q5k_concat3_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
+
+    unsafe {
+        crate::backend::simd::neon::gemv_q5k_q8_0_concat3_neon(
+            a1_quant,
+            a2_quant,
+            a3_quant,
+            x_scales,
+            x_quants,
+            &mut y1[..m1],
+            &mut y2[..m2],
+            &mut y3[..m3],
+            m1,
+            m2,
+            m3,
+            k,
         );
     }
 }
@@ -2349,8 +2643,21 @@ pub fn gemv_q4_1_f32(
         // same function `quantize_columns` calls is what makes the two paths
         // provably identical rather than incidentally close.
         quantize_f32_to_q8_0_into(x, q8_scales, q8_quants);
-        if gemm_preq_dispatch(DType::Q4_1, a_quant, q8_scales, q8_quants, y, m, 1, k) {
-            return;
+        #[cfg(target_arch = "aarch64")]
+        {
+            if unsafe {
+                crate::backend::simd::neon::gemv_q4_1_q8_0_neon(
+                    a_quant, q8_scales, q8_quants, y, m, k,
+                )
+            } {
+                return;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            if gemm_preq_dispatch(DType::Q4_1, a_quant, q8_scales, q8_quants, y, m, 1, k) {
+                return;
+            }
         }
     }
 
@@ -2760,6 +3067,34 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     }
 }
 
+thread_local! {
+    static GEMV_DISPATCH_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i8>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Executes `f` with the caller-provided scratch buffer, or falls back to thread-local scratch.
+/// Handles re-entrancy safely without panicking by allocating temporary buffers if needed.
+#[inline]
+fn with_gemv_scratch<R>(
+    q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    f: impl FnOnce(&mut Vec<f32>, &mut Vec<i8>) -> R,
+) -> R {
+    if let Some((s, q)) = q8_scratch {
+        f(s, q)
+    } else {
+        GEMV_DISPATCH_SCRATCH.with(|cell| {
+            if let Ok(mut borrow) = cell.try_borrow_mut() {
+                let (s, q) = &mut *borrow;
+                f(s, q)
+            } else {
+                let mut s = Vec::new();
+                let mut q = Vec::new();
+                f(&mut s, &mut q)
+            }
+        })
+    }
+}
+
 /// Dispatch GEMV based on dtype: `y[m] = W[m,k] @ x[k]`.
 /// For Q4_0, pass scratch buffers to avoid per-call allocation.
 pub fn gemv_dispatch(
@@ -2776,9 +3111,6 @@ pub fn gemv_dispatch(
     // Written out, that is 12-18 lines per (dtype x tier) pair and six pairs;
     // the repetition is how the NEON, VNNI and AVX2 arms drift apart.
     //
-    // `q8_scratch` is moved by the `Some` arm, which is sound only because each
-    // expansion `return`s: the move sits on a diverging path, so a later
-    // expansion still sees it live.
     // Cfg'd for the same reason `int8_gemm_kernels!` is: an uninvoked
     // `macro_rules!` is an `unused macro definition` warning on every target
     // with no SIMD K-quant GEMV (wasm32, riscv64), and the clippy leg that
@@ -2786,45 +3118,28 @@ pub fn gemv_dispatch(
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     macro_rules! kq_gemv {
         ($f:path) => {{
-            match q8_scratch {
-                Some((scales, quants)) => unsafe { $f(data, x, y, m, k, scales, quants) },
-                None => {
-                    let mut s = Vec::new();
-                    let mut q = Vec::new();
-                    unsafe { $f(data, x, y, m, k, &mut s, &mut q) }
-                }
-            }
+            with_gemv_scratch(q8_scratch, |s, q| unsafe {
+                $f(data, x, y, m, k, s, q);
+            });
             return;
         }};
     }
 
     match dtype {
         DType::Q4_0 => {
-            if let Some((scales, quants)) = q8_scratch {
-                gemv_q4_0_f32(data, x, y, m, k, scales, quants);
-            } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q4_0_f32(data, x, y, m, k, &mut s, &mut q);
-            }
+            with_gemv_scratch(q8_scratch, |s, q| {
+                gemv_q4_0_f32(data, x, y, m, k, s, q);
+            });
         }
         DType::Q8_0 => {
-            if let Some((scales, quants)) = q8_scratch {
-                gemv_q8_0_f32(data, x, y, m, k, scales, quants);
-            } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q8_0_f32(data, x, y, m, k, &mut s, &mut q);
-            }
+            with_gemv_scratch(q8_scratch, |s, q| {
+                gemv_q8_0_f32(data, x, y, m, k, s, q);
+            });
         }
         DType::Q4_1 => {
-            if let Some((scales, quants)) = q8_scratch {
-                gemv_q4_1_f32(data, x, y, m, k, scales, quants);
-            } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q4_1_f32(data, x, y, m, k, &mut s, &mut q);
-            }
+            with_gemv_scratch(q8_scratch, |s, q| {
+                gemv_q4_1_f32(data, x, y, m, k, s, q);
+            });
         }
         DType::F32 => gemv_f32(data, x, y, m, k),
         DType::F16 => gemv_f16(data, x, y, m, k),
@@ -2848,9 +3163,9 @@ pub fn gemv_dispatch(
                 if avx2_int8_available() {
                     kq_gemv!(crate::backend::simd::avx2_int8::gemv_q6k_f32);
                 }
-                let mut s = Vec::new();
-                let mut q = Vec::new();
-                gemv_q6k_f32(data, x, y, m, k, &mut s, &mut q);
+                with_gemv_scratch(q8_scratch, |s, q| {
+                    gemv_q6k_f32(data, x, y, m, k, s, q);
+                });
             }
         }
         DType::Q4KM => {
@@ -2879,7 +3194,11 @@ pub fn gemv_dispatch(
             #[cfg(not(target_arch = "aarch64"))]
             gemv_q5km_f32(data, x, y, m, k);
         }
-        _ => panic!("gemv_dispatch: unsupported dtype {:?}", dtype),
+        _ => {
+            tracing::error!("gemv_dispatch: unsupported dtype {:?}", dtype);
+            debug_assert!(false, "gemv_dispatch: unsupported dtype {:?}", dtype);
+            y.fill(0.0);
+        }
     }
 }
 
@@ -3003,14 +3322,19 @@ pub fn rmsnorm_and_quantize_q8_0(
     quants: &mut [i8],
     out_normed: Option<&mut [f32]>,
 ) {
-    assert_eq!(x.len(), weight.len());
     let n = x.len();
-    assert!(n.is_multiple_of(32));
-    let n_blocks = n / 32;
-    assert!(scales.len() >= n_blocks);
-    assert!(quants.len() >= n);
-    if let Some(ref out) = out_normed {
-        assert!(out.len() >= n);
+    if n == 0
+        || !n.is_multiple_of(32)
+        || x.len() != weight.len()
+        || scales.len() < n / 32
+        || quants.len() < n
+        || out_normed.as_ref().is_some_and(|out| out.len() < n)
+    {
+        debug_assert!(
+            false,
+            "rmsnorm_and_quantize_q8_0: buffer length or alignment mismatch"
+        );
+        return;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3022,6 +3346,7 @@ pub fn rmsnorm_and_quantize_q8_0(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
+        let n_blocks = n / 32;
         let mut sum_sq = 0.0f64;
         for &v in x.iter() {
             sum_sq += (v as f64) * (v as f64);

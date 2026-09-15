@@ -1080,6 +1080,7 @@ fn test_450m_prefill_phase_profile() {
 
 #[test]
 #[ignore]
+#[cfg(target_arch = "aarch64")]
 fn test_cpu_gemv_microbench() {
     use cera::backend::cpu;
 
