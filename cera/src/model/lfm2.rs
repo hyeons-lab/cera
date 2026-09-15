@@ -4351,10 +4351,10 @@ impl Model for Lfm2Model {
         self.dequantize_row_into(&self.embd_ref, token_id, hidden);
         self.run_layers(hidden, pos, state);
 
-        let profile = Self::profile_decode_enabled();
-        let t_lm = std::time::Instant::now();
         #[cfg(target_arch = "aarch64")]
         if self.embd_ref.dtype == DType::Q6K {
+            let profile = Self::profile_decode_enabled();
+            let t_lm = std::time::Instant::now();
             let res = transformer::gemv_preq_argmax(
                 &self.gguf,
                 &self.embd_ref,
