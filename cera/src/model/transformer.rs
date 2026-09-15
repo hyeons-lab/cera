@@ -1870,11 +1870,12 @@ pub(crate) fn forward_ffn_block(
 ) {
     let lora = state.lora.clone();
     #[cfg(target_arch = "aarch64")]
+    let can_fuse_swiglu = activation == FfnActivation::Swiglu
+        && lora.is_none()
+        && weights.ffn_gate.dtype == DType::Q4_0
+        && weights.ffn_up.dtype == DType::Q4_0;
+    #[cfg(target_arch = "aarch64")]
     {
-        let can_fuse_swiglu = activation == FfnActivation::Swiglu
-            && lora.is_none()
-            && weights.ffn_gate.dtype == DType::Q4_0
-            && weights.ffn_up.dtype == DType::Q4_0;
         if can_fuse_swiglu {
             let g_data = weight_data(gguf, weights.ffn_gate);
             let u_data = weight_data(gguf, weights.ffn_up);
@@ -1936,9 +1937,7 @@ pub(crate) fn forward_ffn_block(
     }
 
     #[cfg(target_arch = "aarch64")]
-    let fused_swiglu_done = lora.is_none()
-        && weights.ffn_gate.dtype == DType::Q4_0
-        && weights.ffn_up.dtype == DType::Q4_0;
+    let fused_swiglu_done = can_fuse_swiglu;
     #[cfg(not(target_arch = "aarch64"))]
     let fused_swiglu_done = false;
 

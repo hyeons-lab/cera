@@ -106,16 +106,23 @@ impl ScalarMultipliers {
         let residual = gguf
             .get_f32(&format!("{prefix}.residual_scale"))
             .unwrap_or(1.0);
+        ensure!(
+            embedding.is_finite() && residual.is_finite(),
+            "{prefix} embedding and residual scales must be finite"
+        );
         // llama.cpp treats a stored `attention.scale == 0.0` as "absent ⇒ use
         // 1/sqrt(head_dim)", so map Some(0.0) → None to match (a literal 0.0
         // would otherwise zero every attention score).
         let attn = gguf
             .get_f32(&format!("{prefix}.attention.scale"))
-            .filter(|&s| s != 0.0);
+            .filter(|&s| s.is_finite() && s > 0.0);
         let logit = gguf
             .get_f32(&format!("{prefix}.logit_scale"))
             .unwrap_or(1.0);
-        ensure!(logit != 0.0, "{prefix}.logit_scale must be non-zero");
+        ensure!(
+            logit.is_finite() && logit > 0.0,
+            "{prefix}.logit_scale must be positive and finite"
+        );
         Ok(Self {
             embedding,
             residual,

@@ -3137,7 +3137,7 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    if len >= 1024 {
+    if len >= 2048 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -3158,6 +3158,20 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     }
 }
 
+/// Scalar GeLU approximation matching `ggml_gelu` (tanh-form).
+#[inline(always)]
+pub fn gelu_approx_f32(x: f32) -> f32 {
+    if x <= -10.0 {
+        return 0.0;
+    } else if x >= 10.0 {
+        return x;
+    }
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
+    const COEF: f32 = 0.044_715;
+    let inner = SQRT_2_OVER_PI * (x + COEF * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
 /// Fused GeLU activation + element-wise multiply: gate = gelu(gate) * up.
 /// Uses the tanh approximation matching [`gelu_inplace`].
 pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
@@ -3165,9 +3179,7 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
-    const COEF: f32 = 0.044_715;
-    if len >= 1024 {
+    if len >= 2048 {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -3178,16 +3190,12 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
                 )
             };
             for (g, &u) in g_chunk.iter_mut().zip(u_chunk.iter()) {
-                let gv = *g;
-                let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
-                *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+                *g = gelu_approx_f32(*g) * u;
             }
         });
     } else {
         for (g, &u) in gate.iter_mut().zip(up.iter()) {
-            let gv = *g;
-            let inner = SQRT_2_OVER_PI * (gv + COEF * gv * gv * gv);
-            *g = 0.5 * gv * (1.0 + inner.tanh()) * u;
+            *g = gelu_approx_f32(*g) * u;
         }
     }
 }
@@ -3195,11 +3203,11 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
 /// Logit soft-capping in-place: x = cap * tanh(x / cap).
 /// Used by Gemma 2 for attention scores and final output logits.
 pub fn softcap_inplace(x: &mut [f32], cap: f32) {
-    if cap <= 0.0 {
+    if !cap.is_finite() || cap <= 0.0 {
         return;
     }
     let inv_cap = 1.0 / cap;
-    if x.len() >= 1024 {
+    if x.len() >= 2048 {
         let chunk_size = 512;
         par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
             for v in chunk.iter_mut() {
@@ -3335,12 +3343,8 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
 /// wrong variant degrades downstream output noticeably even though
 /// each individual call looks fine.
 pub fn gelu_inplace(x: &mut [f32]) {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/π)
-    const COEF: f32 = 0.044_715;
     for v in x.iter_mut() {
-        let xv = *v;
-        let inner = SQRT_2_OVER_PI * (xv + COEF * xv * xv * xv);
-        *v = 0.5 * xv * (1.0 + inner.tanh());
+        *v = gelu_approx_f32(*v);
     }
 }
 
@@ -7008,19 +7012,20 @@ mod tests {
             );
         }
 
-        // Test parallel branch (len >= 1024)
-        let n = 2048;
-        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
-        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
-        let mut ref_large = gate_large.clone();
-        silu_inplace(&mut ref_large);
-        mul_inplace(&mut ref_large, &up_large);
-        silu_mul_inplace(&mut gate_large, &up_large);
-        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
-            assert!(
-                (got - expected).abs() < 1e-5,
-                "silu_mul large mismatch at {i}: got {got}, expected {expected}"
-            );
+        // Test serial and parallel branches (threshold >= 2048)
+        for n in [1025, 2048, 2049, 3072] {
+            let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+            let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+            let mut ref_large = gate_large.clone();
+            silu_inplace(&mut ref_large);
+            mul_inplace(&mut ref_large, &up_large);
+            silu_mul_inplace(&mut gate_large, &up_large);
+            for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+                assert!(
+                    (got - expected).abs() < 1e-5,
+                    "silu_mul large mismatch for n={n} at {i}: got {got}, expected {expected}"
+                );
+            }
         }
     }
 
@@ -7043,20 +7048,25 @@ mod tests {
             );
         }
 
-        // Test parallel branch (len >= 1024)
-        let n = 2048;
-        let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
-        let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
-        let mut ref_large = gate_large.clone();
-        gelu_inplace(&mut ref_large);
-        mul_inplace(&mut ref_large, &up_large);
-        gelu_mul_inplace(&mut gate_large, &up_large);
-        for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
-            assert!(
-                (got - expected).abs() < 1e-5,
-                "gelu_mul large mismatch at {i}: got {got}, expected {expected}"
-            );
+        // Test serial and parallel branches (threshold >= 2048)
+        for n in [1025, 2048, 2049, 3072] {
+            let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+            let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
+            let mut ref_large = gate_large.clone();
+            gelu_inplace(&mut ref_large);
+            mul_inplace(&mut ref_large, &up_large);
+            gelu_mul_inplace(&mut gate_large, &up_large);
+            for (i, (&got, &expected)) in gate_large.iter().zip(ref_large.iter()).enumerate() {
+                assert!(
+                    (got - expected).abs() < 1e-5,
+                    "gelu_mul large mismatch for n={n} at {i}: got {got}, expected {expected}"
+                );
+            }
         }
+
+        // Test extreme value saturation
+        assert_eq!(gelu_approx_f32(-50.0), 0.0);
+        assert_eq!(gelu_approx_f32(50.0), 50.0);
     }
 
     #[test]
@@ -7074,16 +7084,29 @@ mod tests {
             );
         }
 
-        // Test parallel branch (len >= 1024)
-        let n = 2048;
-        let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
-        let expected_large: Vec<f32> = x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
-        softcap_inplace(&mut x_large, cap);
-        for (i, (&got, &exp)) in x_large.iter().zip(expected_large.iter()).enumerate() {
-            assert!(
-                (got - exp).abs() < 1e-5,
-                "softcap large mismatch at {i}: got {got}, expected {exp}"
+        // Test non-positive or non-finite cap no-ops
+        let original = vec![1.0, 2.0, 3.0];
+        for invalid_cap in [0.0, -10.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut test_vec = original.clone();
+            softcap_inplace(&mut test_vec, invalid_cap);
+            assert_eq!(
+                test_vec, original,
+                "softcap with cap={invalid_cap} must no-op"
             );
+        }
+
+        // Test serial and parallel branches (threshold >= 2048)
+        for n in [1025, 1537, 2048, 2049, 3072] {
+            let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
+            let expected_large: Vec<f32> =
+                x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
+            softcap_inplace(&mut x_large, cap);
+            for (i, (&got, &exp)) in x_large.iter().zip(expected_large.iter()).enumerate() {
+                assert!(
+                    (got - exp).abs() < 1e-5,
+                    "softcap large mismatch for n={n} at {i}: got {got}, expected {exp}"
+                );
+            }
         }
     }
 

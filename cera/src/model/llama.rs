@@ -202,8 +202,12 @@ impl LlamaModel {
             _ => FfnActivation::Swiglu,
         };
 
-        let attn_logit_softcapping = gguf.get_f32(&format!("{prefix}.attn_logit_softcapping"));
-        let final_logit_softcapping = gguf.get_f32(&format!("{prefix}.final_logit_softcapping"));
+        let attn_logit_softcapping = gguf
+            .get_f32(&format!("{prefix}.attn_logit_softcapping"))
+            .filter(|&c| c.is_finite() && c > 0.0);
+        let final_logit_softcapping = gguf
+            .get_f32(&format!("{prefix}.final_logit_softcapping"))
+            .filter(|&c| c.is_finite() && c > 0.0);
 
         // Granite 3.x scalar multipliers (embedding/residual/attention/logit).
         // Absent on every other arch ⇒ identity, so this is a no-op for
@@ -276,6 +280,15 @@ impl LlamaModel {
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads);
         ensure!(head_dim > 0, "head_dim must be > 0");
+        if gguf
+            .get_u32(&format!("{prefix}.attention.key_length"))
+            .is_none()
+        {
+            ensure!(
+                hidden_size.is_multiple_of(n_heads),
+                "hidden_size ({hidden_size}) must be a multiple of n_heads ({n_heads})"
+            );
+        }
 
         let block_types = vec![BlockType::Attention; n_layers];
         let kv_heads_per_layer = vec![n_kv_heads; n_layers];
@@ -304,6 +317,11 @@ impl LlamaModel {
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
         let output_norm_weight = gguf.get_tensor("output_norm.weight")?.to_f32_vec();
+        ensure!(
+            output_norm_weight.len() == hidden_size,
+            "output_norm length {} != hidden_size ({hidden_size})",
+            output_norm_weight.len()
+        );
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
@@ -317,6 +335,10 @@ impl LlamaModel {
         let mut layer_refs = Vec::with_capacity(n_layers);
 
         for i in 0..n_layers {
+            // Note on Gemma 2 RMSNorm: Hugging Face checkpoints store weights with
+            // an implicit +1.0 unit offset (x * (1.0 + w)), but standard GGUF converters
+            // fold the +1.0 offset directly into the exported tensor data. Standard
+            // cpu::rmsnorm without runtime offset addition matches upstream GGUF semantics.
             let attn_norm_name = format!("blk.{i}.attn_norm.weight");
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
                 gguf.get_tensor(&attn_norm_name)?.to_f32_vec()
@@ -325,6 +347,13 @@ impl LlamaModel {
             } else {
                 bail!("missing required tensor `{attn_norm_name}` for PreNorm architecture");
             };
+            if norm_order == NormOrder::PreNorm {
+                ensure!(
+                    attn_norm.len() == hidden_size,
+                    "layer {i} {attn_norm_name} length {} != hidden_size ({hidden_size})",
+                    attn_norm.len()
+                );
+            }
             attn_norm_weights.push(attn_norm);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
@@ -335,6 +364,13 @@ impl LlamaModel {
             } else {
                 bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
             };
+            if norm_order == NormOrder::PreNorm {
+                ensure!(
+                    ffn_norm.len() == hidden_size,
+                    "layer {i} {ffn_norm_name} length {} != hidden_size ({hidden_size})",
+                    ffn_norm.len()
+                );
+            }
             ffn_norm_weights.push(ffn_norm);
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
@@ -346,6 +382,19 @@ impl LlamaModel {
             .find(|name| gguf.tensors.contains_key(name))
             .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
             .transpose()?;
+            if norm_order == NormOrder::PostNorm {
+                ensure!(
+                    attn_post.is_some(),
+                    "missing required post-attention norm tensor for PostNorm architecture at layer {i}"
+                );
+            }
+            if let Some(w) = &attn_post {
+                ensure!(
+                    w.len() == hidden_size,
+                    "layer {i} post-attention norm length {} != hidden_size ({hidden_size})",
+                    w.len()
+                );
+            }
             attn_post_norm_weights.push(attn_post);
 
             let ffn_post = [
@@ -356,21 +405,60 @@ impl LlamaModel {
             .find(|name| gguf.tensors.contains_key(name))
             .map(|name| gguf.get_tensor(&name).map(|t| t.to_f32_vec()))
             .transpose()?;
+            if norm_order == NormOrder::PostNorm {
+                ensure!(
+                    ffn_post.is_some(),
+                    "missing required post-ffw norm tensor for PostNorm architecture at layer {i}"
+                );
+            }
+            if let Some(w) = &ffn_post {
+                ensure!(
+                    w.len() == hidden_size,
+                    "layer {i} post-ffw norm length {} != hidden_size ({hidden_size})",
+                    w.len()
+                );
+            }
             ffn_post_norm_weights.push(ffn_post);
 
             // Qwen3 / Olmo 2 QK-norm: gate on tensor presence so the same code path
             // serves both archs.
             let q_norm_name = format!("blk.{i}.attn_q_norm.weight");
             let k_norm_name = format!("blk.{i}.attn_k_norm.weight");
+            ensure!(
+                gguf.tensors.contains_key(&q_norm_name) == gguf.tensors.contains_key(&k_norm_name),
+                "layer {i} asymmetric QK-norm: `{q_norm_name}` and `{k_norm_name}` must both be present or both absent"
+            );
             if gguf.tensors.contains_key(&q_norm_name) {
-                attn_q_norm_weights.push(Some(gguf.get_tensor(&q_norm_name)?.to_f32_vec()));
-                attn_k_norm_weights.push(Some(gguf.get_tensor(&k_norm_name)?.to_f32_vec()));
+                let q_w = gguf.get_tensor(&q_norm_name)?.to_f32_vec();
+                let k_w = gguf.get_tensor(&k_norm_name)?.to_f32_vec();
+                let q_dim = n_heads * head_dim;
+                let kv_dim = n_kv_heads * head_dim;
+                ensure!(
+                    q_w.len() == head_dim || q_w.len() == q_dim,
+                    "layer {i} {q_norm_name} length {} must match head_dim ({head_dim}) or q_dim ({q_dim})",
+                    q_w.len()
+                );
+                ensure!(
+                    k_w.len() == head_dim || k_w.len() == kv_dim,
+                    "layer {i} {k_norm_name} length {} must match head_dim ({head_dim}) or kv_dim ({kv_dim})",
+                    k_w.len()
+                );
+                let is_head_scoped = q_w.len() == head_dim && k_w.len() == head_dim;
+                let is_vector_scoped = q_w.len() == q_dim && k_w.len() == kv_dim;
+                ensure!(
+                    is_head_scoped || is_vector_scoped,
+                    "layer {i} QK-norm scoping mismatch: Q len {} (head_dim={head_dim}, q_dim={q_dim}), K len {} (head_dim={head_dim}, kv_dim={kv_dim})",
+                    q_w.len(),
+                    k_w.len()
+                );
+                attn_q_norm_weights.push(Some(q_w));
+                attn_k_norm_weights.push(Some(k_w));
             } else {
                 attn_q_norm_weights.push(None);
                 attn_k_norm_weights.push(None);
             }
 
-            // Qwen2 Q/K/V biases — gate on tensor presence.
+            // Qwen2 Q/K/V biases: gate on tensor presence.
             let q_bias_name = format!("blk.{i}.attn_q.bias");
             let k_bias_name = format!("blk.{i}.attn_k.bias");
             let v_bias_name = format!("blk.{i}.attn_v.bias");
@@ -1008,17 +1096,26 @@ impl LlamaModel {
             // Attention pre-norm: rmsnorm each column (PreNorm only).
             let normed_input: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
-                    for j in 0..n {
-                        for i in 0..hs {
-                            norm_col[i] = hidden[i * n + j];
-                        }
+                    if n == 1 {
+                        normed[..hs].copy_from_slice(&hidden[..hs]);
                         cpu::rmsnorm(
-                            &mut norm_col,
+                            &mut normed[..hs],
                             &self.attn_norm_weights[layer],
                             cfg.rms_norm_eps,
                         );
-                        for i in 0..hs {
-                            normed[i * n + j] = norm_col[i];
+                    } else {
+                        for j in 0..n {
+                            for i in 0..hs {
+                                norm_col[i] = hidden[i * n + j];
+                            }
+                            cpu::rmsnorm(
+                                &mut norm_col,
+                                &self.attn_norm_weights[layer],
+                                cfg.rms_norm_eps,
+                            );
+                            for i in 0..hs {
+                                normed[i * n + j] = norm_col[i];
+                            }
                         }
                     }
                     &normed
@@ -1207,6 +1304,10 @@ impl LlamaModel {
                                 cfg.rms_norm_eps,
                             );
                         }
+                    } else {
+                        cpu::rmsnorm(q, q_norm, cfg.rms_norm_eps);
+                    }
+                    if k_norm.len() == head_dim {
                         for h in 0..n_kv_heads {
                             cpu::rmsnorm(
                                 &mut k[h * head_dim..(h + 1) * head_dim],
@@ -1215,7 +1316,6 @@ impl LlamaModel {
                             );
                         }
                     } else {
-                        cpu::rmsnorm(q, q_norm, cfg.rms_norm_eps);
                         cpu::rmsnorm(k, k_norm, cfg.rms_norm_eps);
                     }
                 }
@@ -1451,13 +1551,17 @@ impl LlamaModel {
 
             // Post-norm on attention output (Gemma 2, Olmo 2/3).
             if let Some(post_norm) = &self.attn_post_norm_weights[layer] {
-                for j in 0..n {
-                    for i in 0..hs {
-                        norm_col[i] = block_out[i * n + j];
-                    }
-                    cpu::rmsnorm(&mut norm_col, post_norm, cfg.rms_norm_eps);
-                    for i in 0..hs {
-                        block_out[i * n + j] = norm_col[i];
+                if n == 1 {
+                    cpu::rmsnorm(&mut block_out[..hs], post_norm, cfg.rms_norm_eps);
+                } else {
+                    for j in 0..n {
+                        for i in 0..hs {
+                            norm_col[i] = block_out[i * n + j];
+                        }
+                        cpu::rmsnorm(&mut norm_col, post_norm, cfg.rms_norm_eps);
+                        for i in 0..hs {
+                            block_out[i * n + j] = norm_col[i];
+                        }
                     }
                 }
             }
@@ -1471,17 +1575,26 @@ impl LlamaModel {
             // FFN pre-norm: rmsnorm each column (PreNorm only).
             let ffn_in: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
-                    for j in 0..n {
-                        for i in 0..hs {
-                            ffn_col[i] = hidden[i * n + j];
-                        }
+                    if n == 1 {
+                        ffn_input[..hs].copy_from_slice(&hidden[..hs]);
                         cpu::rmsnorm(
-                            &mut ffn_col,
+                            &mut ffn_input[..hs],
                             &self.ffn_norm_weights[layer],
                             cfg.rms_norm_eps,
                         );
-                        for i in 0..hs {
-                            ffn_input[i * n + j] = ffn_col[i];
+                    } else {
+                        for j in 0..n {
+                            for i in 0..hs {
+                                ffn_col[i] = hidden[i * n + j];
+                            }
+                            cpu::rmsnorm(
+                                &mut ffn_col,
+                                &self.ffn_norm_weights[layer],
+                                cfg.rms_norm_eps,
+                            );
+                            for i in 0..hs {
+                                ffn_input[i * n + j] = ffn_col[i];
+                            }
                         }
                     }
                     &ffn_input
@@ -1628,13 +1741,17 @@ impl LlamaModel {
 
             // Post-norm on FFN output (Gemma 2, Olmo 2/3).
             if let Some(post_norm) = &self.ffn_post_norm_weights[layer] {
-                for j in 0..n {
-                    for i in 0..hs {
-                        ffn_col[i] = ffn_out[i * n + j];
-                    }
-                    cpu::rmsnorm(&mut ffn_col, post_norm, cfg.rms_norm_eps);
-                    for i in 0..hs {
-                        ffn_out[i * n + j] = ffn_col[i];
+                if n == 1 {
+                    cpu::rmsnorm(&mut ffn_out[..hs], post_norm, cfg.rms_norm_eps);
+                } else {
+                    for j in 0..n {
+                        for i in 0..hs {
+                            ffn_col[i] = ffn_out[i * n + j];
+                        }
+                        cpu::rmsnorm(&mut ffn_col, post_norm, cfg.rms_norm_eps);
+                        for i in 0..hs {
+                            ffn_out[i * n + j] = ffn_col[i];
+                        }
                     }
                 }
             }
