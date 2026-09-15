@@ -95,9 +95,28 @@ impl HybridModel {
             .get_u32(&format!("{prefix}.attention.head_count"))
             .unwrap_or(1) as usize;
 
+        ensure!(n_layers > 0, "block_count must be > 0");
+        ensure!(hidden_size > 0, "embedding_length must be > 0");
+        ensure!(
+            hidden_size.is_multiple_of(32),
+            "hidden_size ({hidden_size}) must be a multiple of 32 for Q8 quantization"
+        );
+        ensure!(n_heads > 0, "attention.head_count must be > 0");
+        ensure!(
+            hidden_size.is_multiple_of(n_heads),
+            "hidden_size ({hidden_size}) must be a multiple of head_count ({n_heads})"
+        );
+        ensure!(intermediate_size > 0, "feed_forward_length must be > 0");
+
         let kv_heads_per_layer: Vec<usize> = if let Some(arr) =
             gguf.get_i32_array(&format!("{prefix}.attention.head_count_kv"))
         {
+            ensure!(
+                arr.len() == n_layers,
+                "attention.head_count_kv length {} does not match block_count {}",
+                arr.len(),
+                n_layers
+            );
             arr.into_iter().map(|x| x.max(0) as usize).collect()
         } else if let Some(kv_heads) = gguf.get_u32(&format!("{prefix}.attention.head_count_kv")) {
             vec![kv_heads as usize; n_layers]
@@ -162,6 +181,10 @@ impl HybridModel {
         ensure!(d_conv > 0, "ssm.conv_kernel must be > 0");
         ensure!(d_state > 0, "ssm.state_size must be > 0");
         ensure!(d_inner > 0, "ssm.inner_size must be > 0");
+        ensure!(
+            d_inner.is_multiple_of(32),
+            "ssm.inner_size ({d_inner}) must be a multiple of 32 for Q8 quantization"
+        );
         ensure!(n_group > 0, "ssm.group_count must be > 0");
         ensure!(dt_rank > 0, "ssm.time_step_rank must be > 0");
         ensure!(
@@ -172,6 +195,22 @@ impl HybridModel {
             d_inner.is_multiple_of(dt_rank),
             "ssm inner_size ({d_inner}) must be a multiple of time_step_rank ({dt_rank})"
         );
+
+        let _conv_dim = n_group
+            .checked_mul(d_state)
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| v.checked_add(d_inner))
+            .context("ssm conv_dim integer overflow")?;
+        let _d_in_proj = d_inner
+            .checked_mul(2)
+            .and_then(|v| {
+                n_group
+                    .checked_mul(d_state)
+                    .and_then(|gs| gs.checked_mul(2))
+                    .and_then(|two_gs| v.checked_add(two_gs))
+            })
+            .and_then(|v| v.checked_add(dt_rank))
+            .context("ssm d_in_proj integer overflow")?;
 
         let ssm_config = SsmConfig {
             d_conv,
@@ -245,6 +284,11 @@ impl HybridModel {
         };
 
         let output_norm_weight = gguf.get_tensor("output_norm.weight")?.to_f32_vec();
+        ensure!(
+            output_norm_weight.len() == hidden_size,
+            "output_norm.weight length {} does not match hidden_size {hidden_size}",
+            output_norm_weight.len()
+        );
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
@@ -270,15 +314,25 @@ impl HybridModel {
             let has_attn = bt == BlockType::Attention || bt == BlockType::ParallelAttentionMamba2;
             let has_ssm = bt == BlockType::Mamba2 || bt == BlockType::ParallelAttentionMamba2;
 
-            attn_norm_weights.push(
-                gguf.get_tensor(&format!("blk.{i}.attn_norm.weight"))?
-                    .to_f32_vec(),
+            let attn_norm = gguf
+                .get_tensor(&format!("blk.{i}.attn_norm.weight"))?
+                .to_f32_vec();
+            ensure!(
+                attn_norm.len() == hidden_size,
+                "blk.{i}.attn_norm.weight length {} does not match hidden_size {hidden_size}",
+                attn_norm.len()
             );
+            attn_norm_weights.push(attn_norm);
 
             let ffn_norm = gguf
                 .get_tensor(&format!("blk.{i}.ffn_norm.weight"))
                 .or_else(|_| gguf.get_tensor(&format!("blk.{i}.ffn_norm")))?
                 .to_f32_vec();
+            ensure!(
+                ffn_norm.len() == hidden_size,
+                "blk.{i}.ffn_norm.weight length {} does not match hidden_size {hidden_size}",
+                ffn_norm.len()
+            );
             ffn_norm_weights.push(ffn_norm);
 
             // SSM tensors
@@ -411,46 +465,84 @@ impl HybridModel {
 
             // Layer weight refs
             let (attn_q, attn_k, attn_v, attn_output) = if has_attn {
-                (
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.attn_q.weight"),
-                    )?),
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.attn_k.weight"),
-                    )?),
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.attn_v.weight"),
-                    )?),
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.attn_output.weight"),
-                    )?),
-                )
+                let q = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_q.weight"))?;
+                let k = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_k.weight"))?;
+                let v = transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_v.weight"))?;
+                let out =
+                    transformer::resolve_weight(&gguf, &format!("blk.{i}.attn_output.weight"))?;
+                let q_dim = n_heads * head_dim;
+                let kv_dim = kv_heads_per_layer[i] * head_dim;
+                ensure!(
+                    q.k == hidden_size && q.m == q_dim,
+                    "blk.{i}.attn_q shape mismatch: expected ({q_dim}, {hidden_size}), got ({}, {})",
+                    q.m,
+                    q.k
+                );
+                ensure!(
+                    k.k == hidden_size && k.m == kv_dim,
+                    "blk.{i}.attn_k shape mismatch: expected ({kv_dim}, {hidden_size}), got ({}, {})",
+                    k.m,
+                    k.k
+                );
+                ensure!(
+                    v.k == hidden_size && v.m == kv_dim,
+                    "blk.{i}.attn_v shape mismatch: expected ({kv_dim}, {hidden_size}), got ({}, {})",
+                    v.m,
+                    v.k
+                );
+                ensure!(
+                    out.k == q_dim && out.m == hidden_size,
+                    "blk.{i}.attn_output shape mismatch: expected ({hidden_size}, {q_dim}), got ({}, {})",
+                    out.m,
+                    out.k
+                );
+                (Some(q), Some(k), Some(v), Some(out))
             } else {
                 (None, None, None, None)
             };
 
             let (ssm_in, ssm_out) = if has_ssm {
-                (
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.ssm_in.weight"),
-                    )?),
-                    Some(transformer::resolve_weight(
-                        &gguf,
-                        &format!("blk.{i}.ssm_out.weight"),
-                    )?),
-                )
+                let s_in = transformer::resolve_weight(&gguf, &format!("blk.{i}.ssm_in.weight"))?;
+                let d_in_proj = 2 * d_inner + 2 * n_group * d_state + dt_rank;
+                ensure!(
+                    s_in.k == hidden_size && s_in.m == d_in_proj,
+                    "blk.{i}.ssm_in.weight shape ({}, {}) incompatible with hidden_size {hidden_size} and d_in_proj {d_in_proj}",
+                    s_in.m,
+                    s_in.k
+                );
+                let s_out = transformer::resolve_weight(&gguf, &format!("blk.{i}.ssm_out.weight"))?;
+                ensure!(
+                    s_out.k == d_inner && s_out.m == hidden_size,
+                    "blk.{i}.ssm_out.weight shape ({}, {}) incompatible with d_inner {d_inner} and hidden_size {hidden_size}",
+                    s_out.m,
+                    s_out.k
+                );
+                (Some(s_in), Some(s_out))
             } else {
                 (None, None)
             };
 
             let ffn_gate = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_gate.weight"))?;
+            ensure!(
+                ffn_gate.k == hidden_size && ffn_gate.m == intermediate_size,
+                "blk.{i}.ffn_gate shape mismatch: expected ({intermediate_size}, {hidden_size}), got ({}, {})",
+                ffn_gate.m,
+                ffn_gate.k
+            );
             let ffn_up = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_up.weight"))?;
+            ensure!(
+                ffn_up.k == hidden_size && ffn_up.m == intermediate_size,
+                "blk.{i}.ffn_up shape mismatch: expected ({intermediate_size}, {hidden_size}), got ({}, {})",
+                ffn_up.m,
+                ffn_up.k
+            );
             let ffn_down = transformer::resolve_weight(&gguf, &format!("blk.{i}.ffn_down.weight"))?;
+            ensure!(
+                ffn_down.k == intermediate_size && ffn_down.m == hidden_size,
+                "blk.{i}.ffn_down shape mismatch: expected ({hidden_size}, {intermediate_size}), got ({}, {})",
+                ffn_down.m,
+                ffn_down.k
+            );
 
             layer_refs.push(LayerWeightRefs {
                 attn_q,
@@ -466,7 +558,21 @@ impl HybridModel {
         }
 
         let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
+        ensure!(
+            embd_ref.k == hidden_size && embd_ref.m >= vocab_size,
+            "token_embd.weight shape ({}, {}) incompatible with vocab_size {vocab_size} and hidden_size {hidden_size}",
+            embd_ref.m,
+            embd_ref.k
+        );
         let output_ref = transformer::resolve_weight(&gguf, "output.weight").ok();
+        if let Some(ref out) = output_ref {
+            ensure!(
+                out.k == hidden_size && out.m >= vocab_size,
+                "output.weight shape ({}, {}) incompatible with vocab_size {vocab_size} and hidden_size {hidden_size}",
+                out.m,
+                out.k
+            );
+        }
 
         Ok(Self {
             gguf,
@@ -728,6 +834,11 @@ impl HybridModel {
                     // Attention writes to state.scratch.out[..hs]
                     self.forward_attn_block(i, &normed, pos, state);
 
+                    // Re-quantize normed into scratch buffers since forward_attn_block
+                    // clobbers state.scratch.q8_scales and q8_quants during attention projection
+                    #[cfg(target_arch = "aarch64")]
+                    transformer::quantize_to_scratch(&normed, state);
+
                     // Mamba-2 writes to state.scratch.ssm_branch_out[..hs]
                     let mut ssm_out = std::mem::take(&mut state.scratch.ssm_branch_out);
                     ssm_out.resize(hs, 0.0);
@@ -793,7 +904,10 @@ impl HybridModel {
     fn project_logits(&self, hidden: &[f32], state: &mut InferenceState) -> Vec<f32> {
         let cfg = &self.config;
         let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
-        let mut logits = vec![0.0f32; cfg.vocab_size];
+        let rows = out_ref.m.max(cfg.vocab_size);
+        if state.scratch.logits.len() < rows {
+            state.scratch.logits.resize(rows, 0.0);
+        }
         #[cfg(target_arch = "aarch64")]
         {
             transformer::quantize_to_scratch(hidden, state);
@@ -803,39 +917,48 @@ impl HybridModel {
                 hidden,
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
-                &mut logits,
+                &mut state.scratch.logits[..rows],
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = state;
-            transformer::gemv(&self.gguf, out_ref, hidden, &mut logits);
+            transformer::gemv(
+                &self.gguf,
+                out_ref,
+                hidden,
+                &mut state.scratch.logits[..rows],
+            );
         }
+        let logits_slice = &mut state.scratch.logits[..cfg.vocab_size];
         if self.config.scalars.logit != 1.0 {
-            cpu::scale_inplace(&mut logits, 1.0 / self.config.scalars.logit);
+            cpu::scale_inplace(logits_slice, 1.0 / self.config.scalars.logit);
         }
-        transformer::oracle_dump::record("result_output", &logits);
-        logits
+        transformer::oracle_dump::record("result_output", logits_slice);
+        logits_slice.to_vec()
     }
-}
 
-impl Model for HybridModel {
-    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        assert_eq!(tokens.len(), 1, "forward() expects exactly 1 token");
-        let token_id = tokens[0] as usize;
+    /// Process a single token through embeddings and all layers, returning the final hidden state.
+    fn forward_token(&self, token_id: usize, pos: usize, state: &mut InferenceState) -> Vec<f32> {
         let cfg = &self.config;
         assert!(
             token_id < cfg.vocab_size,
             "token_id {token_id} out of range (vocab_size={})",
             cfg.vocab_size
         );
-
         let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
-        if self.config.scalars.embedding != 1.0 {
-            cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
+        if cfg.scalars.embedding != 1.0 {
+            cpu::scale_inplace(&mut hidden, cfg.scalars.embedding);
         }
         transformer::oracle_dump::record("embd", &hidden);
         self.run_layers(&mut hidden, pos, state);
+        hidden
+    }
+}
+
+impl Model for HybridModel {
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        assert_eq!(tokens.len(), 1, "forward() expects exactly 1 token");
+        let hidden = self.forward_token(tokens[0] as usize, pos, state);
         self.project_logits(&hidden, state)
     }
 
@@ -849,11 +972,16 @@ impl Model for HybridModel {
             !tokens.is_empty(),
             "forward_prefill requires at least one token"
         );
-        let mut logits = Vec::new();
+        assert_eq!(
+            start_pos, state.seq_len,
+            "start_pos ({start_pos}) must match state.seq_len ({})",
+            state.seq_len
+        );
+        let mut last_hidden = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
-            logits = self.forward(&[token], start_pos + i, state);
+            last_hidden = self.forward_token(token as usize, start_pos + i, state);
         }
-        logits
+        self.project_logits(&last_hidden, state)
     }
 
     fn config(&self) -> &ModelConfig {

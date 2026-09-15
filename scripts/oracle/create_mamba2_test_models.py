@@ -244,5 +244,11 @@ def create_falcon_h1(out_path, seed=42):
     print(f"Created {arch} model at {out_path}")
 
 if __name__ == "__main__":
-    create_granite_hybrid("/tmp/test_granite_hybrid.gguf")
-    create_falcon_h1("/tmp/test_falcon_h1.gguf")
+    import os
+    import sys
+    import tempfile
+
+    out_dir = sys.argv[1] if len(sys.argv) > 1 else tempfile.gettempdir()
+    os.makedirs(out_dir, exist_ok=True)
+    create_granite_hybrid(os.path.join(out_dir, "test_granite_hybrid.gguf"))
+    create_falcon_h1(os.path.join(out_dir, "test_falcon_h1.gguf"))

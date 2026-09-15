@@ -70,6 +70,30 @@ fn zeroed_f32(len: usize) -> Result<Vec<f32>, CeraError> {
     zeroed(len, 0.0)
 }
 
+/// Derives the Mamba-2 1D convolution dimension `d_inner + 2 * n_group * d_state`
+/// using checked arithmetic to protect 32-bit targets from integer overflow.
+fn mamba2_conv_dim(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> {
+    ssm.n_group
+        .checked_mul(ssm.d_state)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_add(ssm.d_inner))
+        .ok_or(CeraError::OutOfMemory {
+            requested_bytes: u64::MAX,
+        })
+}
+
+/// Derives the Mamba-2 in-projection dimension `conv_dim + d_inner + dt_rank`
+/// using checked arithmetic to protect 32-bit targets from integer overflow.
+fn mamba2_d_in_proj(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> {
+    let conv_dim = mamba2_conv_dim(ssm)?;
+    conv_dim
+        .checked_add(ssm.d_inner)
+        .and_then(|v| v.checked_add(ssm.dt_rank))
+        .ok_or(CeraError::OutOfMemory {
+            requested_bytes: u64::MAX,
+        })
+}
+
 /// KV cache compression mode. Passed to `InferenceState::from_config_with_compression`
 /// (or via `GenerateConfig::kv_compression`) — that single call sets up everything
 /// TurboQuant needs: the per-layer rotation states, the compressed key/value
@@ -717,8 +741,7 @@ impl InferenceState {
                         let ssm = config.ssm.as_ref().ok_or_else(|| {
                             CeraError::Backend("ssm config missing for Mamba2 layer".to_string())
                         })?;
-                        let conv_dim =
-                            checked_elems::<f32>(ssm.d_inner + 2 * ssm.n_group * ssm.d_state, 1)?;
+                        let conv_dim = mamba2_conv_dim(ssm)?;
                         let conv_state_len =
                             checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
                         let ssm_state_len = checked_elems::<f32>(ssm.d_inner, ssm.d_state)?;
@@ -774,8 +797,7 @@ impl InferenceState {
                                 "ssm config missing for ParallelAttentionMamba2 layer".to_string(),
                             )
                         })?;
-                        let conv_dim =
-                            checked_elems::<f32>(ssm.d_inner + 2 * ssm.n_group * ssm.d_state, 1)?;
+                        let conv_dim = mamba2_conv_dim(ssm)?;
                         let conv_state_len =
                             checked_elems::<f32>(ssm.d_conv.saturating_sub(1), conv_dim)?;
                         let ssm_state_len = checked_elems::<f32>(ssm.d_inner, ssm.d_state)?;
@@ -805,13 +827,13 @@ impl InferenceState {
                 conv_proj: zeroed_f32(checked_elems::<f32>(3, config.hidden_size)?)?,
                 conv_scratch: zeroed_f32(config.hidden_size)?,
                 ssm_in_proj: if let Some(ssm) = &config.ssm {
-                    let d_in_proj = 2 * ssm.d_inner + 2 * ssm.n_group * ssm.d_state + ssm.dt_rank;
+                    let d_in_proj = mamba2_d_in_proj(ssm)?;
                     zeroed_f32(d_in_proj)?
                 } else {
                     Vec::new()
                 },
                 ssm_conv_out: if let Some(ssm) = &config.ssm {
-                    let conv_dim = ssm.d_inner + 2 * ssm.n_group * ssm.d_state;
+                    let conv_dim = mamba2_conv_dim(ssm)?;
                     zeroed_f32(conv_dim)?
                 } else {
                     Vec::new()
@@ -2776,6 +2798,13 @@ pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
     for k in &config.kv_heads_per_layer {
         buf.extend_from_slice(&(*k as u64).to_le_bytes());
     }
+    if let Some(ssm) = &config.ssm {
+        buf.extend_from_slice(&(ssm.d_conv as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.d_inner as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.d_state as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.dt_rank as u64).to_le_bytes());
+        buf.extend_from_slice(&(ssm.n_group as u64).to_le_bytes());
+    }
     fnv1a_u64(&buf)
 }
 
@@ -3739,5 +3768,31 @@ mod tests {
         }
         assert!(!conv.has_pos(5)); // pos 5 was evicted from capacity 64
         assert!(conv.has_pos(70));
+    }
+
+    #[test]
+    fn test_mamba2_checked_dimension_derivations() {
+        let ssm = crate::model::SsmConfig {
+            d_conv: 4,
+            d_inner: 64,
+            d_state: 16,
+            dt_rank: 4,
+            n_group: 2,
+        };
+        // conv_dim = 64 + 2 * 2 * 16 = 128
+        assert_eq!(mamba2_conv_dim(&ssm).unwrap(), 128);
+        // d_in_proj = 128 + 64 + 4 = 196
+        assert_eq!(mamba2_d_in_proj(&ssm).unwrap(), 196);
+
+        // Overflow in n_group * d_state
+        let overflow_ssm = crate::model::SsmConfig {
+            d_conv: 4,
+            d_inner: 64,
+            d_state: usize::MAX,
+            dt_rank: 4,
+            n_group: 2,
+        };
+        assert!(mamba2_conv_dim(&overflow_ssm).is_err());
+        assert!(mamba2_d_in_proj(&overflow_ssm).is_err());
     }
 }

@@ -21,26 +21,36 @@ fn rel_diff(a: f64, b: f64) -> f64 {
 const SUM_REL_TOL: f64 = 0.01;
 
 fn find_or_create_fixture(model_name: &str) -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("/tmp").join(model_name),
-        std::env::temp_dir().join(model_name),
-    ];
-    for c in &candidates {
-        if c.exists() {
-            return Some(c.clone());
+    if let Ok(dir) = std::env::var("CERA_ORACLE_MODELS_DIR") {
+        let candidate = PathBuf::from(dir).join(model_name);
+        if candidate.exists() && !candidate.is_symlink() {
+            return Some(candidate);
         }
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = manifest_dir.join("../target/oracle/models");
+    let _ = std::fs::create_dir_all(&target_dir);
+    let target = target_dir.join(model_name);
+    if target.exists() && !target.is_symlink() {
+        return Some(target);
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let temp_target = temp_dir.join(model_name);
+    if temp_target.exists() && !temp_target.is_symlink() {
+        return Some(temp_target);
+    }
+
     let script_path = manifest_dir.join("../scripts/oracle/create_mamba2_test_models.py");
     if script_path.exists() {
-        let status = Command::new("python3").arg(&script_path).status().ok()?;
-        if status.success() {
-            for c in &candidates {
-                if c.exists() {
-                    return Some(c.clone());
-                }
-            }
+        let status = Command::new("python3")
+            .arg(&script_path)
+            .arg(&target_dir)
+            .status()
+            .ok()?;
+        if status.success() && target.exists() && !target.is_symlink() {
+            return Some(target);
         }
     }
 
@@ -323,4 +333,91 @@ fn test_falcon_h1_oracle_parity() {
         trunc_diff < 1e-5,
         "state after safe_len > 0 truncation diverged from clean forward: max diff {trunc_diff}"
     );
+}
+
+#[test]
+fn test_mamba2_truncate_to_clears_state() {
+    let config = cera::model::ModelConfig {
+        architecture: "granitehybrid".into(),
+        n_layers: 2,
+        hidden_size: 64,
+        intermediate_size: 128,
+        n_heads: 4,
+        n_kv_heads: 4,
+        head_dim: 16,
+        vocab_size: 256,
+        max_seq_len: 128,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        block_types: vec![
+            cera::model::BlockType::Mamba2,
+            cera::model::BlockType::Attention,
+        ],
+        kv_heads_per_layer: vec![0, 4],
+        conv_kernel_size: None,
+        ssm: Some(cera::model::SsmConfig {
+            d_conv: 4,
+            d_inner: 64,
+            d_state: 16,
+            dt_rank: 4,
+            n_group: 1,
+        }),
+        scalars: Default::default(),
+        moe: None,
+        is_causal: true,
+        class_labels: Vec::new(),
+    };
+
+    let mut state = InferenceState::from_config(&config).expect("create inference state");
+    state.seq_len = 8;
+    if let cera::kv_cache::LayerState::Mamba2 { conv_state, .. } = &mut state.layers[0] {
+        conv_state.fill(1.0);
+    }
+
+    state.truncate_to(4);
+    assert_eq!(state.seq_len, 0);
+    if let cera::kv_cache::LayerState::Mamba2 {
+        conv_state,
+        ssm_state,
+    } = &state.layers[0]
+    {
+        assert!(conv_state.iter().all(|&v| v == 0.0));
+        assert!(ssm_state.iter().all(|&v| v == 0.0));
+    }
+}
+
+#[test]
+fn test_mamba2_session_rollback_clears_last_logits() {
+    let Some(model_path) = find_or_create_fixture("test_granite_hybrid.gguf") else {
+        return;
+    };
+    let gguf = GgufFile::open(&model_path).expect("open gguf");
+    let tokenizer = std::sync::Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
+    let model: std::sync::Arc<dyn cera::model::Model> =
+        load_model(gguf, None, 128).expect("load model").into();
+    let mut session = cera::session::Session::new(
+        model,
+        tokenizer,
+        cera::session::ModalityCapabilities::text_only(),
+        cera::session::SessionConfig {
+            ubatch_size: 1,
+            ..Default::default()
+        },
+    )
+    .expect("create session");
+
+    session.append_tokens(&[69, 70]).expect("append tokens");
+    assert!(session.last_logits().is_some());
+    assert_eq!(session.position(), 2);
+
+    session.cancel();
+    let msg = cera::tokenizer::UserMessage {
+        text: Some("test test".into()),
+        images: Vec::new(),
+        audio: None,
+    };
+    let append_res = session.append_user_message(&msg);
+    assert!(append_res.is_err());
+    assert_eq!(session.position(), 0);
+    assert!(session.last_logits().is_none());
 }
