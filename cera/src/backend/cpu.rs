@@ -6002,9 +6002,36 @@ impl YarnParams {
         beta_slow: f32,
         orig_ctx_len: usize,
     ) -> Self {
+        Self::new_with_log_mul(
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            orig_ctx_len,
+            0.1,
+        )
+    }
+
+    /// Constructs a `YarnParams` instance with a custom attention scale log multiplier.
+    pub fn new_with_log_mul(
+        freq_scale: f32,
+        ext_factor: f32,
+        attn_factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        orig_ctx_len: usize,
+        log_mul: f32,
+    ) -> Self {
         let mut mscale = attn_factor;
-        if ext_factor != 0.0 && freq_scale.is_finite() && freq_scale > 0.0 {
-            let scale_mult = 1.0 - 0.1 * freq_scale.ln();
+        if ext_factor.is_finite()
+            && ext_factor != 0.0
+            && freq_scale.is_finite()
+            && freq_scale > 0.0
+            && log_mul.is_finite()
+            && log_mul > 0.0
+        {
+            let scale_mult = 1.0 - log_mul * freq_scale.ln();
             if scale_mult.is_finite() && scale_mult > 0.0 {
                 mscale *= scale_mult;
             }
@@ -6088,6 +6115,7 @@ fn compute_yarn_cos_sin(
         || head_dim < 2
         || !freq_base.is_finite()
         || freq_base <= 0.0
+        || !yarn.ext_factor.is_finite()
         || !yarn.freq_scale.is_finite()
         || yarn.freq_scale <= 0.0
         || !yarn.mscale.is_finite()
@@ -6229,6 +6257,117 @@ pub fn rope_neox_yarn(
     for h in 0..n_kv_heads {
         let offset = h * head_dim;
         rotate_head_neox_with_cos_sin(&mut k[offset..offset + head_dim], half_dim, cos_sin_slice);
+    }
+}
+
+/// Apply precomputed Norm (interleaved adjacent pair) RoPE rotation to a single head slice.
+#[inline(always)]
+fn rotate_head_norm_with_cos_sin(head: &mut [f32], half_dim: usize, cos_sin: &[(f32, f32)]) {
+    if head.len() < 2 * half_dim || cos_sin.len() < half_dim {
+        return;
+    }
+    for (pair, &(cos_t, sin_t)) in head[..2 * half_dim]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(&cos_sin[..half_dim])
+    {
+        let x0 = pair[0];
+        let x1 = pair[1];
+        pair[0] = x0 * cos_t - x1 * sin_t;
+        pair[1] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+/// Apply interleaved-pair Norm RoPE with YaRN scaling to a single head vector.
+pub fn apply_rope_norm_yarn_to_head(
+    head: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    freq_base: f32,
+    yarn: &YarnParams,
+) {
+    debug_assert_eq!(head.len(), head_dim);
+    debug_assert!(head_dim.is_multiple_of(2));
+
+    if head.len() < head_dim
+        || head_dim < 2
+        || !head_dim.is_multiple_of(2)
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.ext_factor.is_finite()
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return;
+    }
+
+    let half_dim = head_dim / 2;
+    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut heap_buf;
+    let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
+        &mut stack_buf[..half_dim]
+    } else {
+        heap_buf = vec![(0.0, 0.0); half_dim];
+        &mut heap_buf
+    };
+    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+    rotate_head_norm_with_cos_sin(head, half_dim, cos_sin_slice);
+}
+
+/// NORM-layout (interleaved-pairs) RoPE with YaRN scaling for Q and K.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_norm_yarn(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    yarn: &YarnParams,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(k.len(), n_kv_heads * head_dim);
+
+    let min_q = n_heads.checked_mul(head_dim);
+    let min_k = n_kv_heads.checked_mul(head_dim);
+    if min_q.is_none_or(|sz| q.len() < sz)
+        || min_k.is_none_or(|sz| k.len() < sz)
+        || head_dim < 2
+        || !head_dim.is_multiple_of(2)
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.ext_factor.is_finite()
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return;
+    }
+
+    let half_dim = head_dim / 2;
+    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut heap_buf;
+    let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
+        &mut stack_buf[..half_dim]
+    } else {
+        heap_buf = vec![(0.0, 0.0); half_dim];
+        &mut heap_buf
+    };
+    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+
+    for h in 0..n_heads {
+        let offset = h * head_dim;
+        rotate_head_norm_with_cos_sin(&mut q[offset..offset + head_dim], half_dim, cos_sin_slice);
+    }
+
+    for h in 0..n_kv_heads {
+        let offset = h * head_dim;
+        rotate_head_norm_with_cos_sin(&mut k[offset..offset + head_dim], half_dim, cos_sin_slice);
     }
 }
 
@@ -8401,6 +8540,108 @@ mod tests {
         let p_extreme = YarnParams::new(100_000.0, 1.0, 1.0, 32.0, 1.0, 64);
         assert!(p_extreme.mscale.is_finite());
         assert!(p_extreme.mscale > 0.0);
+    }
+
+    #[test]
+    fn test_rope_norm_yarn_identity_with_base_rope() {
+        let head_dim = 16;
+        let freq_base = 10000.0_f32;
+        let raw = vec![
+            0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9, -1.0, 1.1, -1.2, 1.3, -1.4, 1.5, -1.6,
+        ];
+        let yarn = YarnParams::new(1.0, 0.0, 1.0, 32.0, 1.0, 64);
+
+        for pos in [0, 1, 5, 23, 100] {
+            let mut direct = raw.clone();
+            apply_rope_norm_to_head(&mut direct, pos, head_dim, freq_base, None);
+
+            let mut yarn_head = raw.clone();
+            apply_rope_norm_yarn_to_head(&mut yarn_head, pos, head_dim, freq_base, &yarn);
+
+            for i in 0..head_dim {
+                assert!(
+                    (direct[i] - yarn_head[i]).abs() < 1e-6,
+                    "yarn norm identity mismatch at pos {pos}, dim {i}: {} vs {}",
+                    direct[i],
+                    yarn_head[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_rope_norm_yarn_to_head_empty_or_short() {
+        let yarn = YarnParams::new(1.0, 1.0, 1.0, 32.0, 1.0, 64);
+        let mut empty_head = Vec::new();
+        apply_rope_norm_yarn_to_head(&mut empty_head, 0, 0, 10000.0, &yarn);
+
+        let mut q = Vec::new();
+        let mut k = Vec::new();
+        rope_norm_yarn(&mut q, &mut k, 0, 0, 0, 0, 10000.0, &yarn);
+
+        // Odd head dimension must safely return without panic or modification
+        let mut q_odd = vec![1.0; 15];
+        let mut k_odd = vec![2.0; 15];
+        rope_norm_yarn(&mut q_odd, &mut k_odd, 1, 1, 1, 15, 10000.0, &yarn);
+        assert_eq!(q_odd, vec![1.0; 15]);
+        assert_eq!(k_odd, vec![2.0; 15]);
+
+        // Invalid freq_base (<= 0.0 or non-finite) must safely return without modification
+        let mut q_freq = vec![1.0; 16];
+        let mut k_freq = vec![2.0; 16];
+        rope_norm_yarn(&mut q_freq, &mut k_freq, 1, 1, 1, 16, 0.0, &yarn);
+        assert_eq!(q_freq, vec![1.0; 16]);
+        assert_eq!(k_freq, vec![2.0; 16]);
+        rope_norm_yarn(&mut q_freq, &mut k_freq, 1, 1, 1, 16, f32::NAN, &yarn);
+        assert_eq!(q_freq, vec![1.0; 16]);
+        assert_eq!(k_freq, vec![2.0; 16]);
+
+        // Invalid yarn parameters (<= 0.0 or non-finite) must safely return without modification
+        let mut yarn_bad = yarn;
+        yarn_bad.freq_scale = 0.0;
+        let mut q_bad = vec![1.0; 16];
+        let mut k_bad = vec![2.0; 16];
+        rope_norm_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+
+        yarn_bad.freq_scale = 1.0;
+        yarn_bad.mscale = f32::NAN;
+        rope_norm_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+
+        yarn_bad.mscale = 1.0;
+        yarn_bad.ext_factor = f32::NAN;
+        rope_norm_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+
+        yarn_bad.ext_factor = f32::INFINITY;
+        rope_norm_yarn(&mut q_bad, &mut k_bad, 1, 1, 1, 16, 10000.0, &yarn_bad);
+        assert_eq!(q_bad, vec![1.0; 16]);
+        assert_eq!(k_bad, vec![2.0; 16]);
+    }
+
+    #[test]
+    fn test_rope_norm_yarn_pos0_scaling() {
+        let head_dim = 16;
+        let freq_base = 10000.0_f32;
+        let raw = vec![1.0; 16];
+        let factor = 2.0_f32;
+        let attn_factor = 1.069315_f32;
+        let yarn = YarnParams::new(1.0 / factor, 1.0, attn_factor, 32.0, 1.0, 64);
+
+        let mut head = raw.clone();
+        apply_rope_norm_yarn_to_head(&mut head, 0, head_dim, freq_base, &yarn);
+
+        let expected_scale = attn_factor * (1.0 + 0.1 * factor.ln());
+        for (i, &val) in head.iter().enumerate() {
+            assert!(
+                (val - expected_scale).abs() < 1e-5,
+                "dim {i} expected {expected_scale} got {val}",
+            );
+        }
     }
 
     #[test]
