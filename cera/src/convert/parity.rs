@@ -88,6 +88,9 @@ pub struct GgufParityReport {
 impl GgufParityReport {
     /// Check whether this parity audit satisfies quality thresholds.
     pub fn is_passing(&self, min_weight_sim: f32, min_logit_sim: f32) -> bool {
+        if self.total_tensors_compared == 0 {
+            return false;
+        }
         if self.inference_error.is_some() {
             return false;
         }
@@ -269,7 +272,10 @@ fn float_equal(a: f64, b: f64) -> bool {
             && (a.is_sign_positive() == b.is_sign_positive());
     }
     let diff = (a - b).abs();
-    let max_abs = a.abs().max(b.abs()).max(1.0);
+    if diff <= 1e-7 {
+        return true;
+    }
+    let max_abs = a.abs().max(b.abs());
     diff <= 1e-4 * max_abs
 }
 
@@ -473,8 +479,53 @@ pub fn compare_gguf_tensors(
         let (cos_sim, snr, rmse, max_abs) = if !shapes_match {
             (0.0f32, 0.0f32, f32::INFINITY, f32::INFINITY)
         } else {
-            let f32_cera = cera_tensor.to_f32_vec();
-            let f32_ref = ref_tensor.to_f32_vec();
+            let f32_cera = match cera_tensor.try_to_f32_vec() {
+                Ok(v) => v,
+                Err(e) => {
+                    entries.push(TensorParityEntry {
+                        name: name.clone(),
+                        shape_cera: cera_tensor.shape().to_vec(),
+                        shape_reference: ref_tensor.shape().to_vec(),
+                        shapes_match,
+                        dtype_cera: format!("UNSUPPORTED: {e}"),
+                        dtype_reference: format!("{:?}", ref_tensor.dtype()),
+                        cosine_similarity: 0.0,
+                        snr_db: 0.0,
+                        rmse: f32::INFINITY,
+                        max_abs_diff: f32::INFINITY,
+                    });
+                    min_cosine = 0.0;
+                    if min_cosine_tensor.is_none() {
+                        min_cosine_tensor = Some(name.clone());
+                    }
+                    min_snr = 0.0;
+                    continue;
+                }
+            };
+            let f32_ref = match ref_tensor.try_to_f32_vec() {
+                Ok(v) => v,
+                Err(e) => {
+                    entries.push(TensorParityEntry {
+                        name: name.clone(),
+                        shape_cera: cera_tensor.shape().to_vec(),
+                        shape_reference: ref_tensor.shape().to_vec(),
+                        shapes_match,
+                        dtype_cera: format!("{:?}", cera_tensor.dtype()),
+                        dtype_reference: format!("UNSUPPORTED: {e}"),
+                        cosine_similarity: 0.0,
+                        snr_db: 0.0,
+                        rmse: f32::INFINITY,
+                        max_abs_diff: f32::INFINITY,
+                    });
+                    min_cosine = 0.0;
+                    if min_cosine_tensor.is_none() {
+                        min_cosine_tensor = Some(name.clone());
+                    }
+                    min_snr = 0.0;
+                    continue;
+                }
+            };
+
             if f32_cera.len() != f32_ref.len() {
                 (0.0f32, 0.0f32, f32::INFINITY, f32::INFINITY)
             } else {
@@ -485,7 +536,13 @@ pub fn compare_gguf_tensors(
                     .iter()
                     .zip(f32_ref.iter())
                     .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max);
+                    .fold(0.0f32, |acc, diff| {
+                        if acc.is_nan() || diff.is_nan() {
+                            f32::NAN
+                        } else {
+                            acc.max(diff)
+                        }
+                    });
                 (cos_sim, snr, rmse, max_abs)
             }
         };
@@ -494,12 +551,12 @@ pub fn compare_gguf_tensors(
             min_cosine = if cos_sim.is_nan() { 0.0 } else { cos_sim };
             min_cosine_tensor = Some(name.clone());
         }
-        if snr < min_snr {
-            min_snr = snr;
+        if snr.is_nan() || snr < min_snr {
+            min_snr = if snr.is_nan() { 0.0 } else { snr };
         }
 
         sum_cosine += if cos_sim.is_nan() { 0.0 } else { cos_sim };
-        sum_snr += snr;
+        sum_snr += if snr.is_nan() { 0.0 } else { snr };
         compared_count += 1;
 
         entries.push(TensorParityEntry {
@@ -605,9 +662,11 @@ fn get_top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
         .map(|(i, &v)| (i as u32, v))
         .collect();
     let k = k.min(indexed.len());
-    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+    indexed.select_nth_unstable_by(k - 1, |a, b| {
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+    });
     indexed.truncate(k);
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     indexed
 }
 
@@ -634,8 +693,37 @@ pub fn compare_inference_parity(
         if enc.is_empty() { vec![1, 2, 3] } else { enc }
     };
 
+    if tokens.is_empty() {
+        return Err(CeraError::Backend(
+            "token sequence for inference parity is empty".into(),
+        ));
+    }
+
     let model_cera = engine_cera.model();
     let model_ref = engine_ref.model();
+
+    let max_ctx = 256
+        .min(model_cera.config().max_seq_len)
+        .min(model_ref.config().max_seq_len);
+    if tokens.len() > max_ctx {
+        return Err(CeraError::Backend(format!(
+            "token sequence length {} exceeds context limit {}",
+            tokens.len(),
+            max_ctx
+        )));
+    }
+
+    let min_vocab = model_cera
+        .config()
+        .vocab_size
+        .min(model_ref.config().vocab_size);
+    for &tok in &tokens {
+        if (tok as usize) >= min_vocab {
+            return Err(CeraError::Backend(format!(
+                "token id {tok} exceeds model vocabulary bounds (vocab_size: {min_vocab})"
+            )));
+        }
+    }
 
     let mut state_cera = crate::kv_cache::InferenceState::from_config(model_cera.config())
         .map_err(|e| CeraError::Backend(format!("init cera inference state: {e}")))?;
@@ -658,10 +746,17 @@ pub fn compare_inference_parity(
         .iter()
         .zip(logits_ref.iter())
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, |acc, diff| {
+            if acc.is_nan() || diff.is_nan() {
+                f32::NAN
+            } else {
+                acc.max(diff)
+            }
+        });
 
-    let top_cera = get_top_k(&logits_cera, 5);
-    let top_ref = get_top_k(&logits_ref, 5);
+    let k = 5.min(logits_cera.len());
+    let top_cera = get_top_k(&logits_cera, k);
+    let top_ref = get_top_k(&logits_ref, k);
 
     let cera_set: std::collections::HashSet<u32> = top_cera.iter().map(|(id, _)| *id).collect();
     let overlap = top_ref
@@ -674,7 +769,7 @@ pub fn compare_inference_parity(
         tokens,
         logit_cosine_similarity: cos_sim,
         top_k_overlap: overlap,
-        top_k_total: 5,
+        top_k_total: k,
         cera_top_tokens: top_cera,
         reference_top_tokens: top_ref,
         max_abs_diff: max_diff,
@@ -761,6 +856,11 @@ mod tests {
         assert_eq!(top[0], (3, 8.0));
         assert_eq!(top[1], (1, 5.0));
         assert_eq!(top[2], (4, 3.0));
+
+        // Verify deterministic tie-breaking by token ID when logits are equal
+        let tie_logits = vec![5.0, 5.0, 5.0];
+        let tie_top = get_top_k(&tie_logits, 2);
+        assert_eq!(tie_top, vec![(0, 5.0), (1, 5.0)]);
     }
 
     #[test]
@@ -873,5 +973,36 @@ mod tests {
             max_abs_diff: 0.0,
         });
         assert!(!report.is_passing(0.90, 0.90));
+    }
+
+    #[test]
+    fn test_report_is_passing_rejects_zero_tensors() {
+        let report = GgufParityReport {
+            cera_path: "cera.gguf".into(),
+            reference_path: "ref.gguf".into(),
+            metadata_diff: MetadataDiff::default(),
+            tensor_entries: Vec::new(),
+            mean_cosine_similarity: 1.0,
+            min_cosine_similarity: 1.0,
+            min_similarity_tensor: None,
+            mean_snr_db: 100.0,
+            min_snr_db: 100.0,
+            total_tensors_compared: 0,
+            inference_parity: None,
+            inference_error: None,
+        };
+        assert!(!report.is_passing(0.90, 0.90));
+    }
+
+    #[test]
+    fn test_float_equal_epsilon_scale_distinctions() {
+        // RMSNorm epsilons: 1e-5 vs 1e-6 must not be treated as equal
+        assert!(!float_equal(1e-5, 1e-6));
+        // Non-zero epsilon vs zero must not be treated as equal
+        assert!(!float_equal(1e-5, 0.0));
+        assert!(!float_equal(0.0, 1e-5));
+        // Sub-1e-7 float noise is equal
+        assert!(float_equal(1e-8, 0.0));
+        assert!(float_equal(1e-5, 1.00001e-5));
     }
 }
