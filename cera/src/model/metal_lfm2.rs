@@ -55,6 +55,7 @@ enum MetalBacking {
 
 /// A weight matrix on GPU: references the shared mmap buffer via byte offset,
 /// or a dedicated custom buffer if dequantized during upload.
+#[derive(Clone)]
 struct MetalWeight {
     /// Byte offset into the shared mmap_buf where this weight's data starts.
     mmap_offset: u64,
@@ -985,7 +986,14 @@ impl MetalLfm2Model {
         // tensor data region in a usable format (f32 vs mmap'd bytes).
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
+        let uploaded_weights: std::cell::RefCell<std::collections::HashMap<u64, MetalWeight>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+
         let upload_weight = |wref: &WeightRef| -> anyhow::Result<MetalWeight> {
+            if let Some(existing) = uploaded_weights.borrow().get(&wref.start) {
+                return Ok(existing.clone());
+            }
+
             let (mmap_offset, custom_buf, dtype) = if matches!(
                 wref.dtype,
                 DType::Q4_0
@@ -1023,14 +1031,18 @@ impl MetalLfm2Model {
 
             let params_buf =
                 ctx.upload_bytes(bytemuck::cast_slice(&[wref.m as u32, wref.k as u32]));
-            Ok(MetalWeight {
+            let weight = MetalWeight {
                 mmap_offset,
                 custom_buf,
                 dtype,
                 m: wref.m as u32,
                 k: wref.k as u32,
                 params_buf,
-            })
+            };
+            uploaded_weights
+                .borrow_mut()
+                .insert(wref.start, weight.clone());
+            Ok(weight)
         };
         // Optional small-f32 upload (per-head QK-norm / QKV bias).
         let upload_opt_f32 =

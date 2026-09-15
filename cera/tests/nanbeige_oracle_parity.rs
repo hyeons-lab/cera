@@ -418,7 +418,7 @@ fn nanbeige_handles_integer_variants_and_rejects_malformed_metadata() {
     };
     assert!(format!("{err_str:#}").contains("unexpected metadata type"));
 
-    // U8 and U16 num_loops should be accepted
+    // U8, I8, U16, I16, U64, I64 num_loops should be accepted
     let mut gguf_u8 = gguf.clone();
     gguf_u8
         .metadata
@@ -426,12 +426,53 @@ fn nanbeige_handles_integer_variants_and_rejects_malformed_metadata() {
     let model_u8 = LlamaModel::from_gguf(gguf_u8, 256).expect("load with u8 loops");
     assert_eq!(model_u8.config().n_layers, 4);
 
+    let mut gguf_i8 = gguf.clone();
+    gguf_i8
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::I8(2));
+    let model_i8 = LlamaModel::from_gguf(gguf_i8, 256).expect("load with i8 loops");
+    assert_eq!(model_i8.config().n_layers, 4);
+
     let mut gguf_u16 = gguf.clone();
     gguf_u16
         .metadata
         .insert("nanbeige.num_loops".to_string(), GgufValue::U16(2));
     let model_u16 = LlamaModel::from_gguf(gguf_u16, 256).expect("load with u16 loops");
     assert_eq!(model_u16.config().n_layers, 4);
+
+    let mut gguf_i16 = gguf.clone();
+    gguf_i16
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::I16(2));
+    let model_i16 = LlamaModel::from_gguf(gguf_i16, 256).expect("load with i16 loops");
+    assert_eq!(model_i16.config().n_layers, 4);
+
+    let mut gguf_u64 = gguf.clone();
+    gguf_u64
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::U64(2));
+    let model_u64 = LlamaModel::from_gguf(gguf_u64, 256).expect("load with u64 loops");
+    assert_eq!(model_u64.config().n_layers, 4);
+
+    let mut gguf_i64 = gguf.clone();
+    gguf_i64
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::I64(2));
+    let model_i64 = LlamaModel::from_gguf(gguf_i64, 256).expect("load with i64 loops");
+    assert_eq!(model_i64.config().n_layers, 4);
+
+    // Negative I8 and I16 num_loops should be rejected
+    let mut gguf_neg_i8 = gguf.clone();
+    gguf_neg_i8
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::I8(-1));
+    assert!(LlamaModel::from_gguf(gguf_neg_i8, 256).is_err());
+
+    let mut gguf_neg_i16 = gguf.clone();
+    gguf_neg_i16
+        .metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::I16(-1));
+    assert!(LlamaModel::from_gguf(gguf_neg_i16, 256).is_err());
 
     // Case-insensitivity: uppercase architecture "Nanbeige" should resolve correctly
     let mut gguf_case = gguf.clone();
@@ -498,6 +539,37 @@ fn nanbeige_respects_skip_loop_final_norm_and_single_loop() {
         LlamaModel::from_gguf(gguf_skip_u8, 256).expect("load with skip_loop_final_norm as u8");
     assert_eq!(model_skip_u8.loop_norm_interval(), None);
 
+    // Other integer variants: I8, U16, I16, U64, I64 truthiness
+    for val in [
+        GgufValue::I8(1),
+        GgufValue::U16(1),
+        GgufValue::I16(1),
+        GgufValue::U64(1),
+        GgufValue::I64(1),
+    ] {
+        let mut g = gguf.clone();
+        g.metadata
+            .insert("nanbeige.skip_loop_final_norm".to_string(), val);
+        let m = LlamaModel::from_gguf(g, 256).expect("load with skip integer variant");
+        assert_eq!(m.loop_norm_interval(), None);
+    }
+
+    // Falsy integer variants: U8(0), I8(0), etc. keep loop_norm_interval active
+    for val in [
+        GgufValue::U8(0),
+        GgufValue::I8(0),
+        GgufValue::U16(0),
+        GgufValue::I16(0),
+        GgufValue::U64(0),
+        GgufValue::I64(0),
+    ] {
+        let mut g = gguf.clone();
+        g.metadata
+            .insert("nanbeige.skip_loop_final_norm".to_string(), val);
+        let m = LlamaModel::from_gguf(g, 256).expect("load with falsy skip integer variant");
+        assert_eq!(m.loop_norm_interval(), Some(2));
+    }
+
     // When num_loops is 1, loop_norm_interval should be None
     let mut gguf_1loop = gguf;
     gguf_1loop
@@ -506,6 +578,48 @@ fn nanbeige_respects_skip_loop_final_norm_and_single_loop() {
     let model_1loop = LlamaModel::from_gguf(gguf_1loop, 256).expect("load with 1 loop");
     assert_eq!(model_1loop.loop_norm_interval(), None);
     assert_eq!(model_1loop.config().n_layers, 2);
+}
+
+#[test]
+fn nanbeige_three_loops_multi_boundary_normalization() {
+    use cera::gguf::GgufValue;
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_nanbeige.gguf");
+    gguf.metadata
+        .insert("nanbeige.num_loops".to_string(), GgufValue::U32(3));
+    let model = LlamaModel::from_gguf(gguf, 256).expect("load 3-loop nanbeige model");
+
+    assert_eq!(model.config().n_layers, 6);
+    assert_eq!(model.loop_norm_interval(), Some(2));
+
+    let tokens = vec![69u32, 112, 109];
+    let mut state_prefill =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    let logits_prefill = model.forward_prefill(&tokens, 0, &mut state_prefill);
+
+    let mut state_seq =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+    let mut logits_seq = Vec::new();
+    for (pos, &t) in tokens.iter().enumerate() {
+        logits_seq = model.forward(&[t], pos, &mut state_seq);
+    }
+
+    assert_eq!(logits_prefill.len(), logits_seq.len());
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&a, &b) in logits_prefill.iter().zip(logits_seq.iter()) {
+        dot += (a as f64) * (b as f64);
+        norm_a += (a as f64) * (a as f64);
+        norm_b += (b as f64) * (b as f64);
+    }
+    let cos_sim = dot / (norm_a.sqrt() * norm_b.sqrt());
+    assert!(
+        cos_sim > 0.9999,
+        "3-loop prefill vs decode cosine similarity diverged: cos={cos_sim}"
+    );
 }
 
 #[test]
