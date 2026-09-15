@@ -2,7 +2,6 @@ use super::*;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError, LayerState};
 use crate::model::ModelConfig;
 use crate::session::{FinishReason, ModalityCapabilities, RecoveryOutcome, SessionConfig};
-use contract::{CompleteError, ContentPart, Message, Role};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -1175,6 +1174,12 @@ fn chat_into_session_reclaims_usable_session() {
     let session = chat.into_session();
     assert!(session.is_usable());
     assert_eq!(session.position() as usize, summary.input_tokens);
+
+    let roundtrip_chat = session
+        .into_chat()
+        .expect("roundtrip into_chat must succeed");
+    assert_eq!(roundtrip_chat.phase(), SessionPhase::RawContext);
+    assert_eq!(roundtrip_chat.position(), summary.input_tokens);
 }
 
 #[test]

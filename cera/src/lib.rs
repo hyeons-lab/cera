@@ -78,6 +78,11 @@ pub use model::whisper::{
     WhisperModelCatalogEntry, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
     find_whisper_catalog_entry, is_whisper_gguf, transcribe_pcm, transcribe_pcm_with_tokens,
 };
+pub use session::chat::{
+    Chat, CompleteError, ContentPart, CoreExecution, DecodeReport, DecodeState, Execution,
+    IngestCause, IngestError, IngestSummary, Message, Profile, Role, SessionChat, SessionPhase,
+    TurnResult, ValidationError, core_chat,
+};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig, SpecDecode,

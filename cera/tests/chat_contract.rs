@@ -1,5 +1,5 @@
 //! P0.1 executable contract and legacy decode boundary regressions.
-//! The prototype is deliberately outside the published `cera` API.
+//! Validates the public `cera::session::chat` coordinator against the standalone contract harness.
 
 use cera as core_api;
 

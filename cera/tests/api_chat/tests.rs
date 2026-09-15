@@ -847,7 +847,12 @@ fn cancellation_handle_and_clear_cancel_on_chat() {
 }
 
 // Test-only access does not enter the eventual application-facing contract.
-impl Chat<TraceExecution> {
+trait ChatTraceExt {
+    fn set_failure(&mut self, recovery: RecoveryOutcome);
+    fn tokens(&mut self) -> &[u32];
+}
+
+impl ChatTraceExt for Chat<TraceExecution> {
     fn set_failure(&mut self, recovery: RecoveryOutcome) {
         self.execution_for_test().failure = Some(recovery);
     }

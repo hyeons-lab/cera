@@ -24,8 +24,7 @@ use crate::model::{Model, ModelSessionLease};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
 
-#[cfg(test)]
-mod chat;
+pub mod chat;
 mod decode;
 mod recovery;
 use decode::{DecodeObservation, ObservedGeneration};
@@ -225,7 +224,7 @@ impl GenerateOpts {
 }
 
 /// Summary returned from a completed `generate` call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateSummary {
     pub tokens_generated: u32,
     /// Tokens prefilled since the previous `generate()` / `reset()` / session
@@ -1021,6 +1020,17 @@ impl Session {
     /// Flip the cancel flag. Safe from any thread.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Wrap this session in a stateful, multi-turn chat coordinator with automatic
+    /// profile discovery and validated turn-boundary framing.
+    ///
+    /// Returns `Ok(Chat<CoreExecution>)` on successful profile discovery, or
+    /// `Err((self, ValidationError))` if the model configuration or tokenizer template
+    /// is unsupported, returning the original `Session` intact to the caller.
+    #[allow(clippy::result_large_err)]
+    pub fn into_chat(self) -> Result<chat::SessionChat, (Session, chat::ValidationError)> {
+        chat::core_chat(self)
     }
 
     /// Clear KV state and reset position to 0. Rebuilds the sampler from
@@ -3375,6 +3385,87 @@ mod tests {
             }
             other => panic!("expected InvalidToken, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_into_chat_refusal_preserves_session() {
+        let config = crate::model::ModelConfig {
+            architecture: "mock".into(),
+            n_layers: 0,
+            hidden_size: 0,
+            intermediate_size: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: 100,
+            max_seq_len: 1024,
+            rope_theta: 0.0,
+            rms_norm_eps: 0.0,
+            block_types: Vec::new(),
+            conv_kernel_size: None,
+            kv_heads_per_layer: Vec::new(),
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let model = Arc::new(MockTestModel { config });
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+
+        // Empty tokenizer lacks chat template: into_chat fails cleanly with UnsupportedProfile.
+        let (preserved, err) = session.into_chat().unwrap_err();
+        assert_eq!(err, chat::ValidationError::UnsupportedProfile);
+        assert!(preserved.is_usable());
+        assert_eq!(preserved.position(), 0);
+    }
+
+    #[test]
+    fn session_into_chat_refuses_sliding_context() {
+        let config = crate::model::ModelConfig {
+            architecture: "mock".into(),
+            n_layers: 0,
+            hidden_size: 0,
+            intermediate_size: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: 100,
+            max_seq_len: 1024,
+            rope_theta: 0.0,
+            rms_norm_eps: 0.0,
+            block_types: Vec::new(),
+            conv_kernel_size: None,
+            kv_heads_per_layer: Vec::new(),
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let model = Arc::new(MockTestModel { config });
+        let tokenizer = Arc::new(BpeTokenizer::chat_for_test());
+        let session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig {
+                n_keep: 4,
+                ..SessionConfig::default()
+            },
+        )
+        .unwrap();
+
+        // Sliding context is refused when entering chat, preserving the session intact.
+        let (preserved, err) = session.into_chat().unwrap_err();
+        assert_eq!(err, chat::ValidationError::SlidingContext);
+        assert!(preserved.is_usable());
+        assert_eq!(preserved.position(), 0);
     }
 }
 
