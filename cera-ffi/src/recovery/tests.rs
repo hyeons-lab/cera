@@ -1,7 +1,7 @@
 use super::*;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct RefusingModel(ModelConfig);
 
@@ -61,13 +61,7 @@ fn session() -> Arc<Session> {
         },
     )
     .unwrap();
-    Arc::new(Session {
-        position: inner.position_handle(),
-        cancel: inner.cancel_handle(),
-        capabilities: inner.capabilities().into(),
-        hidden_size: 2,
-        inner: Mutex::new(inner),
-    })
+    Session::from_core(inner)
 }
 
 #[test]

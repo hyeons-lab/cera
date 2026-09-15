@@ -93,8 +93,13 @@ use std::sync::Arc;
 
 uniffi::setup_scaffolding!();
 
+mod chat;
 mod loading;
 mod recovery;
+pub use chat::{
+    ChatSession, IngestSummary, Message, Role, SessionPhase, TurnResult, ValidationError,
+    chat_message_assistant, chat_message_system, chat_message_tool, chat_message_user,
+};
 pub use loading::{
     GenerationDefaults, GenerativeModel, LoadError, ModelFiles, ModelHandle, ModelLoader,
     ModelParts, ModelSource, SamplingDefaults,
@@ -269,6 +274,24 @@ pub enum FfiError {
     /// ordinal. New variants go at the end.
     #[error("LoRA adapter not supported by this backend: {detail}")]
     LoraUnsupportedByBackend { detail: String },
+
+    /// Chat contract validation failure.
+    #[error("chat validation: {error}")]
+    ChatValidation { error: ValidationError },
+}
+
+impl From<ValidationError> for FfiError {
+    fn from(error: ValidationError) -> Self {
+        Self::ChatValidation { error }
+    }
+}
+
+impl From<cera::session::chat::ValidationError> for FfiError {
+    fn from(error: cera::session::chat::ValidationError) -> Self {
+        Self::ChatValidation {
+            error: ValidationError::from(error),
+        }
+    }
 }
 
 impl From<cera::CeraError> for FfiError {
@@ -1586,7 +1609,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
 }
 
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
-#[derive(Debug, Clone, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FinishReason {
     MaxTokens,
     Stop,
@@ -1830,17 +1853,20 @@ impl StreamingThinkingParser {
 /// [`cera::ModalitySink`]. Decodes tokens to valid UTF-8 text chunks
 /// incrementally using the session's tokenizer, and forwards audio frames
 /// and terminal completion events.
-struct ForeignSinkAdapter {
+pub(crate) struct ForeignSinkAdapter {
     inner: Arc<dyn ModalitySink>,
     tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
     pending_bytes: Vec<u8>,
     parser: StreamingThinkingParser,
-    done_called: bool,
+    pub(crate) done_called: bool,
     done_reason: Option<FinishReason>,
 }
 
 impl ForeignSinkAdapter {
-    fn new(inner: Arc<dyn ModalitySink>, tokenizer: Arc<cera::tokenizer::BpeTokenizer>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn ModalitySink>,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+    ) -> Self {
         Self {
             inner,
             tokenizer,
@@ -1861,7 +1887,7 @@ impl ForeignSinkAdapter {
         }
     }
 
-    fn flush_pending(&mut self) {
+    pub(crate) fn flush_pending(&mut self) {
         if !self.pending_bytes.is_empty() {
             let piece = String::from_utf8_lossy(&self.pending_bytes);
             if !piece.is_empty() {
@@ -1876,7 +1902,7 @@ impl ForeignSinkAdapter {
         }
     }
 
-    fn notify_done(&mut self, fallback: Option<FinishReason>) {
+    pub(crate) fn notify_done(&mut self, fallback: Option<FinishReason>) {
         if let Some(reason) = self.done_reason.take() {
             self.inner.on_done(reason);
         } else if let Some(fallback_reason) = fallback {
@@ -1994,9 +2020,9 @@ impl LoraAdapters {
 /// session so it outlives the engine handle across FFI calls.
 #[derive(uniffi::Object)]
 pub struct Session {
-    inner: std::sync::Mutex<cera::Session>,
+    inner: std::sync::Mutex<Option<cera::Session>>,
     /// Cloned from the inner session at construction time. Shared
-    /// atomic — `position()` / `cancel()` don't need to acquire the
+    /// atomic: `position()` / `cancel()` don't need to acquire the
     /// mutex, so they're safe to call from a different thread while
     /// `generate()` is running.
     position: Arc<std::sync::atomic::AtomicU32>,
@@ -2004,31 +2030,70 @@ pub struct Session {
     /// Stored at construction so `capabilities()` doesn't need a lock.
     capabilities: ModalityCapabilities,
     /// Model hidden dimension, cached at construction so `hidden_size()` is a
-    /// lock-free read — safe to call from a `generate_streaming` sink callback
+    /// lock-free read: safe to call from a `generate_streaming` sink callback
     /// (which runs while `generate` holds the mutex), same as `position()`.
     hidden_size: u32,
+}
+
+pub(crate) struct SessionGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<cera::Session>>,
+}
+
+impl<'a> std::ops::Deref for SessionGuard<'a> {
+    type Target = cera::Session;
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("session was moved into a ChatSession")
+    }
+}
+
+impl<'a> std::ops::DerefMut for SessionGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("session was moved into a ChatSession")
+    }
 }
 
 impl Session {
     /// Lock the inner session, converting `PoisonError` into
     /// `FfiError::Backend` instead of panicking. `expect` on a
     /// poisoned mutex would propagate as a panic across the FFI
-    /// boundary — Kotlin / Swift / Python callers see that as an
+    /// boundary: Kotlin / Swift / Python callers see that as an
     /// uncatchable abort of the host process, which is unusable in
     /// production. Returning an error lets callers decide whether to
     /// retry, reset, or surface the failure.
-    ///
-    /// A poisoned mutex here means a prior session method panicked
-    /// while holding the lock — the session's internal state (KV
-    /// cache, sampler, position counters) is therefore in an unknown
-    /// state. The error message gives the caller enough context to
-    /// decide whether to reset or drop the session entirely.
-    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::Session>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
+    pub(crate) fn lock_inner(&self) -> Result<SessionGuard<'_>, FfiError> {
+        let guard = self.inner.lock().map_err(|e| FfiError::Backend {
             detail: format!(
                 "session mutex poisoned (a prior call panicked mid-lock; session state is \
                  inconsistent): {e}"
             ),
+        })?;
+        if guard.is_none() {
+            return Err(FfiError::Backend {
+                detail: "session has been moved into a ChatSession".into(),
+            });
+        }
+        Ok(SessionGuard { guard })
+    }
+
+    pub(crate) fn inner_mutex(&self) -> &std::sync::Mutex<Option<cera::Session>> {
+        &self.inner
+    }
+
+    pub(crate) fn from_core(session: cera::Session) -> Arc<Self> {
+        let position = session.position_handle();
+        let cancel = session.cancel_handle();
+        let capabilities = session.capabilities().into();
+        let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(Some(session)),
+            position,
+            cancel,
+            capabilities,
+            hidden_size,
         })
     }
 }
@@ -2066,6 +2131,15 @@ impl cera::ModalitySink for TokenCollectSink {
 
 #[uniffi::export]
 impl Session {
+    /// Wrap this session in a stateful chat coordinator.
+    ///
+    /// On success, ownership of the inner inference state is transferred to the returned
+    /// [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+    /// If validation fails, the session remains intact and usable.
+    pub fn into_chat(&self) -> Result<Arc<ChatSession>, FfiError> {
+        ChatSession::from_session(self)
+    }
+
     /// Append raw text to the context, running a prefill over just
     /// the new tokens. `EmptyInput` error if `text` is empty.
     pub fn append_text(&self, text: String) -> Result<(), FfiError> {
@@ -2955,23 +3029,19 @@ impl CeraEngine {
 // Session-level method on CeraEngine.
 #[uniffi::export]
 impl CeraEngine {
-    /// Open a new [`Session`] sharing this engine's model + tokenizer
+    /// Open a new [`Session`] sharing this engine's model and tokenizer
     /// by `Arc` clone. The returned session outlives `&self`; the
     /// engine keeps the shared state live for every session it hands
-    /// out. Cheap — no model load, just config + state allocation.
+    /// out. Cheap: no model load, just config and state allocation.
     pub fn new_session(&self, config: SessionConfig) -> Result<Arc<Session>, FfiError> {
         let session = self.inner.new_session(config.into())?;
-        let position = session.position_handle();
-        let cancel = session.cancel_handle();
-        let capabilities = session.capabilities().into();
-        let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
-        Ok(Arc::new(Session {
-            inner: std::sync::Mutex::new(session),
-            position,
-            cancel,
-            capabilities,
-            hidden_size,
-        }))
+        Ok(Session::from_core(session))
+    }
+
+    /// Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+    pub fn new_chat_session(&self, config: SessionConfig) -> Result<Arc<ChatSession>, FfiError> {
+        let session = self.inner.new_session(config.into())?;
+        ChatSession::from_core_session(session)
     }
 }
 

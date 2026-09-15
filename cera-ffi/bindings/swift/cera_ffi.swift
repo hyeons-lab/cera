@@ -1003,10 +1003,15 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func metadata()  -> ModelMetadata
     
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    func newChatSession(config: SessionConfig) throws  -> ChatSession
+    
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     func newSession(config: SessionConfig) throws  -> Session
     
@@ -1607,10 +1612,22 @@ open func metadata() -> ModelMetadata  {
 }
     
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+open func newChatSession(config: SessionConfig)throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSessionConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
 open func newSession(config: SessionConfig)throws  -> Session  {
     return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1749,6 +1766,338 @@ public func FfiConverterTypeCeraEngine_lift(_ handle: UInt64) throws -> CeraEngi
 #endif
 public func FfiConverterTypeCeraEngine_lower(_ value: CeraEngine) -> UInt64 {
     return FfiConverterTypeCeraEngine.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+public protocol ChatSessionProtocol: AnyObject, Sendable {
+    
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread.
+     */
+    func cancel() 
+    
+    /**
+     * Clear pending cancellation.
+     */
+    func clearCancel() throws 
+    
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    func complete(opts: GenerateOpts) throws  -> TurnResult
+    
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    func generateStreaming(opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
+    
+    /**
+     * Ingest a single message into the chat context.
+     */
+    func ingest(message: Message) throws  -> IngestSummary
+    
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    func ingestMessages(messages: [Message]) throws  -> IngestSummary
+    
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    func intoSession() throws  -> Session
+    
+    /**
+     * Current session lifecycle phase.
+     */
+    func phase() throws  -> SessionPhase
+    
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    func position() throws  -> UInt32
+    
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    func recoveryStatus() throws  -> SessionRecoveryStatus
+    
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    func replaceMessages(messages: [Message]) throws  -> IngestSummary
+    
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    func reset() throws 
+    
+}
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+open class ChatSession: ChatSessionProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_chatsession(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_chatsession(handle, $0) }
+    }
+
+    
+    /**
+     * Construct a ChatSession from an existing Session, taking ownership of its state.
+     *
+     * If validation fails, the session remains intact and usable on the caller side.
+     */
+public static func fromSession(session: Session)throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_chatsession_from_session(
+        FfiConverterTypeSession_lower(session),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread.
+     */
+open func cancel()  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_chatsession_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Clear pending cancellation.
+     */
+open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+open func complete(opts: GenerateOpts)throws  -> TurnResult  {
+    return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_complete(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),$0
+    )
+})
+}
+    
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
+    return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterTypeModalitySink_lower(sink),$0
+    )
+})
+}
+    
+    /**
+     * Ingest a single message into the chat context.
+     */
+open func ingest(message: Message)throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMessage_lower(message),$0
+    )
+})
+}
+    
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+open func ingestMessages(messages: [Message])throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeMessage.lower(messages),$0
+    )
+})
+}
+    
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+open func intoSession()throws  -> Session  {
+    return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_into_session(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Current session lifecycle phase.
+     */
+open func phase()throws  -> SessionPhase  {
+    return try  FfiConverterTypeSessionPhase_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_phase(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+open func position()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_position(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+open func recoveryStatus()throws  -> SessionRecoveryStatus  {
+    return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+open func replaceMessages(messages: [Message])throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeMessage.lower(messages),$0
+    )
+})
+}
+    
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChatSession: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ChatSession
+
+    public static func lift(_ handle: UInt64) throws -> ChatSession {
+        return ChatSession(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ChatSession) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChatSession {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ChatSession, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatSession_lift(_ handle: UInt64) throws -> ChatSession {
+    return try FfiConverterTypeChatSession.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatSession_lower(_ value: ChatSession) -> UInt64 {
+    return FfiConverterTypeChatSession.lower(value)
 }
 
 
@@ -4496,6 +4845,15 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesMeanPooled(tokens: [UInt32]) throws  -> [Float]
     
     /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    func intoChat() throws  -> ChatSession
+    
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -5066,6 +5424,21 @@ open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
     uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
+}
+    
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+open func intoChat()throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_into_chat(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -6512,6 +6885,85 @@ public func FfiConverterTypeIngestRecovery_lower(_ value: IngestRecovery) -> Rus
 
 
 /**
+ * Summary of a successful message ingestion.
+ */
+public struct IngestSummary: Equatable, Hashable {
+    /**
+     * Number of tokens encoded and appended to context.
+     */
+    public var inputTokens: UInt32
+    /**
+     * KV position before ingestion.
+     */
+    public var positionBefore: UInt32
+    /**
+     * KV position after ingestion.
+     */
+    public var positionAfter: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Number of tokens encoded and appended to context.
+         */inputTokens: UInt32, 
+        /**
+         * KV position before ingestion.
+         */positionBefore: UInt32, 
+        /**
+         * KV position after ingestion.
+         */positionAfter: UInt32) {
+        self.inputTokens = inputTokens
+        self.positionBefore = positionBefore
+        self.positionAfter = positionAfter
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IngestSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIngestSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IngestSummary {
+        return
+            try IngestSummary(
+                inputTokens: FfiConverterUInt32.read(from: &buf), 
+                positionBefore: FfiConverterUInt32.read(from: &buf), 
+                positionAfter: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IngestSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.inputTokens, into: &buf)
+        FfiConverterUInt32.write(value.positionBefore, into: &buf)
+        FfiConverterUInt32.write(value.positionAfter, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestSummary_lift(_ buf: RustBuffer) throws -> IngestSummary {
+    return try FfiConverterTypeIngestSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestSummary_lower(_ value: IngestSummary) -> RustBuffer {
+    return FfiConverterTypeIngestSummary.lower(value)
+}
+
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -6571,6 +7023,75 @@ public func FfiConverterTypeLeapBundleEntry_lift(_ buf: RustBuffer) throws -> Le
 #endif
 public func FfiConverterTypeLeapBundleEntry_lower(_ value: LeapBundleEntry) -> RustBuffer {
     return FfiConverterTypeLeapBundleEntry.lower(value)
+}
+
+
+/**
+ * A structured conversational turn message.
+ */
+public struct Message: Equatable, Hashable {
+    /**
+     * Author role.
+     */
+    public var role: Role
+    /**
+     * Message text content.
+     */
+    public var content: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Author role.
+         */role: Role, 
+        /**
+         * Message text content.
+         */content: String) {
+        self.role = role
+        self.content = content
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension Message: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Message {
+        return
+            try Message(
+                role: FfiConverterTypeRole.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Message, into buf: inout [UInt8]) {
+        FfiConverterTypeRole.write(value.role, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessage_lift(_ buf: RustBuffer) throws -> Message {
+    return try FfiConverterTypeMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
+    return FfiConverterTypeMessage.lower(value)
 }
 
 
@@ -7388,6 +7909,85 @@ public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
 
 
 /**
+ * Result of a completed chat turn.
+ */
+public struct TurnResult: Equatable, Hashable {
+    /**
+     * Decoded assistant response text.
+     */
+    public var text: String
+    /**
+     * Token identifiers emitted during the turn.
+     */
+    public var tokens: [UInt32]
+    /**
+     * Generation summary metrics.
+     */
+    public var summary: GenerateSummary
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Decoded assistant response text.
+         */text: String, 
+        /**
+         * Token identifiers emitted during the turn.
+         */tokens: [UInt32], 
+        /**
+         * Generation summary metrics.
+         */summary: GenerateSummary) {
+        self.text = text
+        self.tokens = tokens
+        self.summary = summary
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TurnResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTurnResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TurnResult {
+        return
+            try TurnResult(
+                text: FfiConverterString.read(from: &buf), 
+                tokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                summary: FfiConverterTypeGenerateSummary.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TurnResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterSequenceUInt32.write(value.tokens, into: &buf)
+        FfiConverterTypeGenerateSummary.write(value.summary, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTurnResult_lift(_ buf: RustBuffer) throws -> TurnResult {
+    return try FfiConverterTypeTurnResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTurnResult_lower(_ value: TurnResult) -> RustBuffer {
+    return FfiConverterTypeTurnResult.lower(value)
+}
+
+
+/**
  * User-facing multimodal input envelope.
  */
 public struct UserMessage: Equatable, Hashable {
@@ -7716,6 +8316,11 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case LoraUnsupportedByBackend(detail: String
     )
+    /**
+     * Chat contract validation failure.
+     */
+    case ChatValidation(error: ValidationError
+    )
 
     
 
@@ -7781,6 +8386,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 14: return .LoraUnsupportedByBackend(
             detail: try FfiConverterString.read(from: &buf)
+            )
+        case 15: return .ChatValidation(
+            error: try FfiConverterTypeValidationError.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -7861,6 +8469,11 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .LoraUnsupportedByBackend(detail):
             writeInt(&buf, Int32(14))
             FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .ChatValidation(error):
+            writeInt(&buf, Int32(15))
+            FfiConverterTypeValidationError.write(error, into: &buf)
             
         }
     }
@@ -8812,6 +9425,218 @@ public func FfiConverterTypeRecoveryOutcome_lower(_ value: RecoveryOutcome) -> R
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Message author role in conversational chat.
+ */
+
+public enum Role: Equatable, Hashable {
+    
+    /**
+     * System prompt setting instructions and context.
+     */
+    case system
+    /**
+     * User prompt input.
+     */
+    case user
+    /**
+     * Assistant model response.
+     */
+    case assistant
+    /**
+     * Tool result or response payload.
+     */
+    case tool
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Role: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRole: FfiConverterRustBuffer {
+    typealias SwiftType = Role
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Role {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .system
+        
+        case 2: return .user
+        
+        case 3: return .assistant
+        
+        case 4: return .tool
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Role, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .system:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .user:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .assistant:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .tool:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRole_lift(_ buf: RustBuffer) throws -> Role {
+    return try FfiConverterTypeRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRole_lower(_ value: Role) -> RustBuffer {
+    return FfiConverterTypeRole.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Lifecycle phase of a stateful chat coordinator.
+ */
+
+public enum SessionPhase: Equatable, Hashable {
+    
+    /**
+     * Clean session at position 0, ready for initial message ingestion.
+     */
+    case idle
+    /**
+     * Input messages have been appended and prefilled; ready for decode.
+     */
+    case promptReady
+    /**
+     * A turn finished with a terminal end-of-sequence stop marker.
+     */
+    case turnComplete
+    /**
+     * Generation was interrupted by cancellation or custom nonterminal stop.
+     */
+    case interrupted
+    /**
+     * Underlying execution state was modified outside chat rules; replacement required.
+     */
+    case rawContext
+    /**
+     * Unrecoverable execution fault or unwind; checked reset required to restore usability.
+     */
+    case unusable
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionPhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionPhase: FfiConverterRustBuffer {
+    typealias SwiftType = SessionPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .idle
+        
+        case 2: return .promptReady
+        
+        case 3: return .turnComplete
+        
+        case 4: return .interrupted
+        
+        case 5: return .rawContext
+        
+        case 6: return .unusable
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .idle:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .promptReady:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .turnComplete:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .interrupted:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .rawContext:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unusable:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionPhase_lift(_ buf: RustBuffer) throws -> SessionPhase {
+    return try FfiConverterTypeSessionPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionPhase_lower(_ value: SessionPhase) -> RustBuffer {
+    return FfiConverterTypeSessionPhase.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The tool-call wire format a model family uses. Mirrors
  * [`cera::tools::ToolFormat`]. Get one from
  * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
@@ -8887,6 +9712,208 @@ public func FfiConverterTypeToolFormat_lift(_ buf: RustBuffer) throws -> ToolFor
 #endif
 public func FfiConverterTypeToolFormat_lower(_ value: ToolFormat) -> RustBuffer {
     return FfiConverterTypeToolFormat.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Validation failure during chat construction, preparation, or decode.
+ */
+
+public enum ValidationError: Equatable, Hashable {
+    
+    /**
+     * Model or tokenizer configuration does not match a supported chat profile.
+     */
+    case unsupportedProfile
+    /**
+     * Sliding context configuration (n_keep != 0) is not supported for chat.
+     */
+    case slidingContext
+    /**
+     * Model audio output is not supported for text chat.
+     */
+    case audioOutput
+    /**
+     * Generation parameter validation error.
+     */
+    case generation(detail: String
+    )
+    /**
+     * Operation refused in the current session phase.
+     */
+    case phase(phase: SessionPhase
+    )
+    /**
+     * Message batch provided to ingest was empty.
+     */
+    case emptyBatch
+    /**
+     * Message role sequence violates chat rules.
+     */
+    case roleOrder(message: UInt32
+    )
+    /**
+     * Message role is not supported in the active profile.
+     */
+    case unsupportedRole(message: UInt32
+    )
+    /**
+     * Content part is not supported in the active profile.
+     */
+    case unsupportedContent(message: UInt32, part: UInt32
+    )
+    /**
+     * Message text contains a reserved ChatML marker sequence.
+     */
+    case reservedMarker(message: UInt32
+    )
+    /**
+     * Context tokens required exceed available capacity in the KV cache.
+     */
+    case capacity(required: UInt32, available: UInt32
+    )
+    /**
+     * Chat template rendering error.
+     */
+    case template(detail: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ValidationError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeValidationError: FfiConverterRustBuffer {
+    typealias SwiftType = ValidationError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ValidationError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unsupportedProfile
+        
+        case 2: return .slidingContext
+        
+        case 3: return .audioOutput
+        
+        case 4: return .generation(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .phase(phase: try FfiConverterTypeSessionPhase.read(from: &buf)
+        )
+        
+        case 6: return .emptyBatch
+        
+        case 7: return .roleOrder(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 8: return .unsupportedRole(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 9: return .unsupportedContent(message: try FfiConverterUInt32.read(from: &buf), part: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 10: return .reservedMarker(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 11: return .capacity(required: try FfiConverterUInt32.read(from: &buf), available: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 12: return .template(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ValidationError, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unsupportedProfile:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .slidingContext:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .audioOutput:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .generation(detail):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .phase(phase):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeSessionPhase.write(phase, into: &buf)
+            
+        
+        case .emptyBatch:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .roleOrder(message):
+            writeInt(&buf, Int32(7))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .unsupportedRole(message):
+            writeInt(&buf, Int32(8))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .unsupportedContent(message,part):
+            writeInt(&buf, Int32(9))
+            FfiConverterUInt32.write(message, into: &buf)
+            FfiConverterUInt32.write(part, into: &buf)
+            
+        
+        case let .reservedMarker(message):
+            writeInt(&buf, Int32(10))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .capacity(required,available):
+            writeInt(&buf, Int32(11))
+            FfiConverterUInt32.write(required, into: &buf)
+            FfiConverterUInt32.write(available, into: &buf)
+            
+        
+        case let .template(detail):
+            writeInt(&buf, Int32(12))
+            FfiConverterString.write(detail, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeValidationError_lift(_ buf: RustBuffer) throws -> ValidationError {
+    return try FfiConverterTypeValidationError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeValidationError_lower(_ value: ValidationError) -> RustBuffer {
+    return FfiConverterTypeValidationError.lower(value)
 }
 
 
@@ -9573,6 +10600,31 @@ fileprivate struct FfiConverterSequenceTypeLeapBundleEntry: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMessage: FfiConverterRustBuffer {
+    typealias SwiftType = [Message]
+
+    public static func write(_ value: [Message], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMessage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Message] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Message]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeToolCall: FfiConverterRustBuffer {
     typealias SwiftType = [ToolCall]
 
@@ -9836,6 +10888,46 @@ public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
     )
 })
 }
+/**
+ * Convenience factory for an assistant text message.
+ */
+public func chatMessageAssistant(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_assistant(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a system text message.
+ */
+public func chatMessageSystem(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_system(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a tool text message.
+ */
+public func chatMessageTool(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_tool(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a user text message.
+ */
+public func chatMessageUser(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -9880,6 +10972,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
@@ -9939,7 +11043,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
@@ -10092,6 +11199,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10114,6 +11224,42 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
@@ -10198,6 +11344,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {

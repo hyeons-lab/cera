@@ -104,11 +104,14 @@ impl Session {
     /// retrying a cancelled append. A missing report gives no recovery guarantee
     /// for raw append operations, which retain their partial-prefill behavior.
     pub fn recovery_status(&self) -> Result<SessionRecoveryStatus, FfiError> {
-        let session = self.inner.try_lock().map_err(|error| match error {
+        let guard = self.inner_mutex().try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => FfiError::Busy,
             std::sync::TryLockError::Poisoned(_) => FfiError::Backend {
                 detail: "session mutex poisoned; recreate the session".into(),
             },
+        })?;
+        let session = guard.as_ref().ok_or_else(|| FfiError::Backend {
+            detail: "session has been moved into a ChatSession".into(),
         })?;
         Ok(SessionRecoveryStatus {
             usable: session.is_usable(),

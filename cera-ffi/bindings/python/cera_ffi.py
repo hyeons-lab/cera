@@ -481,6 +481,14 @@ def _uniffi_check_contract_api_version(lib):
 def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 63071:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
@@ -557,7 +565,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -570,6 +580,32 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -696,6 +732,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_position() != 13264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -996,6 +1034,16 @@ _UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1176,6 +1224,26 @@ _UniffiLib.uniffi_cera_ffi_fn_func_cera_ffi_version.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_cera_ffi_version.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_assistant.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_assistant.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_system.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_system.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_tool.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_tool.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_cpu_backend_report.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1385,6 +1453,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_metadata.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_metadata.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_chat_session.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_chat_session.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_session.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1425,6 +1499,77 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches.argtypes 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_clear_cancel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_clear_cancel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_position.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_position.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_recovery_status.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_recovery_status.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_replace_messages.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_replace_messages.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1785,6 +1930,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.argtypes 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_session_position.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1838,6 +1988,18 @@ _UniffiLib.ffi_cera_ffi_uniffi_contract_version.restype = ctypes.c_uint32
 _UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_uint16
@@ -1952,6 +2114,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token.restype =
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.restype = ctypes.c_uint16
@@ -1973,6 +2138,45 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size.restype = ctype
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
@@ -2162,6 +2366,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.rest
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.restype = ctypes.c_uint16
@@ -2510,6 +2717,628 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
 
 
 
+
+
+
+class SessionPhase(enum.Enum):
+    """
+    Lifecycle phase of a stateful chat coordinator.
+"""
+    
+    IDLE = 0
+    """
+    Clean session at position 0, ready for initial message ingestion.
+"""
+    
+    PROMPT_READY = 1
+    """
+    Input messages have been appended and prefilled; ready for decode.
+"""
+    
+    TURN_COMPLETE = 2
+    """
+    A turn finished with a terminal end-of-sequence stop marker.
+"""
+    
+    INTERRUPTED = 3
+    """
+    Generation was interrupted by cancellation or custom nonterminal stop.
+"""
+    
+    RAW_CONTEXT = 4
+    """
+    Underlying execution state was modified outside chat rules; replacement required.
+"""
+    
+    UNUSABLE = 5
+    """
+    Unrecoverable execution fault or unwind; checked reset required to restore usability.
+"""
+    
+
+
+class _UniffiFfiConverterTypeSessionPhase(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return SessionPhase.IDLE
+        if variant == 2:
+            return SessionPhase.PROMPT_READY
+        if variant == 3:
+            return SessionPhase.TURN_COMPLETE
+        if variant == 4:
+            return SessionPhase.INTERRUPTED
+        if variant == 5:
+            return SessionPhase.RAW_CONTEXT
+        if variant == 6:
+            return SessionPhase.UNUSABLE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == SessionPhase.IDLE:
+            return
+        if value == SessionPhase.PROMPT_READY:
+            return
+        if value == SessionPhase.TURN_COMPLETE:
+            return
+        if value == SessionPhase.INTERRUPTED:
+            return
+        if value == SessionPhase.RAW_CONTEXT:
+            return
+        if value == SessionPhase.UNUSABLE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == SessionPhase.IDLE:
+            buf.write_i32(1)
+        if value == SessionPhase.PROMPT_READY:
+            buf.write_i32(2)
+        if value == SessionPhase.TURN_COMPLETE:
+            buf.write_i32(3)
+        if value == SessionPhase.INTERRUPTED:
+            buf.write_i32(4)
+        if value == SessionPhase.RAW_CONTEXT:
+            buf.write_i32(5)
+        if value == SessionPhase.UNUSABLE:
+            buf.write_i32(6)
+
+
+
+
+
+
+
+
+class ValidationError:
+    """
+    Validation failure during chat construction, preparation, or decode.
+"""
+    def __init__(self):
+        raise RuntimeError("ValidationError cannot be instantiated directly")
+
+    # Each enum variant is a nested class of the enum itself.
+    @dataclass
+    class UNSUPPORTED_PROFILE:
+        """
+        Model or tokenizer configuration does not match a supported chat profile.
+"""
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.UNSUPPORTED_PROFILE()".format()
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_UNSUPPORTED_PROFILE():
+                return False
+            return True
+
+    @dataclass
+    class SLIDING_CONTEXT:
+        """
+        Sliding context configuration (n_keep != 0) is not supported for chat.
+"""
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.SLIDING_CONTEXT()".format()
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_SLIDING_CONTEXT():
+                return False
+            return True
+
+    @dataclass
+    class AUDIO_OUTPUT:
+        """
+        Model audio output is not supported for text chat.
+"""
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.AUDIO_OUTPUT()".format()
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_AUDIO_OUTPUT():
+                return False
+            return True
+
+    @dataclass
+    class GENERATION:
+        """
+        Generation parameter validation error.
+"""
+        
+        def __init__(self, detail:str):
+            self.detail = detail
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.GENERATION(detail={})".format(self.detail)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_GENERATION():
+                return False
+            if self.detail != other.detail:
+                return False
+            return True
+
+    @dataclass
+    class PHASE:
+        """
+        Operation refused in the current session phase.
+"""
+        
+        def __init__(self, phase:SessionPhase):
+            self.phase = phase
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.PHASE(phase={})".format(self.phase)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_PHASE():
+                return False
+            if self.phase != other.phase:
+                return False
+            return True
+
+    @dataclass
+    class EMPTY_BATCH:
+        """
+        Message batch provided to ingest was empty.
+"""
+        
+        def __init__(self, ):
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.EMPTY_BATCH()".format()
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_EMPTY_BATCH():
+                return False
+            return True
+
+    @dataclass
+    class ROLE_ORDER:
+        """
+        Message role sequence violates chat rules.
+"""
+        
+        def __init__(self, message:int):
+            self.message = message
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.ROLE_ORDER(message={})".format(self.message)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_ROLE_ORDER():
+                return False
+            if self.message != other.message:
+                return False
+            return True
+
+    @dataclass
+    class UNSUPPORTED_ROLE:
+        """
+        Message role is not supported in the active profile.
+"""
+        
+        def __init__(self, message:int):
+            self.message = message
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.UNSUPPORTED_ROLE(message={})".format(self.message)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_UNSUPPORTED_ROLE():
+                return False
+            if self.message != other.message:
+                return False
+            return True
+
+    @dataclass
+    class UNSUPPORTED_CONTENT:
+        """
+        Content part is not supported in the active profile.
+"""
+        
+        def __init__(self, message:int, part:int):
+            self.message = message
+            
+            
+            self.part = part
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.UNSUPPORTED_CONTENT(message={}, part={})".format(self.message, self.part)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_UNSUPPORTED_CONTENT():
+                return False
+            if self.message != other.message:
+                return False
+            if self.part != other.part:
+                return False
+            return True
+
+    @dataclass
+    class RESERVED_MARKER:
+        """
+        Message text contains a reserved ChatML marker sequence.
+"""
+        
+        def __init__(self, message:int):
+            self.message = message
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.RESERVED_MARKER(message={})".format(self.message)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_RESERVED_MARKER():
+                return False
+            if self.message != other.message:
+                return False
+            return True
+
+    @dataclass
+    class CAPACITY:
+        """
+        Context tokens required exceed available capacity in the KV cache.
+"""
+        
+        def __init__(self, required:int, available:int):
+            self.required = required
+            
+            
+            self.available = available
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.CAPACITY(required={}, available={})".format(self.required, self.available)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_CAPACITY():
+                return False
+            if self.required != other.required:
+                return False
+            if self.available != other.available:
+                return False
+            return True
+
+    @dataclass
+    class TEMPLATE:
+        """
+        Chat template rendering error.
+"""
+        
+        def __init__(self, detail:str):
+            self.detail = detail
+            
+            
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "ValidationError.TEMPLATE(detail={})".format(self.detail)
+        def __eq__(self, other):
+            if not isinstance(other, ValidationError):
+                return NotImplemented
+            if not other.is_TEMPLATE():
+                return False
+            if self.detail != other.detail:
+                return False
+            return True
+
+    
+
+    # For each variant, we have `is_NAME` and `is_name` methods for easily checking
+    # whether an instance is that variant.
+    def is_UNSUPPORTED_PROFILE(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_PROFILE)
+    def is_unsupported_profile(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_PROFILE)
+    def is_SLIDING_CONTEXT(self) -> bool:
+        return isinstance(self, ValidationError.SLIDING_CONTEXT)
+    def is_sliding_context(self) -> bool:
+        return isinstance(self, ValidationError.SLIDING_CONTEXT)
+    def is_AUDIO_OUTPUT(self) -> bool:
+        return isinstance(self, ValidationError.AUDIO_OUTPUT)
+    def is_audio_output(self) -> bool:
+        return isinstance(self, ValidationError.AUDIO_OUTPUT)
+    def is_GENERATION(self) -> bool:
+        return isinstance(self, ValidationError.GENERATION)
+    def is_generation(self) -> bool:
+        return isinstance(self, ValidationError.GENERATION)
+    def is_PHASE(self) -> bool:
+        return isinstance(self, ValidationError.PHASE)
+    def is_phase(self) -> bool:
+        return isinstance(self, ValidationError.PHASE)
+    def is_EMPTY_BATCH(self) -> bool:
+        return isinstance(self, ValidationError.EMPTY_BATCH)
+    def is_empty_batch(self) -> bool:
+        return isinstance(self, ValidationError.EMPTY_BATCH)
+    def is_ROLE_ORDER(self) -> bool:
+        return isinstance(self, ValidationError.ROLE_ORDER)
+    def is_role_order(self) -> bool:
+        return isinstance(self, ValidationError.ROLE_ORDER)
+    def is_UNSUPPORTED_ROLE(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_ROLE)
+    def is_unsupported_role(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_ROLE)
+    def is_UNSUPPORTED_CONTENT(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_CONTENT)
+    def is_unsupported_content(self) -> bool:
+        return isinstance(self, ValidationError.UNSUPPORTED_CONTENT)
+    def is_RESERVED_MARKER(self) -> bool:
+        return isinstance(self, ValidationError.RESERVED_MARKER)
+    def is_reserved_marker(self) -> bool:
+        return isinstance(self, ValidationError.RESERVED_MARKER)
+    def is_CAPACITY(self) -> bool:
+        return isinstance(self, ValidationError.CAPACITY)
+    def is_capacity(self) -> bool:
+        return isinstance(self, ValidationError.CAPACITY)
+    def is_TEMPLATE(self) -> bool:
+        return isinstance(self, ValidationError.TEMPLATE)
+    def is_template(self) -> bool:
+        return isinstance(self, ValidationError.TEMPLATE)
+    
+
+# Now, a little trick - we make each nested variant class be a subclass of the main
+# enum class, so that method calls and instance checks etc will work intuitively.
+# We might be able to do this a little more neatly with a metaclass, but this'll do.
+ValidationError.UNSUPPORTED_PROFILE = type("ValidationError.UNSUPPORTED_PROFILE", (ValidationError.UNSUPPORTED_PROFILE, ValidationError,), {})  # type: ignore
+ValidationError.SLIDING_CONTEXT = type("ValidationError.SLIDING_CONTEXT", (ValidationError.SLIDING_CONTEXT, ValidationError,), {})  # type: ignore
+ValidationError.AUDIO_OUTPUT = type("ValidationError.AUDIO_OUTPUT", (ValidationError.AUDIO_OUTPUT, ValidationError,), {})  # type: ignore
+ValidationError.GENERATION = type("ValidationError.GENERATION", (ValidationError.GENERATION, ValidationError,), {})  # type: ignore
+ValidationError.PHASE = type("ValidationError.PHASE", (ValidationError.PHASE, ValidationError,), {})  # type: ignore
+ValidationError.EMPTY_BATCH = type("ValidationError.EMPTY_BATCH", (ValidationError.EMPTY_BATCH, ValidationError,), {})  # type: ignore
+ValidationError.ROLE_ORDER = type("ValidationError.ROLE_ORDER", (ValidationError.ROLE_ORDER, ValidationError,), {})  # type: ignore
+ValidationError.UNSUPPORTED_ROLE = type("ValidationError.UNSUPPORTED_ROLE", (ValidationError.UNSUPPORTED_ROLE, ValidationError,), {})  # type: ignore
+ValidationError.UNSUPPORTED_CONTENT = type("ValidationError.UNSUPPORTED_CONTENT", (ValidationError.UNSUPPORTED_CONTENT, ValidationError,), {})  # type: ignore
+ValidationError.RESERVED_MARKER = type("ValidationError.RESERVED_MARKER", (ValidationError.RESERVED_MARKER, ValidationError,), {})  # type: ignore
+ValidationError.CAPACITY = type("ValidationError.CAPACITY", (ValidationError.CAPACITY, ValidationError,), {})  # type: ignore
+ValidationError.TEMPLATE = type("ValidationError.TEMPLATE", (ValidationError.TEMPLATE, ValidationError,), {})  # type: ignore
+
+
+
+
+class _UniffiFfiConverterTypeValidationError(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ValidationError.UNSUPPORTED_PROFILE(
+            )
+        if variant == 2:
+            return ValidationError.SLIDING_CONTEXT(
+            )
+        if variant == 3:
+            return ValidationError.AUDIO_OUTPUT(
+            )
+        if variant == 4:
+            return ValidationError.GENERATION(
+                _UniffiFfiConverterString.read(buf),
+            )
+        if variant == 5:
+            return ValidationError.PHASE(
+                _UniffiFfiConverterTypeSessionPhase.read(buf),
+            )
+        if variant == 6:
+            return ValidationError.EMPTY_BATCH(
+            )
+        if variant == 7:
+            return ValidationError.ROLE_ORDER(
+                _UniffiFfiConverterUInt32.read(buf),
+            )
+        if variant == 8:
+            return ValidationError.UNSUPPORTED_ROLE(
+                _UniffiFfiConverterUInt32.read(buf),
+            )
+        if variant == 9:
+            return ValidationError.UNSUPPORTED_CONTENT(
+                _UniffiFfiConverterUInt32.read(buf),
+                _UniffiFfiConverterUInt32.read(buf),
+            )
+        if variant == 10:
+            return ValidationError.RESERVED_MARKER(
+                _UniffiFfiConverterUInt32.read(buf),
+            )
+        if variant == 11:
+            return ValidationError.CAPACITY(
+                _UniffiFfiConverterUInt32.read(buf),
+                _UniffiFfiConverterUInt32.read(buf),
+            )
+        if variant == 12:
+            return ValidationError.TEMPLATE(
+                _UniffiFfiConverterString.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value.is_UNSUPPORTED_PROFILE():
+            return
+        if value.is_SLIDING_CONTEXT():
+            return
+        if value.is_AUDIO_OUTPUT():
+            return
+        if value.is_GENERATION():
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        if value.is_PHASE():
+            _UniffiFfiConverterTypeSessionPhase.check_lower(value.phase)
+            return
+        if value.is_EMPTY_BATCH():
+            return
+        if value.is_ROLE_ORDER():
+            _UniffiFfiConverterUInt32.check_lower(value.message)
+            return
+        if value.is_UNSUPPORTED_ROLE():
+            _UniffiFfiConverterUInt32.check_lower(value.message)
+            return
+        if value.is_UNSUPPORTED_CONTENT():
+            _UniffiFfiConverterUInt32.check_lower(value.message)
+            _UniffiFfiConverterUInt32.check_lower(value.part)
+            return
+        if value.is_RESERVED_MARKER():
+            _UniffiFfiConverterUInt32.check_lower(value.message)
+            return
+        if value.is_CAPACITY():
+            _UniffiFfiConverterUInt32.check_lower(value.required)
+            _UniffiFfiConverterUInt32.check_lower(value.available)
+            return
+        if value.is_TEMPLATE():
+            _UniffiFfiConverterString.check_lower(value.detail)
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value.is_UNSUPPORTED_PROFILE():
+            buf.write_i32(1)
+        if value.is_SLIDING_CONTEXT():
+            buf.write_i32(2)
+        if value.is_AUDIO_OUTPUT():
+            buf.write_i32(3)
+        if value.is_GENERATION():
+            buf.write_i32(4)
+            _UniffiFfiConverterString.write(value.detail, buf)
+        if value.is_PHASE():
+            buf.write_i32(5)
+            _UniffiFfiConverterTypeSessionPhase.write(value.phase, buf)
+        if value.is_EMPTY_BATCH():
+            buf.write_i32(6)
+        if value.is_ROLE_ORDER():
+            buf.write_i32(7)
+            _UniffiFfiConverterUInt32.write(value.message, buf)
+        if value.is_UNSUPPORTED_ROLE():
+            buf.write_i32(8)
+            _UniffiFfiConverterUInt32.write(value.message, buf)
+        if value.is_UNSUPPORTED_CONTENT():
+            buf.write_i32(9)
+            _UniffiFfiConverterUInt32.write(value.message, buf)
+            _UniffiFfiConverterUInt32.write(value.part, buf)
+        if value.is_RESERVED_MARKER():
+            buf.write_i32(10)
+            _UniffiFfiConverterUInt32.write(value.message, buf)
+        if value.is_CAPACITY():
+            buf.write_i32(11)
+            _UniffiFfiConverterUInt32.write(value.required, buf)
+            _UniffiFfiConverterUInt32.write(value.available, buf)
+        if value.is_TEMPLATE():
+            buf.write_i32(12)
+            _UniffiFfiConverterString.write(value.detail, buf)
+
+
+
+
+
 # FfiError
 # We want to define each variant as a nested class that's also a subclass,
 # which is tricky in Python.  To accomplish this we're going to create each
@@ -2841,6 +3670,20 @@ class FfiError:  # type: ignore
         def __repr__(self):
             return "FfiError.LoraUnsupportedByBackend({})".format(str(self))
     _UniffiTempFfiError.LoraUnsupportedByBackend = LoraUnsupportedByBackend # type: ignore
+    class ChatValidation(_UniffiTempFfiError):
+        """
+        Chat contract validation failure.
+"""
+        
+        def __init__(self, error):
+            super().__init__(", ".join([
+                "error={!r}".format(error),
+            ]))
+            self.error = error
+
+        def __repr__(self):
+            return "FfiError.ChatValidation({})".format(str(self))
+    _UniffiTempFfiError.ChatValidation = ChatValidation # type: ignore
 
 FfiError = _UniffiTempFfiError # type: ignore
 del _UniffiTempFfiError
@@ -2905,6 +3748,10 @@ class _UniffiFfiConverterTypeFfiError(_UniffiConverterRustBuffer):
             return FfiError.LoraUnsupportedByBackend(
                 _UniffiFfiConverterString.read(buf),
             )
+        if variant == 15:
+            return FfiError.ChatValidation(
+                _UniffiFfiConverterTypeValidationError.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -2950,6 +3797,9 @@ class _UniffiFfiConverterTypeFfiError(_UniffiConverterRustBuffer):
         if isinstance(value, FfiError.LoraUnsupportedByBackend):
             _UniffiFfiConverterString.check_lower(value.detail)
             return
+        if isinstance(value, FfiError.ChatValidation):
+            _UniffiFfiConverterTypeValidationError.check_lower(value.error)
+            return
 
     @staticmethod
     def write(value, buf):
@@ -2994,6 +3844,9 @@ class _UniffiFfiConverterTypeFfiError(_UniffiConverterRustBuffer):
         if isinstance(value, FfiError.LoraUnsupportedByBackend):
             buf.write_i32(14)
             _UniffiFfiConverterString.write(value.detail, buf)
+        if isinstance(value, FfiError.ChatValidation):
+            buf.write_i32(15)
+            _UniffiFfiConverterTypeValidationError.write(value.error, buf)
 
 
 class BundleRepoProtocol(typing.Protocol):
@@ -4920,6 +5773,51 @@ class _UniffiFfiConverterTypeIngestRecovery(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeKvRewindFailure.write(value.rewind_error, buf)
         _UniffiFfiConverterOptionalTypeFfiError.write(value.reset_error, buf)
 
+@dataclass
+class IngestSummary:
+    """
+    Summary of a successful message ingestion.
+"""
+    def __init__(self, *, input_tokens:int, position_before:int, position_after:int):
+        self.input_tokens = input_tokens
+        self.position_before = position_before
+        self.position_after = position_after
+        
+        
+
+    
+    def __str__(self):
+        return "IngestSummary(input_tokens={}, position_before={}, position_after={})".format(self.input_tokens, self.position_before, self.position_after)
+    def __eq__(self, other):
+        if self.input_tokens != other.input_tokens:
+            return False
+        if self.position_before != other.position_before:
+            return False
+        if self.position_after != other.position_after:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeIngestSummary(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return IngestSummary(
+            input_tokens=_UniffiFfiConverterUInt32.read(buf),
+            position_before=_UniffiFfiConverterUInt32.read(buf),
+            position_after=_UniffiFfiConverterUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt32.check_lower(value.input_tokens)
+        _UniffiFfiConverterUInt32.check_lower(value.position_before)
+        _UniffiFfiConverterUInt32.check_lower(value.position_after)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt32.write(value.input_tokens, buf)
+        _UniffiFfiConverterUInt32.write(value.position_before, buf)
+        _UniffiFfiConverterUInt32.write(value.position_after, buf)
+
 class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -4987,6 +5885,116 @@ class _UniffiFfiConverterTypeLeapBundleEntry(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterString.write(value.name, buf)
         _UniffiFfiConverterSequenceString.write(value.quants, buf)
+
+
+
+
+
+
+class Role(enum.Enum):
+    """
+    Message author role in conversational chat.
+"""
+    
+    SYSTEM = 0
+    """
+    System prompt setting instructions and context.
+"""
+    
+    USER = 1
+    """
+    User prompt input.
+"""
+    
+    ASSISTANT = 2
+    """
+    Assistant model response.
+"""
+    
+    TOOL = 3
+    """
+    Tool result or response payload.
+"""
+    
+
+
+class _UniffiFfiConverterTypeRole(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return Role.SYSTEM
+        if variant == 2:
+            return Role.USER
+        if variant == 3:
+            return Role.ASSISTANT
+        if variant == 4:
+            return Role.TOOL
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == Role.SYSTEM:
+            return
+        if value == Role.USER:
+            return
+        if value == Role.ASSISTANT:
+            return
+        if value == Role.TOOL:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == Role.SYSTEM:
+            buf.write_i32(1)
+        if value == Role.USER:
+            buf.write_i32(2)
+        if value == Role.ASSISTANT:
+            buf.write_i32(3)
+        if value == Role.TOOL:
+            buf.write_i32(4)
+
+
+
+@dataclass
+class Message:
+    """
+    A structured conversational turn message.
+"""
+    def __init__(self, *, role:Role, content:str):
+        self.role = role
+        self.content = content
+        
+        
+
+    
+    def __str__(self):
+        return "Message(role={}, content={})".format(self.role, self.content)
+    def __eq__(self, other):
+        if self.role != other.role:
+            return False
+        if self.content != other.content:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeMessage(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return Message(
+            role=_UniffiFfiConverterTypeRole.read(buf),
+            content=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeRole.check_lower(value.role)
+        _UniffiFfiConverterString.check_lower(value.content)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeRole.write(value.role, buf)
+        _UniffiFfiConverterString.write(value.content, buf)
 
 @dataclass
 class ModalityCapabilities:
@@ -6058,6 +7066,51 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.description, buf)
         _UniffiFfiConverterString.write(value.parameters_json, buf)
 
+@dataclass
+class TurnResult:
+    """
+    Result of a completed chat turn.
+"""
+    def __init__(self, *, text:str, tokens:typing.List[int], summary:GenerateSummary):
+        self.text = text
+        self.tokens = tokens
+        self.summary = summary
+        
+        
+
+    
+    def __str__(self):
+        return "TurnResult(text={}, tokens={}, summary={})".format(self.text, self.tokens, self.summary)
+    def __eq__(self, other):
+        if self.text != other.text:
+            return False
+        if self.tokens != other.tokens:
+            return False
+        if self.summary != other.summary:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTurnResult(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TurnResult(
+            text=_UniffiFfiConverterString.read(buf),
+            tokens=_UniffiFfiConverterSequenceUInt32.read(buf),
+            summary=_UniffiFfiConverterTypeGenerateSummary.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.text)
+        _UniffiFfiConverterSequenceUInt32.check_lower(value.tokens)
+        _UniffiFfiConverterTypeGenerateSummary.check_lower(value.summary)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.text, buf)
+        _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
+        _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
+
 class _UniffiFfiConverterSequenceBytes(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -7003,141 +8056,6 @@ class _UniffiFfiConverterSequenceTypeFfiEntitySpan(_UniffiConverterRustBuffer):
         ]
 
 
-class LoraAdaptersProtocol(typing.Protocol):
-    """
-    A loaded LoRA adapter, ready to attach to a [`Session`] via
-    [`Session::attach_lora`]. Load it once and share the handle across sessions —
-    it's reference-counted internally, so attaching to multiple sessions doesn't
-    re-parse or re-allocate the factors.
-"""
-    
-    def target_count(self, ) -> int:
-        """
-        Number of `(layer, target)` low-rank deltas the adapter carries — for
-        diagnostics / logging.
-"""
-        raise NotImplementedError
-
-class LoraAdapters(LoraAdaptersProtocol):
-    """
-    A loaded LoRA adapter, ready to attach to a [`Session`] via
-    [`Session::attach_lora`]. Load it once and share the handle across sessions —
-    it's reference-counted internally, so attaching to multiple sessions doesn't
-    re-parse or re-allocate the factors.
-"""
-    
-    _handle: ctypes.c_uint64
-    @classmethod
-    def from_gguf(cls, path: str) -> LoraAdapters:
-        """
-        Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
-        a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
-        metadata (missing ⇒ scale = 1).
-"""
-        
-        _UniffiFfiConverterString.check_lower(path)
-        _uniffi_lowered_args = (
-            _UniffiFfiConverterString.lower(path),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
-        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf,
-            *_uniffi_lowered_args,
-        )
-        return cls._uniffi_make_instance(_uniffi_ffi_result)
-    @classmethod
-    def from_safetensors(cls, path: str,alpha: typing.Optional[float]) -> LoraAdapters:
-        """
-        Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
-        in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
-        scale = 1, i.e. `alpha == rank`).
-"""
-        
-        _UniffiFfiConverterString.check_lower(path)
-
-        _UniffiFfiConverterOptionalFloat32.check_lower(alpha)
-        _uniffi_lowered_args = (
-            _UniffiFfiConverterString.lower(path),
-            _UniffiFfiConverterOptionalFloat32.lower(alpha),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
-        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors,
-            *_uniffi_lowered_args,
-        )
-        return cls._uniffi_make_instance(_uniffi_ffi_result)
-    
-    def __init__(self, *args, **kwargs):
-        raise ValueError("This class has no default constructor")
-
-    def __del__(self):
-        # In case of partial initialization of instances.
-        handle = getattr(self, "_handle", None)
-        if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters, handle)
-
-    def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters, self._handle)
-
-    # Used by alternative constructors or any methods which return this type.
-    @classmethod
-    def _uniffi_make_instance(cls, handle):
-        # Lightly yucky way to bypass the usual __init__ logic
-        # and just create a new instance with the required handle.
-        inst = cls.__new__(cls)
-        inst._handle = handle
-        return inst
-    def target_count(self, ) -> int:
-        """
-        Number of `(layer, target)` low-rank deltas the adapter carries — for
-        diagnostics / logging.
-"""
-        _uniffi_lowered_args = (
-            self._uniffi_clone_handle(),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
-        _uniffi_error_converter = None
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count,
-            *_uniffi_lowered_args,
-        )
-        return _uniffi_lift_return(_uniffi_ffi_result)
-
-
-
-
-
-class _UniffiFfiConverterTypeLoraAdapters:
-    @staticmethod
-    def lift(value: int) -> LoraAdapters:
-        return LoraAdapters._uniffi_make_instance(value)
-
-    @staticmethod
-    def check_lower(value: LoraAdapters):
-        if not isinstance(value, LoraAdapters):
-            raise TypeError("Expected LoraAdapters instance, {} found".format(type(value).__name__))
-
-    @staticmethod
-    def lower(value: LoraAdapters) -> ctypes.c_uint64:
-        return value._uniffi_clone_handle()
-
-    @classmethod
-    def read(cls, buf: _UniffiRustBuffer) -> LoraAdapters:
-        ptr = buf.read_u64()
-        if ptr == 0:
-            raise InternalError("Raw handle value was null")
-        return cls.lift(ptr)
-
-    @classmethod
-    def write(cls, value: LoraAdapters, buf: _UniffiRustBuffer):
-        buf.write_u64(cls.lower(value))
-
-
 class ModalitySink():
     """
     Streaming sink for decode output. Foreign callers implement this
@@ -7456,6 +8374,164 @@ class _UniffiFfiConverterTypeModalitySink:
 
     @classmethod
     def write(cls, value: ModalitySink, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+class _UniffiFfiConverterSequenceTypeMessage(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeMessage.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeMessage.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeMessage.read(buf) for i in range(count)
+        ]
+
+
+class LoraAdaptersProtocol(typing.Protocol):
+    """
+    A loaded LoRA adapter, ready to attach to a [`Session`] via
+    [`Session::attach_lora`]. Load it once and share the handle across sessions —
+    it's reference-counted internally, so attaching to multiple sessions doesn't
+    re-parse or re-allocate the factors.
+"""
+    
+    def target_count(self, ) -> int:
+        """
+        Number of `(layer, target)` low-rank deltas the adapter carries — for
+        diagnostics / logging.
+"""
+        raise NotImplementedError
+
+class LoraAdapters(LoraAdaptersProtocol):
+    """
+    A loaded LoRA adapter, ready to attach to a [`Session`] via
+    [`Session::attach_lora`]. Load it once and share the handle across sessions —
+    it's reference-counted internally, so attaching to multiple sessions doesn't
+    re-parse or re-allocate the factors.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_gguf(cls, path: str) -> LoraAdapters:
+        """
+        Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+        a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+        metadata (missing ⇒ scale = 1).
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_safetensors(cls, path: str,alpha: typing.Optional[float]) -> LoraAdapters:
+        """
+        Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+        in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+        scale = 1, i.e. `alpha == rank`).
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+
+        _UniffiFfiConverterOptionalFloat32.check_lower(alpha)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+            _UniffiFfiConverterOptionalFloat32.lower(alpha),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def target_count(self, ) -> int:
+        """
+        Number of `(layer, target)` low-rank deltas the adapter carries — for
+        diagnostics / logging.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeLoraAdapters:
+    @staticmethod
+    def lift(value: int) -> LoraAdapters:
+        return LoraAdapters._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: LoraAdapters):
+        if not isinstance(value, LoraAdapters):
+            raise TypeError("Expected LoraAdapters instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: LoraAdapters) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> LoraAdapters:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: LoraAdapters, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
 
@@ -7783,6 +8859,15 @@ class SessionProtocol(typing.Protocol):
         Mean-pooled hidden state — a single `[hidden_size]` vector (the common
         classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
         `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+"""
+        raise NotImplementedError
+    def into_chat(self, ) -> ChatSession:
+        """
+        Wrap this session in a stateful chat coordinator.
+
+        On success, ownership of the inner inference state is transferred to the returned
+        [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+        If validation fails, the session remains intact and usable.
 """
         raise NotImplementedError
     def position(self, ) -> int:
@@ -8431,6 +9516,25 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def into_chat(self, ) -> ChatSession:
+        """
+        Wrap this session in a stateful chat coordinator.
+
+        On success, ownership of the inner inference state is transferred to the returned
+        [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+        If validation fails, the session remains intact and usable.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeChatSession.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def position(self, ) -> int:
         """
         Current KV position — how many tokens live in the cache.
@@ -8627,6 +9731,360 @@ class _UniffiFfiConverterTypeSession:
     def write(cls, value: Session, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
+
+class ChatSessionProtocol(typing.Protocol):
+    """
+    Stateful chat coordinator wrapping an inference session.
+"""
+    
+    def cancel(self, ) -> None:
+        """
+        Flip cancellation flag to interrupt in-flight prefill or decode.
+
+        Wait-free and safe from any thread.
+"""
+        raise NotImplementedError
+    def clear_cancel(self, ) -> None:
+        """
+        Clear pending cancellation.
+"""
+        raise NotImplementedError
+    def complete(self, opts: GenerateOpts) -> TurnResult:
+        """
+        Complete generation synchronously and return the assistant response.
+"""
+        raise NotImplementedError
+    def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Stream generation output tokens into the specified sink.
+"""
+        raise NotImplementedError
+    def ingest(self, message: Message) -> IngestSummary:
+        """
+        Ingest a single message into the chat context.
+"""
+        raise NotImplementedError
+    def ingest_messages(self, messages: typing.List[Message]) -> IngestSummary:
+        """
+        Ingest a batch of messages into the chat context.
+"""
+        raise NotImplementedError
+    def into_session(self, ) -> Session:
+        """
+        Reclaim the underlying Session, consuming this ChatSession.
+"""
+        raise NotImplementedError
+    def phase(self, ) -> SessionPhase:
+        """
+        Current session lifecycle phase.
+"""
+        raise NotImplementedError
+    def position(self, ) -> int:
+        """
+        Current token position in the execution context.
+
+        Lock-free and safe to query concurrently while generation is in flight.
+"""
+        raise NotImplementedError
+    def recovery_status(self, ) -> SessionRecoveryStatus:
+        """
+        Observe recovery status after an ingestion failure.
+
+        Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+"""
+        raise NotImplementedError
+    def replace_messages(self, messages: typing.List[Message]) -> IngestSummary:
+        """
+        Replace conversational history with a fresh message batch.
+"""
+        raise NotImplementedError
+    def reset(self, ) -> None:
+        """
+        Reset execution state and return to Idle phase.
+"""
+        raise NotImplementedError
+
+class ChatSession(ChatSessionProtocol):
+    """
+    Stateful chat coordinator wrapping an inference session.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_session(cls, session: Session) -> ChatSession:
+        """
+        Construct a ChatSession from an existing Session, taking ownership of its state.
+
+        If validation fails, the session remains intact and usable on the caller side.
+"""
+        
+        _UniffiFfiConverterTypeSession.check_lower(session)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterTypeSession.lower(session),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeChatSession.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_chatsession, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def cancel(self, ) -> None:
+        """
+        Flip cancellation flag to interrupt in-flight prefill or decode.
+
+        Wait-free and safe from any thread.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def clear_cancel(self, ) -> None:
+        """
+        Clear pending cancellation.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_clear_cancel,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def complete(self, opts: GenerateOpts) -> TurnResult:
+        """
+        Complete generation synchronously and return the assistant response.
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeTurnResult.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Stream generation output tokens into the specified sink.
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterTypeModalitySink.check_lower(sink)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterTypeModalitySink.lower(sink),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def ingest(self, message: Message) -> IngestSummary:
+        """
+        Ingest a single message into the chat context.
+"""
+        
+        _UniffiFfiConverterTypeMessage.check_lower(message)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeMessage.lower(message),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeIngestSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def ingest_messages(self, messages: typing.List[Message]) -> IngestSummary:
+        """
+        Ingest a batch of messages into the chat context.
+"""
+        
+        _UniffiFfiConverterSequenceTypeMessage.check_lower(messages)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceTypeMessage.lower(messages),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeIngestSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def into_session(self, ) -> Session:
+        """
+        Reclaim the underlying Session, consuming this ChatSession.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeSession.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def phase(self, ) -> SessionPhase:
+        """
+        Current session lifecycle phase.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeSessionPhase.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def position(self, ) -> int:
+        """
+        Current token position in the execution context.
+
+        Lock-free and safe to query concurrently while generation is in flight.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_position,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def recovery_status(self, ) -> SessionRecoveryStatus:
+        """
+        Observe recovery status after an ingestion failure.
+
+        Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeSessionRecoveryStatus.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_recovery_status,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def replace_messages(self, messages: typing.List[Message]) -> IngestSummary:
+        """
+        Replace conversational history with a fresh message batch.
+"""
+        
+        _UniffiFfiConverterSequenceTypeMessage.check_lower(messages)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceTypeMessage.lower(messages),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeIngestSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_replace_messages,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def reset(self, ) -> None:
+        """
+        Reset execution state and return to Idle phase.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeChatSession:
+    @staticmethod
+    def lift(value: int) -> ChatSession:
+        return ChatSession._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: ChatSession):
+        if not isinstance(value, ChatSession):
+            raise TypeError("Expected ChatSession instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: ChatSession) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> ChatSession:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: ChatSession, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
 class _UniffiFfiConverterOptionalTypeToolFormat(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8791,12 +10249,17 @@ class CeraEngineProtocol(typing.Protocol):
         max context, etc.). Returns a `Clone` of the stored metadata.
 """
         raise NotImplementedError
+    def new_chat_session(self, config: SessionConfig) -> ChatSession:
+        """
+        Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+"""
+        raise NotImplementedError
     def new_session(self, config: SessionConfig) -> Session:
         """
-        Open a new [`Session`] sharing this engine's model + tokenizer
+        Open a new [`Session`] sharing this engine's model and tokenizer
         by `Arc` clone. The returned session outlives `&self`; the
         engine keeps the shared state live for every session it hands
-        out. Cheap — no model load, just config + state allocation.
+        out. Cheap: no model load, just config and state allocation.
 """
         raise NotImplementedError
     def special_token_id(self, name: str) -> typing.Optional[int]:
@@ -9520,12 +10983,30 @@ class CeraEngine(CeraEngineProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def new_chat_session(self, config: SessionConfig) -> ChatSession:
+        """
+        Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+"""
+        
+        _UniffiFfiConverterTypeSessionConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeSessionConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeChatSession.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_chat_session,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def new_session(self, config: SessionConfig) -> Session:
         """
-        Open a new [`Session`] sharing this engine's model + tokenizer
+        Open a new [`Session`] sharing this engine's model and tokenizer
         by `Arc` clone. The returned session outlives `&self`; the
         engine keeps the shared state live for every session it hands
-        out. Cheap — no model load, just config + state allocation.
+        out. Cheap: no model load, just config and state allocation.
 """
         
         _UniffiFfiConverterTypeSessionConfig.check_lower(config)
@@ -11524,6 +13005,74 @@ def cera_ffi_version() -> str:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_assistant(content: str) -> Message:
+    """
+    Convenience factory for an assistant text message.
+"""
+    
+    _UniffiFfiConverterString.check_lower(content)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(content),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_assistant,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_system(content: str) -> Message:
+    """
+    Convenience factory for a system text message.
+"""
+    
+    _UniffiFfiConverterString.check_lower(content)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(content),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_system,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_tool(content: str) -> Message:
+    """
+    Convenience factory for a tool text message.
+"""
+    
+    _UniffiFfiConverterString.check_lower(content)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(content),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_tool,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_user(content: str) -> Message:
+    """
+    Convenience factory for a user text message.
+"""
+    
+    _UniffiFfiConverterString.check_lower(content)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(content),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def cpu_backend_report() -> str:
     """
     One-line CPU backend report for this host — the resolved SIMD tier plus the
@@ -11709,10 +13258,13 @@ def whisper_default_transcribe_opts() -> FfiWhisperTranscribeOpts:
 __all__ = [
     "InternalError",
     "BackendPreference",
+    "SessionPhase",
+    "ValidationError",
     "FfiError",
     "FinishReason",
     "RecoveryOutcome",
     "KvRewindFailure",
+    "Role",
     "GenerationDefaults",
     "KvCompression",
     "FfiVadEvent",
@@ -11735,7 +13287,9 @@ __all__ = [
     "GenerateSummary",
     "GenerateOutput",
     "IngestRecovery",
+    "IngestSummary",
     "LeapBundleEntry",
+    "Message",
     "ModalityCapabilities",
     "ModelFiles",
     "ModelMetadata",
@@ -11745,8 +13299,13 @@ __all__ = [
     "SessionRecoveryStatus",
     "ToolCall",
     "ToolDef",
+    "TurnResult",
     "UserMessage",
     "cera_ffi_version",
+    "chat_message_assistant",
+    "chat_message_system",
+    "chat_message_tool",
+    "chat_message_user",
     "cpu_backend_report",
     "detect_tool_format",
     "hotword_default_config",
@@ -11758,12 +13317,14 @@ __all__ = [
     "whisper_default_transcribe_opts",
     "BundleRepo",
     "BundleRepoProtocol",
-    "LoraAdapters",
-    "LoraAdaptersProtocol",
     "ModalitySinkImpl",
     "ModalitySink",
+    "LoraAdapters",
+    "LoraAdaptersProtocol",
     "Session",
     "SessionProtocol",
+    "ChatSession",
+    "ChatSessionProtocol",
     "CeraEngine",
     "CeraEngineProtocol",
     "DownloadProgressSinkImpl",

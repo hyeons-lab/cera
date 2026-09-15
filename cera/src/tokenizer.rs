@@ -1144,7 +1144,7 @@ fn unescape_token(s: &str) -> Vec<u8> {
     s.into_bytes()
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 impl BpeTokenizer {
     pub fn empty_for_test() -> Self {
         Self {
@@ -1173,6 +1173,19 @@ impl BpeTokenizer {
         t.special_tokens.insert("<|im_start|>".to_string(), 6);
         t.special_tokens.insert("<|im_end|>".to_string(), 7);
         t.chat_template = Some(crate::session::chat::TEMPLATE.to_string());
+        t.vocab = vec![
+            vec![],                      // 0
+            b"<|startoftext|>".to_vec(), // 1
+            vec![],                      // 2
+            vec![],                      // 3
+            vec![],                      // 4
+            vec![],                      // 5
+            b"<|im_start|>".to_vec(),    // 6
+            b"<|im_end|>".to_vec(),      // 7
+            vec![],                      // 8
+            vec![],                      // 9
+            b"hi ".to_vec(),             // 10
+        ];
         t
     }
 }

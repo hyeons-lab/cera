@@ -169,6 +169,7 @@
         "has_chat_template": "pub fn has_chat_template(&self) -> bool",
         "is_special_token": "pub fn is_special_token(&self, id: u32) -> bool",
         "metadata": "pub fn metadata(&self) -> ModelMetadata",
+        "new_chat_session": "pub fn new_chat_session(&self, config: SessionConfig) -> Result<Arc<ChatSession>, FfiError>",
         "new_session": "pub fn new_session(&self, config: SessionConfig) -> Result<Arc<Session>, FfiError>",
         "special_token_id": "pub fn special_token_id(&self, name: String) -> Option<u32>",
         "tool_call_start_token": "pub fn tool_call_start_token(&self, format: ToolFormat) -> Option<u32>",
@@ -216,6 +217,7 @@
         "hidden_states_for_text": "pub fn hidden_states_for_text(&self, text: String) -> Result<Vec<u8>, FfiError>",
         "hidden_states_for_tokens": "pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError>",
         "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError>",
+        "into_chat": "pub fn into_chat(&self) -> Result<Arc<ChatSession>, FfiError>",
         "position": "pub fn position(&self) -> u32",
         "remove_lora": "pub fn remove_lora(&self) -> Result<(), FfiError>",
         "reset": "pub fn reset(&self) -> Result<(), FfiError>",
@@ -497,7 +499,7 @@
       "kind": "record",
       "owner": "FfiError",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub enum FfiError { #[error(\"modality not supported by this model\")] UnsupportedModality, #[error(\"inference_type `{inference_type}` is not supported in this version of cera\")] UnsupportedInferenceType { inference_type: String }, #[error(\"session is busy with another operation\")] Busy, #[error(\"cancelled\")] Cancelled, #[error(\"context window ({max_seq_len}) exceeded by {by} tokens\")] ContextOverflow { max_seq_len: u32, by: u32 }, #[error(\"empty input\")] EmptyInput, #[error(\"io: {detail}\")] Io { detail: String }, #[error(\"backend: {detail}\")] Backend { detail: String }, #[error(\"grammar: {detail}\")] GrammarParse { detail: String }, #[error(\"token id {id} out of range (vocab_size {vocab_size})\")] InvalidToken { id: u32, vocab_size: u32 }, #[error(\"lora: {detail}\")] LoraParse { detail: String }, #[error(\"out of memory: could not allocate {requested_bytes} bytes\")] OutOfMemory { requested_bytes: u64 }, #[error( \"model already configured for KV compression mode `{configured}`; \\\n         cannot reconfigure to `{requested}` \u2014 create a separate model instance\" )] KvCompressionConflict { configured: String, requested: String, }, #[error(\"LoRA adapter not supported by this backend: {detail}\")] LoraUnsupportedByBackend { detail: String }, }"
+      "expected": "pub enum FfiError { #[error(\"modality not supported by this model\")] UnsupportedModality, #[error(\"inference_type `{inference_type}` is not supported in this version of cera\")] UnsupportedInferenceType { inference_type: String }, #[error(\"session is busy with another operation\")] Busy, #[error(\"cancelled\")] Cancelled, #[error(\"context window ({max_seq_len}) exceeded by {by} tokens\")] ContextOverflow { max_seq_len: u32, by: u32 }, #[error(\"empty input\")] EmptyInput, #[error(\"io: {detail}\")] Io { detail: String }, #[error(\"backend: {detail}\")] Backend { detail: String }, #[error(\"grammar: {detail}\")] GrammarParse { detail: String }, #[error(\"token id {id} out of range (vocab_size {vocab_size})\")] InvalidToken { id: u32, vocab_size: u32 }, #[error(\"lora: {detail}\")] LoraParse { detail: String }, #[error(\"out of memory: could not allocate {requested_bytes} bytes\")] OutOfMemory { requested_bytes: u64 }, #[error( \"model already configured for KV compression mode `{configured}`; \\\n         cannot reconfigure to `{requested}` \u2014 create a separate model instance\" )] KvCompressionConflict { configured: String, requested: String, }, #[error(\"LoRA adapter not supported by this backend: {detail}\")] LoraUnsupportedByBackend { detail: String }, #[error(\"chat validation: {error}\")] ChatValidation { error: ValidationError }, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",

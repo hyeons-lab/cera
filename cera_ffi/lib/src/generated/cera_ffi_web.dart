@@ -1587,6 +1587,178 @@ class UserMessage {
   int get hashCode => Object.hash(text, images, audio);
 }
 
+/// Summary of a successful message ingestion.
+class IngestSummary {
+  const IngestSummary({
+    /// Number of tokens encoded and appended to context.
+    required this.inputTokens,
+    /// KV position before ingestion.
+    required this.positionBefore,
+    /// KV position after ingestion.
+    required this.positionAfter,
+  });
+
+  /// Number of tokens encoded and appended to context.
+  final int inputTokens;
+  /// KV position before ingestion.
+  final int positionBefore;
+  /// KV position after ingestion.
+  final int positionAfter;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'inputTokens': this.inputTokens,
+      'positionBefore': this.positionBefore,
+      'positionAfter': this.positionAfter,
+    };
+  }
+
+  factory IngestSummary.fromJson(Map<String, dynamic> json) {
+    return IngestSummary(
+      inputTokens: (json['inputTokens'] as num).toInt(),
+      positionBefore: (json['positionBefore'] as num).toInt(),
+      positionAfter: (json['positionAfter'] as num).toInt(),
+    );
+  }
+
+  IngestSummary copyWith({
+    int? inputTokens,
+    int? positionBefore,
+    int? positionAfter,
+  }) {
+    return IngestSummary(
+      inputTokens: inputTokens ?? this.inputTokens,
+      positionBefore: positionBefore ?? this.positionBefore,
+      positionAfter: positionAfter ?? this.positionAfter,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'IngestSummary(inputTokens: $inputTokens, positionBefore: $positionBefore, positionAfter: $positionAfter)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IngestSummary && inputTokens == other.inputTokens && positionBefore == other.positionBefore && positionAfter == other.positionAfter;
+
+  @override
+  int get hashCode => Object.hash(inputTokens, positionBefore, positionAfter);
+}
+
+/// A structured conversational turn message.
+class Message {
+  const Message({
+    /// Author role.
+    required this.role,
+    /// Message text content.
+    required this.content,
+  });
+
+  /// Author role.
+  final Role role;
+  /// Message text content.
+  final String content;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'role': RoleFfiCodec.encode(this.role),
+      'content': this.content,
+    };
+  }
+
+  factory Message.fromJson(Map<String, dynamic> json) {
+    return Message(
+      role: RoleFfiCodec.decode(json['role'] as String),
+      content: json['content'] as String,
+    );
+  }
+
+  Message copyWith({
+    Role? role,
+    String? content,
+  }) {
+    return Message(
+      role: role ?? this.role,
+      content: content ?? this.content,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'Message(role: $role, content: $content)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Message && role == other.role && content == other.content;
+
+  @override
+  int get hashCode => Object.hash(role, content);
+}
+
+/// Result of a completed chat turn.
+class TurnResult {
+  const TurnResult({
+    /// Decoded assistant response text.
+    required this.text,
+    /// Token identifiers emitted during the turn.
+    required this.tokens,
+    /// Generation summary metrics.
+    required this.summary,
+  });
+
+  /// Decoded assistant response text.
+  final String text;
+  /// Token identifiers emitted during the turn.
+  final List<int> tokens;
+  /// Generation summary metrics.
+  final GenerateSummary summary;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'text': this.text,
+      'tokens': this.tokens,
+      'summary': this.summary.toJson(),
+    };
+  }
+
+  factory TurnResult.fromJson(Map<String, dynamic> json) {
+    return TurnResult(
+      text: json['text'] as String,
+      tokens: (json['tokens'] as List).map((item) => (item as num).toInt()).toList(),
+      summary: GenerateSummary.fromJson(json['summary'] as Map<String, dynamic>),
+    );
+  }
+
+  TurnResult copyWith({
+    String? text,
+    List<int>? tokens,
+    GenerateSummary? summary,
+  }) {
+    return TurnResult(
+      text: text ?? this.text,
+      tokens: tokens ?? this.tokens,
+      summary: summary ?? this.summary,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'TurnResult(text: $text, tokens: $tokens, summary: $summary)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TurnResult && text == other.text && tokens == other.tokens && summary == other.summary;
+
+  @override
+  int get hashCode => Object.hash(text, tokens, summary);
+}
+
 class ModelFiles {
   const ModelFiles({
     required this.model,
@@ -2343,6 +2515,27 @@ final class FfiErrorLoraUnsupportedByBackend extends FfiError {
   int get hashCode => detail.hashCode;
 }
 
+/// Chat contract validation failure.
+final class FfiErrorChatValidation extends FfiError {
+  const FfiErrorChatValidation({
+    required this.error,
+  });
+  final ValidationError error;
+
+  @override
+  String toString() {
+    return 'FfiErrorChatValidation(error: $error)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorChatValidation && error == other.error;
+
+  @override
+  int get hashCode => error.hashCode;
+}
+
 /// A speech boundary event emitted during streaming audio processing.
 sealed class FfiVadEvent {
   const FfiVadEvent();
@@ -2603,6 +2796,283 @@ enum ToolFormat {
   /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
   /// `<tool_call>…</tool_call>`.
   hermes,
+}
+
+/// Message author role in conversational chat.
+enum Role {
+  /// System prompt setting instructions and context.
+  system,
+  /// User prompt input.
+  user,
+  /// Assistant model response.
+  assistant,
+  /// Tool result or response payload.
+  tool,
+}
+
+/// Lifecycle phase of a stateful chat coordinator.
+enum SessionPhase {
+  /// Clean session at position 0, ready for initial message ingestion.
+  idle,
+  /// Input messages have been appended and prefilled; ready for decode.
+  promptReady,
+  /// A turn finished with a terminal end-of-sequence stop marker.
+  turnComplete,
+  /// Generation was interrupted by cancellation or custom nonterminal stop.
+  interrupted,
+  /// Underlying execution state was modified outside chat rules; replacement required.
+  rawContext,
+  /// Unrecoverable execution fault or unwind; checked reset required to restore usability.
+  unusable,
+}
+
+/// Validation failure during chat construction, preparation, or decode.
+sealed class ValidationError {
+  const ValidationError();
+}
+
+/// Model or tokenizer configuration does not match a supported chat profile.
+final class ValidationErrorUnsupportedProfile extends ValidationError {
+  const ValidationErrorUnsupportedProfile();
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedProfile()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedProfile;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Sliding context configuration (n_keep != 0) is not supported for chat.
+final class ValidationErrorSlidingContext extends ValidationError {
+  const ValidationErrorSlidingContext();
+
+  @override
+  String toString() {
+    return 'ValidationErrorSlidingContext()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorSlidingContext;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Model audio output is not supported for text chat.
+final class ValidationErrorAudioOutput extends ValidationError {
+  const ValidationErrorAudioOutput();
+
+  @override
+  String toString() {
+    return 'ValidationErrorAudioOutput()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorAudioOutput;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Generation parameter validation error.
+final class ValidationErrorGeneration extends ValidationError {
+  const ValidationErrorGeneration({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'ValidationErrorGeneration(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorGeneration && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// Operation refused in the current session phase.
+final class ValidationErrorPhase extends ValidationError {
+  const ValidationErrorPhase({
+    required this.phase,
+  });
+  final SessionPhase phase;
+
+  @override
+  String toString() {
+    return 'ValidationErrorPhase(phase: $phase)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorPhase && phase == other.phase;
+
+  @override
+  int get hashCode => phase.hashCode;
+}
+
+/// Message batch provided to ingest was empty.
+final class ValidationErrorEmptyBatch extends ValidationError {
+  const ValidationErrorEmptyBatch();
+
+  @override
+  String toString() {
+    return 'ValidationErrorEmptyBatch()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorEmptyBatch;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Message role sequence violates chat rules.
+final class ValidationErrorRoleOrder extends ValidationError {
+  const ValidationErrorRoleOrder({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorRoleOrder(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorRoleOrder && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Message role is not supported in the active profile.
+final class ValidationErrorUnsupportedRole extends ValidationError {
+  const ValidationErrorUnsupportedRole({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedRole(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedRole && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Content part is not supported in the active profile.
+final class ValidationErrorUnsupportedContent extends ValidationError {
+  const ValidationErrorUnsupportedContent({
+    required this.message,
+    required this.part_,
+  });
+  final int message;
+  final int part_;
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedContent(message: $message, part_: $part_)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedContent && message == other.message && part_ == other.part_;
+
+  @override
+  int get hashCode => Object.hash(message, part_);
+}
+
+/// Message text contains a reserved ChatML marker sequence.
+final class ValidationErrorReservedMarker extends ValidationError {
+  const ValidationErrorReservedMarker({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorReservedMarker(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorReservedMarker && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Context tokens required exceed available capacity in the KV cache.
+final class ValidationErrorCapacity extends ValidationError {
+  const ValidationErrorCapacity({
+    required this.required_,
+    required this.available,
+  });
+  final int required_;
+  final int available;
+
+  @override
+  String toString() {
+    return 'ValidationErrorCapacity(required_: $required_, available: $available)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorCapacity && required_ == other.required_ && available == other.available;
+
+  @override
+  int get hashCode => Object.hash(required_, available);
+}
+
+/// Chat template rendering error.
+final class ValidationErrorTemplate extends ValidationError {
+  const ValidationErrorTemplate({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'ValidationErrorTemplate(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorTemplate && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
 }
 
 sealed class LoadError {
@@ -3413,6 +3883,19 @@ final class FfiErrorExceptionLoraUnsupportedByBackend extends FfiErrorException 
   }
 }
 
+/// Chat contract validation failure.
+final class FfiErrorExceptionChatValidation extends FfiErrorException {
+  const FfiErrorExceptionChatValidation({
+    required this.error,
+  });
+  final ValidationError error;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionChatValidation(error: $error)';
+  }
+}
+
 sealed class LoadErrorException implements Exception {
   const LoadErrorException();
 }
@@ -3627,6 +4110,12 @@ String _encodeFfiError(FfiError value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorChatValidation) {
+    return jsonEncode({
+      'tag': 'chatValidation',
+      'error': ValidationErrorFfiCodec.encode(value.error),
+    });
+  }
   throw StateError('Unknown FfiError variant instance: $value');
 }
 
@@ -3688,6 +4177,10 @@ FfiError _decodeFfiError(String raw) {
     case 'loraUnsupportedByBackend':
       return FfiErrorLoraUnsupportedByBackend(
         detail: map['detail'] as String,
+      );
+    case 'chatValidation':
+      return FfiErrorChatValidation(
+        error: ValidationErrorFfiCodec.decode(map['error'] as String),
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -3869,6 +4362,177 @@ ToolFormat _decodeToolFormat(String raw) {
     'hermes' => ToolFormat.hermes,
     _ => throw StateError('Unknown ToolFormat variant: $raw'),
   };
+}
+
+String _encodeRole(Role value) {
+  return switch (value) {
+    Role.system => 'system',
+    Role.user => 'user',
+    Role.assistant => 'assistant',
+    Role.tool => 'tool',
+  };
+}
+
+Role _decodeRole(String raw) {
+  return switch (raw) {
+    'system' => Role.system,
+    'user' => Role.user,
+    'assistant' => Role.assistant,
+    'tool' => Role.tool,
+    _ => throw StateError('Unknown Role variant: $raw'),
+  };
+}
+
+String _encodeSessionPhase(SessionPhase value) {
+  return switch (value) {
+    SessionPhase.idle => 'idle',
+    SessionPhase.promptReady => 'promptReady',
+    SessionPhase.turnComplete => 'turnComplete',
+    SessionPhase.interrupted => 'interrupted',
+    SessionPhase.rawContext => 'rawContext',
+    SessionPhase.unusable => 'unusable',
+  };
+}
+
+SessionPhase _decodeSessionPhase(String raw) {
+  return switch (raw) {
+    'idle' => SessionPhase.idle,
+    'promptReady' => SessionPhase.promptReady,
+    'turnComplete' => SessionPhase.turnComplete,
+    'interrupted' => SessionPhase.interrupted,
+    'rawContext' => SessionPhase.rawContext,
+    'unusable' => SessionPhase.unusable,
+    _ => throw StateError('Unknown SessionPhase variant: $raw'),
+  };
+}
+
+String _encodeValidationError(ValidationError value) {
+  if (value is ValidationErrorUnsupportedProfile) {
+    return jsonEncode({
+      'tag': 'unsupportedProfile',
+    });
+  }
+  if (value is ValidationErrorSlidingContext) {
+    return jsonEncode({
+      'tag': 'slidingContext',
+    });
+  }
+  if (value is ValidationErrorAudioOutput) {
+    return jsonEncode({
+      'tag': 'audioOutput',
+    });
+  }
+  if (value is ValidationErrorGeneration) {
+    return jsonEncode({
+      'tag': 'generation',
+      'detail': value.detail,
+    });
+  }
+  if (value is ValidationErrorPhase) {
+    return jsonEncode({
+      'tag': 'phase',
+      'phase': SessionPhaseFfiCodec.encode(value.phase),
+    });
+  }
+  if (value is ValidationErrorEmptyBatch) {
+    return jsonEncode({
+      'tag': 'emptyBatch',
+    });
+  }
+  if (value is ValidationErrorRoleOrder) {
+    return jsonEncode({
+      'tag': 'roleOrder',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorUnsupportedRole) {
+    return jsonEncode({
+      'tag': 'unsupportedRole',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorUnsupportedContent) {
+    return jsonEncode({
+      'tag': 'unsupportedContent',
+      'message': value.message,
+      'part_': value.part_,
+    });
+  }
+  if (value is ValidationErrorReservedMarker) {
+    return jsonEncode({
+      'tag': 'reservedMarker',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorCapacity) {
+    return jsonEncode({
+      'tag': 'capacity',
+      'required_': value.required_,
+      'available': value.available,
+    });
+  }
+  if (value is ValidationErrorTemplate) {
+    return jsonEncode({
+      'tag': 'template',
+      'detail': value.detail,
+    });
+  }
+  throw StateError('Unknown ValidationError variant instance: $value');
+}
+
+ValidationError _decodeValidationError(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'unsupportedProfile':
+      return ValidationErrorUnsupportedProfile(
+      );
+    case 'slidingContext':
+      return ValidationErrorSlidingContext(
+      );
+    case 'audioOutput':
+      return ValidationErrorAudioOutput(
+      );
+    case 'generation':
+      return ValidationErrorGeneration(
+        detail: map['detail'] as String,
+      );
+    case 'phase':
+      return ValidationErrorPhase(
+        phase: SessionPhaseFfiCodec.decode(map['phase'] as String),
+      );
+    case 'emptyBatch':
+      return ValidationErrorEmptyBatch(
+      );
+    case 'roleOrder':
+      return ValidationErrorRoleOrder(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'unsupportedRole':
+      return ValidationErrorUnsupportedRole(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'unsupportedContent':
+      return ValidationErrorUnsupportedContent(
+        message: (map['message'] as num).toInt(),
+        part_: (map['part_'] as num).toInt(),
+      );
+    case 'reservedMarker':
+      return ValidationErrorReservedMarker(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'capacity':
+      return ValidationErrorCapacity(
+        required_: (map['required_'] as num).toInt(),
+        available: (map['available'] as num).toInt(),
+      );
+    case 'template':
+      return ValidationErrorTemplate(
+        detail: map['detail'] as String,
+      );
+    default:
+      throw StateError('Unknown ValidationError variant tag: $tag');
+  }
 }
 
 String _encodeLoadError(LoadError value) {
@@ -4292,6 +4956,12 @@ String _encodeFfiErrorException(FfiErrorException value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorExceptionChatValidation) {
+    return jsonEncode({
+      'tag': 'chatValidation',
+      'error': ValidationErrorFfiCodec.encode(value.error),
+    });
+  }
   throw StateError('Unknown FfiErrorException exception instance: $value');
 }
 
@@ -4349,6 +5019,10 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
     case 'loraUnsupportedByBackend':
       return FfiErrorExceptionLoraUnsupportedByBackend(
         detail: map['detail'] as String,
+      );
+    case 'chatValidation':
+      return FfiErrorExceptionChatValidation(
+        error: ValidationErrorFfiCodec.decode(map['error'] as String),
       );
     default:
       throw StateError('Unknown FfiErrorException exception tag: $tag');
@@ -4513,6 +5187,30 @@ final class ToolFormatFfiCodec {
   static String encode(ToolFormat value) => _encodeToolFormat(value);
 
   static ToolFormat decode(String raw) => _decodeToolFormat(raw);
+}
+
+final class RoleFfiCodec {
+  const RoleFfiCodec._();
+
+  static String encode(Role value) => _encodeRole(value);
+
+  static Role decode(String raw) => _decodeRole(raw);
+}
+
+final class SessionPhaseFfiCodec {
+  const SessionPhaseFfiCodec._();
+
+  static String encode(SessionPhase value) => _encodeSessionPhase(value);
+
+  static SessionPhase decode(String raw) => _decodeSessionPhase(raw);
+}
+
+final class ValidationErrorFfiCodec {
+  const ValidationErrorFfiCodec._();
+
+  static String encode(ValidationError value) => _encodeValidationError(value);
+
+  static ValidationError decode(String raw) => _decodeValidationError(raw);
 }
 
 final class LoadErrorFfiCodec {
@@ -4928,10 +5626,13 @@ final class CeraEngine {
   /// max context, etc.). Returns a `Clone` of the stored metadata.
   ModelMetadata metadata() => _unsupportedOnWeb('CeraEngine.metadata');
 
-  /// Open a new [`Session`] sharing this engine's model + tokenizer
+  /// Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+  ChatSession newChatSession(SessionConfig config) => _unsupportedOnWeb('CeraEngine.newChatSession');
+
+  /// Open a new [`Session`] sharing this engine's model and tokenizer
   /// by `Arc` clone. The returned session outlives `&self`; the
   /// engine keeps the shared state live for every session it hands
-  /// out. Cheap — no model load, just config + state allocation.
+  /// out. Cheap: no model load, just config and state allocation.
   Session newSession(SessionConfig config) => _unsupportedOnWeb('CeraEngine.newSession');
 
   /// Look up a special token by name (e.g. `<|im_start|>`,
@@ -5562,6 +6263,13 @@ final class Session {
   /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
   List<double> hiddenStatesMeanPooled(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesMeanPooled');
 
+  /// Wrap this session in a stateful chat coordinator.
+  ///
+  /// On success, ownership of the inner inference state is transferred to the returned
+  /// [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+  /// If validation fails, the session remains intact and usable.
+  ChatSession intoChat() => _unsupportedOnWeb('Session.intoChat');
+
   /// Current KV position — how many tokens live in the cache.
   /// Atomic-backed; safe to call from a different thread while
   /// `generate()` is in flight.
@@ -5615,6 +6323,67 @@ final class Session {
 final class SessionFfiCodec {
   static int lower(Session value) => _unsupportedOnWeb('SessionFfiCodec.lower');
   static Session lift(int handle) => _unsupportedOnWeb('SessionFfiCodec.lift');
+}
+
+/// Stateful chat coordinator wrapping an inference session.
+final class ChatSession {
+  ChatSession._();
+
+  bool get isClosed => _unsupportedOnWeb('ChatSession.isClosed');
+
+  void close() => _unsupportedOnWeb('ChatSession.close');
+
+  /// Construct a ChatSession from an existing Session, taking ownership of its state.
+  ///
+  /// If validation fails, the session remains intact and usable on the caller side.
+  static ChatSession fromSession(Session session) => _unsupportedOnWeb('ChatSession.fromSession');
+
+  /// Flip cancellation flag to interrupt in-flight prefill or decode.
+  ///
+  /// Wait-free and safe from any thread.
+  void cancel() => _unsupportedOnWeb('ChatSession.cancel');
+
+  /// Clear pending cancellation.
+  void clearCancel() => _unsupportedOnWeb('ChatSession.clearCancel');
+
+  /// Complete generation synchronously and return the assistant response.
+  TurnResult complete(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.complete');
+
+  /// Stream generation output tokens into the specified sink.
+  GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
+
+  /// Ingest a single message into the chat context.
+  IngestSummary ingest(Message message) => _unsupportedOnWeb('ChatSession.ingest');
+
+  /// Ingest a batch of messages into the chat context.
+  IngestSummary ingestMessages(List<Message> messages) => _unsupportedOnWeb('ChatSession.ingestMessages');
+
+  /// Reclaim the underlying Session, consuming this ChatSession.
+  Session intoSession() => _unsupportedOnWeb('ChatSession.intoSession');
+
+  /// Current session lifecycle phase.
+  SessionPhase phase() => _unsupportedOnWeb('ChatSession.phase');
+
+  /// Current token position in the execution context.
+  ///
+  /// Lock-free and safe to query concurrently while generation is in flight.
+  int position() => _unsupportedOnWeb('ChatSession.position');
+
+  /// Observe recovery status after an ingestion failure.
+  ///
+  /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+  SessionRecoveryStatus recoveryStatus() => _unsupportedOnWeb('ChatSession.recoveryStatus');
+
+  /// Replace conversational history with a fresh message batch.
+  IngestSummary replaceMessages(List<Message> messages) => _unsupportedOnWeb('ChatSession.replaceMessages');
+
+  /// Reset execution state and return to Idle phase.
+  void reset() => _unsupportedOnWeb('ChatSession.reset');
+}
+
+final class ChatSessionFfiCodec {
+  static int lower(ChatSession value) => _unsupportedOnWeb('ChatSessionFfiCodec.lower');
+  static ChatSession lift(int handle) => _unsupportedOnWeb('ChatSessionFfiCodec.lift');
 }
 
 /// A shared generative engine. Creating handles never reloads the source or copies live KV.
@@ -5764,3 +6533,15 @@ String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb(
 
 /// Default transcription options for Whisper ASR.
 FfiWhisperTranscribeOpts whisperDefaultTranscribeOpts() => _unsupportedOnWeb('whisperDefaultTranscribeOpts');
+
+/// Convenience factory for an assistant text message.
+Message chatMessageAssistant(String content) => _unsupportedOnWeb('chatMessageAssistant');
+
+/// Convenience factory for a system text message.
+Message chatMessageSystem(String content) => _unsupportedOnWeb('chatMessageSystem');
+
+/// Convenience factory for a tool text message.
+Message chatMessageTool(String content) => _unsupportedOnWeb('chatMessageTool');
+
+/// Convenience factory for a user text message.
+Message chatMessageUser(String content) => _unsupportedOnWeb('chatMessageUser');

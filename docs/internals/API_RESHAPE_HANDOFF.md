@@ -1,7 +1,48 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-15T00:10-0400. This is the current implementation record; the
+Updated: 2026-09-15T18:17-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan47 complete (2026-09-15T18:17-0400)
+
+Lowering of the public Chat coordinator, session phases, and turn execution contracts
+to Swift and Kotlin via UniFFI in `cera-ffi`, with non-destructive session transitions,
+wait-free cancellation, non-blocking recovery diagnostics, and terminal stream event guarantees.
+
+- [x] Canonical UniFFI wrappers: defined `ChatSession`, `Role`, `Message`, `SessionPhase`,
+      `ValidationError`, `IngestSummary`, and `TurnResult` in `cera-ffi/src/chat.rs`.
+      Implemented infallible and fallible conversions (`From`, `TryFrom`) with core types,
+      including `TryFrom<&cera::session::chat::Message>` with single-part text extraction
+      and `FfiError::UnsupportedModality` error mapping. Added convenience constructors
+      (`chat_message_user`, `chat_message_system`, `chat_message_assistant`, `chat_message_tool`).
+- [x] Wait-free cancellation & non-blocking recovery: `ChatSession::cancel` performs a
+      wait-free atomic store on `self.cancel: Arc<AtomicBool>`, eliminating re-entrant
+      deadlocks when streaming callbacks cancel decode from within foreign sinks and
+      preventing UI thread stalls. `ChatSession::position` and `ChatSession::clear_cancel`
+      are lock-free via `position: Arc<AtomicU32>` and fail-close via `moved: AtomicBool`.
+      `ChatSession::recovery_status` queries inner state non-blockingly with `try_lock()`,
+      returning `FfiError::Busy` on contention.
+- [x] Terminal streaming event guarantees: `ChatSession::generate_streaming` synthesizes
+      terminal `on_done` callbacks (`FinishReason::Error` or `FinishReason::Cancelled`)
+      on all early exit paths (option conversion failure, lock poisoning, moved session,
+      and decode errors), preventing foreign stream listeners and coroutines from hanging.
+- [x] Non-destructive Session transitions: `Session.inner` in `cera-ffi/src/lib.rs` evolved
+      to `Mutex<Option<cera::Session>>` with `SessionGuard` implementing `Deref` and `DerefMut`.
+      `Session::into_chat` transfers the inner session into a `ChatSession`, and
+      `ChatSession::into_session` provides symmetric return. Added `CeraEngine::new_chat_session(config)`.
+      Added `FfiError::ChatValidation { error: ValidationError }`.
+- [x] Contract & binding parity: `python3 tests/api_contracts/check.py` matches 69/69 surfaces.
+      Foreign language bindings regenerated via `just bindings` and `just dart-bindings`
+      for Swift, Kotlin, Python, and Dart.
+- [x] Comprehensive test coverage: 12 unit tests in `cera-ffi/src/chat/tests.rs` covering
+      multi-turn chat lifecycle, sliding context refusal, session transfer and reclamation,
+      wait-free re-entrant cancellation during streaming decode, non-blocking recovery status,
+      terminal callbacks on early validation failure, and bidirectional message conversions.
+- [x] Verification gates clean: all 56 FFI unit tests, 15 contract tests, 43 core tests,
+      6 runner tests, Dart analysis, formatting, clippy, and rustdoc pass cleanly.
+
+Evidence: `devlog/plans/000341-47-uniffi-chat-lowering.md`.
+Forty-four increments are complete (42 core, two Leap). Next unused sequence is 48.
 
 ## Plan46 complete (2026-09-15T00:10-0400)
 

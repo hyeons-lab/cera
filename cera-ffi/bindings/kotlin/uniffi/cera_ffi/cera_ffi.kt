@@ -866,6 +866,14 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_chat_message_assistant(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_system(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_tool(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user(): Int
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
@@ -903,6 +911,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_ceraengine_is_special_token(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_metadata(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_new_session(): Int
 
@@ -1006,6 +1016,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_into_chat(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_position(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_remove_lora(): Int
@@ -1021,6 +1033,30 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_clear_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_into_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_phase(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_position(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_recovery_status(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_replace_messages(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
 
     external fun uniffi_cera_ffi_checksum_method_generativemodel_create_session(): Int
 
@@ -1077,6 +1113,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_chatsession_from_session(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_modelloader_new(): Int
 
@@ -1283,6 +1321,12 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+        `ptr`: Long,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
 
     external fun uniffi_cera_ffi_fn_method_ceraengine_new_session(
         `ptr`: Long,
@@ -1753,6 +1797,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_into_chat(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
     external fun uniffi_cera_ffi_fn_method_session_position(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1799,6 +1848,87 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_chatsession(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_chatsession(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_chatsession_from_session(
+        `session`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `sink`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest(
+        `ptr`: Long,
+        `message`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_into_session(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_phase(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_position(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_reset(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_clone_generativemodel(
         `handle`: Long,
@@ -1897,6 +2027,26 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_assistant(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_system(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_tool(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_user(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun ffi_cera_ffi_rustbuffer_alloc(
         `size`: Long,
@@ -2142,6 +2292,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2199,7 +2361,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
@@ -2352,6 +2517,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2374,6 +2542,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
@@ -2458,6 +2662,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
@@ -3566,10 +3773,15 @@ public interface CeraEngineInterface {
     fun `metadata`(): ModelMetadata
 
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    fun `newChatSession`(`config`: SessionConfig): ChatSession
+
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     fun `newSession`(`config`: SessionConfig): Session
 
@@ -4033,10 +4245,27 @@ open class CeraEngine :
         )
 
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    @Throws(FfiException::class)
+    override fun `newChatSession`(`config`: SessionConfig): ChatSession =
+        FfiConverterTypeChatSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+                        it,
+                        FfiConverterTypeSessionConfig.lower(`config`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     @Throws(FfiException::class)
     override fun `newSession`(`config`: SessionConfig): Session =
@@ -4494,6 +4723,514 @@ public object FfiConverterTypeCeraEngine : FfiConverter<CeraEngine, Long> {
 
     override fun write(
         value: CeraEngine,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+public interface ChatSessionInterface {
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread.
+     */
+    fun `cancel`()
+
+    /**
+     * Clear pending cancellation.
+     */
+    fun `clearCancel`()
+
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    fun `complete`(`opts`: GenerateOpts): TurnResult
+
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    fun `generateStreaming`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Ingest a single message into the chat context.
+     */
+    fun `ingest`(`message`: Message): IngestSummary
+
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    fun `ingestMessages`(`messages`: List<Message>): IngestSummary
+
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    fun `intoSession`(): Session
+
+    /**
+     * Current session lifecycle phase.
+     */
+    fun `phase`(): SessionPhase
+
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    fun `position`(): kotlin.UInt
+
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    fun `recoveryStatus`(): SessionRecoveryStatus
+
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    fun `replaceMessages`(`messages`: List<Message>): IngestSummary
+
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    fun `reset`()
+
+    companion object
+}
+
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+open class ChatSession :
+    Disposable,
+    AutoCloseable,
+    ChatSessionInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_chatsession(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_chatsession(handle, status)
+        }
+    }
+
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread.
+     */
+    override fun `cancel`() =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Clear pending cancellation.
+     */
+    @Throws(FfiException::class)
+    override fun `clearCancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    @Throws(FfiException::class)
+    override fun `complete`(`opts`: GenerateOpts): TurnResult =
+        FfiConverterTypeTurnResult.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    @Throws(FfiException::class)
+    override fun `generateStreaming`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        FfiConverterTypeGenerateSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterTypeModalitySink.lower(`sink`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Ingest a single message into the chat context.
+     */
+    @Throws(FfiException::class)
+    override fun `ingest`(`message`: Message): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest(
+                        it,
+                        FfiConverterTypeMessage.lower(`message`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    @Throws(FfiException::class)
+    override fun `ingestMessages`(`messages`: List<Message>): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+                        it,
+                        FfiConverterSequenceTypeMessage.lower(`messages`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    @Throws(FfiException::class)
+    override fun `intoSession`(): Session =
+        FfiConverterTypeSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Current session lifecycle phase.
+     */
+    @Throws(FfiException::class)
+    override fun `phase`(): SessionPhase =
+        FfiConverterTypeSessionPhase.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    @Throws(FfiException::class)
+    override fun `position`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_position(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    @Throws(FfiException::class)
+    override fun `recoveryStatus`(): SessionRecoveryStatus =
+        FfiConverterTypeSessionRecoveryStatus.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    @Throws(FfiException::class)
+    override fun `replaceMessages`(`messages`: List<Message>): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+                        it,
+                        FfiConverterSequenceTypeMessage.lower(`messages`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    @Throws(FfiException::class)
+    override fun `reset`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    companion object {
+        /**
+         * Construct a ChatSession from an existing Session, taking ownership of its state.
+         *
+         * If validation fails, the session remains intact and usable on the caller side.
+         */
+        @Throws(FfiException::class)
+        fun `fromSession`(`session`: Session): ChatSession =
+            FfiConverterTypeChatSession.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session(FfiConverterTypeSession.lower(`session`), _status)
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeChatSession : FfiConverter<ChatSession, Long> {
+    override fun lower(value: ChatSession): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ChatSession = ChatSession(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ChatSession = lift(buf.getLong())
+
+    override fun allocationSize(value: ChatSession) = 8UL
+
+    override fun write(
+        value: ChatSession,
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
@@ -8891,6 +9628,15 @@ public interface SessionInterface {
     fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float>
 
     /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    fun `intoChat`(): ChatSession
+
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -9598,6 +10344,26 @@ open class Session :
                     UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
                         it,
                         FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    @Throws(FfiException::class)
+    override fun `intoChat`(): ChatSession =
+        FfiConverterTypeChatSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat(
+                        it,
                         _status,
                     )
                 }
@@ -10627,6 +11393,54 @@ public object FfiConverterTypeIngestRecovery : FfiConverterRustBuffer<IngestReco
 }
 
 /**
+ * Summary of a successful message ingestion.
+ */
+data class IngestSummary(
+    /**
+     * Number of tokens encoded and appended to context.
+     */
+    var `inputTokens`: kotlin.UInt,
+    /**
+     * KV position before ingestion.
+     */
+    var `positionBefore`: kotlin.UInt,
+    /**
+     * KV position after ingestion.
+     */
+    var `positionAfter`: kotlin.UInt,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIngestSummary : FfiConverterRustBuffer<IngestSummary> {
+    override fun read(buf: ByteBuffer): IngestSummary =
+        IngestSummary(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+
+    override fun allocationSize(value: IngestSummary) =
+        (
+            FfiConverterUInt.allocationSize(value.`inputTokens`) +
+                FfiConverterUInt.allocationSize(value.`positionBefore`) +
+                FfiConverterUInt.allocationSize(value.`positionAfter`)
+        )
+
+    override fun write(
+        value: IngestSummary,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterUInt.write(value.`inputTokens`, buf)
+        FfiConverterUInt.write(value.`positionBefore`, buf)
+        FfiConverterUInt.write(value.`positionAfter`, buf)
+    }
+}
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -10664,6 +11478,47 @@ public object FfiConverterTypeLeapBundleEntry : FfiConverterRustBuffer<LeapBundl
     ) {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterSequenceString.write(value.`quants`, buf)
+    }
+}
+
+/**
+ * A structured conversational turn message.
+ */
+data class Message(
+    /**
+     * Author role.
+     */
+    var `role`: Role,
+    /**
+     * Message text content.
+     */
+    var `content`: kotlin.String,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMessage : FfiConverterRustBuffer<Message> {
+    override fun read(buf: ByteBuffer): Message =
+        Message(
+            FfiConverterTypeRole.read(buf),
+            FfiConverterString.read(buf),
+        )
+
+    override fun allocationSize(value: Message) =
+        (
+            FfiConverterTypeRole.allocationSize(value.`role`) +
+                FfiConverterString.allocationSize(value.`content`)
+        )
+
+    override fun write(
+        value: Message,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeRole.write(value.`role`, buf)
+        FfiConverterString.write(value.`content`, buf)
     }
 }
 
@@ -11200,6 +12055,54 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
 }
 
 /**
+ * Result of a completed chat turn.
+ */
+data class TurnResult(
+    /**
+     * Decoded assistant response text.
+     */
+    var `text`: kotlin.String,
+    /**
+     * Token identifiers emitted during the turn.
+     */
+    var `tokens`: List<kotlin.UInt>,
+    /**
+     * Generation summary metrics.
+     */
+    var `summary`: GenerateSummary,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTurnResult : FfiConverterRustBuffer<TurnResult> {
+    override fun read(buf: ByteBuffer): TurnResult =
+        TurnResult(
+            FfiConverterString.read(buf),
+            FfiConverterSequenceUInt.read(buf),
+            FfiConverterTypeGenerateSummary.read(buf),
+        )
+
+    override fun allocationSize(value: TurnResult) =
+        (
+            FfiConverterString.allocationSize(value.`text`) +
+                FfiConverterSequenceUInt.allocationSize(value.`tokens`) +
+                FfiConverterTypeGenerateSummary.allocationSize(value.`summary`)
+        )
+
+    override fun write(
+        value: TurnResult,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`text`, buf)
+        FfiConverterSequenceUInt.write(value.`tokens`, buf)
+        FfiConverterTypeGenerateSummary.write(value.`summary`, buf)
+    }
+}
+
+/**
  * User-facing multimodal input envelope.
  */
 data class UserMessage(
@@ -11526,6 +12429,16 @@ sealed class FfiException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * Chat contract validation failure.
+     */
+    class ChatValidation(
+        val `error`: ValidationError,
+    ) : FfiException() {
+        override val message
+            get() = "error=${ `error` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -11613,6 +12526,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             14 -> {
                 FfiException.LoraUnsupportedByBackend(
                     FfiConverterString.read(buf),
+                )
+            }
+
+            15 -> {
+                FfiException.ChatValidation(
+                    FfiConverterTypeValidationError.read(buf),
                 )
             }
 
@@ -11705,6 +12624,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
             )
+
+            is FfiException.ChatValidation -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterTypeValidationError.allocationSize(value.`error`)
+            )
         }
 
     override fun write(
@@ -11792,6 +12717,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.LoraUnsupportedByBackend -> {
                 buf.putInt(14)
                 FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is FfiException.ChatValidation -> {
+                buf.putInt(15)
+                FfiConverterTypeValidationError.write(value.`error`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -12998,6 +13929,118 @@ public object FfiConverterTypeRecoveryOutcome : FfiConverterRustBuffer<RecoveryO
 }
 
 /**
+ * Message author role in conversational chat.
+ */
+
+enum class Role {
+    /**
+     * System prompt setting instructions and context.
+     */
+    SYSTEM,
+
+    /**
+     * User prompt input.
+     */
+    USER,
+
+    /**
+     * Assistant model response.
+     */
+    ASSISTANT,
+
+    /**
+     * Tool result or response payload.
+     */
+    TOOL,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRole : FfiConverterRustBuffer<Role> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            Role.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: Role) = 4UL
+
+    override fun write(
+        value: Role,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Lifecycle phase of a stateful chat coordinator.
+ */
+
+enum class SessionPhase {
+    /**
+     * Clean session at position 0, ready for initial message ingestion.
+     */
+    IDLE,
+
+    /**
+     * Input messages have been appended and prefilled; ready for decode.
+     */
+    PROMPT_READY,
+
+    /**
+     * A turn finished with a terminal end-of-sequence stop marker.
+     */
+    TURN_COMPLETE,
+
+    /**
+     * Generation was interrupted by cancellation or custom nonterminal stop.
+     */
+    INTERRUPTED,
+
+    /**
+     * Underlying execution state was modified outside chat rules; replacement required.
+     */
+    RAW_CONTEXT,
+
+    /**
+     * Unrecoverable execution fault or unwind; checked reset required to restore usability.
+     */
+    UNUSABLE,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionPhase : FfiConverterRustBuffer<SessionPhase> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            SessionPhase.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: SessionPhase) = 4UL
+
+    override fun write(
+        value: SessionPhase,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
  * The tool-call wire format a model family uses. Mirrors
  * [`cera::tools::ToolFormat`]. Get one from
  * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
@@ -13040,6 +14083,359 @@ public object FfiConverterTypeToolFormat : FfiConverterRustBuffer<ToolFormat> {
         buf: ByteBuffer,
     ) {
         buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Validation failure during chat construction, preparation, or decode.
+ */
+sealed class ValidationError {
+    /**
+     * Model or tokenizer configuration does not match a supported chat profile.
+     */
+    object UnsupportedProfile : ValidationError()
+
+    /**
+     * Sliding context configuration (n_keep != 0) is not supported for chat.
+     */
+    object SlidingContext : ValidationError()
+
+    /**
+     * Model audio output is not supported for text chat.
+     */
+    object AudioOutput : ValidationError()
+
+    /**
+     * Generation parameter validation error.
+     */
+    data class Generation(
+        val `detail`: kotlin.String,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Operation refused in the current session phase.
+     */
+    data class Phase(
+        val `phase`: uniffi.cera_ffi.SessionPhase,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message batch provided to ingest was empty.
+     */
+    object EmptyBatch : ValidationError()
+
+    /**
+     * Message role sequence violates chat rules.
+     */
+    data class RoleOrder(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message role is not supported in the active profile.
+     */
+    data class UnsupportedRole(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Content part is not supported in the active profile.
+     */
+    data class UnsupportedContent(
+        val `message`: kotlin.UInt,
+        val `part`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message text contains a reserved ChatML marker sequence.
+     */
+    data class ReservedMarker(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Context tokens required exceed available capacity in the KV cache.
+     */
+    data class Capacity(
+        val `required`: kotlin.UInt,
+        val `available`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Chat template rendering error.
+     */
+    data class Template(
+        val `detail`: kotlin.String,
+    ) : ValidationError() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeValidationError : FfiConverterRustBuffer<ValidationError> {
+    override fun read(buf: ByteBuffer): ValidationError =
+        when (buf.getInt()) {
+            1 -> {
+                ValidationError.UnsupportedProfile
+            }
+
+            2 -> {
+                ValidationError.SlidingContext
+            }
+
+            3 -> {
+                ValidationError.AudioOutput
+            }
+
+            4 -> {
+                ValidationError.Generation(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            5 -> {
+                ValidationError.Phase(
+                    FfiConverterTypeSessionPhase.read(buf),
+                )
+            }
+
+            6 -> {
+                ValidationError.EmptyBatch
+            }
+
+            7 -> {
+                ValidationError.RoleOrder(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            8 -> {
+                ValidationError.UnsupportedRole(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            9 -> {
+                ValidationError.UnsupportedContent(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            10 -> {
+                ValidationError.ReservedMarker(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            11 -> {
+                ValidationError.Capacity(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            12 -> {
+                ValidationError.Template(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: ValidationError) =
+        when (value) {
+            is ValidationError.UnsupportedProfile -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.SlidingContext -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.AudioOutput -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.Generation -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+
+            is ValidationError.Phase -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSessionPhase.allocationSize(value.`phase`)
+                )
+            }
+
+            is ValidationError.EmptyBatch -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.RoleOrder -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.UnsupportedRole -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.UnsupportedContent -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`) +
+                        FfiConverterUInt.allocationSize(value.`part`)
+                )
+            }
+
+            is ValidationError.ReservedMarker -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.Capacity -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`required`) +
+                        FfiConverterUInt.allocationSize(value.`available`)
+                )
+            }
+
+            is ValidationError.Template -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+        }
+
+    override fun write(
+        value: ValidationError,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is ValidationError.UnsupportedProfile -> {
+                buf.putInt(1)
+                Unit
+            }
+
+            is ValidationError.SlidingContext -> {
+                buf.putInt(2)
+                Unit
+            }
+
+            is ValidationError.AudioOutput -> {
+                buf.putInt(3)
+                Unit
+            }
+
+            is ValidationError.Generation -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is ValidationError.Phase -> {
+                buf.putInt(5)
+                FfiConverterTypeSessionPhase.write(value.`phase`, buf)
+                Unit
+            }
+
+            is ValidationError.EmptyBatch -> {
+                buf.putInt(6)
+                Unit
+            }
+
+            is ValidationError.RoleOrder -> {
+                buf.putInt(7)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.UnsupportedRole -> {
+                buf.putInt(8)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.UnsupportedContent -> {
+                buf.putInt(9)
+                FfiConverterUInt.write(value.`message`, buf)
+                FfiConverterUInt.write(value.`part`, buf)
+                Unit
+            }
+
+            is ValidationError.ReservedMarker -> {
+                buf.putInt(10)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.Capacity -> {
+                buf.putInt(11)
+                FfiConverterUInt.write(value.`required`, buf)
+                FfiConverterUInt.write(value.`available`, buf)
+                Unit
+            }
+
+            is ValidationError.Template -> {
+                buf.putInt(12)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
@@ -13910,6 +15306,34 @@ public object FfiConverterSequenceTypeLeapBundleEntry : FfiConverterRustBuffer<L
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeMessage : FfiConverterRustBuffer<List<Message>> {
+    override fun read(buf: ByteBuffer): List<Message> {
+        val len = buf.getInt()
+        return List<Message>(len) {
+            FfiConverterTypeMessage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<Message>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMessage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<Message>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMessage.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeToolCall : FfiConverterRustBuffer<List<ToolCall>> {
     override fun read(buf: ByteBuffer): List<ToolCall> {
         val len = buf.getInt()
@@ -14165,5 +15589,45 @@ fun `whisperDefaultTranscribeOpts`(): FfiWhisperTranscribeOpts =
     FfiConverterTypeFfiWhisperTranscribeOpts.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(_status)
+        },
+    )
+
+/**
+ * Convenience factory for an assistant text message.
+ */
+fun `chatMessageAssistant`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_assistant(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a system text message.
+ */
+fun `chatMessageSystem`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_system(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a tool text message.
+ */
+fun `chatMessageTool`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_tool(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a user text message.
+ */
+fun `chatMessageUser`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user(FfiConverterString.lower(`content`), _status)
         },
     )

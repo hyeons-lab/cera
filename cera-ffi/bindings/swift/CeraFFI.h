@@ -464,6 +464,11 @@ int8_t uniffi_cera_ffi_fn_method_ceraengine_is_special_token(uint64_t ptr, uint3
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_metadata(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_NEW_CHAT_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_NEW_CHAT_SESSION
+uint64_t uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(uint64_t ptr, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_NEW_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_NEW_SESSION
 uint64_t uniffi_cera_ffi_fn_method_ceraengine_new_session(uint64_t ptr, RustBuffer config, RustCallStatus *_Nonnull out_status
@@ -889,6 +894,11 @@ RustBuffer uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(uint64_t p
 RustBuffer uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(uint64_t ptr, RustBuffer tokens, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_INTO_CHAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_INTO_CHAT
+uint64_t uniffi_cera_ffi_fn_method_session_into_chat(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_POSITION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_POSITION
 uint32_t uniffi_cera_ffi_fn_method_session_position(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -927,6 +937,81 @@ void uniffi_cera_ffi_fn_method_session_set_image_max_long_size(uint64_t ptr, Rus
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RECOVERY_STATUS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_RECOVERY_STATUS
 RustBuffer uniffi_cera_ffi_fn_method_session_recovery_status(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_CHATSESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_CHATSESSION
+uint64_t uniffi_cera_ffi_fn_clone_chatsession(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_CHATSESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FREE_CHATSESSION
+void uniffi_cera_ffi_fn_free_chatsession(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CHATSESSION_FROM_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_CHATSESSION_FROM_SESSION
+uint64_t uniffi_cera_ffi_fn_constructor_chatsession_from_session(uint64_t session, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_CANCEL
+void uniffi_cera_ffi_fn_method_chatsession_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_CLEAR_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_CLEAR_CANCEL
+void uniffi_cera_ffi_fn_method_chatsession_clear_cancel(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_complete(uint64_t ptr, RustBuffer opts, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming(uint64_t ptr, RustBuffer opts, uint64_t sink, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_ingest(uint64_t ptr, RustBuffer message, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST_MESSAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST_MESSAGES
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_ingest_messages(uint64_t ptr, RustBuffer messages, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INTO_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INTO_SESSION
+uint64_t uniffi_cera_ffi_fn_method_chatsession_into_session(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_PHASE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_PHASE
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_phase(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_POSITION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_POSITION
+uint32_t uniffi_cera_ffi_fn_method_chatsession_position(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RECOVERY_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RECOVERY_STATUS
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_recovery_status(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_REPLACE_MESSAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_REPLACE_MESSAGES
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_replace_messages(uint64_t ptr, RustBuffer messages, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RESET
+void uniffi_cera_ffi_fn_method_chatsession_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_GENERATIVEMODEL
@@ -1049,6 +1134,26 @@ RustBuffer uniffi_cera_ffi_fn_func_tool_grammar(RustBuffer tools, RustBuffer for
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_WHISPER_DEFAULT_TRANSCRIBE_OPTS
 RustBuffer uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_ASSISTANT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_ASSISTANT
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_assistant(RustBuffer content, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_SYSTEM
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_SYSTEM
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_system(RustBuffer content, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_TOOL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_TOOL
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_tool(RustBuffer content, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_user(RustBuffer content, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
@@ -1371,6 +1476,30 @@ uint16_t uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_ASSISTANT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_ASSISTANT
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_assistant(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_SYSTEM
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_SYSTEM
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_system(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_TOOL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_TOOL
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_tool(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_user(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_BUNDLEREPO_CACHE_SIZE
 uint16_t uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(void
@@ -1482,6 +1611,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_is_special_token(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_METADATA
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_METADATA
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_metadata(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_NEW_CHAT_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_NEW_CHAT_SESSION
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session(void
     
 );
 #endif
@@ -1791,6 +1926,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_INTO_CHAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_INTO_CHAT
+uint16_t uniffi_cera_ffi_checksum_method_session_into_chat(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_POSITION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_POSITION
 uint16_t uniffi_cera_ffi_checksum_method_session_position(void
@@ -1836,6 +1977,78 @@ uint16_t uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RECOVERY_STATUS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_RECOVERY_STATUS
 uint16_t uniffi_cera_ffi_checksum_method_session_recovery_status(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_CANCEL
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_CLEAR_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_CLEAR_CANCEL
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_clear_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_ingest(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST_MESSAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST_MESSAGES
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INTO_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INTO_SESSION
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_into_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_PHASE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_PHASE
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_phase(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_POSITION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_POSITION
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_position(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RECOVERY_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RECOVERY_STATUS
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_recovery_status(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_REPLACE_MESSAGES
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_REPLACE_MESSAGES
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_replace_messages(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RESET
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RESET
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_reset(void
     
 );
 #endif
@@ -2004,6 +2217,12 @@ uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapte
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_PIICLASSIFIER_FROM_PATH
 uint16_t uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CHATSESSION_FROM_SESSION
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_CHATSESSION_FROM_SESSION
+uint16_t uniffi_cera_ffi_checksum_constructor_chatsession_from_session(void
     
 );
 #endif
