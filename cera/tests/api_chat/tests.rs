@@ -173,10 +173,14 @@ fn invalid_inputs_preserve_context_and_reject_before_reset() {
         ..Default::default()
     });
     assert_eq!(active.phase(), SessionPhase::RawContext);
+    assert_eq!(
+        Message::tool("tool result"),
+        Message::text(Role::Tool, "tool result")
+    );
     let cases = [
         (vec![], ValidationError::EmptyBatch),
         (
-            vec![Message::text(Role::Tool, "tool result")],
+            vec![Message::tool("tool result")],
             ValidationError::UnsupportedRole { message: 0 },
         ),
         (

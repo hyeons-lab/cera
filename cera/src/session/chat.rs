@@ -110,6 +110,11 @@ impl Message {
     pub fn assistant(text: impl Into<String>) -> Self {
         Self::text(Role::Assistant, text)
     }
+
+    /// Create a single-part tool text message.
+    pub fn tool(text: impl Into<String>) -> Self {
+        Self::text(Role::Tool, text)
+    }
 }
 
 /// Lifecycle phase of a stateful chat coordinator.
@@ -332,11 +337,15 @@ impl ModalitySink for Collector {
 pub struct Profile {
     tokenizer: Arc<BpeTokenizer>,
     eos: u32,
+    newline_tokens: Vec<u32>,
 }
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Profile").field("eos", &self.eos).finish()
+        f.debug_struct("Profile")
+            .field("eos", &self.eos)
+            .field("newline_tokens", &self.newline_tokens)
+            .finish()
     }
 }
 
@@ -356,12 +365,22 @@ impl Profile {
         {
             return Err(ValidationError::UnsupportedProfile);
         }
-        Ok(Self { tokenizer, eos: 7 })
+        let newline_tokens = tokenizer.encode("\n");
+        Ok(Self {
+            tokenizer,
+            eos: 7,
+            newline_tokens,
+        })
     }
 
     /// End-of-sequence token ID.
     pub fn eos(&self) -> u32 {
         self.eos
+    }
+
+    /// Pre-encoded newline token sequence for turn boundaries.
+    pub fn newline_tokens(&self) -> &[u32] {
+        &self.newline_tokens
     }
 
     /// Reference to the tokenizer used by this profile.
@@ -423,11 +442,12 @@ impl Profile {
             .map_err(|e| ValidationError::Template(e.to_string()))?;
         if initial {
             Ok(rendered)
+        } else if rendered.starts_with(BOS) {
+            let mut s = rendered;
+            s.drain(..BOS.len());
+            Ok(s)
         } else {
-            rendered
-                .strip_prefix(BOS)
-                .map(str::to_owned)
-                .ok_or(ValidationError::UnsupportedProfile)
+            Err(ValidationError::UnsupportedProfile)
         }
     }
 }
@@ -552,7 +572,7 @@ impl<E: Execution> Chat<E> {
             if self.terminal_committed == Some(false) {
                 tokens.push(self.profile.eos);
             }
-            tokens.extend(self.profile.tokenizer.encode("\n"));
+            tokens.extend_from_slice(&self.profile.newline_tokens);
         }
         tokens.extend(self.profile.tokenizer.encode(&rendered));
         let available = self
