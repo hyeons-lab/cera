@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use cera::tokenizer::BpeTokenizer;
-use cera::{BackendPreference, CeraEngine, CeraError, EngineConfig, FinishReason, ModalitySink};
+use cera::{
+    BackendPreference, CeraEngine, CeraError, EngineConfig, FinishReason, IngestCause, Message,
+    ModalitySink, Role, SessionChat, SessionPhase, ValidationError,
+};
 use clap::{Parser, Subcommand};
 
 mod bundle_picker;
@@ -1456,6 +1459,27 @@ pub(crate) fn simulate_truncate_oldest_turn_pairs(
         applied += 1;
     }
     (start, end, applied)
+}
+
+/// Convert CLI transcript history to transactional chat coordinator messages.
+///
+/// Maps system, user, assistant, and tool roles into [`cera::Message`]. Returns an error
+/// if an unknown or unsupported role is encountered.
+pub(crate) fn convert_history_to_chat_messages(
+    history: &[cera::tokenizer::ChatMessage],
+) -> Result<Vec<cera::Message>, String> {
+    let mut messages = Vec::with_capacity(history.len());
+    for (i, m) in history.iter().enumerate() {
+        let role = match m.role.as_str() {
+            "system" => Role::System,
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
+            other => return Err(format!("message {i} has unsupported role {other:?}")),
+        };
+        messages.push(cera::Message::text(role, &m.content));
+    }
+    Ok(messages)
 }
 
 /// Default cache root, used by the bundle-id flow when `--cache-dir` is
@@ -4194,7 +4218,50 @@ fn main() -> Result<()> {
             }
 
             // Line-based REPL fallback below.
-            let mut session = session;
+            enum CliSession {
+                Chat(SessionChat),
+                Raw(cera::Session),
+            }
+
+            impl CliSession {
+                fn cancel_handle(&self) -> Arc<AtomicBool> {
+                    match self {
+                        Self::Chat(chat) => chat
+                            .cancel_handle()
+                            .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                        Self::Raw(session) => session.cancel_handle(),
+                    }
+                }
+
+                fn reset(&mut self) -> Result<(), CeraError> {
+                    match self {
+                        Self::Chat(chat) => chat.reset(),
+                        Self::Raw(session) => session.reset(),
+                    }
+                }
+
+                fn into_raw(self) -> cera::Session {
+                    match self {
+                        Self::Chat(chat) => chat.into_session(),
+                        Self::Raw(session) => session,
+                    }
+                }
+
+                fn try_into_chat(self) -> Self {
+                    match self {
+                        Self::Chat(chat) => Self::Chat(chat),
+                        Self::Raw(session) => match session.into_chat() {
+                            Ok(chat) => Self::Chat(chat),
+                            Err((raw, _)) => Self::Raw(raw),
+                        },
+                    }
+                }
+            }
+
+            let mut cli_session = match session.into_chat() {
+                Ok(chat) => CliSession::Chat(chat),
+                Err((raw, _)) => CliSession::Raw(raw),
+            };
             // The actual backend choice is reported by `load_engine` via
             // its own "Using ... backend" line above; don't echo `device`
             // here since under `--device auto` it'd misrepresent the
@@ -4208,7 +4275,7 @@ fn main() -> Result<()> {
             }
 
             let stdin = std::io::stdin();
-            let cancel = session.cancel_handle();
+            let cancel = cli_session.cancel_handle();
             // SIGINT during a turn → flip the session's cancel atomic so
             // prefill / generate unwind cleanly; SIGINT at the prompt →
             // exit the process. `intercepting` distinguishes the two and
@@ -4320,13 +4387,6 @@ fn main() -> Result<()> {
                             if reject_extra_args(cmd) {
                                 continue;
                             }
-                            // Reset history but preserve the initial
-                            // system message if one was set via
-                            // `--system`. The per-turn loop calls
-                            // `session.reset()` itself before the next
-                            // prefill, so we don't need an explicit
-                            // reset here — the next turn will see the
-                            // truncated history and start clean.
                             let had_system = history.first().is_some_and(|m| m.role == "system");
                             if had_system {
                                 history.truncate(1);
@@ -4335,13 +4395,12 @@ fn main() -> Result<()> {
                                 history.clear();
                                 history_images.clear();
                             }
-                            // `/clear` also drops any pending image
-                            // attachments — staying-attached across a
-                            // history wipe would surprise the user
-                            // (the next message would attach to a
-                            // brand-new conversation).
                             let pending_dropped = !pending_images.is_empty();
                             pending_images.clear();
+                            if let Err(e) = cli_session.reset() {
+                                eprintln!("warning: failed to reset session KV cache: {e}");
+                            }
+                            cli_session = cli_session.try_into_chat();
                             eprintln!(
                                 "(history cleared{}{})",
                                 if had_system {
@@ -4377,17 +4436,15 @@ fn main() -> Result<()> {
                             continue;
                         }
                         "/system" => {
-                            // Empty arg removes the system message
-                            // (the user-facing off-switch). Non-empty
-                            // arg replaces or inserts at index 0.
-                            // Either way, the per-turn loop's own
-                            // `session.reset()` will flush KV state
-                            // before the next prefill.
                             if rest.is_empty() {
                                 let removed = history.first().is_some_and(|m| m.role == "system");
                                 if removed {
                                     history.remove(0);
                                     history_images.remove(0);
+                                    if let Err(e) = cli_session.reset() {
+                                        eprintln!("warning: failed to reset session KV cache: {e}");
+                                    }
+                                    cli_session = cli_session.try_into_chat();
                                     eprintln!("(system prompt removed)");
                                 } else {
                                     eprintln!("(no system prompt was set)");
@@ -4400,13 +4457,14 @@ fn main() -> Result<()> {
                             };
                             if history.first().is_some_and(|m| m.role == "system") {
                                 history[0] = new_msg;
-                                // history_images[0] stays as empty
-                                // Vec — system messages never have
-                                // image attachments.
                             } else {
                                 history.insert(0, new_msg);
                                 history_images.insert(0, Vec::new());
                             }
+                            if let Err(e) = cli_session.reset() {
+                                eprintln!("warning: failed to reset session KV cache: {e}");
+                            }
+                            cli_session = cli_session.try_into_chat();
                             eprintln!("(system prompt updated)");
                             continue;
                         }
@@ -4565,127 +4623,151 @@ fn main() -> Result<()> {
                 });
                 history_images.push(pending_images.clone());
 
-                // Re-render the full conversation per turn and rely on
-                // the engine's prefix cache for fast turn-N+1 prefill.
-                // Delta-prefill is a future optimization; the simplicity
-                // of "render fresh, reset, prefill" is worth the lookup.
-                // SIGINT during ANY part of this turn — prefill (incl.
-                // any retries), the "assistant> " banner print, or
-                // generate — should cancel the in-flight call, not kill
-                // the REPL. Hold `intercepting=true` across the whole
-                // turn span and only release it at the very end (after
-                // we've read `sigint_fired`), so there's no gap where a
-                // SIGINT would be misrouted to `process::exit(130)`.
+                let any_images = history_images.iter().any(|v| !v.is_empty());
+                if any_images {
+                    cli_session = CliSession::Raw(cli_session.into_raw());
+                }
+
+                // Delta prompt evaluation is used for text-only turns via the transactional
+                // chat coordinator. Fall back to full-transcript rebuild when images are attached.
+                // SIGINT during ANY part of this turn (prefill including retries,
+                // the "assistant> " banner print, or generate) cancels the in-flight call,
+                // not the REPL. Hold intercepting=true across the whole turn span.
                 intercepting.store(true, Ordering::Relaxed);
-                // Retry-on-overflow: on `CeraError::ContextOverflow`
-                // drop the oldest user+assistant pair and re-render,
-                // so a long conversation can keep going past the
-                // window cap without forcing the user to `/clear`.
-                // Bounded by `truncate_oldest_turn_pair` which
-                // returns false once only the system + the just-
-                // pushed user remain — at which point overflow is a
-                // real "single prompt too large" and we surface it.
-                //
-                // Truncation runs against a SCRATCH copy of the history
-                // — `scratch_history` / `scratch_images`. The
-                // authoritative `history` / `history_images` are only
-                // overwritten with the (possibly-truncated) scratch
-                // AFTER the turn is fully durable (prefill + generate
-                // both succeed). On any failure path the scratch is
-                // discarded and the user keeps every typed turn. Image
-                // bytes are `Arc<Vec<u8>>` so cloning the parallel
-                // `Vec<Vec<…>>` is a refcount bump per attachment, not
-                // a memcpy of up to 50 MB per image.
                 let mut scratch_history = history.clone();
                 let mut scratch_images = history_images.clone();
                 let prefill_outcome: Result<(), String> = loop {
-                    if let Err(e) = session.reset() {
-                        break Err(format!("session reset failed: {e}"));
-                    }
-                    // Recompute per attempt: a truncation step may have
-                    // dropped the last image-bearing turn, in which case
-                    // the conversation is now text-only and the chat
-                    // template renders a different (string-shaped vs
-                    // list-shaped) content prefix.
-                    let any_images = scratch_images.iter().any(|v| !v.is_empty());
-                    let attempt: Result<(), CeraError> = if any_images {
-                        // Multimodal prefill: synthesize multimodal
-                        // messages by zipping scratch_history with
-                        // scratch_images. Each user turn that had
-                        // attachments rebuilds as
-                        // `[Image*N, Text(content)?]`; turns without
-                        // attachments rebuild as `[Text(content)]`.
-                        // Image bytes flatten across all turns in
-                        // document order, matching the chat template's
-                        // `<image>` marker walk.
-                        let messages: Vec<cera::tokenizer::ChatMessageMultimodal> = scratch_history
-                            .iter()
-                            .zip(scratch_images.iter())
-                            .map(|(msg, imgs)| {
-                                let mut content: Vec<cera::tokenizer::ContentItem> =
-                                    vec![cera::tokenizer::ContentItem::Image; imgs.len()];
-                                if !msg.content.is_empty() {
-                                    content.push(cera::tokenizer::ContentItem::Text {
-                                        text: msg.content.clone(),
-                                    });
+                    let attempt: Result<(), String> = match &mut cli_session {
+                        CliSession::Chat(chat) => {
+                            let msgs = match convert_history_to_chat_messages(&scratch_history) {
+                                Ok(m) => m,
+                                Err(e) => break Err(format!("invalid message history: {e}")),
+                            };
+
+                            let ingest_res = if chat.phase() == SessionPhase::Idle {
+                                chat.ingest_messages(&msgs)
+                            } else if chat.phase() == SessionPhase::TurnComplete
+                                && scratch_history.len() == history.len()
+                            {
+                                chat.ingest(&Message::user(&user))
+                            } else {
+                                if chat.phase() == SessionPhase::Unusable
+                                    && let Err(e) = chat.reset()
+                                {
+                                    break Err(format!("chat session reset failed: {e}"));
                                 }
-                                cera::tokenizer::ChatMessageMultimodal {
-                                    role: msg.role.clone(),
-                                    content,
+                                if chat.phase() == SessionPhase::Idle {
+                                    chat.ingest_messages(&msgs)
+                                } else {
+                                    chat.replace_messages(&msgs)
                                 }
-                            })
-                            .collect();
-                        let images_refs: Vec<&[u8]> = scratch_images
-                            .iter()
-                            .flat_map(|v| v.iter().map(|a| a.as_slice()))
-                            .collect();
-                        session.append_chat_with_images(&messages, &images_refs, true)
-                    } else {
-                        match cera::tokenizer::apply_chat_template(
-                            tokenizer,
-                            &scratch_history,
-                            true,
-                        ) {
-                            Ok(formatted) => {
-                                let tokens = tokenizer.encode(&formatted);
-                                session.append_tokens(&tokens)
+                            };
+
+                            match ingest_res {
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    let is_overflow = matches!(
+                                        &e.cause,
+                                        IngestCause::Validation(ValidationError::Capacity { .. })
+                                            | IngestCause::Execution(
+                                                CeraError::ContextOverflow { .. },
+                                            )
+                                    );
+                                    if is_overflow {
+                                        if !truncate_oldest_turn_pair(
+                                            &mut scratch_history,
+                                            &mut scratch_images,
+                                        ) {
+                                            break Err(
+                                                "prompt too large for context window: would exceed capacity and no older history to drop. Raise --context-size or shorten prompt.".to_string(),
+                                            );
+                                        }
+                                        eprintln!(
+                                            "(history truncated to fit context: dropped oldest turn pair)"
+                                        );
+                                        continue;
+                                    }
+                                    Err(format!("chat ingest failed: {e}"))
+                                }
                             }
-                            Err(e) => {
-                                break Err(format!("chat-template render failed: {e}"));
+                        }
+                        CliSession::Raw(session) => {
+                            if let Err(e) = session.reset() {
+                                break Err(format!("session reset failed: {e}"));
+                            }
+                            let any_images = scratch_images.iter().any(|v| !v.is_empty());
+                            let attempt: Result<(), CeraError> = if any_images {
+                                let messages: Vec<cera::tokenizer::ChatMessageMultimodal> =
+                                    scratch_history
+                                        .iter()
+                                        .zip(scratch_images.iter())
+                                        .map(|(msg, imgs)| {
+                                            let mut content: Vec<cera::tokenizer::ContentItem> =
+                                                vec![
+                                                    cera::tokenizer::ContentItem::Image;
+                                                    imgs.len()
+                                                ];
+                                            if !msg.content.is_empty() {
+                                                content.push(cera::tokenizer::ContentItem::Text {
+                                                    text: msg.content.clone(),
+                                                });
+                                            }
+                                            cera::tokenizer::ChatMessageMultimodal {
+                                                role: msg.role.clone(),
+                                                content,
+                                            }
+                                        })
+                                        .collect();
+                                let images_refs: Vec<&[u8]> = scratch_images
+                                    .iter()
+                                    .flat_map(|v| v.iter().map(|a| a.as_slice()))
+                                    .collect();
+                                session.append_chat_with_images(&messages, &images_refs, true)
+                            } else {
+                                match cera::tokenizer::apply_chat_template(
+                                    tokenizer,
+                                    &scratch_history,
+                                    true,
+                                ) {
+                                    Ok(formatted) => {
+                                        let tokens = tokenizer.encode(&formatted);
+                                        session.append_tokens(&tokens)
+                                    }
+                                    Err(e) => {
+                                        break Err(format!("chat-template render failed: {e}"));
+                                    }
+                                }
+                            };
+                            match attempt {
+                                Ok(()) => Ok(()),
+                                Err(CeraError::ContextOverflow { max_seq_len, by }) => {
+                                    if !truncate_oldest_turn_pair(
+                                        &mut scratch_history,
+                                        &mut scratch_images,
+                                    ) {
+                                        break Err(format!(
+                                            "prompt too large for context window: would need {} more \
+                                             tokens past the {max_seq_len}-token cap, and there's no \
+                                             older history to drop. Raise --context-size or shorten \
+                                             the prompt.",
+                                            by
+                                        ));
+                                    }
+                                    eprintln!(
+                                        "(history truncated to fit context: dropped oldest turn pair)"
+                                    );
+                                    continue;
+                                }
+                                Err(other) => Err(format!("prefill failed: {other}")),
                             }
                         }
                     };
                     match attempt {
                         Ok(()) => break Ok(()),
-                        Err(CeraError::ContextOverflow { max_seq_len, by }) => {
-                            if !truncate_oldest_turn_pair(&mut scratch_history, &mut scratch_images)
-                            {
-                                break Err(format!(
-                                    "prompt too large for context window: would need {} more \
-                                     tokens past the {max_seq_len}-token cap, and there's no \
-                                     older history to drop. Raise --context-size or shorten \
-                                     the prompt.",
-                                    by
-                                ));
-                            }
-                            eprintln!(
-                                "(history truncated to fit context: dropped oldest turn pair)"
-                            );
-                        }
-                        Err(other) => {
-                            // Cancelled, real decode failures, etc. —
-                            // surface as the existing String-typed
-                            // error path. Scratch is discarded by
-                            // simply not committing it.
-                            break Err(format!("prefill failed: {other}"));
-                        }
+                        Err(e) => break Err(e),
                     }
                 };
                 if let Err(msg) = prefill_outcome {
-                    // Read `sigint_fired` BEFORE releasing intercepting:
-                    // if SIGINT lands between the swap and the store,
-                    // the handler still routes to the cancel branch
-                    // (loop-top defense clears the leftover next turn).
                     let prefill_sigint = sigint_fired.swap(false, Ordering::Relaxed);
                     intercepting.store(false, Ordering::Relaxed);
                     if prefill_sigint {
@@ -4695,11 +4777,6 @@ fn main() -> Result<()> {
                     }
                     history.pop();
                     history_images.pop();
-                    // Defense: clear the cancel atomic so the next turn
-                    // doesn't carry stale state into the inner handler
-                    // check before `session.reset()` clears it. Leave
-                    // pending state intact so the user can retype the
-                    // prompt without re-attaching the image.
                     cancel.store(false, Ordering::Relaxed);
                     continue;
                 }
@@ -4707,61 +4784,32 @@ fn main() -> Result<()> {
                 eprint!("assistant> ");
                 std::io::stderr().flush().ok();
 
-                let mut sink = ChatSink::new(tokenizer, session.cancel_handle());
-                let generate_result = session.generate(&opts, &mut sink);
-                // Same swap-before-store discipline as the prefill arm —
-                // capture in-turn SIGINTs before releasing intercepting.
+                let mut sink = ChatSink::new(tokenizer, Arc::clone(&cancel));
+                let generate_result = match &mut cli_session {
+                    CliSession::Chat(chat) => match chat.generate_into(&opts, &mut sink) {
+                        Ok(report) => report.result.map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                    CliSession::Raw(session) => session
+                        .generate(&opts, &mut sink)
+                        .map_err(|e| e.to_string()),
+                };
+                let sink_text = sink.into_text();
                 let generate_sigint = sigint_fired.swap(false, Ordering::Relaxed);
                 intercepting.store(false, Ordering::Relaxed);
                 let summary = match generate_result {
                     Ok(s) => s,
                     Err(e) => {
-                        // `Session::generate` surfaces cancellation as
-                        // `Ok(summary)` with `FinishReason::Cancelled`,
-                        // not as `Err`. An `Err` here is always a real
-                        // decode failure — print it verbatim so the
-                        // user sees what actually broke, even if a
-                        // SIGINT happened to fire concurrently. The
-                        // turn isn't durable, so the scratch goes
-                        // unused; authoritative `history` keeps every
-                        // pre-truncation pair intact.
                         eprintln!("\nerror: generate failed: {e}");
                         history.pop();
                         history_images.pop();
                         cancel.store(false, Ordering::Relaxed);
-                        // Same retry semantics as the prefill-error
-                        // path: leave pending images intact. The
-                        // next turn will run `session.reset()` which
-                        // clears the KV state, then re-prefill with
-                        // the same images — consistent and gives
-                        // the user a clean retry.
                         continue;
                     }
                 };
-                // Generate succeeded (possibly with finish_reason =
-                // Cancelled — that path is also durable: the user
-                // saw partial assistant output streamed live, and a
-                // Ctrl+C marker is added below). Commit the
-                // (possibly-truncated) scratch back to authoritative
-                // state. The current user turn is at the tail of
-                // both vectors; truncation only ever removed pairs
-                // from the front; appending the assistant reply
-                // below uses `history` (the now-committed copy).
                 history = scratch_history;
                 history_images = scratch_images;
-                // Mark a SIGINT-truncated turn before pushing it into
-                // history so the user can see in scrollback that the
-                // assistant reply was interrupted (otherwise it just
-                // looks like the model trailed off mid-sentence). Both
-                // gates required:
-                // - `finish_reason == Cancelled` is the source of truth
-                //   from the session — no marker if the model finished
-                //   naturally, even if a SIGINT happened to fire (a
-                //   `generate()` start-of-call cancel-reset can swallow
-                //   one).
-                // - `generate_sigint` separates SIGINT from the only
-                //   other finish_reason=Cancelled path, the
-                //   `ChatSink`-self-cancel-on-BrokenPipe escape below.
+
                 let cancelled_clean =
                     matches!(summary.finish_reason, cera::FinishReason::Cancelled);
                 if cancelled_clean && generate_sigint {
@@ -4771,7 +4819,7 @@ fn main() -> Result<()> {
                 }
                 history.push(cera::tokenizer::ChatMessage {
                     role: "assistant".into(),
-                    content: sink.into_text(),
+                    content: sink_text,
                 });
                 history_images.push(Vec::new());
                 // Image attachments for THIS user turn already
@@ -5111,9 +5159,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BundleQuantPair, Cli, CliSamplingArgs, Command, display_bundle_id, normalize_bundle_id,
-        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
-        split_at_marker, truncate_oldest_turn_pair, write_transcript, write_wav,
+        BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
+        display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
+        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
+        truncate_oldest_turn_pair, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -5983,6 +6032,68 @@ mod tests {
         write_transcript(&history, &path).unwrap();
         let got = std::fs::read_to_string(&path).unwrap();
         assert_eq!(got, "assistant: line one\nline two\nline three\n");
+    }
+
+    #[test]
+    fn convert_history_to_chat_messages_maps_roles_correctly() {
+        use cera::tokenizer::ChatMessage;
+        let history = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "System prompt.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hello!".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Hi there!".into(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "Tool output.".into(),
+            },
+        ];
+        let msgs = convert_history_to_chat_messages(&history).unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, cera::Role::System);
+        assert_eq!(
+            msgs[0].content,
+            vec![cera::ContentPart::Text("System prompt.".into())]
+        );
+        assert_eq!(msgs[1].role, cera::Role::User);
+        assert_eq!(
+            msgs[1].content,
+            vec![cera::ContentPart::Text("Hello!".into())]
+        );
+        assert_eq!(msgs[2].role, cera::Role::Assistant);
+        assert_eq!(
+            msgs[2].content,
+            vec![cera::ContentPart::Text("Hi there!".into())]
+        );
+        assert_eq!(msgs[3].role, cera::Role::Tool);
+        assert_eq!(
+            msgs[3].content,
+            vec![cera::ContentPart::Text("Tool output.".into())]
+        );
+    }
+
+    #[test]
+    fn convert_history_to_chat_messages_rejects_unsupported_role() {
+        use cera::tokenizer::ChatMessage;
+        let history = vec![ChatMessage {
+            role: "unknown_role".into(),
+            content: "Oops".into(),
+        }];
+        let err = convert_history_to_chat_messages(&history).unwrap_err();
+        assert!(err.contains("unsupported role"));
+    }
+
+    #[test]
+    fn convert_history_to_chat_messages_handles_empty() {
+        let msgs = convert_history_to_chat_messages(&[]).unwrap();
+        assert!(msgs.is_empty());
     }
 
     /// `split_at_marker` happy path: a marker in the middle of a

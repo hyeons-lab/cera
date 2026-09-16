@@ -1,7 +1,30 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-16T08:22-0400. This is the current implementation record; the
+Updated: 2026-09-16T11:41-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan49 complete (2026-09-16T11:41-0400)
+
+First-party migration of the `cera-cli` interactive chat REPL to the transactional `SessionChat` coordinator and formal deprecation of uncoordinated legacy single-message append methods.
+
+- [x] First-party CLI migration:
+      - Migrated `cera-cli/src/main.rs` interactive chat REPL to use `SessionChat` (`Session::into_chat()`).
+      - Defined `enum CliSession { Chat(SessionChat), Raw(Session) }` with seamless ownership transitions (`into_raw()`, `try_into_chat()`).
+      - Turn 1 ingests the system prompt (if present) and initial user turn via `chat.ingest_messages(&msgs)`.
+      - Turn 2+ on clean turn completion (`SessionPhase::TurnComplete`) performs delta-only prompt evaluation via `chat.ingest(&Message::user(&user))`, retaining the live KV cache across conversation turns without transcript re-rendering or re-encoding.
+      - Full-batch re-ingestion handles `SessionPhase::Idle`, `SessionPhase::Interrupted`, `SessionPhase::RawContext`, or context overflow truncation.
+      - Slash commands (`/clear`, `/system`) cleanly reset KV state and renew the chat coordinator.
+      - Fallback to `CliSession::Raw` when image attachments are present (`any_images`) or if `into_chat()` is refused by an unsupported chat template, maintaining full multimodal compatibility.
+      - Implemented `convert_history_to_chat_messages` supporting `System`, `User`, `Assistant`, and `Tool` roles, with unit tests in `mod tests` passing (82/82 in `cera-cli`).
+- [x] Superseded turn method deprecations:
+      - Marked `Session::append_user_message` in `cera/src/session.rs` with `#[deprecated(since = "0.2.0", note = "use SessionChat coordinator via Session::into_chat instead")]`.
+      - Updated doc comments and added `#[deprecated(since = "0.2.0", note = "use ChatSession coordinator instead")]` and `#[allow(deprecated)]` to `Session::send_message*` in `cera-ffi/src/lib.rs`.
+      - Added targeted `#[allow(deprecated)]` to existing recovery tests and examples (`cera/examples/ingestion_recovery.rs`, `cera/tests/api_chat/tests.rs`, `cera/src/engine/loading_prototype/tests/ownership/recovery.rs`, `cera/src/engine/loading_prototype/tests/ownership/gpu_recovery.rs`, `cera/src/session/recovery/tests.rs`).
+- [x] Local review-fix loop clean: two max-effort rounds with zero remaining warnings or blocking issues. Hoisted `ChatSink` construction with shared cancellation handle identity, handled unusable phase resets with informative diagnostics, added warnings on slash command reset failures, supported `Role::Tool` in history conversion, and added history content preservation unit tests.
+- [x] Verification gates clean: all 82 `cera-cli` unit tests, all 58 FFI unit tests, 43 core tests, 15 contract tests, 7 runner tests, formatting (`cargo fmt --check`), and clippy (`-D warnings`) pass cleanly.
+
+Evidence: `devlog/plans/000341-49-first-party-migration-and-deprecations.md`.
+Forty-six increments are complete (44 core, two Leap). Next unused sequence is 50.
 
 ## Plan48 complete (2026-09-16T08:22-0400)
 
@@ -2293,20 +2316,20 @@ code, warm-chat behavior, commits or pushes changed.
 ## Phase checklist
 
 - [x] P0-L: all source/constructor/config/ownership/kind and binding prototype proofs.
-- [ ] P0.1: core chat prototypes, all caller inventory, R0 recovery and R1 profile matrix.
-- [ ] P0.2: chat foreign prototypes and frozen numeric performance budgets.
-- [ ] R0: checked recovery for existing ingestion failures.
-- [ ] R1: initial warm-chat boundaries, phases, and retained KV proof.
-- [ ] P1: additive production core/bindings, compatibility fixtures and runnable examples using public imports.
-- [ ] P2: first-party migration, README/chat/recovery examples and documentation; release replacements/deprecations.
+- [x] P0.1: core chat prototypes, all caller inventory, R0 recovery and R1 profile matrix.
+- [x] P0.2: chat foreign prototypes and frozen numeric performance budgets.
+- [x] R0: checked recovery for existing ingestion failures.
+- [x] R1: initial warm-chat boundaries, phases, and retained KV proof.
+- [x] P1: additive production core/bindings, compatibility fixtures and runnable examples using public imports.
+- [x] P2: first-party migration, README/chat/recovery examples and documentation; release replacements/deprecations.
 - [ ] P3: removal in a breaking release after at least one compatibility release.
 - [ ] C0: Leap artifact/API inventory and unchanged-consumer architecture spike.
 - [ ] C1: supported Leap loading/conversation/streaming facade and contract tests.
 - [ ] C2: packaging, actual app migrations, performance and compatibility release gates.
 - [ ] Part II F1–F8: independent capabilities; do not count them as implemented by a facade.
 
-Each unchecked item remains required even though thirty-nine bounded increments
-through Plan42 are complete. See the two linked workstream documents for exit
+Each unchecked item remains required even though forty-six bounded increments
+through Plan 49 are complete. See the two linked workstream documents for exit
 criteria and dependencies; none of these checkboxes means merely writing a plan.
 
 ## Fine-tuning follow-up

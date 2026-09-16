@@ -625,6 +625,7 @@ fn no_progress_error_leaves_the_cursor_stale_not_the_execution_unusable() {
     }
 }
 
+#[allow(deprecated)]
 fn legacy_boundary(tokenizer: Arc<BpeTokenizer>) {
     for temperature in [0.0, 0.7] {
         let (model, mut session) = TraceModel::session(tokenizer.clone());

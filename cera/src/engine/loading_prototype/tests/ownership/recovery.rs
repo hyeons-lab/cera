@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::*;
 use crate::session::RecoveryOutcome;
 use crate::tokenizer::UserMessage;

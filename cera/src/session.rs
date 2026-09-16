@@ -1956,6 +1956,10 @@ impl Session {
     /// [`Self::last_ingest_recovery`]. Reset recovery discards context; unusable
     /// recovery requires checked reset or recreation. Automatic recovery never
     /// clears external cancellation. Raw append helpers retain partial progress.
+    #[deprecated(
+        since = "0.6.0",
+        note = "use Session::into_chat() for transactional multi-turn conversations with delta-only prompt evaluation and live KV retention"
+    )]
     pub fn append_user_message(
         &mut self,
         message: &crate::tokenizer::UserMessage,

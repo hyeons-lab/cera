@@ -1,4 +1,5 @@
 //! Actual device proof; ignored unless explicitly selected on a GPU host.
+#![allow(deprecated)]
 use super::*;
 use crate::kv_cache::{InferenceState, LayerSnapshot, StateSnapshot};
 use crate::session::RecoveryOutcome;

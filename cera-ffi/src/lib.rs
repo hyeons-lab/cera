@@ -2476,6 +2476,10 @@ impl Session {
 
     /// Append a multimodal message, automatically enforcing model-canonical
     /// media ordering, boundary token envelopes, and sample rate normalization.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message(&self, message: UserMessage) -> Result<(), FfiError> {
         let mut guard = self.lock_inner()?;
         let core_msg: cera::tokenizer::UserMessage = message.into();
@@ -2484,6 +2488,10 @@ impl Session {
 
     /// Append a multimodal message and run generation synchronously while holding
     /// the session lock continuously across prefill and decode.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message_and_generate(
         &self,
         message: UserMessage,
@@ -2506,6 +2514,10 @@ impl Session {
 
     /// Append a multimodal message and run streaming generation while holding
     /// the session lock continuously across prefill and decode.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message_streaming(
         &self,
         message: UserMessage,

@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use super::*;
 use crate::kv_cache::LayerState;
 use crate::model::{ModelConfig, ScalarMultipliers};

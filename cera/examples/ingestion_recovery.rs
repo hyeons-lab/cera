@@ -8,6 +8,7 @@ use cera::session::RecoveryOutcome;
 use cera::tokenizer::UserMessage;
 use cera::{BackendPreference, CeraError, EngineConfig, ModelLoader, ModelSource, SessionConfig};
 
+#[allow(deprecated)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() < 3 {
