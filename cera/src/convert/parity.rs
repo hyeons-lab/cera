@@ -678,8 +678,13 @@ pub fn compare_inference_parity(
     prompt: &str,
     test_tokens: Option<&[u32]>,
 ) -> Result<InferenceParityResult, CeraError> {
+    let req_ctx = if let Some(toks) = test_tokens {
+        toks.len().max(2048)
+    } else {
+        2048
+    };
     let cfg = crate::EngineConfig {
-        context_size: 256,
+        context_size: req_ctx,
         backend: crate::BackendPreference::Cpu,
         ..Default::default()
     };
@@ -702,7 +707,7 @@ pub fn compare_inference_parity(
     let model_cera = engine_cera.model();
     let model_ref = engine_ref.model();
 
-    let max_ctx = 256
+    let max_ctx = req_ctx
         .min(model_cera.config().max_seq_len)
         .min(model_ref.config().max_seq_len);
     if tokens.len() > max_ctx {
@@ -739,6 +744,11 @@ pub fn compare_inference_parity(
             logits_cera.len(),
             logits_ref.len()
         )));
+    }
+    if logits_cera.is_empty() {
+        return Err(CeraError::Backend(
+            "model produced empty logits (unsupported architecture or non-generative model)".into(),
+        ));
     }
 
     let cos_sim = compute_cosine_similarity(&logits_cera, &logits_ref);

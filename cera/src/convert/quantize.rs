@@ -238,7 +238,10 @@ pub fn compute_snr_db(orig: &[f32], dequant: &[f32]) -> f32 {
 
 /// Compute Root Mean Square Error (RMSE) between original and dequantized tensor.
 pub fn compute_rmse(orig: &[f32], dequant: &[f32]) -> f32 {
-    if orig.len() != dequant.len() || orig.is_empty() {
+    if orig.len() != dequant.len() {
+        return f32::INFINITY;
+    }
+    if orig.is_empty() {
         return 0.0;
     }
     let mut sum_sq = 0.0f32;
@@ -1429,5 +1432,21 @@ mod tests {
         let poisoned = vec![1.0f32, f32::NAN];
         assert!(compute_rmse(&clean, &poisoned).is_nan());
         assert!(compute_rmse(&poisoned, &clean).is_nan());
+    }
+
+    #[test]
+    fn test_compute_rmse_length_mismatch() {
+        let v1 = vec![1.0f32, 2.0, 3.0];
+        let v2 = vec![1.0f32, 2.0];
+        assert_eq!(compute_rmse(&v1, &v2), f32::INFINITY);
+        assert_eq!(compute_rmse(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_compute_cosine_similarity_length_mismatch() {
+        let v1 = vec![1.0f32, 2.0, 3.0];
+        let v2 = vec![1.0f32, 2.0];
+        assert_eq!(compute_cosine_similarity(&v1, &v2), 0.0);
+        assert_eq!(compute_cosine_similarity(&[], &[]), 0.0);
     }
 }

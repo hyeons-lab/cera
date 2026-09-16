@@ -722,7 +722,18 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             let entry =
                 entry.map_err(|e| CeraError::Backend(format!("failed to read entry: {e}")))?;
             let p = entry.path();
-            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            let is_safetensors =
+                p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("safetensors");
+            let filename_lower = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let is_auxiliary = filename_lower.contains("mmproj")
+                || filename_lower.contains("visual")
+                || filename_lower.contains("audio_decoder")
+                || filename_lower.contains("vocoder");
+            if is_safetensors && !is_auxiliary {
                 safetensors_files.push(p);
             }
         }
