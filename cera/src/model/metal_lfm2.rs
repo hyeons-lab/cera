@@ -677,6 +677,16 @@ impl MetalLfm2Model {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cpu = super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?;
+        if let Some(sw) = cpu.sliding_window() {
+            tracing::warn!(
+                "Model specifies sliding window attention ({sw} tokens), which is not accelerated on Metal; full dense attention will be applied"
+            );
+        }
+        if cpu.has_projection_or_ffn_biases() {
+            tracing::warn!(
+                "Model specifies projection or FFN biases, which are not accelerated on Metal; biases will be omitted in forward passes"
+            );
+        }
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -986,11 +996,13 @@ impl MetalLfm2Model {
         // tensor data region in a usable format (f32 vs mmap'd bytes).
         let output_norm = ctx.upload_f32(src.output_norm_weight());
 
-        let uploaded_weights: std::cell::RefCell<std::collections::HashMap<u64, MetalWeight>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        let uploaded_weights: std::cell::RefCell<
+            std::collections::HashMap<(u64, usize), MetalWeight>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
 
         let upload_weight = |wref: &WeightRef| -> anyhow::Result<MetalWeight> {
-            if let Some(existing) = uploaded_weights.borrow().get(&wref.start) {
+            let key = (wref.start, wref.size);
+            if let Some(existing) = uploaded_weights.borrow().get(&key) {
                 return Ok(existing.clone());
             }
 
@@ -1015,7 +1027,13 @@ impl MetalLfm2Model {
                     wref.dtype,
                     wref.dtype.block_size(),
                 );
-                (wref.start, None, wref.dtype)
+                if wref.start.is_multiple_of(4) {
+                    (wref.start, None, wref.dtype)
+                } else {
+                    let bytes = src.weight_bytes(wref);
+                    let buf = ctx.upload_bytes(&bytes);
+                    (0, Some(buf), wref.dtype)
+                }
             } else {
                 anyhow::ensure!(
                     matches!(wref.dtype, DType::F16 | DType::BF16),
@@ -1039,9 +1057,7 @@ impl MetalLfm2Model {
                 k: wref.k as u32,
                 params_buf,
             };
-            uploaded_weights
-                .borrow_mut()
-                .insert(wref.start, weight.clone());
+            uploaded_weights.borrow_mut().insert(key, weight.clone());
             Ok(weight)
         };
         // Optional small-f32 upload (per-head QK-norm / QKV bias).

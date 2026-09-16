@@ -761,7 +761,7 @@ pub fn load_model(
         )?),
         // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
         "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
-        | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" => Box::new(
+        | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" | "phi3" | "phi" => Box::new(
             llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
         ),
         "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
@@ -830,13 +830,12 @@ pub fn load_model_gpu(
         // Dense transformers share the generalized wgpu loader (per-arch rope /
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" => {
-            Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_llama_with_id(
-                gguf,
-                context_size,
-                model_id,
-            )?))
-        }
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
+        | "phi" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_llama_with_id(
+            gguf,
+            context_size,
+            model_id,
+        )?)),
         other => bail!("unsupported architecture for GPU: {other}"),
     }
 }
@@ -863,13 +862,12 @@ pub fn load_model_metal(
             context_size,
         )?)),
         // Dense transformers share the generalized Metal forward path.
-        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" => {
-            Ok(Box::new(metal_lfm2::MetalLfm2Model::from_llama(
-                gguf,
-                path,
-                context_size,
-            )?))
-        }
+        "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
+        | "phi" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_llama(
+            gguf,
+            path,
+            context_size,
+        )?)),
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }
