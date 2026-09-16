@@ -116,6 +116,13 @@ fn transform_qwen35_ssm_a_inplace(f32_data: &mut [f32]) {
     }
 }
 
+fn transform_bailingmoe_ssm_a_inplace(f32_data: &mut [f32]) {
+    for v in f32_data.iter_mut() {
+        let clamped = v.clamp(-80.0, 80.0);
+        *v = clamped.exp();
+    }
+}
+
 /// Stream and quantize a remote Hugging Face SafeTensors repository into a cached GGUF model.
 #[cfg(feature = "remote")]
 pub fn stream_quantize_hf_repo(
@@ -497,6 +504,12 @@ pub fn stream_quantize_hf_repo(
             && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
         {
             transform_qwen35_ssm_a_inplace(&mut f32_data);
+        }
+
+        if matches!(arch, "bailingmoe3" | "bailingmoe" | "bailingmoe2")
+            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
+        {
+            transform_bailingmoe_ssm_a_inplace(&mut f32_data);
         }
 
         // Quantize to target GGML type
@@ -891,6 +904,12 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
         {
             transform_qwen35_ssm_a_inplace(&mut f32_data);
+        }
+
+        if matches!(arch.as_str(), "bailingmoe3" | "bailingmoe" | "bailingmoe2")
+            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
+        {
+            transform_bailingmoe_ssm_a_inplace(&mut f32_data);
         }
 
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);

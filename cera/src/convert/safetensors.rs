@@ -249,14 +249,20 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
         .or_else(|| hf_name.strip_prefix("layers."));
     if let Some((layer_idx, sub_name)) = layer_rest.and_then(|r| r.split_once('.')) {
         let gguf_suffix = match sub_name {
-            "self_attn.q_proj.weight" => "attn_q.weight",
-            "self_attn.q_proj.bias" => "attn_q.bias",
-            "self_attn.k_proj.weight" => "attn_k.weight",
-            "self_attn.k_proj.bias" => "attn_k.bias",
-            "self_attn.v_proj.weight" => "attn_v.weight",
-            "self_attn.v_proj.bias" => "attn_v.bias",
-            "self_attn.o_proj.weight" | "self_attn.out_proj.weight" => "attn_output.weight",
-            "self_attn.o_proj.bias" | "self_attn.out_proj.bias" => "attn_output.bias",
+            "self_attn.q_proj.weight" | "attention.q_proj.weight" => "attn_q.weight",
+            "self_attn.q_proj.bias" | "attention.q_proj.bias" => "attn_q.bias",
+            "self_attn.k_proj.weight" | "attention.k_proj.weight" => "attn_k.weight",
+            "self_attn.k_proj.bias" | "attention.k_proj.bias" => "attn_k.bias",
+            "self_attn.v_proj.weight" | "attention.v_proj.weight" => "attn_v.weight",
+            "self_attn.v_proj.bias" | "attention.v_proj.bias" => "attn_v.bias",
+            "self_attn.o_proj.weight"
+            | "self_attn.out_proj.weight"
+            | "attention.o_proj.weight"
+            | "attention.out_proj.weight" => "attn_output.weight",
+            "self_attn.o_proj.bias"
+            | "self_attn.out_proj.bias"
+            | "attention.o_proj.bias"
+            | "attention.out_proj.bias" => "attn_output.bias",
             "self_attn.qkv_proj.weight" => "attn_qkv.weight",
             "self_attn.qkv_proj.bias" => "attn_qkv.bias",
             "self_attn.q_norm.weight" | "self_attn.q_layernorm.weight" => "attn_q_norm.weight",
@@ -315,6 +321,41 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
             "linear_attn.in_proj_a.weight" => "ssm_alpha.weight",
             "linear_attn.norm.weight" => "ssm_norm.weight",
             "linear_attn.out_proj.weight" => "ssm_out.weight",
+            "attention.f_proj.weight" | "self_attn.f_proj.weight" => "ssm_f_a.weight",
+            "attention.q_conv1d.weight" | "self_attn.q_conv1d.weight" => "ssm_conv1d_q.weight",
+            "attention.k_conv1d.weight" | "self_attn.k_conv1d.weight" => "ssm_conv1d_k.weight",
+            "attention.v_conv1d.weight" | "self_attn.v_conv1d.weight" => "ssm_conv1d_v.weight",
+            "attention.beta_proj.weight" | "self_attn.beta_proj.weight" => "ssm_beta.weight",
+            "attention.A_log" | "self_attn.A_log" => "ssm_a",
+            "attention.dt_bias" | "self_attn.dt_bias" => "ssm_dt.bias",
+            "attention.norm.weight" | "self_attn.norm.weight" => "ssm_norm.weight",
+            "attention.g_proj.weight" | "self_attn.g_proj.weight" => {
+                if arch == "bailingmoe3" || arch == "bailingmoe" || arch == "bailingmoe2" {
+                    "ssm_g_a.weight"
+                } else {
+                    "attn_gate.weight"
+                }
+            }
+            "attention.kv_a_proj_with_mqa.weight" | "self_attn.kv_a_proj_with_mqa.weight" => {
+                "attn_kv_a_mqa.weight"
+            }
+            "attention.kv_a_layernorm.weight" | "self_attn.kv_a_layernorm.weight" => {
+                "attn_kv_a_norm.weight"
+            }
+            "attention.q_a_proj.weight" | "self_attn.q_a_proj.weight" => "attn_q_a.weight",
+            "attention.q_a_layernorm.weight" | "self_attn.q_a_layernorm.weight" => {
+                "attn_q_a_norm.weight"
+            }
+            "attention.q_b_proj.weight" | "self_attn.q_b_proj.weight" => "attn_q_b.weight",
+            "attention.k_b_proj.weight" | "self_attn.k_b_proj.weight" => "attn_k_b.weight",
+            "attention.v_b_proj.weight" | "self_attn.v_b_proj.weight" => "attn_v_b.weight",
+            "attention.qkv_gate.weight" | "self_attn.qkv_gate.weight" => "attn_qkv_gate.weight",
+            "attention.attn_gate.weight" | "self_attn.attn_gate.weight" => "attn_gate.weight",
+            "mlp.gate.weight" | "mlp.router.weight" => "ffn_gate_inp.weight",
+            "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
+            "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
+            "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
+            "mlp.expert_bias" => "exp_probs_b.bias",
             "operator.conv.weight" | "conv.conv.weight" => "shortconv.conv.weight",
             "operator.conv.bias" | "conv.conv.bias" => "shortconv.conv.bias",
             "operator.in_proj.weight" | "conv.in_proj.weight" => "shortconv.in_proj.weight",

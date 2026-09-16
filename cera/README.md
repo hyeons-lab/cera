@@ -149,6 +149,7 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `nanbeige` | Nanbeige 4.2 (looped-layer dense transformer) |
 | `mistral3`, `ministral3` | Mistral 3 / Ministral 3 (Ministral-3B / 8B, Mistral-Small-3) |
 | `phi3`, `phi` | Microsoft Phi-3-mini, Phi-3.5-mini, and Phi-4-mini (fused QKV, packed SwiGLU FFN) |
+| `bailingmoe3`, `bailingmoe` | Ling 3.0 Tiny (hybrid KDA linear, MLA latent attention, and MoE) |
 
 Any other architecture errors out with `unsupported architecture: <name>` (this
 includes unsupported layouts such as `mistral4`). No Granite 4.0 model loads

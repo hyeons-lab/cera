@@ -157,6 +157,8 @@ impl HfModelConfig {
         match self.model_type.to_ascii_lowercase().as_str() {
             "llama" | "llama2" | "llama3" => "llama",
             "qwen35" | "qwen3_5" | "qwen3.5" => "qwen35",
+            "bailingmoe3" | "bailingmoe" | "bailingmoe2" | "bailing_moe_v3" | "bailing_moe"
+            | "bailing" => "bailingmoe3",
             "qwen2" | "qwen" => "qwen2",
             "qwen3" => "qwen3",
             "mistral3" | "ministral3" | "ministral" => "mistral3",
@@ -187,6 +189,8 @@ impl HfModelConfig {
                         "qwen35"
                     } else if arch_lower.contains("qwen3") {
                         "qwen3"
+                    } else if arch_lower.contains("bailing") {
+                        "bailingmoe3"
                     } else if arch_lower.contains("qwen2") || arch_lower.contains("qwen") {
                         "qwen2"
                     } else if arch_lower.contains("nanbeige") {
@@ -488,6 +492,108 @@ impl HfModelConfig {
                 .and_then(Value::as_u64)
             {
                 writer.add_u32("qwen35.full_attention_interval", full_attn_interval as u32);
+            }
+        }
+
+        if arch == "bailingmoe3" {
+            if let Some(conv_kernel) = self
+                .extra
+                .get("short_conv_kernel_size")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("bailingmoe3.ssm.conv_kernel", conv_kernel as u32);
+            }
+            if let Some(head_dim) = self.extra.get("head_dim").and_then(Value::as_u64) {
+                writer.add_u32("bailingmoe3.kda.head_dim", head_dim as u32);
+            }
+            if let Some(safe_gate) = self.extra.get("kda_safe_gate").and_then(Value::as_bool) {
+                writer.add_bool("bailingmoe3.kda.safe_gate", safe_gate);
+            }
+            if let Some(lower_bound) = self.extra.get("kda_lower_bound").and_then(Value::as_f64) {
+                writer.add_f32("bailingmoe3.kda.gate_lower_bound", lower_bound as f32);
+            }
+            if let Some(kv_lora_rank) = self.extra.get("kv_lora_rank").and_then(Value::as_u64) {
+                writer.add_u32("bailingmoe3.attention.kv_lora_rank", kv_lora_rank as u32);
+            }
+            if let Some(q_lora_rank) = self.extra.get("q_lora_rank").and_then(Value::as_u64) {
+                writer.add_u32("bailingmoe3.attention.q_lora_rank", q_lora_rank as u32);
+            }
+            let qk_rope_dim = self.extra.get("qk_rope_head_dim").and_then(Value::as_u64);
+            if let Some(rope_dim) = qk_rope_dim {
+                writer.add_u32("bailingmoe3.rope.dimension_count", rope_dim as u32);
+            }
+            let kv_lora_rank_val = self
+                .extra
+                .get("kv_lora_rank")
+                .and_then(Value::as_u64)
+                .unwrap_or(512);
+            let qk_nope_dim_val = self
+                .extra
+                .get("qk_nope_head_dim")
+                .and_then(Value::as_u64)
+                .unwrap_or(128);
+            let qk_rope_dim_val = qk_rope_dim.unwrap_or(64);
+            writer.add_u32(
+                "bailingmoe3.attention.key_length",
+                (kv_lora_rank_val + qk_rope_dim_val) as u32,
+            );
+            writer.add_u32(
+                "bailingmoe3.attention.key_length_mla",
+                (qk_nope_dim_val + qk_rope_dim_val) as u32,
+            );
+            if let Some(v_head_dim) = self.extra.get("v_head_dim").and_then(Value::as_u64) {
+                writer.add_u32("bailingmoe3.attention.value_length_mla", v_head_dim as u32);
+            }
+            if let Some(n_exp) = self
+                .extra
+                .get("num_experts")
+                .or_else(|| self.extra.get("n_routed_experts"))
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("bailingmoe3.expert_count", n_exp as u32);
+            }
+            if let Some(n_used) = self
+                .extra
+                .get("num_experts_per_tok")
+                .or_else(|| self.extra.get("n_activated_experts"))
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("bailingmoe3.expert_used_count", n_used as u32);
+            }
+            if let Some(moe_ff) = self
+                .extra
+                .get("moe_intermediate_size")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("bailingmoe3.expert_feed_forward_length", moe_ff as u32);
+            }
+            if let Some(shexp_ff) = self
+                .extra
+                .get("moe_shared_expert_intermediate_size")
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32(
+                    "bailingmoe3.expert_shared_feed_forward_length",
+                    shexp_ff as u32,
+                );
+            }
+            if let Some(shexp_n) = self.extra.get("num_shared_experts").and_then(Value::as_u64) {
+                writer.add_u32("bailingmoe3.expert_shared_count", shexp_n as u32);
+            }
+            if let Some(lead_dense) = self
+                .extra
+                .get("first_k_dense_replace")
+                .or_else(|| self.extra.get("leading_dense_block_count"))
+                .and_then(Value::as_u64)
+            {
+                writer.add_u32("bailingmoe3.leading_dense_block_count", lead_dense as u32);
+            }
+            if let Some(scale) = self
+                .extra
+                .get("routed_scaling_factor")
+                .and_then(Value::as_f64)
+            {
+                writer.add_f32("bailingmoe3.expert_weights_scale", scale as f32);
             }
         }
 
