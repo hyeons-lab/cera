@@ -28,25 +28,36 @@ __global__ void argmax_f32(
     float maxval = -INFINITY;
     uint32_t argmax = UINT32_MAX;
 
-    const uint32_t n4 = n / 4;
-    const float4* x4 = reinterpret_cast<const float4*>(x);
+    if (((uintptr_t)x & 0xF) == 0) {
+        const uint32_t n4 = n / 4;
+        const float4* x4 = reinterpret_cast<const float4*>(x);
 
-    // Vectorized grid-stride loop with 128-bit float4 loads
-    for (uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
-        const float4 val4 = x4[i];
-        const uint32_t base_idx = i * 4;
-        if (val4.x > maxval) { maxval = val4.x; argmax = base_idx; }
-        if (val4.y > maxval) { maxval = val4.y; argmax = base_idx + 1; }
-        if (val4.z > maxval) { maxval = val4.z; argmax = base_idx + 2; }
-        if (val4.w > maxval) { maxval = val4.w; argmax = base_idx + 3; }
-    }
+        // Vectorized grid-stride loop with 128-bit float4 loads
+        for (uint32_t i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 val4 = x4[i];
+            const uint32_t base_idx = i * 4;
+            if (val4.x > maxval) { maxval = val4.x; argmax = base_idx; }
+            if (val4.y > maxval) { maxval = val4.y; argmax = base_idx + 1; }
+            if (val4.z > maxval) { maxval = val4.z; argmax = base_idx + 2; }
+            if (val4.w > maxval) { maxval = val4.w; argmax = base_idx + 3; }
+        }
 
-    // Scalar remainder loop
-    for (uint32_t i = n4 * 4 + threadIdx.x; i < n; i += blockDim.x) {
-        const float val = x[i];
-        if (val > maxval) {
-            maxval = val;
-            argmax = i;
+        // Scalar remainder loop
+        for (uint32_t i = n4 * 4 + threadIdx.x; i < n; i += blockDim.x) {
+            const float val = x[i];
+            if (val > maxval) {
+                maxval = val;
+                argmax = i;
+            }
+        }
+    } else {
+        // Unaligned fallback: scalar loop
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+            const float val = x[i];
+            if (val > maxval) {
+                maxval = val;
+                argmax = i;
+            }
         }
     }
 

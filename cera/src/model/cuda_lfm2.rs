@@ -173,6 +173,7 @@ pub struct CudaLfm2Model {
     pub embedding_table: Option<CudaBuffer>,
     pub embedding_hidden_size: usize,
     pub rope_inv_freq: CudaBuffer,
+    pub rope_type: u32,
     pub workspace: Mutex<CudaWorkspace>,
     pub seq_len: AtomicUsize,
     pub max_seq_len: usize,
@@ -208,6 +209,7 @@ impl CudaLfm2Model {
     pub fn from_weight_source(src: &dyn GpuWeightSource, context_size: usize) -> Result<Self> {
         let ctx = Arc::new(CudaContext::default_device()?);
         let mut config = src.config().clone();
+        let rope_type = src.rope_type() as u32;
         let max_seq_len = context_size.min(config.max_seq_len);
         config.max_seq_len = max_seq_len;
 
@@ -465,6 +467,7 @@ impl CudaLfm2Model {
             embedding_table,
             embedding_hidden_size,
             rope_inv_freq,
+            rope_type,
             workspace: Mutex::new(workspace),
             seq_len: AtomicUsize::new(0),
             max_seq_len,
@@ -604,7 +607,7 @@ impl CudaLfm2Model {
                         head_dim: attn.head_dim,
                         eps,
                         freq_base: self.config.rope_theta,
-                        rope_type: 0, // NeoX
+                        rope_type: self.rope_type,
                         has_freq_factors: 0,
                         has_qk_norm: attn.q_norm.is_some() as u32,
                     };

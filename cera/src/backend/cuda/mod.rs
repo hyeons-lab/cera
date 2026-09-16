@@ -191,6 +191,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0")?;
         let warps_per_block = 8u32; // 256 threads / 32 = 8 warps
         let num_blocks = m.div_ceil(warps_per_block * 4);
@@ -218,6 +221,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_accum")?;
         let warps_per_block = 8u32;
         let num_blocks = m.div_ceil(warps_per_block * 4);
@@ -252,6 +258,9 @@ impl CudaContext {
         m3: u32,
         k: u32,
     ) -> Result<()> {
+        if (m1 == 0 && m2 == 0 && m3 == 0) || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_concat3")?;
         let warps_m1 = m1.div_ceil(4);
         let warps_m2 = m2.div_ceil(4);
@@ -288,6 +297,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4_0_SRC, "gemv_q4_0", "gemv_q4_0_swiglu")?;
         let warps = m.div_ceil(2);
         let warps_per_block = 8u32;
@@ -317,6 +329,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0")?;
         let warps_per_block = 8u32;
         let num_blocks = m.div_ceil(warps_per_block * 4);
@@ -344,6 +359,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_accum")?;
         let warps_per_block = 8u32;
         let num_blocks = m.div_ceil(warps_per_block * 4);
@@ -378,6 +396,9 @@ impl CudaContext {
         m3: u32,
         k: u32,
     ) -> Result<()> {
+        if (m1 == 0 && m2 == 0 && m3 == 0) || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_concat3")?;
         let warps_m1 = m1.div_ceil(4);
         let warps_m2 = m2.div_ceil(4);
@@ -414,6 +435,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q8_0_SRC, "gemv_q8_0", "gemv_q8_0_swiglu")?;
         let warps = m.div_ceil(2);
         let warps_per_block = 8u32;
@@ -443,6 +467,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k")?;
         let warps_per_block = 8u32;
         let warps = m.div_ceil(2);
@@ -471,6 +498,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_accum")?;
         let warps_per_block = 8u32;
         let warps = m.div_ceil(2);
@@ -506,6 +536,9 @@ impl CudaContext {
         m3: u32,
         k: u32,
     ) -> Result<()> {
+        if (m1 == 0 && m2 == 0 && m3 == 0) || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_concat3")?;
         let warps_m1 = m1.div_ceil(2);
         let warps_m2 = m2.div_ceil(2);
@@ -542,6 +575,9 @@ impl CudaContext {
         m: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMV_Q4K_SRC, "gemv_q4k", "gemv_q4k_swiglu")?;
         let warps_per_block = 8u32;
         let num_blocks = m.div_ceil(warps_per_block);
@@ -571,6 +607,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q4_0_SRC, "gemm_q4_0", "gemm_q4_0")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -601,6 +640,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q4_0_SRC, "gemm_q4_0", "gemm_q4_0_accum")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -631,6 +673,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q8_0_SRC, "gemm_q8_0", "gemm_q8_0")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -661,6 +706,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q8_0_SRC, "gemm_q8_0", "gemm_q8_0_accum")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -691,6 +739,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q4K_SRC, "gemm_q4k", "gemm_q4k")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -721,6 +772,9 @@ impl CudaContext {
         n: u32,
         k: u32,
     ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(GEMM_Q4K_SRC, "gemm_q4k", "gemm_q4k_accum")?;
         let tile_m = 16u32;
         let tile_n = 16u32;
@@ -749,6 +803,9 @@ impl CudaContext {
         token_id: u32,
         hidden_size: u32,
     ) -> Result<()> {
+        if hidden_size == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(
             GATHER_EMBEDDING_SRC,
             "gather_embedding",
@@ -780,6 +837,9 @@ impl CudaContext {
         token_id: u32,
         hidden_size: u32,
     ) -> Result<()> {
+        if hidden_size == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(
             GATHER_EMBEDDING_SRC,
             "gather_embedding",
@@ -811,6 +871,9 @@ impl CudaContext {
         token_id: u32,
         hidden_size: u32,
     ) -> Result<()> {
+        if hidden_size == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(
             GATHER_EMBEDDING_SRC,
             "gather_embedding",
@@ -843,6 +906,9 @@ impl CudaContext {
         n: u32,
         eps: f32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(RMSNORM_SRC, "rmsnorm", "rmsnorm")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -869,6 +935,9 @@ impl CudaContext {
         n: u32,
         eps: f32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(RMSNORM_SRC, "rmsnorm", "fused_add_rmsnorm")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -896,6 +965,9 @@ impl CudaContext {
         rope_inv_freq: Option<&CudaBuffer>,
         params: QkNormRopeParams,
     ) -> Result<()> {
+        if params.n_heads == 0 && params.n_kv_heads == 0 {
+            return Ok(());
+        }
         anyhow::ensure!(
             params.head_dim <= 128,
             "CUDA qk_norm_rope kernel supports head_dim <= 128, got {}",
@@ -1004,6 +1076,9 @@ impl CudaContext {
         dst_element_offset: usize,
         n: u32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "cast_f32_to_f16")?;
         let cfg = LaunchConfig::for_num_elems(n);
         let params = ElementwiseParams { n, _pad: 0 };
@@ -1030,6 +1105,9 @@ impl CudaContext {
         dst_element_offset: usize,
         n: u32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ELEMENTWISE_SRC, "elementwise", "append_kv_cache_f16")?;
         let cfg = LaunchConfig::for_num_elems(n.div_ceil(4));
         let params = ElementwiseParams { n, _pad: 0 };
@@ -1049,6 +1127,9 @@ impl CudaContext {
 
     /// Execute numerically stable softmax in-place on a single row of logits.
     pub fn softmax(&self, x: &mut CudaBuffer, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(SOFTMAX_SRC, "softmax", "softmax")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -1072,6 +1153,9 @@ impl CudaContext {
         v_cache: &CudaBuffer,
         params: AttentionParams,
     ) -> Result<()> {
+        if params.n_heads == 0 || params.seq_len == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ATTENTION_SRC, "attention", "flash_attention")?;
         let cfg = LaunchConfig {
             grid_dim: (params.n_heads, 1, 1),
@@ -1097,6 +1181,9 @@ impl CudaContext {
         weight: &CudaBuffer,
         params: Conv1dParams,
     ) -> Result<()> {
+        if params.hs == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(CONV1D_FUSED_SRC, "conv1d_fused", "conv1d_fused")?;
         let cfg = LaunchConfig::for_num_elems(params.hs);
         let mut builder = self.stream.launch_builder(&kernel);
@@ -1111,6 +1198,9 @@ impl CudaContext {
 
     /// Execute GPU-resident argmax: find index of maximum value in float vector x and store u32 token id in dst.
     pub fn argmax_f32(&self, dst: &mut CudaBuffer, x: &CudaBuffer, n: u32) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ARGMAX_F32_SRC, "argmax", "argmax_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
@@ -1133,6 +1223,9 @@ impl CudaContext {
         x: &CudaBuffer,
         n: u32,
     ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let kernel = self.load_kernel(ARGMAX_F32_SRC, "argmax", "argmax_f32")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
