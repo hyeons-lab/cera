@@ -9,11 +9,18 @@ use std::path::Path;
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::Model;
+use cera::model::ScalarMultipliers;
 use cera::model::llama::LlamaModel;
 use cera::model::transformer::oracle_dump;
 
 fn rel_diff(a: f64, b: f64) -> f64 {
     (a - b).abs() / (a.abs() + b.abs() + 1e-9)
+}
+
+fn is_valid_fixture(p: &Path) -> bool {
+    p.symlink_metadata()
+        .map(|m| !m.file_type().is_symlink() && m.len() > 1024)
+        .unwrap_or(false)
 }
 
 fn ensure_test_fixture() -> Option<std::path::PathBuf> {
@@ -22,24 +29,24 @@ fn ensure_test_fixture() -> Option<std::path::PathBuf> {
         .get_or_init(|| {
             if let Ok(p) = std::env::var("CERA_TEST_MINICPM_GGUF") {
                 let path = std::path::PathBuf::from(p);
-                if path.exists() {
+                if is_valid_fixture(&path) {
                     return Some(path);
                 }
             }
             if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
                 let path = std::path::PathBuf::from(d).join("test_minicpm.gguf");
-                if path.exists() {
+                if is_valid_fixture(&path) {
                     return Some(path);
                 }
             }
             let target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../target/oracle/models/test_minicpm.gguf");
-            if target_path.exists() {
+            if is_valid_fixture(&target_path) {
                 return Some(target_path);
             }
             let root_target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../target/oracle/models/test_minicpm.gguf");
-            if root_target_path.exists() {
+            if is_valid_fixture(&root_target_path) {
                 return Some(root_target_path);
             }
 
@@ -53,11 +60,7 @@ fn ensure_test_fixture() -> Option<std::path::PathBuf> {
                 return None;
             }
             let path = target_dir.join("test_minicpm.gguf");
-            if path
-                .symlink_metadata()
-                .map(|m| !m.file_type().is_symlink() && m.len() > 1024)
-                .unwrap_or(false)
-            {
+            if is_valid_fixture(&path) {
                 return Some(path);
             }
             let script = manifest_dir.join("../scripts/oracle/create_minicpm_test_model.py");
@@ -650,4 +653,42 @@ fn minicpm5_arch_alias_loads_and_evaluates() {
         let g_logits = gpu_model.forward(&[88u32], 0, &mut g_state);
         assert_eq!(g_logits.len(), gpu_model.config().vocab_size);
     }
+}
+
+#[test]
+fn minicpm_invalid_rope_theta_is_rejected() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_minicpm.gguf");
+    // Subnormal or non-positive rope_theta should be rejected
+    gguf.metadata.insert(
+        "minicpm.rope.freq_base".to_string(),
+        cera::gguf::GgufValue::F32(0.5),
+    );
+    assert!(
+        LlamaModel::from_gguf(gguf.clone(), 256).is_err(),
+        "model loader must reject rope_theta < 1.0"
+    );
+
+    gguf.metadata.insert(
+        "minicpm.rope.freq_base".to_string(),
+        cera::gguf::GgufValue::F32(1e10),
+    );
+    assert!(
+        LlamaModel::from_gguf(gguf, 256).is_err(),
+        "model loader must reject rope_theta > 1e9"
+    );
+}
+
+#[test]
+fn minicpm_defaults_for_arch_validation() {
+    let defaults = ScalarMultipliers::defaults_for_arch("minicpm", 16, 256);
+    assert_eq!(defaults.embedding, 12.0);
+    assert!((defaults.residual - (1.4 / 4.0)).abs() < 1e-6);
+    assert_eq!(defaults.attn, None);
+    assert_eq!(defaults.logit, 1.0);
+
+    let generic_defaults = ScalarMultipliers::defaults_for_arch("llama", 16, 256);
+    assert_eq!(generic_defaults, ScalarMultipliers::default());
 }

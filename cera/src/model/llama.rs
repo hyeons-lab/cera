@@ -387,8 +387,8 @@ impl LlamaModel {
             .get_f32(&format!("{prefix}.rope.freq_base"))
             .unwrap_or(default_rope_theta);
         ensure!(
-            rope_theta.is_finite() && rope_theta > 0.0,
-            "{prefix}.rope.freq_base must be positive and finite"
+            rope_theta.is_finite() && (1.0..=1e9).contains(&rope_theta),
+            "{prefix}.rope.freq_base must be finite and within [1.0, 1e9]"
         );
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))

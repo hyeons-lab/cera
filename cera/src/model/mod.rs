@@ -95,6 +95,7 @@ pub struct ScalarMultipliers {
     /// `None` uses default `1/sqrt(head_dim)`.
     pub attn: Option<f32>,
     /// `logits_scaling`: divide the final logits by this. `1.0` is a no-op.
+    /// Invariant: always strictly positive in [1e-4, 1e4], preserving argmax monotonicity.
     pub logit: f32,
 }
 
@@ -110,6 +111,34 @@ impl Default for ScalarMultipliers {
 }
 
 impl ScalarMultipliers {
+    /// Return architecture-specific defaults for scalar multipliers when keys are absent.
+    pub fn defaults_for_arch(prefix: &str, n_layers: usize, hidden_size: usize) -> Self {
+        if prefix == "minicpm" || prefix == "minicpm5" {
+            Self {
+                embedding: 12.0,
+                residual: if n_layers > 0 {
+                    1.4 / (n_layers as f32).sqrt()
+                } else {
+                    1.0
+                },
+                attn: None,
+                // Canonical MiniCPM reference math (modeling_minicpm.py) scales logits by
+                // dividing by (hidden_size / dim_model_base), where dim_model_base = 256.0.
+                // Note: llama.cpp minicpm.cpp line 7 sets default f_logit_scale = 256.0 / n_embd,
+                // which when inverted by ggml_scale(1.0 / f_logit_scale) inadvertently multiplies
+                // logits on legacy GGUFs that lack minicpm.logit_scale. Cera maintains faithful
+                // division matching Hugging Face and modern GGUFs.
+                logit: if hidden_size > 0 {
+                    (hidden_size as f32) / 256.0
+                } else {
+                    1.0
+                },
+            }
+        } else {
+            Self::default()
+        }
+    }
+
     /// Load scalar multipliers from GGUF metadata under `{prefix}.*`.
     /// Handles Granite and MiniCPM architectural defaults. Absent keys on other
     /// architectures map to identity defaults ([`Self::default`]).
@@ -119,31 +148,14 @@ impl ScalarMultipliers {
         n_layers: usize,
         hidden_size: usize,
     ) -> Result<Self> {
-        let (default_emb, default_res, default_logit) =
-            if prefix == "minicpm" || prefix == "minicpm5" {
-                (
-                    12.0,
-                    if n_layers > 0 {
-                        1.4 / (n_layers as f32).sqrt()
-                    } else {
-                        1.0
-                    },
-                    if hidden_size > 0 {
-                        (hidden_size as f32) / 256.0
-                    } else {
-                        1.0
-                    },
-                )
-            } else {
-                (1.0, 1.0, 1.0)
-            };
+        let defaults = Self::defaults_for_arch(prefix, n_layers, hidden_size);
 
         let embedding = gguf
             .get_f32(&format!("{prefix}.embedding_scale"))
-            .unwrap_or(default_emb);
+            .unwrap_or(defaults.embedding);
         let residual = gguf
             .get_f32(&format!("{prefix}.residual_scale"))
-            .unwrap_or(default_res);
+            .unwrap_or(defaults.residual);
         // llama.cpp treats a stored `attention.scale == 0.0` as "absent => use
         // 1/sqrt(head_dim)", so map Some(0.0) -> None to match (a literal 0.0
         // would otherwise zero every attention score).
@@ -152,7 +164,7 @@ impl ScalarMultipliers {
             .filter(|&s| s != 0.0);
         let logit = gguf
             .get_f32(&format!("{prefix}.logit_scale"))
-            .unwrap_or(default_logit);
+            .unwrap_or(defaults.logit);
         ensure!(
             embedding.is_finite() && (1e-4..=1e4).contains(&embedding),
             "{prefix}.embedding_scale must be finite and within [1e-4, 1e4]"
