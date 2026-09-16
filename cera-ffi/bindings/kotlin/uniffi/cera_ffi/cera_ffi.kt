@@ -2529,13 +2529,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
@@ -9669,12 +9669,18 @@ public interface SessionInterface {
     /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessage`(`message`: UserMessage)
 
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessageAndGenerate`(
         `message`: UserMessage,
@@ -9684,6 +9690,9 @@ public interface SessionInterface {
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessageStreaming`(
         `message`: UserMessage,
@@ -10431,6 +10440,9 @@ open class Session :
     /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessage`(`message`: UserMessage) =
@@ -10447,6 +10459,9 @@ open class Session :
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessageAndGenerate`(
@@ -10469,6 +10484,9 @@ open class Session :
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessageStreaming`(

@@ -8644,8 +8644,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message != 5757) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message`: expected 5757, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message != 6919) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message`: expected 6919, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate;
     try {
@@ -8654,8 +8654,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate != 44503) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: expected 44503, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate != 43103) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: expected 43103, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming;
     try {
@@ -8664,8 +8664,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming != 14947) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: expected 14947, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming != 26617) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: expected 26617, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size;
     try {
@@ -24419,6 +24419,9 @@ final class Session {
 
   /// Append a multimodal message, automatically enforcing model-canonical
   /// media ordering, boundary token envelopes, and sample rate normalization.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   void sendMessage(UserMessage message) {
     _ensureOpen();
     _ffi.sessionInvokeSendMessage(_handle, message);
@@ -24426,6 +24429,9 @@ final class Session {
 
   /// Append a multimodal message and run generation synchronously while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateOutput sendMessageAndGenerate(UserMessage message, GenerateOpts opts) {
     _ensureOpen();
     return _ffi.sessionInvokeSendMessageAndGenerate(_handle, message, opts);
@@ -24433,6 +24439,9 @@ final class Session {
 
   /// Append a multimodal message and run streaming generation while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
     return _ffi.sessionInvokeSendMessageStreaming(_handle, message, opts, sink);

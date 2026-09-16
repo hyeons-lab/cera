@@ -4886,18 +4886,27 @@ public protocol SessionProtocol: AnyObject, Sendable {
     /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessage(message: UserMessage) throws 
     
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts) throws  -> GenerateOutput
     
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
     
@@ -5492,6 +5501,9 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
     /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_send_message(
@@ -5504,6 +5516,9 @@ open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiCo
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -5518,6 +5533,9 @@ open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -11219,13 +11237,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {

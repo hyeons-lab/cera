@@ -6299,14 +6299,23 @@ final class Session {
 
   /// Append a multimodal message, automatically enforcing model-canonical
   /// media ordering, boundary token envelopes, and sample rate normalization.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   void sendMessage(UserMessage message) => _unsupportedOnWeb('Session.sendMessage');
 
   /// Append a multimodal message and run generation synchronously while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateOutput sendMessageAndGenerate(UserMessage message, GenerateOpts opts) => _unsupportedOnWeb('Session.sendMessageAndGenerate');
 
   /// Append a multimodal message and run streaming generation while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended

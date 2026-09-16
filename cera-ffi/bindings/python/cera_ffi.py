@@ -743,11 +743,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -8909,18 +8909,27 @@ class SessionProtocol(typing.Protocol):
         """
         Append a multimodal message, automatically enforcing model-canonical
         media ordering, boundary token envelopes, and sample rate normalization.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         raise NotImplementedError
     def send_message_and_generate(self, message: UserMessage,opts: GenerateOpts) -> GenerateOutput:
         """
         Append a multimodal message and run generation synchronously while holding
         the session lock continuously across prefill and decode.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         raise NotImplementedError
     def send_message_streaming(self, message: UserMessage,opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Append a multimodal message and run streaming generation while holding
         the session lock continuously across prefill and decode.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         raise NotImplementedError
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
@@ -9614,6 +9623,9 @@ class Session(SessionProtocol):
         """
         Append a multimodal message, automatically enforcing model-canonical
         media ordering, boundary token envelopes, and sample rate normalization.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         
         _UniffiFfiConverterTypeUserMessage.check_lower(message)
@@ -9633,6 +9645,9 @@ class Session(SessionProtocol):
         """
         Append a multimodal message and run generation synchronously while holding
         the session lock continuously across prefill and decode.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         
         _UniffiFfiConverterTypeUserMessage.check_lower(message)
@@ -9655,6 +9670,9 @@ class Session(SessionProtocol):
         """
         Append a multimodal message and run streaming generation while holding
         the session lock continuously across prefill and decode.
+
+        Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+        multi-turn conversations with delta-only prompt evaluation and live KV retention.
 """
         
         _UniffiFfiConverterTypeUserMessage.check_lower(message)
