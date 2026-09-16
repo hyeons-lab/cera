@@ -1110,9 +1110,7 @@ class ChatController extends ValueNotifier<ChatState> {
       _sessionPhase = SessionPhase.unusable;
       debugPrint('[cera:chat] Engine reset failed: $err');
       if (!_disposed) {
-        value = value.copyWith(
-          status: 'Engine reset failed: $err',
-        );
+        value = value.copyWith(status: 'Engine reset failed: $err');
       }
     }
   }
