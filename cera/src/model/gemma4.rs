@@ -53,6 +53,7 @@ pub struct Gemma4Model {
     n_layer_kv_from_start: usize,
     is_swa: Vec<bool>,
     sliding_window: usize,
+    rope_theta_swa: f32,
     final_logit_softcapping: Option<f32>,
 
     output_norm_weight: Vec<f32>,
@@ -205,6 +206,18 @@ impl Gemma4Model {
             "sliding_window_pattern length ({}) must be >= n_layers ({n_layers})",
             is_swa.len()
         );
+        if n_kv_shared_layers > 0 {
+            ensure!(
+                is_swa[n_layer_kv_from_start - 2],
+                "layer {} must be a sliding-window attention layer to serve as the shared SWA KV cache source",
+                n_layer_kv_from_start - 2
+            );
+            ensure!(
+                !is_swa[n_layer_kv_from_start - 1],
+                "layer {} must be a full-attention layer to serve as the shared full-attention KV cache source",
+                n_layer_kv_from_start - 1
+            );
+        }
 
         let max_seq_len = gguf
             .get_u32(&format!("{prefix}.context_length"))
@@ -219,6 +232,14 @@ impl Gemma4Model {
         ensure!(
             rope_theta.is_finite() && rope_theta > 0.0,
             "rope_theta must be positive and finite: {rope_theta}"
+        );
+        let rope_theta_swa = gguf
+            .get_f32(&format!("{prefix}.rope.freq_base_swa"))
+            .or_else(|| gguf.get_f32("gemma4-assistant.rope.freq_base_swa"))
+            .unwrap_or(rope_theta);
+        ensure!(
+            rope_theta_swa.is_finite() && rope_theta_swa > 0.0,
+            "rope_theta_swa must be positive and finite: {rope_theta_swa}"
         );
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
@@ -584,6 +605,7 @@ impl Gemma4Model {
             n_layer_kv_from_start,
             is_swa,
             sliding_window,
+            rope_theta_swa,
             final_logit_softcapping,
             output_norm_weight,
             embd_ref,
@@ -779,7 +801,11 @@ impl Gemma4Model {
                     );
                 }
 
-                // RoPE on Q and K (Neox split-halves layout).
+                let theta = if self.is_swa[i] {
+                    self.rope_theta_swa
+                } else {
+                    self.config.rope_theta
+                };
                 cpu::rope(
                     &mut state.scratch.q[..q_dim],
                     &mut state.scratch.k[..kv_dim],
@@ -787,7 +813,7 @@ impl Gemma4Model {
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     head_dim,
-                    self.config.rope_theta,
+                    theta,
                 );
                 if transformer::oracle_dump::is_active() {
                     transformer::oracle_dump::record(
@@ -871,7 +897,11 @@ impl Gemma4Model {
                     }
                 }
             } else {
-                // Shared layer: RoPE Q only.
+                let theta = if self.is_swa[i] {
+                    self.rope_theta_swa
+                } else {
+                    self.config.rope_theta
+                };
                 cpu::rope(
                     &mut state.scratch.q[..q_dim],
                     &mut [],
@@ -879,7 +909,7 @@ impl Gemma4Model {
                     self.config.n_heads,
                     0,
                     head_dim,
-                    self.config.rope_theta,
+                    theta,
                 );
                 if transformer::oracle_dump::is_active() {
                     transformer::oracle_dump::record(
@@ -1424,7 +1454,11 @@ impl Gemma4Model {
                         );
                     }
 
-                    // RoPE on Q and K (Neox split-halves layout).
+                    let theta = if self.is_swa[i] {
+                        self.rope_theta_swa
+                    } else {
+                        self.config.rope_theta
+                    };
                     cpu::rope(
                         &mut state.scratch.q[..q_dim],
                         &mut state.scratch.k[..kv_dim],
@@ -1432,7 +1466,7 @@ impl Gemma4Model {
                         self.config.n_heads,
                         self.config.n_kv_heads,
                         head_dim,
-                        self.config.rope_theta,
+                        theta,
                     );
                     if transformer::oracle_dump::is_active() {
                         transformer::oracle_dump::record(
@@ -1516,7 +1550,11 @@ impl Gemma4Model {
                         }
                     }
                 } else {
-                    // Shared layer: RoPE Q only.
+                    let theta = if self.is_swa[i] {
+                        self.rope_theta_swa
+                    } else {
+                        self.config.rope_theta
+                    };
                     cpu::rope(
                         &mut state.scratch.q[..q_dim],
                         &mut [],
@@ -1524,7 +1562,7 @@ impl Gemma4Model {
                         self.config.n_heads,
                         0,
                         head_dim,
-                        self.config.rope_theta,
+                        theta,
                     );
                     if transformer::oracle_dump::is_active() {
                         transformer::oracle_dump::record(

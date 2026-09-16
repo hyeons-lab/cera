@@ -40,7 +40,7 @@ fn get_test_model_path() -> PathBuf {
     if root_target_path.exists() {
         return root_target_path;
     }
-    std::env::temp_dir().join("test_gemma4.gguf")
+    std::env::temp_dir().join(format!("test_gemma4_{}.gguf", std::process::id()))
 }
 
 fn ensure_test_model(path: &Path) -> bool {
@@ -73,6 +73,9 @@ fn ensure_test_model(path: &Path) -> bool {
             .output();
         let python_has_deps = matches!(probe, Ok(out) if out.status.success());
         if !python_has_deps {
+            if std::env::var("CERA_REQUIRE_ORACLE").as_deref() == Ok("1") {
+                panic!("python3 missing numpy/gguf dependencies while CERA_REQUIRE_ORACLE=1");
+            }
             eprintln!("skipping: python3 missing numpy/gguf dependencies");
             return false;
         }

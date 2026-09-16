@@ -3345,7 +3345,7 @@ unsafe fn rmsnorm_unweighted_neon(ptr: *mut f32, n: usize, eps: f32) {
 
         let mean = total_sum_sq / n as f64;
         let rms = (mean + eps as f64).sqrt();
-        let inv_rms = (1.0 / rms) as f32;
+        let inv_rms = if rms > 0.0 { (1.0 / rms) as f32 } else { 0.0 };
         let v_inv_rms = vdupq_n_f32(inv_rms);
 
         for i in 0..n_chunks {
@@ -3401,7 +3401,7 @@ pub fn rmsnorm_unweighted(x: &mut [f32], eps: f32) {
         }
         let mean = sum_sq / n as f64;
         let rms = (mean + eps as f64).sqrt();
-        let inv_rms = (1.0 / rms) as f32;
+        let inv_rms = if rms > 0.0 { (1.0 / rms) as f32 } else { 0.0 };
 
         for v in x.iter_mut() {
             *v *= inv_rms;
