@@ -322,6 +322,7 @@ pub struct ChatSession {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     position: Arc<std::sync::atomic::AtomicU32>,
     moved: std::sync::atomic::AtomicBool,
+    last_ingest_recovery: std::sync::Mutex<Option<crate::IngestRecovery>>,
 }
 
 impl ChatSession {
@@ -337,6 +338,7 @@ impl ChatSession {
             cancel,
             position,
             moved: std::sync::atomic::AtomicBool::new(false),
+            last_ingest_recovery: std::sync::Mutex::new(None),
         }))
     }
 
@@ -360,6 +362,14 @@ impl ChatSession {
             detail: "chat session has been moved back into a Session".into(),
         })?;
         f(chat)
+    }
+
+    fn set_last_ingest_recovery(&self, recovery: Option<crate::IngestRecovery>) {
+        let mut guard = self
+            .last_ingest_recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = recovery;
     }
 }
 
@@ -390,6 +400,7 @@ impl ChatSession {
                     cancel,
                     position,
                     moved: std::sync::atomic::AtomicBool::new(false),
+                    last_ingest_recovery: std::sync::Mutex::new(None),
                 }))
             }
             Err((returned_session, validation_err)) => {
@@ -417,14 +428,28 @@ impl ChatSession {
     }
 
     /// Ingest a single message into the chat context.
+    ///
+    /// Single-message ingestion requires a user message to trigger assistant turn
+    /// completion. To start a multi-turn conversation with a system prompt, supply both
+    /// messages via [`ChatSession::ingest_messages`].
     pub fn ingest(&self, message: Message) -> Result<IngestSummary, FfiError> {
         let core_msg = cera::session::chat::Message::from(message);
-        self.with_chat(|chat| {
-            let summary = chat.ingest(&core_msg).map_err(|err| match err.cause {
-                cera::session::chat::IngestCause::Validation(val) => FfiError::from(val),
-                cera::session::chat::IngestCause::Execution(exec) => FfiError::from(exec),
-            })?;
-            Ok(summary.into())
+        self.with_chat(|chat| match chat.ingest(&core_msg) {
+            Ok(summary) => {
+                self.set_last_ingest_recovery(None);
+                Ok(summary.into())
+            }
+            Err(err) => {
+                self.set_last_ingest_recovery(Some(crate::IngestRecovery {
+                    outcome: err.recovery.into(),
+                    rewind_error: err.rewind_error.as_deref().map(Into::into),
+                    reset_error: err.recovery_error.as_ref().map(Into::into),
+                }));
+                Err(match err.cause {
+                    cera::session::chat::IngestCause::Validation(val) => FfiError::from(val),
+                    cera::session::chat::IngestCause::Execution(exec) => FfiError::from(exec),
+                })
+            }
         })
     }
 
@@ -432,14 +457,22 @@ impl ChatSession {
     pub fn ingest_messages(&self, messages: Vec<Message>) -> Result<IngestSummary, FfiError> {
         let core_msgs: Vec<cera::session::chat::Message> =
             messages.into_iter().map(Into::into).collect();
-        self.with_chat(|chat| {
-            let summary = chat
-                .ingest_messages(&core_msgs)
-                .map_err(|err| match err.cause {
+        self.with_chat(|chat| match chat.ingest_messages(&core_msgs) {
+            Ok(summary) => {
+                self.set_last_ingest_recovery(None);
+                Ok(summary.into())
+            }
+            Err(err) => {
+                self.set_last_ingest_recovery(Some(crate::IngestRecovery {
+                    outcome: err.recovery.into(),
+                    rewind_error: err.rewind_error.as_deref().map(Into::into),
+                    reset_error: err.recovery_error.as_ref().map(Into::into),
+                }));
+                Err(match err.cause {
                     cera::session::chat::IngestCause::Validation(val) => FfiError::from(val),
                     cera::session::chat::IngestCause::Execution(exec) => FfiError::from(exec),
-                })?;
-            Ok(summary.into())
+                })
+            }
         })
     }
 
@@ -447,14 +480,22 @@ impl ChatSession {
     pub fn replace_messages(&self, messages: Vec<Message>) -> Result<IngestSummary, FfiError> {
         let core_msgs: Vec<cera::session::chat::Message> =
             messages.into_iter().map(Into::into).collect();
-        self.with_chat(|chat| {
-            let summary = chat
-                .replace_messages(&core_msgs)
-                .map_err(|err| match err.cause {
+        self.with_chat(|chat| match chat.replace_messages(&core_msgs) {
+            Ok(summary) => {
+                self.set_last_ingest_recovery(None);
+                Ok(summary.into())
+            }
+            Err(err) => {
+                self.set_last_ingest_recovery(Some(crate::IngestRecovery {
+                    outcome: err.recovery.into(),
+                    rewind_error: err.rewind_error.as_deref().map(Into::into),
+                    reset_error: err.recovery_error.as_ref().map(Into::into),
+                }));
+                Err(match err.cause {
                     cera::session::chat::IngestCause::Validation(val) => FfiError::from(val),
                     cera::session::chat::IngestCause::Execution(exec) => FfiError::from(exec),
-                })?;
-            Ok(summary.into())
+                })
+            }
         })
     }
 
@@ -476,72 +517,87 @@ impl ChatSession {
         opts: GenerateOpts,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let outcome = match cera::GenerateOpts::try_from(opts) {
-            Ok(core) => match self.lock_inner() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(chat) => {
-                        let tokenizer = chat.profile().tokenizer().clone();
-                        let mut adapter = ForeignSinkAdapter::new(sink, tokenizer);
-                        let report_result = chat
-                            .generate_into(&core, &mut adapter)
-                            .map_err(FfiError::from);
-                        drop(guard);
-                        let result = match report_result {
-                            Ok(report) => report.result.map(Into::into).map_err(FfiError::from),
-                            Err(validation_err) => Err(validation_err),
-                        };
-                        (result, Some(adapter), None)
-                    }
-                    None => (
-                        Err(FfiError::Backend {
-                            detail: "chat session has been moved back into a Session".into(),
-                        }),
-                        None,
-                        Some(sink),
-                    ),
-                },
-                Err(e) => (Err(e), None, Some(sink)),
-            },
-            Err(e) => (Err(e), None, Some(sink)),
-        };
-        match outcome {
-            (Ok(summary), Some(mut adapter), _) => {
-                adapter.notify_done(None);
-                Ok(summary)
+        let core = match cera::GenerateOpts::try_from(opts) {
+            Ok(core) => core,
+            Err(err) => {
+                sink.on_done(FinishReason::Error {
+                    message: err.to_string(),
+                });
+                return Err(err);
             }
-            (Err(err), Some(mut adapter), _) => {
+        };
+        let (mut adapter, report_result) = {
+            let mut guard = match self.lock_inner() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    sink.on_done(FinishReason::Error {
+                        message: err.to_string(),
+                    });
+                    return Err(err);
+                }
+            };
+            let chat = match guard.as_mut() {
+                Some(chat) => chat,
+                None => {
+                    let err = FfiError::Backend {
+                        detail: "chat session has been moved back into a Session".into(),
+                    };
+                    sink.on_done(FinishReason::Error {
+                        message: err.to_string(),
+                    });
+                    return Err(err);
+                }
+            };
+            let tokenizer = chat.profile().tokenizer().clone();
+            let mut adapter = ForeignSinkAdapter::new(sink, tokenizer);
+            let report_result = chat
+                .generate_into(&core, &mut adapter)
+                .map_err(FfiError::from);
+            (adapter, report_result)
+        };
+        match report_result {
+            Ok(report) => match report.result {
+                Ok(summary) => {
+                    adapter.notify_done(None);
+                    Ok(summary.into())
+                }
+                Err(cera_err) => {
+                    let err = FfiError::from(cera_err);
+                    if !adapter.done_called {
+                        adapter.flush_pending();
+                        let finish_reason = match &err {
+                            FfiError::Cancelled => FinishReason::Cancelled,
+                            _ => FinishReason::Error {
+                                message: err.to_string(),
+                            },
+                        };
+                        adapter.notify_done(Some(finish_reason));
+                    } else {
+                        adapter.notify_done(None);
+                    }
+                    Err(err)
+                }
+            },
+            Err(val_err) => {
                 if !adapter.done_called {
                     adapter.flush_pending();
-                    let finish_reason = match &err {
-                        FfiError::Cancelled => FinishReason::Cancelled,
-                        _ => FinishReason::Error {
-                            message: err.to_string(),
-                        },
-                    };
-                    adapter.notify_done(Some(finish_reason));
+                    adapter.notify_done(Some(FinishReason::Error {
+                        message: val_err.to_string(),
+                    }));
                 } else {
                     adapter.notify_done(None);
                 }
-                Err(err)
+                Err(val_err)
             }
-            (Err(err), None, Some(inner)) => {
-                let finish_reason = match &err {
-                    FfiError::Cancelled => FinishReason::Cancelled,
-                    _ => FinishReason::Error {
-                        message: err.to_string(),
-                    },
-                };
-                inner.on_done(finish_reason);
-                Err(err)
-            }
-            (Err(err), None, None) => Err(err),
-            (Ok(_), None, _) => unreachable!(),
         }
     }
 
     /// Reset execution state and return to Idle phase.
     pub fn reset(&self) -> Result<(), FfiError> {
-        self.with_chat(|chat| chat.reset().map_err(FfiError::from))
+        self.with_chat(|chat| {
+            self.set_last_ingest_recovery(None);
+            chat.reset().map_err(FfiError::from)
+        })
     }
 
     /// Flip cancellation flag to interrupt in-flight prefill or decode.
@@ -576,10 +632,16 @@ impl ChatSession {
             detail: "chat session has been moved back into a Session".into(),
         })?;
         let session = chat.session();
+        let ingest_recovery = self
+            .last_ingest_recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         Ok(SessionRecoveryStatus {
             usable: session.is_usable(),
             position: session.position(),
-            last_ingest_recovery: session.last_ingest_recovery().map(Into::into),
+            last_ingest_recovery: ingest_recovery
+                .or_else(|| session.last_ingest_recovery().map(Into::into)),
         })
     }
 

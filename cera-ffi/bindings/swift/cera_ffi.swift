@@ -1802,6 +1802,10 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     
     /**
      * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
      */
     func ingest(message: Message) throws  -> IngestSummary
     
@@ -1963,6 +1967,10 @@ open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> Ge
     
     /**
      * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
      */
 open func ingest(message: Message)throws  -> IngestSummary  {
     return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -11238,7 +11246,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {

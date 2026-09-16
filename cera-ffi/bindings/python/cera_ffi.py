@@ -591,7 +591,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -9762,6 +9762,10 @@ class ChatSessionProtocol(typing.Protocol):
     def ingest(self, message: Message) -> IngestSummary:
         """
         Ingest a single message into the chat context.
+
+        Single-message ingestion requires a user message to trigger assistant turn
+        completion. To start a multi-turn conversation with a system prompt, supply both
+        messages via [`ChatSession::ingest_messages`].
 """
         raise NotImplementedError
     def ingest_messages(self, messages: typing.List[Message]) -> IngestSummary:
@@ -9925,6 +9929,10 @@ class ChatSession(ChatSessionProtocol):
     def ingest(self, message: Message) -> IngestSummary:
         """
         Ingest a single message into the chat context.
+
+        Single-message ingestion requires a user message to trigger assistant turn
+        completion. To start a multi-turn conversation with a system prompt, supply both
+        messages via [`ChatSession::ingest_messages`].
 """
         
         _UniffiFfiConverterTypeMessage.check_lower(message)

@@ -6353,6 +6353,10 @@ final class ChatSession {
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
 
   /// Ingest a single message into the chat context.
+  ///
+  /// Single-message ingestion requires a user message to trigger assistant turn
+  /// completion. To start a multi-turn conversation with a system prompt, supply both
+  /// messages via [`ChatSession::ingest_messages`].
   IngestSummary ingest(Message message) => _unsupportedOnWeb('ChatSession.ingest');
 
   /// Ingest a batch of messages into the chat context.

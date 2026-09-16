@@ -3,7 +3,7 @@
 use crate::{FfiError, Session};
 
 /// Execution state after a failed whole-message append.
-#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RecoveryOutcome {
     Unchanged,
     Restored,
@@ -14,7 +14,7 @@ pub enum RecoveryOutcome {
 }
 
 /// Why checked tail rewind was unavailable. Numeric positions are token counts.
-#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum KvRewindFailure {
     OutOfBounds { requested: u64, current: u64 },
     Compressed,
@@ -28,7 +28,7 @@ pub enum KvRewindFailure {
 /// Recovery diagnostic retained after a failed `send_message` ingestion.
 /// The call's original error is still returned separately. Generation failures
 /// after successful ingestion do not create this report.
-#[derive(Debug, uniffi::Record)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct IngestRecovery {
     pub outcome: RecoveryOutcome,
     pub rewind_error: Option<KvRewindFailure>,
@@ -76,16 +76,22 @@ impl From<&cera::kv_cache::KvRewindError> for KvRewindFailure {
     }
 }
 
+impl From<cera::session::RecoveryOutcome> for RecoveryOutcome {
+    fn from(outcome: cera::session::RecoveryOutcome) -> Self {
+        match outcome {
+            cera::session::RecoveryOutcome::Unchanged => RecoveryOutcome::Unchanged,
+            cera::session::RecoveryOutcome::Restored => RecoveryOutcome::Restored,
+            cera::session::RecoveryOutcome::Reset => RecoveryOutcome::Reset,
+            cera::session::RecoveryOutcome::Unusable => RecoveryOutcome::Unusable,
+            _ => RecoveryOutcome::Unknown,
+        }
+    }
+}
+
 impl From<&cera::session::IngestRecovery> for IngestRecovery {
     fn from(report: &cera::session::IngestRecovery) -> Self {
         Self {
-            outcome: match report.outcome {
-                cera::session::RecoveryOutcome::Unchanged => RecoveryOutcome::Unchanged,
-                cera::session::RecoveryOutcome::Restored => RecoveryOutcome::Restored,
-                cera::session::RecoveryOutcome::Reset => RecoveryOutcome::Reset,
-                cera::session::RecoveryOutcome::Unusable => RecoveryOutcome::Unusable,
-                _ => RecoveryOutcome::Unknown,
-            },
+            outcome: report.outcome.into(),
             rewind_error: report.rewind_error.as_ref().map(Into::into),
             reset_error: report.reset_error.as_ref().map(Into::into),
         }

@@ -2556,7 +2556,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 11223) {
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
@@ -4854,6 +4854,10 @@ public interface ChatSessionInterface {
 
     /**
      * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
      */
     fun `ingest`(`message`: Message): IngestSummary
 
@@ -5070,6 +5074,10 @@ open class ChatSession :
 
     /**
      * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
      */
     @Throws(FfiException::class)
     override fun `ingest`(`message`: Message): IngestSummary =

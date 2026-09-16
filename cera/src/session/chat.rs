@@ -736,11 +736,6 @@ impl Chat<CoreExecution> {
     pub fn session(&self) -> &Session {
         self.execution.session()
     }
-
-    /// Mutably borrow the underlying [`Session`].
-    pub fn session_mut(&mut self) -> &mut Session {
-        self.execution.session_mut()
-    }
 }
 
 /// Wrap a [`Session`] in a [`Chat`] coordinator.
@@ -780,11 +775,6 @@ impl CoreExecution {
     /// Borrow the underlying [`Session`].
     pub fn session(&self) -> &Session {
         &self.session
-    }
-
-    /// Mutably borrow the underlying [`Session`].
-    pub fn session_mut(&mut self) -> &mut Session {
-        &mut self.session
     }
 
     fn validate_identity(&self) -> Result<(), ValidationError> {

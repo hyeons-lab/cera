@@ -8734,8 +8734,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_ingest`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest != 11223) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest`: expected 11223, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest != 15502) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest`: expected 15502, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages;
     try {
@@ -24532,6 +24532,10 @@ final class ChatSession {
   }
 
   /// Ingest a single message into the chat context.
+  ///
+  /// Single-message ingestion requires a user message to trigger assistant turn
+  /// completion. To start a multi-turn conversation with a system prompt, supply both
+  /// messages via [`ChatSession::ingest_messages`].
   IngestSummary ingest(Message message) {
     _ensureOpen();
     return _ffi.chatSessionInvokeIngest(_handle, message);

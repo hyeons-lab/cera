@@ -133,7 +133,7 @@ pub use recovery::{IngestRecovery, KvRewindFailure, RecoveryOutcome, SessionReco
 /// every shared variant, so `Display` output is identical whether the
 /// error originates from cera directly or routes through the FFI
 /// wrapper. Pinned by `ffi_error_display_matches_cera_error_for_every_shared_variant`.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     /// The loaded model doesn't support the modality the caller
     /// requested (e.g. `append_audio` on a text-only LLM).
@@ -2018,7 +2018,7 @@ impl LoraAdapters {
 /// Call [`CeraEngine::new_session`] to open a session; the engine's
 /// `Arc<Model>` and `Arc<BpeTokenizer>` are cloned into the new
 /// session so it outlives the engine handle across FFI calls.
-#[derive(uniffi::Object)]
+#[derive(Debug, uniffi::Object)]
 pub struct Session {
     inner: std::sync::Mutex<Option<cera::Session>>,
     /// Cloned from the inner session at construction time. Shared
@@ -2042,17 +2042,23 @@ pub(crate) struct SessionGuard<'a> {
 impl<'a> std::ops::Deref for SessionGuard<'a> {
     type Target = cera::Session;
     fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_ref()
-            .expect("session was moved into a ChatSession")
+        // Invariant: SessionGuard is constructible only via lock_inner, which
+        // verifies guard.is_some() before returning this guard.
+        match self.guard.as_ref() {
+            Some(session) => session,
+            None => unreachable!("session guard invariant violated: inner session is None"),
+        }
     }
 }
 
 impl<'a> std::ops::DerefMut for SessionGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard
-            .as_mut()
-            .expect("session was moved into a ChatSession")
+        // Invariant: SessionGuard is constructible only via lock_inner, which
+        // verifies guard.is_some() before returning this guard.
+        match self.guard.as_mut() {
+            Some(session) => session,
+            None => unreachable!("session guard invariant violated: inner session is None"),
+        }
     }
 }
 

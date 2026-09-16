@@ -415,3 +415,66 @@ fn chat_message_bidirectional_conversion() {
     let err = Message::try_from(&multimodal_msg).unwrap_err();
     assert!(matches!(err, FfiError::UnsupportedModality));
 }
+
+#[test]
+fn chat_session_recovery_status_retains_ingest_recovery() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    // Single message ingestion with system role fails validation because
+    // Profile::render requires the message batch to end with a user role.
+    let sys_msg = chat_message_system("System instructions".to_string());
+    let err = chat.ingest(sys_msg).unwrap_err();
+    assert!(matches!(err, FfiError::ChatValidation { .. }));
+
+    // recovery_status must retain the IngestRecovery diagnostic
+    let status = chat.recovery_status().expect("recovery status succeeds");
+    assert!(status.usable);
+    assert!(status.last_ingest_recovery.is_some());
+
+    // Valid user turn clears the retained diagnostic
+    let user_msg = chat_message_user("Hello!".to_string());
+    chat.ingest(user_msg).expect("valid ingest succeeds");
+
+    let status_after = chat.recovery_status().expect("recovery status succeeds");
+    assert!(status_after.usable);
+    assert!(status_after.last_ingest_recovery.is_none());
+
+    // Ingest failure again to set diagnostic
+    let invalid_assistant = chat_message_assistant("Premature assistant reply".to_string());
+    chat.ingest(invalid_assistant).unwrap_err();
+    assert!(
+        chat.recovery_status()
+            .unwrap()
+            .last_ingest_recovery
+            .is_some()
+    );
+
+    // Explicit reset clears the diagnostic
+    chat.reset().expect("reset succeeds");
+    assert!(
+        chat.recovery_status()
+            .unwrap()
+            .last_ingest_recovery
+            .is_none()
+    );
+}
+
+#[test]
+fn chat_session_double_into_session_fails() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    // First into_session reclamation succeeds
+    let reclaimed = chat.into_session().expect("first reclamation succeeds");
+    assert_eq!(reclaimed.position(), 0);
+
+    // Second into_session fails fail-closed
+    let err = chat.into_session().unwrap_err();
+    match err {
+        FfiError::Backend { detail } => {
+            assert!(detail.contains("already been moved"));
+        }
+        other => panic!("expected Backend error on double move, got: {other:?}"),
+    }
+}

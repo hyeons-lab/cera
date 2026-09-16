@@ -34,12 +34,18 @@ wait-free cancellation, non-blocking recovery diagnostics, and terminal stream e
 - [x] Contract & binding parity: `python3 tests/api_contracts/check.py` matches 69/69 surfaces.
       Foreign language bindings regenerated via `just bindings` and `just dart-bindings`
       for Swift, Kotlin, Python, and Dart.
-- [x] Comprehensive test coverage: 12 unit tests in `cera-ffi/src/chat/tests.rs` covering
+- [x] Comprehensive test coverage: 14 unit tests in `cera-ffi/src/chat/tests.rs` covering
       multi-turn chat lifecycle, sliding context refusal, session transfer and reclamation,
       wait-free re-entrant cancellation during streaming decode, non-blocking recovery status,
-      terminal callbacks on early validation failure, and bidirectional message conversions.
-- [x] Verification gates clean: all 56 FFI unit tests, 15 contract tests, 43 core tests,
+      terminal callbacks on early validation failure, bidirectional message conversions,
+      retained ingest recovery diagnostics across failed turns, and double move refusal.
+- [x] Verification gates clean: all 58 FFI unit tests, 15 contract tests, 43 core tests,
       6 runner tests, Dart analysis, formatting, clippy, and rustdoc pass cleanly.
+- [x] Local review fix loop clean: two max-effort rounds with zero remaining warnings
+      or blocking issues. Ingest diagnostics are retained across turns in `ChatSession`,
+      dead `session_mut` methods are removed to seal session encapsulation, `SessionGuard`
+      safety invariants are documented, and streaming completions drop the inner lock
+      before foreign sink callbacks.
 
 Evidence: `devlog/plans/000341-47-uniffi-chat-lowering.md`.
 Forty-four increments are complete (42 core, two Leap). Next unused sequence is 48.
