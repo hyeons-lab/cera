@@ -110,13 +110,16 @@ def get_training_texts(
     if len(words) > 1 and words[0].lower() in ("hey", "hi", "okay", "ok"):
         target_name = " ".join(words[1:])
         # Competing onset prefixes
+        synonyms = {"ok", "okay"}
+        w0_lower = words[0].lower()
         for prefix in [
             "they", "play", "say", "may", "bay", "way", "ray", "pay", "day",
             "stay", "gray", "pray", "lay", "delay", "relay", "decay", "today",
             "away", "bye", "why", "no", "yes", "oh", "yo", "hello", "good", "bad",
             "okay", "hi", "hey",
         ]:
-            if prefix.lower() != words[0].lower():
+            is_synonym = prefix.lower() in synonyms and w0_lower in synonyms
+            if prefix.lower() != w0_lower and not is_synonym:
                 neg_texts.append(f"{prefix} {target_name}")
                 neg_texts.append(f"{prefix.capitalize()} {target_name}")
 
@@ -175,7 +178,14 @@ def get_training_texts(
     if extra_negatives:
         neg_texts.extend(extra_negatives)
 
-    return list(dict.fromkeys(pos_texts)), list(dict.fromkeys(neg_texts))
+    # Prevent target phrase contamination: eliminate any negative texts
+    # whose lowercased representation overlaps with the positive variations
+    pos_set_lower = {p.lower() for p in pos_texts}
+    cleaned_neg_texts = [
+        t for t in neg_texts if t.lower() not in pos_set_lower
+    ]
+
+    return list(dict.fromkeys(pos_texts)), list(dict.fromkeys(cleaned_neg_texts))
 
 
 
@@ -529,7 +539,9 @@ def synthesize_dataset(
     output_dir: str,
     phrase: str = "Hey Liquid",
     extra_negatives: List[str] = None,
-) -> List[Tuple[np.ndarray, float, float]]:
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> Tuple[List[Tuple[np.ndarray, float, float]], List[Tuple[np.ndarray, float, float]]]:
     """Synthesize positive and negative speech clips in parallel and extract mel spectrograms."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -553,6 +565,8 @@ def synthesize_dataset(
     # 2. Plan negative tasks
     neg_idx = 0
     words = [w.lower() for w in phrase.split()]
+    if not words:
+        raise ValueError(f"The target wake word '--phrase' cannot be empty or whitespace, got: {phrase!r}")
     target_name = " ".join(words[1:]) if len(words) > 1 else words[0]
     extra_set = {t.lower() for t in (extra_negatives or [])}
 
@@ -585,60 +599,107 @@ def synthesize_dataset(
         for res in executor.map(run_task, tasks):
             rendered_results.append(res)
 
-    print(f"Rendered {sum(1 for _, _, _, ok in rendered_results if ok)} clips successfully. Processing features...", flush=True)
+    valid_results = [r for r in rendered_results if r[3] and os.path.exists(r[0])]
+    print(
+        f"Rendered {len(valid_results)} clips successfully. Partitioning dataset at source level...",
+        flush=True,
+    )
 
-    samples: List[Tuple[np.ndarray, float, float]] = []
-    pos_count = 0
-    neg_count = 0
+    # Stratified split at the source audio recording level to prevent data leakage across train/val
+    rng = random.Random(seed)
+    pos_records = [r for r in valid_results if r[1] > 0.5]
+    hard_neg_records = [r for r in valid_results if r[1] <= 0.5 and r[2]]
+    soft_neg_records = [r for r in valid_results if r[1] <= 0.5 and not r[2]]
 
-    for wav_path, label, is_hard_neg, ok in rendered_results:
-        if not ok or not os.path.exists(wav_path):
-            continue
-        audio = read_wav(wav_path)
-        is_pos = label > 0.5
-        # Tiered penalty: hard negatives (keyword negatives + external confusers) get 3.8x penalty; general negatives get 1.0x; positives get 1.5x
-        sample_weight = 1.5 if is_pos else (3.8 if is_hard_neg else 1.0)
-        framed_list = extract_framed_windows(audio, is_pos)
-        for framed in framed_list:
-            augmented = add_acoustic_perturbations(framed)
-            mel = extract_log_mel_spectrogram(augmented)
-            samples.append((mel, label, sample_weight))
-            # Add SpecAugment version to enhance acoustic invariance
-            mel_spec = apply_spec_augment(mel)
-            samples.append((mel_spec, label, sample_weight))
-            if is_pos:
-                pos_count += 2
-            else:
-                neg_count += 2
+    rng.shuffle(pos_records)
+    rng.shuffle(hard_neg_records)
+    rng.shuffle(soft_neg_records)
 
-    # 3. Add synthetic silence and noise negatives
-    for _ in range(150):
+    def split_records(records: List, ratio: float):
+        split_idx = int(len(records) * (1.0 - ratio))
+        return records[:split_idx], records[split_idx:]
+
+    train_pos, val_pos = split_records(pos_records, val_ratio)
+    train_hard, val_hard = split_records(hard_neg_records, val_ratio)
+    train_soft, val_soft = split_records(soft_neg_records, val_ratio)
+
+    train_records = train_pos + train_hard + train_soft
+    val_records = val_pos + val_hard + val_soft
+    rng.shuffle(train_records)
+    rng.shuffle(val_records)
+
+    def process_records(records: List, is_training: bool) -> List[Tuple[np.ndarray, float, float]]:
+        samples: List[Tuple[np.ndarray, float, float]] = []
+        for wav_path, label, is_hard_neg, _ in records:
+            audio = read_wav(wav_path)
+            is_pos = label > 0.5
+            # Tiered penalty: hard negatives get 3.8x penalty; general negatives get 1.0x; positives get 1.5x
+            sample_weight = 1.5 if is_pos else (3.8 if is_hard_neg else 1.0)
+            framed_list = extract_framed_windows(audio, is_pos)
+            for framed in framed_list:
+                if is_training:
+                    augmented = add_acoustic_perturbations(framed)
+                    mel = extract_log_mel_spectrogram(augmented)
+                    samples.append((mel, label, sample_weight))
+                    # Add SpecAugment version to enhance acoustic invariance
+                    mel_spec = apply_spec_augment(mel)
+                    samples.append((mel_spec, label, sample_weight))
+                else:
+                    mel = extract_log_mel_spectrogram(framed)
+                    samples.append((mel, label, sample_weight))
+        return samples
+
+    train_samples = process_records(train_records, is_training=True)
+    val_samples = process_records(val_records, is_training=False)
+
+    # 3. Add synthetic silence and noise negatives (split proportionally)
+    silence_count = 150
+    train_silence = int(silence_count * (1.0 - val_ratio))
+    val_silence = silence_count - train_silence
+
+    for _ in range(train_silence):
         silence = np.random.randn(19200).astype(np.float32) * random.uniform(0.0001, 0.02)
         mel = extract_log_mel_spectrogram(silence)
-        samples.append((mel, 0.0, 2.0))
-        neg_count += 1
+        train_samples.append((mel, 0.0, 2.0))
 
-    print(f"Total dataset size: {len(samples)} samples (Pos: {pos_count}, Neg: {neg_count})", flush=True)
-    return samples
+    for _ in range(val_silence):
+        silence = np.random.randn(19200).astype(np.float32) * random.uniform(0.0001, 0.02)
+        mel = extract_log_mel_spectrogram(silence)
+        val_samples.append((mel, 0.0, 2.0))
+
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+
+    train_pos_cnt = sum(1 for _, l, _ in train_samples if l > 0.5)
+    train_neg_cnt = len(train_samples) - train_pos_cnt
+    val_pos_cnt = sum(1 for _, l, _ in val_samples if l > 0.5)
+    val_neg_cnt = len(val_samples) - val_pos_cnt
+
+    print(
+        f"Train dataset: {len(train_samples)} samples (Pos: {train_pos_cnt}, Neg: {train_neg_cnt}) | "
+        f"Val dataset: {len(val_samples)} samples (Pos: {val_pos_cnt}, Neg: {val_neg_cnt})",
+        flush=True,
+    )
+    return train_samples, val_samples
 
 
 def train_model(
-    samples: List[Tuple[np.ndarray, float, float]],
+    train_samples: List[Tuple[np.ndarray, float, float]],
+    val_samples: List[Tuple[np.ndarray, float, float]],
     epochs: int = 30,
     batch_size: int = 64,
     lr: float = 1e-3,
 ) -> KwsModel:
     """Train KwsModel on acoustic mel spectrograms."""
-    random.seed(42)
-    random.shuffle(samples)
-    split_idx = int(len(samples) * 0.85)
-    train_data = samples[:split_idx]
-    val_data = samples[split_idx:]
+    train_loader = DataLoader(KwsDataset(train_samples), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(KwsDataset(val_samples), batch_size=batch_size, shuffle=False)
 
-    train_loader = DataLoader(KwsDataset(train_data), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(KwsDataset(val_data), batch_size=batch_size, shuffle=False)
-
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"\nTraining on device: {device}", flush=True)
 
     model = KwsModel(mel_bins=32, emb_dim=64, num_keywords=1).to(device)
@@ -665,7 +726,7 @@ def train_model(
             optimizer.step()
             train_loss += loss.item() * len(labels)
 
-        train_loss /= len(train_data)
+        train_loss /= len(train_samples)
         scheduler.step()
 
         # Validation
@@ -688,7 +749,7 @@ def train_model(
                     else:
                         neg_scores.append(float(p))
 
-        val_loss /= len(val_data)
+        val_loss /= len(val_samples)
         pos_min = min(pos_scores) if pos_scores else 0.0
         pos_mean = sum(pos_scores) / len(pos_scores) if pos_scores else 0.0
         neg_max = max(neg_scores) if neg_scores else 0.0
@@ -750,6 +811,9 @@ def main() -> None:
         help="Optional path to a text file with negative phrases (one per line)",
     )
     args = parser.parse_args()
+    if not args.phrase or not args.phrase.strip():
+        raise ValueError("The target wake word '--phrase' cannot be empty or whitespace.")
+
     keywords = args.keywords if args.keywords is not None else [args.phrase]
     if len(keywords) != 1:
         raise ValueError(
@@ -767,10 +831,14 @@ def main() -> None:
     # 1. Synthesize audio dataset
     with tempfile.TemporaryDirectory() as tmpdir:
         print(f"Synthesizing dataset for '{args.phrase}' in {tmpdir}...", flush=True)
-        samples = synthesize_dataset(tmpdir, phrase=args.phrase, extra_negatives=extra_negs)
+        train_samples, val_samples = synthesize_dataset(
+            tmpdir,
+            phrase=args.phrase,
+            extra_negatives=extra_negs,
+        )
 
         # 2. Train model
-        model = train_model(samples, epochs=args.epochs)
+        model = train_model(train_samples, val_samples, epochs=args.epochs)
 
     # 3. Export to GGUF with folded BatchNorm
     print(f"\n--- Exporting Trained GGUF to {args.output} ---", flush=True)
