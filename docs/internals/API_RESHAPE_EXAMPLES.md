@@ -1,15 +1,17 @@
 # Executable API reshape examples
 
-The new Rust loading API is public in this checkout through `cera` imports;
-native Swift/Kotlin and CPU WASM loaders are also implemented in this checkout.
+The Rust loading and chat coordinator APIs are public in this checkout through `cera` imports;
+native Swift/Kotlin, Python, and Dart loaders and `ChatSession` coordinators are also implemented.
 Released package availability is not claimed. Existing `CeraEngine` constructors
-remain available. High-level `ingest`/`complete` and the Leap `ModelRunner` replacement
-are still planned; these examples exercise the implemented loading/session path.
+remain available. These examples exercise both the loading/session path and the
+high-level transactional `ingest`/`complete` multi-turn chat coordinator.
 
 The [native loading examples](../../cera-ffi/README.md#explicit-model-loading)
 show the production Swift/Kotlin types, raw prompt completion and resource cleanup.
 The [Node completion example](../../cera-wasm/examples/explicit_loading.cjs)
 uses the production CPU WASM module, with [build instructions](../../cera-wasm/README.md#explicit-cpu-model-loading).
+The [multi-turn chat examples](#multi-turn-conversational-chat-with-live-kv-retention)
+demonstrate warm multi-turn conversation with delta-only prompt evaluation across Rust, Swift, Kotlin, Python, and Dart.
 
 ## Load once and continue the same Rust session
 
@@ -247,6 +249,174 @@ Complete sources: [Swift](../../tests/api_loading/consumers/LoadingProbe.swift),
 See [Leap compatibility status](API_RESHAPE_LEAP_COMPAT.md) for the separate
 Swift/Kotlin drop-in workstream. Its actual runner, history, cancellation,
 LoRA/embeddings and replacement packages remain gated.
+
+## Multi-turn conversational chat with live KV retention
+
+The high-level chat coordinator manages conversational state machine lifecycles
+(`SessionPhase`), turn delimiter framing, and transactional ingestion over an underlying
+inference `Session`. In-capacity consecutive turns evaluate only newly ingested user
+messages and continuation tokens (delta-only prefill), without replaying history or
+rebuilding the KV cache.
+
+Complete runnable examples:
+- Rust: [`cera/examples/chat.rs`](../../cera/examples/chat.rs)
+- Swift: [`cera-ffi/examples/Chat.swift`](../../cera-ffi/examples/Chat.swift)
+- Kotlin: [`cera-ffi/examples/Chat.kt`](../../cera-ffi/examples/Chat.kt)
+- Python: [`cera-ffi/examples/chat.py`](../../cera-ffi/examples/chat.py)
+- Dart: [`cera_ffi/example/chat.dart`](../../cera_ffi/example/chat.dart)
+
+### Rust Multi-Turn Workflow
+
+```rust
+use cera::{GenerateOpts, Message, ModelLoader, ModelSource, SessionConfig, SessionPhase};
+
+let model = ModelLoader::new(ModelSource::path(path)).build_generative()?;
+let session = model.create_session(SessionConfig::default())?;
+let mut chat = session.into_chat().map_err(|(_, err)| err)?;
+
+// Turn 1: Ingest system and user messages together
+let turn1_messages = vec![
+    Message::system("You are a helpful assistant."),
+    Message::user("What is a KV cache?"),
+];
+chat.ingest_messages(&turn1_messages)?;
+let turn1 = chat.complete(&GenerateOpts::default())?;
+println!("Assistant: {}", turn1.text);
+
+// Turn 2: Warm continuation. The previous KV context remains resident.
+chat.ingest(&Message::user("When should it be discarded?"))?;
+let turn2 = chat.complete(&GenerateOpts::default())?;
+println!("Assistant: {}", turn2.text);
+
+// Reclaim the raw Session when done
+let raw_session = chat.into_session();
+```
+
+### Swift Multi-Turn Workflow
+
+```swift
+import Cera
+
+let loader = ModelLoader(source: .path(path: path), config: EngineConfig(backend: .cpu))
+let model = try loader.buildGenerative()
+let session = try model.createSession(config: SessionConfig())
+let chat = try session.intoChat()
+
+// Turn 1
+try chat.ingestMessages(messages: [
+    chatMessageSystem(content: "You are a helpful assistant."),
+    chatMessageUser(content: "What is a KV cache?"),
+])
+let turn1 = try chat.complete(opts: GenerateOpts(maxTokens: 64, temperature: 0.7))
+print("Assistant: \(turn1.text)")
+
+// Turn 2: Delta-only prompt evaluation
+try chat.ingest(message: chatMessageUser(content: "When should it be discarded?"))
+let turn2 = try chat.complete(opts: GenerateOpts(maxTokens: 64, temperature: 0.7))
+print("Assistant: \(turn2.text)")
+
+// Reclaim raw session
+let rawSession = try chat.intoSession()
+```
+
+### Kotlin Multi-Turn Workflow
+
+```kotlin
+import uniffi.cera_ffi.*
+
+ModelLoader(ModelSource.Path(modelPath), EngineConfig(backend = BackendPreference.CPU)).use { loader ->
+    loader.buildGenerative().use { model ->
+        model.createSession(SessionConfig(seed = 42uL)).use { session ->
+            session.intoChat().use { chat ->
+                val opts = GenerateOpts(maxTokens = 64u, temperature = 0.7f)
+
+                // Turn 1
+                chat.ingestMessages(listOf(
+                    chatMessageSystem("You are a helpful assistant."),
+                    chatMessageUser("What is a KV cache?")
+                ))
+                val turn1 = chat.complete(opts)
+                println("Assistant: ${turn1.text.trim()}")
+
+                // Turn 2: Delta-only prompt evaluation
+                chat.ingest(chatMessageUser("When should it be discarded?"))
+                val turn2 = chat.complete(opts)
+                println("Assistant: ${turn2.text.trim()}")
+
+                // Reclaim raw session
+                chat.intoSession().use { reclaimedSession ->
+                    println("Reclaimed session position: ${reclaimedSession.position()}")
+                }
+            }
+        }
+    }
+}
+```
+
+### Python Multi-Turn Workflow
+
+```python
+import cera_ffi
+
+loader = cera_ffi.ModelLoader(
+    cera_ffi.ModelSource.Path(model_path),
+    cera_ffi.EngineConfig(backend=cera_ffi.BackendPreference.CPU),
+)
+model = loader.build_generative()
+session = model.create_session(cera_ffi.SessionConfig(seed=42))
+chat = session.into_chat()
+
+opts = cera_ffi.GenerateOpts(max_tokens=64, temperature=0.7)
+
+# Turn 1
+chat.ingest_messages([
+    cera_ffi.chat_message_system("You are a helpful assistant."),
+    cera_ffi.chat_message_user("What is a KV cache?"),
+])
+turn1 = chat.complete(opts)
+print(f"Assistant: {turn1.text.strip()}")
+
+# Turn 2: Delta-only prompt evaluation
+chat.ingest(cera_ffi.chat_message_user("When should it be discarded?"))
+turn2 = chat.complete(opts)
+print(f"Assistant: {turn2.text.strip()}")
+
+# Reclaim raw session
+reclaimed_session = chat.into_session()
+```
+
+### Dart Multi-Turn Workflow
+
+```dart
+import 'package:cera_ffi/cera_ffi.dart';
+
+final loader = ModelLoader.create(
+  ModelSourcePath(path: modelPath),
+  const EngineConfig(backend: BackendPreference.cpu),
+);
+final model = loader.buildGenerative();
+final session = model.createSession(const SessionConfig(seed: 42));
+final chat = session.intoChat();
+
+const opts = GenerateOpts(maxTokens: 64, temperature: 0.7);
+
+// Turn 1
+final turn1Messages = [
+  chatMessageSystem('You are a helpful assistant.'),
+  chatMessageUser('What is a KV cache?'),
+];
+chat.ingestMessages(turn1Messages);
+final turn1 = chat.complete(opts);
+print('Assistant: ${turn1.text.trim()}');
+
+// Turn 2: Delta-only prompt evaluation
+chat.ingest(chatMessageUser('When should it be discarded?'));
+final turn2 = chat.complete(opts);
+print('Assistant: ${turn2.text.trim()}');
+
+// Reclaim raw session
+final reclaimedSession = chat.intoSession();
+```
 
 ## Cache behavior and documentation follow-through
 

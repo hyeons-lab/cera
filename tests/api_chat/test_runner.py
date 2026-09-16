@@ -93,6 +93,39 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("isolated chat contract", isolated_scope)
         self.assertNotIn("Full warm turns", isolated_scope)
 
+    def test_budgets_schema_and_numerical_ranges(self):
+        import json
+
+        budgets_path = HERE / "budgets.json"
+        self.assertTrue(budgets_path.is_file(), f"Missing budgets file: {budgets_path}")
+        with open(budgets_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("version", data)
+        self.assertIn("scope", data)
+        self.assertIn("reference_architecture", data)
+
+        invariants = data.get("deterministic_work_invariants", {})
+        self.assertTrue(invariants.get("delta_only_prompt_evaluation"))
+        self.assertFalse(invariants.get("history_replay_on_normal_turn"))
+        self.assertEqual(invariants.get("normal_turn_resets"), 0)
+        self.assertEqual(invariants.get("full_cache_checkpoint_copies"), 0)
+        self.assertTrue(invariants.get("kv_cache_bit_exact_retention"))
+
+        profiles = data.get("profiles", {})
+        self.assertIn("lfm2-350m-gguf-simple-text-v1", profiles)
+        self.assertIn("lfm2.5-350m-gguf-text-v1", profiles)
+
+        for name, profile in profiles.items():
+            targets = profile.get("targets", {})
+            self.assertIn("native-cpu-arm64", targets, f"Missing native-cpu-arm64 target in {name}")
+            target = targets["native-cpu-arm64"]
+            self.assertLessEqual(target["max_turn_framing_overhead_ms"], 1.5)
+            self.assertLessEqual(target["max_warm_ttft_ratio_vs_raw"], 1.05)
+            self.assertGreaterEqual(target["min_decode_throughput_ratio_vs_raw"], 0.98)
+            self.assertLessEqual(target["max_wrapper_heap_overhead_bytes"], 16384)
+            self.assertLessEqual(target["max_per_turn_allocation_bytes"], 8192)
+
 
 if __name__ == "__main__":
     unittest.main()

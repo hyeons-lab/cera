@@ -1,7 +1,44 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-15T18:17-0400. This is the current implementation record; the
+Updated: 2026-09-16T08:22-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan48 complete (2026-09-16T08:22-0400)
+
+Multi-language runnable Chat examples across five programming languages (Rust, Swift,
+Kotlin, Python, Dart) and frozen Section 8.1 performance and memory regression budgets.
+
+- [x] Multi-language Chat examples:
+      - Rust: `cera/examples/chat.rs` exercising `Session::into_chat()`, `ingest_messages()`,
+        `ingest()`, `complete()`, and session reclamation via `into_session()`.
+      - Swift: `cera-ffi/examples/Chat.swift` exercising `ChatSession`, `chatMessageSystem()`,
+        `chatMessageUser()`, `ingestMessages()`, `ingest()`, and `intoSession()`.
+      - Kotlin: `cera-ffi/examples/Chat.kt` exercising `ChatSession` in idiomatic Kotlin with
+        `use` blocks, `ingestMessages()`, `ingest()`, and `intoSession()`.
+      - Python: `cera-ffi/examples/chat.py` using `cera_ffi` UniFFI bindings.
+      - Dart: `cera_ffi/example/chat.dart` using `package:cera_ffi` native bindings.
+- [x] Warm continuation verified: every example demonstrates two consecutive conversational
+      turns with delta-only prompt evaluation on the second turn, retaining live KV context
+      without transcript replay or recomputation, and verifies `TurnComplete` phase transitions.
+- [x] Section 8.1 frozen regression budgets:
+      - Defined machine-readable criteria in `tests/api_chat/budgets.json` covering deterministic
+        work invariants (delta-only prefill, zero history replay, zero normal-turn resets,
+        zero full-cache checkpoint copies, bit-exact KV retention).
+      - Authored comprehensive specification in `tests/api_chat/BUDGETS.md` establishing
+        framing latency (<1.5 ms), TTFT warm/raw ratio (<=1.05 at matched resident context length),
+        decode throughput ratio (>=0.98), and coordinator heap overhead (<16 KiB).
+      - Added automated schema and numerical range verification in `tests/api_chat/test_runner.py`.
+- [x] Documentation updated: `docs/internals/API_RESHAPE_EXAMPLES.md` documents multi-turn chat
+      workflows across all languages alongside existing explicit loading examples.
+- [x] Local review fix loop clean: two max-effort rounds with zero remaining warnings
+      or blocking issues. Handled dynamic library loading errors in Python, ensured deterministic
+      handle release with `.use` in Kotlin, documented direct swiftc and SPM execution in Swift,
+      clarified invocation paths in Dart, and achieved 5-language documentation parity.
+- [x] Verification gates clean: all 58 FFI unit tests, 43 core tests, 15 contract tests,
+      7 runner tests, Dart analysis, formatting, clippy, and rustdoc pass cleanly.
+
+Evidence: `devlog/plans/000341-48-chat-examples-and-performance-budgets.md`.
+Forty-five increments are complete (43 core, two Leap). Next unused sequence is 49.
 
 ## Plan47 complete (2026-09-15T18:17-0400)
 
