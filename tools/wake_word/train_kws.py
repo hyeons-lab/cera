@@ -12,6 +12,7 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,15 @@ from scripts.convert_kws import (
     extract_log_mel_spectrogram,
     generate_verification_fixture,
 )
+
+
+def seed_everything(seed: int = 42) -> None:
+    """Seed all random number generators for reproducible dataset generation and training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # Natural English voices available on macOS (excluding eval held-out voices like Tara)
@@ -57,6 +67,20 @@ VOICES = [
 
 # Rates in words per minute covering natural speech range
 RATES = [150, 175, 200]
+
+
+def is_phrase_in_text(phrase: str, text: str) -> bool:
+    """Check if the sequence of words in phrase appears as a contiguous subsequence in text."""
+    phrase_words = [w for w in re.findall(r"\b\w+\b", phrase.lower()) if w]
+    text_words = [w for w in re.findall(r"\b\w+\b", text.lower()) if w]
+    if not phrase_words or len(text_words) < len(phrase_words):
+        return False
+    k = len(phrase_words)
+    for i in range(len(text_words) - k + 1):
+        if text_words[i : i + k] == phrase_words:
+            return True
+    return False
+
 
 def get_training_texts(
     phrase: str = "Hey Liquid",
@@ -180,9 +204,11 @@ def get_training_texts(
 
     # Prevent target phrase contamination: eliminate any negative texts
     # whose lowercased representation overlaps with the positive variations
+    # or that contain the target phrase as a word subsequence.
     pos_set_lower = {p.lower() for p in pos_texts}
     cleaned_neg_texts = [
-        t for t in neg_texts if t.lower() not in pos_set_lower
+        t for t in neg_texts
+        if t.lower() not in pos_set_lower and not is_phrase_in_text(phrase, t)
     ]
 
     return list(dict.fromkeys(pos_texts)), list(dict.fromkeys(cleaned_neg_texts))
@@ -521,18 +547,20 @@ class KwsDataset(Dataset):
     """PyTorch Dataset yielding (mel_spectrogram, label, weight)."""
 
     def __init__(self, samples: List[Tuple[np.ndarray, float, float]]):
-        self.samples = samples
+        self.samples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = [
+            (
+                torch.from_numpy(mel) if isinstance(mel, np.ndarray) else mel,
+                torch.tensor([label], dtype=torch.float32) if not isinstance(label, torch.Tensor) else label,
+                torch.tensor([weight], dtype=torch.float32) if not isinstance(weight, torch.Tensor) else weight,
+            )
+            for mel, label, weight in samples
+        ]
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mel, label, weight = self.samples[idx]
-        return (
-            torch.from_numpy(mel),
-            torch.tensor([label], dtype=torch.float32),
-            torch.tensor([weight], dtype=torch.float32),
-        )
+        return self.samples[idx]
 
 
 def synthesize_dataset(
@@ -614,6 +642,11 @@ def synthesize_dataset(
     # Stratified split at the source audio recording level to prevent data leakage across train/val
     rng = random.Random(seed)
     pos_records = [r for r in valid_results if r[1] > 0.5]
+    if not pos_records:
+        raise RuntimeError(
+            f"No positive audio clips were successfully rendered for phrase '{phrase}'. "
+            "Cannot train model with zero positive samples."
+        )
     hard_neg_records = [r for r in valid_results if r[1] <= 0.5 and r[2]]
     soft_neg_records = [r for r in valid_results if r[1] <= 0.5 and not r[2]]
 
@@ -681,6 +714,11 @@ def synthesize_dataset(
     val_pos_cnt = sum(1 for _, l, _ in val_samples if l > 0.5)
     val_neg_cnt = len(val_samples) - val_pos_cnt
 
+    if train_pos_cnt == 0:
+        raise RuntimeError(f"Training split contains zero positive samples for phrase '{phrase}'.")
+    if val_pos_cnt == 0 and val_ratio > 0.0:
+        raise RuntimeError(f"Validation split contains zero positive samples for phrase '{phrase}'.")
+
     print(
         f"Train dataset: {len(train_samples)} samples (Pos: {train_pos_cnt}, Neg: {train_neg_cnt}) | "
         f"Val dataset: {len(val_samples)} samples (Pos: {val_pos_cnt}, Neg: {val_neg_cnt})",
@@ -695,8 +733,10 @@ def train_model(
     epochs: int = 30,
     batch_size: int = 64,
     lr: float = 1e-3,
+    seed: int = 42,
 ) -> KwsModel:
     """Train KwsModel on acoustic mel spectrograms."""
+    seed_everything(seed)
     train_loader = DataLoader(KwsDataset(train_samples), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(KwsDataset(val_samples), batch_size=batch_size, shuffle=False)
 
@@ -777,6 +817,14 @@ def train_model(
 
 
 def main() -> None:
+    if sys.platform != "darwin":
+        print(
+            "Error: train_kws.py requires macOS ('darwin') to synthesize training datasets "
+            "using native macOS speech synthesis ('say').",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="Train KWS model for wake word detection")
     parser.add_argument(
         "--phrase",
@@ -806,6 +854,12 @@ def main() -> None:
         help="Training epochs (default: 30)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for dataset split and model training (default: 42)",
+    )
+    parser.add_argument(
         "--extra-negatives",
         nargs="*",
         default=None,
@@ -817,6 +871,8 @@ def main() -> None:
         help="Optional path to a text file with negative phrases (one per line)",
     )
     args = parser.parse_args()
+    seed_everything(args.seed)
+
     if not args.phrase or not args.phrase.strip():
         raise ValueError("The target wake word '--phrase' cannot be empty or whitespace.")
 
@@ -843,10 +899,11 @@ def main() -> None:
             tmpdir,
             phrase=args.phrase,
             extra_negatives=extra_negs,
+            seed=args.seed,
         )
 
         # 2. Train model
-        model = train_model(train_samples, val_samples, epochs=args.epochs)
+        model = train_model(train_samples, val_samples, epochs=args.epochs, seed=args.seed)
 
     # 3. Export to GGUF with folded BatchNorm
     print(f"\n--- Exporting Trained GGUF to {args.output} ---", flush=True)
@@ -865,7 +922,7 @@ def main() -> None:
             fixture_path=args.fixture,
             model=model,
             keywords=keywords,
-            seed=42,
+            seed=args.seed,
         )
 
     print("\nTraining and GGUF export complete!", flush=True)
