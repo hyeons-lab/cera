@@ -238,7 +238,10 @@ pub fn compute_snr_db(orig: &[f32], dequant: &[f32]) -> f32 {
 
 /// Compute Root Mean Square Error (RMSE) between original and dequantized tensor.
 pub fn compute_rmse(orig: &[f32], dequant: &[f32]) -> f32 {
-    if orig.len() != dequant.len() || orig.is_empty() {
+    if orig.len() != dequant.len() {
+        return f32::INFINITY;
+    }
+    if orig.is_empty() {
         return 0.0;
     }
     let mut sum_sq = 0.0f32;
@@ -246,7 +249,11 @@ pub fn compute_rmse(orig: &[f32], dequant: &[f32]) -> f32 {
         let diff = o - d;
         sum_sq += diff * diff;
     }
-    (sum_sq / orig.len() as f32).sqrt()
+    if sum_sq.is_nan() {
+        f32::NAN
+    } else {
+        (0.0f32.max(sum_sq) / orig.len() as f32).sqrt()
+    }
 }
 
 /// Compute Cosine Similarity between original and dequantized tensor.
@@ -262,11 +269,14 @@ pub fn compute_cosine_similarity(orig: &[f32], dequant: &[f32]) -> f32 {
         norm_o += o * o;
         norm_d += d * d;
     }
-    let denom = (norm_o * norm_d).sqrt();
-    if denom <= 1e-12 {
+    if norm_o <= 1e-12 && norm_d <= 1e-12 {
         return 1.0;
     }
-    dot / denom
+    if norm_o <= 1e-12 || norm_d <= 1e-12 {
+        return 0.0;
+    }
+    let denom = (norm_o * norm_d).sqrt();
+    (dot / denom).clamp(-1.0, 1.0)
 }
 
 // ── In-Place Fast Walsh-Hadamard Transform (FWHT) for QuaRot ─────────────────
@@ -1403,5 +1413,40 @@ mod tests {
             &overrides,
         );
         assert_eq!(attn_type, GGML_TYPE_Q4_K);
+    }
+
+    #[test]
+    fn test_compute_cosine_similarity_zero_vectors() {
+        let zero = vec![0.0f32; 4];
+        let non_zero = vec![1.0f32, 2.0, 3.0, 4.0];
+        // Identical zero vectors yield 1.0 (perfect match)
+        assert_eq!(compute_cosine_similarity(&zero, &zero), 1.0);
+        // Zero vs non-zero yields 0.0 (mismatch, not false positive 1.0)
+        assert_eq!(compute_cosine_similarity(&zero, &non_zero), 0.0);
+        assert_eq!(compute_cosine_similarity(&non_zero, &zero), 0.0);
+    }
+
+    #[test]
+    fn test_compute_rmse_nan_propagation() {
+        let clean = vec![1.0f32, 2.0];
+        let poisoned = vec![1.0f32, f32::NAN];
+        assert!(compute_rmse(&clean, &poisoned).is_nan());
+        assert!(compute_rmse(&poisoned, &clean).is_nan());
+    }
+
+    #[test]
+    fn test_compute_rmse_length_mismatch() {
+        let v1 = vec![1.0f32, 2.0, 3.0];
+        let v2 = vec![1.0f32, 2.0];
+        assert_eq!(compute_rmse(&v1, &v2), f32::INFINITY);
+        assert_eq!(compute_rmse(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_compute_cosine_similarity_length_mismatch() {
+        let v1 = vec![1.0f32, 2.0, 3.0];
+        let v2 = vec![1.0f32, 2.0];
+        assert_eq!(compute_cosine_similarity(&v1, &v2), 0.0);
+        assert_eq!(compute_cosine_similarity(&[], &[]), 0.0);
     }
 }

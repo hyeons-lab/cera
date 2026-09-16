@@ -137,52 +137,104 @@ impl Tensor {
         bytemuck::cast_slice_mut(&mut self.data)
     }
 
-    /// Convert tensor data to a `Vec<f32>`, dequantizing if necessary.
-    pub fn to_f32_vec(&self) -> Vec<f32> {
+    /// Convert tensor data to a `Vec<f32>`, returning an error if dequantization is unsupported.
+    pub fn try_to_f32_vec(&self) -> Result<Vec<f32>, crate::CeraError> {
+        let numel = self.numel();
         match self.dtype {
-            DType::F32 => self.as_f32_slice().to_vec(),
+            DType::F32 => {
+                if self.data.len() != numel * 4 {
+                    return Err(crate::CeraError::Backend(format!(
+                        "F32 tensor size mismatch: expected {} bytes, got {}",
+                        numel * 4,
+                        self.data.len()
+                    )));
+                }
+                if let Ok(slice) = bytemuck::try_cast_slice::<u8, f32>(&self.data) {
+                    Ok(slice.to_vec())
+                } else {
+                    let (chunks, _) = self.data.as_chunks::<4>();
+                    Ok(chunks.iter().map(|c| f32::from_le_bytes(*c)).collect())
+                }
+            }
             DType::F16 => {
-                let f16s: &[half::f16] = bytemuck::cast_slice(&self.data);
-                f16s.iter()
-                    .map(|x| crate::quant::f16_to_f32(x.to_bits()))
-                    .collect()
+                if self.data.len() != numel * 2 {
+                    return Err(crate::CeraError::Backend(format!(
+                        "F16 tensor size mismatch: expected {} bytes, got {}",
+                        numel * 2,
+                        self.data.len()
+                    )));
+                }
+                if let Ok(f16s) = bytemuck::try_cast_slice::<u8, half::f16>(&self.data) {
+                    Ok(f16s
+                        .iter()
+                        .map(|x| crate::quant::f16_to_f32(x.to_bits()))
+                        .collect())
+                } else {
+                    let (chunks, _) = self.data.as_chunks::<2>();
+                    Ok(chunks
+                        .iter()
+                        .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes(*c)))
+                        .collect())
+                }
             }
             DType::BF16 => {
-                let bf16s: &[half::bf16] = bytemuck::cast_slice(&self.data);
-                bf16s.iter().map(|x| x.to_f32()).collect()
+                if self.data.len() != numel * 2 {
+                    return Err(crate::CeraError::Backend(format!(
+                        "BF16 tensor size mismatch: expected {} bytes, got {}",
+                        numel * 2,
+                        self.data.len()
+                    )));
+                }
+                if let Ok(bf16s) = bytemuck::try_cast_slice::<u8, half::bf16>(&self.data) {
+                    Ok(bf16s.iter().map(|x| x.to_f32()).collect())
+                } else {
+                    let (chunks, _) = self.data.as_chunks::<2>();
+                    Ok(chunks
+                        .iter()
+                        .map(|c| half::bf16::from_bits(u16::from_le_bytes(*c)).to_f32())
+                        .collect())
+                }
             }
-            DType::Q4_0 => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q4_0_row(&self.data, &mut out);
-                out
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q4KM | DType::Q5KM | DType::Q6K => {
+                let block_size = self.dtype.block_size();
+                let block_bytes = self.dtype.block_bytes();
+                if !numel.is_multiple_of(block_size) {
+                    return Err(crate::CeraError::Backend(format!(
+                        "{:?} tensor element count {} not multiple of block size {}",
+                        self.dtype, numel, block_size
+                    )));
+                }
+                let expected_bytes = (numel / block_size) * block_bytes;
+                if self.data.len() != expected_bytes {
+                    return Err(crate::CeraError::Backend(format!(
+                        "{:?} tensor data length mismatch: expected {} bytes, got {}",
+                        self.dtype,
+                        expected_bytes,
+                        self.data.len()
+                    )));
+                }
+                let mut out = vec![0.0f32; numel];
+                match self.dtype {
+                    DType::Q4_0 => crate::quant::dequantize_q4_0_row(&self.data, &mut out),
+                    DType::Q4_1 => crate::quant::dequantize_q4_1_row(&self.data, &mut out),
+                    DType::Q8_0 => crate::quant::dequantize_q8_0_row(&self.data, &mut out),
+                    DType::Q4KM => crate::quant::dequantize_q4_k_m_row(&self.data, &mut out),
+                    DType::Q5KM => crate::quant::dequantize_q5_k_row(&self.data, &mut out),
+                    DType::Q6K => crate::quant::dequantize_q6_k_row(&self.data, &mut out),
+                    _ => unreachable!(),
+                }
+                Ok(out)
             }
-            DType::Q4_1 => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q4_1_row(&self.data, &mut out);
-                out
-            }
-            DType::Q8_0 => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q8_0_row(&self.data, &mut out);
-                out
-            }
-            DType::Q4KM => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q4_k_m_row(&self.data, &mut out);
-                out
-            }
-            DType::Q5KM => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q5_k_row(&self.data, &mut out);
-                out
-            }
-            DType::Q6K => {
-                let mut out = vec![0.0f32; self.numel()];
-                crate::quant::dequantize_q6_k_row(&self.data, &mut out);
-                out
-            }
-            _ => unimplemented!("to_f32_vec not implemented for {:?}", self.dtype),
+            _ => Err(crate::CeraError::Backend(format!(
+                "to_f32_vec not implemented for {:?}",
+                self.dtype
+            ))),
         }
+    }
+
+    /// Convert tensor data to a `Vec<f32>`, dequantizing if necessary.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        self.try_to_f32_vec().unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -242,5 +294,33 @@ mod tests {
         assert_eq!(DType::Q5KM.block_bytes(), 176);
         assert_eq!(DType::Q5KM.element_size(), None);
         assert_eq!(DType::F32.element_size(), Some(4));
+    }
+
+    #[test]
+    fn test_try_to_f32_vec_unsupported_dtype() {
+        let t = Tensor::new(vec![0u8; 16], vec![4], DType::I32);
+        assert!(t.try_to_f32_vec().is_err());
+    }
+
+    #[test]
+    fn test_try_to_f32_vec_size_mismatch() {
+        let t = Tensor::new(vec![0u8; 7], vec![2], DType::F32);
+        assert!(t.try_to_f32_vec().is_err());
+
+        let t_f16 = Tensor::new(vec![0u8; 3], vec![2], DType::F16);
+        assert!(t_f16.try_to_f32_vec().is_err());
+
+        let t_q8 = Tensor::new(vec![0u8; 30], vec![32], DType::Q8_0);
+        assert!(t_q8.try_to_f32_vec().is_err());
+    }
+
+    #[test]
+    fn test_try_to_f32_vec_unaligned_memory() {
+        let mut unaligned_bytes = [0u8; 9];
+        unaligned_bytes[1..5].copy_from_slice(&1.0f32.to_le_bytes());
+        unaligned_bytes[5..9].copy_from_slice(&2.0f32.to_le_bytes());
+        let t = Tensor::new(unaligned_bytes[1..9].to_vec(), vec![2], DType::F32);
+        let res = t.try_to_f32_vec().expect("unaligned f32 decode");
+        assert_eq!(res, vec![1.0, 2.0]);
     }
 }
