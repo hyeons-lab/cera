@@ -1609,12 +1609,33 @@ impl Model for LlamaModel {
             return 0;
         }
         if tokens.len() > 1 {
-            for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
-                let _ = self.forward(&[t], pos + i, state);
+            if transformer::oracle_dump::is_active() {
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let _ = self.forward(&[t], pos + i, state);
+                }
+            } else {
+                let cfg = &self.config;
+                let mut hidden_stack = [0.0f32; 4096];
+                let mut hidden_heap;
+                let hidden = if cfg.hidden_size <= 4096 {
+                    &mut hidden_stack[..cfg.hidden_size]
+                } else {
+                    hidden_heap = vec![0.0f32; cfg.hidden_size];
+                    &mut hidden_heap[..]
+                };
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let token_id = t as usize;
+                    if token_id >= cfg.vocab_size {
+                        continue;
+                    }
+                    transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, hidden);
+                    if self.config.scalars.embedding != 1.0 {
+                        cpu::scale_inplace(hidden, self.config.scalars.embedding);
+                    }
+                    self.run_layers(hidden, pos + i, state);
+                }
             }
-            let last_token = [tokens[tokens.len() - 1]];
-            let logits = self.forward(&last_token, pos + tokens.len() - 1, state);
-            return crate::sampler::argmax(&logits);
+            return self.forward_greedy(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
         }
         if transformer::oracle_dump::is_active() {
             let logits = self.forward(tokens, pos, state);
@@ -1680,7 +1701,7 @@ impl Model for LlamaModel {
                 &mut state.scratch.logits[..cfg.vocab_size],
             );
         }
-        if self.config.scalars.logit != 1.0 {
+        if self.config.scalars.logit > 0.0 && self.config.scalars.logit != 1.0 {
             cpu::scale_inplace(
                 &mut state.scratch.logits[..cfg.vocab_size],
                 1.0 / self.config.scalars.logit,
@@ -1923,5 +1944,33 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // differential test (batched vs per-token, all four archs) in
         // `tests/gpu_transformer_parity.rs`.
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::ScalarMultipliers;
+
+    #[test]
+    fn test_llama_scalars_logit_non_positive_fallback_logic() {
+        // When scalars.logit <= 0.0, forward_greedy must not take the gemv_preq_argmax fast path
+        // because argmax order would invert or degrade.
+        let neg = ScalarMultipliers {
+            logit: -1.0,
+            ..Default::default()
+        };
+        assert!(neg.logit <= 0.0);
+
+        let zero = ScalarMultipliers {
+            logit: 0.0,
+            ..Default::default()
+        };
+        assert!(zero.logit <= 0.0);
+
+        let pos = ScalarMultipliers {
+            logit: 1.0,
+            ..Default::default()
+        };
+        assert!(pos.logit > 0.0);
     }
 }

@@ -680,17 +680,7 @@ pub(crate) fn blas_dequantizer(dtype: DType) -> Option<MatrixDequantizer> {
 #[cfg(has_blas)]
 fn blas_cache_weights_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CERA_BLAS_CACHE_WEIGHTS")
-            .map(|v| {
-                let s = v.trim();
-                s == "1"
-                    || s.eq_ignore_ascii_case("true")
-                    || s.eq_ignore_ascii_case("yes")
-                    || s.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| std::env::var("CERA_BLAS_CACHE_WEIGHTS").as_deref() == Ok("1"))
 }
 
 /// Prefill GEMM through BLAS: dequantize `wref` into `dequant_scratch[..m*k]`,
@@ -1625,9 +1615,14 @@ pub(crate) fn forward_attn_block(
     // Q8_0 at the layer level, so the integer dot-product path is used.
     #[cfg(target_arch = "aarch64")]
     {
-        let same_k = weights.attn_k.k == weights.attn_q.k && weights.attn_v.k == weights.attn_q.k;
+        let valid_dims = weights.attn_q.k == hidden.len()
+            && weights.attn_k.k == hidden.len()
+            && weights.attn_v.k == hidden.len()
+            && weights.attn_q.m == q_dim
+            && weights.attn_k.m == kv_dim
+            && weights.attn_v.m == kv_dim;
         if lora.is_none()
-            && same_k
+            && valid_dims
             && weights.attn_q.dtype == DType::Q4_0
             && weights.attn_k.dtype == DType::Q4_0
             && weights.attn_v.dtype == DType::Q4_0
@@ -1650,7 +1645,7 @@ pub(crate) fn forward_attn_block(
                 weights.attn_q.k,
             );
         } else if lora.is_none()
-            && same_k
+            && valid_dims
             && weights.attn_q.dtype == DType::Q4KM
             && weights.attn_k.dtype == DType::Q4KM
             && weights.attn_v.dtype == DType::Q4KM
@@ -1673,7 +1668,7 @@ pub(crate) fn forward_attn_block(
                 weights.attn_q.k,
             );
         } else if lora.is_none()
-            && same_k
+            && valid_dims
             && weights.attn_q.dtype == DType::Q5KM
             && weights.attn_k.dtype == DType::Q5KM
             && weights.attn_v.dtype == DType::Q5KM
@@ -1926,16 +1921,20 @@ pub(crate) fn forward_ffn_block(
     let lora = state.lora.clone();
 
     #[cfg(target_arch = "aarch64")]
+    let fused_swiglu_done = lora.is_none()
+        && weights.ffn_gate.m == intermediate_size
+        && weights.ffn_up.m == intermediate_size
+        && weights.ffn_gate.k == hidden_size
+        && weights.ffn_up.k == hidden_size
+        && ((weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0)
+            || (weights.ffn_gate.dtype == DType::Q4KM && weights.ffn_up.dtype == DType::Q4KM)
+            || (weights.ffn_gate.dtype == DType::Q5KM && weights.ffn_up.dtype == DType::Q5KM));
+    #[cfg(not(target_arch = "aarch64"))]
+    let fused_swiglu_done = false;
+
+    #[cfg(target_arch = "aarch64")]
     {
-        let can_fuse_swiglu = lora.is_none()
-            && weights.ffn_gate.m == intermediate_size
-            && weights.ffn_up.m == intermediate_size
-            && weights.ffn_gate.k == hidden_size
-            && weights.ffn_up.k == hidden_size
-            && ((weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0)
-                || (weights.ffn_gate.dtype == DType::Q4KM && weights.ffn_up.dtype == DType::Q4KM)
-                || (weights.ffn_gate.dtype == DType::Q5KM && weights.ffn_up.dtype == DType::Q5KM));
-        if can_fuse_swiglu {
+        if fused_swiglu_done {
             let g_data = weight_data(gguf, weights.ffn_gate);
             let u_data = weight_data(gguf, weights.ffn_up);
             if weights.ffn_gate.dtype == DType::Q5KM {
@@ -1969,7 +1968,13 @@ pub(crate) fn forward_ffn_block(
                     hidden_size,
                 );
             }
-        } else if weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0 {
+        } else if weights.ffn_gate.dtype == DType::Q4_0
+            && weights.ffn_up.dtype == DType::Q4_0
+            && weights.ffn_gate.m == intermediate_size
+            && weights.ffn_up.m == intermediate_size
+            && weights.ffn_gate.k == hidden_size
+            && weights.ffn_up.k == hidden_size
+        {
             let g_data = weight_data(gguf, weights.ffn_gate);
             let u_data = weight_data(gguf, weights.ffn_up);
             cpu::gemv_q4_0_fused2_with_q8(
@@ -2017,14 +2022,6 @@ pub(crate) fn forward_ffn_block(
             &mut state.scratch.up[..intermediate_size],
         );
     }
-
-    #[cfg(target_arch = "aarch64")]
-    let fused_swiglu_done = lora.is_none()
-        && ((weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0)
-            || (weights.ffn_gate.dtype == DType::Q4KM && weights.ffn_up.dtype == DType::Q4KM)
-            || (weights.ffn_gate.dtype == DType::Q5KM && weights.ffn_up.dtype == DType::Q5KM));
-    #[cfg(not(target_arch = "aarch64"))]
-    let fused_swiglu_done = false;
 
     if !fused_swiglu_done {
         // LoRA on gate/up - BEFORE the SwiGLU mul (which reads both), input is the

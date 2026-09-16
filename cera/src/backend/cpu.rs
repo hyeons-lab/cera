@@ -1928,6 +1928,16 @@ pub fn gemv_with_preq(
     m: usize,
     k: usize,
 ) {
+    if y.len() < m {
+        debug_assert!(
+            false,
+            "gemv_with_preq: destination buffer underflow: {} < {}",
+            y.len(),
+            m
+        );
+        return;
+    }
+    let y = &mut y[..m];
     #[cfg(target_arch = "aarch64")]
     match dtype {
         DType::Q4_0 => gemv_q4_0_with_q8(a_quant, x_scales, x_quants, y, m, k),
@@ -1977,6 +1987,11 @@ pub fn gemv_with_preq(
     }
 }
 
+thread_local! {
+    static ARGMAX_LOGITS_SCRATCH: std::cell::Cell<Option<Vec<f32>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Greedy argmax GEMV: directly computes the argmax over output logits without writing logits to memory.
 #[allow(dead_code)]
 pub fn gemv_with_preq_argmax(
@@ -1988,18 +2003,41 @@ pub fn gemv_with_preq_argmax(
     m: usize,
     k: usize,
 ) -> usize {
+    if m == 0 {
+        return 0;
+    }
     #[cfg(target_arch = "aarch64")]
     if dtype == DType::Q6K
         && crate::backend::cpu_features::cpu_features().tier
             >= crate::backend::cpu_features::CpuTier::NeonDotprod
+        && k.is_multiple_of(256)
+        && a_quant.len() >= m * (k / 256) * std::mem::size_of::<crate::quant::BlockQ6K>()
+        && x_quants.len() >= k
+        && x_scales.len() >= k / 32
     {
         return unsafe {
             crate::backend::simd::neon::gemv_q6k_q8_0_argmax_neon(a_quant, x_scales, x_quants, m, k)
         };
     }
-    let mut logits = vec![0.0f32; m];
-    gemv_with_preq(dtype, a_quant, x_scales, x_quants, x_f32, &mut logits, m, k);
-    crate::sampler::argmax(&logits) as usize
+    ARGMAX_LOGITS_SCRATCH.with(|cell| {
+        let mut logits = cell.take().unwrap_or_else(|| Vec::with_capacity(m));
+        if logits.len() < m {
+            logits.resize(m, 0.0);
+        }
+        gemv_with_preq(
+            dtype,
+            a_quant,
+            x_scales,
+            x_quants,
+            x_f32,
+            &mut logits[..m],
+            m,
+            k,
+        );
+        let best = crate::sampler::argmax(&logits[..m]) as usize;
+        cell.set(Some(logits));
+        best
+    })
 }
 
 /// Q4_0 GEMV with pre-quantized Q8_0 input. Avoids re-quantizing x when
@@ -2013,6 +2051,16 @@ pub fn gemv_q4_0_with_q8(
     m: usize,
     k: usize,
 ) {
+    if y.len() < m {
+        debug_assert!(
+            false,
+            "gemv_q4_0_with_q8: destination buffer underflow: {} < {}",
+            y.len(),
+            m
+        );
+        return;
+    }
+    let y = &mut y[..m];
     unsafe {
         crate::backend::simd::neon::gemv_q4_0_q8_0_neon(a_quant, x_scales, x_quants, y, m, k);
     }
@@ -3076,11 +3124,12 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
 // Thread-local scratch buffers to avoid per-call allocation during fallback GEMV.
 //
 // Invariant: Dispatched GEMV functions should execute as leaf operations on the thread.
-// To eliminate re-entrancy panic hazards, `with_gemv_scratch` uses `try_borrow_mut()`,
-// falling back safely to temporary allocation if a nested borrow occurs.
+// To eliminate re-entrancy panic hazards and avoid RefCell borrow tracking overhead,
+// `with_gemv_scratch` uses `Cell::take()`, falling back safely to temporary allocation
+// if a nested invocation occurs.
 thread_local! {
-    static GEMV_DISPATCH_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i8>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static GEMV_DISPATCH_SCRATCH: std::cell::Cell<Option<(Vec<f32>, Vec<i8>)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Executes `f` with the caller-provided scratch buffer, or falls back to thread-local scratch.
@@ -3094,20 +3143,18 @@ fn with_gemv_scratch<R>(
         f(s, q)
     } else {
         GEMV_DISPATCH_SCRATCH.with(|cell| {
-            if let Ok(mut borrow) = cell.try_borrow_mut() {
-                let (s, q) = &mut *borrow;
-                if s.capacity() < 128 {
-                    s.reserve(128);
-                }
-                if q.capacity() < 4096 {
-                    q.reserve(4096);
-                }
-                f(s, q)
-            } else {
-                let mut s = Vec::with_capacity(128);
-                let mut q = Vec::with_capacity(4096);
-                f(&mut s, &mut q)
+            let mut scratch = cell
+                .take()
+                .unwrap_or_else(|| (Vec::with_capacity(128), Vec::with_capacity(4096)));
+            if scratch.0.capacity() < 128 {
+                scratch.0.reserve(128);
             }
+            if scratch.1.capacity() < 4096 {
+                scratch.1.reserve(4096);
+            }
+            let res = f(&mut scratch.0, &mut scratch.1);
+            cell.set(Some(scratch));
+            res
         })
     }
 }
@@ -6441,7 +6488,7 @@ mod tests {
         for (bi, blk) in data.chunks_mut(bb).enumerate() {
             let d = half::f16::from_f32(0.01 + 0.004 * (bi % 7) as f32);
             match dtype {
-                DType::Q4_0 | DType::Q8_0 | DType::Q4_1 | DType::Q4KM => {
+                DType::Q4_0 | DType::Q8_0 | DType::Q4_1 | DType::Q4KM | DType::Q5KM => {
                     blk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
                 }
                 // Q6K keeps its `d` at the end of the block.
@@ -6453,9 +6500,9 @@ mod tests {
                 // field this function does not name cannot be left random.
                 _ => unreachable!("dtype without an int8 kernel"),
             }
-            // Q4_1's `m` and Q4KM's `dmin` share the slot after `d`, and both are
+            // Q4_1's `m`, and Q4KM / Q5KM's `dmin` share the slot after `d`, and all are
             // f16 fields that must not be left random for the same reason.
-            if matches!(dtype, DType::Q4_1 | DType::Q4KM) {
+            if matches!(dtype, DType::Q4_1 | DType::Q4KM | DType::Q5KM) {
                 let d2 = half::f16::from_f32(0.02 + 0.003 * (bi % 5) as f32);
                 blk[2..4].copy_from_slice(&d2.to_bits().to_le_bytes());
             }
@@ -6650,6 +6697,100 @@ mod tests {
                     a.to_bits(),
                     b.to_bits(),
                     "Q4_K_M row {i}: gemv_dispatch {a:e} vs gemv_with_preq {b:e}"
+                );
+            }
+        }
+
+        #[test]
+        fn gemv_with_preq_argmax_matches_argmax_of_gemv_with_preq() {
+            let (m, k) = (64usize, 256usize);
+            let mut st = 0xbeef_cafe_1234u64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut scales = vec![0.0f32; k / 32];
+            let mut quants = vec![0i8; k];
+            quantize_f32_to_q8_0_into(&x, &mut scales, &mut quants);
+
+            for dtype in [DType::Q4_0, DType::Q6K] {
+                let data = weights(dtype, m, k, &mut st);
+                let mut logits = vec![0.0f32; m];
+                gemv_with_preq(dtype, &data, &scales, &quants, &x, &mut logits, m, k);
+                let want = crate::sampler::argmax(&logits) as usize;
+
+                let got = gemv_with_preq_argmax(dtype, &data, &scales, &quants, &x, m, k);
+                assert_eq!(
+                    got, want,
+                    "{dtype:?}: gemv_with_preq_argmax ({got}) vs argmax(gemv_with_preq) ({want})"
+                );
+            }
+
+            // Zero-length input check.
+            assert_eq!(
+                gemv_with_preq_argmax(DType::Q6K, &[], &[], &[], &[], 0, 0),
+                0
+            );
+
+            // Test non-multiple of 256 k for fallback routing.
+            let (m_sub, k_sub) = (32usize, 128usize);
+            let x_sub: Vec<f32> = (0..k_sub)
+                .map(|_| (lcg(&mut st) % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut s_sub = vec![0.0f32; k_sub / 32];
+            let mut q_sub = vec![0i8; k_sub];
+            quantize_f32_to_q8_0_into(&x_sub, &mut s_sub, &mut q_sub);
+            let data_sub = weights(DType::Q4_0, m_sub, k_sub, &mut st);
+            let mut logits_sub = vec![0.0f32; m_sub];
+            gemv_with_preq(
+                DType::Q4_0,
+                &data_sub,
+                &s_sub,
+                &q_sub,
+                &x_sub,
+                &mut logits_sub,
+                m_sub,
+                k_sub,
+            );
+            let want_sub = crate::sampler::argmax(&logits_sub) as usize;
+            let got_sub =
+                gemv_with_preq_argmax(DType::Q4_0, &data_sub, &s_sub, &q_sub, &x_sub, m_sub, k_sub);
+            assert_eq!(got_sub, want_sub);
+        }
+
+        #[test]
+        fn gemv_with_preq_handles_y_len_greater_than_m() {
+            let (m, k) = (16usize, 256usize);
+            let mut st = 0x1234_5678_90abu64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut scales = vec![0.0f32; k / 32];
+            let mut quants = vec![0i8; k];
+            quantize_f32_to_q8_0_into(&x, &mut scales, &mut quants);
+
+            let dtypes = [
+                DType::Q4_0,
+                DType::Q4_1,
+                DType::Q8_0,
+                DType::Q6K,
+                DType::Q5KM,
+                DType::Q4KM,
+            ];
+
+            for dtype in dtypes {
+                let data = weights(dtype, m, k, &mut st);
+                // y buffer with extra length beyond m.
+                let mut y_oversized = vec![999.0f32; m + 32];
+                gemv_with_preq(dtype, &data, &scales, &quants, &x, &mut y_oversized, m, k);
+                assert!(
+                    y_oversized[..m].iter().any(|&v| v != 999.0),
+                    "expected computed elements for {:?}",
+                    dtype
+                );
+                assert!(
+                    y_oversized[m..].iter().all(|&v| v == 999.0),
+                    "trailing buffer elements overwritten for {:?}",
+                    dtype
                 );
             }
         }

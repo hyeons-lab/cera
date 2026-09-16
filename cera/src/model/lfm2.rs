@@ -1649,7 +1649,14 @@ impl Lfm2Model {
             let q_ref = refs.attn_q.as_ref().unwrap();
             let k_ref = refs.attn_k.as_ref().unwrap();
             let v_ref = refs.attn_v.as_ref().unwrap();
-            if q_ref.dtype == DType::Q4_0
+            let valid_dims = q_ref.k == cfg.hidden_size
+                && k_ref.k == cfg.hidden_size
+                && v_ref.k == cfg.hidden_size
+                && q_ref.m == cfg.hidden_size
+                && k_ref.m == kv_dim
+                && v_ref.m == kv_dim;
+            if valid_dims
+                && q_ref.dtype == DType::Q4_0
                 && k_ref.dtype == DType::Q4_0
                 && v_ref.dtype == DType::Q4_0
             {
@@ -1670,7 +1677,8 @@ impl Lfm2Model {
                     kv_dim,
                     cfg.hidden_size,
                 );
-            } else if q_ref.dtype == DType::Q4KM
+            } else if valid_dims
+                && q_ref.dtype == DType::Q4KM
                 && k_ref.dtype == DType::Q4KM
                 && v_ref.dtype == DType::Q4KM
             {
@@ -1691,7 +1699,8 @@ impl Lfm2Model {
                     kv_dim,
                     cfg.hidden_size,
                 );
-            } else if q_ref.dtype == DType::Q5KM
+            } else if valid_dims
+                && q_ref.dtype == DType::Q5KM
                 && k_ref.dtype == DType::Q5KM
                 && v_ref.dtype == DType::Q5KM
             {
@@ -2066,7 +2075,11 @@ impl Lfm2Model {
         let mut t_ffn = std::time::Duration::ZERO;
 
         for i in 0..cfg.n_layers {
-            let t0 = std::time::Instant::now();
+            let t0 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.attn_norm_weights[i],
@@ -2075,26 +2088,34 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut normed),
             );
-            if profile {
-                t_norm += t0.elapsed();
+            if let Some(t) = t0 {
+                t_norm += t.elapsed();
             }
 
-            let t1 = std::time::Instant::now();
+            let t1 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if cfg.block_types[i] == BlockType::GatedConv {
                 self.forward_conv_block(i, &normed, pos, state);
-                if profile {
-                    t_conv += t1.elapsed();
+                if let Some(t) = t1 {
+                    t_conv += t.elapsed();
                 }
             } else {
                 self.forward_attn_block(i, &normed, pos, state);
-                if profile {
-                    t_attn += t1.elapsed();
+                if let Some(t) = t1 {
+                    t_attn += t.elapsed();
                 }
             }
 
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
-            let t2 = std::time::Instant::now();
+            let t2 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.ffn_norm_weights[i],
@@ -2103,11 +2124,15 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut ffn_input),
             );
-            if profile {
-                t_norm += t2.elapsed();
+            if let Some(t) = t2 {
+                t_norm += t.elapsed();
             }
 
-            let t3 = std::time::Instant::now();
+            let t3 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             match &self.layer_refs[i].ffn {
                 FfnRefs::Dense(dense) => {
                     let ffn_weights = FfnWeights {
@@ -2127,8 +2152,8 @@ impl Lfm2Model {
                 }
                 FfnRefs::Moe(moe) => self.forward_moe_ffn(i, moe, hs, &ffn_input, state),
             }
-            if profile {
-                t_ffn += t3.elapsed();
+            if let Some(t) = t3 {
+                t_ffn += t.elapsed();
             }
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
@@ -4335,12 +4360,30 @@ impl Model for Lfm2Model {
             return 0;
         }
         if tokens.len() > 1 {
-            for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
-                let _ = self.forward(&[t], pos + i, state);
+            if transformer::oracle_dump::is_active() {
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let _ = self.forward(&[t], pos + i, state);
+                }
+            } else {
+                let cfg = &self.config;
+                let mut hidden_stack = [0.0f32; 4096];
+                let mut hidden_heap;
+                let hidden = if cfg.hidden_size <= 4096 {
+                    &mut hidden_stack[..cfg.hidden_size]
+                } else {
+                    hidden_heap = vec![0.0f32; cfg.hidden_size];
+                    &mut hidden_heap[..]
+                };
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let token_id = t as usize;
+                    if token_id >= cfg.vocab_size {
+                        continue;
+                    }
+                    self.dequantize_row_into(&self.embd_ref, token_id, hidden);
+                    self.run_layers(hidden, pos + i, state);
+                }
             }
-            let last_token = [tokens[tokens.len() - 1]];
-            let logits = self.forward(&last_token, pos + tokens.len() - 1, state);
-            return crate::sampler::argmax(&logits);
+            return self.forward_greedy(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
         }
         if transformer::oracle_dump::is_active() {
             let logits = self.forward(tokens, pos, state);
@@ -4365,7 +4408,7 @@ impl Model for Lfm2Model {
         self.run_layers(hidden, pos, state);
 
         #[cfg(target_arch = "aarch64")]
-        if self.embd_ref.dtype == DType::Q6K {
+        if self.embd_ref.dtype == DType::Q6K && self.config.scalars.logit > 0.0 {
             let profile = Self::profile_decode_enabled();
             let t_lm = std::time::Instant::now();
             let res = transformer::gemv_preq_argmax(

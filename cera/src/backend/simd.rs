@@ -917,9 +917,17 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q4_0_q8_0_neon_dotprod: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         unsafe {
             let blocks_per_row = k / 32;
             let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
@@ -1583,7 +1591,7 @@ pub(crate) mod neon {
         }
     }
 
-    /// Fused 4-row unrolled Gate + Up GEMV with in-register SwiGLU:
+    /// Fused 2-row unrolled Gate + Up GEMV with in-register SwiGLU:
     /// `out[r] = silu(gate[r] · x) * (up[r] · x)`.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_q4_0_gate_up_swiglu_neon(
@@ -3201,17 +3209,22 @@ pub(crate) mod neon {
         a_quant: &[u8],
         x: &[f32],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if y.len() < m {
+            debug_assert!(false, "gemv_q4_0_f32_neon: destination buffer underflow");
+            return;
+        }
+        let y = &mut y[..m];
         unsafe {
             let n_blocks = k / 32;
             q8_scales.resize(n_blocks, 0.0);
             q8_quants.resize(k, 0);
             quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-            gemv_q4_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+            gemv_q4_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, m, k);
         }
     }
 
@@ -3222,9 +3235,17 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q8_0_q8_0_neon_dotprod: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         unsafe {
             let n_blocks = k / 32;
             let row_bytes = n_blocks * size_of::<BlockQ8_0>();
@@ -3359,17 +3380,22 @@ pub(crate) mod neon {
         a_quant: &[u8],
         x: &[f32],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if y.len() < m {
+            debug_assert!(false, "gemv_q8_0_f32_neon: destination buffer underflow");
+            return;
+        }
+        let y = &mut y[..m];
         unsafe {
             let n_blocks = k / 32;
             q8_scales.resize(n_blocks, 0.0);
             q8_quants.resize(k, 0);
             quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-            gemv_q8_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, _m, k);
+            gemv_q8_0_q8_0_neon(a_quant, q8_scales, q8_quants, y, m, k);
         }
     }
 
@@ -3383,9 +3409,17 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q6k_q8_0_neon_dotprod: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         unsafe {
             let blocks_per_row = k / 256;
             let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
@@ -3518,6 +3552,9 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) -> usize {
+        if m == 0 || k == 0 || !k.is_multiple_of(256) {
+            return 0;
+        }
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
         let pool = crate::backend::threadpool::RowPool::decode();
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -3545,7 +3582,7 @@ pub(crate) mod neon {
 
         let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
             let num_rows = slice_len;
-            let chunk_idx = start_row / chunk;
+            let chunk_idx = (start_row / chunk).min(n_chunks.saturating_sub(1));
 
             let mask_0f = vdupq_n_u8(0x0F);
             let mask_03 = vdupq_n_u8(0x03);
@@ -3860,11 +3897,18 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
         debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
-        debug_assert_eq!(y.len(), _m, "Q4_K GEMV: y.len() must equal m");
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q4k_q8_0_neon_dotprod: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         debug_assert!(
             x_scales.len() >= k / 32 && x_quants.len() >= k,
             "Q4_K GEMV: activation scratch too small"
@@ -3876,7 +3920,7 @@ pub(crate) mod neon {
             // `gemv_q4km_f32`): each of the m rows reads `row_bytes` from a_quant.
             debug_assert_eq!(
                 a_quant.len(),
-                _m * row_bytes,
+                m * row_bytes,
                 "Q4_K GEMV: a_quant size mismatch"
             );
             let a_base = a_quant.as_ptr() as usize;
@@ -3977,11 +4021,18 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
         debug_assert_eq!(k % 256, 0, "Q5_K GEMV: k must be divisible by 256");
-        debug_assert_eq!(y.len(), _m, "Q5_K GEMV: y.len() must equal m");
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q5k_q8_0_neon_dotprod: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         debug_assert!(
             x_scales.len() >= k / 32 && x_quants.len() >= k,
             "Q5_K GEMV: activation scratch too small"
@@ -3991,7 +4042,7 @@ pub(crate) mod neon {
             let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
             debug_assert_eq!(
                 a_quant.len(),
-                _m * row_bytes,
+                m * row_bytes,
                 "Q5_K GEMV: a_quant size mismatch"
             );
             let a_base = a_quant.as_ptr() as usize;
@@ -4251,27 +4302,25 @@ pub(crate) mod neon {
         }
     }
 
-    /// Batched GEMM: C[m, n] = A_q4_1[m, k] @ B_q8_0[k, n].
-    ///
-    /// Q4_1 dequant is `w = d·q + m` with `q ∈ [0, 15]`, no `−8` recentering. Against
-    /// a Q8_0-quantized activation column (`x = xs · xq`), the per-32-block contribution
-    /// is
-    ///
-    /// ```text
-    /// out[i][j] += xs · ( d·Σ(q·xq) + m·Σ(xq) )
-    /// ```
-    ///
-    /// `Σ(q·xq)` is the int8 dot; `Σ(xq)` is the activation block-sum, hoisted once per
-    /// column by [`q8_0_col_sums`] exactly like the Q4_K min term, but **added**, since
-    /// Q4_1's `m` raises the value where the K-quant `dmin` subtracts. A Q4_1 block is 32
-    /// values, aligning 1:1 with the Q8_0 input blocks, so weight block `bi` dots input
-    /// block `bi` with no superblock bookkeeping. Nibble layout mirrors
-    /// `dequantize_q4_1_block`: low nibble of `qs[t]` → element index `t`, high nibble →
-    /// index `t + 16`, so the low/high halves pair with input halves `x0`/`x1`.
     /// NEON Q4_1 × Q8_0 integer GEMV with pre-quantized input using dotprod.
     ///
-    /// Evaluates `m` rows with 4-row register tiling, shared activation loads,
-    /// and stack-allocated activation column sums.
+    /// Evaluates `y[m] = A_q4_1[m, k] @ x_q8_0[k]` with 4-row register tiling,
+    /// shared activation loads, and stack-allocated activation column sums.
+    ///
+    /// Q4_1 dequant is `w = d·q + m` with `q ∈ [0, 15]`, no `−8` recentering. Against
+    /// a Q8_0-quantized activation vector (`x = xs · xq`), the per-32-block contribution is:
+    ///
+    /// ```text
+    /// y[i] += xs · ( d·Σ(q·xq) + m·Σ(xq) )
+    /// ```
+    ///
+    /// `Σ(q·xq)` is the int8 dot; `Σ(xq)` is the activation block-sum, hoisted once
+    /// by [`q8_0_col_sums`] exactly like the Q4_K min term, but added (since Q4_1's `m`
+    /// raises the value where K-quant `dmin` subtracts). A Q4_1 block is 32 values, aligning
+    /// 1:1 with the Q8_0 input blocks, so weight block `bi` dots input block `bi` with no
+    /// superblock bookkeeping. Nibble layout mirrors `dequantize_q4_1_block`: low nibble of
+    /// `qs[t]` -> element index `t`, high nibble -> index `t + 16`, so the low/high halves
+    /// pair with input halves `x0`/`x1`.
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn gemv_q4_1_q8_0_neon_dotprod(
         a_quant: &[u8],
@@ -4281,6 +4330,7 @@ pub(crate) mod neon {
         _m: usize,
         k: usize,
     ) {
+        let y = &mut y[.._m];
         debug_assert_eq!(k % 32, 0, "Q4_1 GEMV: k must be divisible by 32");
         debug_assert_eq!(y.len(), _m, "Q4_1 GEMV: y.len() must equal m");
         debug_assert!(
@@ -5365,18 +5415,23 @@ pub(crate) mod neon {
         a_quant: &[u8],
         x: &[f32],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if y.len() < m {
+            debug_assert!(false, "gemv_q6k_f32_neon: destination buffer underflow");
+            return;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe {
                 let n_blocks = k / 32;
                 q8_scales.resize(n_blocks, 0.0);
                 q8_quants.resize(k, 0);
                 quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-                gemv_q6k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, _m, k);
+                gemv_q6k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, m, k);
             }
         } else {
             gemv_q6k_fallback(a_quant, x, y, k);
@@ -5391,16 +5446,21 @@ pub(crate) mod neon {
         a_quant: &[u8],
         x: &[f32],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if y.len() < m {
+            debug_assert!(false, "gemv_q4k_f32_neon: destination buffer underflow");
+            return;
+        }
+        let y = &mut y[..m];
         // Shape checks matching the scalar `gemv_q4km_f32`; in particular
         // `k % 256 == 0`, else `blocks_per_row = k / 256` would silently
         // truncate the row instead of failing.
         debug_assert_eq!(x.len(), k);
-        debug_assert_eq!(y.len(), _m);
+        debug_assert_eq!(y.len(), m);
         debug_assert_eq!(k % 256, 0, "Q4_K GEMV: k must be divisible by 256");
         if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe {
@@ -5408,10 +5468,10 @@ pub(crate) mod neon {
                 q8_scales.resize(n_blocks, 0.0);
                 q8_quants.resize(k, 0);
                 quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-                gemv_q4k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, _m, k);
+                gemv_q4k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, m, k);
             }
         } else {
-            crate::backend::cpu::gemv_q4km_f32(a_quant, x, y, _m, k);
+            crate::backend::cpu::gemv_q4km_f32(a_quant, x, y, m, k);
         }
     }
 
@@ -5420,13 +5480,18 @@ pub(crate) mod neon {
         a_quant: &[u8],
         x: &[f32],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
         q8_scales: &mut Vec<f32>,
         q8_quants: &mut Vec<i8>,
     ) {
+        if y.len() < m {
+            debug_assert!(false, "gemv_q5k_f32_neon: destination buffer underflow");
+            return;
+        }
+        let y = &mut y[..m];
         debug_assert_eq!(x.len(), k);
-        debug_assert_eq!(y.len(), _m);
+        debug_assert_eq!(y.len(), m);
         debug_assert_eq!(k % 256, 0, "Q5_K GEMV: k must be divisible by 256");
         if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe {
@@ -5434,10 +5499,10 @@ pub(crate) mod neon {
                 q8_scales.resize(n_blocks, 0.0);
                 q8_quants.resize(k, 0);
                 quantize_f32_to_q8_0_neon(x, q8_scales, q8_quants);
-                gemv_q5k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, _m, k);
+                gemv_q5k_q8_0_neon_dotprod(a_quant, q8_scales, q8_quants, y, m, k);
             }
         } else {
-            crate::backend::cpu::gemv_q5km_f32(a_quant, x, y, _m, k);
+            crate::backend::cpu::gemv_q5km_f32(a_quant, x, y, m, k);
         }
     }
 
@@ -5492,9 +5557,17 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q4_0_q8_0_neon_base: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         let blocks_per_row = k / 32;
         let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
         let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
@@ -5535,9 +5608,17 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q8_0_q8_0_neon_base: destination buffer underflow"
+            );
+            return;
+        }
+        let y = &mut y[..m];
         let blocks_per_row = k / 32;
         let row_bytes = blocks_per_row * size_of::<BlockQ8_0>();
         let compute_row = |(i, yi): (usize, &mut f32)| unsafe {
@@ -5686,15 +5767,25 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q4_0_q8_0_neon: destination buffer underflow: {} < {}",
+                y.len(),
+                m
+            );
+            return;
+        }
+        let y = &mut y[..m];
         // Compare against `tier` (not the raw `dotprod` flag) so `CERA_CPU_TIER`
         // can force the base path, e.g. for parity testing on dotprod hardware.
         if cpu_features().tier >= CpuTier::NeonDotprod {
-            unsafe { gemv_q4_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q4_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) }
         } else {
-            unsafe { gemv_q4_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q4_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, m, k) }
         }
     }
 
@@ -5704,13 +5795,23 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q8_0_q8_0_neon: destination buffer underflow: {} < {}",
+                y.len(),
+                m
+            );
+            return;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
-            unsafe { gemv_q8_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q8_0_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) }
         } else {
-            unsafe { gemv_q8_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q8_0_q8_0_neon_base(a_quant, x_scales, x_quants, y, m, k) }
         }
     }
 
@@ -5720,11 +5821,21 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q6k_q8_0_neon: destination buffer underflow: {} < {}",
+                y.len(),
+                m
+            );
+            return;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
-            unsafe { gemv_q6k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q6k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) }
         } else {
             let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
             gemv_q6k_fallback(a_quant, &xf, y, k);
@@ -5737,14 +5848,24 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q5k_q8_0_neon: destination buffer underflow: {} < {}",
+                y.len(),
+                m
+            );
+            return;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
-            unsafe { gemv_q5k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q5k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) }
         } else {
             let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
-            crate::backend::cpu::gemv_q5km_f32(a_quant, &xf, y, _m, k);
+            crate::backend::cpu::gemv_q5km_f32(a_quant, &xf, y, m, k);
         }
     }
 
@@ -5754,14 +5875,24 @@ pub(crate) mod neon {
         x_scales: &[f32],
         x_quants: &[i8],
         y: &mut [f32],
-        _m: usize,
+        m: usize,
         k: usize,
     ) {
+        if y.len() < m {
+            debug_assert!(
+                false,
+                "gemv_q4k_q8_0_neon: destination buffer underflow: {} < {}",
+                y.len(),
+                m
+            );
+            return;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
-            unsafe { gemv_q4k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, _m, k) }
+            unsafe { gemv_q4k_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) }
         } else {
             let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
-            crate::backend::cpu::gemv_q4km_f32(a_quant, &xf, y, _m, k);
+            crate::backend::cpu::gemv_q4km_f32(a_quant, &xf, y, m, k);
         }
     }
 
@@ -7212,6 +7343,19 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) -> bool {
+        if k == 0 || !k.is_multiple_of(32) || y.len() < m {
+            return false;
+        }
+        let nb = k / 32;
+        let row_bytes = nb * size_of::<BlockQ4_1>();
+        let expected_a_len = match m.checked_mul(row_bytes) {
+            Some(l) => l,
+            None => return false,
+        };
+        if a_quant.len() < expected_a_len || x_scales.len() < nb || x_quants.len() < k {
+            return false;
+        }
+        let y = &mut y[..m];
         if cpu_features().tier >= CpuTier::NeonDotprod {
             unsafe { gemv_q4_1_q8_0_neon_dotprod(a_quant, x_scales, x_quants, y, m, k) };
             true

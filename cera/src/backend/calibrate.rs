@@ -264,12 +264,7 @@ pub fn decode_thread_count(topo: &CoreTopology) -> usize {
     #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     let allow_sizing = env_overrides().narrow.is_some()
         || env_overrides().wide.is_some()
-        || std::env::var("CERA_DECODE_SIZING")
-            .map(|v| {
-                let s = v.trim();
-                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false);
+        || std::env::var("CERA_DECODE_SIZING").as_deref() == Ok("1");
     #[cfg(not(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
     let allow_sizing = true;
 
