@@ -1026,7 +1026,9 @@ fn build_pretokenize_regex(pre_type: &str) -> Regex {
         // arm, so cera's unknown-type fallback was already correct and naming it
         // only drops the warning. `smaug-bpe` shares that arm but stays out
         // until the test corpus covers it.
-        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" => concat!(
+        // `minicpm` and `minicpm5` map to LLAMA_VOCAB_PRE_TYPE_MINICPM5 in
+        // llama.cpp, which shares the identical LLAMA3 regex pattern.
+        "lfm2" | "llama3" | "llama-v3" | "llama-bpe" | "dbrx" | "minicpm" | "minicpm5" => concat!(
             r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
             r"|[^\r\n\p{L}\p{N}]?\p{L}+",
             r"|\p{N}{1,3}",
@@ -1293,6 +1295,18 @@ mod tests {
         // retokenize every Granite 4.x GGUF.
         assert_eq!(
             build_pretokenize_regex("dbrx").as_str(),
+            build_pretokenize_regex("llama3").as_str(),
+        );
+    }
+
+    #[test]
+    fn test_pretokenize_minicpm5_matches_llama3() {
+        assert_eq!(
+            build_pretokenize_regex("minicpm5").as_str(),
+            build_pretokenize_regex("llama3").as_str(),
+        );
+        assert_eq!(
+            build_pretokenize_regex("minicpm").as_str(),
             build_pretokenize_regex("llama3").as_str(),
         );
     }
