@@ -408,7 +408,13 @@ def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
         text,
     ]
     if subprocess.run(say_cmd, capture_output=True).returncode == 0:
-        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 100
+        if os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            try:
+                with wave.open(output_wav, "rb") as wf:
+                    if wf.getnchannels() == 1 and wf.getsampwidth() == 2 and wf.getframerate() == 16000:
+                        return True
+            except Exception:
+                pass
 
     # Fallback to AIFF + afconvert
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp_aiff:
@@ -429,7 +435,13 @@ def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
         if subprocess.run(convert_cmd, capture_output=True).returncode != 0:
             return False
 
-        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 100
+        if os.path.exists(output_wav) and os.path.getsize(output_wav) > 100:
+            try:
+                with wave.open(output_wav, "rb") as wf:
+                    return wf.getnchannels() == 1 and wf.getsampwidth() == 2 and wf.getframerate() == 16000
+            except Exception:
+                return False
+        return False
     finally:
         if os.path.exists(aiff_path):
             os.remove(aiff_path)
@@ -438,9 +450,18 @@ def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
 def read_wav(path: str) -> np.ndarray:
     """Read a 16 kHz mono 16-bit PCM WAV into float32 array in [-1.0, 1.0]."""
     with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
         n_frames = wf.getnframes()
         data = wf.readframes(n_frames)
+    if sampwidth != 2:
+        raise ValueError(f"Expected 16-bit PCM audio, got sample width {sampwidth} in {path}")
+    if framerate != 16000:
+        raise ValueError(f"Expected 16 kHz audio, got framerate {framerate} in {path}")
     audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
     return audio
 
 
