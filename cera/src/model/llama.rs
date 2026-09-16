@@ -1644,7 +1644,7 @@ impl Model for LlamaModel {
         let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
         #[cfg(target_arch = "aarch64")]
         {
-            if out_ref.dtype == crate::tensor::DType::Q6K {
+            if out_ref.dtype == crate::tensor::DType::Q6K && self.config.scalars.logit > 0.0 {
                 transformer::quantize_to_scratch(hidden, state);
                 return transformer::gemv_preq_argmax(
                     &self.gguf,

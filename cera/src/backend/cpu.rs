@@ -3073,6 +3073,11 @@ pub fn gemv_bf16(a: &[u8], x: &[f32], y: &mut [f32], m: usize, k: usize) {
     }
 }
 
+// Thread-local scratch buffers to avoid per-call allocation during fallback GEMV.
+//
+// Invariant: Dispatched GEMV functions should execute as leaf operations on the thread.
+// To eliminate re-entrancy panic hazards, `with_gemv_scratch` uses `try_borrow_mut()`,
+// falling back safely to temporary allocation if a nested borrow occurs.
 thread_local! {
     static GEMV_DISPATCH_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<i8>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -3091,10 +3096,16 @@ fn with_gemv_scratch<R>(
         GEMV_DISPATCH_SCRATCH.with(|cell| {
             if let Ok(mut borrow) = cell.try_borrow_mut() {
                 let (s, q) = &mut *borrow;
+                if s.capacity() < 128 {
+                    s.reserve(128);
+                }
+                if q.capacity() < 4096 {
+                    q.reserve(4096);
+                }
                 f(s, q)
             } else {
-                let mut s = Vec::new();
-                let mut q = Vec::new();
+                let mut s = Vec::with_capacity(128);
+                let mut q = Vec::with_capacity(4096);
                 f(&mut s, &mut q)
             }
         })
@@ -6606,6 +6617,39 @@ mod tests {
                     "Q4_1 row {i}: gemv_dispatch {a:e} vs gemv_with_preq {b:e}, so \
                      the pre-quantized decode path is not the path everything else \
                      is pinned against"
+                );
+            }
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn gemv_with_preq_matches_gemv_dispatch_for_q4k() {
+            let (m, k) = (7usize, 512usize);
+            let mut st = 0x1dea_5eedu64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 4000) as f32 / 1000.0 - 2.0)
+                .collect();
+            let data = weights(DType::Q4KM, m, k, &mut st);
+
+            let mut scales = vec![0.0f32; k / 32];
+            let mut quants = vec![0i8; k];
+            quantize_f32_to_q8_0_into(&x, &mut scales, &mut quants);
+
+            let mut want = vec![0.0f32; m];
+            gemv_dispatch(DType::Q4KM, &data, &x, &mut want, m, k, None);
+            assert!(
+                want.iter().any(|v| *v != 0.0),
+                "reference produced all zeros, so the comparison proves nothing"
+            );
+
+            let mut got = vec![0.0f32; m];
+            gemv_with_preq(DType::Q4KM, &data, &scales, &quants, &x, &mut got, m, k);
+
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "Q4_K_M row {i}: gemv_dispatch {a:e} vs gemv_with_preq {b:e}"
                 );
             }
         }
