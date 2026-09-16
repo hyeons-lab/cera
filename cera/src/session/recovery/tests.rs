@@ -35,6 +35,7 @@ impl FaultModel {
                 rms_norm_eps: 1e-5,
                 block_types: vec![crate::model::BlockType::Attention],
                 conv_kernel_size: None,
+                ssm: None,
                 kv_heads_per_layer: vec![1],
                 scalars: ScalarMultipliers::default(),
                 moe: None,

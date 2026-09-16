@@ -416,6 +416,7 @@ fn test_mamba2_session_rollback_clears_last_logits() {
         images: Vec::new(),
         audio: None,
     };
+    #[allow(deprecated)]
     let append_res = session.append_user_message(&msg);
     assert!(append_res.is_err());
     assert_eq!(session.position(), 0);

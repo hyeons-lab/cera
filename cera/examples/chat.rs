@@ -15,8 +15,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or("usage: chat <model.gguf>")?;
 
-    println!("Loading model from: {path}");
-    let model = ModelLoader::new(ModelSource::path(path)).build_generative()?;
+    #[cfg(feature = "mmap")]
+    let source = ModelSource::path(path);
+    #[cfg(not(feature = "mmap"))]
+    let source = ModelSource::bytes(std::fs::read(path)?);
+    let model = ModelLoader::new(source).build_generative()?;
     let session = model.create_session(SessionConfig {
         seed: Some(42),
         ..SessionConfig::default()

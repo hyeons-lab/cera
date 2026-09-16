@@ -1948,4 +1948,33 @@ impl Model for Gemma4Model {
     fn config(&self) -> &ModelConfig {
         &self.config
     }
+
+    fn try_reset_kv(
+        &self,
+        state: &mut InferenceState,
+        compression: &crate::kv_cache::KvCompression,
+        max_seq_len: usize,
+    ) -> Result<(), crate::session::CeraError> {
+        super::reset_cpu_kv(self, state, compression, max_seq_len)
+    }
+
+    fn check_kv_rewind(
+        &self,
+        state: &InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        state.check_truncate_to(len)
+    }
+
+    fn try_truncate_kv(
+        &self,
+        state: &mut InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        state.try_truncate_to(len)
+    }
+
+    fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        state.truncate_to(len);
+    }
 }

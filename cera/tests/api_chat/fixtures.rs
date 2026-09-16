@@ -93,6 +93,7 @@ pub fn model_config(architecture: &str, vocab_size: usize) -> ModelConfig {
         rms_norm_eps: 1e-5,
         block_types: vec![BlockType::Attention],
         conv_kernel_size: None,
+        ssm: None,
         kv_heads_per_layer: vec![1],
         scalars: ScalarMultipliers::default(),
         moe: None,

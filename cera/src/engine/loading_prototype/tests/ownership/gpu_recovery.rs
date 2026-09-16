@@ -17,36 +17,60 @@ fn load_device(bytes: Arc<[u8]>, backend: BackendPreference) -> GenerativeModel 
         .unwrap()
 }
 
+fn assert_empty_layer(layer: &LayerSnapshot) {
+    match layer {
+        LayerSnapshot::Attention { k_data, v_data }
+        | LayerSnapshot::AttentionF16 { k_data, v_data } => {
+            assert!(k_data.is_empty() && v_data.is_empty());
+        }
+        LayerSnapshot::AttentionCompressed { keys, values } => {
+            assert_eq!(
+                crate::turboquant::decode_compressed_keys(keys)
+                    .unwrap()
+                    .seq_len(),
+                0
+            );
+            assert_eq!(
+                crate::turboquant::decode_compressed_values(values)
+                    .unwrap()
+                    .seq_len(),
+                0
+            );
+        }
+        LayerSnapshot::Conv { buffer } => {
+            assert!(!buffer.is_empty());
+            assert!(
+                buffer.iter().all(|&byte| byte == 0),
+                "device convolution was not cleared"
+            );
+        }
+        LayerSnapshot::Mamba2 {
+            conv_state,
+            ssm_state,
+        }
+        | LayerSnapshot::DeltaNet {
+            conv_state,
+            ssm_state,
+        } => {
+            assert!(conv_state.iter().all(|&byte| byte == 0));
+            assert!(ssm_state.iter().all(|&byte| byte == 0));
+        }
+        LayerSnapshot::ParallelAttentionMamba2 {
+            snap,
+            conv_state,
+            ssm_state,
+        } => {
+            assert_empty_layer(snap);
+            assert!(conv_state.iter().all(|&byte| byte == 0));
+            assert!(ssm_state.iter().all(|&byte| byte == 0));
+        }
+    }
+}
+
 fn assert_empty(snapshot: &StateSnapshot) {
     assert_eq!(snapshot.seq_len, 0);
     for layer in &snapshot.layers {
-        match layer {
-            LayerSnapshot::Attention { k_data, v_data }
-            | LayerSnapshot::AttentionF16 { k_data, v_data } => {
-                assert!(k_data.is_empty() && v_data.is_empty());
-            }
-            LayerSnapshot::AttentionCompressed { keys, values } => {
-                assert_eq!(
-                    crate::turboquant::decode_compressed_keys(keys)
-                        .unwrap()
-                        .seq_len(),
-                    0
-                );
-                assert_eq!(
-                    crate::turboquant::decode_compressed_values(values)
-                        .unwrap()
-                        .seq_len(),
-                    0
-                );
-            }
-            LayerSnapshot::Conv { buffer } => {
-                assert!(!buffer.is_empty());
-                assert!(
-                    buffer.iter().all(|&byte| byte == 0),
-                    "device convolution was not cleared"
-                );
-            }
-        }
+        assert_empty_layer(layer);
     }
 }
 

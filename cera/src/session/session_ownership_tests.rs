@@ -29,6 +29,7 @@ fn config() -> ModelConfig {
         rms_norm_eps: 1e-5,
         block_types: Vec::new(),
         conv_kernel_size: None,
+        ssm: None,
         kv_heads_per_layer: Vec::new(),
         scalars: ScalarMultipliers::default(),
         moe: None,

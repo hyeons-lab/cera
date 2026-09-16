@@ -65,6 +65,32 @@ fn image(state: &InferenceState) -> String {
                     .map(crate::turboquant::encode_compressed_values)
             ),
             LayerState::Conv { buffer, history } => format!("{buffer:?}{history:?}"),
+            LayerState::Mamba2 {
+                conv_state,
+                ssm_state,
+            }
+            | LayerState::DeltaNet {
+                conv_state,
+                ssm_state,
+            } => format!("{conv_state:?}{ssm_state:?}"),
+            LayerState::ParallelAttentionMamba2 {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                compressed_keys,
+                compressed_values,
+                conv_state,
+                ssm_state,
+            } => format!(
+                "{key_cache:?}{value_cache:?}{key_cache_f16:?}{value_cache_f16:?}{:?}{:?}{conv_state:?}{ssm_state:?}",
+                compressed_keys
+                    .as_ref()
+                    .map(crate::turboquant::encode_compressed_keys),
+                compressed_values
+                    .as_ref()
+                    .map(crate::turboquant::encode_compressed_values)
+            ),
         });
     }
     out
