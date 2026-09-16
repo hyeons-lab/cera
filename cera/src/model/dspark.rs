@@ -180,6 +180,7 @@ impl DSparkConfig {
             rms_norm_eps: self.rms_norm_eps,
             block_types: vec![BlockType::Attention; self.num_layers],
             conv_kernel_size: None,
+            ssm: None,
             kv_heads_per_layer: vec![self.num_kv_heads; self.num_layers],
             scalars: ScalarMultipliers::default(),
             moe: None,
