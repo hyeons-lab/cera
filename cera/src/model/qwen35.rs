@@ -346,6 +346,7 @@ impl Qwen35Model {
                         .to_f32_vec();
                     let ssm_a = gguf
                         .get_tensor(&format!("blk.{il}.ssm_a"))
+                        .or_else(|_| gguf.get_tensor(&format!("blk.{il}.ssm_a.weight")))
                         .with_context(|| format!("missing blk.{il}.ssm_a"))?
                         .to_f32_vec();
                     let ssm_beta =
@@ -354,6 +355,7 @@ impl Qwen35Model {
                         transformer::resolve_weight(&gguf, &format!("blk.{il}.ssm_alpha.weight"))?;
                     let ssm_norm = gguf
                         .get_tensor(&format!("blk.{il}.ssm_norm.weight"))
+                        .or_else(|_| gguf.get_tensor(&format!("blk.{il}.ssm_norm")))
                         .with_context(|| format!("missing blk.{il}.ssm_norm.weight"))?
                         .to_f32_vec();
                     let ssm_out =
@@ -648,18 +650,8 @@ impl Qwen35Model {
 
         let mut beta_raw_buf = [0.0f32; 128];
         let mut alpha_raw_buf = [0.0f32; 128];
-        let mut beta_raw_heap;
-        let mut alpha_raw_heap;
-        let (beta_raw, alpha_raw) = if num_v_heads <= 128 {
-            (
-                &mut beta_raw_buf[..num_v_heads],
-                &mut alpha_raw_buf[..num_v_heads],
-            )
-        } else {
-            beta_raw_heap = vec![0.0f32; num_v_heads];
-            alpha_raw_heap = vec![0.0f32; num_v_heads];
-            (beta_raw_heap.as_mut_slice(), alpha_raw_heap.as_mut_slice())
-        };
+        let beta_raw = &mut beta_raw_buf[..num_v_heads];
+        let alpha_raw = &mut alpha_raw_buf[..num_v_heads];
 
         transformer::gemv(&self.gguf, &refs.wqkv, normed, &mut qkv_mixed);
         transformer::gemv(&self.gguf, &refs.wqkv_gate, normed, &mut z);
@@ -710,15 +702,8 @@ impl Qwen35Model {
         let s_dim = head_v_dim;
         let mut sk_buf = [0.0f32; 256];
         let mut d_buf = [0.0f32; 256];
-        let mut sk_heap;
-        let mut d_heap;
-        let (sk, d) = if s_dim <= 256 {
-            (&mut sk_buf[..s_dim], &mut d_buf[..s_dim])
-        } else {
-            sk_heap = vec![0.0f32; s_dim];
-            d_heap = vec![0.0f32; s_dim];
-            (sk_heap.as_mut_slice(), d_heap.as_mut_slice())
-        };
+        let sk = &mut sk_buf[..s_dim];
+        let d = &mut d_buf[..s_dim];
         let heads_per_group = (num_v_heads / num_k_heads.max(1)).max(1);
 
         for h in 0..num_v_heads {
@@ -763,23 +748,12 @@ impl Qwen35Model {
             for i in 0..s_dim {
                 let ki = k[i];
                 let qi = q[i];
-                let row = &mut s_mat[i * s_dim..(i + 1) * s_dim];
-                if ki == 0.0 {
-                    if qi != 0.0 {
-                        for (oh, &r) in o_head.iter_mut().zip(row.iter()) {
-                            *oh += r * qi;
-                        }
-                    }
-                } else if qi == 0.0 {
-                    for (r, &dj) in row.iter_mut().zip(d.iter()) {
-                        *r += ki * dj;
-                    }
-                } else {
-                    for ((r, &dj), oh) in row.iter_mut().zip(d.iter()).zip(o_head.iter_mut()) {
-                        let updated = *r + ki * dj;
-                        *r = updated;
-                        *oh += updated * qi;
-                    }
+                let row_offset = i * s_dim;
+                let row = &mut s_mat[row_offset..row_offset + s_dim];
+                for j in 0..s_dim {
+                    let updated = row[j] + ki * d[j];
+                    row[j] = updated;
+                    o_head[j] += updated * qi;
                 }
             }
         }
@@ -971,6 +945,7 @@ impl Qwen35Model {
     /// Run single token through all layers.
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let hs = self.config.hidden_size;
+        let hidden = &mut hidden[..hs];
         let mut normed = std::mem::take(&mut state.scratch.normed);
         let mut layer_out = std::mem::take(&mut state.scratch.out);
         let mut ffn_in = std::mem::take(&mut state.scratch.ffn_input);
@@ -1043,16 +1018,15 @@ impl Qwen35Model {
     fn project_logits(&self, hidden: &[f32], state: &mut InferenceState) -> Vec<f32> {
         let vocab_size = self.config.vocab_size;
         let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
-        let rows = out_ref.m.max(vocab_size);
-        if state.scratch.logits.len() < rows {
-            state.scratch.logits.resize(rows, 0.0);
+        if state.scratch.logits.len() < out_ref.m {
+            state.scratch.logits.resize(out_ref.m, 0.0);
         }
 
         transformer::gemv(
             &self.gguf,
             out_ref,
-            hidden,
-            &mut state.scratch.logits[..rows],
+            &hidden[..out_ref.k],
+            &mut state.scratch.logits[..out_ref.m],
         );
 
         state.scratch.logits[..vocab_size].to_vec()
@@ -1075,10 +1049,8 @@ impl Model for Qwen35Model {
             cfg.vocab_size
         );
 
-        if state.scratch.hidden_in.len() < cfg.hidden_size {
-            state.scratch.hidden_in.resize(cfg.hidden_size, 0.0);
-        }
         let mut hidden = std::mem::take(&mut state.scratch.hidden_in);
+        hidden.resize(cfg.hidden_size, 0.0);
         transformer::dequantize_row_into(
             &self.gguf,
             &self.embd_ref,
@@ -1088,16 +1060,16 @@ impl Model for Qwen35Model {
         if transformer::oracle_dump::is_active() {
             transformer::oracle_dump::record("embd", &hidden[..cfg.hidden_size]);
         }
-        self.run_layers(&mut hidden, pos, state);
+        self.run_layers(&mut hidden[..cfg.hidden_size], pos, state);
         cpu::rmsnorm(
-            &mut hidden,
+            &mut hidden[..cfg.hidden_size],
             &self.output_norm_weight,
             self.config.rms_norm_eps,
         );
         if transformer::oracle_dump::is_active() {
-            transformer::oracle_dump::record("result_norm", &hidden);
+            transformer::oracle_dump::record("result_norm", &hidden[..cfg.hidden_size]);
         }
-        let logits = self.project_logits(&hidden, state);
+        let logits = self.project_logits(&hidden[..cfg.hidden_size], state);
         if transformer::oracle_dump::is_active() {
             transformer::oracle_dump::record("result_output", &logits);
         }
@@ -1112,10 +1084,9 @@ impl Model for Qwen35Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        assert!(
-            !tokens.is_empty(),
-            "forward_prefill requires at least one token"
-        );
+        if tokens.is_empty() {
+            return Vec::new();
+        }
         assert_eq!(
             start_pos, state.seq_len,
             "start_pos ({start_pos}) must match state.seq_len ({})",
@@ -1126,10 +1097,8 @@ impl Model for Qwen35Model {
         let cfg = &self.config;
 
         if n > 1 {
-            if state.scratch.hidden_in.len() < cfg.hidden_size {
-                state.scratch.hidden_in.resize(cfg.hidden_size, 0.0);
-            }
             let mut hidden = std::mem::take(&mut state.scratch.hidden_in);
+            hidden.resize(cfg.hidden_size, 0.0);
             for (i, &token) in tokens[..n - 1].iter().enumerate() {
                 let token_id = token as usize;
                 assert!(
@@ -1146,7 +1115,7 @@ impl Model for Qwen35Model {
                 if transformer::oracle_dump::is_active() {
                     transformer::oracle_dump::record("embd", &hidden[..cfg.hidden_size]);
                 }
-                self.run_layers(&mut hidden, start_pos + i, state);
+                self.run_layers(&mut hidden[..cfg.hidden_size], start_pos + i, state);
                 state.seq_len = start_pos + i + 1;
             }
             state.scratch.hidden_in = hidden;

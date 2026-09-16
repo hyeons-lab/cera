@@ -1062,55 +1062,75 @@ impl InferenceState {
 
     /// Borrow the Mamba-2 convolution and SSM states for a layer.
     pub fn mamba2_state(&self, layer: usize) -> (&[f32], &[f32]) {
-        match &self.layers[layer] {
-            LayerState::Mamba2 {
-                conv_state,
-                ssm_state,
-            }
-            | LayerState::ParallelAttentionMamba2 {
-                conv_state,
-                ssm_state,
-                ..
-            } => (conv_state, ssm_state),
-            _ => panic!("mamba2_state called on non-mamba2 layer {layer}"),
+        match self.layers.get(layer) {
+            Some(
+                LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                }
+                | LayerState::ParallelAttentionMamba2 {
+                    conv_state,
+                    ssm_state,
+                    ..
+                },
+            ) => (conv_state, ssm_state),
+            Some(_) => panic!("mamba2_state called on non-mamba2 layer {layer}"),
+            None => panic!(
+                "mamba2_state called on out-of-bounds layer {layer} (total layers: {})",
+                self.layers.len()
+            ),
         }
     }
 
     /// Mutably borrow the Mamba-2 convolution and SSM states for a layer.
     pub fn mamba2_state_mut(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
-        match &mut self.layers[layer] {
-            LayerState::Mamba2 {
-                conv_state,
-                ssm_state,
-            }
-            | LayerState::ParallelAttentionMamba2 {
-                conv_state,
-                ssm_state,
-                ..
-            } => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
-            _ => panic!("mamba2_state_mut called on non-mamba2 layer {layer}"),
+        let n_layers = self.layers.len();
+        match self.layers.get_mut(layer) {
+            Some(
+                LayerState::Mamba2 {
+                    conv_state,
+                    ssm_state,
+                }
+                | LayerState::ParallelAttentionMamba2 {
+                    conv_state,
+                    ssm_state,
+                    ..
+                },
+            ) => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
+            Some(_) => panic!("mamba2_state_mut called on non-mamba2 layer {layer}"),
+            None => panic!(
+                "mamba2_state_mut called on out-of-bounds layer {layer} (total layers: {n_layers})"
+            ),
         }
     }
 
     /// Borrow the DeltaNet convolution and SSM states for a layer.
     pub fn deltanet_state(&self, layer: usize) -> (&[f32], &[f32]) {
-        match &self.layers[layer] {
-            LayerState::DeltaNet {
+        match self.layers.get(layer) {
+            Some(LayerState::DeltaNet {
                 conv_state,
                 ssm_state,
-            } => (conv_state, ssm_state),
-            _ => panic!("deltanet_state called on non-deltanet layer {layer}"),
+            }) => (conv_state, ssm_state),
+            Some(_) => panic!("deltanet_state called on non-deltanet layer {layer}"),
+            None => panic!(
+                "deltanet_state called on out-of-bounds layer {layer} (total layers: {})",
+                self.layers.len()
+            ),
         }
     }
 
     /// Mutably borrow the DeltaNet convolution and SSM states for a layer.
     pub fn deltanet_state_mut(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
-        match &mut self.layers[layer] {
-            LayerState::DeltaNet {
+        let n_layers = self.layers.len();
+        match self.layers.get_mut(layer) {
+            Some(LayerState::DeltaNet {
                 conv_state,
                 ssm_state,
-            } => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
-            _ => panic!("deltanet_state_mut called on non-deltanet layer {layer}"),
+            }) => (conv_state.as_mut_slice(), ssm_state.as_mut_slice()),
+            Some(_) => panic!("deltanet_state_mut called on non-deltanet layer {layer}"),
+            None => panic!(
+                "deltanet_state_mut called on out-of-bounds layer {layer} (total layers: {n_layers})"
+            ),
         }
     }
 

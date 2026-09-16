@@ -109,6 +109,13 @@ fn extract_chat_template(tokenizer_config: &serde_json::Value) -> Option<String>
     })
 }
 
+fn transform_qwen35_ssm_a_inplace(f32_data: &mut [f32]) {
+    for v in f32_data.iter_mut() {
+        let clamped = v.clamp(-80.0, 80.0);
+        *v = -clamped.exp();
+    }
+}
+
 /// Stream and quantize a remote Hugging Face SafeTensors repository into a cached GGUF model.
 #[cfg(feature = "remote")]
 pub fn stream_quantize_hf_repo(
@@ -486,11 +493,10 @@ pub fn stream_quantize_hf_repo(
             }
         }
 
-        if matches!(arch, "qwen35" | "qwen3_5" | "qwen3.5") && pt.gguf_name.ends_with(".ssm_a") {
-            for v in f32_data.iter_mut() {
-                let clamped = v.clamp(-80.0, 80.0);
-                *v = -clamped.exp();
-            }
+        if matches!(arch, "qwen35" | "qwen3_5" | "qwen3.5")
+            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
+        {
+            transform_qwen35_ssm_a_inplace(&mut f32_data);
         }
 
         // Quantize to target GGML type
@@ -882,12 +888,9 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         }
 
         if matches!(arch.as_str(), "qwen35" | "qwen3_5" | "qwen3.5")
-            && pt.gguf_name.ends_with(".ssm_a")
+            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
         {
-            for v in f32_data.iter_mut() {
-                let clamped = v.clamp(-80.0, 80.0);
-                *v = -clamped.exp();
-            }
+            transform_qwen35_ssm_a_inplace(&mut f32_data);
         }
 
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);

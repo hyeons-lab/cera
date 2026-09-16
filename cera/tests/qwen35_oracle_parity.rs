@@ -983,3 +983,56 @@ fn qwen35_multi_turn_truncate_and_prefill_continuation() {
         "cosine similarity between truncated-and-reprefilled and fresh state should be > 0.99999, got {sim}"
     );
 }
+
+#[test]
+fn qwen35_oversized_scratch_buffer_forward() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    // Pre-populate shared scratch buffer with oversized dimensions to simulate another model
+    state
+        .scratch
+        .hidden_in
+        .resize(model.config().hidden_size * 2, 42.0);
+
+    let logits = model.forward(&[69], 0, &mut state);
+    assert_eq!(logits.len(), model.config().vocab_size);
+    assert!(logits.iter().all(|x| x.is_finite()));
+    assert_eq!(state.seq_len, 1);
+}
+
+#[test]
+fn qwen35_forward_prefill_empty_tokens_returns_empty() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+    let mut state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let logits = model.forward_prefill(&[], 0, &mut state);
+    assert!(logits.is_empty());
+    assert_eq!(state.seq_len, 0);
+}
+
+#[test]
+fn qwen35_out_of_bounds_deltanet_state_panics_cleanly() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let model = Qwen35Model::from_gguf(gguf, 256).expect("load Qwen35Model");
+    let state =
+        InferenceState::from_config_with_compression(model.config(), &KvCompression::None).unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = state.deltanet_state(9999);
+    }));
+    assert!(result.is_err());
+}
