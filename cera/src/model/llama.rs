@@ -470,13 +470,20 @@ impl LlamaModel {
         normed.resize(hs, 0.0);
         ffn_input.resize(hs, 0.0);
 
+        let nb = hs / 32;
+        state.scratch.q8_scales.resize(nb, 0.0);
+        state.scratch.q8_quants.resize(hs, 0);
+
         for i in 0..cfg.n_layers {
             // Attention pre-norm.
-            normed.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut normed, &self.attn_norm_weights[i], cfg.rms_norm_eps);
-
-            #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&normed, state);
+            cpu::rmsnorm_and_quantize_q8_0(
+                hidden,
+                &self.attn_norm_weights[i],
+                cfg.rms_norm_eps,
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+                Some(&mut normed),
+            );
 
             let refs = &self.layer_refs[i];
             let weights = AttnWeights {
@@ -514,11 +521,14 @@ impl LlamaModel {
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             // FFN pre-norm.
-            ffn_input.copy_from_slice(hidden);
-            cpu::rmsnorm(&mut ffn_input, &self.ffn_norm_weights[i], cfg.rms_norm_eps);
-
-            #[cfg(target_arch = "aarch64")]
-            transformer::quantize_to_scratch(&ffn_input, state);
+            cpu::rmsnorm_and_quantize_q8_0(
+                hidden,
+                &self.ffn_norm_weights[i],
+                cfg.rms_norm_eps,
+                &mut state.scratch.q8_scales,
+                &mut state.scratch.q8_quants,
+                Some(&mut ffn_input),
+            );
 
             let refs = &self.layer_refs[i];
             let ffn_weights = FfnWeights {
@@ -1594,6 +1604,112 @@ impl Model for LlamaModel {
         self.project_logits(&hidden, state)
     }
 
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        if tokens.is_empty() {
+            return 0;
+        }
+        if tokens.len() > 1 {
+            if transformer::oracle_dump::is_active() {
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let _ = self.forward(&[t], pos + i, state);
+                }
+            } else {
+                let cfg = &self.config;
+                let mut hidden_stack = [0.0f32; 4096];
+                let mut hidden_heap;
+                let hidden = if cfg.hidden_size <= 4096 {
+                    &mut hidden_stack[..cfg.hidden_size]
+                } else {
+                    hidden_heap = vec![0.0f32; cfg.hidden_size];
+                    &mut hidden_heap[..]
+                };
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let token_id = t as usize;
+                    if token_id >= cfg.vocab_size {
+                        continue;
+                    }
+                    transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, hidden);
+                    if self.config.scalars.embedding != 1.0 {
+                        cpu::scale_inplace(hidden, self.config.scalars.embedding);
+                    }
+                    self.run_layers(hidden, pos + i, state);
+                }
+            }
+            return self.forward_greedy(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
+        }
+        if transformer::oracle_dump::is_active() {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
+        let token_id = tokens[0] as usize;
+        let cfg = &self.config;
+        if token_id >= cfg.vocab_size {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
+
+        let mut hidden_stack = [0.0f32; 4096];
+        let mut hidden_heap;
+        let hidden = if cfg.hidden_size <= 4096 {
+            &mut hidden_stack[..cfg.hidden_size]
+        } else {
+            hidden_heap = vec![0.0f32; cfg.hidden_size];
+            &mut hidden_heap[..]
+        };
+        transformer::dequantize_row_into(&self.gguf, &self.embd_ref, token_id, hidden);
+        if self.config.scalars.embedding != 1.0 {
+            cpu::scale_inplace(hidden, self.config.scalars.embedding);
+        }
+        self.run_layers(hidden, pos, state);
+
+        let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
+        #[cfg(target_arch = "aarch64")]
+        {
+            if out_ref.dtype == crate::tensor::DType::Q6K && self.config.scalars.logit > 0.0 {
+                transformer::quantize_to_scratch(hidden, state);
+                return transformer::gemv_preq_argmax(
+                    &self.gguf,
+                    out_ref,
+                    hidden,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                ) as u32;
+            }
+        }
+
+        if state.scratch.logits.len() < cfg.vocab_size {
+            state.scratch.logits.resize(cfg.vocab_size, 0.0);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            transformer::quantize_to_scratch(hidden, state);
+            transformer::gemv_preq(
+                &self.gguf,
+                out_ref,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                &mut state.scratch.logits[..cfg.vocab_size],
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            transformer::gemv(
+                &self.gguf,
+                out_ref,
+                hidden,
+                &mut state.scratch.logits[..cfg.vocab_size],
+            );
+        }
+        if self.config.scalars.logit > 0.0 && self.config.scalars.logit != 1.0 {
+            cpu::scale_inplace(
+                &mut state.scratch.logits[..cfg.vocab_size],
+                1.0 / self.config.scalars.logit,
+            );
+        }
+        crate::sampler::argmax(&state.scratch.logits[..cfg.vocab_size])
+    }
+
     fn forward_prefill(
         &self,
         tokens: &[u32],
@@ -1828,5 +1944,33 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // differential test (batched vs per-token, all four archs) in
         // `tests/gpu_transformer_parity.rs`.
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::ScalarMultipliers;
+
+    #[test]
+    fn test_llama_scalars_logit_non_positive_fallback_logic() {
+        // When scalars.logit <= 0.0, forward_greedy must not take the gemv_preq_argmax fast path
+        // because argmax order would invert or degrade.
+        let neg = ScalarMultipliers {
+            logit: -1.0,
+            ..Default::default()
+        };
+        assert!(neg.logit <= 0.0);
+
+        let zero = ScalarMultipliers {
+            logit: 0.0,
+            ..Default::default()
+        };
+        assert!(zero.logit <= 0.0);
+
+        let pos = ScalarMultipliers {
+            logit: 1.0,
+            ..Default::default()
+        };
+        assert!(pos.logit > 0.0);
     }
 }

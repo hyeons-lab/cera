@@ -67,6 +67,46 @@ pub fn sgemm_rowmajor_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: 
         return;
     };
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let num_threads = crate::backend::cpu::configure_thread_pool();
+        if num_threads > 1 && m >= 512 {
+            let a_ptr = a.as_ptr() as usize;
+            let b_ptr = b.as_ptr() as usize;
+            let c_ptr = c.as_mut_ptr() as usize;
+
+            crate::backend::cpu::par_range_prefill(m, 64, move |m_start, m_t| unsafe {
+                let a_t = (a_ptr as *const f32).add(m_start * k);
+                let b = b_ptr as *const f32;
+                let c_t = (c_ptr as *mut f32).add(m_start * n);
+
+                let (Ok(mt_i), Ok(n_i), Ok(k_i)) =
+                    (i32::try_from(m_t), i32::try_from(n), i32::try_from(k))
+                else {
+                    return;
+                };
+
+                cblas_sgemm(
+                    CBLAS_ORDER::CblasRowMajor,
+                    CBLAS_TRANSPOSE::CblasNoTrans,
+                    CBLAS_TRANSPOSE::CblasNoTrans,
+                    mt_i,
+                    n_i,
+                    k_i,
+                    1.0,
+                    a_t,
+                    k_i,
+                    b,
+                    n_i,
+                    0.0,
+                    c_t,
+                    n_i,
+                );
+            });
+            return;
+        }
+    }
+
     // SAFETY:
     // - lengths verified above (a ≥ m*k, b ≥ k*n, c ≥ m*n).
     // - row-major leading dims match: lda=k, ldb=n, ldc=n with no transpose.
@@ -229,7 +269,7 @@ pub fn sgemm_rowmajor_nn_parallel(
         let a_ptr = a.as_ptr() as usize;
         let c_ptr = c.as_mut_ptr() as usize;
 
-        crate::backend::cpu::par_range(m, 1, move |m_start, m_t| unsafe {
+        crate::backend::cpu::par_range_prefill(m, 1, move |m_start, m_t| unsafe {
             let b = b_ptr as *const f32;
             let a_t = (a_ptr as *const f32).add(m_start);
             let c_t = (c_ptr as *mut f32).add(m_start);
@@ -961,6 +1001,49 @@ mod tests {
         }
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sgemm_rowmajor_nn_parallel_matches() {
+        let m = 512;
+        let n = 32;
+        let k = 64;
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 * 0.1).collect();
+        let mut c_parallel = vec![0.0f32; m * n];
+        sgemm_rowmajor_nn(m, n, k, &a, &b, &mut c_parallel);
+
+        let mut c_serial = vec![0.0f32; m * n];
+        let (Ok(m_i), Ok(n_i), Ok(k_i)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k))
+        else {
+            panic!("cast failed");
+        };
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ORDER::CblasRowMajor,
+                CBLAS_TRANSPOSE::CblasNoTrans,
+                CBLAS_TRANSPOSE::CblasNoTrans,
+                m_i,
+                n_i,
+                k_i,
+                1.0,
+                a.as_ptr(),
+                k_i,
+                b.as_ptr(),
+                n_i,
+                0.0,
+                c_serial.as_mut_ptr(),
+                n_i,
+            );
+        }
+        for i in 0..m * n {
+            assert!(
+                (c_parallel[i] - c_serial[i]).abs() < 1e-4,
+                "mismatch at index {i}: parallel {} vs serial {}",
+                c_parallel[i],
+                c_serial[i]
+            );
         }
     }
 

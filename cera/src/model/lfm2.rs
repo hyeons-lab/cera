@@ -1434,32 +1434,13 @@ impl Lfm2Model {
         // in_proj: hidden → 3*hidden (uses pre-quantized Q8_0 data when available)
         let proj = &mut state.scratch.conv_proj[..3 * hidden_size];
         #[cfg(target_arch = "aarch64")]
-        if in_proj.dtype == DType::Q4_0 || in_proj.dtype == DType::Q8_0 {
-            let data = self.weight_data(in_proj);
-            if in_proj.dtype == DType::Q4_0 {
-                cpu::gemv_q4_0_with_q8(
-                    data,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    proj,
-                    in_proj.m,
-                    in_proj.k,
-                );
-            } else {
-                unsafe {
-                    crate::backend::simd::neon::gemv_q8_0_q8_0_neon(
-                        data,
-                        &state.scratch.q8_scales,
-                        &state.scratch.q8_quants,
-                        proj,
-                        in_proj.m,
-                        in_proj.k,
-                    );
-                }
-            }
-        } else {
-            self.gemv(in_proj, hidden, proj);
-        }
+        self.gemv_preq(
+            in_proj,
+            hidden,
+            &state.scratch.q8_scales,
+            &state.scratch.q8_quants,
+            proj,
+        );
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(in_proj, hidden, proj);
 
@@ -1668,7 +1649,14 @@ impl Lfm2Model {
             let q_ref = refs.attn_q.as_ref().unwrap();
             let k_ref = refs.attn_k.as_ref().unwrap();
             let v_ref = refs.attn_v.as_ref().unwrap();
-            if q_ref.dtype == DType::Q4_0
+            let valid_dims = q_ref.k == cfg.hidden_size
+                && k_ref.k == cfg.hidden_size
+                && v_ref.k == cfg.hidden_size
+                && q_ref.m == cfg.hidden_size
+                && k_ref.m == kv_dim
+                && v_ref.m == kv_dim;
+            if valid_dims
+                && q_ref.dtype == DType::Q4_0
                 && k_ref.dtype == DType::Q4_0
                 && v_ref.dtype == DType::Q4_0
             {
@@ -1676,6 +1664,50 @@ impl Lfm2Model {
                 let k_data = self.weight_data(k_ref);
                 let v_data = self.weight_data(v_ref);
                 cpu::gemv_q4_0_concat3_with_q8(
+                    q_data,
+                    k_data,
+                    v_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                    k,
+                    v,
+                    cfg.hidden_size,
+                    kv_dim,
+                    kv_dim,
+                    cfg.hidden_size,
+                );
+            } else if valid_dims
+                && q_ref.dtype == DType::Q4KM
+                && k_ref.dtype == DType::Q4KM
+                && v_ref.dtype == DType::Q4KM
+            {
+                let q_data = self.weight_data(q_ref);
+                let k_data = self.weight_data(k_ref);
+                let v_data = self.weight_data(v_ref);
+                cpu::gemv_q4k_concat3_with_q8(
+                    q_data,
+                    k_data,
+                    v_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                    k,
+                    v,
+                    cfg.hidden_size,
+                    kv_dim,
+                    kv_dim,
+                    cfg.hidden_size,
+                );
+            } else if valid_dims
+                && q_ref.dtype == DType::Q5KM
+                && k_ref.dtype == DType::Q5KM
+                && v_ref.dtype == DType::Q5KM
+            {
+                let q_data = self.weight_data(q_ref);
+                let k_data = self.weight_data(k_ref);
+                let v_data = self.weight_data(v_ref);
+                cpu::gemv_q5k_concat3_with_q8(
                     q_data,
                     k_data,
                     v_data,
@@ -2036,7 +2068,18 @@ impl Lfm2Model {
         state.scratch.q8_scales.resize(nb, 0.0);
         state.scratch.q8_quants.resize(hs, 0);
 
+        let profile = Self::profile_decode_enabled();
+        let mut t_norm = std::time::Duration::ZERO;
+        let mut t_conv = std::time::Duration::ZERO;
+        let mut t_attn = std::time::Duration::ZERO;
+        let mut t_ffn = std::time::Duration::ZERO;
+
         for i in 0..cfg.n_layers {
+            let t0 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.attn_norm_weights[i],
@@ -2045,15 +2088,34 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut normed),
             );
+            if let Some(t) = t0 {
+                t_norm += t.elapsed();
+            }
 
+            let t1 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if cfg.block_types[i] == BlockType::GatedConv {
                 self.forward_conv_block(i, &normed, pos, state);
+                if let Some(t) = t1 {
+                    t_conv += t.elapsed();
+                }
             } else {
                 self.forward_attn_block(i, &normed, pos, state);
+                if let Some(t) = t1 {
+                    t_attn += t.elapsed();
+                }
             }
 
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
+            let t2 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.ffn_norm_weights[i],
@@ -2062,7 +2124,15 @@ impl Lfm2Model {
                 &mut state.scratch.q8_quants,
                 Some(&mut ffn_input),
             );
+            if let Some(t) = t2 {
+                t_norm += t.elapsed();
+            }
 
+            let t3 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             match &self.layer_refs[i].ffn {
                 FfnRefs::Dense(dense) => {
                     let ffn_weights = FfnWeights {
@@ -2082,8 +2152,21 @@ impl Lfm2Model {
                 }
                 FfnRefs::Moe(moe) => self.forward_moe_ffn(i, moe, hs, &ffn_input, state),
             }
+            if let Some(t) = t3 {
+                t_ffn += t.elapsed();
+            }
 
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
+        }
+
+        if profile {
+            eprintln!(
+                "[PROFILE DECODE] norm: {:.2}ms | conv: {:.2}ms | attn: {:.2}ms | ffn: {:.2}ms",
+                t_norm.as_secs_f64() * 1000.0,
+                t_conv.as_secs_f64() * 1000.0,
+                t_attn.as_secs_f64() * 1000.0,
+                t_ffn.as_secs_f64() * 1000.0,
+            );
         }
 
         cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
@@ -2117,6 +2200,11 @@ impl Lfm2Model {
     fn profile_prefill_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some())
+    }
+
+    fn profile_decode_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_DECODE").is_some())
     }
 
     /// Shared layer loop for prefill passes. Runs all layers and updates `hidden` in place.
@@ -4268,14 +4356,45 @@ impl Model for Lfm2Model {
     }
 
     fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
-        assert_eq!(tokens.len(), 1, "LFM2 forward expects single token");
+        if tokens.is_empty() {
+            return 0;
+        }
+        if tokens.len() > 1 {
+            if transformer::oracle_dump::is_active() {
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let _ = self.forward(&[t], pos + i, state);
+                }
+            } else {
+                let cfg = &self.config;
+                let mut hidden_stack = [0.0f32; 4096];
+                let mut hidden_heap;
+                let hidden = if cfg.hidden_size <= 4096 {
+                    &mut hidden_stack[..cfg.hidden_size]
+                } else {
+                    hidden_heap = vec![0.0f32; cfg.hidden_size];
+                    &mut hidden_heap[..]
+                };
+                for (i, &t) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let token_id = t as usize;
+                    if token_id >= cfg.vocab_size {
+                        continue;
+                    }
+                    self.dequantize_row_into(&self.embd_ref, token_id, hidden);
+                    self.run_layers(hidden, pos + i, state);
+                }
+            }
+            return self.forward_greedy(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
+        }
+        if transformer::oracle_dump::is_active() {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
-        assert!(
-            token_id < cfg.vocab_size,
-            "token_id {token_id} out of range (vocab_size={})",
-            cfg.vocab_size
-        );
+        if token_id >= cfg.vocab_size {
+            let logits = self.forward(tokens, pos, state);
+            return crate::sampler::argmax(&logits);
+        }
 
         let mut hidden_stack = [0.0f32; 4096];
         let mut hidden_heap;
@@ -4287,6 +4406,26 @@ impl Model for Lfm2Model {
         };
         self.dequantize_row_into(&self.embd_ref, token_id, hidden);
         self.run_layers(hidden, pos, state);
+
+        #[cfg(target_arch = "aarch64")]
+        if self.embd_ref.dtype == DType::Q6K && self.config.scalars.logit > 0.0 {
+            let profile = Self::profile_decode_enabled();
+            let t_lm = std::time::Instant::now();
+            let res = transformer::gemv_preq_argmax(
+                &self.gguf,
+                &self.embd_ref,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+            ) as u32;
+            if profile {
+                eprintln!(
+                    "[PROFILE DECODE] lm_head (argmax): {:.2}ms",
+                    t_lm.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return res;
+        }
 
         if state.scratch.logits.len() < cfg.vocab_size {
             state.scratch.logits.resize(cfg.vocab_size, 0.0);
