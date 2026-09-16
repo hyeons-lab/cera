@@ -1357,6 +1357,16 @@ impl InferenceState {
                         ssm_state: snap_ssm,
                     },
                 ) => {
+                    assert_eq!(
+                        snap_conv.len(),
+                        conv_state.len() * 4,
+                        "mismatched Mamba2 conv_state byte length in snapshot"
+                    );
+                    assert_eq!(
+                        snap_ssm.len(),
+                        ssm_state.len() * 4,
+                        "mismatched Mamba2 ssm_state byte length in snapshot"
+                    );
                     decode_f32_into(conv_state, snap_conv);
                     decode_f32_into(ssm_state, snap_ssm);
                 }
@@ -1412,6 +1422,16 @@ impl InferenceState {
                         }
                         _ => panic!("snapshot layer kind doesn't match state layer kind"),
                     }
+                    assert_eq!(
+                        snap_conv.len(),
+                        conv_state.len() * 4,
+                        "mismatched ParallelAttentionMamba2 conv_state byte length in snapshot"
+                    );
+                    assert_eq!(
+                        snap_ssm.len(),
+                        ssm_state.len() * 4,
+                        "mismatched ParallelAttentionMamba2 ssm_state byte length in snapshot"
+                    );
                     decode_f32_into(conv_state, snap_conv);
                     decode_f32_into(ssm_state, snap_ssm);
                 }
@@ -2063,11 +2083,7 @@ impl StateSnapshot {
                         LayerSnapshot::AttentionF16 { k_data, v_data } => {
                             k_data.len() + v_data.len()
                         }
-                        _ => {
-                            unreachable!(
-                                "ParallelAttentionMamba2 should only wrap Attention variants"
-                            )
-                        }
+                        _ => 0,
                     };
                     snap_len + conv_state.len() + ssm_state.len()
                 }

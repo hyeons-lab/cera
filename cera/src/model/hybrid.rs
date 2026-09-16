@@ -958,6 +958,11 @@ impl HybridModel {
 impl Model for HybridModel {
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "forward() expects exactly 1 token");
+        assert_eq!(
+            pos, state.seq_len,
+            "forward: pos ({pos}) must match state.seq_len ({})",
+            state.seq_len
+        );
         let hidden = self.forward_token(tokens[0] as usize, pos, state);
         self.project_logits(&hidden, state)
     }

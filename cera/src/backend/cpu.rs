@@ -6519,6 +6519,8 @@ pub fn mamba2_conv1d_step(
     if conv_bias.is_some_and(|b| b.len() < conv_dim) {
         return;
     }
+    let state_len = d_conv.saturating_sub(1) * conv_dim;
+    let conv_state = &mut conv_state[..state_len];
 
     if d_conv == 4 {
         let (tap0, tap1, tap2) = (0, conv_dim, 2 * conv_dim);
@@ -6652,10 +6654,14 @@ pub fn mamba2_ssd_step(
             let state_row = &mut ssm_state[ii * d_state..(ii + 1) * d_state];
             debug_assert_eq!(state_row.len(), d_state);
 
+            let state_slice = &mut state_row[..d_state];
+            let b_slice = &b_g[..d_state];
+            let c_slice = &c_g[..d_state];
+
             let mut dot = 0.0f32;
-            for ((s, &b_val), &c_val) in state_row.iter_mut().zip(b_g).zip(c_g) {
-                *s = *s * da + b_val * x_dt;
-                dot += *s * c_val;
+            for k in 0..d_state {
+                state_slice[k] = state_slice[k] * da + b_slice[k] * x_dt;
+                dot += state_slice[k] * c_slice[k];
             }
 
             // Skip connection: y = dot + x * D

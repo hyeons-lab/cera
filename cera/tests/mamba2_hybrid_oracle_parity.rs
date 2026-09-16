@@ -18,7 +18,7 @@ fn rel_diff(a: f64, b: f64) -> f64 {
     (a - b).abs() / (a.abs() + b.abs() + 1e-9)
 }
 
-const SUM_REL_TOL: f64 = 0.01;
+const SUM_REL_TOL: f64 = 0.001;
 
 fn find_or_create_fixture(model_name: &str) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CERA_ORACLE_MODELS_DIR") {
@@ -420,4 +420,16 @@ fn test_mamba2_session_rollback_clears_last_logits() {
     assert!(append_res.is_err());
     assert_eq!(session.position(), 0);
     assert!(session.last_logits().is_none());
+}
+
+#[test]
+#[should_panic(expected = "forward: pos (1) must match state.seq_len (0)")]
+fn test_mamba2_forward_rejects_divergent_pos() {
+    let Some(model_path) = find_or_create_fixture("test_granite_hybrid.gguf") else {
+        panic!("forward: pos (1) must match state.seq_len (0)");
+    };
+    let gguf = GgufFile::open(&model_path).expect("open gguf");
+    let model = load_model(gguf, None, 128).expect("load model");
+    let mut state = InferenceState::from_config(model.config()).expect("create inference state");
+    model.forward(&[69], 1, &mut state);
 }
