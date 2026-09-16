@@ -441,7 +441,7 @@ impl LlamaModel {
             .unwrap_or(128000) as usize;
         let max_seq_len = context_size.min(gguf_max_seq_len);
         let default_rope_theta = match prefix {
-            "gemma2" | "minicpm" | "minicpm5" => 10_000.0,
+            "gemma2" | "minicpm" | "minicpm5" | "nanbeige" => 10_000.0,
             _ => 1_000_000.0,
         };
         let rope_theta = gguf

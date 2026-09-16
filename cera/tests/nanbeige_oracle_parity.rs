@@ -656,3 +656,18 @@ fn nanbeige_forward_prefill_logits_all_matches_last_position() {
         "forward_prefill_logits_all last slice diverged from forward_prefill: max_diff={max_diff}"
     );
 }
+
+#[test]
+fn nanbeige_defaults_rope_theta_when_omitted() {
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_nanbeige.gguf");
+    gguf.metadata.remove("nanbeige.rope.freq_base");
+    let model = LlamaModel::from_gguf(gguf, 256).expect("load nanbeige model");
+    assert_eq!(
+        model.config().rope_theta,
+        10_000.0,
+        "nanbeige must default rope_theta to 10,000.0 when omitted from metadata"
+    );
+}

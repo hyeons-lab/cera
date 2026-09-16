@@ -1793,10 +1793,23 @@ impl GpuLfm2Model {
             })
             .transpose()?;
 
+        let mut uploaded_norms: std::collections::HashMap<usize, (wgpu::Buffer, wgpu::Buffer)> =
+            std::collections::HashMap::new();
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            let attn_norm = ctx.upload_f32(src.attn_norm_weight(i), &format!("l{i}.anorm"));
-            let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i), &format!("l{i}.fnorm"));
+            let phys_idx = src
+                .loop_norm_interval()
+                .map(|n_phys| i % n_phys)
+                .unwrap_or(i);
+            let (attn_norm, ffn_norm) = uploaded_norms
+                .entry(phys_idx)
+                .or_insert_with(|| {
+                    (
+                        ctx.upload_f32(src.attn_norm_weight(i), &format!("l{i}.anorm")),
+                        ctx.upload_f32(src.ffn_norm_weight(i), &format!("l{i}.fnorm")),
+                    )
+                })
+                .clone();
 
             let ffn = match src.moe_refs(i) {
                 None => GpuFfn::Dense(Box::new(GpuDenseFfn {

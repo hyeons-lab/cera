@@ -1114,10 +1114,23 @@ impl MetalLfm2Model {
             })
             .transpose()?;
 
+        let mut uploaded_norms: std::collections::HashMap<usize, (Buffer, Buffer)> =
+            std::collections::HashMap::new();
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            let attn_norm = ctx.upload_f32(src.attn_norm_weight(i));
-            let ffn_norm = ctx.upload_f32(src.ffn_norm_weight(i));
+            let phys_idx = src
+                .loop_norm_interval()
+                .map(|n_phys| i % n_phys)
+                .unwrap_or(i);
+            let (attn_norm, ffn_norm) = uploaded_norms
+                .entry(phys_idx)
+                .or_insert_with(|| {
+                    (
+                        ctx.upload_f32(src.attn_norm_weight(i)),
+                        ctx.upload_f32(src.ffn_norm_weight(i)),
+                    )
+                })
+                .clone();
             let ffn = match src.moe_refs(i) {
                 None => MetalFfn::Dense(MetalDenseFfn {
                     gate: upload_weight(src.ffn_gate_ref(i)?)?,
