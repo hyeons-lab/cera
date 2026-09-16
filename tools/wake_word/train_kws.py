@@ -312,11 +312,11 @@ NEGATIVE_CONVERSATIONAL = [
 
 
 NEGATIVE_TEXTS = [
-    # Competitor wake words
-    "Hey Siri",
-    "Hey Google",
-    "Okay Google",
-    "Alexa",
+    # Voice assistant wake phrases
+    "Hey Assistant",
+    "Okay Assistant",
+    "Hey Device",
+    "Hey System",
     "Computer",
     "Jarvis",
     # Phonetic and sibilant rhyming near-misses
@@ -569,10 +569,16 @@ def synthesize_dataset(
         raise ValueError(f"The target wake word '--phrase' cannot be empty or whitespace, got: {phrase!r}")
     target_name = " ".join(words[1:]) if len(words) > 1 else words[0]
     extra_set = {t.lower() for t in (extra_negatives or [])}
+    onset = words[0] if words else ""
 
     for text in neg_texts:
         text_lower = text.lower()
-        is_hard_negative = (target_name in text_lower) or (text_lower in extra_set)
+        # Hard negatives include target name mentions, user extra negatives, and wake onset confusers
+        is_hard_negative = (
+            (target_name in text_lower)
+            or (text_lower in extra_set)
+            or (bool(onset) and (text_lower == onset or text_lower.startswith(f"{onset} ")))
+        )
         if is_hard_negative:
             for v_idx, voice in enumerate(available_voices):
                 rate = 175 if (v_idx % 3 == 0) else (150 if v_idx % 3 == 1 else 200)
@@ -821,7 +827,9 @@ def main() -> None:
         )
 
     extra_negs = list(args.extra_negatives or [])
-    if args.negatives_file and os.path.exists(args.negatives_file):
+    if args.negatives_file:
+        if not os.path.exists(args.negatives_file):
+            raise FileNotFoundError(f"Negatives file not found: {args.negatives_file}")
         with open(args.negatives_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
