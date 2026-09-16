@@ -402,7 +402,7 @@ impl CudaLfm2Model {
         }
 
         // Precompute RoPE inverse frequencies once on CPU, incorporating optional LLaMA-3 freq factors
-        let half_dim = (head_dim / 2).min(64);
+        let half_dim = (head_dim / 2).min(128);
         let theta_scale = config.rope_theta.powf(-2.0 / head_dim as f32);
         let mut inv_freqs = Vec::with_capacity(half_dim);
         for i in 0..half_dim {

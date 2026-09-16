@@ -969,17 +969,19 @@ impl CudaContext {
             return Ok(());
         }
         anyhow::ensure!(
-            params.head_dim <= 128,
-            "CUDA qk_norm_rope kernel supports head_dim <= 128, got {}",
+            params.head_dim <= 256,
+            "CUDA qk_norm_rope kernel supports head_dim <= 256, got {}",
             params.head_dim
         );
         let kernel = self.load_kernel(QK_NORM_ROPE_SRC, "qk_norm_rope", "qk_norm_rope")?;
         let num_blocks = params.n_heads.max(params.n_kv_heads);
-        // Shared memory for per-head reduction: head_dim floats + 8 floats for warp sums
-        let shared_mem_bytes = (params.head_dim + 8) * std::mem::size_of::<f32>() as u32;
+        let block_threads = 256u32;
+        let num_warps = block_threads / 32;
+        // Shared memory for per-head reduction: head_dim floats + warp sums
+        let shared_mem_bytes = (params.head_dim + num_warps) * std::mem::size_of::<f32>() as u32;
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (block_threads, 1, 1),
             shared_mem_bytes,
         };
 

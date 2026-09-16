@@ -53,8 +53,7 @@ __device__ inline void head_rmsnorm(
     if (warp_id == 0) {
         uint32_t num_warps = blockDim.x / 32;
         float v = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        #pragma unroll
-        for (int mask = 4; mask > 0; mask >>= 1) {
+        for (int mask = (int)num_warps / 2; mask > 0; mask >>= 1) {
             v += __shfl_down_sync(0xffffffff, v, mask);
         }
         if (lane == 0) {
@@ -114,7 +113,7 @@ __global__ void qk_norm_rope(
     QkNormRopeParams params
 ) {
     extern __shared__ float shared_scratch[];
-    __shared__ float s_inv_freq[64];
+    __shared__ float s_inv_freq[128];
 
     const uint32_t head = blockIdx.x;
     const uint32_t tid = threadIdx.x;
@@ -123,12 +122,12 @@ __global__ void qk_norm_rope(
 
     // Load precomputed RoPE inverse frequencies directly into shared memory,
     // eliminating 24,576 runtime powf calls per token across query and KV heads.
-    if (tid < half_dim && tid < 64) {
+    for (uint32_t i = tid; i < half_dim && i < 128; i += blockDim.x) {
         if (rope_inv_freq != nullptr) {
-            s_inv_freq[tid] = rope_inv_freq[tid];
+            s_inv_freq[i] = rope_inv_freq[i];
         } else {
             const float theta_scale = powf(params.freq_base, -2.0f / (float)head_dim);
-            s_inv_freq[tid] = powf(theta_scale, (float)tid);
+            s_inv_freq[i] = powf(theta_scale, (float)i);
         }
     }
     __syncthreads();

@@ -533,71 +533,72 @@ fn test_cuda_qk_norm_rope_precomputed_inv_freq() {
     let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
     let n_heads = 2u32;
     let n_kv_heads = 1u32;
-    let head_dim = 64u32;
-    let half_dim = (head_dim / 2).min(64) as usize;
-    let freq_base = 10000.0f32;
-    let pos = 5u32;
+    for head_dim in [64u32, 256u32] {
+        let half_dim = (head_dim / 2).min(128) as usize;
+        let freq_base = 10000.0f32;
+        let pos = 5u32;
 
-    // Precompute inverse frequencies on CPU
-    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
-    let inv_freqs: Vec<f32> = (0..half_dim).map(|i| theta_scale.powf(i as f32)).collect();
-    let rope_inv_freq_buf = ctx.upload_f32(&inv_freqs).expect("upload rope_inv_freq");
+        // Precompute inverse frequencies on CPU
+        let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+        let inv_freqs: Vec<f32> = (0..half_dim).map(|i| theta_scale.powf(i as f32)).collect();
+        let rope_inv_freq_buf = ctx.upload_f32(&inv_freqs).expect("upload rope_inv_freq");
 
-    let q_len = (n_heads * head_dim) as usize;
-    let k_len = (n_kv_heads * head_dim) as usize;
-    let q_init: Vec<f32> = (0..q_len).map(|i| (i as f32) * 0.05 + 0.1).collect();
-    let k_init: Vec<f32> = (0..k_len).map(|i| (i as f32) * -0.03 + 0.5).collect();
+        let q_len = (n_heads * head_dim) as usize;
+        let k_len = (n_kv_heads * head_dim) as usize;
+        let q_init: Vec<f32> = (0..q_len).map(|i| (i as f32) * 0.05 + 0.1).collect();
+        let k_init: Vec<f32> = (0..k_len).map(|i| (i as f32) * -0.03 + 0.5).collect();
 
-    let mut q_buf = ctx.upload_f32(&q_init).expect("upload q");
-    let mut k_buf = ctx.upload_f32(&k_init).expect("upload k");
+        let mut q_buf = ctx.upload_f32(&q_init).expect("upload q");
+        let mut k_buf = ctx.upload_f32(&k_init).expect("upload k");
 
-    let params = QkNormRopeParams {
-        pos,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        eps: 1e-5,
-        freq_base,
-        rope_type: 0, // NeoX
-        has_freq_factors: 0,
-        has_qk_norm: 0,
-    };
+        let params = QkNormRopeParams {
+            pos,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            eps: 1e-5,
+            freq_base,
+            rope_type: 0, // NeoX
+            has_freq_factors: 0,
+            has_qk_norm: 0,
+        };
 
-    ctx.qk_norm_rope(
-        &mut q_buf,
-        &mut k_buf,
-        None,
-        None,
-        Some(&rope_inv_freq_buf),
-        params,
-    )
-    .expect("qk_norm_rope failed");
-    ctx.synchronize().expect("synchronize failed");
+        ctx.qk_norm_rope(
+            &mut q_buf,
+            &mut k_buf,
+            None,
+            None,
+            Some(&rope_inv_freq_buf),
+            params,
+        )
+        .expect("qk_norm_rope failed");
+        ctx.synchronize().expect("synchronize failed");
 
-    let mut q_out = vec![0.0f32; q_len];
-    ctx.download_f32(&q_buf, &mut q_out).expect("download q");
+        let mut q_out = vec![0.0f32; q_len];
+        ctx.download_f32(&q_buf, &mut q_out).expect("download q");
 
-    // Check against CPU reference RoPE
-    for h in 0..n_heads as usize {
-        for d in 0..half_dim {
-            let theta = (pos as f32) * inv_freqs[d];
-            let cos_a = theta.cos();
-            let sin_a = theta.sin();
-            let x0 = q_init[h * head_dim as usize + d];
-            let x1 = q_init[h * head_dim as usize + d + half_dim];
-            let expected_0 = x0 * cos_a - x1 * sin_a;
-            let expected_1 = x0 * sin_a + x1 * cos_a;
+        // Check against CPU reference RoPE
+        for h in 0..n_heads as usize {
+            for d in 0..half_dim {
+                let theta = (pos as f32) * inv_freqs[d];
+                let cos_a = theta.cos();
+                let sin_a = theta.sin();
+                let x0 = q_init[h * head_dim as usize + d];
+                let x1 = q_init[h * head_dim as usize + d + half_dim];
+                let expected_0 = x0 * cos_a - x1 * sin_a;
+                let expected_1 = x0 * sin_a + x1 * cos_a;
 
-            let actual_0 = q_out[h * head_dim as usize + d];
-            let actual_1 = q_out[h * head_dim as usize + d + half_dim];
-            assert!(
-                (actual_0 - expected_0).abs() < 1e-4,
-                "Q head {h} dim {d} mismatch: {actual_0} vs {expected_0}"
-            );
-            assert!(
-                (actual_1 - expected_1).abs() < 1e-4,
-                "Q head {h} dim {d}+half mismatch: {actual_1} vs {expected_1}"
-            );
+                let actual_0 = q_out[h * head_dim as usize + d];
+                let actual_1 = q_out[h * head_dim as usize + d + half_dim];
+                assert!(
+                    (actual_0 - expected_0).abs() < 1e-4,
+                    "Q head {h} dim {d} mismatch for head_dim {head_dim}: {actual_0} vs {expected_0}"
+                );
+                assert!(
+                    (actual_1 - expected_1).abs() < 1e-4,
+                    "Q head {h} dim {d}+half mismatch for head_dim {head_dim}: {actual_1} vs {expected_1}"
+                );
+            }
         }
     }
 }
@@ -1053,99 +1054,100 @@ fn test_cuda_rope_layout_parity() {
     let ctx = CudaContext::new(0).expect("failed to initialize CUDA context");
     let n_heads = 2;
     let n_kv_heads = 1;
-    let head_dim = 64;
     let pos = 5;
     let freq_base = 10000.0f32;
 
-    // Test both 0 (NeoX) and 1 (Norm / interleaved)
-    for rope_type in [0u32, 1u32] {
-        let mut q_host: Vec<f32> = (0..n_heads * head_dim).map(|i| (i as f32) * 0.05).collect();
-        let mut k_host: Vec<f32> = (0..n_kv_heads * head_dim)
-            .map(|i| (i as f32) * 0.03)
-            .collect();
+    // Test both head_dim 64 and 256, and both 0 (NeoX) and 1 (Norm / interleaved)
+    for head_dim in [64usize, 256usize] {
+        for rope_type in [0u32, 1u32] {
+            let mut q_host: Vec<f32> = (0..n_heads * head_dim).map(|i| (i as f32) * 0.05).collect();
+            let mut k_host: Vec<f32> = (0..n_kv_heads * head_dim)
+                .map(|i| (i as f32) * 0.03)
+                .collect();
 
-        // Compute CPU reference
-        let mut q_ref = q_host.clone();
-        let mut k_ref = k_host.clone();
-        let half_dim = head_dim / 2;
-        let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+            // Compute CPU reference
+            let mut q_ref = q_host.clone();
+            let mut k_ref = k_host.clone();
+            let half_dim = head_dim / 2;
+            let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
 
-        // Reference RoPE application
-        for h in 0..n_heads {
-            let offset = h * head_dim;
-            for d in 0..half_dim {
-                let theta = (pos as f32) * theta_scale.powf(d as f32);
-                let (sin_a, cos_a) = theta.sin_cos();
-                if rope_type == 0 {
-                    let x0 = q_ref[offset + d];
-                    let x1 = q_ref[offset + d + half_dim];
-                    q_ref[offset + d] = x0 * cos_a - x1 * sin_a;
-                    q_ref[offset + d + half_dim] = x0 * sin_a + x1 * cos_a;
-                } else {
-                    let x0 = q_ref[offset + 2 * d];
-                    let x1 = q_ref[offset + 2 * d + 1];
-                    q_ref[offset + 2 * d] = x0 * cos_a - x1 * sin_a;
-                    q_ref[offset + 2 * d + 1] = x0 * sin_a + x1 * cos_a;
+            // Reference RoPE application
+            for h in 0..n_heads {
+                let offset = h * head_dim;
+                for d in 0..half_dim {
+                    let theta = (pos as f32) * theta_scale.powf(d as f32);
+                    let (sin_a, cos_a) = theta.sin_cos();
+                    if rope_type == 0 {
+                        let x0 = q_ref[offset + d];
+                        let x1 = q_ref[offset + d + half_dim];
+                        q_ref[offset + d] = x0 * cos_a - x1 * sin_a;
+                        q_ref[offset + d + half_dim] = x0 * sin_a + x1 * cos_a;
+                    } else {
+                        let x0 = q_ref[offset + 2 * d];
+                        let x1 = q_ref[offset + 2 * d + 1];
+                        q_ref[offset + 2 * d] = x0 * cos_a - x1 * sin_a;
+                        q_ref[offset + 2 * d + 1] = x0 * sin_a + x1 * cos_a;
+                    }
                 }
             }
-        }
 
-        for h in 0..n_kv_heads {
-            let offset = h * head_dim;
-            for d in 0..half_dim {
-                let theta = (pos as f32) * theta_scale.powf(d as f32);
-                let (sin_a, cos_a) = theta.sin_cos();
-                if rope_type == 0 {
-                    let x0 = k_ref[offset + d];
-                    let x1 = k_ref[offset + d + half_dim];
-                    k_ref[offset + d] = x0 * cos_a - x1 * sin_a;
-                    k_ref[offset + d + half_dim] = x0 * sin_a + x1 * cos_a;
-                } else {
-                    let x0 = k_ref[offset + 2 * d];
-                    let x1 = k_ref[offset + 2 * d + 1];
-                    k_ref[offset + 2 * d] = x0 * cos_a - x1 * sin_a;
-                    k_ref[offset + 2 * d + 1] = x0 * sin_a + x1 * cos_a;
+            for h in 0..n_kv_heads {
+                let offset = h * head_dim;
+                for d in 0..half_dim {
+                    let theta = (pos as f32) * theta_scale.powf(d as f32);
+                    let (sin_a, cos_a) = theta.sin_cos();
+                    if rope_type == 0 {
+                        let x0 = k_ref[offset + d];
+                        let x1 = k_ref[offset + d + half_dim];
+                        k_ref[offset + d] = x0 * cos_a - x1 * sin_a;
+                        k_ref[offset + d + half_dim] = x0 * sin_a + x1 * cos_a;
+                    } else {
+                        let x0 = k_ref[offset + 2 * d];
+                        let x1 = k_ref[offset + 2 * d + 1];
+                        k_ref[offset + 2 * d] = x0 * cos_a - x1 * sin_a;
+                        k_ref[offset + 2 * d + 1] = x0 * sin_a + x1 * cos_a;
+                    }
                 }
             }
-        }
 
-        let mut q_buf = ctx.upload_f32(&q_host).expect("upload q");
-        let mut k_buf = ctx.upload_f32(&k_host).expect("upload k");
+            let mut q_buf = ctx.upload_f32(&q_host).expect("upload q");
+            let mut k_buf = ctx.upload_f32(&k_host).expect("upload k");
 
-        let params = QkNormRopeParams {
-            pos: pos as u32,
-            n_heads: n_heads as u32,
-            n_kv_heads: n_kv_heads as u32,
-            head_dim: head_dim as u32,
-            eps: 1e-5,
-            freq_base,
-            rope_type,
-            has_freq_factors: 0,
-            has_qk_norm: 0,
-        };
+            let params = QkNormRopeParams {
+                pos: pos as u32,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                head_dim: head_dim as u32,
+                eps: 1e-5,
+                freq_base,
+                rope_type,
+                has_freq_factors: 0,
+                has_qk_norm: 0,
+            };
 
-        ctx.qk_norm_rope(&mut q_buf, &mut k_buf, None, None, None, params)
-            .expect("qk_norm_rope kernel");
-        ctx.synchronize().expect("sync");
+            ctx.qk_norm_rope(&mut q_buf, &mut k_buf, None, None, None, params)
+                .expect("qk_norm_rope kernel");
+            ctx.synchronize().expect("sync");
 
-        ctx.download_f32(&q_buf, &mut q_host).expect("download q");
-        ctx.download_f32(&k_buf, &mut k_host).expect("download k");
+            ctx.download_f32(&q_buf, &mut q_host).expect("download q");
+            ctx.download_f32(&k_buf, &mut k_host).expect("download k");
 
-        for i in 0..q_host.len() {
-            assert!(
-                (q_host[i] - q_ref[i]).abs() < 1e-4,
-                "rope_type {rope_type} q mismatch at {i}: cuda {} vs ref {}",
-                q_host[i],
-                q_ref[i]
-            );
-        }
-        for i in 0..k_host.len() {
-            assert!(
-                (k_host[i] - k_ref[i]).abs() < 1e-4,
-                "rope_type {rope_type} k mismatch at {i}: cuda {} vs ref {}",
-                k_host[i],
-                k_ref[i]
-            );
+            for i in 0..q_host.len() {
+                assert!(
+                    (q_host[i] - q_ref[i]).abs() < 1e-4,
+                    "rope_type {rope_type} head_dim {head_dim} q mismatch at {i}: cuda {} vs ref {}",
+                    q_host[i],
+                    q_ref[i]
+                );
+            }
+            for i in 0..k_host.len() {
+                assert!(
+                    (k_host[i] - k_ref[i]).abs() < 1e-4,
+                    "rope_type {rope_type} head_dim {head_dim} k mismatch at {i}: cuda {} vs ref {}",
+                    k_host[i],
+                    k_ref[i]
+                );
+            }
         }
     }
 }
