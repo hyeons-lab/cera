@@ -1175,6 +1175,11 @@ export class WebGpuSession {
     cancelHandle(): WebGpuCancelHandle;
     clearCancel(): void;
     /**
+     * Clear all conversation state from the KV cache and convolution buffers,
+     * resetting the session back to position zero.
+     */
+    reset(): void;
+    /**
      * Async constructor: initialize WebGPU (`requestAdapter` /
      * `requestDevice` resolve on the JS event loop), parse the in-memory
      * GGUF, upload the model to the GPU, and build a fresh inference

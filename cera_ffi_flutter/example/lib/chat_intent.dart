@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 import 'chat_state.dart';
 import 'model_source.dart';
 
@@ -32,7 +32,7 @@ class LoadBundleIntent extends ChatIntent {
 /// Intent to load a local .gguf file model.
 class LoadLocalModelIntent extends ChatIntent {
   const LoadLocalModelIntent(this.source);
-  final ModelSource source;
+  final LoadedModel source;
 }
 
 /// Intent to explicitly unload the active model and release its engine resources.

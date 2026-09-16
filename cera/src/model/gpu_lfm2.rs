@@ -6995,6 +6995,14 @@ impl GpuLfm2Model {
         }
         self.ctx.submit_encoder(enc);
     }
+
+    /// Resets GPU-side session state (rolling conv buffers and sequence counter).
+    /// Used by WebGPU sessions to perform in-place resets without reloading weights.
+    pub fn reset_session_state(&self) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.gpu_state.seq_len.store(0, Ordering::Relaxed);
+        self.zero_conv_buffers_locked();
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

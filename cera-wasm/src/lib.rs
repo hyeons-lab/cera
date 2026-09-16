@@ -1959,6 +1959,7 @@ mod webgpu {
         model: cera::model::gpu_lfm2::GpuLfm2Model,
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
         state: cera::kv_cache::InferenceState,
+        compression: cera::kv_cache::KvCompression,
         eos: Option<u32>,
         /// CPU vision-encoder weights, parsed from the mmproj passed to
         /// `createWithParts`. `None` for a text-only session. Kept even when
@@ -2027,6 +2028,29 @@ mod webgpu {
         pub fn clear_cancel(&self) {
             self.cancel
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Reset the session in-place, clearing GPU convolution rolling buffers,
+        /// resetting sequence counter to zero, and rebuilding fresh CPU state.
+        #[wasm_bindgen]
+        pub fn reset(&mut self) -> Result<(), JsError> {
+            let mut fresh = cera::kv_cache::InferenceState::from_config_with_compression(
+                self.model.config(),
+                &self.compression,
+            )
+            .map_err(crate::map_cera_err)?;
+            fresh.lora = self.state.lora.clone();
+            self.model.reset_session_state();
+            if let Some(gad) = self.gpu_audio_decoder.as_ref() {
+                gad.reset();
+            }
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.reset();
+            }
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.state = fresh;
+            Ok(())
         }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
@@ -2164,6 +2188,7 @@ mod webgpu {
                 model,
                 tokenizer,
                 state,
+                compression,
                 eos,
                 vision_encoder: None,
                 gpu_vision_encoder: None,
@@ -2306,6 +2331,7 @@ mod webgpu {
                     model,
                     tokenizer,
                     state,
+                    compression,
                     eos,
                     vision_encoder: None,
                     gpu_vision_encoder: None,

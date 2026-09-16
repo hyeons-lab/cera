@@ -248,6 +248,7 @@
         "from_file": "pub fn from_file(path: String) -> Result<Arc<Self>, FfiError>",
         "get_speech_timestamps": "pub fn get_speech_timestamps( &self, audio: Vec<f32>, rate: FfiVadSampleRate, config: Option<FfiVadConfig>, ) -> Result<Vec<FfiSpeechTimestamp>, FfiError>",
         "process_chunk": "pub fn process_chunk(&self, chunk: Vec<f32>, rate: FfiVadSampleRate) -> Result<f32, FfiError>",
+        "process_chunk_with_stride": "pub fn process_chunk_with_stride( &self, chunk: Vec<f32>, rate: FfiVadSampleRate, stride: u32, ) -> Result<f32, FfiError>",
         "reset": "pub fn reset(&self) -> Result<(), FfiError>"
       }
     },
@@ -258,7 +259,10 @@
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
       "expected": {
         "flush": "pub fn flush(&self) -> Result<Option<FfiVadEvent>, FfiError>",
+        "frame_stride": "pub fn frame_stride(&self) -> Result<u32, FfiError>",
+        "is_speech_active": "pub fn is_speech_active(&self) -> Result<bool, FfiError>",
         "new": "pub fn new(rate: FfiVadSampleRate, config: Option<FfiVadConfig>) -> Arc<Self>",
+        "pop_event": "pub fn pop_event(&self) -> Result<Option<FfiVadEvent>, FfiError>",
         "process_chunk": "pub fn process_chunk( &self, vad: &FfiSileroVad, chunk: Vec<f32>, ) -> Result<Option<FfiVadEvent>, FfiError>",
         "reset": "pub fn reset(&self) -> Result<(), FfiError>"
       }
@@ -450,7 +454,7 @@
       "kind": "record",
       "owner": "FfiVadConfig",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct FfiVadConfig { #[uniffi(default = 0.5)] pub threshold: f32, #[uniffi(default = 0.35)] pub neg_threshold: f32, #[uniffi(default = 64)] pub min_speech_duration_ms: u32, #[uniffi(default = 100)] pub min_silence_duration_ms: u32, #[uniffi(default = 30)] pub speech_pad_ms: u32, }"
+      "expected": "pub struct FfiVadConfig { #[uniffi(default = 0.5)] pub threshold: f32, #[uniffi(default = 0.35)] pub neg_threshold: f32, #[uniffi(default = 64)] pub min_speech_duration_ms: u32, #[uniffi(default = 100)] pub min_silence_duration_ms: u32, #[uniffi(default = 30)] pub speech_pad_ms: u32, #[uniffi(default = None)] pub frame_stride: Option<u32>, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -736,6 +740,7 @@
         "image_in": "pub fn image_in(&self) -> bool",
         "kv_compression": "pub fn kv_compression(&self) -> String",
         "position": "pub fn position(&self) -> u32",
+        "reset": "pub fn reset(&mut self) -> Result<(), JsError>",
         "set_image_max_long_size": "pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>)",
         "tokenizer": "pub fn tokenizer(&self) -> Tokenizer"
       }

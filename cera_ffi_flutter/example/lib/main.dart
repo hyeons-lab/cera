@@ -14,7 +14,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 
 import 'chat_controller.dart';
 import 'chat_intent.dart';
