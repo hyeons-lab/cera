@@ -262,7 +262,9 @@ impl LlamaModel {
                 .unwrap_or(1.0);
             let orig_ctx_len = gguf
                 .get_u32(&format!("{prefix}.rope.scaling.original_context_length"))
+                .or_else(|| gguf.get_u32(&format!("{prefix}.rope.scaling.orig_ctx_len")))
                 .or_else(|| gguf.get_u32("rope.scaling.original_context_length"))
+                .or_else(|| gguf.get_u32("rope.scaling.orig_ctx_len"))
                 .map(|len| len as usize)
                 .filter(|&len| len > 0)
                 .unwrap_or(context_size);

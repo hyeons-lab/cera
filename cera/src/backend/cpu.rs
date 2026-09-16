@@ -6399,7 +6399,11 @@ impl YarnParams {
             }
         }
         if !mscale.is_finite() || mscale <= 0.0 {
-            mscale = attn_factor.max(1.0);
+            mscale = if attn_factor.is_finite() && attn_factor > 0.0 {
+                attn_factor
+            } else {
+                1.0
+            };
         }
         Self {
             freq_scale,
@@ -6470,7 +6474,7 @@ fn compute_yarn_cos_sin(
     freq_base: f32,
     yarn: &YarnParams,
     cos_sin: &mut [(f32, f32)],
-) {
+) -> bool {
     let half_dim = head_dim / 2;
     debug_assert!(cos_sin.len() >= half_dim);
     if cos_sin.len() < half_dim
@@ -6482,7 +6486,7 @@ fn compute_yarn_cos_sin(
         || !yarn.mscale.is_finite()
         || yarn.mscale <= 0.0
     {
-        return;
+        return false;
     }
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let corr_dims = if yarn.ext_factor != 0.0 {
@@ -6512,6 +6516,7 @@ fn compute_yarn_cos_sin(
         *entry = (cos_t * mscale, sin_t * mscale);
         theta_base *= theta_scale;
     }
+    true
 }
 
 /// Apply precomputed NeoX RoPE rotation to a single head slice.
@@ -6522,12 +6527,11 @@ fn rotate_head_neox_with_cos_sin(head: &mut [f32], half_dim: usize, cos_sin: &[(
     }
     let (h0, h1) = head[..2 * half_dim].split_at_mut(half_dim);
     let cos_sin = &cos_sin[..half_dim];
-    for i in 0..half_dim {
-        let (cos_t, sin_t) = cos_sin[i];
-        let x0 = h0[i];
-        let x1 = h1[i];
-        h0[i] = x0 * cos_t - x1 * sin_t;
-        h1[i] = x0 * sin_t + x1 * cos_t;
+    for ((x0, x1), &(cos_t, sin_t)) in h0.iter_mut().zip(h1.iter_mut()).zip(cos_sin.iter()) {
+        let orig_x0 = *x0;
+        let orig_x1 = *x1;
+        *x0 = orig_x0 * cos_t - orig_x1 * sin_t;
+        *x1 = orig_x0 * sin_t + orig_x1 * cos_t;
     }
 }
 
@@ -6556,15 +6560,17 @@ pub fn apply_rope_neox_yarn_to_head(
     }
 
     let half_dim = head_dim / 2;
-    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut stack_buf = [(1.0f32, 0.0f32); 256];
     let mut heap_buf;
     let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
         &mut stack_buf[..half_dim]
     } else {
-        heap_buf = vec![(0.0, 0.0); half_dim];
+        heap_buf = vec![(1.0, 0.0); half_dim];
         &mut heap_buf
     };
-    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+    if !compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice) {
+        return;
+    }
     rotate_head_neox_with_cos_sin(head, half_dim, cos_sin_slice);
 }
 
@@ -6600,15 +6606,17 @@ pub fn rope_neox_yarn(
     }
 
     let half_dim = head_dim / 2;
-    let mut stack_buf = [(0.0f32, 0.0f32); 256];
+    let mut stack_buf = [(1.0f32, 0.0f32); 256];
     let mut heap_buf;
     let cos_sin_slice: &mut [(f32, f32)] = if half_dim <= 256 {
         &mut stack_buf[..half_dim]
     } else {
-        heap_buf = vec![(0.0, 0.0); half_dim];
+        heap_buf = vec![(1.0, 0.0); half_dim];
         &mut heap_buf
     };
-    compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice);
+    if !compute_yarn_cos_sin(pos, head_dim, freq_base, yarn, cos_sin_slice) {
+        return;
+    }
 
     for h in 0..n_heads {
         let offset = h * head_dim;
