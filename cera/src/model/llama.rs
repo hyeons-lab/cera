@@ -86,6 +86,11 @@ pub struct LlamaModel {
     attn_q_bias: Vec<Option<Vec<f32>>>,
     attn_k_bias: Vec<Option<Vec<f32>>>,
     attn_v_bias: Vec<Option<Vec<f32>>>,
+    // Mistral 3 optional projection and FFN biases.
+    attn_output_bias: Vec<Option<Vec<f32>>>,
+    ffn_gate_bias: Vec<Option<Vec<f32>>>,
+    ffn_up_bias: Vec<Option<Vec<f32>>>,
+    ffn_down_bias: Vec<Option<Vec<f32>>>,
     // Pre-resolved quantized weight refs.
     embd_ref: WeightRef,
     /// Separate output projection (`output.weight`) when present; `None` means
@@ -95,6 +100,7 @@ pub struct LlamaModel {
     sliding_window: Option<usize>,
     sliding_window_pattern: Option<Vec<bool>>,
     yarn: Option<cpu::YarnParams>,
+    attn_temp_scale: Option<(f32, usize)>,
     /// Number of physical layers per loop for models with tied layer loops (e.g. Nanbeige).
     /// When Some, output_norm is applied between loops.
     loop_norm_interval: Option<usize>,
@@ -160,6 +166,26 @@ fn lm_head_gemm_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1"))
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+#[inline]
+fn apply_column_major_bias(mat: &mut [f32], bias: &[f32], dim: usize, n: usize) {
+    if n == 1 {
+        let len = dim.min(bias.len()).min(mat.len());
+        cpu::add_inplace(&mut mat[..len], &bias[..len]);
+    } else {
+        for (i, &b) in bias.iter().enumerate().take(dim) {
+            let start = i * n;
+            let end = (start + n).min(mat.len());
+            if start >= end {
+                break;
+            }
+            for val in &mut mat[start..end] {
+                *val += b;
+            }
+        }
+    }
+}
+
 impl LlamaModel {
     /// Construct without a model identifier.
     #[allow(dead_code)]
@@ -181,13 +207,25 @@ impl LlamaModel {
             .get_str("general.architecture")
             .context("missing general.architecture")?
             .to_lowercase();
-        let prefix = arch.as_str();
+        let resolved_prefix = if (arch == "ministral3" || arch == "ministral")
+            && (!gguf
+                .metadata
+                .keys()
+                .any(|k| k.starts_with(&format!("{arch}.")))
+                || gguf.metadata.keys().any(|k| k.starts_with("mistral3.")))
+        {
+            "mistral3"
+        } else {
+            arch.as_str()
+        };
+        let prefix = resolved_prefix;
 
         // RoPE layout per arch. Qwen, Gemma 2, Olmo 2, and Olmo 3 GGUFs are NEOX (split-halves);
         let rope_type = match prefix {
             "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" => RopeType::Neox,
             // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" => RopeType::Norm,
+            "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3"
+            | "ministral3" | "ministral" => RopeType::Norm,
             // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
             // routed here without a layout mapping must fail loudly rather than
             // silently default to NORM (wrong for any NEOX-family arch: phi3,
@@ -301,23 +339,48 @@ impl LlamaModel {
                 .filter(|x| x.is_finite() && *x >= 0.0)
                 .map(|x| x.clamp(0.0, 1.0))
                 .unwrap_or(1.0);
+            let log_mul = gguf
+                .get_f32(&format!("{prefix}.rope.scaling.yarn_log_multiplier"))
+                .or_else(|| gguf.get_f32("rope.scaling.yarn_log_multiplier"))
+                .filter(|x| x.is_finite() && *x >= 0.0)
+                .unwrap_or(0.1);
             let freq_scale = if factor > 0.0 { 1.0 / factor } else { 1.0 };
-            Some(cpu::YarnParams::new(
+            Some(cpu::YarnParams::new_with_log_mul(
                 freq_scale,
                 ext_factor,
                 attn_factor,
                 beta_fast,
                 beta_slow,
                 orig_ctx_len,
+                log_mul,
             ))
         } else {
             None
         };
-        if yarn.is_some() && rope_type != RopeType::Neox {
-            tracing::warn!(
-                "YaRN RoPE scaling configured on {rope_type:?} layout; only NeoX is currently supported"
-            );
-        }
+
+        let attn_temp_scale = gguf
+            .get_f32(&format!("{prefix}.attention.temperature_scale"))
+            .or_else(|| gguf.get_f32("attention.temperature_scale"))
+            .or_else(|| gguf.get_f32(&format!("{prefix}.attention.temp_scale")))
+            .or_else(|| gguf.get_f32("attention.temp_scale"))
+            .filter(|&scale| scale.is_finite() && scale > 0.0)
+            .map(|scale| {
+                let floor_scale = gguf
+                    .get_u32(&format!("{prefix}.attention.temperature_length"))
+                    .or_else(|| gguf.get_u32("attention.temperature_length"))
+                    .or_else(|| gguf.get_u32(&format!("{prefix}.attention.temp_floor_scale")))
+                    .or_else(|| gguf.get_u32("attention.temp_floor_scale"))
+                    .or_else(|| {
+                        gguf.get_u32(&format!("{prefix}.rope.scaling.original_context_length"))
+                    })
+                    .or_else(|| gguf.get_u32("rope.scaling.original_context_length"))
+                    .or_else(|| gguf.get_u32(&format!("{prefix}.context_length")))
+                    .or_else(|| gguf.get_u32("context_length"))
+                    .map(|len| len as usize)
+                    .filter(|&len| len > 0)
+                    .unwrap_or(context_size.max(1));
+                (scale, floor_scale)
+            });
 
         let n_phys_layers =
             gguf.get_u32(&format!("{prefix}.block_count"))
@@ -522,6 +585,10 @@ impl LlamaModel {
         let mut attn_q_bias = Vec::with_capacity(n_layers);
         let mut attn_k_bias = Vec::with_capacity(n_layers);
         let mut attn_v_bias = Vec::with_capacity(n_layers);
+        let mut attn_output_bias = Vec::with_capacity(n_layers);
+        let mut ffn_gate_bias = Vec::with_capacity(n_layers);
+        let mut ffn_up_bias = Vec::with_capacity(n_layers);
+        let mut ffn_down_bias = Vec::with_capacity(n_layers);
         let mut layer_refs = Vec::with_capacity(n_layers);
 
         for i in 0..n_phys_layers {
@@ -662,6 +729,43 @@ impl LlamaModel {
                 attn_v_bias.push(None);
             }
 
+            // Optional projection and FFN biases (Mistral 3).
+            let load_optional_bias =
+                |name: &str, expected_len: usize| -> Result<Option<Vec<f32>>> {
+                    if gguf.tensors.contains_key(name) {
+                        let b = gguf.get_tensor(name)?.try_to_f32_vec()?;
+                        ensure!(
+                            b.len() == expected_len,
+                            "invalid {name} length {} for layer {i} (expected {expected_len})",
+                            b.len()
+                        );
+                        ensure!(
+                            b.iter().all(|v| v.is_finite()),
+                            "non-finite value detected in {name} for layer {i}"
+                        );
+                        Ok(Some(b))
+                    } else {
+                        Ok(None)
+                    }
+                };
+
+            attn_output_bias.push(load_optional_bias(
+                &format!("blk.{i}.attn_output.bias"),
+                config.hidden_size,
+            )?);
+            ffn_gate_bias.push(load_optional_bias(
+                &format!("blk.{i}.ffn_gate.bias"),
+                config.intermediate_size,
+            )?);
+            ffn_up_bias.push(load_optional_bias(
+                &format!("blk.{i}.ffn_up.bias"),
+                config.intermediate_size,
+            )?);
+            ffn_down_bias.push(load_optional_bias(
+                &format!("blk.{i}.ffn_down.bias"),
+                config.hidden_size,
+            )?);
+
             // `.with_repack` on the projection weights only: these are the ones
             // that hit the batched prefill GEMM at `n > 1`. token_embd / output
             // stay excluded, though no longer because the head runs at `n = 1` (see
@@ -699,6 +803,10 @@ impl LlamaModel {
                 attn_q_bias.extend_from_within(..n_phys_layers);
                 attn_k_bias.extend_from_within(..n_phys_layers);
                 attn_v_bias.extend_from_within(..n_phys_layers);
+                attn_output_bias.extend_from_within(..n_phys_layers);
+                ffn_gate_bias.extend_from_within(..n_phys_layers);
+                ffn_up_bias.extend_from_within(..n_phys_layers);
+                ffn_down_bias.extend_from_within(..n_phys_layers);
                 layer_refs.extend_from_within(..n_phys_layers);
             }
         }
@@ -807,12 +915,17 @@ impl LlamaModel {
             attn_q_bias,
             attn_k_bias,
             attn_v_bias,
+            attn_output_bias,
+            ffn_gate_bias,
+            ffn_up_bias,
+            ffn_down_bias,
             embd_ref,
             output_ref,
             layer_refs,
             sliding_window,
             sliding_window_pattern,
             yarn,
+            attn_temp_scale,
             loop_norm_interval,
             model_id,
         })
@@ -872,6 +985,7 @@ impl LlamaModel {
             attn_logit_softcapping: self.attn_logit_softcapping,
             sliding_window: self.layer_sliding_window(il),
             yarn: self.layer_yarn(il),
+            attn_temp_scale: self.attn_temp_scale,
         }
     }
 
@@ -937,6 +1051,7 @@ impl LlamaModel {
                     (Some(q), Some(k)) => Some((q, k)),
                     _ => None,
                 },
+                attn_output_bias: self.attn_output_bias[i].as_deref(),
             };
             let dims = self.attn_dims(i);
             transformer::forward_attn_block(
@@ -981,10 +1096,16 @@ impl LlamaModel {
                 ffn_up: &refs.ffn_up,
                 ffn_down: &refs.ffn_down,
             };
+            let ffn_extras = transformer::FfnExtras {
+                gate_bias: self.ffn_gate_bias[i].as_deref(),
+                up_bias: self.ffn_up_bias[i].as_deref(),
+                down_bias: self.ffn_down_bias[i].as_deref(),
+            };
             transformer::forward_ffn_block(
                 &self.gguf,
                 i,
                 &ffn_weights,
+                &ffn_extras,
                 hs,
                 cfg.intermediate_size,
                 ffn_in,
@@ -1624,16 +1745,42 @@ impl LlamaModel {
                             cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, cfg.rope_theta);
                         }
                     }
-                    RopeType::Norm => cpu::rope_norm(
-                        q,
-                        k,
-                        pos,
-                        n_heads,
-                        n_kv_heads,
-                        head_dim,
-                        cfg.rope_theta,
-                        self.rope_freqs.as_deref(),
-                    ),
+                    RopeType::Norm => {
+                        if let Some(yarn) = self.layer_yarn(layer) {
+                            cpu::rope_norm_yarn(
+                                q,
+                                k,
+                                pos,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                cfg.rope_theta,
+                                &yarn,
+                            );
+                        } else {
+                            cpu::rope_norm(
+                                q,
+                                k,
+                                pos,
+                                n_heads,
+                                n_kv_heads,
+                                head_dim,
+                                cfg.rope_theta,
+                                self.rope_freqs.as_deref(),
+                            );
+                        }
+                    }
+                }
+
+                // Optional attention temperature scaling (Mistral 3 / Llama 4).
+                if let Some((scale, floor_scale)) = self.attn_temp_scale
+                    && scale > 0.0
+                    && floor_scale > 0
+                    && pos >= floor_scale
+                {
+                    let q_scale =
+                        ((pos as f32 / floor_scale as f32).floor() + 1.0).ln() * scale + 1.0;
+                    cpu::scale_inplace(q, q_scale);
                 }
 
                 // Stash post-RoPE Q back into q_mat for the attention pass.
@@ -1853,6 +2000,10 @@ impl LlamaModel {
                 );
             }
 
+            if let Some(bias) = self.attn_output_bias[layer].as_deref() {
+                apply_column_major_bias(&mut block_out, bias, hs, n);
+            }
+
             // Post-norm on attention output (Gemma 2, Olmo 2/3).
             if let Some(post_norm) = &self.attn_post_norm_weights[layer] {
                 if n == 1 {
@@ -1985,6 +2136,13 @@ impl LlamaModel {
                 }
             }
 
+            if let Some(bias) = self.ffn_gate_bias[layer].as_deref() {
+                apply_column_major_bias(&mut gate_mat, bias, is, n);
+            }
+            if let Some(bias) = self.ffn_up_bias[layer].as_deref() {
+                apply_column_major_bias(&mut up_mat, bias, is, n);
+            }
+
             match self.activation {
                 FfnActivation::Swiglu => {
                     cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
@@ -2041,6 +2199,10 @@ impl LlamaModel {
                     n,
                     &mut state.scratch.lora_tmp,
                 );
+            }
+
+            if let Some(bias) = self.ffn_down_bias[layer].as_deref() {
+                apply_column_major_bias(&mut ffn_out, bias, hs, n);
             }
 
             // Post-norm on FFN output (Gemma 2, Olmo 2/3).
@@ -2551,9 +2713,16 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
         // differential test (batched vs per-token, all four archs) in
         // `tests/gpu_transformer_parity.rs`.
         //
-        // YaRN frequency scaling and per-layer sliding window attention
-        // patterns are not implemented in the current GPU prefill shaders.
-        self.yarn.is_none() && self.sliding_window.is_none()
+        // YaRN frequency scaling, per-layer sliding window attention patterns,
+        // attention temperature scaling, and projection/FFN biases are not
+        // implemented in the current GPU prefill shaders.
+        self.yarn.is_none()
+            && self.sliding_window.is_none()
+            && self.attn_temp_scale.is_none()
+            && self.attn_output_bias.iter().all(Option::is_none)
+            && self.ffn_gate_bias.iter().all(Option::is_none)
+            && self.ffn_up_bias.iter().all(Option::is_none)
+            && self.ffn_down_bias.iter().all(Option::is_none)
     }
     fn loop_norm_interval(&self) -> Option<usize> {
         self.loop_norm_interval

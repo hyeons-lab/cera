@@ -12,7 +12,7 @@ use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::kv_cache::InferenceState;
 use crate::model::transformer::{
-    self, AttnDims, AttnExtras, AttnWeights, FfnWeights, WeightRef, forward_attn_block,
+    self, AttnDims, AttnExtras, AttnWeights, FfnExtras, FfnWeights, WeightRef, forward_attn_block,
     forward_ffn_block, gemv,
 };
 use crate::model::{BlockType, ModelConfig, ScalarMultipliers};
@@ -733,10 +733,12 @@ impl DSparkDraftModel {
             attn_logit_softcapping: None,
             sliding_window: None,
             yarn: None,
+            attn_temp_scale: None,
         };
         let attn_extras = AttnExtras {
             qkv_bias: None,
             qk_norm: None,
+            attn_output_bias: None,
         };
 
         for (l, layer) in self.layers.iter().enumerate() {
@@ -785,6 +787,7 @@ impl DSparkDraftModel {
                 &self.gguf,
                 l,
                 &ffn_weights,
+                &FfnExtras::default(),
                 self.config.hidden_size,
                 self.config.intermediate_size,
                 normed,

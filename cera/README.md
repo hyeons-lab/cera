@@ -147,9 +147,10 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `granite` | IBM Granite 3.x, and the dense Granite 4.1 line (3b / 8b / 30b) |
 | `minicpm`, `minicpm5` | MiniCPM / MiniCPM5 (MiniCPM-1B / 2B) |
 | `nanbeige` | Nanbeige 4.2 (looped-layer dense transformer) |
+| `mistral3`, `ministral3` | Mistral 3 / Ministral 3 (Ministral-3B / 8B, Mistral-Small-3) |
 
 Any other architecture errors out with `unsupported architecture: <name>` (this
-includes the newer `mistral3`/`mistral4` layouts). No Granite 4.0 model loads
+includes unsupported layouts such as `mistral4`). No Granite 4.0 model loads
 today: the 4.0-H hybrids convert to the separate arch `granitehybrid`; the
 non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do convert to `granite`,
 but write `attention.head_count_kv` as a per-layer array the loader does not yet
