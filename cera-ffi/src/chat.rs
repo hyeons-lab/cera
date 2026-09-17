@@ -124,6 +124,15 @@ pub fn chat_message_tool(content: String) -> Message {
     }
 }
 
+/// Compile a JSON Schema definition string into a GBNF grammar string.
+#[uniffi::export]
+pub fn json_schema_to_grammar(schema_json: String) -> Result<String, FfiError> {
+    cera::grammar::json_schema_to_gbnf_str(&schema_json)
+        .map_err(|e| FfiError::GrammarParse {
+            detail: format!("invalid JSON schema: {e}"),
+        })
+}
+
 /// Lifecycle phase of a stateful chat coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SessionPhase {
@@ -603,6 +612,37 @@ impl ChatSession {
         }
     }
 
+    /// Complete generation synchronously constrained by a JSON Schema.
+    pub fn complete_json(
+        &self,
+        opts: GenerateOpts,
+        schema_json: String,
+    ) -> Result<TurnResult, FfiError> {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
+            .map_err(|e| FfiError::GrammarParse {
+                detail: format!("invalid JSON schema: {e}"),
+            })?;
+        let mut constrained_opts = opts;
+        constrained_opts.grammar = Some(grammar_str);
+        self.complete(constrained_opts)
+    }
+
+    /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+    pub fn generate_streaming_json(
+        &self,
+        opts: GenerateOpts,
+        schema_json: String,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
+            .map_err(|e| FfiError::GrammarParse {
+                detail: format!("invalid JSON schema: {e}"),
+            })?;
+        let mut constrained_opts = opts;
+        constrained_opts.grammar = Some(grammar_str);
+        self.generate_streaming(constrained_opts, sink)
+    }
+
     /// Reset execution state and return to Idle phase.
     pub fn reset(&self) -> Result<(), FfiError> {
         self.with_chat(|chat| {
@@ -727,6 +767,37 @@ impl ChatSession {
         join_result.map_err(|e| FfiError::Backend {
             detail: format!("generate_streaming_async join error: {e}"),
         })?
+    }
+
+    /// Async variant of [`ChatSession::complete_json`].
+    pub async fn complete_async_json(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+        schema_json: String,
+    ) -> Result<TurnResult, FfiError> {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
+            .map_err(|e| FfiError::GrammarParse {
+                detail: format!("invalid JSON schema: {e}"),
+            })?;
+        let mut constrained_opts = opts;
+        constrained_opts.grammar = Some(grammar_str);
+        self.complete_async(constrained_opts).await
+    }
+
+    /// Async variant of [`ChatSession::generate_streaming_json`].
+    pub async fn generate_streaming_async_json(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+        schema_json: String,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
+            .map_err(|e| FfiError::GrammarParse {
+                detail: format!("invalid JSON schema: {e}"),
+            })?;
+        let mut constrained_opts = opts;
+        constrained_opts.grammar = Some(grammar_str);
+        self.generate_streaming_async(constrained_opts, sink).await
     }
 }
 

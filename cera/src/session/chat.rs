@@ -750,6 +750,19 @@ impl<E: Execution> Chat<E> {
         })
     }
 
+    /// Complete generation constrained by a JSON Schema, returning the assistant response.
+    pub fn complete_json(
+        &mut self,
+        opts: &GenerateOpts,
+        schema_str: &str,
+    ) -> Result<TurnResult, CompleteError> {
+        let grammar = crate::grammar::Grammar::from_json_schema_str(schema_str)
+            .map_err(|e| CompleteError::Validation(ValidationError::Generation(format!("invalid JSON schema: {e}"))))?;
+        let mut constrained_opts = opts.clone();
+        constrained_opts.grammar = Some(Arc::new(grammar));
+        self.complete(&constrained_opts)
+    }
+
     /// Reset execution state and return to `SessionPhase::Idle`.
     pub fn reset(&mut self) -> Result<(), CeraError> {
         self.phase = SessionPhase::Unusable;

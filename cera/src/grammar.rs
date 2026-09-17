@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
 
+pub mod json_schema;
+pub use json_schema::{json_schema_to_gbnf, json_schema_to_gbnf_str};
+
 // ── Compiled grammar ────────────────────────────────────────────────────────
 
 /// A single compiled grammar element. Rules are `Vec<Elem>` where alternates are
@@ -62,6 +65,18 @@ impl Grammar {
     /// Parse a GBNF grammar from text.
     pub fn parse(src: &str) -> Result<Grammar> {
         Parser::new(src).parse_grammar()
+    }
+
+    /// Compile a JSON Schema value into a constrained decoding grammar.
+    pub fn from_json_schema(schema: &serde_json::Value) -> Result<Grammar> {
+        let gbnf = json_schema::json_schema_to_gbnf(schema)?;
+        Self::parse(&gbnf)
+    }
+
+    /// Compile a JSON Schema string into a constrained decoding grammar.
+    pub fn from_json_schema_str(schema_str: &str) -> Result<Grammar> {
+        let gbnf = json_schema::json_schema_to_gbnf_str(schema_str)?;
+        Self::parse(&gbnf)
     }
 
     /// Position into a rule's element list.

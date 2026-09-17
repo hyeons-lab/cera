@@ -50,3 +50,16 @@ fun ChatSession.stream(opts: GenerateOpts): Flow<String> =
             job.cancel()
         }
     }
+
+/**
+ * Constrain generation options with a JSON Schema definition string.
+ */
+fun GenerateOpts.withJsonSchema(schemaJson: String): GenerateOpts = copy(grammar = jsonSchemaToGrammar(schemaJson))
+
+/**
+ * Streams generation output text tokens conforming to a JSON Schema as a cold [Flow].
+ */
+fun ChatSession.streamJson(
+    opts: GenerateOpts,
+    schemaJson: String,
+): Flow<String> = stream(opts.withJsonSchema(schemaJson))

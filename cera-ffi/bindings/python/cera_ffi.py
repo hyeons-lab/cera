@@ -495,6 +495,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360:
@@ -591,9 +593,17 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1261,6 +1271,11 @@ _UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_json_schema_to_grammar.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_json_schema_to_grammar.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_list_leap_bundles.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1529,6 +1544,19 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async.argtypes = (
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async_json.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async_json.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1542,6 +1570,21 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async.argtyp
     ctypes.c_uint64,
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2024,6 +2067,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_u
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.restype = ctypes.c_uint16
@@ -2168,12 +2214,24 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
@@ -9799,6 +9857,16 @@ class ChatSessionProtocol(typing.Protocol):
         Async variant of [`ChatSession::complete`].
 """
         raise NotImplementedError
+    async def complete_async_json(self, opts: GenerateOpts,schema_json: str) -> TurnResult:
+        """
+        Async variant of [`ChatSession::complete_json`].
+"""
+        raise NotImplementedError
+    def complete_json(self, opts: GenerateOpts,schema_json: str) -> TurnResult:
+        """
+        Complete generation synchronously constrained by a JSON Schema.
+"""
+        raise NotImplementedError
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
@@ -9807,6 +9875,16 @@ class ChatSessionProtocol(typing.Protocol):
     async def generate_streaming_async(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Async variant of [`ChatSession::generate_streaming`].
+"""
+        raise NotImplementedError
+    async def generate_streaming_async_json(self, opts: GenerateOpts,schema_json: str,sink: ModalitySink) -> GenerateSummary:
+        """
+        Async variant of [`ChatSession::generate_streaming_json`].
+"""
+        raise NotImplementedError
+    def generate_streaming_json(self, opts: GenerateOpts,schema_json: str,sink: ModalitySink) -> GenerateSummary:
+        """
+        Stream generation output tokens into the specified sink, constrained by a JSON Schema.
 """
         raise NotImplementedError
     def ingest(self, message: Message) -> IngestSummary:
@@ -9978,6 +10056,50 @@ class ChatSession(ChatSessionProtocol):
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
+    async def complete_async_json(self, opts: GenerateOpts,schema_json: str) -> TurnResult:
+        """
+        Async variant of [`ChatSession::complete_json`].
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterString.check_lower(schema_json)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterString.lower(schema_json),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeTurnResult.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async_json(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    def complete_json(self, opts: GenerateOpts,schema_json: str) -> TurnResult:
+        """
+        Complete generation synchronously constrained by a JSON Schema.
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterString.check_lower(schema_json)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterString.lower(schema_json),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeTurnResult.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
@@ -10022,6 +10144,56 @@ class ChatSession(ChatSessionProtocol):
             _uniffi_lift_return,
             _uniffi_error_converter,
         )
+    async def generate_streaming_async_json(self, opts: GenerateOpts,schema_json: str,sink: ModalitySink) -> GenerateSummary:
+        """
+        Async variant of [`ChatSession::generate_streaming_json`].
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterString.check_lower(schema_json)
+
+        _UniffiFfiConverterTypeModalitySink.check_lower(sink)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterString.lower(schema_json),
+            _UniffiFfiConverterTypeModalitySink.lower(sink),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    def generate_streaming_json(self, opts: GenerateOpts,schema_json: str,sink: ModalitySink) -> GenerateSummary:
+        """
+        Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterString.check_lower(schema_json)
+
+        _UniffiFfiConverterTypeModalitySink.check_lower(sink)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterString.lower(schema_json),
+            _UniffiFfiConverterTypeModalitySink.lower(sink),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def ingest(self, message: Message) -> IngestSummary:
         """
         Ingest a single message into the chat context.
@@ -13229,6 +13401,23 @@ def hotword_default_config() -> FfiHotwordConfig:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def json_schema_to_grammar(schema_json: str) -> str:
+    """
+    Compile a JSON Schema definition string into a GBNF grammar string.
+"""
+    
+    _UniffiFfiConverterString.check_lower(schema_json)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(schema_json),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterString.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_json_schema_to_grammar,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def list_leap_bundles() -> typing.List[LeapBundleEntry]:
     """
     List every bundle published on `LiquidAI/LeapBundles`, so a picker
@@ -13415,6 +13604,7 @@ __all__ = [
     "cpu_backend_report",
     "detect_tool_format",
     "hotword_default_config",
+    "json_schema_to_grammar",
     "list_leap_bundles",
     "list_leap_bundles_async",
     "parse_tool_calls",

@@ -1802,6 +1802,16 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func completeAsync(opts: GenerateOpts) async throws  -> TurnResult
     
     /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    func completeAsyncJson(opts: GenerateOpts, schemaJson: String) async throws  -> TurnResult
+    
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    func completeJson(opts: GenerateOpts, schemaJson: String) throws  -> TurnResult
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
     func generateStreaming(opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
@@ -1810,6 +1820,16 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Async variant of [`ChatSession::generate_streaming`].
      */
     func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink) async throws  -> GenerateSummary
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) async throws  -> GenerateSummary
+    
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) throws  -> GenerateSummary
     
     /**
      * Ingest a single message into the chat context.
@@ -1987,6 +2007,39 @@ open func completeAsync(opts: GenerateOpts)async throws  -> TurnResult  {
 }
     
     /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+open func completeAsyncJson(opts: GenerateOpts, schemaJson: String)async throws  -> TurnResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTurnResult_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+open func completeJson(opts: GenerateOpts, schemaJson: String)throws  -> TurnResult  {
+    return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_complete_json(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterString.lower(schemaJson),$0
+    )
+})
+}
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
 open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
@@ -2017,6 +2070,40 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
             liftFunc: FfiConverterTypeGenerateSummary_lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
+}
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+open func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink)async throws  -> GenerateSummary  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson),FfiConverterTypeModalitySink_lower(sink)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGenerateSummary_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink)throws  -> GenerateSummary  {
+    return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterString.lower(schemaJson),
+        FfiConverterTypeModalitySink_lower(sink),$0
+    )
+})
 }
     
     /**
@@ -11010,6 +11097,16 @@ public func chatMessageUser(content: String) -> Message  {
     )
 })
 }
+/**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ */
+public func jsonSchemaToGrammar(schemaJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_json_schema_to_grammar(
+        FfiConverterString.lower(schemaJson),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -11066,6 +11163,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
@@ -11320,10 +11420,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {

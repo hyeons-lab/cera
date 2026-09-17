@@ -1314,3 +1314,109 @@ fn chat_stream_text_emits_fragments_and_returns_complete_turn() {
     assert_eq!(chat.phase(), SessionPhase::TurnComplete);
     assert_eq!(emitted.concat(), "a");
 }
+
+struct JsonScriptedModel {
+    config: ModelConfig,
+    tokens: Vec<u32>,
+    step: AtomicUsize,
+}
+
+impl Model for JsonScriptedModel {
+    fn is_classifier(&self) -> bool {
+        false
+    }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
+        let LayerState::Attention {
+            key_cache,
+            value_cache,
+            ..
+        } = &mut state.layers[0]
+        else {
+            unreachable!()
+        };
+        key_cache.extend(
+            tokens
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &token)| [token as f32, (pos + i) as f32]),
+        );
+        value_cache.extend(tokens.iter().flat_map(|&token| [token as f32, 1.0]));
+        state.seq_len += tokens.len();
+
+        let mut logits = vec![-100.0; self.config.vocab_size];
+        let idx = self.step.fetch_add(1, Ordering::Relaxed);
+        let next = if idx < self.tokens.len() {
+            self.tokens[idx]
+        } else {
+            7 // EOS
+        };
+        logits[next as usize] = 10.0;
+        logits
+    }
+    fn forward_prefill_chunked(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+        _: usize,
+        _cancel: &AtomicBool,
+    ) -> (usize, Option<Vec<f32>>) {
+        let mut last = None;
+        for (i, &token) in tokens.iter().enumerate() {
+            self.step.store(0, Ordering::Relaxed);
+            last = Some(self.forward(&[token], pos + i, state));
+        }
+        (tokens.len(), last)
+    }
+}
+
+#[test]
+fn chat_complete_json_compiles_schema_and_enforces_grammar() {
+    let tokenizer = fixtures::tokenizer();
+    // In fixtures::tokenizer():
+    // token 11 = '"'
+    // token 74 = 'a'
+    // token 7 = '<|im_end|>' (EOS)
+    let scripted = Arc::new(JsonScriptedModel {
+        config: fixtures::model_config("json-scripted-test", tokenizer.vocab_size()),
+        tokens: vec![11, 74, 11],
+        step: AtomicUsize::new(0),
+    });
+    let session = Session::new(
+        scripted,
+        tokenizer,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+    let mut chat = core_chat(session).unwrap();
+
+    chat.ingest(&user("give json")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let schema = r#"{"type": "string", "enum": ["a"]}"#;
+    let turn = chat.complete_json(&opts(0.0), schema).unwrap();
+
+    assert_eq!(turn.text, "\"a\"");
+    assert_eq!(turn.tokens, vec![11, 74, 11]);
+    assert_eq!(turn.summary.finish_reason, FinishReason::Stop);
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+}
+
+#[test]
+fn chat_complete_json_rejects_invalid_schema() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("give json")).unwrap();
+
+    let invalid_schema = r#"{"type": "unsupported_xyz"}"#;
+    let err = chat.complete_json(&opts(0.0), invalid_schema).unwrap_err();
+    match err {
+        CompleteError::Validation(ValidationError::Generation(msg)) => {
+            assert!(msg.contains("invalid JSON schema"));
+        }
+        other => panic!("expected Validation(Generation), got: {other:?}"),
+    }
+}

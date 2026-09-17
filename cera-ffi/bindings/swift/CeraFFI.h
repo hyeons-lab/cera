@@ -974,6 +974,16 @@ RustBuffer uniffi_cera_ffi_fn_method_chatsession_complete(uint64_t ptr, RustBuff
 uint64_t uniffi_cera_ffi_fn_method_chatsession_complete_async(uint64_t ptr, RustBuffer opts
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_ASYNC_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_ASYNC_JSON
+uint64_t uniffi_cera_ffi_fn_method_chatsession_complete_async_json(uint64_t ptr, RustBuffer opts, RustBuffer schema_json
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_JSON
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_complete_json(uint64_t ptr, RustBuffer opts, RustBuffer schema_json, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
 RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming(uint64_t ptr, RustBuffer opts, uint64_t sink, RustCallStatus *_Nonnull out_status
@@ -982,6 +992,16 @@ RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming(uint64_t ptr
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
 uint64_t uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(uint64_t ptr, RustBuffer opts, uint64_t sink
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC_JSON
+uint64_t uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(uint64_t ptr, RustBuffer opts, RustBuffer schema_json, uint64_t sink
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_JSON
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(uint64_t ptr, RustBuffer opts, RustBuffer schema_json, uint64_t sink, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST
@@ -1164,6 +1184,11 @@ RustBuffer uniffi_cera_ffi_fn_func_chat_message_tool(RustBuffer content, RustCal
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER
 RustBuffer uniffi_cera_ffi_fn_func_chat_message_user(RustBuffer content, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_JSON_SCHEMA_TO_GRAMMAR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_JSON_SCHEMA_TO_GRAMMAR
+RustBuffer uniffi_cera_ffi_fn_func_json_schema_to_grammar(RustBuffer schema_json, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CERA_FFI_RUSTBUFFER_ALLOC
@@ -1507,6 +1532,12 @@ uint16_t uniffi_cera_ffi_checksum_func_chat_message_tool(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
 uint16_t uniffi_cera_ffi_checksum_func_chat_message_user(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_JSON_SCHEMA_TO_GRAMMAR
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_JSON_SCHEMA_TO_GRAMMAR
+uint16_t uniffi_cera_ffi_checksum_func_json_schema_to_grammar(void
     
 );
 #endif
@@ -2014,6 +2045,18 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete_async(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_ASYNC_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_ASYNC_JSON
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete_async_json(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_JSON
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete_json(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(void
@@ -2023,6 +2066,18 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC_JSON
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_JSON
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_JSON
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(void
     
 );
 #endif

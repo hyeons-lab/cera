@@ -6362,11 +6362,23 @@ final class ChatSession {
   /// Async variant of [`ChatSession::complete`].
   Future<TurnResult> completeAsync(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.completeAsync');
 
+  /// Async variant of [`ChatSession::complete_json`].
+  Future<TurnResult> completeAsyncJson(GenerateOpts opts, String schemaJson) => _unsupportedOnWeb('ChatSession.completeAsyncJson');
+
+  /// Complete generation synchronously constrained by a JSON Schema.
+  TurnResult completeJson(GenerateOpts opts, String schemaJson) => _unsupportedOnWeb('ChatSession.completeJson');
+
   /// Stream generation output tokens into the specified sink.
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
 
   /// Async variant of [`ChatSession::generate_streaming`].
   Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingAsync');
+
+  /// Async variant of [`ChatSession::generate_streaming_json`].
+  Future<GenerateSummary> generateStreamingAsyncJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingAsyncJson');
+
+  /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+  GenerateSummary generateStreamingJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingJson');
 
   /// Ingest a single message into the chat context.
   ///
@@ -6567,3 +6579,6 @@ Message chatMessageTool(String content) => _unsupportedOnWeb('chatMessageTool');
 
 /// Convenience factory for a user text message.
 Message chatMessageUser(String content) => _unsupportedOnWeb('chatMessageUser');
+
+/// Compile a JSON Schema definition string into a GBNF grammar string.
+String jsonSchemaToGrammar(String schemaJson) => _unsupportedOnWeb('jsonSchemaToGrammar');

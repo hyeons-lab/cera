@@ -1,7 +1,40 @@
 # API reshape implementation handoff
 
-Updated: 2026-09-16T11:41-0400. This is the current implementation record; the
+Updated: 2026-09-16T23:43-0400. This is the current implementation record; the
 review worktree preserves the earlier design review and is not the active branch.
+
+## Plan53 complete (2026-09-16T23:43-0400)
+
+Structured outputs and JSON Schema enforcement via constrained GBNF grammars across Core Rust and multi-language foreign bindings (Swift, Kotlin, Python, Dart).
+
+- [x] Core Rust JSON Schema to GBNF compiler:
+      - Implemented `cera/src/grammar/json_schema.rs` with `json_schema_to_gbnf` and `json_schema_to_gbnf_str`.
+      - Supports Draft 7 and 2020-12 subsets: primitives (string, number, integer, boolean, null), string enums and consts, objects with required and optional properties, arrays with minItems, unions (`anyOf`/`oneOf`), and definitions (`$defs`/`definitions`) with `$ref` resolution.
+      - Added `Grammar::from_json_schema` and `Grammar::from_json_schema_str` in `cera/src/grammar.rs`.
+      - Added `GenerateOpts::with_json_schema` and `GenerateOpts::with_json_schema_value` in `cera/src/session.rs`.
+      - Added `Chat::complete_json` on `Chat<E>` in `cera/src/session/chat.rs`.
+- [x] Foreign bindings & UniFFI lowering:
+      - Preserved exact `GenerateOpts` struct shape in `cera-ffi/src/lib.rs` to maintain 69/69 retained API surface contracts.
+      - Exported `json_schema_to_grammar(schema_json: String) -> Result<String, FfiError>` top-level function.
+      - Added `ChatSession::complete_json` and `ChatSession::generate_streaming_json` (sync and async variants) in `cera-ffi/src/chat.rs`.
+      - Added reactive language extensions: Swift `streamJson` and `GenerateOpts.withJsonSchema`, Kotlin `streamJson` and `GenerateOpts.withJsonSchema`, Python `chat_stream_json` and `json_schema_to_grammar`, Dart `streamJson`.
+- [x] Verification gates clean: 9 grammar unit tests, 31 core chat unit tests, 22 FFI chat unit tests, 69/69 retained API surfaces, `ktlint`, and `dart analyze` pass cleanly.
+
+## Plan52 complete (2026-09-16T23:20-0400)
+
+Language-native reactive streaming primitives across Swift (`AsyncThrowingStream`), Kotlin (`Flow`), Dart (`Stream`), Python (`Iterator`), and Rust (`stream_text`).
+
+- [x] Core Rust reactive streaming:
+      - Added `Chat::stream_text` to `Chat<E>` in `cera/src/session/chat.rs`, yielding fragments as generated and returning the final completed `TurnResult`.
+- [x] FFI async streaming & cancel guard:
+      - Implemented `complete_async` and `generate_streaming_async` on `ChatSession` in `cera-ffi/src/chat.rs` using Tokio async runtime.
+      - Implemented `AsyncChatCancelGuard` for wait-free cancellation when foreign async tasks or coroutines are dropped.
+- [x] Multi-language reactive streaming extensions:
+      - Swift: `ChatSession.stream(opts:) -> AsyncThrowingStream<String, Error>`.
+      - Kotlin: `ChatSession.stream(opts: GenerateOpts): Flow<String>`.
+      - Dart: `ChatSession.stream(GenerateOpts opts) -> Stream<String>`.
+      - Python: `chat_stream(session: ChatSession, opts: GenerateOpts) -> Iterator[str]`.
+- [x] Verification gates clean: all 58 FFI tests, 29 core chat tests, Kotlin build (`compileKotlin`), and `dart analyze` pass cleanly with 0 binding drift.
 
 ## Plan49 complete (2026-09-16T11:41-0400)
 

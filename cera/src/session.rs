@@ -221,6 +221,20 @@ impl GenerateOpts {
         }
         opts
     }
+
+    /// Constrain output to valid JSON conforming to the given JSON Schema string.
+    pub fn with_json_schema(mut self, schema_str: &str) -> anyhow::Result<Self> {
+        let grammar = crate::grammar::Grammar::from_json_schema_str(schema_str)?;
+        self.grammar = Some(Arc::new(grammar));
+        Ok(self)
+    }
+
+    /// Constrain output to valid JSON conforming to the given JSON Schema value.
+    pub fn with_json_schema_value(mut self, schema: &serde_json::Value) -> anyhow::Result<Self> {
+        let grammar = crate::grammar::Grammar::from_json_schema(schema)?;
+        self.grammar = Some(Arc::new(grammar));
+        Ok(self)
+    }
 }
 
 /// Summary returned from a completed `generate` call.

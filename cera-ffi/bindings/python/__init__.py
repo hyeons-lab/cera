@@ -23,6 +23,7 @@ from .cera_ffi import (
     chat_message_system,
     chat_message_tool,
     chat_message_user,
+    json_schema_to_grammar,
 )
 
 
@@ -74,8 +75,16 @@ def chat_stream(session: ChatSession, opts: GenerateOpts) -> Iterator[str]:
         session.cancel()
 
 
-# Attach stream method to ChatSession for idiomatic object-oriented calling
+def chat_stream_json(session: ChatSession, opts: GenerateOpts, schema_json: str) -> Iterator[str]:
+    """Stream generated text fragments constrained by a JSON Schema as a Python iterator."""
+    grammar = json_schema_to_grammar(schema_json)
+    opts.grammar = grammar
+    return chat_stream(session, opts)
+
+
+# Attach stream methods to ChatSession for idiomatic object-oriented calling
 setattr(ChatSession, "stream", chat_stream)
+setattr(ChatSession, "stream_json", chat_stream_json)
 
 __all__ = [
     "CeraEngine",
@@ -97,4 +106,6 @@ __all__ = [
     "chat_message_tool",
     "chat_message_user",
     "chat_stream",
+    "chat_stream_json",
+    "json_schema_to_grammar",
 ]

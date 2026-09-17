@@ -874,6 +874,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_chat_message_user(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_json_schema_to_grammar(): Int
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
@@ -1042,9 +1044,17 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_complete_async(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_async_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_json(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
 
@@ -1889,6 +1899,19 @@ internal object UniffiLib {
         `opts`: RustBuffer.ByValue,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
         `ptr`: Long,
         `opts`: RustBuffer.ByValue,
@@ -1901,6 +1924,21 @@ internal object UniffiLib {
         `opts`: RustBuffer.ByValue,
         `sink`: Long,
     ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        `sink`: Long,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        `sink`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_method_chatsession_ingest(
         `ptr`: Long,
@@ -2060,6 +2098,11 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_func_chat_message_user(
         `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_json_schema_to_grammar(
+        `schemaJson`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -2319,6 +2362,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2571,10 +2617,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
@@ -4872,6 +4930,22 @@ public interface ChatSessionInterface {
     suspend fun `completeAsync`(`opts`: GenerateOpts): TurnResult
 
     /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    suspend fun `completeAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult
+
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    fun `completeJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     fun `generateStreaming`(
@@ -4884,6 +4958,24 @@ public interface ChatSessionInterface {
      */
     suspend fun `generateStreamingAsync`(
         `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    suspend fun `generateStreamingAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    fun `generateStreamingJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
         `sink`: ModalitySink,
     ): GenerateSummary
 
@@ -5112,6 +5204,53 @@ open class ChatSession :
         )
 
     /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `completeAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterString.lower(`schemaJson`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeTurnResult.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    @Throws(FfiException::class)
+    override fun `completeJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult =
+        FfiConverterTypeTurnResult.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterString.lower(`schemaJson`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     @Throws(FfiException::class)
@@ -5156,6 +5295,57 @@ open class ChatSession :
             { FfiConverterTypeGenerateSummary.lift(it) },
             // Error FFI converter
             FfiException.ErrorHandler,
+        )
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `generateStreamingAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterString.lower(`schemaJson`),
+                    FfiConverterTypeModalitySink.lower(`sink`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeGenerateSummary.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    @Throws(FfiException::class)
+    override fun `generateStreamingJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        FfiConverterTypeGenerateSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterString.lower(`schemaJson`),
+                        FfiConverterTypeModalitySink.lower(`sink`),
+                        _status,
+                    )
+                }
+            },
         )
 
     /**
@@ -15743,5 +15933,16 @@ fun `chatMessageUser`(`content`: kotlin.String): Message =
     FfiConverterTypeMessage.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ */
+@Throws(FfiException::class)
+fun `jsonSchemaToGrammar`(`schemaJson`: kotlin.String): kotlin.String =
+    FfiConverterString.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_json_schema_to_grammar(FfiConverterString.lower(`schemaJson`), _status)
         },
     )

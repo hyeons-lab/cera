@@ -563,3 +563,44 @@ async fn chat_session_generate_streaming_async_produces_stream() {
     assert_eq!(*sink.done.lock().unwrap(), Some(FinishReason::MaxTokens));
     assert_eq!(chat.phase().unwrap(), SessionPhase::Interrupted);
 }
+
+#[test]
+fn json_schema_to_grammar_compiles_valid_schema() {
+    let schema = r#"{"type": "string", "enum": ["apple", "banana"]}"#;
+    let grammar = json_schema_to_grammar(schema.to_string()).expect("compiles valid schema");
+    assert!(grammar.contains("root ::="));
+    assert!(grammar.contains("apple"));
+    assert!(grammar.contains("banana"));
+}
+
+#[test]
+fn json_schema_to_grammar_rejects_invalid_schema() {
+    let schema = r#"{"type": "invalid_type_123"}"#;
+    let err = json_schema_to_grammar(schema.to_string()).unwrap_err();
+    match err {
+        FfiError::GrammarParse { detail } => {
+            assert!(detail.contains("invalid JSON schema"));
+        }
+        other => panic!("expected GrammarParse, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_session_complete_json_rejects_invalid_schema() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+    chat.ingest(chat_message_user("give me json".into()))
+        .expect("ingest succeeds");
+
+    let opts = GenerateOpts::default();
+    let err = chat
+        .complete_json(opts, r#"{"type": "unsupported"}"#.into())
+        .unwrap_err();
+    match err {
+        FfiError::GrammarParse { detail } => {
+            assert!(detail.contains("invalid JSON schema"));
+        }
+        other => panic!("expected GrammarParse, got {other:?}"),
+    }
+}
+
