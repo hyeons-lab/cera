@@ -2662,6 +2662,353 @@ public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgress
 
 
 /**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
+    
+    /**
+     * Cooperatively cancel any active transcription.
+     */
+    func cancel() throws 
+    
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    func clearCancel() throws 
+    
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    func currentSample() throws  -> UInt64
+    
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    func flush() throws  -> [FfiAudioPipelineEvent]
+    
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    func isListeningForHotword() throws  -> Bool
+    
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    func isSpeechActive() throws  -> Bool
+    
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    func lastUtterance() throws  -> [Float]
+    
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    func popEvent() throws  -> FfiAudioPipelineEvent?
+    
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    func processChunk(chunk: [Float]) throws  -> [FfiAudioPipelineEvent]
+    
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    func reset() throws 
+    
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    func state() throws  -> FfiAudioPipelineState
+    
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    func takeLastUtterance() throws  -> [Float]
+    
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    func transcribePcm(pcm: [Float]) throws  -> String
+    
+}
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+open class FfiAudioPipeline: FfiAudioPipelineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffiaudiopipeline(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffiaudiopipeline(handle, $0) }
+    }
+
+    
+    /**
+     * Construct a pipeline from in-memory GGUF byte buffers.
+     */
+public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+        FfiConverterOptionData.lower(vadBytes),
+        FfiConverterOptionData.lower(hotwordBytes),
+        FfiConverterOptionData.lower(whisperBytes),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Construct a pipeline from filesystem model paths.
+     */
+public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath: String?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+        FfiConverterOptionString.lower(vadPath),
+        FfiConverterOptionString.lower(hotwordPath),
+        FfiConverterOptionString.lower(whisperPath),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Cooperatively cancel any active transcription.
+     */
+open func cancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Clear cooperative cancellation flag.
+     */
+open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Total audio samples processed since start or reset.
+     */
+open func currentSample()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+open func flush()throws  -> [FfiAudioPipelineEvent]  {
+    return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+open func isListeningForHotword()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+open func isSpeechActive()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+open func lastUtterance()throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+open func popEvent()throws  -> FfiAudioPipelineEvent?  {
+    return try  FfiConverterOptionTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+open func processChunk(chunk: [Float])throws  -> [FfiAudioPipelineEvent]  {
+    return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(chunk),$0
+    )
+})
+}
+    
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+open func state()throws  -> FfiAudioPipelineState  {
+    return try  FfiConverterTypeFfiAudioPipelineState_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+open func takeLastUtterance()throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+open func transcribePcm(pcm: [Float])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(pcm),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipeline: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiAudioPipeline
+
+    public static func lift(_ handle: UInt64) throws -> FfiAudioPipeline {
+        return FfiAudioPipeline(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiAudioPipeline) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipeline {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiAudioPipeline, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipeline_lift(_ handle: UInt64) throws -> FfiAudioPipeline {
+    return try FfiConverterTypeFfiAudioPipeline.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipeline_lower(_ value: FfiAudioPipeline) -> UInt64 {
+    return FfiConverterTypeFfiAudioPipeline.lower(value)
+}
+
+
+
+
+
+
+/**
  * Stateful Keyword Spotting detector executing pure-Rust forward inference.
  */
 public protocol FfiHotwordDetectorProtocol: AnyObject, Sendable {
@@ -6224,6 +6571,125 @@ public func FfiConverterTypeEngineConfig_lower(_ value: EngineConfig) -> RustBuf
 
 
 /**
+ * Configuration options for the unified audio pipeline.
+ */
+public struct FfiAudioPipelineConfig: Equatable, Hashable {
+    /**
+     * Whether a keyword spotting wake word must be detected before speech tracking begins.
+     */
+    public var requireHotword: Bool
+    /**
+     * Whether to automatically run Whisper transcription upon speech completion.
+     */
+    public var autoTranscribe: Bool
+    /**
+     * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+     */
+    public var preRollMs: UInt32
+    /**
+     * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+     */
+    public var maxUtteranceMs: UInt32
+    /**
+     * Voice Activity Detection configuration.
+     */
+    public var vadConfig: FfiVadConfig?
+    /**
+     * Keyword Spotting configuration.
+     */
+    public var hotwordConfig: FfiHotwordConfig?
+    /**
+     * Whisper transcription options.
+     */
+    public var whisperOpts: FfiWhisperTranscribeOpts?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Whether a keyword spotting wake word must be detected before speech tracking begins.
+         */requireHotword: Bool, 
+        /**
+         * Whether to automatically run Whisper transcription upon speech completion.
+         */autoTranscribe: Bool, 
+        /**
+         * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+         */preRollMs: UInt32, 
+        /**
+         * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+         */maxUtteranceMs: UInt32, 
+        /**
+         * Voice Activity Detection configuration.
+         */vadConfig: FfiVadConfig?, 
+        /**
+         * Keyword Spotting configuration.
+         */hotwordConfig: FfiHotwordConfig?, 
+        /**
+         * Whisper transcription options.
+         */whisperOpts: FfiWhisperTranscribeOpts?) {
+        self.requireHotword = requireHotword
+        self.autoTranscribe = autoTranscribe
+        self.preRollMs = preRollMs
+        self.maxUtteranceMs = maxUtteranceMs
+        self.vadConfig = vadConfig
+        self.hotwordConfig = hotwordConfig
+        self.whisperOpts = whisperOpts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineConfig {
+        return
+            try FfiAudioPipelineConfig(
+                requireHotword: FfiConverterBool.read(from: &buf), 
+                autoTranscribe: FfiConverterBool.read(from: &buf), 
+                preRollMs: FfiConverterUInt32.read(from: &buf), 
+                maxUtteranceMs: FfiConverterUInt32.read(from: &buf), 
+                vadConfig: FfiConverterOptionTypeFfiVadConfig.read(from: &buf), 
+                hotwordConfig: FfiConverterOptionTypeFfiHotwordConfig.read(from: &buf), 
+                whisperOpts: FfiConverterOptionTypeFfiWhisperTranscribeOpts.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiAudioPipelineConfig, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.requireHotword, into: &buf)
+        FfiConverterBool.write(value.autoTranscribe, into: &buf)
+        FfiConverterUInt32.write(value.preRollMs, into: &buf)
+        FfiConverterUInt32.write(value.maxUtteranceMs, into: &buf)
+        FfiConverterOptionTypeFfiVadConfig.write(value.vadConfig, into: &buf)
+        FfiConverterOptionTypeFfiHotwordConfig.write(value.hotwordConfig, into: &buf)
+        FfiConverterOptionTypeFfiWhisperTranscribeOpts.write(value.whisperOpts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineConfig_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineConfig {
+    return try FfiConverterTypeFfiAudioPipelineConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineConfig_lower(_ value: FfiAudioPipelineConfig) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineConfig.lower(value)
+}
+
+
+/**
  * An identified PII entity span in source text.
  */
 public struct FfiEntitySpan: Equatable, Hashable {
@@ -8561,6 +9027,262 @@ public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) 
 }
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * An event emitted by the unified audio pipeline.
+ */
+
+public enum FfiAudioPipelineEvent: Equatable, Hashable {
+    
+    /**
+     * Keyword spotting detected a wake word.
+     */
+    case wakeWordDetected(
+        /**
+         * Triggered keyword.
+         */keyword: String, 
+        /**
+         * Confidence probability between 0.0 and 1.0.
+         */confidence: Float, 
+        /**
+         * Timestamp in milliseconds from stream start.
+         */timestampMs: Float, 
+        /**
+         * Sample offset where the detection hop completed.
+         */sampleOffset: UInt64
+    )
+    /**
+     * Voice Activity Detection identified speech onset.
+     */
+    case speechStart(
+        /**
+         * Sample index where speech began.
+         */sample: UInt64, 
+        /**
+         * Timestamp in milliseconds from stream start.
+         */ms: Float
+    )
+    /**
+     * Voice Activity Detection identified speech termination.
+     */
+    case speechEnd(
+        /**
+         * Starting sample index of the speech segment.
+         */startSample: UInt64, 
+        /**
+         * Ending sample index of the speech segment.
+         */endSample: UInt64, 
+        /**
+         * Start timestamp in milliseconds.
+         */startMs: Float, 
+        /**
+         * End timestamp in milliseconds.
+         */endMs: Float
+    )
+    /**
+     * Whisper transcription completed for a speech utterance.
+     */
+    case utteranceTranscribed(
+        /**
+         * Recognized text output.
+         */text: String, 
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */startMs: Float, 
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */endMs: Float, 
+        /**
+         * Number of 16 kHz audio samples transcribed.
+         */sampleCount: UInt64
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .wakeWordDetected(keyword: try FfiConverterString.read(from: &buf), confidence: try FfiConverterFloat.read(from: &buf), timestampMs: try FfiConverterFloat.read(from: &buf), sampleOffset: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 2: return .speechStart(sample: try FfiConverterUInt64.read(from: &buf), ms: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        case 3: return .speechEnd(startSample: try FfiConverterUInt64.read(from: &buf), endSample: try FfiConverterUInt64.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        case 4: return .utteranceTranscribed(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), sampleCount: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAudioPipelineEvent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .wakeWordDetected(keyword,confidence,timestampMs,sampleOffset):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(keyword, into: &buf)
+            FfiConverterFloat.write(confidence, into: &buf)
+            FfiConverterFloat.write(timestampMs, into: &buf)
+            FfiConverterUInt64.write(sampleOffset, into: &buf)
+            
+        
+        case let .speechStart(sample,ms):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(sample, into: &buf)
+            FfiConverterFloat.write(ms, into: &buf)
+            
+        
+        case let .speechEnd(startSample,endSample,startMs,endMs):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt64.write(startSample, into: &buf)
+            FfiConverterUInt64.write(endSample, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            
+        
+        case let .utteranceTranscribed(text,startMs,endMs,sampleCount):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(text, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            FfiConverterUInt64.write(sampleCount, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineEvent_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineEvent {
+    return try FfiConverterTypeFfiAudioPipelineEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineEvent_lower(_ value: FfiAudioPipelineEvent) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Active state of the streaming audio pipeline.
+ */
+
+public enum FfiAudioPipelineState: Equatable, Hashable {
+    
+    /**
+     * Awaiting a keyword spotting wake word before activating speech recording.
+     */
+    case listeningForHotword
+    /**
+     * Evaluating incoming audio frames to detect speech onset.
+     */
+    case listeningForSpeech
+    /**
+     * Speech onset detected; accumulating utterance samples in the audio buffer.
+     */
+    case speechActive
+    /**
+     * Transcribing the accumulated speech utterance using Whisper.
+     */
+    case transcribing
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .listeningForHotword
+        
+        case 2: return .listeningForSpeech
+        
+        case 3: return .speechActive
+        
+        case 4: return .transcribing
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAudioPipelineState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .listeningForHotword:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .listeningForSpeech:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .speechActive:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .transcribing:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineState_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineState {
+    return try FfiConverterTypeFfiAudioPipelineState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineState_lower(_ value: FfiAudioPipelineState) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineState.lower(value)
+}
+
+
 
 /**
  * Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -10531,6 +11253,30 @@ fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiAudioPipelineConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiAudioPipelineConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiHotwordConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiHotwordConfig?
 
@@ -10667,6 +11413,30 @@ fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSpecDecodeConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineEvent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiAudioPipelineEvent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiAudioPipelineEvent.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11118,6 +11888,31 @@ fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiAudioPipelineEvent]
+
+    public static func write(_ value: [FfiAudioPipelineEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiAudioPipelineEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiAudioPipelineEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiAudioPipelineEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiAudioPipelineEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
     public static func write(_ value: [String: String], into buf: inout [UInt8]) {
         let len = Int32(value.count)
@@ -11332,6 +12127,15 @@ public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
 })
 }
 /**
+ * Returns default configuration for the audio pipeline.
+ */
+public func audioPipelineDefaultConfig() -> FfiAudioPipelineConfig  {
+    return try!  FfiConverterTypeFfiAudioPipelineConfig_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_audio_pipeline_default_config($0
+    )
+})
+}
+/**
  * Convenience factory for an assistant text message.
  */
 public func chatMessageAssistant(content: String) -> Message  {
@@ -11448,6 +12252,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
@@ -11723,6 +12530,45 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11886,6 +12732,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {

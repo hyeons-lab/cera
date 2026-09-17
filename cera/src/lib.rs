@@ -38,6 +38,7 @@ pub mod engine;
 mod generated {
     include!("generated/kv_cache_generated.rs");
 }
+pub mod audio_pipeline;
 pub mod gguf;
 pub mod grammar;
 pub mod hotword;
@@ -61,6 +62,10 @@ pub mod vad;
 // Canonical public re-exports for the stateful API. Consumers should
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
 // `cera::session::*`.
+pub use audio_pipeline::{
+    AudioPipeline, AudioPipelineBuilder, AudioPipelineConfig, AudioPipelineEvent,
+    AudioPipelineState,
+};
 pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
 pub use classifier::{
     BioesPrefix, EntitySpan, detect_pii, extract_spans, parse_bioes, viterbi_decode,

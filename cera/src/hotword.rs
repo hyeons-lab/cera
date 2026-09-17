@@ -922,6 +922,15 @@ impl HotwordIterator {
         self.last_log_sample = 0;
     }
 
+    /// Read the most recent `n` samples from the circular ring buffer.
+    ///
+    /// If fewer than `n` samples have been ingested, the missing prefix is zero-padded.
+    pub fn read_last_samples(&self, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        self.ring_buffer.read_last(n, &mut out);
+        out
+    }
+
     /// Process a streaming chunk of audio samples and return a detection event if triggered.
     ///
     /// For chunks containing multiple hops, returns the first detected event encountered

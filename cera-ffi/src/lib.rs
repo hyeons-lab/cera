@@ -93,9 +93,14 @@ use std::sync::Arc;
 
 uniffi::setup_scaffolding!();
 
+mod audio_pipeline;
 mod chat;
 mod loading;
 mod recovery;
+pub use audio_pipeline::{
+    FfiAudioPipeline, FfiAudioPipelineConfig, FfiAudioPipelineEvent, FfiAudioPipelineState,
+    audio_pipeline_default_config,
+};
 pub use chat::{
     ChatSession, IngestSummary, Message, Role, SessionPhase, TurnResult, ValidationError,
     chat_message_assistant, chat_message_system, chat_message_tool, chat_message_user,

@@ -479,6 +479,8 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
+    if lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795:
@@ -644,6 +646,36 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1098,6 +1130,16 @@ _UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1264,6 +1306,10 @@ _UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.argtypes = (
     ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiModalitySink),
 )
 _UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_cera_ffi_version.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1731,6 +1777,89 @@ _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes =
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_state.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_state.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2161,6 +2290,9 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size.restype = N
 _UniffiLib.ffi_cera_ffi_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_cera_ffi_uniffi_contract_version.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.restype = ctypes.c_uint16
@@ -2410,6 +2542,51 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.restype = ctypes.c_
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint16
@@ -4498,6 +4675,386 @@ class _UniffiFfiConverterTypeEngineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.draft_model, buf)
         _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
 
+class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt32.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt32.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiVadConfig:
+    """
+    Configuration options for batch speech detection and segmentation.
+"""
+    def __init__(self, *, threshold:float = 0.5, neg_threshold:float = 0.35, min_speech_duration_ms:int = 64, min_silence_duration_ms:int = 100, speech_pad_ms:int = 30, frame_stride:typing.Optional[int] = _DEFAULT):
+        self.threshold = threshold
+        self.neg_threshold = neg_threshold
+        self.min_speech_duration_ms = min_speech_duration_ms
+        self.min_silence_duration_ms = min_silence_duration_ms
+        self.speech_pad_ms = speech_pad_ms
+        if frame_stride is _DEFAULT:
+            self.frame_stride = None
+        else:
+            self.frame_stride = frame_stride
+        
+        
+
+    
+    def __str__(self):
+        return "FfiVadConfig(threshold={}, neg_threshold={}, min_speech_duration_ms={}, min_silence_duration_ms={}, speech_pad_ms={}, frame_stride={})".format(self.threshold, self.neg_threshold, self.min_speech_duration_ms, self.min_silence_duration_ms, self.speech_pad_ms, self.frame_stride)
+    def __eq__(self, other):
+        if self.threshold != other.threshold:
+            return False
+        if self.neg_threshold != other.neg_threshold:
+            return False
+        if self.min_speech_duration_ms != other.min_speech_duration_ms:
+            return False
+        if self.min_silence_duration_ms != other.min_silence_duration_ms:
+            return False
+        if self.speech_pad_ms != other.speech_pad_ms:
+            return False
+        if self.frame_stride != other.frame_stride:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiVadConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiVadConfig(
+            threshold=_UniffiFfiConverterFloat32.read(buf),
+            neg_threshold=_UniffiFfiConverterFloat32.read(buf),
+            min_speech_duration_ms=_UniffiFfiConverterUInt32.read(buf),
+            min_silence_duration_ms=_UniffiFfiConverterUInt32.read(buf),
+            speech_pad_ms=_UniffiFfiConverterUInt32.read(buf),
+            frame_stride=_UniffiFfiConverterOptionalUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterFloat32.check_lower(value.threshold)
+        _UniffiFfiConverterFloat32.check_lower(value.neg_threshold)
+        _UniffiFfiConverterUInt32.check_lower(value.min_speech_duration_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.min_silence_duration_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.speech_pad_ms)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.frame_stride)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterFloat32.write(value.threshold, buf)
+        _UniffiFfiConverterFloat32.write(value.neg_threshold, buf)
+        _UniffiFfiConverterUInt32.write(value.min_speech_duration_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.min_silence_duration_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.speech_pad_ms, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.frame_stride, buf)
+
+class _UniffiFfiConverterOptionalTypeFfiVadConfig(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiVadConfig.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiVadConfig.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiVadConfig.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiHotwordConfig:
+    """
+    Configuration options for keyword spotting.
+"""
+    def __init__(self, *, threshold:float, cooldown_ms:int, step_ms:int, window_ms:int, pre_roll_ms:int, vad_threshold:float):
+        self.threshold = threshold
+        self.cooldown_ms = cooldown_ms
+        self.step_ms = step_ms
+        self.window_ms = window_ms
+        self.pre_roll_ms = pre_roll_ms
+        self.vad_threshold = vad_threshold
+        
+        
+
+    
+    def __str__(self):
+        return "FfiHotwordConfig(threshold={}, cooldown_ms={}, step_ms={}, window_ms={}, pre_roll_ms={}, vad_threshold={})".format(self.threshold, self.cooldown_ms, self.step_ms, self.window_ms, self.pre_roll_ms, self.vad_threshold)
+    def __eq__(self, other):
+        if self.threshold != other.threshold:
+            return False
+        if self.cooldown_ms != other.cooldown_ms:
+            return False
+        if self.step_ms != other.step_ms:
+            return False
+        if self.window_ms != other.window_ms:
+            return False
+        if self.pre_roll_ms != other.pre_roll_ms:
+            return False
+        if self.vad_threshold != other.vad_threshold:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiHotwordConfig(
+            threshold=_UniffiFfiConverterFloat32.read(buf),
+            cooldown_ms=_UniffiFfiConverterUInt32.read(buf),
+            step_ms=_UniffiFfiConverterUInt32.read(buf),
+            window_ms=_UniffiFfiConverterUInt32.read(buf),
+            pre_roll_ms=_UniffiFfiConverterUInt32.read(buf),
+            vad_threshold=_UniffiFfiConverterFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterFloat32.check_lower(value.threshold)
+        _UniffiFfiConverterUInt32.check_lower(value.cooldown_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.step_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.window_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.pre_roll_ms)
+        _UniffiFfiConverterFloat32.check_lower(value.vad_threshold)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterFloat32.write(value.threshold, buf)
+        _UniffiFfiConverterUInt32.write(value.cooldown_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.step_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.window_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.pre_roll_ms, buf)
+        _UniffiFfiConverterFloat32.write(value.vad_threshold, buf)
+
+class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiHotwordConfig.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiHotwordConfig.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiHotwordConfig.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterFloat32.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterFloat32.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterFloat32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiWhisperTranscribeOpts:
+    """
+    Options for Whisper speech transcription.
+"""
+    def __init__(self, *, language:typing.Optional[str], translate:bool, timestamps:bool, max_tokens:typing.Optional[int], temperature:typing.Optional[float]):
+        self.language = language
+        self.translate = translate
+        self.timestamps = timestamps
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        
+        
+
+    
+    def __str__(self):
+        return "FfiWhisperTranscribeOpts(language={}, translate={}, timestamps={}, max_tokens={}, temperature={})".format(self.language, self.translate, self.timestamps, self.max_tokens, self.temperature)
+    def __eq__(self, other):
+        if self.language != other.language:
+            return False
+        if self.translate != other.translate:
+            return False
+        if self.timestamps != other.timestamps:
+            return False
+        if self.max_tokens != other.max_tokens:
+            return False
+        if self.temperature != other.temperature:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiWhisperTranscribeOpts(
+            language=_UniffiFfiConverterOptionalString.read(buf),
+            translate=_UniffiFfiConverterBoolean.read(buf),
+            timestamps=_UniffiFfiConverterBoolean.read(buf),
+            max_tokens=_UniffiFfiConverterOptionalUInt32.read(buf),
+            temperature=_UniffiFfiConverterOptionalFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalString.check_lower(value.language)
+        _UniffiFfiConverterBoolean.check_lower(value.translate)
+        _UniffiFfiConverterBoolean.check_lower(value.timestamps)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.max_tokens)
+        _UniffiFfiConverterOptionalFloat32.check_lower(value.temperature)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalString.write(value.language, buf)
+        _UniffiFfiConverterBoolean.write(value.translate, buf)
+        _UniffiFfiConverterBoolean.write(value.timestamps, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.max_tokens, buf)
+        _UniffiFfiConverterOptionalFloat32.write(value.temperature, buf)
+
+class _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class FfiAudioPipelineConfig:
+    """
+    Configuration options for the unified audio pipeline.
+"""
+    def __init__(self, *, require_hotword:bool, auto_transcribe:bool, pre_roll_ms:int, max_utterance_ms:int, vad_config:typing.Optional[FfiVadConfig], hotword_config:typing.Optional[FfiHotwordConfig], whisper_opts:typing.Optional[FfiWhisperTranscribeOpts]):
+        self.require_hotword = require_hotword
+        self.auto_transcribe = auto_transcribe
+        self.pre_roll_ms = pre_roll_ms
+        self.max_utterance_ms = max_utterance_ms
+        self.vad_config = vad_config
+        self.hotword_config = hotword_config
+        self.whisper_opts = whisper_opts
+        
+        
+
+    
+    def __str__(self):
+        return "FfiAudioPipelineConfig(require_hotword={}, auto_transcribe={}, pre_roll_ms={}, max_utterance_ms={}, vad_config={}, hotword_config={}, whisper_opts={})".format(self.require_hotword, self.auto_transcribe, self.pre_roll_ms, self.max_utterance_ms, self.vad_config, self.hotword_config, self.whisper_opts)
+    def __eq__(self, other):
+        if self.require_hotword != other.require_hotword:
+            return False
+        if self.auto_transcribe != other.auto_transcribe:
+            return False
+        if self.pre_roll_ms != other.pre_roll_ms:
+            return False
+        if self.max_utterance_ms != other.max_utterance_ms:
+            return False
+        if self.vad_config != other.vad_config:
+            return False
+        if self.hotword_config != other.hotword_config:
+            return False
+        if self.whisper_opts != other.whisper_opts:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return FfiAudioPipelineConfig(
+            require_hotword=_UniffiFfiConverterBoolean.read(buf),
+            auto_transcribe=_UniffiFfiConverterBoolean.read(buf),
+            pre_roll_ms=_UniffiFfiConverterUInt32.read(buf),
+            max_utterance_ms=_UniffiFfiConverterUInt32.read(buf),
+            vad_config=_UniffiFfiConverterOptionalTypeFfiVadConfig.read(buf),
+            hotword_config=_UniffiFfiConverterOptionalTypeFfiHotwordConfig.read(buf),
+            whisper_opts=_UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterBoolean.check_lower(value.require_hotword)
+        _UniffiFfiConverterBoolean.check_lower(value.auto_transcribe)
+        _UniffiFfiConverterUInt32.check_lower(value.pre_roll_ms)
+        _UniffiFfiConverterUInt32.check_lower(value.max_utterance_ms)
+        _UniffiFfiConverterOptionalTypeFfiVadConfig.check_lower(value.vad_config)
+        _UniffiFfiConverterOptionalTypeFfiHotwordConfig.check_lower(value.hotword_config)
+        _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.check_lower(value.whisper_opts)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterBoolean.write(value.require_hotword, buf)
+        _UniffiFfiConverterBoolean.write(value.auto_transcribe, buf)
+        _UniffiFfiConverterUInt32.write(value.pre_roll_ms, buf)
+        _UniffiFfiConverterUInt32.write(value.max_utterance_ms, buf)
+        _UniffiFfiConverterOptionalTypeFfiVadConfig.write(value.vad_config, buf)
+        _UniffiFfiConverterOptionalTypeFfiHotwordConfig.write(value.hotword_config, buf)
+        _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.write(value.whisper_opts, buf)
+
 @dataclass
 class FfiEntitySpan:
     """
@@ -4566,69 +5123,6 @@ class _UniffiFfiConverterTypeFfiEntitySpan(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.end_token, buf)
         _UniffiFfiConverterString.write(value.text, buf)
         _UniffiFfiConverterFloat32.write(value.score, buf)
-
-@dataclass
-class FfiHotwordConfig:
-    """
-    Configuration options for keyword spotting.
-"""
-    def __init__(self, *, threshold:float, cooldown_ms:int, step_ms:int, window_ms:int, pre_roll_ms:int, vad_threshold:float):
-        self.threshold = threshold
-        self.cooldown_ms = cooldown_ms
-        self.step_ms = step_ms
-        self.window_ms = window_ms
-        self.pre_roll_ms = pre_roll_ms
-        self.vad_threshold = vad_threshold
-        
-        
-
-    
-    def __str__(self):
-        return "FfiHotwordConfig(threshold={}, cooldown_ms={}, step_ms={}, window_ms={}, pre_roll_ms={}, vad_threshold={})".format(self.threshold, self.cooldown_ms, self.step_ms, self.window_ms, self.pre_roll_ms, self.vad_threshold)
-    def __eq__(self, other):
-        if self.threshold != other.threshold:
-            return False
-        if self.cooldown_ms != other.cooldown_ms:
-            return False
-        if self.step_ms != other.step_ms:
-            return False
-        if self.window_ms != other.window_ms:
-            return False
-        if self.pre_roll_ms != other.pre_roll_ms:
-            return False
-        if self.vad_threshold != other.vad_threshold:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return FfiHotwordConfig(
-            threshold=_UniffiFfiConverterFloat32.read(buf),
-            cooldown_ms=_UniffiFfiConverterUInt32.read(buf),
-            step_ms=_UniffiFfiConverterUInt32.read(buf),
-            window_ms=_UniffiFfiConverterUInt32.read(buf),
-            pre_roll_ms=_UniffiFfiConverterUInt32.read(buf),
-            vad_threshold=_UniffiFfiConverterFloat32.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterFloat32.check_lower(value.threshold)
-        _UniffiFfiConverterUInt32.check_lower(value.cooldown_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.step_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.window_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.pre_roll_ms)
-        _UniffiFfiConverterFloat32.check_lower(value.vad_threshold)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterFloat32.write(value.threshold, buf)
-        _UniffiFfiConverterUInt32.write(value.cooldown_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.step_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.window_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.pre_roll_ms, buf)
-        _UniffiFfiConverterFloat32.write(value.vad_threshold, buf)
 
 @dataclass
 class FfiHotwordEvent:
@@ -4776,179 +5270,6 @@ class _UniffiFfiConverterTypeFfiSpeechTimestamp(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.end_sample, buf)
         _UniffiFfiConverterFloat32.write(value.start_ms, buf)
         _UniffiFfiConverterFloat32.write(value.end_ms, buf)
-
-class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt32.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt32.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt32.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-@dataclass
-class FfiVadConfig:
-    """
-    Configuration options for batch speech detection and segmentation.
-"""
-    def __init__(self, *, threshold:float = 0.5, neg_threshold:float = 0.35, min_speech_duration_ms:int = 64, min_silence_duration_ms:int = 100, speech_pad_ms:int = 30, frame_stride:typing.Optional[int] = _DEFAULT):
-        self.threshold = threshold
-        self.neg_threshold = neg_threshold
-        self.min_speech_duration_ms = min_speech_duration_ms
-        self.min_silence_duration_ms = min_silence_duration_ms
-        self.speech_pad_ms = speech_pad_ms
-        if frame_stride is _DEFAULT:
-            self.frame_stride = None
-        else:
-            self.frame_stride = frame_stride
-        
-        
-
-    
-    def __str__(self):
-        return "FfiVadConfig(threshold={}, neg_threshold={}, min_speech_duration_ms={}, min_silence_duration_ms={}, speech_pad_ms={}, frame_stride={})".format(self.threshold, self.neg_threshold, self.min_speech_duration_ms, self.min_silence_duration_ms, self.speech_pad_ms, self.frame_stride)
-    def __eq__(self, other):
-        if self.threshold != other.threshold:
-            return False
-        if self.neg_threshold != other.neg_threshold:
-            return False
-        if self.min_speech_duration_ms != other.min_speech_duration_ms:
-            return False
-        if self.min_silence_duration_ms != other.min_silence_duration_ms:
-            return False
-        if self.speech_pad_ms != other.speech_pad_ms:
-            return False
-        if self.frame_stride != other.frame_stride:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeFfiVadConfig(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return FfiVadConfig(
-            threshold=_UniffiFfiConverterFloat32.read(buf),
-            neg_threshold=_UniffiFfiConverterFloat32.read(buf),
-            min_speech_duration_ms=_UniffiFfiConverterUInt32.read(buf),
-            min_silence_duration_ms=_UniffiFfiConverterUInt32.read(buf),
-            speech_pad_ms=_UniffiFfiConverterUInt32.read(buf),
-            frame_stride=_UniffiFfiConverterOptionalUInt32.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterFloat32.check_lower(value.threshold)
-        _UniffiFfiConverterFloat32.check_lower(value.neg_threshold)
-        _UniffiFfiConverterUInt32.check_lower(value.min_speech_duration_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.min_silence_duration_ms)
-        _UniffiFfiConverterUInt32.check_lower(value.speech_pad_ms)
-        _UniffiFfiConverterOptionalUInt32.check_lower(value.frame_stride)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterFloat32.write(value.threshold, buf)
-        _UniffiFfiConverterFloat32.write(value.neg_threshold, buf)
-        _UniffiFfiConverterUInt32.write(value.min_speech_duration_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.min_silence_duration_ms, buf)
-        _UniffiFfiConverterUInt32.write(value.speech_pad_ms, buf)
-        _UniffiFfiConverterOptionalUInt32.write(value.frame_stride, buf)
-
-class _UniffiFfiConverterOptionalFloat32(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterFloat32.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterFloat32.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterFloat32.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-@dataclass
-class FfiWhisperTranscribeOpts:
-    """
-    Options for Whisper speech transcription.
-"""
-    def __init__(self, *, language:typing.Optional[str], translate:bool, timestamps:bool, max_tokens:typing.Optional[int], temperature:typing.Optional[float]):
-        self.language = language
-        self.translate = translate
-        self.timestamps = timestamps
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        
-        
-
-    
-    def __str__(self):
-        return "FfiWhisperTranscribeOpts(language={}, translate={}, timestamps={}, max_tokens={}, temperature={})".format(self.language, self.translate, self.timestamps, self.max_tokens, self.temperature)
-    def __eq__(self, other):
-        if self.language != other.language:
-            return False
-        if self.translate != other.translate:
-            return False
-        if self.timestamps != other.timestamps:
-            return False
-        if self.max_tokens != other.max_tokens:
-            return False
-        if self.temperature != other.temperature:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return FfiWhisperTranscribeOpts(
-            language=_UniffiFfiConverterOptionalString.read(buf),
-            translate=_UniffiFfiConverterBoolean.read(buf),
-            timestamps=_UniffiFfiConverterBoolean.read(buf),
-            max_tokens=_UniffiFfiConverterOptionalUInt32.read(buf),
-            temperature=_UniffiFfiConverterOptionalFloat32.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterOptionalString.check_lower(value.language)
-        _UniffiFfiConverterBoolean.check_lower(value.translate)
-        _UniffiFfiConverterBoolean.check_lower(value.timestamps)
-        _UniffiFfiConverterOptionalUInt32.check_lower(value.max_tokens)
-        _UniffiFfiConverterOptionalFloat32.check_lower(value.temperature)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterOptionalString.write(value.language, buf)
-        _UniffiFfiConverterBoolean.write(value.translate, buf)
-        _UniffiFfiConverterBoolean.write(value.timestamps, buf)
-        _UniffiFfiConverterOptionalUInt32.write(value.max_tokens, buf)
-        _UniffiFfiConverterOptionalFloat32.write(value.temperature, buf)
 
 class _UniffiFfiConverterSequenceUInt32(_UniffiConverterRustBuffer):
     @classmethod
@@ -7538,6 +7859,408 @@ class _UniffiFfiConverterTypeUserMessage(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.text, buf)
         _UniffiFfiConverterSequenceBytes.write(value.images, buf)
         _UniffiFfiConverterOptionalTypeAudioInput.write(value.audio, buf)
+
+
+
+
+
+
+class FfiAudioPipelineEvent:
+    """
+    An event emitted by the unified audio pipeline.
+"""
+    def __init__(self):
+        raise RuntimeError("FfiAudioPipelineEvent cannot be instantiated directly")
+
+    # Each enum variant is a nested class of the enum itself.
+    @dataclass
+    class WAKE_WORD_DETECTED:
+        """
+        Keyword spotting detected a wake word.
+"""
+        
+        def __init__(self, keyword:str, confidence:float, timestamp_ms:float, sample_offset:int):
+            self.keyword = keyword
+            
+            """
+        Triggered keyword.
+"""
+        
+            self.confidence = confidence
+            
+            """
+        Confidence probability between 0.0 and 1.0.
+"""
+        
+            self.timestamp_ms = timestamp_ms
+            
+            """
+        Timestamp in milliseconds from stream start.
+"""
+        
+            self.sample_offset = sample_offset
+            
+            """
+        Sample offset where the detection hop completed.
+"""
+        
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "FfiAudioPipelineEvent.WAKE_WORD_DETECTED(keyword={}, confidence={}, timestamp_ms={}, sample_offset={})".format(self.keyword, self.confidence, self.timestamp_ms, self.sample_offset)
+        def __eq__(self, other):
+            if not isinstance(other, FfiAudioPipelineEvent):
+                return NotImplemented
+            if not other.is_WAKE_WORD_DETECTED():
+                return False
+            if self.keyword != other.keyword:
+                return False
+            if self.confidence != other.confidence:
+                return False
+            if self.timestamp_ms != other.timestamp_ms:
+                return False
+            if self.sample_offset != other.sample_offset:
+                return False
+            return True
+
+    @dataclass
+    class SPEECH_START:
+        """
+        Voice Activity Detection identified speech onset.
+"""
+        
+        def __init__(self, sample:int, ms:float):
+            self.sample = sample
+            
+            """
+        Sample index where speech began.
+"""
+        
+            self.ms = ms
+            
+            """
+        Timestamp in milliseconds from stream start.
+"""
+        
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "FfiAudioPipelineEvent.SPEECH_START(sample={}, ms={})".format(self.sample, self.ms)
+        def __eq__(self, other):
+            if not isinstance(other, FfiAudioPipelineEvent):
+                return NotImplemented
+            if not other.is_SPEECH_START():
+                return False
+            if self.sample != other.sample:
+                return False
+            if self.ms != other.ms:
+                return False
+            return True
+
+    @dataclass
+    class SPEECH_END:
+        """
+        Voice Activity Detection identified speech termination.
+"""
+        
+        def __init__(self, start_sample:int, end_sample:int, start_ms:float, end_ms:float):
+            self.start_sample = start_sample
+            
+            """
+        Starting sample index of the speech segment.
+"""
+        
+            self.end_sample = end_sample
+            
+            """
+        Ending sample index of the speech segment.
+"""
+        
+            self.start_ms = start_ms
+            
+            """
+        Start timestamp in milliseconds.
+"""
+        
+            self.end_ms = end_ms
+            
+            """
+        End timestamp in milliseconds.
+"""
+        
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "FfiAudioPipelineEvent.SPEECH_END(start_sample={}, end_sample={}, start_ms={}, end_ms={})".format(self.start_sample, self.end_sample, self.start_ms, self.end_ms)
+        def __eq__(self, other):
+            if not isinstance(other, FfiAudioPipelineEvent):
+                return NotImplemented
+            if not other.is_SPEECH_END():
+                return False
+            if self.start_sample != other.start_sample:
+                return False
+            if self.end_sample != other.end_sample:
+                return False
+            if self.start_ms != other.start_ms:
+                return False
+            if self.end_ms != other.end_ms:
+                return False
+            return True
+
+    @dataclass
+    class UTTERANCE_TRANSCRIBED:
+        """
+        Whisper transcription completed for a speech utterance.
+"""
+        
+        def __init__(self, text:str, start_ms:float, end_ms:float, sample_count:int):
+            self.text = text
+            
+            """
+        Recognized text output.
+"""
+        
+            self.start_ms = start_ms
+            
+            """
+        Start timestamp of the utterance in milliseconds.
+"""
+        
+            self.end_ms = end_ms
+            
+            """
+        End timestamp of the utterance in milliseconds.
+"""
+        
+            self.sample_count = sample_count
+            
+            """
+        Number of 16 kHz audio samples transcribed.
+"""
+        
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED(text={}, start_ms={}, end_ms={}, sample_count={})".format(self.text, self.start_ms, self.end_ms, self.sample_count)
+        def __eq__(self, other):
+            if not isinstance(other, FfiAudioPipelineEvent):
+                return NotImplemented
+            if not other.is_UTTERANCE_TRANSCRIBED():
+                return False
+            if self.text != other.text:
+                return False
+            if self.start_ms != other.start_ms:
+                return False
+            if self.end_ms != other.end_ms:
+                return False
+            if self.sample_count != other.sample_count:
+                return False
+            return True
+
+    
+
+    # For each variant, we have `is_NAME` and `is_name` methods for easily checking
+    # whether an instance is that variant.
+    def is_WAKE_WORD_DETECTED(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.WAKE_WORD_DETECTED)
+    def is_wake_word_detected(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.WAKE_WORD_DETECTED)
+    def is_SPEECH_START(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.SPEECH_START)
+    def is_speech_start(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.SPEECH_START)
+    def is_SPEECH_END(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.SPEECH_END)
+    def is_speech_end(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.SPEECH_END)
+    def is_UTTERANCE_TRANSCRIBED(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED)
+    def is_utterance_transcribed(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED)
+    
+
+# Now, a little trick - we make each nested variant class be a subclass of the main
+# enum class, so that method calls and instance checks etc will work intuitively.
+# We might be able to do this a little more neatly with a metaclass, but this'll do.
+FfiAudioPipelineEvent.WAKE_WORD_DETECTED = type("FfiAudioPipelineEvent.WAKE_WORD_DETECTED", (FfiAudioPipelineEvent.WAKE_WORD_DETECTED, FfiAudioPipelineEvent,), {})  # type: ignore
+FfiAudioPipelineEvent.SPEECH_START = type("FfiAudioPipelineEvent.SPEECH_START", (FfiAudioPipelineEvent.SPEECH_START, FfiAudioPipelineEvent,), {})  # type: ignore
+FfiAudioPipelineEvent.SPEECH_END = type("FfiAudioPipelineEvent.SPEECH_END", (FfiAudioPipelineEvent.SPEECH_END, FfiAudioPipelineEvent,), {})  # type: ignore
+FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED = type("FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED", (FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED, FfiAudioPipelineEvent,), {})  # type: ignore
+
+
+
+
+class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return FfiAudioPipelineEvent.WAKE_WORD_DETECTED(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterUInt64.read(buf),
+            )
+        if variant == 2:
+            return FfiAudioPipelineEvent.SPEECH_START(
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+            )
+        if variant == 3:
+            return FfiAudioPipelineEvent.SPEECH_END(
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterUInt64.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+            )
+        if variant == 4:
+            return FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterUInt64.read(buf),
+            )
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value.is_WAKE_WORD_DETECTED():
+            _UniffiFfiConverterString.check_lower(value.keyword)
+            _UniffiFfiConverterFloat32.check_lower(value.confidence)
+            _UniffiFfiConverterFloat32.check_lower(value.timestamp_ms)
+            _UniffiFfiConverterUInt64.check_lower(value.sample_offset)
+            return
+        if value.is_SPEECH_START():
+            _UniffiFfiConverterUInt64.check_lower(value.sample)
+            _UniffiFfiConverterFloat32.check_lower(value.ms)
+            return
+        if value.is_SPEECH_END():
+            _UniffiFfiConverterUInt64.check_lower(value.start_sample)
+            _UniffiFfiConverterUInt64.check_lower(value.end_sample)
+            _UniffiFfiConverterFloat32.check_lower(value.start_ms)
+            _UniffiFfiConverterFloat32.check_lower(value.end_ms)
+            return
+        if value.is_UTTERANCE_TRANSCRIBED():
+            _UniffiFfiConverterString.check_lower(value.text)
+            _UniffiFfiConverterFloat32.check_lower(value.start_ms)
+            _UniffiFfiConverterFloat32.check_lower(value.end_ms)
+            _UniffiFfiConverterUInt64.check_lower(value.sample_count)
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value.is_WAKE_WORD_DETECTED():
+            buf.write_i32(1)
+            _UniffiFfiConverterString.write(value.keyword, buf)
+            _UniffiFfiConverterFloat32.write(value.confidence, buf)
+            _UniffiFfiConverterFloat32.write(value.timestamp_ms, buf)
+            _UniffiFfiConverterUInt64.write(value.sample_offset, buf)
+        if value.is_SPEECH_START():
+            buf.write_i32(2)
+            _UniffiFfiConverterUInt64.write(value.sample, buf)
+            _UniffiFfiConverterFloat32.write(value.ms, buf)
+        if value.is_SPEECH_END():
+            buf.write_i32(3)
+            _UniffiFfiConverterUInt64.write(value.start_sample, buf)
+            _UniffiFfiConverterUInt64.write(value.end_sample, buf)
+            _UniffiFfiConverterFloat32.write(value.start_ms, buf)
+            _UniffiFfiConverterFloat32.write(value.end_ms, buf)
+        if value.is_UTTERANCE_TRANSCRIBED():
+            buf.write_i32(4)
+            _UniffiFfiConverterString.write(value.text, buf)
+            _UniffiFfiConverterFloat32.write(value.start_ms, buf)
+            _UniffiFfiConverterFloat32.write(value.end_ms, buf)
+            _UniffiFfiConverterUInt64.write(value.sample_count, buf)
+
+
+
+
+
+
+
+
+class FfiAudioPipelineState(enum.Enum):
+    """
+    Active state of the streaming audio pipeline.
+"""
+    
+    LISTENING_FOR_HOTWORD = 0
+    """
+    Awaiting a keyword spotting wake word before activating speech recording.
+"""
+    
+    LISTENING_FOR_SPEECH = 1
+    """
+    Evaluating incoming audio frames to detect speech onset.
+"""
+    
+    SPEECH_ACTIVE = 2
+    """
+    Speech onset detected; accumulating utterance samples in the audio buffer.
+"""
+    
+    TRANSCRIBING = 3
+    """
+    Transcribing the accumulated speech utterance using Whisper.
+"""
+    
+
+
+class _UniffiFfiConverterTypeFfiAudioPipelineState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return FfiAudioPipelineState.LISTENING_FOR_HOTWORD
+        if variant == 2:
+            return FfiAudioPipelineState.LISTENING_FOR_SPEECH
+        if variant == 3:
+            return FfiAudioPipelineState.SPEECH_ACTIVE
+        if variant == 4:
+            return FfiAudioPipelineState.TRANSCRIBING
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == FfiAudioPipelineState.LISTENING_FOR_HOTWORD:
+            return
+        if value == FfiAudioPipelineState.LISTENING_FOR_SPEECH:
+            return
+        if value == FfiAudioPipelineState.SPEECH_ACTIVE:
+            return
+        if value == FfiAudioPipelineState.TRANSCRIBING:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == FfiAudioPipelineState.LISTENING_FOR_HOTWORD:
+            buf.write_i32(1)
+        if value == FfiAudioPipelineState.LISTENING_FOR_SPEECH:
+            buf.write_i32(2)
+        if value == FfiAudioPipelineState.SPEECH_ACTIVE:
+            buf.write_i32(3)
+        if value == FfiAudioPipelineState.TRANSCRIBING:
+            buf.write_i32(4)
+
+
 
 
 
@@ -12177,6 +12900,438 @@ class _UniffiFfiConverterTypeDownloadProgressSink:
     def write(cls, value: DownloadProgressSink, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
 
+class _UniffiFfiConverterSequenceTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeFfiAudioPipelineEvent.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeFfiAudioPipelineEvent.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeFfiAudioPipelineEvent.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeFfiAudioPipelineEvent.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeFfiAudioPipelineEvent.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeFfiAudioPipelineEvent.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+class FfiAudioPipelineProtocol(typing.Protocol):
+    """
+    Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+"""
+    
+    def cancel(self, ) -> None:
+        """
+        Cooperatively cancel any active transcription.
+"""
+        raise NotImplementedError
+    def clear_cancel(self, ) -> None:
+        """
+        Clear cooperative cancellation flag.
+"""
+        raise NotImplementedError
+    def current_sample(self, ) -> int:
+        """
+        Total audio samples processed since start or reset.
+"""
+        raise NotImplementedError
+    def flush(self, ) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        Flush any in-flight speech segment at the end of the audio stream.
+"""
+        raise NotImplementedError
+    def is_listening_for_hotword(self, ) -> bool:
+        """
+        Whether the pipeline is currently awaiting a wake word trigger.
+"""
+        raise NotImplementedError
+    def is_speech_active(self, ) -> bool:
+        """
+        Whether speech activity is currently ongoing.
+"""
+        raise NotImplementedError
+    def last_utterance(self, ) -> typing.List[float]:
+        """
+        Return a copy of the most recently finished utterance audio samples.
+"""
+        raise NotImplementedError
+    def pop_event(self, ) -> typing.Optional[FfiAudioPipelineEvent]:
+        """
+        Pop a queued event emitted by previous chunk evaluations.
+"""
+        raise NotImplementedError
+    def process_chunk(self, chunk: typing.List[float]) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        Process a streaming chunk of 16 kHz mono PCM audio samples.
+"""
+        raise NotImplementedError
+    def reset(self, ) -> None:
+        """
+        Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+"""
+        raise NotImplementedError
+    def state(self, ) -> FfiAudioPipelineState:
+        """
+        Current lifecycle state of the pipeline.
+"""
+        raise NotImplementedError
+    def take_last_utterance(self, ) -> typing.List[float]:
+        """
+        Take ownership of the most recently completed utterance audio samples.
+"""
+        raise NotImplementedError
+    def transcribe_pcm(self, pcm: typing.List[float]) -> str:
+        """
+        Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+"""
+        raise NotImplementedError
+
+class FfiAudioPipeline(FfiAudioPipelineProtocol):
+    """
+    Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_bytes(cls, vad_bytes: typing.Optional[bytes],hotword_bytes: typing.Optional[bytes],whisper_bytes: typing.Optional[bytes],config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from in-memory GGUF byte buffers.
+"""
+        
+        _UniffiFfiConverterOptionalBytes.check_lower(vad_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(hotword_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(whisper_bytes)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalBytes.lower(vad_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(hotword_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(whisper_bytes),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_files(cls, vad_path: typing.Optional[str],hotword_path: typing.Optional[str],whisper_path: typing.Optional[str],config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from filesystem model paths.
+"""
+        
+        _UniffiFfiConverterOptionalString.check_lower(vad_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(hotword_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(whisper_path)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalString.lower(vad_path),
+            _UniffiFfiConverterOptionalString.lower(hotword_path),
+            _UniffiFfiConverterOptionalString.lower(whisper_path),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def cancel(self, ) -> None:
+        """
+        Cooperatively cancel any active transcription.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def clear_cancel(self, ) -> None:
+        """
+        Clear cooperative cancellation flag.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def current_sample(self, ) -> int:
+        """
+        Total audio samples processed since start or reset.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterUInt64.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def flush(self, ) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        Flush any in-flight speech segment at the end of the audio stream.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceTypeFfiAudioPipelineEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def is_listening_for_hotword(self, ) -> bool:
+        """
+        Whether the pipeline is currently awaiting a wake word trigger.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def is_speech_active(self, ) -> bool:
+        """
+        Whether speech activity is currently ongoing.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def last_utterance(self, ) -> typing.List[float]:
+        """
+        Return a copy of the most recently finished utterance audio samples.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceFloat32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def pop_event(self, ) -> typing.Optional[FfiAudioPipelineEvent]:
+        """
+        Pop a queued event emitted by previous chunk evaluations.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalTypeFfiAudioPipelineEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def process_chunk(self, chunk: typing.List[float]) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        Process a streaming chunk of 16 kHz mono PCM audio samples.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(chunk)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(chunk),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceTypeFfiAudioPipelineEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def reset(self, ) -> None:
+        """
+        Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def state(self, ) -> FfiAudioPipelineState:
+        """
+        Current lifecycle state of the pipeline.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipelineState.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_state,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def take_last_utterance(self, ) -> typing.List[float]:
+        """
+        Take ownership of the most recently completed utterance audio samples.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceFloat32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def transcribe_pcm(self, pcm: typing.List[float]) -> str:
+        """
+        Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+"""
+        
+        _UniffiFfiConverterSequenceFloat32.check_lower(pcm)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceFloat32.lower(pcm),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeFfiAudioPipeline:
+    @staticmethod
+    def lift(value: int) -> FfiAudioPipeline:
+        return FfiAudioPipeline._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: FfiAudioPipeline):
+        if not isinstance(value, FfiAudioPipeline):
+            raise TypeError("Expected FfiAudioPipeline instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: FfiAudioPipeline) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> FfiAudioPipeline:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: FfiAudioPipeline, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
 
 class FfiHotwordDetectorProtocol(typing.Protocol):
     """
@@ -12515,31 +13670,6 @@ class _UniffiFfiConverterTypeFfiHotwordIterator:
     @classmethod
     def write(cls, value: FfiHotwordIterator, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
-
-class _UniffiFfiConverterOptionalTypeFfiVadConfig(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeFfiVadConfig.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeFfiVadConfig.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeFfiVadConfig.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 class _UniffiFfiConverterSequenceTypeFfiSpeechTimestamp(_UniffiConverterRustBuffer):
     @classmethod
@@ -13005,31 +14135,6 @@ class _UniffiFfiConverterTypeFfiVadIterator:
     @classmethod
     def write(cls, value: FfiVadIterator, buf: _UniffiRustBuffer):
         buf.write_u64(cls.lower(value))
-
-class _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeFfiWhisperTranscribeOpts.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 
 class FfiWhisperModelProtocol(typing.Protocol):
@@ -13757,11 +14862,11 @@ class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
     def write(value, buf):
         buf.write_u8(value)
 
-class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer):
+class _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
         if value is not None:
-            _UniffiFfiConverterTypeFfiHotwordConfig.check_lower(value)
+            _UniffiFfiConverterTypeFfiAudioPipelineConfig.check_lower(value)
 
     @classmethod
     def write(cls, value, buf):
@@ -13770,7 +14875,7 @@ class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer
             return
 
         buf.write_u8(1)
-        _UniffiFfiConverterTypeFfiHotwordConfig.write(value, buf)
+        _UniffiFfiConverterTypeFfiAudioPipelineConfig.write(value, buf)
 
     @classmethod
     def read(cls, buf):
@@ -13778,9 +14883,23 @@ class _UniffiFfiConverterOptionalTypeFfiHotwordConfig(_UniffiConverterRustBuffer
         if flag == 0:
             return None
         elif flag == 1:
-            return _UniffiFfiConverterTypeFfiHotwordConfig.read(buf)
+            return _UniffiFfiConverterTypeFfiAudioPipelineConfig.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
+def audio_pipeline_default_config() -> FfiAudioPipelineConfig:
+    """
+    Returns default configuration for the audio pipeline.
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipelineConfig.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def cera_ffi_version() -> str:
     """
     Version string of the `cera-ffi` crate. Useful as a smoke test
@@ -14119,6 +15238,8 @@ __all__ = [
     "Role",
     "GenerationDefaults",
     "KvCompression",
+    "FfiAudioPipelineEvent",
+    "FfiAudioPipelineState",
     "FfiVadEvent",
     "FfiVadSampleRate",
     "LoadError",
@@ -14127,13 +15248,14 @@ __all__ = [
     "AudioInput",
     "ChatMessage",
     "EngineConfig",
-    "FfiEntitySpan",
+    "FfiVadConfig",
     "FfiHotwordConfig",
+    "FfiWhisperTranscribeOpts",
+    "FfiAudioPipelineConfig",
+    "FfiEntitySpan",
     "FfiHotwordEvent",
     "FfiHotwordScore",
     "FfiSpeechTimestamp",
-    "FfiVadConfig",
-    "FfiWhisperTranscribeOpts",
     "SpecDecodeConfig",
     "GenerateOpts",
     "GenerateSummary",
@@ -14153,6 +15275,7 @@ __all__ = [
     "ToolDef",
     "TurnResult",
     "UserMessage",
+    "audio_pipeline_default_config",
     "cera_ffi_version",
     "chat_message_assistant",
     "chat_message_system",
@@ -14184,6 +15307,8 @@ __all__ = [
     "CeraEngineProtocol",
     "DownloadProgressSinkImpl",
     "DownloadProgressSink",
+    "FfiAudioPipeline",
+    "FfiAudioPipelineProtocol",
     "FfiHotwordDetector",
     "FfiHotwordDetectorProtocol",
     "FfiHotwordIterator",

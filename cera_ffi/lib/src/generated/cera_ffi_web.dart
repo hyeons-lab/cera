@@ -1587,6 +1587,98 @@ class UserMessage {
   int get hashCode => Object.hash(text, images, audio);
 }
 
+/// Configuration options for the unified audio pipeline.
+class FfiAudioPipelineConfig {
+  const FfiAudioPipelineConfig({
+    /// Whether a keyword spotting wake word must be detected before speech tracking begins.
+    required this.requireHotword,
+    /// Whether to automatically run Whisper transcription upon speech completion.
+    required this.autoTranscribe,
+    /// Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+    required this.preRollMs,
+    /// Maximum allowed utterance duration in milliseconds before forcing a boundary.
+    required this.maxUtteranceMs,
+    /// Voice Activity Detection configuration.
+    required this.vadConfig,
+    /// Keyword Spotting configuration.
+    required this.hotwordConfig,
+    /// Whisper transcription options.
+    required this.whisperOpts,
+  });
+
+  /// Whether a keyword spotting wake word must be detected before speech tracking begins.
+  final bool requireHotword;
+  /// Whether to automatically run Whisper transcription upon speech completion.
+  final bool autoTranscribe;
+  /// Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+  final int preRollMs;
+  /// Maximum allowed utterance duration in milliseconds before forcing a boundary.
+  final int maxUtteranceMs;
+  /// Voice Activity Detection configuration.
+  final FfiVadConfig? vadConfig;
+  /// Keyword Spotting configuration.
+  final FfiHotwordConfig? hotwordConfig;
+  /// Whisper transcription options.
+  final FfiWhisperTranscribeOpts? whisperOpts;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'requireHotword': this.requireHotword,
+      'autoTranscribe': this.autoTranscribe,
+      'preRollMs': this.preRollMs,
+      'maxUtteranceMs': this.maxUtteranceMs,
+      'vadConfig': this.vadConfig == null ? null : (() { final __tmp = this.vadConfig!; return __tmp.toJson(); })(),
+      'hotwordConfig': this.hotwordConfig == null ? null : (() { final __tmp = this.hotwordConfig!; return __tmp.toJson(); })(),
+      'whisperOpts': this.whisperOpts == null ? null : (() { final __tmp = this.whisperOpts!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory FfiAudioPipelineConfig.fromJson(Map<String, dynamic> json) {
+    return FfiAudioPipelineConfig(
+      requireHotword: json['requireHotword'] as bool,
+      autoTranscribe: json['autoTranscribe'] as bool,
+      preRollMs: (json['preRollMs'] as num).toInt(),
+      maxUtteranceMs: (json['maxUtteranceMs'] as num).toInt(),
+      vadConfig: json['vadConfig'] == null ? null : (() { final __tmp = json['vadConfig']; return FfiVadConfig.fromJson(__tmp as Map<String, dynamic>); })(),
+      hotwordConfig: json['hotwordConfig'] == null ? null : (() { final __tmp = json['hotwordConfig']; return FfiHotwordConfig.fromJson(__tmp as Map<String, dynamic>); })(),
+      whisperOpts: json['whisperOpts'] == null ? null : (() { final __tmp = json['whisperOpts']; return FfiWhisperTranscribeOpts.fromJson(__tmp as Map<String, dynamic>); })(),
+    );
+  }
+
+  FfiAudioPipelineConfig copyWith({
+    bool? requireHotword,
+    bool? autoTranscribe,
+    int? preRollMs,
+    int? maxUtteranceMs,
+    Object? vadConfig = _sentinel,
+    Object? hotwordConfig = _sentinel,
+    Object? whisperOpts = _sentinel,
+  }) {
+    return FfiAudioPipelineConfig(
+      requireHotword: requireHotword ?? this.requireHotword,
+      autoTranscribe: autoTranscribe ?? this.autoTranscribe,
+      preRollMs: preRollMs ?? this.preRollMs,
+      maxUtteranceMs: maxUtteranceMs ?? this.maxUtteranceMs,
+      vadConfig: vadConfig == _sentinel ? this.vadConfig : vadConfig as FfiVadConfig?,
+      hotwordConfig: hotwordConfig == _sentinel ? this.hotwordConfig : hotwordConfig as FfiHotwordConfig?,
+      whisperOpts: whisperOpts == _sentinel ? this.whisperOpts : whisperOpts as FfiWhisperTranscribeOpts?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts;
+
+  @override
+  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts);
+}
+
 /// Summary of a successful message ingestion.
 class IngestSummary {
   const IngestSummary({
@@ -2828,6 +2920,155 @@ enum ToolFormat {
   /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
   /// `<tool_call>…</tool_call>`.
   hermes,
+}
+
+/// An event emitted by the unified audio pipeline.
+sealed class FfiAudioPipelineEvent {
+  const FfiAudioPipelineEvent();
+}
+
+/// Keyword spotting detected a wake word.
+final class FfiAudioPipelineEventWakeWordDetected extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventWakeWordDetected({
+    /// Triggered keyword.
+    required this.keyword,
+    /// Confidence probability between 0.0 and 1.0.
+    required this.confidence,
+    /// Timestamp in milliseconds from stream start.
+    required this.timestampMs,
+    /// Sample offset where the detection hop completed.
+    required this.sampleOffset,
+  });
+  /// Triggered keyword.
+  final String keyword;
+  /// Confidence probability between 0.0 and 1.0.
+  final double confidence;
+  /// Timestamp in milliseconds from stream start.
+  final double timestampMs;
+  /// Sample offset where the detection hop completed.
+  final int sampleOffset;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventWakeWordDetected(keyword: $keyword, confidence: $confidence, timestampMs: $timestampMs, sampleOffset: $sampleOffset)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventWakeWordDetected && keyword == other.keyword && confidence == other.confidence && timestampMs == other.timestampMs && sampleOffset == other.sampleOffset;
+
+  @override
+  int get hashCode => Object.hash(keyword, confidence, timestampMs, sampleOffset);
+}
+
+/// Voice Activity Detection identified speech onset.
+final class FfiAudioPipelineEventSpeechStart extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventSpeechStart({
+    /// Sample index where speech began.
+    required this.sample,
+    /// Timestamp in milliseconds from stream start.
+    required this.ms,
+  });
+  /// Sample index where speech began.
+  final int sample;
+  /// Timestamp in milliseconds from stream start.
+  final double ms;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventSpeechStart(sample: $sample, ms: $ms)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventSpeechStart && sample == other.sample && ms == other.ms;
+
+  @override
+  int get hashCode => Object.hash(sample, ms);
+}
+
+/// Voice Activity Detection identified speech termination.
+final class FfiAudioPipelineEventSpeechEnd extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventSpeechEnd({
+    /// Starting sample index of the speech segment.
+    required this.startSample,
+    /// Ending sample index of the speech segment.
+    required this.endSample,
+    /// Start timestamp in milliseconds.
+    required this.startMs,
+    /// End timestamp in milliseconds.
+    required this.endMs,
+  });
+  /// Starting sample index of the speech segment.
+  final int startSample;
+  /// Ending sample index of the speech segment.
+  final int endSample;
+  /// Start timestamp in milliseconds.
+  final double startMs;
+  /// End timestamp in milliseconds.
+  final double endMs;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventSpeechEnd(startSample: $startSample, endSample: $endSample, startMs: $startMs, endMs: $endMs)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventSpeechEnd && startSample == other.startSample && endSample == other.endSample && startMs == other.startMs && endMs == other.endMs;
+
+  @override
+  int get hashCode => Object.hash(startSample, endSample, startMs, endMs);
+}
+
+/// Whisper transcription completed for a speech utterance.
+final class FfiAudioPipelineEventUtteranceTranscribed extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventUtteranceTranscribed({
+    /// Recognized text output.
+    required this.text,
+    /// Start timestamp of the utterance in milliseconds.
+    required this.startMs,
+    /// End timestamp of the utterance in milliseconds.
+    required this.endMs,
+    /// Number of 16 kHz audio samples transcribed.
+    required this.sampleCount,
+  });
+  /// Recognized text output.
+  final String text;
+  /// Start timestamp of the utterance in milliseconds.
+  final double startMs;
+  /// End timestamp of the utterance in milliseconds.
+  final double endMs;
+  /// Number of 16 kHz audio samples transcribed.
+  final int sampleCount;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventUtteranceTranscribed(text: $text, startMs: $startMs, endMs: $endMs, sampleCount: $sampleCount)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventUtteranceTranscribed && text == other.text && startMs == other.startMs && endMs == other.endMs && sampleCount == other.sampleCount;
+
+  @override
+  int get hashCode => Object.hash(text, startMs, endMs, sampleCount);
+}
+
+/// Active state of the streaming audio pipeline.
+enum FfiAudioPipelineState {
+  /// Awaiting a keyword spotting wake word before activating speech recording.
+  listeningForHotword,
+  /// Evaluating incoming audio frames to detect speech onset.
+  listeningForSpeech,
+  /// Speech onset detected; accumulating utterance samples in the audio buffer.
+  speechActive,
+  /// Transcribing the accumulated speech utterance using Whisper.
+  transcribing,
 }
 
 /// Message author role in conversational chat.
@@ -4396,6 +4637,98 @@ ToolFormat _decodeToolFormat(String raw) {
   };
 }
 
+String _encodeFfiAudioPipelineEvent(FfiAudioPipelineEvent value) {
+  if (value is FfiAudioPipelineEventWakeWordDetected) {
+    return jsonEncode({
+      'tag': 'wakeWordDetected',
+      'keyword': value.keyword,
+      'confidence': value.confidence,
+      'timestampMs': value.timestampMs,
+      'sampleOffset': value.sampleOffset,
+    });
+  }
+  if (value is FfiAudioPipelineEventSpeechStart) {
+    return jsonEncode({
+      'tag': 'speechStart',
+      'sample': value.sample,
+      'ms': value.ms,
+    });
+  }
+  if (value is FfiAudioPipelineEventSpeechEnd) {
+    return jsonEncode({
+      'tag': 'speechEnd',
+      'startSample': value.startSample,
+      'endSample': value.endSample,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+    });
+  }
+  if (value is FfiAudioPipelineEventUtteranceTranscribed) {
+    return jsonEncode({
+      'tag': 'utteranceTranscribed',
+      'text': value.text,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+      'sampleCount': value.sampleCount,
+    });
+  }
+  throw StateError('Unknown FfiAudioPipelineEvent variant instance: $value');
+}
+
+FfiAudioPipelineEvent _decodeFfiAudioPipelineEvent(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'wakeWordDetected':
+      return FfiAudioPipelineEventWakeWordDetected(
+        keyword: map['keyword'] as String,
+        confidence: (map['confidence'] as num).toDouble(),
+        timestampMs: (map['timestampMs'] as num).toDouble(),
+        sampleOffset: (map['sampleOffset'] as num).toInt(),
+      );
+    case 'speechStart':
+      return FfiAudioPipelineEventSpeechStart(
+        sample: (map['sample'] as num).toInt(),
+        ms: (map['ms'] as num).toDouble(),
+      );
+    case 'speechEnd':
+      return FfiAudioPipelineEventSpeechEnd(
+        startSample: (map['startSample'] as num).toInt(),
+        endSample: (map['endSample'] as num).toInt(),
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+      );
+    case 'utteranceTranscribed':
+      return FfiAudioPipelineEventUtteranceTranscribed(
+        text: map['text'] as String,
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+        sampleCount: (map['sampleCount'] as num).toInt(),
+      );
+    default:
+      throw StateError('Unknown FfiAudioPipelineEvent variant tag: $tag');
+  }
+}
+
+String _encodeFfiAudioPipelineState(FfiAudioPipelineState value) {
+  return switch (value) {
+    FfiAudioPipelineState.listeningForHotword => 'listeningForHotword',
+    FfiAudioPipelineState.listeningForSpeech => 'listeningForSpeech',
+    FfiAudioPipelineState.speechActive => 'speechActive',
+    FfiAudioPipelineState.transcribing => 'transcribing',
+  };
+}
+
+FfiAudioPipelineState _decodeFfiAudioPipelineState(String raw) {
+  return switch (raw) {
+    'listeningForHotword' => FfiAudioPipelineState.listeningForHotword,
+    'listeningForSpeech' => FfiAudioPipelineState.listeningForSpeech,
+    'speechActive' => FfiAudioPipelineState.speechActive,
+    'transcribing' => FfiAudioPipelineState.transcribing,
+    _ => throw StateError('Unknown FfiAudioPipelineState variant: $raw'),
+  };
+}
+
 String _encodeRole(Role value) {
   return switch (value) {
     Role.system => 'system',
@@ -5219,6 +5552,22 @@ final class ToolFormatFfiCodec {
   static String encode(ToolFormat value) => _encodeToolFormat(value);
 
   static ToolFormat decode(String raw) => _decodeToolFormat(raw);
+}
+
+final class FfiAudioPipelineEventFfiCodec {
+  const FfiAudioPipelineEventFfiCodec._();
+
+  static String encode(FfiAudioPipelineEvent value) => _encodeFfiAudioPipelineEvent(value);
+
+  static FfiAudioPipelineEvent decode(String raw) => _decodeFfiAudioPipelineEvent(raw);
+}
+
+final class FfiAudioPipelineStateFfiCodec {
+  const FfiAudioPipelineStateFfiCodec._();
+
+  static String encode(FfiAudioPipelineState value) => _encodeFfiAudioPipelineState(value);
+
+  static FfiAudioPipelineState decode(String raw) => _decodeFfiAudioPipelineState(raw);
 }
 
 final class RoleFfiCodec {
@@ -6378,6 +6727,65 @@ final class SessionFfiCodec {
   static Session lift(int handle) => _unsupportedOnWeb('SessionFfiCodec.lift');
 }
 
+/// Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+final class FfiAudioPipeline {
+  FfiAudioPipeline._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiAudioPipeline.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiAudioPipeline.close');
+
+  /// Construct a pipeline from in-memory GGUF byte buffers.
+  static FfiAudioPipeline fromBytes(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytes');
+
+  /// Construct a pipeline from filesystem model paths.
+  static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
+
+  /// Cooperatively cancel any active transcription.
+  void cancel() => _unsupportedOnWeb('FfiAudioPipeline.cancel');
+
+  /// Clear cooperative cancellation flag.
+  void clearCancel() => _unsupportedOnWeb('FfiAudioPipeline.clearCancel');
+
+  /// Total audio samples processed since start or reset.
+  int currentSample() => _unsupportedOnWeb('FfiAudioPipeline.currentSample');
+
+  /// Flush any in-flight speech segment at the end of the audio stream.
+  List<FfiAudioPipelineEvent> flush() => _unsupportedOnWeb('FfiAudioPipeline.flush');
+
+  /// Whether the pipeline is currently awaiting a wake word trigger.
+  bool isListeningForHotword() => _unsupportedOnWeb('FfiAudioPipeline.isListeningForHotword');
+
+  /// Whether speech activity is currently ongoing.
+  bool isSpeechActive() => _unsupportedOnWeb('FfiAudioPipeline.isSpeechActive');
+
+  /// Return a copy of the most recently finished utterance audio samples.
+  List<double> lastUtterance() => _unsupportedOnWeb('FfiAudioPipeline.lastUtterance');
+
+  /// Pop a queued event emitted by previous chunk evaluations.
+  FfiAudioPipelineEvent? popEvent() => _unsupportedOnWeb('FfiAudioPipeline.popEvent');
+
+  /// Process a streaming chunk of 16 kHz mono PCM audio samples.
+  List<FfiAudioPipelineEvent> processChunk(List<double> chunk) => _unsupportedOnWeb('FfiAudioPipeline.processChunk');
+
+  /// Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+  void reset() => _unsupportedOnWeb('FfiAudioPipeline.reset');
+
+  /// Current lifecycle state of the pipeline.
+  FfiAudioPipelineState state() => _unsupportedOnWeb('FfiAudioPipeline.state');
+
+  /// Take ownership of the most recently completed utterance audio samples.
+  List<double> takeLastUtterance() => _unsupportedOnWeb('FfiAudioPipeline.takeLastUtterance');
+
+  /// Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+  String transcribePcm(List<double> pcm) => _unsupportedOnWeb('FfiAudioPipeline.transcribePcm');
+}
+
+final class FfiAudioPipelineFfiCodec {
+  static int lower(FfiAudioPipeline value) => _unsupportedOnWeb('FfiAudioPipelineFfiCodec.lower');
+  static FfiAudioPipeline lift(int handle) => _unsupportedOnWeb('FfiAudioPipelineFfiCodec.lift');
+}
+
 /// Stateful chat coordinator wrapping an inference session.
 final class ChatSession {
   ChatSession._();
@@ -6638,6 +7046,9 @@ String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb(
 
 /// Default transcription options for Whisper ASR.
 FfiWhisperTranscribeOpts whisperDefaultTranscribeOpts() => _unsupportedOnWeb('whisperDefaultTranscribeOpts');
+
+/// Returns default configuration for the audio pipeline.
+FfiAudioPipelineConfig audioPipelineDefaultConfig() => _unsupportedOnWeb('audioPipelineDefaultConfig');
 
 /// Convenience factory for an assistant text message.
 Message chatMessageAssistant(String content) => _unsupportedOnWeb('chatMessageAssistant');

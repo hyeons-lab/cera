@@ -866,6 +866,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_audio_pipeline_default_config(): Int
+
     external fun uniffi_cera_ffi_checksum_func_chat_message_assistant(): Int
 
     external fun uniffi_cera_ffi_checksum_func_chat_message_system(): Int
@@ -1048,6 +1050,32 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_cancel(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_clear_cancel(): Int
@@ -1157,6 +1185,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_chatsession_from_session(): Int
 
@@ -1916,6 +1948,99 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_clone_ffiaudiopipeline(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_ffiaudiopipeline(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+        `vadBytes`: RustBuffer.ByValue,
+        `hotwordBytes`: RustBuffer.ByValue,
+        `whisperBytes`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+        `vadPath`: RustBuffer.ByValue,
+        `hotwordPath`: RustBuffer.ByValue,
+        `whisperPath`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+        `ptr`: Long,
+        `chunk`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+        `ptr`: Long,
+        `pcm`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_clone_chatsession(
         `handle`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -2185,6 +2310,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_audio_pipeline_default_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_chat_message_assistant(
         `content`: RustBuffer.ByValue,
@@ -2468,6 +2595,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2741,6 +2871,45 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2904,6 +3073,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
@@ -6239,6 +6414,545 @@ public object FfiConverterTypeDownloadProgressSink : FfiConverter<DownloadProgre
 
     override fun write(
         value: DownloadProgressSink,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+public interface FfiAudioPipelineInterface {
+    /**
+     * Cooperatively cancel any active transcription.
+     */
+    fun `cancel`()
+
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    fun `clearCancel`()
+
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    fun `currentSample`(): kotlin.ULong
+
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    fun `flush`(): List<FfiAudioPipelineEvent>
+
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    fun `isListeningForHotword`(): kotlin.Boolean
+
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    fun `isSpeechActive`(): kotlin.Boolean
+
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    fun `lastUtterance`(): List<kotlin.Float>
+
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    fun `popEvent`(): FfiAudioPipelineEvent?
+
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    fun `processChunk`(`chunk`: List<kotlin.Float>): List<FfiAudioPipelineEvent>
+
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    fun `reset`()
+
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    fun `state`(): FfiAudioPipelineState
+
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    fun `takeLastUtterance`(): List<kotlin.Float>
+
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    fun `transcribePcm`(`pcm`: List<kotlin.Float>): kotlin.String
+
+    companion object
+}
+
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+open class FfiAudioPipeline :
+    Disposable,
+    AutoCloseable,
+    FfiAudioPipelineInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline(handle, status)
+        }
+    }
+
+    /**
+     * Cooperatively cancel any active transcription.
+     */
+    @Throws(FfiException::class)
+    override fun `cancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    @Throws(FfiException::class)
+    override fun `clearCancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    @Throws(FfiException::class)
+    override fun `currentSample`(): kotlin.ULong =
+        FfiConverterULong.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    @Throws(FfiException::class)
+    override fun `flush`(): List<FfiAudioPipelineEvent> =
+        FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    @Throws(FfiException::class)
+    override fun `isListeningForHotword`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    @Throws(FfiException::class)
+    override fun `isSpeechActive`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `lastUtterance`(): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    @Throws(FfiException::class)
+    override fun `popEvent`(): FfiAudioPipelineEvent? =
+        FfiConverterOptionalTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `processChunk`(`chunk`: List<kotlin.Float>): List<FfiAudioPipelineEvent> =
+        FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+                        it,
+                        FfiConverterSequenceFloat.lower(`chunk`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    @Throws(FfiException::class)
+    override fun `reset`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    @Throws(FfiException::class)
+    override fun `state`(): FfiAudioPipelineState =
+        FfiConverterTypeFfiAudioPipelineState.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `takeLastUtterance`(): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `transcribePcm`(`pcm`: List<kotlin.Float>): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+                        it,
+                        FfiConverterSequenceFloat.lower(`pcm`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    companion object {
+        /**
+         * Construct a pipeline from in-memory GGUF byte buffers.
+         */
+        @Throws(FfiException::class)
+        fun `fromBytes`(
+            `vadBytes`: kotlin.ByteArray?,
+            `hotwordBytes`: kotlin.ByteArray?,
+            `whisperBytes`: kotlin.ByteArray?,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+                        FfiConverterOptionalByteArray.lower(`vadBytes`),
+                        FfiConverterOptionalByteArray.lower(`hotwordBytes`),
+                        FfiConverterOptionalByteArray.lower(`whisperBytes`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Construct a pipeline from filesystem model paths.
+         */
+        @Throws(FfiException::class)
+        fun `fromFiles`(
+            `vadPath`: kotlin.String?,
+            `hotwordPath`: kotlin.String?,
+            `whisperPath`: kotlin.String?,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+                        FfiConverterOptionalString.lower(`vadPath`),
+                        FfiConverterOptionalString.lower(`hotwordPath`),
+                        FfiConverterOptionalString.lower(`whisperPath`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipeline : FfiConverter<FfiAudioPipeline, Long> {
+    override fun lower(value: FfiAudioPipeline): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): FfiAudioPipeline = FfiAudioPipeline(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): FfiAudioPipeline = lift(buf.getLong())
+
+    override fun allocationSize(value: FfiAudioPipeline) = 8UL
+
+    override fun write(
+        value: FfiAudioPipeline,
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
@@ -11457,6 +12171,82 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
 }
 
 /**
+ * Configuration options for the unified audio pipeline.
+ */
+data class FfiAudioPipelineConfig(
+    /**
+     * Whether a keyword spotting wake word must be detected before speech tracking begins.
+     */
+    var `requireHotword`: kotlin.Boolean,
+    /**
+     * Whether to automatically run Whisper transcription upon speech completion.
+     */
+    var `autoTranscribe`: kotlin.Boolean,
+    /**
+     * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+     */
+    var `preRollMs`: kotlin.UInt,
+    /**
+     * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+     */
+    var `maxUtteranceMs`: kotlin.UInt,
+    /**
+     * Voice Activity Detection configuration.
+     */
+    var `vadConfig`: FfiVadConfig?,
+    /**
+     * Keyword Spotting configuration.
+     */
+    var `hotwordConfig`: FfiHotwordConfig?,
+    /**
+     * Whisper transcription options.
+     */
+    var `whisperOpts`: FfiWhisperTranscribeOpts?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<FfiAudioPipelineConfig> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineConfig =
+        FfiAudioPipelineConfig(
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeFfiVadConfig.read(buf),
+            FfiConverterOptionalTypeFfiHotwordConfig.read(buf),
+            FfiConverterOptionalTypeFfiWhisperTranscribeOpts.read(buf),
+        )
+
+    override fun allocationSize(value: FfiAudioPipelineConfig) =
+        (
+            FfiConverterBoolean.allocationSize(value.`requireHotword`) +
+                FfiConverterBoolean.allocationSize(value.`autoTranscribe`) +
+                FfiConverterUInt.allocationSize(value.`preRollMs`) +
+                FfiConverterUInt.allocationSize(value.`maxUtteranceMs`) +
+                FfiConverterOptionalTypeFfiVadConfig.allocationSize(value.`vadConfig`) +
+                FfiConverterOptionalTypeFfiHotwordConfig.allocationSize(value.`hotwordConfig`) +
+                FfiConverterOptionalTypeFfiWhisperTranscribeOpts.allocationSize(value.`whisperOpts`)
+        )
+
+    override fun write(
+        value: FfiAudioPipelineConfig,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterBoolean.write(value.`requireHotword`, buf)
+        FfiConverterBoolean.write(value.`autoTranscribe`, buf)
+        FfiConverterUInt.write(value.`preRollMs`, buf)
+        FfiConverterUInt.write(value.`maxUtteranceMs`, buf)
+        FfiConverterOptionalTypeFfiVadConfig.write(value.`vadConfig`, buf)
+        FfiConverterOptionalTypeFfiHotwordConfig.write(value.`hotwordConfig`, buf)
+        FfiConverterOptionalTypeFfiWhisperTranscribeOpts.write(value.`whisperOpts`, buf)
+    }
+}
+
+/**
  * An identified PII entity span in source text.
  */
 data class FfiEntitySpan(
@@ -12952,6 +13742,284 @@ public object FfiConverterTypeBackendPreference : FfiConverterRustBuffer<Backend
 
     override fun write(
         value: BackendPreference,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * An event emitted by the unified audio pipeline.
+ */
+sealed class FfiAudioPipelineEvent {
+    /**
+     * Keyword spotting detected a wake word.
+     */
+    data class WakeWordDetected(
+        /**
+         * Triggered keyword.
+         */
+        val `keyword`: kotlin.String,
+        /**
+         * Confidence probability between 0.0 and 1.0.
+         */
+        val `confidence`: kotlin.Float,
+        /**
+         * Timestamp in milliseconds from stream start.
+         */
+        val `timestampMs`: kotlin.Float,
+        /**
+         * Sample offset where the detection hop completed.
+         */
+        val `sampleOffset`: kotlin.ULong,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Voice Activity Detection identified speech onset.
+     */
+    data class SpeechStart(
+        /**
+         * Sample index where speech began.
+         */
+        val `sample`: kotlin.ULong,
+        /**
+         * Timestamp in milliseconds from stream start.
+         */
+        val `ms`: kotlin.Float,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Voice Activity Detection identified speech termination.
+     */
+    data class SpeechEnd(
+        /**
+         * Starting sample index of the speech segment.
+         */
+        val `startSample`: kotlin.ULong,
+        /**
+         * Ending sample index of the speech segment.
+         */
+        val `endSample`: kotlin.ULong,
+        /**
+         * Start timestamp in milliseconds.
+         */
+        val `startMs`: kotlin.Float,
+        /**
+         * End timestamp in milliseconds.
+         */
+        val `endMs`: kotlin.Float,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Whisper transcription completed for a speech utterance.
+     */
+    data class UtteranceTranscribed(
+        /**
+         * Recognized text output.
+         */
+        val `text`: kotlin.String,
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */
+        val `startMs`: kotlin.Float,
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */
+        val `endMs`: kotlin.Float,
+        /**
+         * Number of 16 kHz audio samples transcribed.
+         */
+        val `sampleCount`: kotlin.ULong,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<FfiAudioPipelineEvent> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineEvent =
+        when (buf.getInt()) {
+            1 -> {
+                FfiAudioPipelineEvent.WakeWordDetected(
+                    FfiConverterString.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            2 -> {
+                FfiAudioPipelineEvent.SpeechStart(
+                    FfiConverterULong.read(buf),
+                    FfiConverterFloat.read(buf),
+                )
+            }
+
+            3 -> {
+                FfiAudioPipelineEvent.SpeechEnd(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                )
+            }
+
+            4 -> {
+                FfiAudioPipelineEvent.UtteranceTranscribed(
+                    FfiConverterString.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: FfiAudioPipelineEvent) =
+        when (value) {
+            is FfiAudioPipelineEvent.WakeWordDetected -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`keyword`) +
+                        FfiConverterFloat.allocationSize(value.`confidence`) +
+                        FfiConverterFloat.allocationSize(value.`timestampMs`) +
+                        FfiConverterULong.allocationSize(value.`sampleOffset`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.SpeechStart -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`sample`) +
+                        FfiConverterFloat.allocationSize(value.`ms`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.SpeechEnd -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`startSample`) +
+                        FfiConverterULong.allocationSize(value.`endSample`) +
+                        FfiConverterFloat.allocationSize(value.`startMs`) +
+                        FfiConverterFloat.allocationSize(value.`endMs`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.UtteranceTranscribed -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`text`) +
+                        FfiConverterFloat.allocationSize(value.`startMs`) +
+                        FfiConverterFloat.allocationSize(value.`endMs`) +
+                        FfiConverterULong.allocationSize(value.`sampleCount`)
+                )
+            }
+        }
+
+    override fun write(
+        value: FfiAudioPipelineEvent,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is FfiAudioPipelineEvent.WakeWordDetected -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`keyword`, buf)
+                FfiConverterFloat.write(value.`confidence`, buf)
+                FfiConverterFloat.write(value.`timestampMs`, buf)
+                FfiConverterULong.write(value.`sampleOffset`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.SpeechStart -> {
+                buf.putInt(2)
+                FfiConverterULong.write(value.`sample`, buf)
+                FfiConverterFloat.write(value.`ms`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.SpeechEnd -> {
+                buf.putInt(3)
+                FfiConverterULong.write(value.`startSample`, buf)
+                FfiConverterULong.write(value.`endSample`, buf)
+                FfiConverterFloat.write(value.`startMs`, buf)
+                FfiConverterFloat.write(value.`endMs`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.UtteranceTranscribed -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`text`, buf)
+                FfiConverterFloat.write(value.`startMs`, buf)
+                FfiConverterFloat.write(value.`endMs`, buf)
+                FfiConverterULong.write(value.`sampleCount`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Active state of the streaming audio pipeline.
+ */
+
+enum class FfiAudioPipelineState {
+    /**
+     * Awaiting a keyword spotting wake word before activating speech recording.
+     */
+    LISTENING_FOR_HOTWORD,
+
+    /**
+     * Evaluating incoming audio frames to detect speech onset.
+     */
+    LISTENING_FOR_SPEECH,
+
+    /**
+     * Speech onset detected; accumulating utterance samples in the audio buffer.
+     */
+    SPEECH_ACTIVE,
+
+    /**
+     * Transcribing the accumulated speech utterance using Whisper.
+     */
+    TRANSCRIBING,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineState : FfiConverterRustBuffer<FfiAudioPipelineState> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            FfiAudioPipelineState.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: FfiAudioPipelineState) = 4UL
+
+    override fun write(
+        value: FfiAudioPipelineState,
         buf: ByteBuffer,
     ) {
         buf.putInt(value.ordinal + 1)
@@ -15466,6 +16534,38 @@ public object FfiConverterOptionalTypeAudioInput : FfiConverterRustBuffer<AudioI
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<FfiAudioPipelineConfig?> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiAudioPipelineConfig.read(buf)
+    }
+
+    override fun allocationSize(value: FfiAudioPipelineConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiAudioPipelineConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiAudioPipelineConfig?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiAudioPipelineConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiHotwordConfig : FfiConverterRustBuffer<FfiHotwordConfig?> {
     override fun read(buf: ByteBuffer): FfiHotwordConfig? {
         if (buf.get().toInt() == 0) {
@@ -15651,6 +16751,38 @@ public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<
         } else {
             buf.put(1)
             FfiConverterTypeSpecDecodeConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<FfiAudioPipelineEvent?> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineEvent? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiAudioPipelineEvent.read(buf)
+    }
+
+    override fun allocationSize(value: FfiAudioPipelineEvent?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiAudioPipelineEvent.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiAudioPipelineEvent?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiAudioPipelineEvent.write(value, buf)
         }
     }
 }
@@ -16190,6 +17322,34 @@ public object FfiConverterSequenceTypeToolDef : FfiConverterRustBuffer<List<Tool
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<List<FfiAudioPipelineEvent>> {
+    override fun read(buf: ByteBuffer): List<FfiAudioPipelineEvent> {
+        val len = buf.getInt()
+        return List<FfiAudioPipelineEvent>(len) {
+            FfiConverterTypeFfiAudioPipelineEvent.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiAudioPipelineEvent>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiAudioPipelineEvent.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<FfiAudioPipelineEvent>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiAudioPipelineEvent.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterMapStringString : FfiConverterRustBuffer<Map<kotlin.String, kotlin.String>> {
     override fun read(buf: ByteBuffer): Map<kotlin.String, kotlin.String> {
         val len = buf.getInt()
@@ -16389,6 +17549,16 @@ fun `whisperDefaultTranscribeOpts`(): FfiWhisperTranscribeOpts =
     FfiConverterTypeFfiWhisperTranscribeOpts.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(_status)
+        },
+    )
+
+/**
+ * Returns default configuration for the audio pipeline.
+ */
+fun `audioPipelineDefaultConfig`(): FfiAudioPipelineConfig =
+    FfiConverterTypeFfiAudioPipelineConfig.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config(_status)
         },
     )
 
