@@ -1352,10 +1352,20 @@ impl InferenceState {
                             ));
                         }
                     }
-                    LayerSnapshot::AttentionCompressed { .. } => {
+                    LayerSnapshot::AttentionCompressed { keys, values } => {
                         if compressed_keys.is_none() {
                             return Err(format!(
                                 "layer {idx}: compressed snapshot provided but state is not compressed"
+                            ));
+                        }
+                        if crate::turboquant::decode_compressed_keys(keys).is_none() {
+                            return Err(format!(
+                                "layer {idx}: invalid TQK1 compressed keys blob in snapshot"
+                            ));
+                        }
+                        if crate::turboquant::decode_compressed_values(values).is_none() {
+                            return Err(format!(
+                                "layer {idx}: invalid TQV1 compressed values blob in snapshot"
                             ));
                         }
                     }
@@ -1448,10 +1458,20 @@ impl InferenceState {
                                 ));
                             }
                         }
-                        LayerSnapshot::AttentionCompressed { .. } => {
+                        LayerSnapshot::AttentionCompressed { keys, values } => {
                             if compressed_keys.is_none() {
                                 return Err(format!(
                                     "layer {idx}: compressed snapshot provided but state is not compressed"
+                                ));
+                            }
+                            if crate::turboquant::decode_compressed_keys(keys).is_none() {
+                                return Err(format!(
+                                    "layer {idx}: invalid TQK1 compressed keys blob in snapshot"
+                                ));
+                            }
+                            if crate::turboquant::decode_compressed_values(values).is_none() {
+                                return Err(format!(
+                                    "layer {idx}: invalid TQV1 compressed values blob in snapshot"
                                 ));
                             }
                         }
@@ -4258,5 +4278,29 @@ mod tests {
         };
         assert!(mamba2_conv_dim(&overflow_ssm).is_err());
         assert!(mamba2_d_in_proj(&overflow_ssm).is_err());
+    }
+
+    #[test]
+    fn test_validate_snapshot_rejects_corrupt_compressed_blobs() {
+        let mut cfg = tiny_config(1, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 1];
+        cfg.kv_heads_per_layer = vec![2; 1];
+
+        let state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+        assert!(state.is_compressed());
+
+        let invalid_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionCompressed {
+                keys: vec![0u8; 16],
+                values: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&invalid_snapshot).unwrap_err();
+        assert!(err.contains("invalid TQK1 compressed keys blob in snapshot"));
     }
 }

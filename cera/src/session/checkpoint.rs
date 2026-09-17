@@ -35,7 +35,7 @@ const SESSION_CHECKPOINT_MAGIC: &[u8; 8] = b"CERASCHK";
 const SESSION_CHECKPOINT_VERSION: u32 = 1;
 
 const CHAT_CHECKPOINT_MAGIC: &[u8; 8] = b"CERACHAT";
-const CHAT_CHECKPOINT_VERSION: u32 = 1;
+const CHAT_CHECKPOINT_VERSION: u32 = 2;
 
 /// A serializable, resumable snapshot of an inference session's state.
 #[derive(Clone, Debug, PartialEq)]
@@ -193,12 +193,22 @@ pub struct ChatCheckpoint {
     pub tool_format: ToolFormat,
     /// Currently registered tools.
     pub tools: Vec<ToolDef>,
+    /// Whether the terminal token was already committed to the KV cache.
+    pub terminal_committed: Option<bool>,
 }
 
 impl ChatCheckpoint {
     /// Serialize this chat checkpoint into a compact binary representation.
     pub fn to_bytes(&self) -> Result<Vec<u8>, CeraError> {
-        let mut writer = BufferWriter::with_capacity(self.session_checkpoint.byte_size() + 256);
+        let tools_json = serde_json::to_string(&self.tools)
+            .map_err(|e| CeraError::Format(format!("failed to serialize tools to json: {e}")))?;
+        let tools_bytes = tools_json.as_bytes();
+        let session_bytes = self.session_checkpoint.to_bytes();
+
+        // Exact capacity:
+        // magic(8) + version(4) + phase(1) + format(1) + term(1) + tools_len(4) + tools_bytes + session_len(4) + session_bytes
+        let capacity = 8 + 4 + 1 + 1 + 1 + 4 + tools_bytes.len() + 4 + session_bytes.len();
+        let mut writer = BufferWriter::with_capacity(capacity);
         writer.write_bytes(CHAT_CHECKPOINT_MAGIC);
         writer.write_u32(CHAT_CHECKPOINT_VERSION);
 
@@ -218,13 +228,16 @@ impl ChatCheckpoint {
         };
         writer.write_u8(format_byte);
 
-        let tools_json = serde_json::to_string(&self.tools)
-            .map_err(|e| CeraError::Format(format!("failed to serialize tools to json: {e}")))?;
-        let tools_bytes = tools_json.as_bytes();
+        let term_byte = match self.terminal_committed {
+            None => 0u8,
+            Some(false) => 1u8,
+            Some(true) => 2u8,
+        };
+        writer.write_u8(term_byte);
+
         writer.write_u32(tools_bytes.len() as u32);
         writer.write_bytes(tools_bytes);
 
-        let session_bytes = self.session_checkpoint.to_bytes();
         writer.write_u32(session_bytes.len() as u32);
         writer.write_bytes(&session_bytes);
 
@@ -241,7 +254,7 @@ impl ChatCheckpoint {
             ));
         }
         let version = reader.read_u32()?;
-        if version != CHAT_CHECKPOINT_VERSION {
+        if version != 1 && version != CHAT_CHECKPOINT_VERSION {
             return Err(CeraError::Format(format!(
                 "unsupported chat checkpoint version {version}, expected {CHAT_CHECKPOINT_VERSION}"
             )));
@@ -273,6 +286,24 @@ impl ChatCheckpoint {
             }
         };
 
+        let terminal_committed = if version >= 2 {
+            let term_byte = reader.read_u8()?;
+            match term_byte {
+                0 => None,
+                1 => Some(false),
+                2 => Some(true),
+                other => {
+                    return Err(CeraError::Format(format!(
+                        "unknown terminal_committed code {other} in chat checkpoint"
+                    )));
+                }
+            }
+        } else if phase == SessionPhase::TurnComplete {
+            Some(false)
+        } else {
+            None
+        };
+
         let tools_len = reader.read_u32()? as usize;
         let tools_bytes = reader.read_bytes(tools_len)?;
         let tools: Vec<ToolDef> = if tools_bytes.is_empty() {
@@ -299,6 +330,7 @@ impl ChatCheckpoint {
             phase,
             tool_format,
             tools,
+            terminal_committed,
         })
     }
 

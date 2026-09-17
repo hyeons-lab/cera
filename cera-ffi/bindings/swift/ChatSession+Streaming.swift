@@ -60,4 +60,28 @@ extension ChatSession {
             }
         }
     }
+
+    /// Streams generated text tokens conforming to a JSON Schema as an AsyncThrowingStream.
+    public func streamJson(opts: GenerateOpts, schemaJson: String) -> AsyncThrowingStream<String, Error> {
+        do {
+            let grammar = try jsonSchemaToGrammar(schemaJson: schemaJson)
+            var constrainedOpts = opts
+            constrainedOpts.grammar = grammar
+            return stream(opts: constrainedOpts)
+        } catch {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: error)
+            }
+        }
+    }
 }
+
+extension GenerateOpts {
+    /// Returns a copy of GenerateOpts with JSON Schema constrained grammar.
+    public func withJsonSchema(_ schemaJson: String) throws -> GenerateOpts {
+        var opts = self
+        opts.grammar = try jsonSchemaToGrammar(schemaJson: schemaJson)
+        return opts
+    }
+}
+

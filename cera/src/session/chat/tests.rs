@@ -1874,6 +1874,7 @@ fn chat_checkpoint_roundtrip_persistence_and_continuation() {
 
     let cp = chat.checkpoint().unwrap();
     assert_eq!(cp.phase, SessionPhase::TurnComplete);
+    assert_eq!(cp.terminal_committed, Some(false));
     assert_eq!(cp.tools.len(), 1);
     assert_eq!(cp.tool_format, ToolFormat::Hermes);
     assert_eq!(cp.session_checkpoint.position, pos_before_checkpoint);
@@ -1895,6 +1896,7 @@ fn chat_checkpoint_roundtrip_persistence_and_continuation() {
 
     chat2.load_checkpoint(&path).unwrap();
     assert_eq!(chat2.phase(), SessionPhase::TurnComplete);
+    assert_eq!(chat2.terminal_committed, Some(false));
     assert_eq!(chat2.tools(), tools.as_slice());
     assert_eq!(chat2.tool_format(), ToolFormat::Hermes);
     assert_eq!(chat2.position(), pos_before_checkpoint);
@@ -1902,6 +1904,7 @@ fn chat_checkpoint_roundtrip_persistence_and_continuation() {
     // Clear tools for normal dialogue continuation:
     chat2.set_tools(Vec::new());
     chat2.ingest(&user("follow up")).unwrap();
+    assert_eq!(chat2.terminal_committed, None);
     assert_eq!(chat2.phase(), SessionPhase::PromptReady);
     let result2 = chat2.complete(&opts(0.0)).unwrap();
     assert_eq!(chat2.phase(), SessionPhase::TurnComplete);

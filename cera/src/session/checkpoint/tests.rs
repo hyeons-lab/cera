@@ -134,6 +134,7 @@ fn chat_checkpoint_roundtrip() {
         phase: SessionPhase::TurnComplete,
         tool_format: ToolFormat::Hermes,
         tools: vec![tool],
+        terminal_committed: Some(false),
     };
 
     let bytes = chat_checkpoint
@@ -162,6 +163,7 @@ fn chat_checkpoint_magic_rejection() {
         phase: SessionPhase::Idle,
         tool_format: ToolFormat::Lfm2Pythonic,
         tools: Vec::new(),
+        terminal_committed: None,
     };
 
     let mut bytes = chat_checkpoint.to_bytes().expect("to_bytes");
@@ -228,6 +230,7 @@ fn checkpoint_trailing_bytes_rejection() {
         phase: SessionPhase::Idle,
         tool_format: ToolFormat::Lfm2Pythonic,
         tools: Vec::new(),
+        terminal_committed: None,
     };
     let mut chat_bytes = chat_checkpoint.to_bytes().expect("to_bytes");
     chat_bytes.extend_from_slice(b"extra_junk");
@@ -238,6 +241,38 @@ fn checkpoint_trailing_bytes_rejection() {
         }
         other => panic!("expected format error for trailing bytes, got {other:?}"),
     }
+}
+
+#[test]
+fn chat_checkpoint_v1_backward_compatibility() {
+    let kv_state = StateSnapshot::new(Vec::new(), 0);
+    let session_checkpoint = SessionCheckpoint {
+        model_fingerprint: 0x1122,
+        position: 0,
+        max_seq_len: 256,
+        prefill_tokens: 0,
+        prefill_elapsed_ms: 0,
+        last_logits: None,
+        token_history: Vec::new(),
+        kv_state,
+    };
+
+    // Craft a valid version 1 serialized payload:
+    // magic(8) + version 1 (4) + phase TurnComplete (1) + format Hermes (1) + tools_len 0 (4) + session_bytes
+    let mut v1_bytes = Vec::new();
+    v1_bytes.extend_from_slice(b"CERACHAT");
+    v1_bytes.extend_from_slice(&1u32.to_le_bytes()); // version 1
+    v1_bytes.push(2u8); // SessionPhase::TurnComplete
+    v1_bytes.push(1u8); // ToolFormat::Hermes
+    v1_bytes.extend_from_slice(&0u32.to_le_bytes()); // tools_len = 0
+    let session_bytes = session_checkpoint.to_bytes();
+    v1_bytes.extend_from_slice(&(session_bytes.len() as u32).to_le_bytes());
+    v1_bytes.extend_from_slice(&session_bytes);
+
+    let decoded = ChatCheckpoint::from_bytes(&v1_bytes).expect("v1 deserialization should succeed");
+    assert_eq!(decoded.phase, SessionPhase::TurnComplete);
+    assert_eq!(decoded.tool_format, ToolFormat::Hermes);
+    assert_eq!(decoded.terminal_committed, Some(false));
 }
 
 #[test]

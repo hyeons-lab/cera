@@ -1048,6 +1048,7 @@ impl<E: Execution> Chat<E> {
             phase: self.phase,
             tool_format: self.tool_format,
             tools: self.tools.clone(),
+            terminal_committed: self.terminal_committed,
         })
     }
 
@@ -1062,7 +1063,13 @@ impl<E: Execution> Chat<E> {
         self.phase = checkpoint.phase;
         self.tool_format = checkpoint.tool_format;
         self.tools = checkpoint.tools.clone();
-        self.terminal_committed = None;
+        self.terminal_committed = checkpoint.terminal_committed.or_else(|| {
+            if checkpoint.phase == SessionPhase::TurnComplete {
+                Some(false)
+            } else {
+                None
+            }
+        });
         Ok(())
     }
 
