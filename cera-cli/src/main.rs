@@ -4218,6 +4218,7 @@ fn main() -> Result<()> {
             }
 
             // Line-based REPL fallback below.
+            #[allow(clippy::large_enum_variant)]
             enum CliSession {
                 Chat(SessionChat),
                 Raw(cera::Session),
