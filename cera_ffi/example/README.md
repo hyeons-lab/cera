@@ -18,11 +18,14 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 
 | Script | Shows |
 |---|---|
+| `chat.dart` | Multi-turn conversational chat coordinator (`ChatSession`), delta-only prefill, and live KV cache retention |
+| `explicit_loading.dart` | Explicit model loading with `ModelLoader` and raw prompt completion |
 | `cera_chat.dart` | Chat template, tokenize, generate, decode back to text |
 | `cera_generate.dart` | Minimal synchronous generate, token IDs only |
 | `cera_async.dart` | `generateAsync` + `generateStreamingAsync` (recommended streaming path) |
 | `cera_stream.dart` | Synchronous `generateStreaming`, and why you must drain the event loop |
 | `cera_progress.dart` | `BundleRepo.withProgress` download progress callbacks, via `fromBundleIdAsync` (downloads a full bundle; it cannot be aborted) |
+| `gpu_ownership_probe.dart` | Native GPU context reservation, Busy error handling, and session release |
 
 They print to stdout by design; `analysis_options.yaml` disables `avoid_print`
 for that reason rather than excluding the directory from analysis, so these

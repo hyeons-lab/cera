@@ -1,11 +1,11 @@
-# Chat contract prototype
+# Chat contract and coordinator verification
 
-This executable P0.1 prototype lives under `cera/tests/api_chat`, outside the
-published API, so its Rust modules also travel with packaged crate tests. It defines owned
-messages with ordered content, batch/replacement operations, six phases, typed
-validation/recovery outcomes and a text collector over one decode call. The
-application retains its transcript. `Chat` retains an execution object, shared
-tokenizer/profile, phase and one optional terminal-residency bit.
+This test suite under `tests/api_chat` validates the transactional chat coordinator architecture,
+published in `cera::session::chat` and exposed via `Session::into_chat()`.
+It defines owned messages with ordered content, batch/replacement operations, six session phases, typed
+validation/recovery outcomes and a text collector over decode calls.
+The application retains its transcript. `Chat` retains an execution object, shared
+tokenizer/profile, phase and a terminal-residency bit.
 
 Run the offline fixtures from the worktree:
 
@@ -53,15 +53,13 @@ let answer = chat.complete(&GenerateOpts::default())?;
 // After a proven terminal boundary, the next user batch can be ingested.
 ```
 
-This snippet describes the compiled test contract; no production `Chat` constructor
-is published. The only backend bridge is the private unit-test adapter described
-under [Actual Session transactions](#actual-session-transactions) below.
+This workflow mirrors the production `Session::into_chat()` coordinator API.
 Streaming callers use `generate_into` with the existing `ModalitySink`.
 `complete` collects token IDs and decodes the whole sequence with the existing
-tokenizer, returning its original `GenerateSummary`. Use streaming to retain
+tokenizer, returning a `TurnResult` with `GenerateSummary`. Use streaming to retain
 partial output after a decode error. This profile rejects audio-output execution
-at construction and before preparation/decode and rejects input
-images/audio/tools before append or reset.
+at construction and before preparation/decode and rejects unsupported input
+modalities before append or reset.
 
 The structural ten-turn fixture uses nonempty scripted answers and the real public
 BPE vocabulary/merges, including Unicode and whitespace in user messages. It
@@ -72,14 +70,13 @@ resident, and the next isolated user append repeats BOS. Its corrected suffix
 matches the full-render token fixture. These are tokenizer/control-flow proofs;
 they do not execute the model's numerical weights or establish R1 KV performance.
 
-See the [chat inventory and remaining gates](../../docs/internals/API_RESHAPE_CHAT.md)
+See the [chat inventory and documentation](../../docs/internals/API_RESHAPE_CHAT.md)
 for native/browser adapters, real decode observations and performance work.
 
 ## Actual Session transactions
 
-The core unit-test adapter runs the same contract against actual Session append,
-checked recovery/reset and observed decode. It remains private until the numerical,
-backend and binding gates pass. Without the pinned model, the offline cases run with:
+The core transaction suite validates the production `SessionChat` coordinator against actual Session append,
+checked recovery/reset and observed decode. Without the pinned model, the offline cases run with:
 
 ```sh
 cargo test -p cera --lib --locked --offline -- session::chat::
@@ -115,3 +112,10 @@ Keep reports and pinned models in a persistent ignored project directory when
 continuing across sessions. Temporary-directory cleanup can remove otherwise valid
 historical evidence. Rebuild and rehash missing artifacts before making fresh
 runtime claims; source and handoff records do not recreate a lost binary report.
+
+## Performance regression budgets
+
+Machine-readable performance, latency, and memory targets are specified in
+[`budgets.json`](budgets.json) and detailed in [`BUDGETS.md`](BUDGETS.md).
+These criteria enforce delta-only prefill, zero normal-turn resets, bit-exact KV retention,
+and bounded coordinator heap overhead.

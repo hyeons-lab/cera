@@ -411,8 +411,19 @@ impl ChatSession {
     }
 
     /// Current session lifecycle phase.
+    ///
+    /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
     pub fn phase(&self) -> Result<SessionPhase, FfiError> {
-        self.with_chat(|chat| Ok(chat.phase().into()))
+        let guard = self.inner.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => FfiError::Busy,
+            std::sync::TryLockError::Poisoned(_) => FfiError::Backend {
+                detail: "chat session mutex poisoned; recreate the session".into(),
+            },
+        })?;
+        let chat = guard.as_ref().ok_or_else(|| FfiError::Backend {
+            detail: "chat session has been moved back into a Session".into(),
+        })?;
+        Ok(chat.phase().into())
     }
 
     /// Current token position in the execution context.
@@ -602,8 +613,12 @@ impl ChatSession {
 
     /// Flip cancellation flag to interrupt in-flight prefill or decode.
     ///
-    /// Wait-free and safe from any thread.
+    /// Wait-free and safe from any thread. If the session has already been reclaimed
+    /// via `into_session()`, this call is a no-op to prevent cross-session cancellation.
     pub fn cancel(&self) {
+        if self.moved.load(Ordering::Acquire) {
+            return;
+        }
         self.cancel.store(true, Ordering::Relaxed);
     }
 
@@ -652,6 +667,7 @@ impl ChatSession {
             detail: "chat session has already been moved into a Session".into(),
         })?;
         self.moved.store(true, Ordering::Release);
+        self.cancel.store(false, Ordering::Relaxed);
         let session = chat.into_session();
         Ok(Session::from_core(session))
     }

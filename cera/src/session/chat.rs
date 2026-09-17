@@ -445,6 +445,11 @@ impl Profile {
         } else if rendered.starts_with(BOS) {
             let mut s = rendered;
             s.drain(..BOS.len());
+            if s.starts_with("\r\n") {
+                s.drain(..2);
+            } else if s.starts_with('\n') {
+                s.drain(..1);
+            }
             Ok(s)
         } else {
             Err(ValidationError::UnsupportedProfile)
@@ -567,7 +572,9 @@ impl<E: Execution> Chat<E> {
         let before = self.position();
         let initial = replace || self.phase == SessionPhase::Idle;
         let rendered = self.profile.render(messages, initial)?;
-        let mut tokens = Vec::new();
+        let mut tokens = Vec::with_capacity(
+            rendered.len().saturating_div(2) + self.profile.newline_tokens.len() + 1,
+        );
         if !initial {
             if self.terminal_committed == Some(false) {
                 tokens.push(self.profile.eos);

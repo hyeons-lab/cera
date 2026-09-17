@@ -15,11 +15,13 @@ This one exists for Dart without Flutter: a CLI, a server, a test. It is also
 where the bindings live so that they *can* be resolved without Flutter, since a
 package declaring `flutter.plugin.platforms` is one `dart pub get` refuses.
 
-Native `Session.recoveryStatus()` exposes usability and the retained whole-message
-recovery report, including typed rewind/reset errors. Read it after a failed
-`sendMessage` call; `Reset` requires context replay and `Unusable` requires a
-successful reset or recreation. The report does not cover raw append failures.
-See the [recovery contract](../docs/internals/API_RESHAPE_RECOVERY.md#native-recovery-status).
+Native `ChatSession.recoveryStatus()` and `Session.recoveryStatus()` expose usability
+and the retained recovery report, including typed rewind/reset errors. Read it after
+a failed turn or append call; `Reset` requires context replay and `Unusable` requires
+a successful reset or recreation. Legacy `sendMessage` is deprecated in favor of
+`ChatSession` (`session.intoChat()`).
+See the [recovery contract](../docs/internals/API_RESHAPE_RECOVERY.md#native-recovery-status)
+and the [conversational chat example](example/chat.dart).
 
 ## Explicit loading in this checkout
 
@@ -148,6 +150,18 @@ void main() {
 `generate` returns token IDs plus a summary; `decodeTokens` turns them back into
 text. For streaming and the async variants that keep the isolate responsive, see
 `example/`.
+
+For multi-turn conversational chat with delta-only prefill and automatic template handling,
+use `ChatSession` via `session.intoChat()`:
+
+```dart
+final chat = session.intoChat();
+chat.ingest(chatMessageUser(text: 'Why is the sky blue?'));
+final reply = chat.complete(const GenerateOpts(maxTokens: 128));
+print(reply.text);
+```
+
+See [`example/chat.dart`](example/chat.dart) for the complete multi-turn conversational chat workflow.
 
 Native Metal/wgpu models permit one live session per loaded model. Close a raw
 session before creating another on that model; reset and cancellation retain

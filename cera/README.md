@@ -33,13 +33,16 @@ cera = "0.5"
 - **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection in Rust. Includes a parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model containers, reusable forward scratch buffers (`HotwordDetector`), 30.0x AGC peak normalization, and the Silero VAD gating state machine (`HotwordIterator`). Process chunks serially on a background audio worker; event creation and stream buffer growth can allocate.
 - **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
 
+- **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
+
 The additive API work also includes a [checked raw KV rewind example](examples/checked_rewind.rs)
 and a [backend recovery matrix](../docs/internals/API_RESHAPE_RECOVERY.md).
-CPU Llama/LFM2 support checked user-message recovery. The runnable
+CPU Llama/LFM2 support checked recovery. The runnable
 [ingestion recovery example](examples/ingestion_recovery.rs) demonstrates cancellation,
 restoration/reset diagnostics and retry. Select native device reset with `--metal`
 or `--wgpu` and the matching Cargo feature; `--compressed` exercises TurboQuant.
-The full chat contract and richer foreign/browser recovery remain under development.
+The full conversational chat contract is available via `Session::into_chat()` and
+demonstrated in the [chat example](examples/chat.rs).
 
 ## Breaking changes in 0.4.0
 
@@ -255,10 +258,13 @@ the prompt and decodes generated tokens:
 cargo run -p cera --example explicit_loading -- model.gguf "Once upon a time"
 ```
 
-For chat models, supply a prompt rendered with that model's template. This is a
-raw completion example; the new high-level chat workflow remains in progress.
-The explicit loading exports are available in this checkout and are not claimed
-as part of an already published release.
+For conversational chat, use the dedicated coordinator (`Session::into_chat()`)
+detailed below, which handles Jinja2 template formatting, incremental turn boundaries,
+and KV cache retention automatically. Run the [conversational chat example](examples/chat.rs):
+
+```bash
+cargo run -p cera --example chat -- model.gguf
+```
 
 Load a local GGUF and stream tokens to stdout as they decode:
 
@@ -296,9 +302,53 @@ fn main() -> Result<(), cera::CeraError> {
 ```
 
 `Session` retains live KV across `append_text` / `generate` calls. Continue by
-appending new input to the same session. For chat, supply the model's required
-template boundaries using `cera::tokenizer::apply_chat_template`. Reusable model
-prefix caches are separate and are implemented only by some backends.
+appending new input to the same session.
+
+### Conversational chat coordinator (`Session::into_chat`)
+
+For chat models, use `Session::into_chat()` instead of manual string formatting.
+`SessionChat` discovers the model's chat template, tracks conversation phases,
+enforces role alternation, evaluates only new tokens on continuation turns (delta-only prefill),
+and maintains bit-exact KV retention across turns:
+
+```rust
+use cera::{CeraEngine, EngineConfig, GenerateOpts, Message, SessionConfig};
+
+fn main() -> Result<(), cera::CeraError> {
+    let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
+    let session = engine.new_session(SessionConfig::default())?;
+
+    // Transition the session into a chat coordinator.
+    let mut chat = match session.into_chat() {
+        Ok(chat) => chat,
+        Err((_session, err)) => panic!("chat setup refused: {err:?}"),
+    };
+
+    // Ingest conversation history or initial prompt.
+    chat.ingest_messages(&[
+        Message::system("You are a concise, helpful assistant."),
+        Message::user("What is the capital of France?"),
+    ])?;
+
+    // Generate assistant reply (delta-only prefill + decode).
+    let opts = GenerateOpts { max_tokens: 64, ..Default::default() };
+    let reply = chat.complete(&opts)?;
+    println!("Assistant: {}", reply.text);
+
+    // Continuation turn: only the new user message is prefilled into KV.
+    chat.ingest(&Message::user("And what is its population?"))?;
+    let reply2 = chat.complete(&opts)?;
+    println!("Assistant: {}", reply2.text);
+
+    // Reclaim the underlying session when raw completion access is needed.
+    let mut session = chat.into_session();
+    session.reset()?;
+    Ok(())
+}
+```
+
+Legacy `Session::append_user_message` is deprecated in favor of `Session::into_chat()`.
+See [`cera/examples/chat.rs`](examples/chat.rs) for the complete runnable example.
 
 ### Auto-downloading LeapBundles
 

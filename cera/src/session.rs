@@ -1040,25 +1040,22 @@ impl Session {
     /// After failed recovery, this requires a complete checked backend reset;
     /// backends without checked reset fall back to state re-allocation.
     pub fn reset(&mut self) -> Result<(), CeraError> {
-        if !self.usable {
-            match self.reset_execution_checked() {
-                Ok(()) => {
-                    self.usable = true;
-                    self.last_ingest_recovery = None;
-                    self.cancel.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(ref err) if err.is_checked_kv_reset_unsupported() => {
-                    self.reset_realloc_state()?;
-                    self.cancel.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
+        self.usable = false;
+        self.last_logits = None;
+        match self.reset_execution_checked() {
+            Ok(()) => {
+                self.usable = true;
+                self.last_ingest_recovery = None;
+                self.cancel.store(false, Ordering::Relaxed);
+                Ok(())
             }
+            Err(ref err) if err.is_checked_kv_reset_unsupported() => {
+                self.reset_realloc_state()?;
+                self.cancel.store(false, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(err) => Err(err),
         }
-        self.reset_realloc_state()?;
-        self.cancel.store(false, Ordering::Relaxed);
-        Ok(())
     }
 
     pub(super) fn reset_realloc_state(&mut self) -> Result<(), CeraError> {

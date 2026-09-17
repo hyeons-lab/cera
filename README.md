@@ -128,11 +128,11 @@ One Rust core, consumed from many places:
 | **Rust (Engine)** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
 | **Rust (API client)** | [`cera-client`](cera-client/) | any Rust project (`cargo add cera-client`); OpenAI and OpenRouter endpoints |
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
-| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, VAD, KWS, Whisper) |
+| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, ChatSession, VAD, KWS, Whisper) |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
 | **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
-| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, VAD, KWS, Whisper) |
-| **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib |
+| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, ChatSession, VAD, KWS, Whisper) |
+| **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib (ChatSession, explicit loading) |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
 A complete SwiftUI example app (streaming chat + embeddings + LoRA) that consumes
@@ -396,17 +396,24 @@ cera chat
 cera run -m model.gguf -p "Hi" --device metal   # or: gpu, cpu, auto
 ```
 
-Using the library directly (streaming tokens through a sink):
+Using the library directly:
 
 ```rust
-use cera::{CeraEngine, EngineConfig, GenerateOpts, SessionConfig};
+use cera::{CeraEngine, EngineConfig, GenerateOpts, Message, SessionConfig};
 
 let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
 let mut session = engine.new_session(SessionConfig::default())?;
-session.append_text("Once upon a time")?;
 
+// Raw prompt completion:
+session.append_text("Once upon a time")?;
 let opts = GenerateOpts { max_tokens: 128, ..Default::default() };
 let summary = session.generate(&opts, &mut sink)?; // sink: your ModalitySink
+
+// Or conversational chat coordination (delta-only prefill, live KV retention):
+let mut chat = session.into_chat().map_err(|(_, err)| err)?;
+chat.ingest(&Message::user("What is the capital of France?"))?;
+let reply = chat.complete(&opts)?;
+println!("Assistant: {}", reply.text);
 ```
 
 See the [`cera` crate README](cera/README.md) for the full library API.
@@ -423,8 +430,12 @@ session.append_text("Once upon a time")?;
 
 Run the complete [text-completion example](cera/examples/explicit_loading.rs):
 `cargo run -p cera --example explicit_loading -- model.gguf "Once upon a time"`.
-The API refactor also has [runnable Rust and Swift/Kotlin examples](docs/internals/API_RESHAPE_EXAMPLES.md),
-including session continuation and vision/draft loading. The new Rust, native and CPU WASM
+For multi-turn chat, run the [conversational chat example](cera/examples/chat.rs):
+`cargo run -p cera --example chat -- model.gguf`.
+The API refactor also provides [runnable multi-language examples](docs/internals/API_RESHAPE_EXAMPLES.md),
+including conversational chat ([Rust](cera/examples/chat.rs), [Swift](cera-ffi/examples/Chat.swift),
+[Kotlin](cera-ffi/examples/Chat.kt), [Python](cera-ffi/examples/chat.py), [Dart](cera_ffi/example/chat.dart)),
+session continuation, and vision/draft loading. The new Rust, native and CPU WASM
 loading APIs are in this checkout; released packages have not been updated.
 The [audio walkthrough](docs/internals/API_RESHAPE_AUDIO_EXAMPLE.md) demonstrates PCM input and output with locally generated test weights.
 The [remote companion examples](docs/internals/API_RESHAPE_REMOTE_EXAMPLES.md) run HF discovery, downloads, cache repair and retained vision/audio/draft execution against a local HTTP fixture.

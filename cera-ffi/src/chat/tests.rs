@@ -479,3 +479,37 @@ fn chat_session_double_into_session_fails() {
         other => panic!("expected Backend error on double move, got: {other:?}"),
     }
 }
+
+#[test]
+fn chat_session_phase_nonblocking_when_locked() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    // Acquire inner lock directly to simulate active decode or ingest
+    let guard = chat.inner.lock().unwrap();
+
+    // phase must not block and return Busy
+    let err = chat.phase().unwrap_err();
+    match err {
+        FfiError::Busy => {}
+        other => panic!("expected Busy error, got: {other:?}"),
+    }
+    drop(guard);
+
+    // After dropping the lock, phase returns Ok
+    assert_eq!(chat.phase().unwrap(), SessionPhase::Idle);
+}
+
+#[test]
+fn chat_session_cancel_after_into_session_does_not_cancel_reclaimed_session() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    let reclaimed = chat.into_session().expect("reclamation succeeds");
+
+    // Calling cancel on the moved chat session must be a no-op
+    chat.cancel();
+
+    // Reclaimed session's cancellation atomic must remain false
+    assert!(!reclaimed.cancel.load(std::sync::atomic::Ordering::Relaxed));
+}

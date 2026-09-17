@@ -545,3 +545,17 @@ fn default_backend_recovery_succeeds_via_fallback_reset() {
     assert!(active.is_usable());
     assert_eq!(active.position(), 0);
 }
+
+#[test]
+fn usable_session_reset_uses_checked_kv_reset_without_reallocating() {
+    let model = FaultModel::new();
+    let mut active = session(model.clone(), 16, 0);
+    active.append_tokens(&[0, 1]).unwrap();
+    assert_eq!(active.position(), 2);
+    let resets_before = model.resets.load(Ordering::Relaxed);
+    active.reset().expect("reset succeeds");
+    assert_eq!(active.position(), 0);
+    assert!(active.is_usable());
+    // Must have invoked try_reset_kv (in-place checked reset) rather than reallocating
+    assert_eq!(model.resets.load(Ordering::Relaxed), resets_before + 1);
+}
