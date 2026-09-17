@@ -9,9 +9,12 @@ extension ChatSessionStreaming on ChatSession {
   /// Cancelling the subscription signals wait-free cancellation to the underlying [ChatSession].
   Stream<String> stream(GenerateOpts opts) {
     late StreamController<String> controller;
+    var finished = false;
     controller = StreamController<String>(
       onCancel: () {
-        cancel();
+        if (!finished) {
+          cancel();
+        }
       },
       onListen: () {
         final sink = _ChatSessionStreamSink(
@@ -19,6 +22,7 @@ extension ChatSessionStreaming on ChatSession {
             if (!controller.isClosed) controller.add(text);
           },
           onDoneCallback: (reason) {
+            finished = true;
             if (!controller.isClosed) {
               if (reason is FinishReasonError) {
                 controller.addError(StateError(reason.message));
@@ -29,9 +33,11 @@ extension ChatSessionStreaming on ChatSession {
         );
         generateStreamingAsync(opts, sink).then(
           (_) {
+            finished = true;
             if (!controller.isClosed) controller.close();
           },
           onError: (Object err, StackTrace stack) {
+            finished = true;
             if (!controller.isClosed) {
               controller.addError(err, stack);
               controller.close();

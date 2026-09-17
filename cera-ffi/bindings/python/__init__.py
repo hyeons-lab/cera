@@ -63,16 +63,20 @@ def chat_stream(session: ChatSession, opts: GenerateOpts) -> Iterator[str]:
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
+    finished = False
     try:
         while True:
             item = q.get()
             if item is sentinel:
+                finished = True
                 break
             if isinstance(item, Exception):
+                finished = True
                 raise item
             yield item
     finally:
-        session.cancel()
+        if not finished:
+            session.cancel()
 
 
 def chat_stream_json(session: ChatSession, opts: GenerateOpts, schema_json: str) -> Iterator[str]:

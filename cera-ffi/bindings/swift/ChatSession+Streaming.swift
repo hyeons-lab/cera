@@ -51,7 +51,9 @@ extension ChatSession {
 
             let sink = StreamSink(continuation)
             continuation.onTermination = { @Sendable [weak self] _ in
-                self?.cancel()
+                if !sink.hasFinished {
+                    self?.cancel()
+                }
             }
 
             Task { [weak self] in

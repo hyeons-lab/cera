@@ -390,3 +390,53 @@ fn test_audio_pipeline_listening_for_speech_handles_speech_end_in_same_chunk() {
         "Pipeline must return to ListeningForSpeech after utterance completes"
     );
 }
+
+#[test]
+fn test_audio_pipeline_utterance_buffer_allocation_reused() {
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .build()
+        .expect("builder succeeds");
+
+    let chunk = vec![0.1f32; 1600];
+    pipeline.process_chunk(&chunk).expect("process chunk 1");
+    pipeline.flush().expect("flush 1");
+    let ptr1 = pipeline.last_utterance().as_ptr();
+    assert_eq!(pipeline.last_utterance().len(), 1600);
+
+    // Turn 2 uses the swapped buffer
+    pipeline.process_chunk(&chunk).expect("process chunk 2");
+    pipeline.flush().expect("flush 2");
+    let ptr2 = pipeline.last_utterance().as_ptr();
+    assert_eq!(pipeline.last_utterance().len(), 1600);
+
+    // Turn 3 returns to the original buffer, proving ping-pong without reallocation
+    pipeline.process_chunk(&chunk).expect("process chunk 3");
+    pipeline.flush().expect("flush 3");
+    let ptr3 = pipeline.last_utterance().as_ptr();
+    assert_eq!(pipeline.last_utterance().len(), 1600);
+    assert_eq!(ptr3, ptr1, "buffers must ping-pong without reallocation");
+    assert_ne!(ptr1, ptr2, "buffers must swap alternating instances");
+}
+
+#[test]
+fn test_audio_pipeline_take_last_utterance_reserves_capacity_on_next_turn() {
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .build()
+        .expect("builder succeeds");
+
+    let chunk = vec![0.1f32; 1600];
+    pipeline.process_chunk(&chunk).expect("process chunk 1");
+    pipeline.flush().expect("flush 1");
+
+    // Taking the utterance empties last_utterance and leaves it with 0 capacity
+    let taken = pipeline.take_last_utterance();
+    assert_eq!(taken.len(), 1600);
+    assert!(pipeline.last_utterance().is_empty());
+
+    // Subsequent turn must cleanly restore capacity without panic
+    pipeline.process_chunk(&chunk).expect("process chunk 2");
+    pipeline.flush().expect("flush 2");
+    assert_eq!(pipeline.last_utterance().len(), 1600);
+}

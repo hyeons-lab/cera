@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
  */
 fun ChatSession.stream(opts: GenerateOpts): Flow<String> =
     callbackFlow {
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
         val sink =
             object : ModalitySink {
                 override fun onThoughtChunk(text: String) {}
@@ -30,6 +31,7 @@ fun ChatSession.stream(opts: GenerateOpts): Flow<String> =
                 ) {}
 
                 override fun onDone(reason: FinishReason) {
+                    finished.set(true)
                     when (reason) {
                         is FinishReason.Error -> close(RuntimeException(reason.message))
                         else -> close()
@@ -42,12 +44,15 @@ fun ChatSession.stream(opts: GenerateOpts): Flow<String> =
                 try {
                     generateStreamingAsync(opts, sink)
                 } catch (e: Exception) {
+                    finished.set(true)
                     close(e)
                 }
             }
 
         awaitClose {
-            cancel()
+            if (!finished.get()) {
+                cancel()
+            }
             job.cancel()
         }
     }

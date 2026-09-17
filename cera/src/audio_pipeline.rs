@@ -328,7 +328,7 @@ impl AudioPipelineBuilder {
             state: initial_state,
             current_sample: 0,
             utterance_buffer: Vec::with_capacity(32_000),
-            last_utterance: Vec::new(),
+            last_utterance: Vec::with_capacity(32_000),
             current_utterance_start_sample: 0,
             pending_events: VecDeque::with_capacity(8),
             cancel,
@@ -804,7 +804,12 @@ impl AudioPipeline {
         events: &mut Vec<AudioPipelineEvent>,
         reset_vad: bool,
     ) -> Result<()> {
-        self.last_utterance = std::mem::take(&mut self.utterance_buffer);
+        std::mem::swap(&mut self.last_utterance, &mut self.utterance_buffer);
+        self.utterance_buffer.clear();
+        if self.utterance_buffer.capacity() < 32_000 {
+            self.utterance_buffer
+                .reserve(32_000 - self.utterance_buffer.capacity());
+        }
         let sample_count = self.last_utterance.len();
 
         if self.config.auto_transcribe

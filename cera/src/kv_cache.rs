@@ -1644,8 +1644,8 @@ impl InferenceState {
                         key_cache.clear();
                         value_cache.clear();
                     } else {
-                        tracing::error!(
-                            "invalid TQK1/TQV1 compressed blob in snapshot; skipping layer restore"
+                        panic!(
+                            "invalid TQK1/TQV1 compressed blob in snapshot: caller must validate with `validate_snapshot` before calling `restore`"
                         );
                     }
                 }
@@ -4358,5 +4358,28 @@ mod tests {
             err.contains("AttentionF16 snapshot cannot be restored into a non-f16 state"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid TQK1/TQV1 compressed blob in snapshot")]
+    fn restore_corrupt_compressed_blob_panics() {
+        let mut cfg = tiny_config(1, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 1];
+        cfg.kv_heads_per_layer = vec![2; 1];
+
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+
+        let invalid_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionCompressed {
+                keys: vec![0u8; 16],
+                values: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        state.restore(&invalid_snapshot);
     }
 }

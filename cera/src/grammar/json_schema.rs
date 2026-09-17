@@ -122,11 +122,39 @@ impl SchemaCompiler {
         // Handle allOf
         if let Some(Value::Array(subschemas)) = schema.get("allOf") {
             ensure!(!subschemas.is_empty(), "allOf array must not be empty");
+            // If allOf contains a single non-object scalar (or a $ref to one), compile directly
             if subschemas.len() == 1
                 && schema.get("properties").is_none()
                 && schema.get("required").is_none()
+                && subschemas[0].get("properties").is_none()
+                && subschemas[0].get("required").is_none()
             {
-                return self.compile_value(&subschemas[0]);
+                let mut target = &subschemas[0];
+                let mut depth = 0;
+                while let Some(r) = target.get("$ref").and_then(|v| v.as_str()) {
+                    depth += 1;
+                    if depth > 32 {
+                        break;
+                    }
+                    let def_name = r
+                        .strip_prefix("#/$defs/")
+                        .or_else(|| r.strip_prefix("#/definitions/"))
+                        .unwrap_or(r);
+                    if let Some(t) = self.defs.get(def_name) {
+                        target = t;
+                    } else {
+                        break;
+                    }
+                }
+                if target
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t != "object")
+                    && target.get("properties").is_none()
+                    && target.get("required").is_none()
+                {
+                    return self.compile_value(&subschemas[0]);
+                }
             }
             // Merge subschemas and any sibling root properties into a unified object definition
             let mut merged = serde_json::Map::new();
@@ -147,33 +175,45 @@ impl SchemaCompiler {
             }
 
             for sub in subschemas {
-                // If sub has $ref, resolve it
-                let resolved_sub = if let Some(r) = sub.get("$ref").and_then(|v| v.as_str()) {
+                // Resolve $ref chains recursively, accumulating sibling properties and required keys
+                let mut current = sub;
+                let mut depth = 0;
+                const MAX_REF_DEPTH: usize = 32;
+
+                loop {
+                    if let Some(obj) = current.as_object() {
+                        if let Some(Value::Object(p)) = obj.get("properties") {
+                            for (k, v) in p {
+                                merged_props.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if let Some(Value::Array(r)) = obj.get("required") {
+                            for item in r {
+                                if !merged_required.contains(item) {
+                                    merged_required.push(item.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    let Some(r) = current.get("$ref").and_then(|v| v.as_str()) else {
+                        break;
+                    };
+
+                    depth += 1;
+                    if depth > MAX_REF_DEPTH {
+                        bail!(
+                            "exceeded maximum $ref depth ({MAX_REF_DEPTH}) in allOf: possible circular reference"
+                        );
+                    }
                     let def_name = r
                         .strip_prefix("#/$defs/")
                         .or_else(|| r.strip_prefix("#/definitions/"))
                         .unwrap_or(r);
                     if let Some(target) = self.defs.get(def_name) {
-                        target.clone()
+                        current = target;
                     } else {
                         bail!("unresolved $ref in allOf: {r}");
-                    }
-                } else {
-                    sub.clone()
-                };
-
-                if let Some(obj) = resolved_sub.as_object() {
-                    if let Some(Value::Object(p)) = obj.get("properties") {
-                        for (k, v) in p {
-                            merged_props.insert(k.clone(), v.clone());
-                        }
-                    }
-                    if let Some(Value::Array(r)) = obj.get("required") {
-                        for item in r {
-                            if !merged_required.contains(item) {
-                                merged_required.push(item.clone());
-                            }
-                        }
                     }
                 }
             }
@@ -580,5 +620,92 @@ json-ws ::= [ \t\n\r]*
         Grammar::parse(&gbnf).expect("valid grammar");
         assert!(gbnf.contains(r#"\"base_field\""#));
         assert!(gbnf.contains(r#"\"sibling_field\""#));
+    }
+
+    #[test]
+    fn all_of_chained_refs() {
+        let schema = json!({
+            "$defs": {
+                "Leaf": {
+                    "type": "object",
+                    "properties": {
+                        "leaf_val": { "type": "boolean" }
+                    },
+                    "required": ["leaf_val"]
+                },
+                "Intermediate": {
+                    "$ref": "#/$defs/Leaf"
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/Intermediate" }
+            ]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+        assert!(gbnf.contains(r#"\"leaf_val\""#));
+    }
+
+    #[test]
+    fn all_of_sibling_properties_on_ref_element() {
+        let schema = json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": {
+                        "base_val": { "type": "string" }
+                    },
+                    "required": ["base_val"]
+                }
+            },
+            "allOf": [
+                {
+                    "$ref": "#/$defs/Base",
+                    "properties": {
+                        "extra_val": { "type": "number" }
+                    },
+                    "required": ["extra_val"]
+                }
+            ]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+        assert!(gbnf.contains(r#"\"base_val\""#));
+        assert!(gbnf.contains(r#"\"extra_val\""#));
+    }
+
+    #[test]
+    fn all_of_circular_ref_fails() {
+        let schema = json!({
+            "$defs": {
+                "LoopA": {
+                    "$ref": "#/$defs/LoopB"
+                },
+                "LoopB": {
+                    "$ref": "#/$defs/LoopA"
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/LoopA" }
+            ]
+        });
+        assert!(json_schema_to_gbnf(&schema).is_err());
+    }
+
+    #[test]
+    fn all_of_single_ref_to_scalar() {
+        let schema = json!({
+            "$defs": {
+                "MyString": {
+                    "type": "string"
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/MyString" }
+            ]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+        assert!(gbnf.contains("json-string"));
     }
 }
