@@ -644,7 +644,7 @@ class _ChatPageState extends State<ChatPage> {
                           borderRadius: BorderRadius.circular(6),
                         ),
                         child: Text(
-                          'v0.5.6',
+                          'v0.6.0',
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 10,

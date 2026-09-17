@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- **Transactional Chat & Audio Support**: Aligned with `cera_ffi` 0.6.0, adding support for `ChatSession` coordinator, unified streaming audio pipelines, and session checkpoint persistence.
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.6.0` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.5.6
 
 ### Added
