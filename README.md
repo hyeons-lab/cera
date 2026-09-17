@@ -18,7 +18,7 @@ or in the browser, from a single dependency-free core.
   bundle id; it can auto-download and cache models from Hugging Face.
 - **Multimodal.** Text, vision (image → text), and audio (in/out) models all
   load through the same session API.
-- **Wake word & speech recognition.** Native Keyword Spotting (KWS) and OpenAI Whisper ASR in pure Rust, linked through a single unified binary across mobile and desktop.
+- **Wake word & speech recognition.** Native Keyword Spotting (KWS), Silero VAD, OpenAI Whisper ASR, and the unified stateful `AudioPipeline` in pure Rust, linked through a single unified binary across mobile and desktop.
 - **Structured output.** Constrain generation to a GBNF grammar, or one flag
   for guaranteed-valid JSON.
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it

@@ -615,6 +615,13 @@ console.log(session.kvCompression);
 const text = await session.generate('The capital of France is', 32, (piece) => {
     outputEl.textContent += piece;  // stream into the DOM (browser-safe)
 });
+
+// Checkpoint VRAM state: asynchronously snapshot KV and conv buffers to binary bytes.
+const checkpointBytes = await session.checkpoint();
+
+// Restore session state: validate model fingerprint, layer layout, sequence length,
+// precision (f32 or compressed KV; f16 CPU checkpoints are rejected), and TurboQuant mode.
+await session.importCheckpoint(checkpointBytes);
 ```
 
 ## Building from source

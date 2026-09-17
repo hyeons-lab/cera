@@ -418,6 +418,11 @@ impl AudioPipeline {
         self.vad.is_some()
     }
 
+    /// Reference to the attached Voice Activity Detection session if configured.
+    pub fn vad(&self) -> Option<&SileroVad> {
+        self.vad.as_ref()
+    }
+
     /// Whether a Whisper speech recognition model and tokenizer are attached.
     pub fn has_whisper(&self) -> bool {
         self.whisper.is_some() && self.whisper_tokenizer.is_some()
@@ -597,7 +602,7 @@ impl AudioPipeline {
                             end_ms: end_m,
                         });
 
-                        self.finish_utterance(&mut events)?;
+                        self.finish_utterance(&mut events, true)?;
                     }
                 }
             }
@@ -640,14 +645,22 @@ impl AudioPipeline {
                     }
 
                     if speech_ended || duration_exceeded {
-                        let (start_sample, end_sample, start_ms, end_ms) = end_payload
-                            .unwrap_or_else(|| {
+                        let (start_sample, end_sample, start_ms, end_ms) = match end_payload {
+                            Some((start_s, end_s, _, end_m)) => {
+                                let clamped_start =
+                                    start_s.max(self.current_utterance_start_sample);
+                                let clamped_start_m =
+                                    (clamped_start as f64 * 1000.0 / 16000.0) as f32;
+                                (clamped_start, end_s, clamped_start_m, end_m)
+                            }
+                            None => {
                                 let end_s = self.current_sample;
                                 let start_s = self.current_utterance_start_sample;
                                 let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
                                 let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
                                 (start_s, end_s, start_m, end_m)
-                            });
+                            }
+                        };
 
                         events.push(AudioPipelineEvent::SpeechEnd {
                             start_sample,
@@ -656,7 +669,8 @@ impl AudioPipeline {
                             end_ms,
                         });
 
-                        self.finish_utterance(&mut events)?;
+                        let reset_vad = speech_ended;
+                        self.finish_utterance(&mut events, reset_vad)?;
                     }
                 } else {
                     self.current_sample = self.current_sample.saturating_add(chunk_len);
@@ -673,7 +687,7 @@ impl AudioPipeline {
                             end_ms: end_m,
                         });
 
-                        self.finish_utterance(&mut events)?;
+                        self.finish_utterance(&mut events, true)?;
                     }
                 }
             }
@@ -727,7 +741,7 @@ impl AudioPipeline {
                 end_ms,
             });
 
-            self.finish_utterance(&mut events)?;
+            self.finish_utterance(&mut events, true)?;
         }
 
         for ev in &events {
@@ -738,8 +752,12 @@ impl AudioPipeline {
     }
 
     /// Internal helper: finalize an utterance buffer, perform optional Whisper transcription,
-    /// and transition back to listening.
-    fn finish_utterance(&mut self, events: &mut Vec<AudioPipelineEvent>) -> Result<()> {
+    /// and transition back to listening or continue active speech.
+    fn finish_utterance(
+        &mut self,
+        events: &mut Vec<AudioPipelineEvent>,
+        reset_vad: bool,
+    ) -> Result<()> {
         self.last_utterance = std::mem::take(&mut self.utterance_buffer);
         let sample_count = self.last_utterance.len();
 
@@ -775,18 +793,31 @@ impl AudioPipeline {
             }
         }
 
-        // Return to listening state
-        self.state = if self.config.require_hotword && self.hotword.is_some() {
-            AudioPipelineState::ListeningForHotword
-        } else {
-            AudioPipelineState::ListeningForSpeech
-        };
+        if reset_vad {
+            // Return to listening state
+            self.state = if self.config.require_hotword && self.hotword.is_some() {
+                AudioPipelineState::ListeningForHotword
+            } else {
+                AudioPipelineState::ListeningForSpeech
+            };
 
-        if let Some(vad) = &mut self.vad {
-            vad.reset();
-        }
-        if let Some(vad_iter) = &mut self.vad_iter {
-            vad_iter.reset();
+            if let Some(vad) = &mut self.vad {
+                vad.reset();
+            }
+            if let Some(vad_iter) = &mut self.vad_iter {
+                vad_iter.reset();
+            }
+        } else {
+            // Speech is still active across max utterance duration cutoff:
+            // cycle the utterance buffer while preserving the VAD model's internal
+            // hidden states and trigger state so continuations do not lose leading phonemes.
+            self.state = AudioPipelineState::SpeechActive;
+            self.current_utterance_start_sample = self.current_sample;
+            let ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
+            events.push(AudioPipelineEvent::SpeechStart {
+                sample: self.current_sample,
+                ms,
+            });
         }
 
         Ok(())

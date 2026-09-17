@@ -134,6 +134,105 @@ fn test_audio_pipeline_max_utterance_boundary() {
 }
 
 #[test]
+fn test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation() {
+    let candidates = [
+        std::path::PathBuf::from("../../models/silero_vad.gguf"),
+        std::path::PathBuf::from("models/silero_vad.gguf"),
+        std::path::PathBuf::from("../models/silero_vad.gguf"),
+    ];
+    let Some(vad_path) = candidates.into_iter().find(|p| p.exists()) else {
+        eprintln!(
+            "Skipping test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation: models/silero_vad.gguf not found"
+        );
+        return;
+    };
+
+    let config = AudioPipelineConfig {
+        max_utterance_ms: 1000,
+        auto_transcribe: false,
+        ..Default::default()
+    };
+
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_config(config)
+        .with_vad_from_file(vad_path)
+        .expect("load vad")
+        .build()
+        .expect("builder succeeds");
+
+    // Feed non-zero audio to warm up VAD hidden states
+    // 512 samples per frame (standard 16kHz window)
+    let speech_frame = vec![0.3f32; 512];
+    let mut triggered = false;
+    for _ in 0..40 {
+        let events = pipeline
+            .process_chunk(&speech_frame)
+            .expect("process chunk");
+        for ev in &events {
+            if matches!(ev, AudioPipelineEvent::SpeechStart { .. }) {
+                triggered = true;
+            }
+        }
+    }
+    assert!(triggered, "VAD should have triggered SpeechStart");
+    assert!(pipeline.is_speech_active());
+
+    let (h_before, c_before) = pipeline.vad().unwrap().hidden_states();
+    assert!(
+        h_before.iter().any(|&v| v != 0.0),
+        "VAD hidden state h should be non-zero during active speech"
+    );
+    assert!(
+        c_before.iter().any(|&v| v != 0.0),
+        "VAD cell state c should be non-zero during active speech"
+    );
+
+    // Continue feeding speech until max utterance (16,000 samples = 1s) is exceeded
+    let mut hit_speech_end = false;
+    let mut hit_new_speech_start = false;
+    for _ in 0..40 {
+        let events = pipeline
+            .process_chunk(&speech_frame)
+            .expect("process chunk");
+        for ev in &events {
+            match ev {
+                AudioPipelineEvent::SpeechEnd { .. } => hit_speech_end = true,
+                AudioPipelineEvent::SpeechStart { .. } => hit_new_speech_start = true,
+                _ => {}
+            }
+        }
+        if hit_speech_end {
+            break;
+        }
+    }
+
+    assert!(
+        hit_speech_end,
+        "Duration cutoff should have emitted SpeechEnd"
+    );
+    assert!(
+        hit_new_speech_start,
+        "Continuation should have emitted new SpeechStart"
+    );
+    assert!(
+        pipeline.is_speech_active(),
+        "Pipeline should remain in SpeechActive"
+    );
+    assert_eq!(pipeline.state(), AudioPipelineState::SpeechActive);
+
+    // Verify VAD hidden states were preserved and not reset to 0
+    let (h_after, c_after) = pipeline.vad().unwrap().hidden_states();
+    assert!(
+        h_after.iter().any(|&v| v != 0.0),
+        "VAD hidden state h must not be wiped to zero on max duration cutoff"
+    );
+    assert!(
+        c_after.iter().any(|&v| v != 0.0),
+        "VAD cell state c must not be wiped to zero on max duration cutoff"
+    );
+}
+
+#[test]
 fn test_audio_pipeline_sanitizes_nan_audio() {
     let mut pipeline = AudioPipelineBuilder::new()
         .with_auto_transcribe(false)

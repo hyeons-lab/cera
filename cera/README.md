@@ -32,6 +32,7 @@ cera = "0.5"
 - **Multimodal Vision ViT Optimization**: High-resolution image encoding improvements and async WebGPU readbacks.
 - **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection in Rust. Includes a parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model containers, reusable forward scratch buffers (`HotwordDetector`), 30.0x AGC peak normalization, and the Silero VAD gating state machine (`HotwordIterator`). Process chunks serially on a background audio worker; event creation and stream buffer growth can allocate.
 - **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
+- **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and thread-safe cancellation across FFI boundaries.
 
 - **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
 

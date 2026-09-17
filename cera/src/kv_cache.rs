@@ -1334,6 +1334,11 @@ impl InferenceState {
                                 "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
                             ));
                         }
+                        if compressed_keys.is_some() {
+                            return Err(format!(
+                                "layer {idx}: uncompressed Attention snapshot cannot be restored into a compressed state"
+                            ));
+                        }
                         if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
                             return Err(format!(
                                 "layer {idx}: Attention byte lengths are not multiples of 4"
@@ -1438,6 +1443,11 @@ impl InferenceState {
                             if kv_f16 {
                                 return Err(format!(
                                     "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
+                                ));
+                            }
+                            if compressed_keys.is_some() {
+                                return Err(format!(
+                                    "layer {idx}: uncompressed Attention snapshot cannot be restored into a compressed state"
                                 ));
                             }
                             if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
@@ -4302,5 +4312,51 @@ mod tests {
 
         let err = state.validate_snapshot(&invalid_snapshot).unwrap_err();
         assert!(err.contains("invalid TQK1 compressed keys blob in snapshot"));
+    }
+
+    #[test]
+    fn validate_snapshot_rejects_uncompressed_attention_into_compressed_state() {
+        let cfg = tiny_config(1, 16);
+        let state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+        assert!(state.is_compressed());
+
+        let uncompressed_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::Attention {
+                k_data: vec![0u8; 16],
+                v_data: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&uncompressed_snapshot).unwrap_err();
+        assert!(
+            err.contains(
+                "uncompressed Attention snapshot cannot be restored into a compressed state"
+            ),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_snapshot_rejects_f16_attention_into_f32_state() {
+        let cfg = tiny_config(1, 16);
+        let state = InferenceState::from_config(&cfg).unwrap();
+        assert!(!state.kv_f16);
+
+        let f16_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionF16 {
+                k_data: vec![0u8; 8],
+                v_data: vec![0u8; 8],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&f16_snapshot).unwrap_err();
+        assert!(
+            err.contains("AttentionF16 snapshot cannot be restored into a non-f16 state"),
+            "unexpected error message: {err}"
+        );
     }
 }

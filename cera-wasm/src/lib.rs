@@ -2498,9 +2498,72 @@ impl ChatSession {
 // so the whole prefill + decode loop is `async` and reads logits back via
 // `GpuContext::download_*_async`. Prototype scope: LFM2 only, greedy decode.
 // See devlog 000169.
+/// Validate that a session checkpoint is compatible with a WebGPU session before restoring.
+///
+/// Ensures fingerprint, sequence length bounds, layer counts, precision (f16 CPU checkpoints
+/// are rejected because WebGPU uses f32 or compressed KV), and TurboQuant compression modes match.
+#[cfg(any(feature = "wgpu", test))]
+pub(crate) fn validate_webgpu_checkpoint(
+    cp: &cera::session::SessionCheckpoint,
+    config: &cera::model::ModelConfig,
+    state: &cera::kv_cache::InferenceState,
+    model_is_compressed: bool,
+) -> Result<(), wasm_bindgen::JsError> {
+    use wasm_bindgen::JsError;
+
+    let current_fp = cera::kv_cache::model_fingerprint(config, "");
+    if cp.model_fingerprint != current_fp {
+        return Err(JsError::new(&format!(
+            "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
+            cp.model_fingerprint
+        )));
+    }
+    let max_seq_len = config.max_seq_len;
+    if cp.position > max_seq_len {
+        return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+            max_seq_len: max_seq_len as u32,
+            by: (cp.position - max_seq_len) as u32,
+        }));
+    }
+    if cp.position != cp.kv_state.seq_len {
+        return Err(JsError::new(&format!(
+            "checkpoint position {} does not match KV state sequence length {}",
+            cp.position, cp.kv_state.seq_len
+        )));
+    }
+    if cp.kv_state.layers.len() != state.layers.len() {
+        return Err(JsError::new(&format!(
+            "checkpoint layer count {} does not match session layer count {}",
+            cp.kv_state.layers.len(),
+            state.layers.len()
+        )));
+    }
+    // WebGPU strictly uses f32 or compressed KV, never f16.
+    if cp.kv_state.is_f16() {
+        return Err(JsError::new(
+            "checkpoint KV precision (f16) does not match WebGpuSession (wgpu uses f32 or compressed KV)",
+        ));
+    }
+    // Ensure TurboQuant compression mode matches the active engine configuration.
+    if cp.kv_state.is_compressed() != model_is_compressed {
+        return Err(JsError::new(
+            "checkpoint compression mode (TurboQuant vs uncompressed) does not match WebGpuSession",
+        ));
+    }
+
+    state
+        .validate_snapshot(&cp.kv_state)
+        .map_err(|e| JsError::new(&e))?;
+
+    Ok(())
+}
+
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err};
+    use super::{
+        Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err,
+        validate_webgpu_checkpoint,
+    };
     use cera::model::Model;
     use cera::time::Instant;
     use std::sync::Arc;
@@ -4450,42 +4513,12 @@ mod webgpu {
         pub fn import_checkpoint(&mut self, data: &[u8]) -> Result<(), JsError> {
             let cp =
                 cera::session::SessionCheckpoint::from_bytes(data).map_err(crate::map_cera_err)?;
-            let current_fp = cera::kv_cache::model_fingerprint(self.model.config(), "");
-            if cp.model_fingerprint != current_fp {
-                return Err(JsError::new(&format!(
-                    "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
-                    cp.model_fingerprint
-                )));
-            }
-            let max_seq_len = self.model.config().max_seq_len;
-            if cp.position > max_seq_len {
-                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
-                    max_seq_len: max_seq_len as u32,
-                    by: (cp.position - max_seq_len) as u32,
-                }));
-            }
-            if cp.position != cp.kv_state.seq_len {
-                return Err(JsError::new(&format!(
-                    "checkpoint position {} does not match KV state sequence length {}",
-                    cp.position, cp.kv_state.seq_len
-                )));
-            }
-            if cp.kv_state.layers.len() != self.state.layers.len() {
-                return Err(JsError::new(&format!(
-                    "checkpoint layer count {} does not match session layer count {}",
-                    cp.kv_state.layers.len(),
-                    self.state.layers.len()
-                )));
-            }
-            if cp.kv_state.is_f16() != self.state.kv_f16 {
-                return Err(JsError::new(
-                    "checkpoint KV precision (f16 vs f32) does not match session",
-                ));
-            }
-
-            self.state
-                .validate_snapshot(&cp.kv_state)
-                .map_err(|e| JsError::new(&e))?;
+            validate_webgpu_checkpoint(
+                &cp,
+                self.model.config(),
+                &self.state,
+                self.model.is_compressed(),
+            )?;
 
             self.state.restore(&cp.kv_state);
             self.model.restore_session_state(&cp.kv_state);
@@ -4751,5 +4784,63 @@ mod tests {
             let err = session2.restore(&data);
             assert!(err.is_err(), "mismatched fingerprint must be rejected");
         }
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn webgpu_checkpoint_rejects_f16_and_compression_mismatch() {
+        let test_model = TestModel::new(7);
+        let config = test_model.config().clone();
+        let state = InferenceState::from_config(&config).expect("inference state");
+
+        // 1. Checkpoint with f16 layer must be rejected gracefully
+        let f16_snapshot = cera::kv_cache::StateSnapshot {
+            seq_len: 4,
+            layers: vec![cera::kv_cache::LayerSnapshot::AttentionF16 {
+                k_data: vec![0u8; 8],
+                v_data: vec![0u8; 8],
+            }],
+        };
+        let f16_checkpoint = cera::session::SessionCheckpoint {
+            model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
+            position: 4,
+            terminal_committed: false,
+            kv_state: f16_snapshot,
+            generator_state: None,
+        };
+
+        let res_f16 = validate_webgpu_checkpoint(&f16_checkpoint, &config, &state, false);
+        assert!(res_f16.is_err());
+        let err_msg = format!("{}", res_f16.unwrap_err());
+        assert!(
+            err_msg.contains("f16"),
+            "Error must mention f16 precision mismatch, got: {err_msg}"
+        );
+
+        // 2. Checkpoint with compression mode mismatch must be rejected gracefully
+        let f32_snapshot = cera::kv_cache::StateSnapshot {
+            seq_len: 4,
+            layers: vec![cera::kv_cache::LayerSnapshot::Attention {
+                k_data: vec![0u8; 16],
+                v_data: vec![0u8; 16],
+            }],
+        };
+        let f32_checkpoint = cera::session::SessionCheckpoint {
+            model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
+            position: 4,
+            terminal_committed: false,
+            kv_state: f32_snapshot,
+            generator_state: None,
+        };
+
+        // When model is configured with TurboQuant compression (model_is_compressed = true)
+        // but checkpoint is uncompressed, validation must reject it
+        let res_comp = validate_webgpu_checkpoint(&f32_checkpoint, &config, &state, true);
+        assert!(res_comp.is_err());
+        let comp_err_msg = format!("{}", res_comp.unwrap_err());
+        assert!(
+            comp_err_msg.contains("compression mode"),
+            "Error must mention compression mode mismatch, got: {comp_err_msg}"
+        );
     }
 }

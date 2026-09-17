@@ -7097,6 +7097,12 @@ impl GpuLfm2Model {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.restore_state_locked(snapshot);
     }
+
+    /// Returns true if this GPU model is configured with TurboQuant KV cache compression.
+    #[inline]
+    pub fn is_compressed(&self) -> bool {
+        self.tq_cache().is_some()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
