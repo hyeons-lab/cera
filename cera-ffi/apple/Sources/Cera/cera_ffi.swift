@@ -7289,6 +7289,18 @@ public struct Message: Equatable, Hashable {
      * Message text content.
      */
     public var content: String
+    /**
+     * Optional image payload bytes.
+     */
+    public var imageBytes: Data?
+    /**
+     * Optional audio PCM waveform samples.
+     */
+    public var audioPcm: [Float]?
+    /**
+     * Audio sample rate in Hz (e.g. 16000).
+     */
+    public var audioSampleRate: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7298,9 +7310,21 @@ public struct Message: Equatable, Hashable {
          */role: Role, 
         /**
          * Message text content.
-         */content: String) {
+         */content: String, 
+        /**
+         * Optional image payload bytes.
+         */imageBytes: Data? = nil, 
+        /**
+         * Optional audio PCM waveform samples.
+         */audioPcm: [Float]? = nil, 
+        /**
+         * Audio sample rate in Hz (e.g. 16000).
+         */audioSampleRate: UInt32? = nil) {
         self.role = role
         self.content = content
+        self.imageBytes = imageBytes
+        self.audioPcm = audioPcm
+        self.audioSampleRate = audioSampleRate
     }
 
     
@@ -7320,13 +7344,19 @@ public struct FfiConverterTypeMessage: FfiConverterRustBuffer {
         return
             try Message(
                 role: FfiConverterTypeRole.read(from: &buf), 
-                content: FfiConverterString.read(from: &buf)
+                content: FfiConverterString.read(from: &buf), 
+                imageBytes: FfiConverterOptionData.read(from: &buf), 
+                audioPcm: FfiConverterOptionSequenceFloat.read(from: &buf), 
+                audioSampleRate: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: Message, into buf: inout [UInt8]) {
         FfiConverterTypeRole.write(value.role, into: &buf)
         FfiConverterString.write(value.content, into: &buf)
+        FfiConverterOptionData.write(value.imageBytes, into: &buf)
+        FfiConverterOptionSequenceFloat.write(value.audioPcm, into: &buf)
+        FfiConverterOptionUInt32.write(value.audioSampleRate, into: &buf)
     }
 }
 
@@ -10661,6 +10691,30 @@ fileprivate struct FfiConverterOptionTypeToolFormat: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceFloat: FfiConverterRustBuffer {
+    typealias SwiftType = [Float]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceFloat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceFloat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -11190,6 +11244,29 @@ public func chatMessageUser(content: String) -> Message  {
 })
 }
 /**
+ * Convenience factory for a user audio message.
+ */
+public func chatMessageUserAudio(audioPcm: [Float], sampleRate: UInt32, text: String?) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user_audio(
+        FfiConverterSequenceFloat.lower(audioPcm),
+        FfiConverterUInt32.lower(sampleRate),
+        FfiConverterOptionString.lower(text),$0
+    )
+})
+}
+/**
+ * Convenience factory for a user image message.
+ */
+public func chatMessageUserImage(imageBytes: Data, text: String?) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user_image(
+        FfiConverterData.lower(imageBytes),
+        FfiConverterOptionString.lower(text),$0
+    )
+})
+}
+/**
  * Compile a JSON Schema definition string into a GBNF grammar string.
  */
 public func jsonSchemaToGrammar(schemaJson: String)throws  -> String  {
@@ -11255,6 +11332,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {

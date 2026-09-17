@@ -1555,3 +1555,292 @@ fn chat_tool_validation_rules() {
         other => panic!("expected validation error, got {other:?}"),
     }
 }
+
+#[derive(Debug, Default)]
+struct MockMultimodalExecution {
+    tokens: Vec<u32>,
+    images: Vec<Vec<u8>>,
+    audio: Vec<(Vec<f32>, u32)>,
+    image_capable: bool,
+    audio_capable: bool,
+}
+
+impl Execution for MockMultimodalExecution {
+    fn position(&self) -> usize {
+        self.tokens.len()
+    }
+    fn capacity(&self) -> usize {
+        4096
+    }
+    fn audio_output(&self) -> bool {
+        false
+    }
+    fn image_input(&self) -> bool {
+        self.image_capable
+    }
+    fn audio_input(&self) -> bool {
+        self.audio_capable
+    }
+    fn validate_decode(&self, _: &GenerateOpts) -> Result<(), ValidationError> {
+        Ok(())
+    }
+    fn append(&mut self, tokens: &[u32]) -> Result<(), IngestError> {
+        self.tokens.extend_from_slice(tokens);
+        Ok(())
+    }
+    fn append_segments(&mut self, segments: &[IngestSegment<'_>]) -> Result<(), IngestError> {
+        for seg in segments {
+            match *seg {
+                IngestSegment::Tokens(toks) => self.tokens.extend_from_slice(toks),
+                IngestSegment::Image(bytes) => {
+                    self.images.push(bytes.to_vec());
+                    self.tokens.push(9999);
+                }
+                IngestSegment::Audio { pcm, sample_rate } => {
+                    self.audio.push((pcm.to_vec(), sample_rate));
+                    self.tokens.push(8888);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn reset(&mut self, _explicit: bool) -> Result<(), CeraError> {
+        self.tokens.clear();
+        self.images.clear();
+        self.audio.clear();
+        Ok(())
+    }
+    fn decode(&mut self, _: &GenerateOpts, _: &mut dyn ModalitySink) -> DecodeReport {
+        DecodeReport {
+            result: Ok(GenerateSummary {
+                tokens_generated: 1,
+                prompt_eval_tokens: 0,
+                prompt_eval_ms: 0,
+                decode_ms: 0,
+                finish_reason: FinishReason::Stop,
+            }),
+            state: DecodeState::Terminal {
+                token: 7,
+                committed: true,
+            },
+        }
+    }
+}
+
+#[test]
+fn chat_multimodal_image_rejected_on_text_only_session() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    let err = chat.ingest(&Message::image(vec![1, 2, 3, 4])).unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(
+                val,
+                ValidationError::UnsupportedContent {
+                    message: 0,
+                    part: 0,
+                }
+            );
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+}
+
+#[test]
+fn chat_multimodal_audio_rejected_on_text_only_session() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    let err = chat
+        .ingest(&Message::audio(vec![0.1, 0.2, 0.3], 16000))
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(
+                val,
+                ValidationError::UnsupportedContent {
+                    message: 0,
+                    part: 0,
+                }
+            );
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+    assert_eq!(chat.phase(), SessionPhase::Idle);
+}
+
+#[test]
+fn chat_multimodal_convenience_constructors_and_profile_accessors() {
+    let text_part = ContentPart::text("hello");
+    assert_eq!(text_part, ContentPart::Text("hello".into()));
+    let img_part = ContentPart::image(vec![1, 2, 3]);
+    assert_eq!(img_part, ContentPart::Image(vec![1, 2, 3]));
+    let aud_part = ContentPart::audio(vec![0.5], 16000);
+    assert_eq!(
+        aud_part,
+        ContentPart::Audio {
+            pcm: vec![0.5],
+            sample_rate: 16000,
+        }
+    );
+
+    let img_msg = Message::image(vec![10, 20]);
+    assert_eq!(img_msg.role, Role::User);
+    assert_eq!(img_msg.content, vec![ContentPart::Image(vec![10, 20])]);
+
+    let user_img = Message::user_with_image("look", vec![30, 40]);
+    assert_eq!(user_img.role, Role::User);
+    assert_eq!(
+        user_img.content,
+        vec![
+            ContentPart::Image(vec![30, 40]),
+            ContentPart::Text("look".into()),
+        ]
+    );
+
+    let aud_msg = Message::audio(vec![0.25], 16000);
+    assert_eq!(aud_msg.role, Role::User);
+
+    let user_aud = Message::user_with_audio("listen", vec![0.75], 16000);
+    assert_eq!(user_aud.role, Role::User);
+
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    assert!(profile.image_marker().is_some());
+    assert!(profile.image_start().is_some());
+    assert!(profile.image_end().is_some());
+    assert!(profile.audio_marker().is_some());
+}
+
+#[test]
+fn chat_multimodal_image_ingestion_with_image_capable_execution() {
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let exec = MockMultimodalExecution {
+        image_capable: true,
+        ..Default::default()
+    };
+    let mut chat = Chat::new(exec, profile, 0).ok().unwrap();
+
+    let image_payload = vec![1, 2, 3, 4, 5];
+    let summary = chat
+        .ingest(&Message::user_with_image(
+            "Describe this image",
+            image_payload.clone(),
+        ))
+        .unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let inner = chat.into_inner();
+    assert_eq!(inner.images.len(), 1);
+    assert_eq!(inner.images[0], image_payload);
+    assert!(inner.tokens.contains(&2));
+    assert!(inner.tokens.contains(&3));
+    assert!(inner.tokens.contains(&9999));
+}
+
+#[test]
+fn chat_multimodal_audio_ingestion_with_audio_capable_execution() {
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let exec = MockMultimodalExecution {
+        audio_capable: true,
+        ..Default::default()
+    };
+    let mut chat = Chat::new(exec, profile, 0).ok().unwrap();
+
+    let pcm = vec![0.1, 0.2, 0.3, 0.4];
+    let summary = chat
+        .ingest(&Message::user_with_audio(
+            "Transcribe speech",
+            pcm.clone(),
+            16000,
+        ))
+        .unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let inner = chat.into_inner();
+    assert_eq!(inner.audio.len(), 1);
+    assert_eq!(inner.audio[0], (pcm, 16000));
+    assert!(inner.tokens.contains(&8888));
+}
+
+#[test]
+fn chat_multimodal_validation_rules() {
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let exec = MockMultimodalExecution {
+        image_capable: true,
+        audio_capable: true,
+        ..Default::default()
+    };
+    let mut chat = Chat::new(exec, profile, 0).ok().unwrap();
+
+    // Image in System role is rejected:
+    let err = chat
+        .replace_messages(&[Message::with_parts(
+            Role::System,
+            vec![ContentPart::Image(vec![1, 2])],
+        )])
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(
+                val,
+                ValidationError::UnsupportedContent {
+                    message: 0,
+                    part: 0,
+                }
+            );
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+
+    // Audio in Assistant role is rejected:
+    let err = chat
+        .replace_messages(&[
+            Message::user("hi"),
+            Message::with_parts(
+                Role::Assistant,
+                vec![ContentPart::Audio {
+                    pcm: vec![0.1],
+                    sample_rate: 16000,
+                }],
+            ),
+        ])
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(
+                val,
+                ValidationError::UnsupportedContent {
+                    message: 1,
+                    part: 0,
+                }
+            );
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+
+    // Mixing image and audio in the same turn is rejected:
+    let err = chat
+        .replace_messages(&[Message::with_parts(
+            Role::User,
+            vec![
+                ContentPart::Image(vec![1, 2]),
+                ContentPart::Audio {
+                    pcm: vec![0.1],
+                    sample_rate: 16000,
+                },
+            ],
+        )])
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(
+                val,
+                ValidationError::UnsupportedContent {
+                    message: 0,
+                    part: 1,
+                }
+            );
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+}

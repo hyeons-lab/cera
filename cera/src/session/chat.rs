@@ -76,6 +76,26 @@ pub enum ContentPart {
     Audio { pcm: Vec<f32>, sample_rate: u32 },
 }
 
+impl ContentPart {
+    /// Convenience constructor for a text part.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    /// Convenience constructor for an image part.
+    pub fn image(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Image(bytes.into())
+    }
+
+    /// Convenience constructor for an audio PCM part.
+    pub fn audio(pcm: impl Into<Vec<f32>>, sample_rate: u32) -> Self {
+        Self::Audio {
+            pcm: pcm.into(),
+            sample_rate,
+        }
+    }
+}
+
 /// A structured conversational turn message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
@@ -117,6 +137,50 @@ impl Message {
     /// Create a single-part tool text message.
     pub fn tool(text: impl Into<String>) -> Self {
         Self::text(Role::Tool, text)
+    }
+
+    /// Create a single-part user message with an image payload.
+    pub fn image(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::with_parts(Role::User, vec![ContentPart::Image(bytes.into())])
+    }
+
+    /// Create a user message with an image payload and accompanying text prompt.
+    pub fn user_with_image(text: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self::with_parts(
+            Role::User,
+            vec![
+                ContentPart::Image(bytes.into()),
+                ContentPart::Text(text.into()),
+            ],
+        )
+    }
+
+    /// Create a single-part user message with audio PCM waveform samples.
+    pub fn audio(pcm: impl Into<Vec<f32>>, sample_rate: u32) -> Self {
+        Self::with_parts(
+            Role::User,
+            vec![ContentPart::Audio {
+                pcm: pcm.into(),
+                sample_rate,
+            }],
+        )
+    }
+
+    /// Create a user message with audio PCM samples and accompanying text prompt.
+    pub fn user_with_audio(
+        text: impl Into<String>,
+        pcm: impl Into<Vec<f32>>,
+        sample_rate: u32,
+    ) -> Self {
+        let text = text.into();
+        let mut parts = vec![ContentPart::Audio {
+            pcm: pcm.into(),
+            sample_rate,
+        }];
+        if !text.is_empty() {
+            parts.push(ContentPart::Text(format!("\n{text}")));
+        }
+        Self::with_parts(Role::User, parts)
     }
 }
 
@@ -267,6 +331,17 @@ pub struct DecodeReport {
     pub state: DecodeState,
 }
 
+/// A segment of prefill content to be ingested into the execution context.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IngestSegment<'a> {
+    /// Token IDs to be evaluated.
+    Tokens(&'a [u32]),
+    /// Image payload bytes.
+    Image(&'a [u8]),
+    /// Audio PCM samples and sample rate.
+    Audio { pcm: &'a [f32], sample_rate: u32 },
+}
+
 /// Execution backend contract for chat coordination.
 pub trait Execution: std::fmt::Debug {
     /// Current token position in the context.
@@ -275,6 +350,14 @@ pub trait Execution: std::fmt::Debug {
     fn capacity(&self) -> usize;
     /// Whether audio output decoding is active.
     fn audio_output(&self) -> bool;
+    /// Whether image input is supported.
+    fn image_input(&self) -> bool {
+        false
+    }
+    /// Whether audio input is supported.
+    fn audio_input(&self) -> bool {
+        false
+    }
     /// Pre-mutation validation before preparing context.
     fn validate_prepare(&self) -> Result<(), ValidationError> {
         Ok(())
@@ -283,6 +366,22 @@ pub trait Execution: std::fmt::Debug {
     fn validate_decode(&self, opts: &GenerateOpts) -> Result<(), ValidationError>;
     /// Append a batch of tokens atomically to context.
     fn append(&mut self, tokens: &[u32]) -> Result<(), IngestError>;
+    /// Append a sequence of multimodal segments (tokens, images, audio) atomically to context.
+    fn append_segments(&mut self, segments: &[IngestSegment<'_>]) -> Result<(), IngestError> {
+        for seg in segments {
+            match *seg {
+                IngestSegment::Tokens(tokens) => self.append(tokens)?,
+                IngestSegment::Image(_) | IngestSegment::Audio { .. } => {
+                    return Err(ValidationError::UnsupportedContent {
+                        message: 0,
+                        part: 0,
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
     /// Checked reset of execution state.
     fn reset(&mut self, explicit: bool) -> Result<(), CeraError>;
     /// Execute decode pass driving token generation into sink.
@@ -343,6 +442,10 @@ pub struct Profile {
     tokenizer: Arc<BpeTokenizer>,
     eos: u32,
     newline_tokens: Vec<u32>,
+    image_marker: Option<u32>,
+    image_start: Option<u32>,
+    image_end: Option<u32>,
+    audio_marker: Option<(u32, &'static str)>,
 }
 
 impl std::fmt::Debug for Profile {
@@ -350,6 +453,10 @@ impl std::fmt::Debug for Profile {
         f.debug_struct("Profile")
             .field("eos", &self.eos)
             .field("newline_tokens", &self.newline_tokens)
+            .field("image_marker", &self.image_marker)
+            .field("image_start", &self.image_start)
+            .field("image_end", &self.image_end)
+            .field("audio_marker", &self.audio_marker)
             .finish()
     }
 }
@@ -371,10 +478,27 @@ impl Profile {
             return Err(ValidationError::UnsupportedProfile);
         }
         let newline_tokens = tokenizer.encode("\n");
+        let image_marker = {
+            let probed = tokenizer.encode("<image>");
+            if probed.len() == 1 {
+                Some(probed[0])
+            } else {
+                None
+            }
+        };
+        let image_start = tokenizer.special_token_id("<|image_start|>");
+        let image_end = tokenizer.special_token_id("<|image_end|>");
+        let audio_marker = crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
+            .into_iter()
+            .find_map(|name| tokenizer.special_token_id(name).map(|id| (id, name)));
         Ok(Self {
             tokenizer,
             eos: 7,
             newline_tokens,
+            image_marker,
+            image_start,
+            image_end,
+            audio_marker,
         })
     }
 
@@ -386,6 +510,26 @@ impl Profile {
     /// Pre-encoded newline token sequence for turn boundaries.
     pub fn newline_tokens(&self) -> &[u32] {
         &self.newline_tokens
+    }
+
+    /// Token ID for `<image>` marker if supported by tokenizer.
+    pub fn image_marker(&self) -> Option<u32> {
+        self.image_marker
+    }
+
+    /// Token ID for `<|image_start|>` envelope if supported by tokenizer.
+    pub fn image_start(&self) -> Option<u32> {
+        self.image_start
+    }
+
+    /// Token ID for `<|image_end|>` envelope if supported by tokenizer.
+    pub fn image_end(&self) -> Option<u32> {
+        self.image_end
+    }
+
+    /// Audio marker special token ID and candidate name if supported.
+    pub fn audio_marker(&self) -> Option<(u32, &'static str)> {
+        self.audio_marker
     }
 
     /// Reference to the tokenizer used by this profile.
@@ -446,18 +590,49 @@ impl Profile {
                 _ => return Err(ValidationError::RoleOrder { message: index }),
             };
             let mut text = String::new();
+            let mut user_text = String::new();
             for (part, content) in message.content.iter().enumerate() {
                 match content {
-                    ContentPart::Text(value) => text.push_str(value),
-                    _ => {
-                        return Err(ValidationError::UnsupportedContent {
-                            message: index,
-                            part,
-                        });
+                    ContentPart::Text(value) => {
+                        user_text.push_str(value);
+                        text.push_str(value);
+                    }
+                    ContentPart::Image(_) => {
+                        if message.role != Role::User {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: index,
+                                part,
+                            });
+                        }
+                        if self.image_marker.is_none()
+                            || self.image_start.is_none()
+                            || self.image_end.is_none()
+                        {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: index,
+                                part,
+                            });
+                        }
+                        text.push_str("<image>");
+                    }
+                    ContentPart::Audio { .. } => {
+                        if message.role != Role::User {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: index,
+                                part,
+                            });
+                        }
+                        let Some((_, marker_name)) = self.audio_marker else {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: index,
+                                part,
+                            });
+                        };
+                        text.push_str(marker_name);
                     }
                 }
             }
-            if text.contains("<|") {
+            if user_text.contains("<|") {
                 return Err(ValidationError::ReservedMarker { message: index });
             }
             serialized.push(ChatMessage {
@@ -667,6 +842,52 @@ impl<E: Execution> Chat<E> {
         if self.execution.audio_output() {
             return Err(ValidationError::AudioOutput.into());
         }
+
+        // Scan messages for multimodal parts and check capabilities upfront:
+        let mut images: Vec<&[u8]> = Vec::new();
+        let mut audio: Option<(&[f32], u32)> = None;
+        for (m_idx, msg) in messages.iter().enumerate() {
+            for (p_idx, part) in msg.content.iter().enumerate() {
+                match part {
+                    ContentPart::Text(_) => {}
+                    ContentPart::Image(bytes) => {
+                        if !self.execution.image_input() {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: m_idx,
+                                part: p_idx,
+                            }
+                            .into());
+                        }
+                        if audio.is_some() {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: m_idx,
+                                part: p_idx,
+                            }
+                            .into());
+                        }
+                        images.push(bytes);
+                    }
+                    ContentPart::Audio { pcm, sample_rate } => {
+                        if !self.execution.audio_input() {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: m_idx,
+                                part: p_idx,
+                            }
+                            .into());
+                        }
+                        if audio.is_some() || !images.is_empty() {
+                            return Err(ValidationError::UnsupportedContent {
+                                message: m_idx,
+                                part: p_idx,
+                            }
+                            .into());
+                        }
+                        audio = Some((pcm, *sample_rate));
+                    }
+                }
+            }
+        }
+
         let before = self.position();
         let initial = replace || self.phase == SessionPhase::Idle;
         let rendered = self.profile.render(messages, initial, &self.tools)?;
@@ -680,6 +901,7 @@ impl<E: Execution> Chat<E> {
             tokens.extend_from_slice(&self.profile.newline_tokens);
         }
         tokens.extend(self.profile.tokenizer.encode(&rendered));
+
         let available = self
             .execution
             .capacity()
@@ -691,6 +913,83 @@ impl<E: Execution> Chat<E> {
             }
             .into());
         }
+
+        // Build prefill segments:
+        let img_start_arr;
+        let img_end_arr;
+        let mut template_segments_opt = None;
+        let mut audio_split_opt = None;
+
+        if !images.is_empty() {
+            let image_marker_id = self.profile.image_marker.ok_or_else(|| {
+                ValidationError::Template("missing image marker token in profile".into())
+            })?;
+            let img_start_id = self.profile.image_start.ok_or_else(|| {
+                ValidationError::Template("missing image start token in profile".into())
+            })?;
+            let img_end_id = self.profile.image_end.ok_or_else(|| {
+                ValidationError::Template("missing image end token in profile".into())
+            })?;
+            img_start_arr = [img_start_id];
+            img_end_arr = [img_end_id];
+
+            let segs = crate::session::splice_image_markers(&tokens, image_marker_id);
+            let marker_count = segs
+                .iter()
+                .filter(|s| matches!(s, crate::session::ChatTemplateSegment::Image))
+                .count();
+            if marker_count != images.len() {
+                return Err(ValidationError::Template(format!(
+                    "rendered template has {marker_count} image markers but {} images were supplied",
+                    images.len()
+                ))
+                .into());
+            }
+            template_segments_opt = Some(segs);
+        } else if audio.is_some() {
+            img_start_arr = [0];
+            img_end_arr = [0];
+            let (marker_id, marker_name) = self.profile.audio_marker.ok_or_else(|| {
+                ValidationError::Template("missing audio marker token in profile".into())
+            })?;
+            let split =
+                crate::engine::CeraEngine::split_tokens_at_marker(&tokens, marker_id, marker_name)
+                    .map_err(|e| ValidationError::Template(e.to_string()))?;
+            audio_split_opt = Some(split);
+        } else {
+            img_start_arr = [0];
+            img_end_arr = [0];
+        }
+
+        let mut segments = Vec::new();
+        if let Some(template_segments) = template_segments_opt {
+            let mut img_idx = 0;
+            for seg in &template_segments {
+                match *seg {
+                    crate::session::ChatTemplateSegment::Text { start, end } => {
+                        segments.push(IngestSegment::Tokens(&tokens[start..end]));
+                    }
+                    crate::session::ChatTemplateSegment::Image => {
+                        segments.push(IngestSegment::Tokens(&img_start_arr));
+                        segments.push(IngestSegment::Image(images[img_idx]));
+                        segments.push(IngestSegment::Tokens(&img_end_arr));
+                        img_idx += 1;
+                    }
+                }
+            }
+        } else if let Some(split) = audio_split_opt {
+            let (pcm, sample_rate) = audio.unwrap();
+            if split > 0 {
+                segments.push(IngestSegment::Tokens(&tokens[..split]));
+            }
+            segments.push(IngestSegment::Audio { pcm, sample_rate });
+            if split + 1 < tokens.len() {
+                segments.push(IngestSegment::Tokens(&tokens[split + 1..]));
+            }
+        } else {
+            segments.push(IngestSegment::Tokens(&tokens));
+        }
+
         // Enter Unusable phase before mutating execution state.
         // If an append fails or panics, the session remains safely marked Unusable
         // unless a recovery path restores consistency.
@@ -706,12 +1005,12 @@ impl<E: Execution> Chat<E> {
                 recovery_error: None,
             });
         }
-        match self.execution.append(&tokens) {
+        match self.execution.append_segments(&segments) {
             Ok(()) => {
                 self.phase = SessionPhase::PromptReady;
                 self.terminal_committed = None;
                 Ok(IngestSummary {
-                    input_tokens: tokens.len(),
+                    input_tokens: self.position().saturating_sub(before),
                     position_before: before,
                     position_after: self.position(),
                 })
@@ -1039,6 +1338,12 @@ impl Execution for CoreExecution {
     fn audio_output(&self) -> bool {
         self.session.capabilities.audio_out || self.session.audio_decoder.is_some()
     }
+    fn image_input(&self) -> bool {
+        self.session.capabilities.image_in
+    }
+    fn audio_input(&self) -> bool {
+        self.session.capabilities.audio_in
+    }
     fn validate_prepare(&self) -> Result<(), ValidationError> {
         self.validate_identity()?;
         if !self.session.is_usable() {
@@ -1050,9 +1355,29 @@ impl Execution for CoreExecution {
         self.validate_prepare()
     }
     fn append(&mut self, tokens: &[u32]) -> Result<(), IngestError> {
+        self.append_segments(&[IngestSegment::Tokens(tokens)])
+    }
+    fn append_segments(&mut self, segments: &[IngestSegment<'_>]) -> Result<(), IngestError> {
         self.session.last_ingest_recovery = None;
         self.session
-            .with_ingest_recovery(|session| session.append_tokens(tokens))
+            .with_ingest_recovery(|session| {
+                for seg in segments {
+                    match *seg {
+                        IngestSegment::Tokens(toks) => {
+                            if !toks.is_empty() {
+                                session.append_tokens(toks)?;
+                            }
+                        }
+                        IngestSegment::Image(bytes) => {
+                            session.append_image(bytes)?;
+                        }
+                        IngestSegment::Audio { pcm, sample_rate } => {
+                            session.append_audio(pcm, sample_rate)?;
+                        }
+                    }
+                }
+                Ok(())
+            })
             .map_err(|cause| {
                 let IngestRecovery {
                     outcome,

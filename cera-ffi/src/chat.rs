@@ -47,44 +47,85 @@ impl From<Role> for cera::session::chat::Role {
 }
 
 /// A structured conversational turn message.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Message {
     /// Author role.
     pub role: Role,
     /// Message text content.
     pub content: String,
+    /// Optional image payload bytes.
+    #[uniffi(default = None)]
+    pub image_bytes: Option<Vec<u8>>,
+    /// Optional audio PCM waveform samples.
+    #[uniffi(default = None)]
+    pub audio_pcm: Option<Vec<f32>>,
+    /// Audio sample rate in Hz (e.g. 16000).
+    #[uniffi(default = None)]
+    pub audio_sample_rate: Option<u32>,
 }
 
 impl From<Message> for cera::session::chat::Message {
     fn from(m: Message) -> Self {
-        cera::session::chat::Message::text(m.role.into(), m.content)
+        let mut parts = Vec::new();
+        if let Some(bytes) = m.image_bytes {
+            parts.push(cera::session::chat::ContentPart::Image(bytes));
+        }
+        if let Some(pcm) = m.audio_pcm {
+            let sample_rate = m.audio_sample_rate.unwrap_or(16000);
+            parts.push(cera::session::chat::ContentPart::Audio { pcm, sample_rate });
+        }
+        if !m.content.is_empty() || parts.is_empty() {
+            parts.push(cera::session::chat::ContentPart::Text(m.content));
+        }
+        cera::session::chat::Message::with_parts(m.role.into(), parts)
     }
 }
 
 impl From<&Message> for cera::session::chat::Message {
     fn from(m: &Message) -> Self {
-        cera::session::chat::Message::text(m.role.into(), m.content.clone())
+        let mut parts = Vec::new();
+        if let Some(bytes) = &m.image_bytes {
+            parts.push(cera::session::chat::ContentPart::Image(bytes.clone()));
+        }
+        if let Some(pcm) = &m.audio_pcm {
+            let sample_rate = m.audio_sample_rate.unwrap_or(16000);
+            parts.push(cera::session::chat::ContentPart::Audio {
+                pcm: pcm.clone(),
+                sample_rate,
+            });
+        }
+        if !m.content.is_empty() || parts.is_empty() {
+            parts.push(cera::session::chat::ContentPart::Text(m.content.clone()));
+        }
+        cera::session::chat::Message::with_parts(m.role.into(), parts)
     }
 }
 
-impl TryFrom<&cera::session::chat::Message> for Message {
-    type Error = FfiError;
-
-    fn try_from(msg: &cera::session::chat::Message) -> Result<Self, Self::Error> {
+impl From<&cera::session::chat::Message> for Message {
+    fn from(msg: &cera::session::chat::Message) -> Self {
         let mut text = String::new();
+        let mut image_bytes = None;
+        let mut audio_pcm = None;
+        let mut audio_sample_rate = None;
         for part in &msg.content {
             match part {
                 cera::session::chat::ContentPart::Text(s) => text.push_str(s),
-                cera::session::chat::ContentPart::Image(_)
-                | cera::session::chat::ContentPart::Audio { .. } => {
-                    return Err(FfiError::UnsupportedModality);
+                cera::session::chat::ContentPart::Image(bytes) => {
+                    image_bytes = Some(bytes.clone());
+                }
+                cera::session::chat::ContentPart::Audio { pcm, sample_rate } => {
+                    audio_pcm = Some(pcm.clone());
+                    audio_sample_rate = Some(*sample_rate);
                 }
             }
         }
-        Ok(Message {
+        Message {
             role: msg.role.into(),
             content: text,
-        })
+            image_bytes,
+            audio_pcm,
+            audio_sample_rate,
+        }
     }
 }
 
@@ -94,6 +135,9 @@ pub fn chat_message_user(content: String) -> Message {
     Message {
         role: Role::User,
         content,
+        image_bytes: None,
+        audio_pcm: None,
+        audio_sample_rate: None,
     }
 }
 
@@ -103,6 +147,9 @@ pub fn chat_message_system(content: String) -> Message {
     Message {
         role: Role::System,
         content,
+        image_bytes: None,
+        audio_pcm: None,
+        audio_sample_rate: None,
     }
 }
 
@@ -112,6 +159,9 @@ pub fn chat_message_assistant(content: String) -> Message {
     Message {
         role: Role::Assistant,
         content,
+        image_bytes: None,
+        audio_pcm: None,
+        audio_sample_rate: None,
     }
 }
 
@@ -121,6 +171,37 @@ pub fn chat_message_tool(content: String) -> Message {
     Message {
         role: Role::Tool,
         content,
+        image_bytes: None,
+        audio_pcm: None,
+        audio_sample_rate: None,
+    }
+}
+
+/// Convenience factory for a user image message.
+#[uniffi::export]
+pub fn chat_message_user_image(image_bytes: Vec<u8>, text: Option<String>) -> Message {
+    Message {
+        role: Role::User,
+        content: text.unwrap_or_default(),
+        image_bytes: Some(image_bytes),
+        audio_pcm: None,
+        audio_sample_rate: None,
+    }
+}
+
+/// Convenience factory for a user audio message.
+#[uniffi::export]
+pub fn chat_message_user_audio(
+    audio_pcm: Vec<f32>,
+    sample_rate: u32,
+    text: Option<String>,
+) -> Message {
+    Message {
+        role: Role::User,
+        content: text.unwrap_or_default(),
+        image_bytes: None,
+        audio_pcm: Some(audio_pcm),
+        audio_sample_rate: Some(sample_rate),
     }
 }
 

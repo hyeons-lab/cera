@@ -1211,6 +1211,16 @@ RustBuffer uniffi_cera_ffi_fn_func_chat_message_tool(RustBuffer content, RustCal
 RustBuffer uniffi_cera_ffi_fn_func_chat_message_user(RustBuffer content, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER_AUDIO
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER_AUDIO
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_user_audio(RustBuffer audio_pcm, uint32_t sample_rate, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_CHAT_MESSAGE_USER_IMAGE
+RustBuffer uniffi_cera_ffi_fn_func_chat_message_user_image(RustBuffer image_bytes, RustBuffer text, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_JSON_SCHEMA_TO_GRAMMAR
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_JSON_SCHEMA_TO_GRAMMAR
 RustBuffer uniffi_cera_ffi_fn_func_json_schema_to_grammar(RustBuffer schema_json, RustCallStatus *_Nonnull out_status
@@ -1557,6 +1567,18 @@ uint16_t uniffi_cera_ffi_checksum_func_chat_message_tool(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER
 uint16_t uniffi_cera_ffi_checksum_func_chat_message_user(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER_AUDIO
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER_AUDIO
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_user_audio(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_CHAT_MESSAGE_USER_IMAGE
+uint16_t uniffi_cera_ffi_checksum_func_chat_message_user_image(void
     
 );
 #endif

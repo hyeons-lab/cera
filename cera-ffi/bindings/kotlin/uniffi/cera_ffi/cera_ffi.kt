@@ -874,6 +874,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_chat_message_user(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user_audio(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user_image(): Int
+
     external fun uniffi_cera_ffi_checksum_func_json_schema_to_grammar(): Int
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
@@ -2140,6 +2144,19 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_chat_message_user_audio(
+        `audioPcm`: RustBuffer.ByValue,
+        `sampleRate`: Int,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_user_image(
+        `imageBytes`: RustBuffer.ByValue,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_func_json_schema_to_grammar(
         `schemaJson`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
@@ -2399,6 +2416,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
@@ -11962,6 +11985,18 @@ data class Message(
      * Message text content.
      */
     var `content`: kotlin.String,
+    /**
+     * Optional image payload bytes.
+     */
+    var `imageBytes`: kotlin.ByteArray? = null,
+    /**
+     * Optional audio PCM waveform samples.
+     */
+    var `audioPcm`: List<kotlin.Float>? = null,
+    /**
+     * Audio sample rate in Hz (e.g. 16000).
+     */
+    var `audioSampleRate`: kotlin.UInt? = null,
 ) {
     companion object
 }
@@ -11974,12 +12009,18 @@ public object FfiConverterTypeMessage : FfiConverterRustBuffer<Message> {
         Message(
             FfiConverterTypeRole.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalSequenceFloat.read(buf),
+            FfiConverterOptionalUInt.read(buf),
         )
 
     override fun allocationSize(value: Message) =
         (
             FfiConverterTypeRole.allocationSize(value.`role`) +
-                FfiConverterString.allocationSize(value.`content`)
+                FfiConverterString.allocationSize(value.`content`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`imageBytes`) +
+                FfiConverterOptionalSequenceFloat.allocationSize(value.`audioPcm`) +
+                FfiConverterOptionalUInt.allocationSize(value.`audioSampleRate`)
         )
 
     override fun write(
@@ -11988,6 +12029,9 @@ public object FfiConverterTypeMessage : FfiConverterRustBuffer<Message> {
     ) {
         FfiConverterTypeRole.write(value.`role`, buf)
         FfiConverterString.write(value.`content`, buf)
+        FfiConverterOptionalByteArray.write(value.`imageBytes`, buf)
+        FfiConverterOptionalSequenceFloat.write(value.`audioPcm`, buf)
+        FfiConverterOptionalUInt.write(value.`audioSampleRate`, buf)
     }
 }
 
@@ -15558,6 +15602,38 @@ public object FfiConverterOptionalTypeToolFormat : FfiConverterRustBuffer<ToolFo
 /**
  * @suppress
  */
+public object FfiConverterOptionalSequenceFloat : FfiConverterRustBuffer<List<kotlin.Float>?> {
+    override fun read(buf: ByteBuffer): List<kotlin.Float>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceFloat.read(buf)
+    }
+
+    override fun allocationSize(value: List<kotlin.Float>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceFloat.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: List<kotlin.Float>?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceFloat.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUInt : FfiConverterRustBuffer<List<kotlin.UInt>> {
     override fun read(buf: ByteBuffer): List<kotlin.UInt> {
         val len = buf.getInt()
@@ -16105,6 +16181,42 @@ fun `chatMessageUser`(`content`: kotlin.String): Message =
     FfiConverterTypeMessage.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a user audio message.
+ */
+fun `chatMessageUserAudio`(
+    `audioPcm`: List<kotlin.Float>,
+    `sampleRate`: kotlin.UInt,
+    `text`: kotlin.String?,
+): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_audio(
+                FfiConverterSequenceFloat.lower(`audioPcm`),
+                FfiConverterUInt.lower(`sampleRate`),
+                FfiConverterOptionalString.lower(`text`),
+                _status,
+            )
+        },
+    )
+
+/**
+ * Convenience factory for a user image message.
+ */
+fun `chatMessageUserImage`(
+    `imageBytes`: kotlin.ByteArray,
+    `text`: kotlin.String?,
+): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_image(
+                FfiConverterByteArray.lower(`imageBytes`),
+                FfiConverterOptionalString.lower(`text`),
+                _status,
+            )
         },
     )
 

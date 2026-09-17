@@ -1722,17 +1722,32 @@ class Message {
     required this.role,
     /// Message text content.
     required this.content,
+    /// Optional image payload bytes.
+    this.imageBytes = null,
+    /// Optional audio PCM waveform samples.
+    this.audioPcm = null,
+    /// Audio sample rate in Hz (e.g. 16000).
+    this.audioSampleRate = null,
   });
 
   /// Author role.
   final Role role;
   /// Message text content.
   final String content;
+  /// Optional image payload bytes.
+  final Uint8List? imageBytes;
+  /// Optional audio PCM waveform samples.
+  final List<double>? audioPcm;
+  /// Audio sample rate in Hz (e.g. 16000).
+  final int? audioSampleRate;
 
   Map<String, dynamic> toJson() {
     return {
       'role': RoleFfiCodec.encode(this.role),
       'content': this.content,
+      'imageBytes': this.imageBytes == null ? null : (() { final __tmp = this.imageBytes!; return base64Encode(__tmp); })(),
+      'audioPcm': this.audioPcm == null ? null : (() { final __tmp = this.audioPcm!; return __tmp; })(),
+      'audioSampleRate': this.audioSampleRate,
     };
   }
 
@@ -1740,31 +1755,40 @@ class Message {
     return Message(
       role: RoleFfiCodec.decode(json['role'] as String),
       content: json['content'] as String,
+      imageBytes: json.containsKey('imageBytes') ? json['imageBytes'] == null ? null : (() { final __tmp = json['imageBytes']; return base64Decode(__tmp as String); })() : null,
+      audioPcm: json.containsKey('audioPcm') ? json['audioPcm'] == null ? null : (() { final __tmp = json['audioPcm']; return (__tmp as List).map((item) => (item as num).toDouble()).toList(); })() : null,
+      audioSampleRate: json.containsKey('audioSampleRate') ? json['audioSampleRate'] == null ? null : (json['audioSampleRate'] as num).toInt() : null,
     );
   }
 
   Message copyWith({
     Role? role,
     String? content,
+    Object? imageBytes = _sentinel,
+    Object? audioPcm = _sentinel,
+    Object? audioSampleRate = _sentinel,
   }) {
     return Message(
       role: role ?? this.role,
       content: content ?? this.content,
+      imageBytes: imageBytes == _sentinel ? this.imageBytes : imageBytes as Uint8List?,
+      audioPcm: audioPcm == _sentinel ? this.audioPcm : audioPcm as List<double>?,
+      audioSampleRate: audioSampleRate == _sentinel ? this.audioSampleRate : audioSampleRate as int?,
     );
   }
 
   @override
   String toString() {
-    return 'Message(role: $role, content: $content)';
+    return 'Message(role: $role, content: $content, imageBytes: $imageBytes, audioPcm: $audioPcm, audioSampleRate: $audioSampleRate)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is Message && role == other.role && content == other.content;
+      other is Message && role == other.role && content == other.content && imageBytes == other.imageBytes && audioPcm == other.audioPcm && audioSampleRate == other.audioSampleRate;
 
   @override
-  int get hashCode => Object.hash(role, content);
+  int get hashCode => Object.hash(role, content, imageBytes, audioPcm, audioSampleRate);
 }
 
 /// Result of a completed chat turn.
@@ -6363,6 +6387,28 @@ IngestSummary _uniffiDecodeIngestSummary(Uint8List bytes) {
 void _uniffiWriteMessage(Message value, _UniFfiBinaryWriter writer) {
   _uniffiWriteRole(value.role, writer);
   writer.writeString(value.content);
+  if (value.imageBytes == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.imageBytes!.length);
+    writer.writeBytes(value.imageBytes!);
+  }
+  if (value.audioPcm == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeI32(value.audioPcm!.length);
+    for (final item in value.audioPcm!) {
+      writer.writeF32(item);
+    }
+  }
+  if (value.audioSampleRate == null) {
+    writer.writeI8(0);
+  } else {
+    writer.writeI8(1);
+    writer.writeU32(value.audioSampleRate!);
+  }
 }
 
 Uint8List _uniffiEncodeMessage(Message value) {
@@ -6375,6 +6421,9 @@ Message _uniffiReadMessage(_UniFfiBinaryReader reader) {
   return Message(
     role: _uniffiReadRole(reader),
     content: reader.readString(),
+    imageBytes: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); return reader.readBytes(__len); })(); })(),
+    audioPcm: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return (() { final int __len = reader.readI32(); final out = <double>[]; for (var i = 0; i < __len; i++) { out.add(reader.readF32()); } return out; })(); })(),
+    audioSampleRate: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
   );
 }
 
@@ -7899,6 +7948,26 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user != 46361) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user`: expected 46361, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_chat_message_user_audio');
+      _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_user_audio`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio != 15774) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_audio`: expected 15774, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_chat_message_user_image');
+      _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_user_image`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image != 57033) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_image`: expected 57033, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar;
     try {
@@ -10343,6 +10412,259 @@ class CeraFfiFfi {
       (argBuf + 1).ref.u64 = contentRustBuffer.len;
       (argBuf + 2).ref.ptr = contentRustBuffer.data.cast<ffi.Void>();
       _chatMessageUserFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeMessage(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _chatMessageUserAudioFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_chat_message_user_audio');
+
+  Message chatMessageUserAudio(List<double> audioPcm, int sampleRate, String? text) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final audioPcmWriter = _UniFfiBinaryWriter();
+      audioPcmWriter.writeI32(audioPcm.length);
+      for (final item in audioPcm) {
+        audioPcmWriter.writeF32(item);
+      }
+      final Uint8List audioPcmBytes = audioPcmWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> audioPcmPtr = audioPcmBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(audioPcmBytes.length);
+      if (audioPcmBytes.isNotEmpty) { audioPcmPtr.asTypedList(audioPcmBytes.length).setAll(0, audioPcmBytes); }
+      foreignArgPtrs.add(audioPcmPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> audioPcmFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      audioPcmFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      audioPcmFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> audioPcmForeignPtr = calloc<_UniFfiForeignBytes>();
+      audioPcmForeignPtr.ref
+        ..len = audioPcmBytes.length
+        ..data = audioPcmPtr;
+      final _UniFfiRustBuffer audioPcmRustBuffer = _uniFfiRustBufferFromBytes(audioPcmForeignPtr.ref, audioPcmFromBytesStatusPtr);
+      calloc.free(audioPcmForeignPtr);
+      final int audioPcmFromBytesCode = audioPcmFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer audioPcmFromBytesErrBuf = audioPcmFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(audioPcmFromBytesStatusPtr);
+      if (audioPcmFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> audioPcmFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        audioPcmFromBytesErrBufPtr.ref
+          ..capacity = audioPcmFromBytesErrBuf.capacity
+          ..len = audioPcmFromBytesErrBuf.len
+          ..data = audioPcmFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(audioPcmFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $audioPcmFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = audioPcmRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = audioPcmRustBuffer.len;
+      (argBuf + 2).ref.ptr = audioPcmRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 3).ref.u32 = sampleRate;
+      final textWriter = _UniFfiBinaryWriter();
+      if (text == null) {
+        textWriter.writeI8(0);
+      } else {
+        textWriter.writeI8(1);
+        textWriter.writeString(text!);
+      }
+      final Uint8List textBytes = textWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> textPtr = textBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(textBytes.length);
+      if (textBytes.isNotEmpty) { textPtr.asTypedList(textBytes.length).setAll(0, textBytes); }
+      foreignArgPtrs.add(textPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> textFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      textFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      textFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> textForeignPtr = calloc<_UniFfiForeignBytes>();
+      textForeignPtr.ref
+        ..len = textBytes.length
+        ..data = textPtr;
+      final _UniFfiRustBuffer textRustBuffer = _uniFfiRustBufferFromBytes(textForeignPtr.ref, textFromBytesStatusPtr);
+      calloc.free(textForeignPtr);
+      final int textFromBytesCode = textFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer textFromBytesErrBuf = textFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(textFromBytesStatusPtr);
+      if (textFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> textFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        textFromBytesErrBufPtr.ref
+          ..capacity = textFromBytesErrBuf.capacity
+          ..len = textFromBytesErrBuf.len
+          ..data = textFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(textFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $textFromBytesCode');
+      }
+      (argBuf + 4).ref.u64 = textRustBuffer.capacity;
+      (argBuf + 5).ref.u64 = textRustBuffer.len;
+      (argBuf + 6).ref.ptr = textRustBuffer.data.cast<ffi.Void>();
+      _chatMessageUserAudioFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeMessage(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _chatMessageUserImageFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_chat_message_user_image');
+
+  Message chatMessageUserImage(Uint8List imageBytes, String? text) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(6);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final imageBytesWriter = _UniFfiBinaryWriter();
+      imageBytesWriter.writeI32(imageBytes.length);
+      imageBytesWriter.writeBytes(imageBytes);
+      final Uint8List imageBytesBytes = imageBytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> imageBytesPtr = imageBytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(imageBytesBytes.length);
+      if (imageBytesBytes.isNotEmpty) { imageBytesPtr.asTypedList(imageBytesBytes.length).setAll(0, imageBytesBytes); }
+      foreignArgPtrs.add(imageBytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> imageBytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      imageBytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      imageBytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> imageBytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      imageBytesForeignPtr.ref
+        ..len = imageBytesBytes.length
+        ..data = imageBytesPtr;
+      final _UniFfiRustBuffer imageBytesRustBuffer = _uniFfiRustBufferFromBytes(imageBytesForeignPtr.ref, imageBytesFromBytesStatusPtr);
+      calloc.free(imageBytesForeignPtr);
+      final int imageBytesFromBytesCode = imageBytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer imageBytesFromBytesErrBuf = imageBytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(imageBytesFromBytesStatusPtr);
+      if (imageBytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> imageBytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        imageBytesFromBytesErrBufPtr.ref
+          ..capacity = imageBytesFromBytesErrBuf.capacity
+          ..len = imageBytesFromBytesErrBuf.len
+          ..data = imageBytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(imageBytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $imageBytesFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = imageBytesRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = imageBytesRustBuffer.len;
+      (argBuf + 2).ref.ptr = imageBytesRustBuffer.data.cast<ffi.Void>();
+      final textWriter = _UniFfiBinaryWriter();
+      if (text == null) {
+        textWriter.writeI8(0);
+      } else {
+        textWriter.writeI8(1);
+        textWriter.writeString(text!);
+      }
+      final Uint8List textBytes = textWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> textPtr = textBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(textBytes.length);
+      if (textBytes.isNotEmpty) { textPtr.asTypedList(textBytes.length).setAll(0, textBytes); }
+      foreignArgPtrs.add(textPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> textFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      textFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      textFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> textForeignPtr = calloc<_UniFfiForeignBytes>();
+      textForeignPtr.ref
+        ..len = textBytes.length
+        ..data = textPtr;
+      final _UniFfiRustBuffer textRustBuffer = _uniFfiRustBufferFromBytes(textForeignPtr.ref, textFromBytesStatusPtr);
+      calloc.free(textForeignPtr);
+      final int textFromBytesCode = textFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer textFromBytesErrBuf = textFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(textFromBytesStatusPtr);
+      if (textFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> textFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        textFromBytesErrBufPtr.ref
+          ..capacity = textFromBytesErrBuf.capacity
+          ..len = textFromBytesErrBuf.len
+          ..data = textFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(textFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $textFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = textRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = textRustBuffer.len;
+      (argBuf + 5).ref.ptr = textRustBuffer.data.cast<ffi.Void>();
+      _chatMessageUserImageFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 3).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
         final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
@@ -26693,6 +27015,16 @@ Message chatMessageTool(String content) {
 /// Convenience factory for a user text message.
 Message chatMessageUser(String content) {
   return _bindings().chatMessageUser(content);
+}
+
+/// Convenience factory for a user audio message.
+Message chatMessageUserAudio(List<double> audioPcm, int sampleRate, String? text) {
+  return _bindings().chatMessageUserAudio(audioPcm, sampleRate, text);
+}
+
+/// Convenience factory for a user image message.
+Message chatMessageUserImage(Uint8List imageBytes, String? text) {
+  return _bindings().chatMessageUserImage(imageBytes, text);
 }
 
 /// Compile a JSON Schema definition string into a GBNF grammar string.

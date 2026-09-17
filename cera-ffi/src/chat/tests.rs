@@ -405,16 +405,39 @@ fn chat_session_streaming_early_error_dispatches_on_done() {
 fn chat_message_bidirectional_conversion() {
     let core_msg =
         cera::session::chat::Message::text(cera::session::chat::Role::Assistant, "Hello from core");
-    let ffi_msg = Message::try_from(&core_msg).expect("conversion succeeds");
+    let ffi_msg = Message::from(&core_msg);
     assert_eq!(ffi_msg.role, Role::Assistant);
     assert_eq!(ffi_msg.content, "Hello from core");
+    assert!(ffi_msg.image_bytes.is_none());
+    assert!(ffi_msg.audio_pcm.is_none());
 
-    let multimodal_msg = cera::session::chat::Message {
+    let core_roundtrip: cera::session::chat::Message = ffi_msg.into();
+    assert_eq!(core_roundtrip, core_msg);
+
+    let multimodal_img = cera::session::chat::Message {
         role: cera::session::chat::Role::User,
-        content: vec![cera::session::chat::ContentPart::Image(vec![1, 2, 3])],
+        content: vec![
+            cera::session::chat::ContentPart::Image(vec![1, 2, 3]),
+            cera::session::chat::ContentPart::Text("what is this?".into()),
+        ],
     };
-    let err = Message::try_from(&multimodal_msg).unwrap_err();
-    assert!(matches!(err, FfiError::UnsupportedModality));
+    let ffi_img = Message::from(&multimodal_img);
+    assert_eq!(ffi_img.role, Role::User);
+    assert_eq!(ffi_img.content, "what is this?");
+    assert_eq!(ffi_img.image_bytes, Some(vec![1, 2, 3]));
+    let img_roundtrip: cera::session::chat::Message = ffi_img.into();
+    assert_eq!(img_roundtrip, multimodal_img);
+
+    let user_img_factory = chat_message_user_image(vec![4, 5, 6], Some("describe".into()));
+    assert_eq!(user_img_factory.role, Role::User);
+    assert_eq!(user_img_factory.content, "describe");
+    assert_eq!(user_img_factory.image_bytes, Some(vec![4, 5, 6]));
+
+    let user_aud_factory = chat_message_user_audio(vec![0.1, 0.2], 16000, Some("listen".into()));
+    assert_eq!(user_aud_factory.role, Role::User);
+    assert_eq!(user_aud_factory.content, "listen");
+    assert_eq!(user_aud_factory.audio_pcm, Some(vec![0.1, 0.2]));
+    assert_eq!(user_aud_factory.audio_sample_rate, Some(16000));
 }
 
 #[test]

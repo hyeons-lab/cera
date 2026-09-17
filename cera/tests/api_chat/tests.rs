@@ -14,6 +14,8 @@ use super::fixtures::{self, Sink, TraceModel};
 #[derive(Debug)]
 struct TraceExecution {
     tokens: Vec<u32>,
+    images: Vec<Vec<u8>>,
+    audio_samples: Vec<(Vec<f32>, u32)>,
     capacity: usize,
     resets: Vec<bool>,
     append_calls: usize,
@@ -22,6 +24,8 @@ struct TraceExecution {
     reset_fails: bool,
     panic_append: bool,
     audio: bool,
+    image_capable: bool,
+    audio_capable: bool,
     invalid_decode: bool,
     cancel: Arc<AtomicBool>,
     decode: VecDeque<DecodeReport>,
@@ -32,6 +36,8 @@ impl Default for TraceExecution {
     fn default() -> Self {
         Self {
             tokens: Vec::new(),
+            images: Vec::new(),
+            audio_samples: Vec::new(),
             capacity: 8192,
             resets: Vec::new(),
             append_calls: 0,
@@ -40,6 +46,8 @@ impl Default for TraceExecution {
             reset_fails: false,
             panic_append: false,
             audio: false,
+            image_capable: false,
+            audio_capable: false,
             invalid_decode: false,
             cancel: Arc::new(AtomicBool::new(false)),
             decode: VecDeque::new(),
@@ -58,6 +66,12 @@ impl Execution for TraceExecution {
     fn audio_output(&self) -> bool {
         self.audio
     }
+    fn image_input(&self) -> bool {
+        self.image_capable
+    }
+    fn audio_input(&self) -> bool {
+        self.audio_capable
+    }
     fn validate_decode(&self, _: &GenerateOpts) -> Result<(), ValidationError> {
         if self.invalid_decode {
             Err(ValidationError::Generation(
@@ -68,11 +82,16 @@ impl Execution for TraceExecution {
         }
     }
     fn append(&mut self, tokens: &[u32]) -> Result<(), IngestError> {
+        self.append_segments(&[IngestSegment::Tokens(tokens)])
+    }
+    fn append_segments(&mut self, segments: &[IngestSegment<'_>]) -> Result<(), IngestError> {
         self.append_calls += 1;
         assert!(!self.panic_append, "injected append unwind");
         if let Some(recovery) = self.failure.take() {
             if recovery == RecoveryOutcome::Reset {
                 self.tokens.clear();
+                self.images.clear();
+                self.audio_samples.clear();
             }
             return Err(IngestError {
                 cause: IngestCause::Execution(CeraError::Cancelled),
@@ -82,7 +101,21 @@ impl Execution for TraceExecution {
                     .then(|| CeraError::Backend("reset failed".into())),
             });
         }
-        self.tokens.extend_from_slice(tokens);
+        for seg in segments {
+            match *seg {
+                IngestSegment::Tokens(toks) => {
+                    self.tokens.extend_from_slice(toks);
+                }
+                IngestSegment::Image(bytes) => {
+                    self.images.push(bytes.to_vec());
+                    self.tokens.push(9999);
+                }
+                IngestSegment::Audio { pcm, sample_rate } => {
+                    self.audio_samples.push((pcm.to_vec(), sample_rate));
+                    self.tokens.push(8888);
+                }
+            }
+        }
         Ok(())
     }
     fn reset(&mut self, explicit: bool) -> Result<(), CeraError> {
@@ -91,6 +124,8 @@ impl Execution for TraceExecution {
             return Err(CeraError::Backend("reset failed".into()));
         }
         self.tokens.clear();
+        self.images.clear();
+        self.audio_samples.clear();
         Ok(())
     }
     fn decode(&mut self, _: &GenerateOpts, sink: &mut dyn ModalitySink) -> DecodeReport {

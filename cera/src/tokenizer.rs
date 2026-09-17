@@ -1170,16 +1170,20 @@ impl BpeTokenizer {
         t.bos_id = Some(1);
         t.eos_id = Some(7);
         t.special_tokens.insert("<|startoftext|>".to_string(), 1);
+        t.special_tokens.insert("<|image_start|>".to_string(), 2);
+        t.special_tokens.insert("<|image_end|>".to_string(), 3);
+        t.special_tokens.insert("<image>".to_string(), 4);
+        t.special_tokens.insert("<|reserved_4|>".to_string(), 5);
         t.special_tokens.insert("<|im_start|>".to_string(), 6);
         t.special_tokens.insert("<|im_end|>".to_string(), 7);
         t.chat_template = Some(crate::session::chat::TEMPLATE.to_string());
         t.vocab = vec![
             vec![],                      // 0
             b"<|startoftext|>".to_vec(), // 1
-            vec![],                      // 2
-            vec![],                      // 3
-            vec![],                      // 4
-            vec![],                      // 5
+            b"<|image_start|>".to_vec(), // 2
+            b"<|image_end|>".to_vec(),   // 3
+            b"<image>".to_vec(),         // 4
+            b"<|reserved_4|>".to_vec(),  // 5
             b"<|im_start|>".to_vec(),    // 6
             b"<|im_end|>".to_vec(),      // 7
             vec![],                      // 8

@@ -1654,17 +1654,32 @@ class Message {
     required this.role,
     /// Message text content.
     required this.content,
+    /// Optional image payload bytes.
+    this.imageBytes = null,
+    /// Optional audio PCM waveform samples.
+    this.audioPcm = null,
+    /// Audio sample rate in Hz (e.g. 16000).
+    this.audioSampleRate = null,
   });
 
   /// Author role.
   final Role role;
   /// Message text content.
   final String content;
+  /// Optional image payload bytes.
+  final Uint8List? imageBytes;
+  /// Optional audio PCM waveform samples.
+  final List<double>? audioPcm;
+  /// Audio sample rate in Hz (e.g. 16000).
+  final int? audioSampleRate;
 
   Map<String, dynamic> toJson() {
     return {
       'role': RoleFfiCodec.encode(this.role),
       'content': this.content,
+      'imageBytes': this.imageBytes == null ? null : (() { final __tmp = this.imageBytes!; return base64Encode(__tmp); })(),
+      'audioPcm': this.audioPcm == null ? null : (() { final __tmp = this.audioPcm!; return __tmp; })(),
+      'audioSampleRate': this.audioSampleRate,
     };
   }
 
@@ -1672,31 +1687,40 @@ class Message {
     return Message(
       role: RoleFfiCodec.decode(json['role'] as String),
       content: json['content'] as String,
+      imageBytes: json.containsKey('imageBytes') ? json['imageBytes'] == null ? null : (() { final __tmp = json['imageBytes']; return base64Decode(__tmp as String); })() : null,
+      audioPcm: json.containsKey('audioPcm') ? json['audioPcm'] == null ? null : (() { final __tmp = json['audioPcm']; return (__tmp as List).map((item) => (item as num).toDouble()).toList(); })() : null,
+      audioSampleRate: json.containsKey('audioSampleRate') ? json['audioSampleRate'] == null ? null : (json['audioSampleRate'] as num).toInt() : null,
     );
   }
 
   Message copyWith({
     Role? role,
     String? content,
+    Object? imageBytes = _sentinel,
+    Object? audioPcm = _sentinel,
+    Object? audioSampleRate = _sentinel,
   }) {
     return Message(
       role: role ?? this.role,
       content: content ?? this.content,
+      imageBytes: imageBytes == _sentinel ? this.imageBytes : imageBytes as Uint8List?,
+      audioPcm: audioPcm == _sentinel ? this.audioPcm : audioPcm as List<double>?,
+      audioSampleRate: audioSampleRate == _sentinel ? this.audioSampleRate : audioSampleRate as int?,
     );
   }
 
   @override
   String toString() {
-    return 'Message(role: $role, content: $content)';
+    return 'Message(role: $role, content: $content, imageBytes: $imageBytes, audioPcm: $audioPcm, audioSampleRate: $audioSampleRate)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is Message && role == other.role && content == other.content;
+      other is Message && role == other.role && content == other.content && imageBytes == other.imageBytes && audioPcm == other.audioPcm && audioSampleRate == other.audioSampleRate;
 
   @override
-  int get hashCode => Object.hash(role, content);
+  int get hashCode => Object.hash(role, content, imageBytes, audioPcm, audioSampleRate);
 }
 
 /// Result of a completed chat turn.
@@ -6602,6 +6626,12 @@ Message chatMessageTool(String content) => _unsupportedOnWeb('chatMessageTool');
 
 /// Convenience factory for a user text message.
 Message chatMessageUser(String content) => _unsupportedOnWeb('chatMessageUser');
+
+/// Convenience factory for a user audio message.
+Message chatMessageUserAudio(List<double> audioPcm, int sampleRate, String? text) => _unsupportedOnWeb('chatMessageUserAudio');
+
+/// Convenience factory for a user image message.
+Message chatMessageUserImage(Uint8List imageBytes, String? text) => _unsupportedOnWeb('chatMessageUserImage');
 
 /// Compile a JSON Schema definition string into a GBNF grammar string.
 String jsonSchemaToGrammar(String schemaJson) => _unsupportedOnWeb('jsonSchemaToGrammar');

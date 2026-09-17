@@ -489,6 +489,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
@@ -1268,6 +1272,19 @@ _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_audio.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint32,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_audio.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_image.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_image.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_cpu_backend_report.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -2097,6 +2114,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.restype = ctypes.c_ui
 _UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_uint16
@@ -6090,24 +6113,112 @@ class _UniffiFfiConverterTypeRole(_UniffiConverterRustBuffer):
 
 
 
+class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative byte string length")
+        return buf.read(size)
+
+    @staticmethod
+    def check_lower(value):
+        try:
+            memoryview(value)
+        except TypeError:
+            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i32(len(value))
+        buf.write(value)
+
+class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBytes.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBytes.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBytes.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalSequenceFloat32(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceFloat32.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceFloat32.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceFloat32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class Message:
     """
     A structured conversational turn message.
 """
-    def __init__(self, *, role:Role, content:str):
+    def __init__(self, *, role:Role, content:str, image_bytes:typing.Optional[bytes] = _DEFAULT, audio_pcm:typing.Optional[typing.List[float]] = _DEFAULT, audio_sample_rate:typing.Optional[int] = _DEFAULT):
         self.role = role
         self.content = content
+        if image_bytes is _DEFAULT:
+            self.image_bytes = None
+        else:
+            self.image_bytes = image_bytes
+        if audio_pcm is _DEFAULT:
+            self.audio_pcm = None
+        else:
+            self.audio_pcm = audio_pcm
+        if audio_sample_rate is _DEFAULT:
+            self.audio_sample_rate = None
+        else:
+            self.audio_sample_rate = audio_sample_rate
         
         
 
     
     def __str__(self):
-        return "Message(role={}, content={})".format(self.role, self.content)
+        return "Message(role={}, content={}, image_bytes={}, audio_pcm={}, audio_sample_rate={})".format(self.role, self.content, self.image_bytes, self.audio_pcm, self.audio_sample_rate)
     def __eq__(self, other):
         if self.role != other.role:
             return False
         if self.content != other.content:
+            return False
+        if self.image_bytes != other.image_bytes:
+            return False
+        if self.audio_pcm != other.audio_pcm:
+            return False
+        if self.audio_sample_rate != other.audio_sample_rate:
             return False
         return True
 
@@ -6117,17 +6228,26 @@ class _UniffiFfiConverterTypeMessage(_UniffiConverterRustBuffer):
         return Message(
             role=_UniffiFfiConverterTypeRole.read(buf),
             content=_UniffiFfiConverterString.read(buf),
+            image_bytes=_UniffiFfiConverterOptionalBytes.read(buf),
+            audio_pcm=_UniffiFfiConverterOptionalSequenceFloat32.read(buf),
+            audio_sample_rate=_UniffiFfiConverterOptionalUInt32.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterTypeRole.check_lower(value.role)
         _UniffiFfiConverterString.check_lower(value.content)
+        _UniffiFfiConverterOptionalBytes.check_lower(value.image_bytes)
+        _UniffiFfiConverterOptionalSequenceFloat32.check_lower(value.audio_pcm)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.audio_sample_rate)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterTypeRole.write(value.role, buf)
         _UniffiFfiConverterString.write(value.content, buf)
+        _UniffiFfiConverterOptionalBytes.write(value.image_bytes, buf)
+        _UniffiFfiConverterOptionalSequenceFloat32.write(value.audio_pcm, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.audio_sample_rate, buf)
 
 @dataclass
 class ModalityCapabilities:
@@ -6364,51 +6484,6 @@ class _UniffiFfiConverterTypeModelMetadata(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.add_bos_token, buf)
         _UniffiFfiConverterBoolean.write(value.add_eos_token, buf)
         _UniffiFfiConverterString.write(value.cpu_backend, buf)
-
-class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative byte string length")
-        return buf.read(size)
-
-    @staticmethod
-    def check_lower(value):
-        try:
-            memoryview(value)
-        except TypeError:
-            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_i32(len(value))
-        buf.write(value)
-
-class _UniffiFfiConverterOptionalBytes(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBytes.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBytes.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBytes.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
 class SamplingDefaults:
@@ -13526,6 +13601,49 @@ def chat_message_user(content: str) -> Message:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_user_audio(audio_pcm: typing.List[float],sample_rate: int,text: typing.Optional[str]) -> Message:
+    """
+    Convenience factory for a user audio message.
+"""
+    
+    _UniffiFfiConverterSequenceFloat32.check_lower(audio_pcm)
+
+    _UniffiFfiConverterUInt32.check_lower(sample_rate)
+
+    _UniffiFfiConverterOptionalString.check_lower(text)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterSequenceFloat32.lower(audio_pcm),
+        _UniffiFfiConverterUInt32.lower(sample_rate),
+        _UniffiFfiConverterOptionalString.lower(text),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_audio,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def chat_message_user_image(image_bytes: bytes,text: typing.Optional[str]) -> Message:
+    """
+    Convenience factory for a user image message.
+"""
+    
+    _UniffiFfiConverterBytes.check_lower(image_bytes)
+
+    _UniffiFfiConverterOptionalString.check_lower(text)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterBytes.lower(image_bytes),
+        _UniffiFfiConverterOptionalString.lower(text),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeMessage.lift
+    _uniffi_error_converter = None
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_image,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def cpu_backend_report() -> str:
     """
     One-line CPU backend report for this host — the resolved SIMD tier plus the
@@ -13776,6 +13894,8 @@ __all__ = [
     "chat_message_system",
     "chat_message_tool",
     "chat_message_user",
+    "chat_message_user_audio",
+    "chat_message_user_image",
     "cpu_backend_report",
     "detect_tool_format",
     "hotword_default_config",
