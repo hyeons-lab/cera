@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 
 import 'model_source.dart';
 

@@ -6,6 +6,27 @@ engine to Kotlin, Swift, Python, and every other language
 
 > **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
 
+Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
+and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
+cover session release, Busy errors and pending async work.
+
+`ChatSession.recoveryStatus()` and `Session.recoveryStatus()` report what happened
+after a failed ingestion or whole-message append: context was unchanged, restored, reset,
+or left unusable. The original call still throws its existing error; a failed reset is
+retained separately as `lastIngestRecovery.resetError`. Read the status after the operation
+returns. It throws `Busy` while an operation holds the session lock. Terminal callbacks
+and final buffered text flushes can run after that lock is released, so status
+may already be available inside those callbacks.
+
+For conversational chat, use the dedicated `ChatSession` coordinator via `session.intoChat()`
+or `engine.newChatSession(config)`. The complete [Swift](examples/Chat.swift),
+[Kotlin](examples/Chat.kt), and [Python](examples/chat.py) examples demonstrate multi-turn
+chat with delta-only prefill, bit-exact KV cache retention, and session reclamation.
+The legacy [Swift](examples/IngestionRecovery.swift) and [Kotlin](examples/IngestionRecovery.kt)
+examples demonstrate raw append recovery.
+See the [recovery contract and target limits](../docs/internals/API_RESHAPE_RECOVERY.md)
+and [executable native checks](../tests/api_recovery/README.md).
+
 ## Status
 
 **Cache management.** Through PRs 2–13 `cera-ffi` built up a typed
@@ -39,10 +60,111 @@ filesystem tree manually" workaround.
 | 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
 | 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`); both shipped |
 | 20+ | Native Keyword Spotting (KWS): `FfiHotwordConfig`, `FfiHotwordScore`, `FfiHotwordEvent`, `FfiHotwordDetector`, and `FfiHotwordIterator` (`process_chunk`, `reset`) |
-| 21+ | OpenAI Whisper ASR: `FfiWhisperModel`, `FfiWhisperTranscribeOpts`, `whisper_default_transcribe_opts` with synchronous/asynchronous transcription and cooperative task cancellation |
+| 21+ | OpenAI Whisper ASR: `FfiWhisperModel`, `FfiWhisperTranscribeOpts`, `whisper_default_transcribe_opts` with synchronous/asynchronous transcription and cooperative cancellation on Rust future drop |
+| 22+ | Conversational Chat: `ChatSession`, `Message`, `Role`, `SessionPhase`, `TurnResult`, `Session::into_chat`, `CeraEngine::new_chat_session`, wait-free cancellation, and streaming decode |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
+
+## Explicit model loading
+
+This checkout exposes `ModelSource`, `ModelLoader`, `ModelHandle` and
+`GenerativeModel` in the generated native bindings. Build the library and wrappers
+from this branch together; released packages have not been updated by this work.
+A loader is single-use, including after a failed build. Loading is synchronous;
+run it on a worker thread in a UI application. Existing engine constructors remain
+available.
+
+Swift, with `import Cera` and a local generative GGUF:
+
+```swift
+let loader = ModelLoader(
+  source: .path(path: modelPath), config: EngineConfig(backend: .cpu))
+let model = try loader.buildGenerative()
+let engine = model.engine()
+let session = try model.createSession(config: SessionConfig(seed: 42))
+try session.appendTokens(tokens: engine.encodeText(text: "The capital of France is"))
+let output = try session.generate(opts: GenerateOpts(maxTokens: 32, temperature: 0.7))
+print(engine.decodeTokens(tokens: output.tokens))
+```
+
+Kotlin, with the types imported from `uniffi.cera_ffi`:
+
+```kotlin
+ModelLoader(ModelSource.Path(modelPath), EngineConfig(backend = BackendPreference.CPU)).use { loader ->
+    loader.buildGenerative().use { model ->
+        model.engine().use { engine ->
+            model.createSession(SessionConfig(seed = 42uL)).use { session ->
+                session.appendTokens(engine.encodeText("The capital of France is"))
+                val output = session.generate(GenerateOpts(maxTokens = 32u, temperature = 0.7f))
+                println(engine.decodeTokens(output.tokens))
+            }
+        }
+    }
+}
+```
+
+These examples request a raw completion; they do not apply a chat template.
+Complete command-line sources with imports and arguments are in
+[ExplicitLoading.swift](examples/ExplicitLoading.swift) and
+[ExplicitLoading.kt](examples/ExplicitLoading.kt).
+`Bytes`, `Parts`, `Files`, `HuggingFace` and `BundleId` provide other explicit
+sources. Remote resolution uses `EngineConfig.bundleRepo`. `Parts` preserves
+companion bytes, inference type, chat template and Text/Audio/Other generation
+defaults; `Files` preserves companion paths and extras. A build reports structured
+`LoadError` in Swift or `LoadException` in Kotlin. Existing session methods retain
+`FfiError`/`FfiException`.
+
+`model.engine()` shares the loaded core engine, including its tokenizer and cache.
+A session keeps its resources when the model and engine wrappers are released.
+Reuse that session to continue with its live KV, subject to the backend ownership
+rules below. This API does not establish new KV performance budgets.
+
+## Sharing a loaded GPU model
+
+Metal and wgpu permit one live `Session` per loaded model. A second session
+returns `Busy` until the first is dropped; reset and cancellation keep ownership.
+CPU models continue to support shared weights across concurrent sessions. Load
+separate GPU models for simultaneous conversations. The
+[session ownership walkthrough](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
+and executable CPU/Metal/wgpu checks.
+
+LFM2-Audio transcription during a live GPU conversation uses a cached secondary
+model built from retained weights. This preserves conversation KV and costs
+additional model memory and first-use setup; the walkthrough includes a native
+Dart consumer for transcription and seeded generation.
+
+## Whisper in Swift and Kotlin
+
+`FfiWhisperModel` exposes file/byte loading, synchronous and asynchronous
+transcription, `languages()` and `isMultilingual()` in the generated wrappers.
+Use a Whisper GGUF and decoded 16 kHz mono float PCM. For example, within a Swift
+async function using `import Cera`, after loading `model` off the UI thread:
+
+```swift
+var opts = whisperDefaultTranscribeOpts()
+opts.language = "en"
+let text = try await model.transcribeAsync(pcm: pcm16kMono, opts: opts)
+```
+
+The Kotlin equivalent, inside a suspend function with a loaded model:
+
+```kotlin
+val opts = whisperDefaultTranscribeOpts().copy(language = "en")
+val text = model.transcribeAsync(pcm16kMono, opts)
+```
+
+The [complete recording helpers and executable probes](../docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md)
+show imports, background loading, byte ownership and Kotlin `use` cleanup. They
+also document the 30-second input limit, option defaults and cancellation:
+dropping an async transcription future aborts queued work and signals a running
+decoder to stop at its next cooperative cancellation check.
+Kotlin coroutine cancellation frees that future. The pinned Swift wrapper has
+no task cancellation handler, so `Task.cancel()` alone leaves transcription
+running; the guide records this remaining binding limitation.
+This standalone API is distinct from `CeraEngine.transcribe` (LFM2-Audio).
+Build the matching native library and wrappers from this branch; published
+packages have not been updated by this work.
 
 ## Crate types
 
@@ -72,7 +194,7 @@ target in this crate (`src/bin/uniffi-bindgen.rs` → `uniffi::uniffi_bindgen_ma
 and committed under `cera-ffi/bindings/`:
 
 - `bindings/kotlin/uniffi/cera_ffi/cera_ffi.kt`: ktlint-formatted.
-- `bindings/swift/cera_ffi.swift`, `cera_ffiFFI.h`, `cera_ffiFFI.modulemap`.
+- `bindings/swift/cera_ffi.swift`, `CeraFFI.h`, `CeraFFI.modulemap`.
 
 ### Regenerating
 
@@ -706,8 +828,9 @@ messages without going through `Session::append_text`. Useful for:
   incremental UI (`generateStreaming` already returns text chunks
   via `ModalitySink::on_text_chunk`, but consumers building a
   custom token-level UI can encode/decode IDs directly).
-- Rendering a chat template against a list of `ChatMessage`s to
-  produce the prompt string for `Session::append_text`.
+- Rendering a chat template against a list of `ChatMessage`s (for low-level
+  inspection or manual prompt construction; for multi-turn conversations prefer
+  `ChatSession`).
 
 ### Surface
 
@@ -748,11 +871,12 @@ if (engine.hasChatTemplate()) {
         ),
         addGenerationPrompt = true,
     )
-    val session = engine.newSession(SessionConfig())
-    session.appendText(rendered)
-    val out = session.generate(GenerateOpts())
-    val replyText = engine.decodeTokens(out.tokens)
-    println("Assistant: $replyText")
+    engine.newSession(SessionConfig()).use { session ->
+        session.appendText(rendered)
+        val out = session.generate(GenerateOpts())
+        val replyText = engine.decodeTokens(out.tokens)
+        println("Assistant: $replyText")
+    }
 }
 
 // Tool calling: render tools into the prompt, then parse calls from the reply.
@@ -770,19 +894,24 @@ val toolsPrompt = engine.applyChatTemplateWithTools(
     tools = tools,
     addGenerationPrompt = true,
 )
-val session = engine.newSession(SessionConfig())
-session.appendText(toolsPrompt)
-// Optional: constrain to a valid call via grammar + lazy trigger.
-val opts = GenerateOpts()
-engine.toolCallStartToken(format)?.let { trigger ->
-    opts.grammar = toolGrammar(tools, format)      // GBNF string
-    opts.grammarTriggerTokens = listOf(trigger)
-}
-val reply = engine.decodeTokens(session.generate(opts).tokens)
-for (call in parseToolCalls(reply, format)) {
-    println("${call.name}(${call.argumentsJson})")
+engine.newSession(SessionConfig()).use { session ->
+    session.appendText(toolsPrompt)
+    // Optional: constrain to a valid call via grammar + lazy trigger.
+    val opts = GenerateOpts()
+    engine.toolCallStartToken(format)?.let { trigger ->
+        opts.grammar = toolGrammar(tools, format)      // GBNF string
+        opts.grammarTriggerTokens = listOf(trigger)
+    }
+    val reply = engine.decodeTokens(session.generate(opts).tokens)
+    for (call in parseToolCalls(reply, format)) {
+        println("${call.name}(${call.argumentsJson})")
+    }
 }
 ```
+
+These are two separate conversations. Each `use` block closes its session,
+releasing GPU ownership before another session is created. Keep the same session
+open when continuing an existing conversation.
 
 ### Swift example
 
@@ -857,24 +986,122 @@ for call in try parseToolCalls(text: reply, format: format) {
   path for unrecognized roles, but it's template-dependent rather
   than enforced by `applyChatTemplate`.
 
-## Session API
+## Conversational Chat Coordinator (ChatSession)
 
-`engine.newSession(config)` produces an `Arc<Session>` that holds
-the model + tokenizer Arc'd from the engine plus its own KV cache,
-sampler, and cancel atomic. Sessions are independent; many can
-run against the same engine concurrently (each holds its own
-`Mutex` over the inner `cera::Session`).
+`ChatSession` is the high-level coordinator for multi-turn conversational chat.
+It manages Jinja2 template formatting, tracks conversation phases, enforces role alternation,
+evaluates only new tokens on continuation turns (delta-only prefill), retains KV cache state
+across turns without full history replay, and supports wait-free cancellation.
+
+Obtain a `ChatSession` by calling `session.intoChat()` on an existing `Session`, or instantiate
+one directly with `engine.newChatSession(config)`.
 
 ### Surface
 
 | Method | Signature | Notes |
 |---|---|---|
-| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Fallible: `OutOfMemory` when the KV cache can't be allocated. |
+| `engine.newChatSession(config)` | `(SessionConfig) -> Result<Arc<ChatSession>, FfiError>` | Instantiate a chat coordinator directly from an engine. |
+| `session.intoChat()` | `() -> Result<Arc<ChatSession>, FfiError>` | Transition a raw session into a chat coordinator. Moves ownership out of Session. |
+| `chat.ingest(message)` | `(Message) -> Result<IngestSummary, FfiError>` | Ingest a single message (typically User) into conversation state. |
+| `chat.ingestMessages(messages)` | `(Vec<Message>) -> Result<IngestSummary, FfiError>` | Ingest a sequence of messages (for example, System prompt followed by initial User turn). |
+| `chat.replaceMessages(messages)` | `(Vec<Message>) -> Result<IngestSummary, FfiError>` | Replace conversation history and restart framing without full engine re-allocation. |
+| `chat.complete(opts)` | `(GenerateOpts) -> Result<TurnResult, FfiError>` | Complete the current turn synchronously (delta prefill + decode). |
+| `chat.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<TurnResult, FfiError>` | Stream turn generation to a `ModalitySink` callback. |
+| `chat.phase()` | `() -> SessionPhase` | Non-blocking query of the current coordinator phase (`idle`, `promptReady`, `turnComplete`, `turnRefused`, `cancelled`, `rawContext`). |
+| `chat.position()` | `() -> u32` | Lock-free query of current KV tokens. |
+| `chat.cancel()` | `() -> ()` | Wait-free cancellation atomic flip. Safe to call from any thread or callback. |
+| `chat.clearCancel()` | `() -> ()` | Clear cancellation flag while preserving KV cache and conversation position. |
+| `chat.reset()` | `() -> Result<(), FfiError>` | Reset conversation history and clear KV cache. |
+| `chat.recoveryStatus()` | `() -> Result<RecoveryOutcome, FfiError>` | Non-blocking diagnostic query returning outcome of failed ingestion or reset. |
+| `chat.intoSession()` | `() -> Result<Arc<Session>, FfiError>` | Non-destructively reclaim the underlying raw Session. |
+
+### Message constructors
+
+Foreign bindings provide convenience functions to construct `Message` records:
+- `chatMessageUser(text: String)`
+- `chatMessageSystem(text: String)`
+- `chatMessageAssistant(text: String)`
+- `chatMessageTool(callId: String, content: String)`
+
+### Swift example
+
+```swift
+import Cera
+
+let engine = try CeraEngine.fromPath(path: "model.gguf", config: config)
+let session = try engine.newSession(config: SessionConfig())
+let chat = try session.intoChat()
+
+// Ingest system prompt and first user message
+try chat.ingestMessages(messages: [
+    chatMessageSystem(text: "You are a concise, helpful assistant."),
+    chatMessageUser(text: "What is the capital of France?"),
+])
+
+// Generate assistant reply
+var opts = GenerateOpts()
+opts.maxTokens = 64
+let turn1 = try chat.complete(opts: opts)
+print("Assistant: \(turn1.text)")
+
+// Continuation turn: only the new message is prefilled into KV
+try chat.ingest(message: chatMessageUser(text: "What is its population?"))
+let turn2 = try chat.complete(opts: opts)
+print("Assistant: \(turn2.text)")
+
+// Reclaim raw session if needed
+let reclaimedSession = try chat.intoSession()
+```
+
+### Kotlin example
+
+```kotlin
+import uniffi.cera_ffi.*
+
+val engine = CeraEngine.fromPath("model.gguf", config)
+engine.newChatSession(SessionConfig()).use { chat ->
+    // Ingest system prompt and first turn
+    chat.ingestMessages(listOf(
+        chatMessageSystem("You are a concise, helpful assistant."),
+        chatMessageUser("What is the capital of France?"),
+    ))
+
+    val opts = GenerateOpts(maxTokens = 64u)
+    val turn1 = chat.complete(opts)
+    println("Assistant: ${turn1.text}")
+
+    // Continuation turn (delta-only prefill, live KV retention)
+    chat.ingest(chatMessageUser("What is its population?"))
+    val turn2 = chat.complete(opts)
+    println("Assistant: ${turn2.text}")
+}
+```
+
+See runnable multi-language examples in [`examples/Chat.swift`](examples/Chat.swift),
+[`examples/Chat.kt`](examples/Chat.kt), and [`examples/chat.py`](examples/chat.py).
+
+## Session API
+
+`engine.newSession(config)` produces an `Arc<Session>` that retains the
+engine's model and tokenizer, plus its own sampler, cancel atomic, and
+`Mutex` over the inner `cera::Session`. CPU sessions own their live KV state
+and can run concurrently against the same engine. Metal/wgpu models own one
+live GPU context: a second session on the same loaded model returns
+`FfiError::Busy` until the first session is released. Resetting or cancelling
+keeps that reservation. Load separate models for simultaneous GPU conversations;
+see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifetimes.
+
+### Surface
+
+| Method | Signature | Notes |
+|---|---|---|
+| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Returns `Busy` if another session owns the model's GPU context, or `OutOfMemory` when the KV cache can't be allocated. |
+| `session.intoChat()` | `() -> Result<Arc<ChatSession>, FfiError>` | Transition the raw session into a transactional chat coordinator. Moves ownership out of Session. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
-| `session.sendMessage(message)` | `(UserMessage) -> Result<(), FfiError>` | Append a multimodal envelope (`UserMessage` with optional `text`, `images`, `audio`) enforcing model-canonical ordering (vision-first for VL, audio-first for audio) and automatic 16 kHz resampling. |
-| `session.sendMessageAndGenerate(message, opts)` | `(UserMessage, GenerateOpts) -> Result<GenerateOutput, FfiError>` | Convenience combining `sendMessage` and `generate` under session lock. |
-| `session.sendMessageStreaming(message, opts, sink)` | `(UserMessage, GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Convenience combining `sendMessage` and `generateStreaming` under session lock. |
+| `session.sendMessage(message)` | `(UserMessage) -> Result<(), FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. Append a multimodal envelope (`UserMessage` with optional `text`, `images`, `audio`) enforcing model-canonical ordering and automatic 16 kHz resampling. |
+| `session.sendMessageAndGenerate(message, opts)` | `(UserMessage, GenerateOpts) -> Result<GenerateOutput, FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. |
+| `session.sendMessageStreaming(message, opts, sink)` | `(UserMessage, GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. |
 | `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full text + token list + summary in one shot. |
 | `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text chunks or audio frames per the model's modality). Returns the summary only; text chunks flow through the sink. |
 | `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Cancel by dropping the future. |
@@ -882,7 +1109,7 @@ run against the same engine concurrently (each holds its own
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
 | `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
 | `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
-| `session.reset()` | `() -> Result<(), FfiError>` | Drop KV + position + last logits + re-seed sampler from `SessionConfig.seed`. |
+| `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from `SessionConfig.seed`. Retains GPU context ownership. |
 | `session.capabilities()` | `() -> ModalityCapabilities` | The same flags `engine.capabilities()` reports; exposed on `Session` too so a caller holding only the session handle can probe. |
 
 ### Lifecycle (Kotlin)
@@ -1005,10 +1232,14 @@ do {
 
 `cera-ffi` exposes the native streaming wake word engine (`FfiHotwordDetector`, `FfiHotwordIterator`, `FfiHotwordConfig`, `FfiHotwordEvent`):
 
-- **`FfiHotwordDetector.fromFile(path)`** / **`fromBytes(bytes)`**: Loads a self-describing GGUF keyword spotting model (`kws.keywords`, window/hop dimensions, thresholds) with zero-allocation forward inference.
+- **`FfiHotwordDetector.fromFile(path)`** / **`fromBytes(bytes)`**: Loads a self-describing GGUF keyword spotting model (`kws.keywords`, window/hop dimensions, thresholds) with reusable inference scratch buffers. Foreign argument/result conversion and event creation can still allocate.
 - **`FfiHotwordIterator.fromFiles(detectorPath, vadPath, config)`**: Creates a streaming state machine with integrated circular ring buffering, 30.0x AGC peak normalization, Silero VAD gating, and post-detection lockout debounce.
-- **`iterator.processChunk(chunk)`**: Ingests arbitrary chunks of 16 kHz mono PCM float samples and returns any triggered `FfiHotwordEvent` (keyword, confidence, timestamp, audio sample offset) or `None`.
+- **`iterator.processChunk(chunk)`**: Ingests mono PCM float samples at the model's sample rate (commonly 16 kHz). It processes the whole chunk and returns its first triggered `FfiHotwordEvent` (keyword, confidence, timestamp, audio sample offset), or no event. Keep one iterator per stream and call it serially on a background audio worker; it does not resample input.
 - **`iterator.reset()`**: Clears ring buffers and debounces after command execution.
+
+Event offsets identify the detection window's exclusive end. `commandStartSample`
+subtracts the configured pre-roll from that offset, saturating at zero; these
+values provide a stream reference rather than acoustic word alignment.
 
 ### Whisper Speech Recognition (ASR)
 
@@ -1016,7 +1247,7 @@ do {
 
 - **`FfiWhisperModel.fromFile(path)`** / **`fromBytes(bytes)`**: Instantiates the Whisper model from standard GGUF weights.
 - **`model.transcribe(pcm, opts)`**: Synchronous transcription returning recognized text.
-- **`model.transcribeAsync(pcm, opts)`**: Non-blocking asynchronous transcription powered by Tokio, supporting cooperative task cancellation when host listening states are dismissed.
+- **`model.transcribeAsync(pcm, opts)`**: Asynchronous transcription on a Tokio blocking worker. Dropping its Rust future signals cooperative cancellation; Kotlin coroutine cancellation propagates this, while the pinned Swift wrapper does not propagate `Task.cancel()`. See the [Whisper examples](../docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md) for input and cancellation limits.
 
 ## Design notes
 

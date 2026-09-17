@@ -866,6 +866,22 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_audio_pipeline_default_config(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_assistant(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_system(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_tool(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user_audio(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_chat_message_user_image(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_json_schema_to_grammar(): Int
+
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_cache_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache(): Int
@@ -903,6 +919,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_ceraengine_is_special_token(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_metadata(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_new_session(): Int
 
@@ -988,6 +1006,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_default_generate_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_export_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_generate(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_generate_async(): Int
@@ -1006,11 +1026,19 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_import_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_into_chat(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_load_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_position(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_remove_lora(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_save_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_send_message(): Int
 
@@ -1019,6 +1047,100 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_send_message_streaming(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_clear_cancel(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_async(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_async_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_into_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_phase(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_position(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_recovery_status(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_replace_messages(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_tools(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_tool_format(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_tools(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_generativemodel_create_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_generativemodel_engine(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelhandle_as_generative(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelhandle_kind(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelloader_build(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_modelloader_build_generative(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_bundlerepo_new(): Int
 
@@ -1063,6 +1185,14 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_chatsession_from_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_modelloader_new(): Int
 
     external fun ffi_cera_ffi_uniffi_contract_version(): Int
 }
@@ -1267,6 +1397,12 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+        `ptr`: Long,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
 
     external fun uniffi_cera_ffi_fn_method_ceraengine_new_session(
         `ptr`: Long,
@@ -1685,6 +1821,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_export_checkpoint(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_session_generate(
         `ptr`: Long,
         `opts`: RustBuffer.ByValue,
@@ -1737,6 +1878,23 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_import_checkpoint(
+        `ptr`: Long,
+        `data`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_into_chat(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_session_load_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_position(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1749,6 +1907,12 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_session_reset(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_save_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1778,6 +1942,343 @@ internal object UniffiLib {
         `maxLongSize`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_recovery_status(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_ffiaudiopipeline(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_ffiaudiopipeline(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+        `vadBytes`: RustBuffer.ByValue,
+        `hotwordBytes`: RustBuffer.ByValue,
+        `whisperBytes`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+        `vadPath`: RustBuffer.ByValue,
+        `hotwordPath`: RustBuffer.ByValue,
+        `whisperPath`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+        `ptr`: Long,
+        `chunk`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+        `ptr`: Long,
+        `pcm`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_chatsession(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_chatsession(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_chatsession_from_session(
+        `session`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_async(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `sink`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `sink`: Long,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        `sink`: Long,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `schemaJson`: RustBuffer.ByValue,
+        `sink`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+        `ptr`: Long,
+        `data`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest(
+        `ptr`: Long,
+        `message`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+        `ptr`: Long,
+        `name`: RustBuffer.ByValue,
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_into_session(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_phase(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_position(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+        `ptr`: Long,
+        `messages`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_reset(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+        `ptr`: Long,
+        `format`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_tools(
+        `ptr`: Long,
+        `tools`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_tool_format(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_tools(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_generativemodel(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_generativemodel(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_generativemodel_create_session(
+        `ptr`: Long,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_generativemodel_engine(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_clone_modelhandle(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_modelhandle(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_modelhandle_kind(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_clone_modelloader(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_free_modelloader(
+        `handle`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_constructor_modelloader_new(
+        `source`: RustBuffer.ByValue,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_modelloader_build(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_modelloader_build_generative(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
 
     external fun uniffi_cera_ffi_fn_func_cera_ffi_version(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
@@ -1809,6 +2310,46 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_audio_pipeline_default_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_assistant(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_system(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_tool(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_user(
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_user_audio(
+        `audioPcm`: RustBuffer.ByValue,
+        `sampleRate`: Int,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_chat_message_user_image(
+        `imageBytes`: RustBuffer.ByValue,
+        `text`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_json_schema_to_grammar(
+        `schemaJson`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun ffi_cera_ffi_rustbuffer_alloc(
         `size`: Long,
@@ -2054,6 +2595,30 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2111,7 +2676,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
@@ -2186,10 +2754,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -2237,6 +2805,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2264,6 +2835,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2273,16 +2853,160 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
@@ -2349,6 +3073,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3454,10 +4190,15 @@ public interface CeraEngineInterface {
     fun `metadata`(): ModelMetadata
 
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    fun `newChatSession`(`config`: SessionConfig): ChatSession
+
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     fun `newSession`(`config`: SessionConfig): Session
 
@@ -3921,10 +4662,27 @@ open class CeraEngine :
         )
 
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    @Throws(FfiException::class)
+    override fun `newChatSession`(`config`: SessionConfig): ChatSession =
+        FfiConverterTypeChatSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+                        it,
+                        FfiConverterTypeSessionConfig.lower(`config`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     @Throws(FfiException::class)
     override fun `newSession`(`config`: SessionConfig): Session =
@@ -4483,6 +5241,913 @@ public object FfiConverterTypeCeraEngine : FfiConverter<CeraEngine, Long> {
 //
 
 /**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+public interface ChatSessionInterface {
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
+     */
+    fun `cancel`()
+
+    /**
+     * Clear pending cancellation.
+     */
+    fun `clearCancel`()
+
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    fun `complete`(`opts`: GenerateOpts): TurnResult
+
+    /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    suspend fun `completeAsync`(`opts`: GenerateOpts): TurnResult
+
+    /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    suspend fun `completeAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult
+
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    fun `completeJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult
+
+    /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    fun `exportCheckpoint`(): kotlin.ByteArray
+
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    fun `generateStreaming`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    suspend fun `generateStreamingAsync`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    suspend fun `generateStreamingAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    fun `generateStreamingJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    fun `importCheckpoint`(`data`: kotlin.ByteArray)
+
+    /**
+     * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
+     */
+    fun `ingest`(`message`: Message): IngestSummary
+
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    fun `ingestMessages`(`messages`: List<Message>): IngestSummary
+
+    /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    fun `ingestToolResponse`(
+        `name`: kotlin.String,
+        `content`: kotlin.String,
+    ): IngestSummary
+
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    fun `intoSession`(): Session
+
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    fun `loadCheckpoint`(`path`: kotlin.String)
+
+    /**
+     * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    fun `phase`(): SessionPhase
+
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    fun `position`(): kotlin.UInt
+
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    fun `recoveryStatus`(): SessionRecoveryStatus
+
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    fun `replaceMessages`(`messages`: List<Message>): IngestSummary
+
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    fun `reset`()
+
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    fun `saveCheckpoint`(`path`: kotlin.String)
+
+    /**
+     * Set tool wire format explicitly.
+     */
+    fun `setToolFormat`(`format`: ToolFormat)
+
+    /**
+     * Register tools for function calling.
+     */
+    fun `setTools`(`tools`: List<ToolDef>)
+
+    /**
+     * Current tool wire format.
+     */
+    fun `toolFormat`(): ToolFormat
+
+    /**
+     * Currently registered tools for function calling.
+     */
+    fun `tools`(): List<ToolDef>
+
+    companion object
+}
+
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+open class ChatSession :
+    Disposable,
+    AutoCloseable,
+    ChatSessionInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_chatsession(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_chatsession(handle, status)
+        }
+    }
+
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
+     */
+    override fun `cancel`() =
+        callWithHandle {
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Clear pending cancellation.
+     */
+    @Throws(FfiException::class)
+    override fun `clearCancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    @Throws(FfiException::class)
+    override fun `complete`(`opts`: GenerateOpts): TurnResult =
+        FfiConverterTypeTurnResult.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `completeAsync`(`opts`: GenerateOpts): TurnResult =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeTurnResult.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `completeAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterString.lower(`schemaJson`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeTurnResult.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    @Throws(FfiException::class)
+    override fun `completeJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+    ): TurnResult =
+        FfiConverterTypeTurnResult.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterString.lower(`schemaJson`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `exportCheckpoint`(): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    @Throws(FfiException::class)
+    override fun `generateStreaming`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        FfiConverterTypeGenerateSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterTypeModalitySink.lower(`sink`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `generateStreamingAsync`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterTypeModalitySink.lower(`sink`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeGenerateSummary.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `generateStreamingAsyncJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterString.lower(`schemaJson`),
+                    FfiConverterTypeModalitySink.lower(`sink`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeGenerateSummary.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    @Throws(FfiException::class)
+    override fun `generateStreamingJson`(
+        `opts`: GenerateOpts,
+        `schemaJson`: kotlin.String,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        FfiConverterTypeGenerateSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+                        it,
+                        FfiConverterTypeGenerateOpts.lower(`opts`),
+                        FfiConverterString.lower(`schemaJson`),
+                        FfiConverterTypeModalitySink.lower(`sink`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `importCheckpoint`(`data`: kotlin.ByteArray) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+                    it,
+                    FfiConverterByteArray.lower(`data`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
+     */
+    @Throws(FfiException::class)
+    override fun `ingest`(`message`: Message): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest(
+                        it,
+                        FfiConverterTypeMessage.lower(`message`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    @Throws(FfiException::class)
+    override fun `ingestMessages`(`messages`: List<Message>): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+                        it,
+                        FfiConverterSequenceTypeMessage.lower(`messages`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    @Throws(FfiException::class)
+    override fun `ingestToolResponse`(
+        `name`: kotlin.String,
+        `content`: kotlin.String,
+    ): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+                        it,
+                        FfiConverterString.lower(`name`),
+                        FfiConverterString.lower(`content`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    @Throws(FfiException::class)
+    override fun `intoSession`(): Session =
+        FfiConverterTypeSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    @Throws(FfiException::class)
+    override fun `loadCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    @Throws(FfiException::class)
+    override fun `phase`(): SessionPhase =
+        FfiConverterTypeSessionPhase.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    @Throws(FfiException::class)
+    override fun `position`(): kotlin.UInt =
+        FfiConverterUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_position(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    @Throws(FfiException::class)
+    override fun `recoveryStatus`(): SessionRecoveryStatus =
+        FfiConverterTypeSessionRecoveryStatus.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    @Throws(FfiException::class)
+    override fun `replaceMessages`(`messages`: List<Message>): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+                        it,
+                        FfiConverterSequenceTypeMessage.lower(`messages`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    @Throws(FfiException::class)
+    override fun `reset`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    @Throws(FfiException::class)
+    override fun `saveCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Set tool wire format explicitly.
+     */
+    @Throws(FfiException::class)
+    override fun `setToolFormat`(`format`: ToolFormat) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+                    it,
+                    FfiConverterTypeToolFormat.lower(`format`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Register tools for function calling.
+     */
+    @Throws(FfiException::class)
+    override fun `setTools`(`tools`: List<ToolDef>) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tools(
+                    it,
+                    FfiConverterSequenceTypeToolDef.lower(`tools`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Current tool wire format.
+     */
+    @Throws(FfiException::class)
+    override fun `toolFormat`(): ToolFormat =
+        FfiConverterTypeToolFormat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tool_format(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Currently registered tools for function calling.
+     */
+    @Throws(FfiException::class)
+    override fun `tools`(): List<ToolDef> =
+        FfiConverterSequenceTypeToolDef.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    companion object {
+        /**
+         * Construct a ChatSession from an existing Session, taking ownership of its state.
+         *
+         * If validation fails, the session remains intact and usable on the caller side.
+         */
+        @Throws(FfiException::class)
+        fun `fromSession`(`session`: Session): ChatSession =
+            FfiConverterTypeChatSession.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session(FfiConverterTypeSession.lower(`session`), _status)
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeChatSession : FfiConverter<ChatSession, Long> {
+    override fun lower(value: ChatSession): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ChatSession = ChatSession(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ChatSession = lift(buf.getLong())
+
+    override fun allocationSize(value: ChatSession) = 8UL
+
+    override fun write(
+        value: ChatSession,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
  * Foreign-trait callback for download progress events from
  * [`BundleRepo::with_progress`]. Implementers (Kotlin class, Swift
  * class, Python subclass) drive a progress UI from these events.
@@ -4749,6 +6414,551 @@ public object FfiConverterTypeDownloadProgressSink : FfiConverter<DownloadProgre
 
     override fun write(
         value: DownloadProgressSink,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+public interface FfiAudioPipelineInterface {
+    /**
+     * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
+     */
+    fun `cancel`()
+
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    fun `clearCancel`()
+
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    fun `currentSample`(): kotlin.ULong
+
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    fun `flush`(): List<FfiAudioPipelineEvent>
+
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    fun `isListeningForHotword`(): kotlin.Boolean
+
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    fun `isSpeechActive`(): kotlin.Boolean
+
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    fun `lastUtterance`(): List<kotlin.Float>
+
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    fun `popEvent`(): FfiAudioPipelineEvent?
+
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    fun `processChunk`(`chunk`: List<kotlin.Float>): List<FfiAudioPipelineEvent>
+
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    fun `reset`()
+
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    fun `state`(): FfiAudioPipelineState
+
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    fun `takeLastUtterance`(): List<kotlin.Float>
+
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    fun `transcribePcm`(`pcm`: List<kotlin.Float>): kotlin.String
+
+    companion object
+}
+
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+open class FfiAudioPipeline :
+    Disposable,
+    AutoCloseable,
+    FfiAudioPipelineInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline(handle, status)
+        }
+    }
+
+    /**
+     * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
+     */
+    @Throws(FfiException::class)
+    override fun `cancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    @Throws(FfiException::class)
+    override fun `clearCancel`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    @Throws(FfiException::class)
+    override fun `currentSample`(): kotlin.ULong =
+        FfiConverterULong.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    @Throws(FfiException::class)
+    override fun `flush`(): List<FfiAudioPipelineEvent> =
+        FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    @Throws(FfiException::class)
+    override fun `isListeningForHotword`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    @Throws(FfiException::class)
+    override fun `isSpeechActive`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `lastUtterance`(): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    @Throws(FfiException::class)
+    override fun `popEvent`(): FfiAudioPipelineEvent? =
+        FfiConverterOptionalTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `processChunk`(`chunk`: List<kotlin.Float>): List<FfiAudioPipelineEvent> =
+        FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+                        it,
+                        FfiConverterSequenceFloat.lower(`chunk`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    @Throws(FfiException::class)
+    override fun `reset`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    @Throws(FfiException::class)
+    override fun `state`(): FfiAudioPipelineState =
+        FfiConverterTypeFfiAudioPipelineState.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `takeLastUtterance`(): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    @Throws(FfiException::class)
+    override fun `transcribePcm`(`pcm`: List<kotlin.Float>): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+                        it,
+                        FfiConverterSequenceFloat.lower(`pcm`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    companion object {
+        /**
+         * Construct a pipeline from in-memory GGUF byte buffers.
+         */
+        @Throws(FfiException::class)
+        fun `fromBytes`(
+            `vadBytes`: kotlin.ByteArray?,
+            `hotwordBytes`: kotlin.ByteArray?,
+            `whisperBytes`: kotlin.ByteArray?,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+                        FfiConverterOptionalByteArray.lower(`vadBytes`),
+                        FfiConverterOptionalByteArray.lower(`hotwordBytes`),
+                        FfiConverterOptionalByteArray.lower(`whisperBytes`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Construct a pipeline from filesystem model paths.
+         */
+        @Throws(FfiException::class)
+        fun `fromFiles`(
+            `vadPath`: kotlin.String?,
+            `hotwordPath`: kotlin.String?,
+            `whisperPath`: kotlin.String?,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+                        FfiConverterOptionalString.lower(`vadPath`),
+                        FfiConverterOptionalString.lower(`hotwordPath`),
+                        FfiConverterOptionalString.lower(`whisperPath`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipeline : FfiConverter<FfiAudioPipeline, Long> {
+    override fun lower(value: FfiAudioPipeline): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): FfiAudioPipeline = FfiAudioPipeline(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): FfiAudioPipeline = lift(buf.getLong())
+
+    override fun allocationSize(value: FfiAudioPipeline) = 8UL
+
+    override fun write(
+        value: FfiAudioPipeline,
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
@@ -6226,6 +8436,7 @@ public interface FfiWhisperModelInterface {
 
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     fun `transcribe`(
         `pcm`: List<kotlin.Float>,
@@ -6234,6 +8445,8 @@ public interface FfiWhisperModelInterface {
 
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     suspend fun `transcribeAsync`(
         `pcm`: List<kotlin.Float>,
@@ -6377,6 +8590,7 @@ open class FfiWhisperModel :
 
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     @Throws(FfiException::class)
     override fun `transcribe`(
@@ -6398,6 +8612,8 @@ open class FfiWhisperModel :
 
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     @Throws(FfiException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
@@ -6461,6 +8677,281 @@ public object FfiConverterTypeFfiWhisperModel : FfiConverter<FfiWhisperModel, Lo
 
     override fun write(
         value: FfiWhisperModel,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+public interface GenerativeModelInterface {
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    fun `createSession`(`config`: SessionConfig): Session
+
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    fun `engine`(): CeraEngine
+
+    companion object
+}
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+open class GenerativeModel :
+    Disposable,
+    AutoCloseable,
+    GenerativeModelInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_generativemodel(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel(handle, status)
+        }
+    }
+
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    @Throws(FfiException::class)
+    override fun `createSession`(`config`: SessionConfig): Session =
+        FfiConverterTypeSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session(
+                        it,
+                        FfiConverterTypeSessionConfig.lower(`config`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    override fun `engine`(): CeraEngine =
+        FfiConverterTypeCeraEngine.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeGenerativeModel : FfiConverter<GenerativeModel, Long> {
+    override fun lower(value: GenerativeModel): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): GenerativeModel = GenerativeModel(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): GenerativeModel = lift(buf.getLong())
+
+    override fun allocationSize(value: GenerativeModel) = 8UL
+
+    override fun write(
+        value: GenerativeModel,
         buf: ByteBuffer,
     ) {
         buf.putLong(lower(value))
@@ -7326,6 +9817,564 @@ public object FfiConverterTypeModalitySink : FfiConverter<ModalitySink, Long> {
 //
 
 /**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+public interface ModelHandleInterface {
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    fun `asGenerative`(): GenerativeModel?
+
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    fun `kind`(): kotlin.String
+
+    companion object
+}
+
+/**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+open class ModelHandle :
+    Disposable,
+    AutoCloseable,
+    ModelHandleInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_modelhandle(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle(handle, status)
+        }
+    }
+
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    override fun `asGenerative`(): GenerativeModel? =
+        FfiConverterOptionalTypeGenerativeModel.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    override fun `kind`(): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelHandle : FfiConverter<ModelHandle, Long> {
+    override fun lower(value: ModelHandle): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ModelHandle = ModelHandle(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ModelHandle = lift(buf.getLong())
+
+    override fun allocationSize(value: ModelHandle) = 8UL
+
+    override fun write(
+        value: ModelHandle,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+public interface ModelLoaderInterface {
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    fun `build`(): ModelHandle
+
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    fun `buildGenerative`(): GenerativeModel
+
+    companion object
+}
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+open class ModelLoader :
+    Disposable,
+    AutoCloseable,
+    ModelLoaderInterface {
+    /**
+     * @suppress
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    /**
+     * Retain explicit source data and the existing production engine options.
+     * Construction does not load weights or contact a remote service.
+     */
+    constructor(`source`: ModelSource, `config`: EngineConfig) :
+        this(
+            UniffiWithHandle,
+            uniffiRustCall { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new(
+                    FfiConverterTypeModelSource.lower(`source`),
+                    FfiConverterTypeEngineConfig.lower(`config`),
+                    _status,
+                )
+            },
+        )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(
+        private val handle: Long,
+    ) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_cera_ffi_fn_free_modelloader(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        }
+        return uniffiRustCall { status ->
+            UniffiLib.uniffi_cera_ffi_fn_clone_modelloader(handle, status)
+        }
+    }
+
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    @Throws(LoadException::class)
+    override fun `build`(): ModelHandle =
+        FfiConverterTypeModelHandle.lift(
+            callWithHandle {
+                uniffiRustCallWithError(LoadException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    @Throws(LoadException::class)
+    override fun `buildGenerative`(): GenerativeModel =
+        FfiConverterTypeGenerativeModel.lift(
+            callWithHandle {
+                uniffiRustCallWithError(LoadException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * @suppress
+     */
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelLoader : FfiConverter<ModelLoader, Long> {
+    override fun lower(value: ModelLoader): Long = value.uniffiCloneHandle()
+
+    override fun lift(value: Long): ModelLoader = ModelLoader(UniffiWithHandle, value)
+
+    override fun read(buf: ByteBuffer): ModelLoader = lift(buf.getLong())
+
+    override fun allocationSize(value: ModelLoader) = 8UL
+
+    override fun write(
+        value: ModelLoader,
+        buf: ByteBuffer,
+    ) {
+        buf.putLong(lower(value))
+    }
+}
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+/**
  * Zero-dependency PII Classifier for named entity recognition.
  */
 public interface PiiClassifierInterface {
@@ -7791,6 +10840,11 @@ public interface SessionInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    fun `exportCheckpoint`(): kotlin.ByteArray
+
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -7940,6 +10994,25 @@ public interface SessionInterface {
     fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float>
 
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    fun `importCheckpoint`(`data`: kotlin.ByteArray)
+
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    fun `intoChat`(): ChatSession
+
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    fun `loadCheckpoint`(`path`: kotlin.String)
+
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -7962,14 +11035,25 @@ public interface SessionInterface {
     fun `reset`()
 
     /**
+     * Save current inference session checkpoint to a file.
+     */
+    fun `saveCheckpoint`(`path`: kotlin.String)
+
+    /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessage`(`message`: UserMessage)
 
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessageAndGenerate`(
         `message`: UserMessage,
@@ -7979,6 +11063,9 @@ public interface SessionInterface {
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     fun `sendMessageStreaming`(
         `message`: UserMessage,
@@ -7997,6 +11084,19 @@ public interface SessionInterface {
      * precedence over the model's minimum-resolution floor).
      */
     fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
+
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    fun `recoveryStatus`(): SessionRecoveryStatus
 
     companion object
 }
@@ -8375,6 +11475,22 @@ open class Session :
         )
 
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `exportCheckpoint`(): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -8641,6 +11757,56 @@ open class Session :
         )
 
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `importCheckpoint`(`data`: kotlin.ByteArray) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint(
+                    it,
+                    FfiConverterByteArray.lower(`data`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    @Throws(FfiException::class)
+    override fun `intoChat`(): ChatSession =
+        FfiConverterTypeChatSession.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    @Throws(FfiException::class)
+    override fun `loadCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_load_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -8691,8 +11857,26 @@ open class Session :
         }
 
     /**
+     * Save current inference session checkpoint to a file.
+     */
+    @Throws(FfiException::class)
+    override fun `saveCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_save_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessage`(`message`: UserMessage) =
@@ -8709,6 +11893,9 @@ open class Session :
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessageAndGenerate`(
@@ -8731,6 +11918,9 @@ open class Session :
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     @Throws(FfiException::class)
     override fun `sendMessageStreaming`(
@@ -8773,6 +11963,30 @@ open class Session :
                 )
             }
         }
+
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    @Throws(FfiException::class)
+    override fun `recoveryStatus`(): SessionRecoveryStatus =
+        FfiConverterTypeSessionRecoveryStatus.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_recovery_status(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
     /**
      * @suppress
@@ -8963,6 +12177,82 @@ public object FfiConverterTypeEngineConfig : FfiConverterRustBuffer<EngineConfig
 }
 
 /**
+ * Configuration options for the unified audio pipeline.
+ */
+data class FfiAudioPipelineConfig(
+    /**
+     * Whether a keyword spotting wake word must be detected before speech tracking begins.
+     */
+    var `requireHotword`: kotlin.Boolean,
+    /**
+     * Whether to automatically run Whisper transcription upon speech completion.
+     */
+    var `autoTranscribe`: kotlin.Boolean,
+    /**
+     * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+     */
+    var `preRollMs`: kotlin.UInt,
+    /**
+     * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+     */
+    var `maxUtteranceMs`: kotlin.UInt,
+    /**
+     * Voice Activity Detection configuration.
+     */
+    var `vadConfig`: FfiVadConfig?,
+    /**
+     * Keyword Spotting configuration.
+     */
+    var `hotwordConfig`: FfiHotwordConfig?,
+    /**
+     * Whisper transcription options.
+     */
+    var `whisperOpts`: FfiWhisperTranscribeOpts?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<FfiAudioPipelineConfig> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineConfig =
+        FfiAudioPipelineConfig(
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeFfiVadConfig.read(buf),
+            FfiConverterOptionalTypeFfiHotwordConfig.read(buf),
+            FfiConverterOptionalTypeFfiWhisperTranscribeOpts.read(buf),
+        )
+
+    override fun allocationSize(value: FfiAudioPipelineConfig) =
+        (
+            FfiConverterBoolean.allocationSize(value.`requireHotword`) +
+                FfiConverterBoolean.allocationSize(value.`autoTranscribe`) +
+                FfiConverterUInt.allocationSize(value.`preRollMs`) +
+                FfiConverterUInt.allocationSize(value.`maxUtteranceMs`) +
+                FfiConverterOptionalTypeFfiVadConfig.allocationSize(value.`vadConfig`) +
+                FfiConverterOptionalTypeFfiHotwordConfig.allocationSize(value.`hotwordConfig`) +
+                FfiConverterOptionalTypeFfiWhisperTranscribeOpts.allocationSize(value.`whisperOpts`)
+        )
+
+    override fun write(
+        value: FfiAudioPipelineConfig,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterBoolean.write(value.`requireHotword`, buf)
+        FfiConverterBoolean.write(value.`autoTranscribe`, buf)
+        FfiConverterUInt.write(value.`preRollMs`, buf)
+        FfiConverterUInt.write(value.`maxUtteranceMs`, buf)
+        FfiConverterOptionalTypeFfiVadConfig.write(value.`vadConfig`, buf)
+        FfiConverterOptionalTypeFfiHotwordConfig.write(value.`hotwordConfig`, buf)
+        FfiConverterOptionalTypeFfiWhisperTranscribeOpts.write(value.`whisperOpts`, buf)
+    }
+}
+
+/**
  * An identified PII entity span in source text.
  */
 data class FfiEntitySpan(
@@ -9116,15 +12406,16 @@ data class FfiHotwordEvent(
      */
     var `keyword`: kotlin.String,
     /**
-     * Exact audio stream sample index where the keyword completed.
+     * Exclusive end sample of the window evaluated when detection triggered.
+     * This is a detection-hop boundary; it does not locate the spoken word's end.
      */
     var `sampleOffset`: kotlin.ULong,
     /**
-     * Audio stream sample index including pre-roll safety margin for downstream ASR.
+     * `sample_offset` minus the configured pre-roll samples, saturating at zero.
      */
     var `commandStartSample`: kotlin.ULong,
     /**
-     * Timestamp in milliseconds from stream origin where keyword completed.
+     * `sample_offset` converted to milliseconds using the model sample rate.
      */
     var `timestampMs`: kotlin.Float,
     /**
@@ -9597,6 +12888,95 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
 }
 
 /**
+ * Recovery diagnostic retained after a failed `send_message` ingestion.
+ * The call's original error is still returned separately. Generation failures
+ * after successful ingestion do not create this report.
+ */
+data class IngestRecovery(
+    var `outcome`: RecoveryOutcome,
+    var `rewindError`: KvRewindFailure?,
+    var `resetError`: FfiException?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIngestRecovery : FfiConverterRustBuffer<IngestRecovery> {
+    override fun read(buf: ByteBuffer): IngestRecovery =
+        IngestRecovery(
+            FfiConverterTypeRecoveryOutcome.read(buf),
+            FfiConverterOptionalTypeKvRewindFailure.read(buf),
+            FfiConverterOptionalTypeFfiError.read(buf),
+        )
+
+    override fun allocationSize(value: IngestRecovery) =
+        (
+            FfiConverterTypeRecoveryOutcome.allocationSize(value.`outcome`) +
+                FfiConverterOptionalTypeKvRewindFailure.allocationSize(value.`rewindError`) +
+                FfiConverterOptionalTypeFfiError.allocationSize(value.`resetError`)
+        )
+
+    override fun write(
+        value: IngestRecovery,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeRecoveryOutcome.write(value.`outcome`, buf)
+        FfiConverterOptionalTypeKvRewindFailure.write(value.`rewindError`, buf)
+        FfiConverterOptionalTypeFfiError.write(value.`resetError`, buf)
+    }
+}
+
+/**
+ * Summary of a successful message ingestion.
+ */
+data class IngestSummary(
+    /**
+     * Number of tokens encoded and appended to context.
+     */
+    var `inputTokens`: kotlin.UInt,
+    /**
+     * KV position before ingestion.
+     */
+    var `positionBefore`: kotlin.UInt,
+    /**
+     * KV position after ingestion.
+     */
+    var `positionAfter`: kotlin.UInt,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIngestSummary : FfiConverterRustBuffer<IngestSummary> {
+    override fun read(buf: ByteBuffer): IngestSummary =
+        IngestSummary(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+
+    override fun allocationSize(value: IngestSummary) =
+        (
+            FfiConverterUInt.allocationSize(value.`inputTokens`) +
+                FfiConverterUInt.allocationSize(value.`positionBefore`) +
+                FfiConverterUInt.allocationSize(value.`positionAfter`)
+        )
+
+    override fun write(
+        value: IngestSummary,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterUInt.write(value.`inputTokens`, buf)
+        FfiConverterUInt.write(value.`positionBefore`, buf)
+        FfiConverterUInt.write(value.`positionAfter`, buf)
+    }
+}
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -9634,6 +13014,68 @@ public object FfiConverterTypeLeapBundleEntry : FfiConverterRustBuffer<LeapBundl
     ) {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterSequenceString.write(value.`quants`, buf)
+    }
+}
+
+/**
+ * A structured conversational turn message.
+ */
+data class Message(
+    /**
+     * Author role.
+     */
+    var `role`: Role,
+    /**
+     * Message text content.
+     */
+    var `content`: kotlin.String,
+    /**
+     * Optional image payload bytes.
+     */
+    var `imageBytes`: kotlin.ByteArray? = null,
+    /**
+     * Optional audio PCM waveform samples.
+     */
+    var `audioPcm`: List<kotlin.Float>? = null,
+    /**
+     * Audio sample rate in Hz (e.g. 16000).
+     */
+    var `audioSampleRate`: kotlin.UInt? = null,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMessage : FfiConverterRustBuffer<Message> {
+    override fun read(buf: ByteBuffer): Message =
+        Message(
+            FfiConverterTypeRole.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalSequenceFloat.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+        )
+
+    override fun allocationSize(value: Message) =
+        (
+            FfiConverterTypeRole.allocationSize(value.`role`) +
+                FfiConverterString.allocationSize(value.`content`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`imageBytes`) +
+                FfiConverterOptionalSequenceFloat.allocationSize(value.`audioPcm`) +
+                FfiConverterOptionalUInt.allocationSize(value.`audioSampleRate`)
+        )
+
+    override fun write(
+        value: Message,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeRole.write(value.`role`, buf)
+        FfiConverterString.write(value.`content`, buf)
+        FfiConverterOptionalByteArray.write(value.`imageBytes`, buf)
+        FfiConverterOptionalSequenceFloat.write(value.`audioPcm`, buf)
+        FfiConverterOptionalUInt.write(value.`audioSampleRate`, buf)
     }
 }
 
@@ -9682,6 +13124,62 @@ public object FfiConverterTypeModalityCapabilities : FfiConverterRustBuffer<Moda
         FfiConverterBoolean.write(value.`imageIn`, buf)
         FfiConverterBoolean.write(value.`audioIn`, buf)
         FfiConverterBoolean.write(value.`audioOut`, buf)
+    }
+}
+
+data class ModelFiles(
+    var `model`: kotlin.String,
+    var `multimodalProjector`: kotlin.String?,
+    var `audioDecoder`: kotlin.String?,
+    var `audioTokenizer`: kotlin.String?,
+    var `draftModel`: kotlin.String?,
+    var `extras`: Map<kotlin.String, kotlin.String>,
+    var `inferenceType`: kotlin.String?,
+    var `chatTemplate`: kotlin.String?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelFiles : FfiConverterRustBuffer<ModelFiles> {
+    override fun read(buf: ByteBuffer): ModelFiles =
+        ModelFiles(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterMapStringString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+
+    override fun allocationSize(value: ModelFiles) =
+        (
+            FfiConverterString.allocationSize(value.`model`) +
+                FfiConverterOptionalString.allocationSize(value.`multimodalProjector`) +
+                FfiConverterOptionalString.allocationSize(value.`audioDecoder`) +
+                FfiConverterOptionalString.allocationSize(value.`audioTokenizer`) +
+                FfiConverterOptionalString.allocationSize(value.`draftModel`) +
+                FfiConverterMapStringString.allocationSize(value.`extras`) +
+                FfiConverterOptionalString.allocationSize(value.`inferenceType`) +
+                FfiConverterOptionalString.allocationSize(value.`chatTemplate`)
+        )
+
+    override fun write(
+        value: ModelFiles,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`model`, buf)
+        FfiConverterOptionalString.write(value.`multimodalProjector`, buf)
+        FfiConverterOptionalString.write(value.`audioDecoder`, buf)
+        FfiConverterOptionalString.write(value.`audioTokenizer`, buf)
+        FfiConverterOptionalString.write(value.`draftModel`, buf)
+        FfiConverterMapStringString.write(value.`extras`, buf)
+        FfiConverterOptionalString.write(value.`inferenceType`, buf)
+        FfiConverterOptionalString.write(value.`chatTemplate`, buf)
     }
 }
 
@@ -9760,6 +13258,106 @@ public object FfiConverterTypeModelMetadata : FfiConverterRustBuffer<ModelMetada
     }
 }
 
+data class ModelParts(
+    var `model`: kotlin.ByteArray,
+    var `multimodalProjector`: kotlin.ByteArray?,
+    var `audioDecoder`: kotlin.ByteArray?,
+    var `audioTokenizer`: kotlin.ByteArray?,
+    var `draftModel`: kotlin.ByteArray?,
+    var `inferenceType`: kotlin.String?,
+    var `chatTemplate`: kotlin.String?,
+    var `generationDefaults`: GenerationDefaults?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelParts : FfiConverterRustBuffer<ModelParts> {
+    override fun read(buf: ByteBuffer): ModelParts =
+        ModelParts(
+            FfiConverterByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeGenerationDefaults.read(buf),
+        )
+
+    override fun allocationSize(value: ModelParts) =
+        (
+            FfiConverterByteArray.allocationSize(value.`model`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`multimodalProjector`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`audioDecoder`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`audioTokenizer`) +
+                FfiConverterOptionalByteArray.allocationSize(value.`draftModel`) +
+                FfiConverterOptionalString.allocationSize(value.`inferenceType`) +
+                FfiConverterOptionalString.allocationSize(value.`chatTemplate`) +
+                FfiConverterOptionalTypeGenerationDefaults.allocationSize(value.`generationDefaults`)
+        )
+
+    override fun write(
+        value: ModelParts,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterByteArray.write(value.`model`, buf)
+        FfiConverterOptionalByteArray.write(value.`multimodalProjector`, buf)
+        FfiConverterOptionalByteArray.write(value.`audioDecoder`, buf)
+        FfiConverterOptionalByteArray.write(value.`audioTokenizer`, buf)
+        FfiConverterOptionalByteArray.write(value.`draftModel`, buf)
+        FfiConverterOptionalString.write(value.`inferenceType`, buf)
+        FfiConverterOptionalString.write(value.`chatTemplate`, buf)
+        FfiConverterOptionalTypeGenerationDefaults.write(value.`generationDefaults`, buf)
+    }
+}
+
+data class SamplingDefaults(
+    var `temperature`: kotlin.Float?,
+    var `topP`: kotlin.Float?,
+    var `topK`: kotlin.UInt?,
+    var `minP`: kotlin.Float?,
+    var `repetitionPenalty`: kotlin.Float?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSamplingDefaults : FfiConverterRustBuffer<SamplingDefaults> {
+    override fun read(buf: ByteBuffer): SamplingDefaults =
+        SamplingDefaults(
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+            FfiConverterOptionalFloat.read(buf),
+        )
+
+    override fun allocationSize(value: SamplingDefaults) =
+        (
+            FfiConverterOptionalFloat.allocationSize(value.`temperature`) +
+                FfiConverterOptionalFloat.allocationSize(value.`topP`) +
+                FfiConverterOptionalUInt.allocationSize(value.`topK`) +
+                FfiConverterOptionalFloat.allocationSize(value.`minP`) +
+                FfiConverterOptionalFloat.allocationSize(value.`repetitionPenalty`)
+        )
+
+    override fun write(
+        value: SamplingDefaults,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterOptionalFloat.write(value.`temperature`, buf)
+        FfiConverterOptionalFloat.write(value.`topP`, buf)
+        FfiConverterOptionalUInt.write(value.`topK`, buf)
+        FfiConverterOptionalFloat.write(value.`minP`, buf)
+        FfiConverterOptionalFloat.write(value.`repetitionPenalty`, buf)
+    }
+}
+
 /**
  * Per-session configuration. Mirrors [`cera::SessionConfig`].
  */
@@ -9828,6 +13426,56 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
         FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
+    }
+}
+
+/**
+ * Coherent snapshot of a session at the instant the lock was acquired.
+ * Another thread may change the session after this method returns.
+ */
+data class SessionRecoveryStatus(
+    /**
+     * False requires a successful checked reset or recreation.
+     */
+    var `usable`: kotlin.Boolean,
+    /**
+     * Meaningful as reusable context only when `usable` is true.
+     */
+    var `position`: kotlin.UInt,
+    /**
+     * Cleared by successful whole-message ingestion or explicit reset.
+     * Raw append calls and cancellation controls leave it unchanged.
+     */
+    var `lastIngestRecovery`: IngestRecovery?,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionRecoveryStatus : FfiConverterRustBuffer<SessionRecoveryStatus> {
+    override fun read(buf: ByteBuffer): SessionRecoveryStatus =
+        SessionRecoveryStatus(
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeIngestRecovery.read(buf),
+        )
+
+    override fun allocationSize(value: SessionRecoveryStatus) =
+        (
+            FfiConverterBoolean.allocationSize(value.`usable`) +
+                FfiConverterUInt.allocationSize(value.`position`) +
+                FfiConverterOptionalTypeIngestRecovery.allocationSize(value.`lastIngestRecovery`)
+        )
+
+    override fun write(
+        value: SessionRecoveryStatus,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterBoolean.write(value.`usable`, buf)
+        FfiConverterUInt.write(value.`position`, buf)
+        FfiConverterOptionalTypeIngestRecovery.write(value.`lastIngestRecovery`, buf)
     }
 }
 
@@ -9964,6 +13612,61 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
 }
 
 /**
+ * Result of a completed chat turn.
+ */
+data class TurnResult(
+    /**
+     * Decoded assistant response text.
+     */
+    var `text`: kotlin.String,
+    /**
+     * Token identifiers emitted during the turn.
+     */
+    var `tokens`: List<kotlin.UInt>,
+    /**
+     * Generation summary metrics.
+     */
+    var `summary`: GenerateSummary,
+    /**
+     * Parsed tool calls emitted by the model during the turn.
+     */
+    var `toolCalls`: List<ToolCall> = listOf(),
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTurnResult : FfiConverterRustBuffer<TurnResult> {
+    override fun read(buf: ByteBuffer): TurnResult =
+        TurnResult(
+            FfiConverterString.read(buf),
+            FfiConverterSequenceUInt.read(buf),
+            FfiConverterTypeGenerateSummary.read(buf),
+            FfiConverterSequenceTypeToolCall.read(buf),
+        )
+
+    override fun allocationSize(value: TurnResult) =
+        (
+            FfiConverterString.allocationSize(value.`text`) +
+                FfiConverterSequenceUInt.allocationSize(value.`tokens`) +
+                FfiConverterTypeGenerateSummary.allocationSize(value.`summary`) +
+                FfiConverterSequenceTypeToolCall.allocationSize(value.`toolCalls`)
+        )
+
+    override fun write(
+        value: TurnResult,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`text`, buf)
+        FfiConverterSequenceUInt.write(value.`tokens`, buf)
+        FfiConverterTypeGenerateSummary.write(value.`summary`, buf)
+        FfiConverterSequenceTypeToolCall.write(value.`toolCalls`, buf)
+    }
+}
+
+/**
  * User-facing multimodal input envelope.
  */
 data class UserMessage(
@@ -10045,6 +13748,284 @@ public object FfiConverterTypeBackendPreference : FfiConverterRustBuffer<Backend
 
     override fun write(
         value: BackendPreference,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * An event emitted by the unified audio pipeline.
+ */
+sealed class FfiAudioPipelineEvent {
+    /**
+     * Keyword spotting detected a wake word.
+     */
+    data class WakeWordDetected(
+        /**
+         * Triggered keyword.
+         */
+        val `keyword`: kotlin.String,
+        /**
+         * Confidence probability between 0.0 and 1.0.
+         */
+        val `confidence`: kotlin.Float,
+        /**
+         * Timestamp in milliseconds from stream start.
+         */
+        val `timestampMs`: kotlin.Float,
+        /**
+         * Sample offset where the detection hop completed.
+         */
+        val `sampleOffset`: kotlin.ULong,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Voice Activity Detection identified speech onset.
+     */
+    data class SpeechStart(
+        /**
+         * Sample index where speech began.
+         */
+        val `sample`: kotlin.ULong,
+        /**
+         * Timestamp in milliseconds from stream start.
+         */
+        val `ms`: kotlin.Float,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Voice Activity Detection identified speech termination.
+     */
+    data class SpeechEnd(
+        /**
+         * Starting sample index of the speech segment.
+         */
+        val `startSample`: kotlin.ULong,
+        /**
+         * Ending sample index of the speech segment.
+         */
+        val `endSample`: kotlin.ULong,
+        /**
+         * Start timestamp in milliseconds.
+         */
+        val `startMs`: kotlin.Float,
+        /**
+         * End timestamp in milliseconds.
+         */
+        val `endMs`: kotlin.Float,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    /**
+     * Whisper transcription completed for a speech utterance.
+     */
+    data class UtteranceTranscribed(
+        /**
+         * Recognized text output.
+         */
+        val `text`: kotlin.String,
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */
+        val `startMs`: kotlin.Float,
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */
+        val `endMs`: kotlin.Float,
+        /**
+         * Number of 16 kHz audio samples transcribed.
+         */
+        val `sampleCount`: kotlin.ULong,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<FfiAudioPipelineEvent> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineEvent =
+        when (buf.getInt()) {
+            1 -> {
+                FfiAudioPipelineEvent.WakeWordDetected(
+                    FfiConverterString.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            2 -> {
+                FfiAudioPipelineEvent.SpeechStart(
+                    FfiConverterULong.read(buf),
+                    FfiConverterFloat.read(buf),
+                )
+            }
+
+            3 -> {
+                FfiAudioPipelineEvent.SpeechEnd(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                )
+            }
+
+            4 -> {
+                FfiAudioPipelineEvent.UtteranceTranscribed(
+                    FfiConverterString.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: FfiAudioPipelineEvent) =
+        when (value) {
+            is FfiAudioPipelineEvent.WakeWordDetected -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`keyword`) +
+                        FfiConverterFloat.allocationSize(value.`confidence`) +
+                        FfiConverterFloat.allocationSize(value.`timestampMs`) +
+                        FfiConverterULong.allocationSize(value.`sampleOffset`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.SpeechStart -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`sample`) +
+                        FfiConverterFloat.allocationSize(value.`ms`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.SpeechEnd -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`startSample`) +
+                        FfiConverterULong.allocationSize(value.`endSample`) +
+                        FfiConverterFloat.allocationSize(value.`startMs`) +
+                        FfiConverterFloat.allocationSize(value.`endMs`)
+                )
+            }
+
+            is FfiAudioPipelineEvent.UtteranceTranscribed -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`text`) +
+                        FfiConverterFloat.allocationSize(value.`startMs`) +
+                        FfiConverterFloat.allocationSize(value.`endMs`) +
+                        FfiConverterULong.allocationSize(value.`sampleCount`)
+                )
+            }
+        }
+
+    override fun write(
+        value: FfiAudioPipelineEvent,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is FfiAudioPipelineEvent.WakeWordDetected -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`keyword`, buf)
+                FfiConverterFloat.write(value.`confidence`, buf)
+                FfiConverterFloat.write(value.`timestampMs`, buf)
+                FfiConverterULong.write(value.`sampleOffset`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.SpeechStart -> {
+                buf.putInt(2)
+                FfiConverterULong.write(value.`sample`, buf)
+                FfiConverterFloat.write(value.`ms`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.SpeechEnd -> {
+                buf.putInt(3)
+                FfiConverterULong.write(value.`startSample`, buf)
+                FfiConverterULong.write(value.`endSample`, buf)
+                FfiConverterFloat.write(value.`startMs`, buf)
+                FfiConverterFloat.write(value.`endMs`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.UtteranceTranscribed -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`text`, buf)
+                FfiConverterFloat.write(value.`startMs`, buf)
+                FfiConverterFloat.write(value.`endMs`, buf)
+                FfiConverterULong.write(value.`sampleCount`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Active state of the streaming audio pipeline.
+ */
+
+enum class FfiAudioPipelineState {
+    /**
+     * Awaiting a keyword spotting wake word before activating speech recording.
+     */
+    LISTENING_FOR_HOTWORD,
+
+    /**
+     * Evaluating incoming audio frames to detect speech onset.
+     */
+    LISTENING_FOR_SPEECH,
+
+    /**
+     * Speech onset detected; accumulating utterance samples in the audio buffer.
+     */
+    SPEECH_ACTIVE,
+
+    /**
+     * Transcribing the accumulated speech utterance using Whisper.
+     */
+    TRANSCRIBING,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAudioPipelineState : FfiConverterRustBuffer<FfiAudioPipelineState> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            FfiAudioPipelineState.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: FfiAudioPipelineState) = 4UL
+
+    override fun write(
+        value: FfiAudioPipelineState,
         buf: ByteBuffer,
     ) {
         buf.putInt(value.ordinal + 1)
@@ -10290,6 +14271,16 @@ sealed class FfiException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * Chat contract validation failure.
+     */
+    class ChatValidation(
+        val `error`: ValidationError,
+    ) : FfiException() {
+        override val message
+            get() = "error=${ `error` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<FfiException> {
         override fun lift(error_buf: RustBuffer.ByValue): FfiException = FfiConverterTypeFfiError.lift(error_buf)
     }
@@ -10377,6 +14368,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             14 -> {
                 FfiException.LoraUnsupportedByBackend(
                     FfiConverterString.read(buf),
+                )
+            }
+
+            15 -> {
+                FfiException.ChatValidation(
+                    FfiConverterTypeValidationError.read(buf),
                 )
             }
 
@@ -10469,6 +14466,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
             )
+
+            is FfiException.ChatValidation -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterTypeValidationError.allocationSize(value.`error`)
+            )
         }
 
     override fun write(
@@ -10556,6 +14559,12 @@ public object FfiConverterTypeFfiError : FfiConverterRustBuffer<FfiException> {
             is FfiException.LoraUnsupportedByBackend -> {
                 buf.putInt(14)
                 FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is FfiException.ChatValidation -> {
+                buf.putInt(15)
+                FfiConverterTypeValidationError.write(value.`error`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -10842,6 +14851,122 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
     }
 }
 
+sealed class GenerationDefaults {
+    data class Text(
+        val `sampling`: uniffi.cera_ffi.SamplingDefaults,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    data class Audio(
+        val `sampling`: uniffi.cera_ffi.SamplingDefaults,
+        val `numberOfDecodingThreads`: kotlin.UInt?,
+        val `audioTemperature`: kotlin.Float?,
+        val `audioTopK`: kotlin.UInt?,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    data class Other(
+        val `rawJson`: kotlin.String,
+    ) : GenerationDefaults() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeGenerationDefaults : FfiConverterRustBuffer<GenerationDefaults> {
+    override fun read(buf: ByteBuffer): GenerationDefaults =
+        when (buf.getInt()) {
+            1 -> {
+                GenerationDefaults.Text(
+                    FfiConverterTypeSamplingDefaults.read(buf),
+                )
+            }
+
+            2 -> {
+                GenerationDefaults.Audio(
+                    FfiConverterTypeSamplingDefaults.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                    FfiConverterOptionalFloat.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                )
+            }
+
+            3 -> {
+                GenerationDefaults.Other(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: GenerationDefaults) =
+        when (value) {
+            is GenerationDefaults.Text -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSamplingDefaults.allocationSize(value.`sampling`)
+                )
+            }
+
+            is GenerationDefaults.Audio -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSamplingDefaults.allocationSize(value.`sampling`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`numberOfDecodingThreads`) +
+                        FfiConverterOptionalFloat.allocationSize(value.`audioTemperature`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`audioTopK`)
+                )
+            }
+
+            is GenerationDefaults.Other -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`rawJson`)
+                )
+            }
+        }
+
+    override fun write(
+        value: GenerationDefaults,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is GenerationDefaults.Text -> {
+                buf.putInt(1)
+                FfiConverterTypeSamplingDefaults.write(value.`sampling`, buf)
+                Unit
+            }
+
+            is GenerationDefaults.Audio -> {
+                buf.putInt(2)
+                FfiConverterTypeSamplingDefaults.write(value.`sampling`, buf)
+                FfiConverterOptionalUInt.write(value.`numberOfDecodingThreads`, buf)
+                FfiConverterOptionalFloat.write(value.`audioTemperature`, buf)
+                FfiConverterOptionalUInt.write(value.`audioTopK`, buf)
+                Unit
+            }
+
+            is GenerationDefaults.Other -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`rawJson`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
  * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
@@ -10962,6 +15087,802 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
 }
 
 /**
+ * Why checked tail rewind was unavailable. Numeric positions are token counts.
+ */
+sealed class KvRewindFailure {
+    data class OutOfBounds(
+        val `requested`: kotlin.ULong,
+        val `current`: kotlin.ULong,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    object Compressed : KvRewindFailure()
+
+    object NonCausal : KvRewindFailure()
+
+    data class MissingConvolutionCheckpoint(
+        val `layer`: kotlin.ULong,
+        val `position`: kotlin.ULong,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    data class InvalidCacheLayout(
+        val `layer`: kotlin.ULong,
+        val `detail`: kotlin.String,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    object BackendUnsupported : KvRewindFailure()
+
+    data class Unknown(
+        val `detail`: kotlin.String,
+    ) : KvRewindFailure() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeKvRewindFailure : FfiConverterRustBuffer<KvRewindFailure> {
+    override fun read(buf: ByteBuffer): KvRewindFailure =
+        when (buf.getInt()) {
+            1 -> {
+                KvRewindFailure.OutOfBounds(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            2 -> {
+                KvRewindFailure.Compressed
+            }
+
+            3 -> {
+                KvRewindFailure.NonCausal
+            }
+
+            4 -> {
+                KvRewindFailure.MissingConvolutionCheckpoint(
+                    FfiConverterULong.read(buf),
+                    FfiConverterULong.read(buf),
+                )
+            }
+
+            5 -> {
+                KvRewindFailure.InvalidCacheLayout(
+                    FfiConverterULong.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                KvRewindFailure.BackendUnsupported
+            }
+
+            7 -> {
+                KvRewindFailure.Unknown(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: KvRewindFailure) =
+        when (value) {
+            is KvRewindFailure.OutOfBounds -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`requested`) +
+                        FfiConverterULong.allocationSize(value.`current`)
+                )
+            }
+
+            is KvRewindFailure.Compressed -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.NonCausal -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.MissingConvolutionCheckpoint -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`layer`) +
+                        FfiConverterULong.allocationSize(value.`position`)
+                )
+            }
+
+            is KvRewindFailure.InvalidCacheLayout -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterULong.allocationSize(value.`layer`) +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+
+            is KvRewindFailure.BackendUnsupported -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is KvRewindFailure.Unknown -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+        }
+
+    override fun write(
+        value: KvRewindFailure,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is KvRewindFailure.OutOfBounds -> {
+                buf.putInt(1)
+                FfiConverterULong.write(value.`requested`, buf)
+                FfiConverterULong.write(value.`current`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.Compressed -> {
+                buf.putInt(2)
+                Unit
+            }
+
+            is KvRewindFailure.NonCausal -> {
+                buf.putInt(3)
+                Unit
+            }
+
+            is KvRewindFailure.MissingConvolutionCheckpoint -> {
+                buf.putInt(4)
+                FfiConverterULong.write(value.`layer`, buf)
+                FfiConverterULong.write(value.`position`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.InvalidCacheLayout -> {
+                buf.putInt(5)
+                FfiConverterULong.write(value.`layer`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is KvRewindFailure.BackendUnsupported -> {
+                buf.putInt(6)
+                Unit
+            }
+
+            is KvRewindFailure.Unknown -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+sealed class LoadException : kotlin.Exception() {
+    class KindMismatch(
+        val `expected`: kotlin.String,
+        val `actual`: kotlin.String,
+        val `architecture`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "expected=${ `expected` }, actual=${ `actual` }, architecture=${ `architecture` }"
+    }
+
+    class UnsupportedArchitecture(
+        val `architecture`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "architecture=${ `architecture` }"
+    }
+
+    class UnsupportedInferenceType(
+        val `inferenceType`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "inferenceType=${ `inferenceType` }"
+    }
+
+    class Source(
+        val `sourceKind`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "sourceKind=${ `sourceKind` }, detail=${ `detail` }"
+    }
+
+    class Assembly(
+        val `backend`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "backend=${ `backend` }, detail=${ `detail` }"
+    }
+
+    class InvalidConfig(
+        val `field`: kotlin.String,
+        val `value`: kotlin.String,
+        val `reason`: kotlin.String,
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "field=${ `field` }, value=${ `value` }, reason=${ `reason` }, detail=${ `detail` }"
+    }
+
+    class Engine(
+        val `detail`: kotlin.String,
+    ) : LoadException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
+    class Consumed : LoadException() {
+        override val message
+            get() = ""
+    }
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<LoadException> {
+        override fun lift(error_buf: RustBuffer.ByValue): LoadException = FfiConverterTypeLoadError.lift(error_buf)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLoadError : FfiConverterRustBuffer<LoadException> {
+    override fun read(buf: ByteBuffer): LoadException =
+        when (buf.getInt()) {
+            1 -> {
+                LoadException.KindMismatch(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            2 -> {
+                LoadException.UnsupportedArchitecture(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            3 -> {
+                LoadException.UnsupportedInferenceType(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            4 -> {
+                LoadException.Source(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            5 -> {
+                LoadException.Assembly(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                LoadException.InvalidConfig(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            7 -> {
+                LoadException.Engine(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            8 -> {
+                LoadException.Consumed()
+            }
+
+            else -> {
+                throw RuntimeException("invalid error enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: LoadException): ULong =
+        when (value) {
+            is LoadException.KindMismatch -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`expected`) +
+                    FfiConverterString.allocationSize(value.`actual`) +
+                    FfiConverterString.allocationSize(value.`architecture`)
+            )
+
+            is LoadException.UnsupportedArchitecture -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`architecture`)
+            )
+
+            is LoadException.UnsupportedInferenceType -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`inferenceType`)
+            )
+
+            is LoadException.Source -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`sourceKind`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Assembly -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`backend`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.InvalidConfig -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`field`) +
+                    FfiConverterString.allocationSize(value.`value`) +
+                    FfiConverterString.allocationSize(value.`reason`) +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Engine -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is LoadException.Consumed -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+            )
+        }
+
+    override fun write(
+        value: LoadException,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is LoadException.KindMismatch -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`expected`, buf)
+                FfiConverterString.write(value.`actual`, buf)
+                FfiConverterString.write(value.`architecture`, buf)
+                Unit
+            }
+
+            is LoadException.UnsupportedArchitecture -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`architecture`, buf)
+                Unit
+            }
+
+            is LoadException.UnsupportedInferenceType -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`inferenceType`, buf)
+                Unit
+            }
+
+            is LoadException.Source -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`sourceKind`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Assembly -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`backend`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.InvalidConfig -> {
+                buf.putInt(6)
+                FfiConverterString.write(value.`field`, buf)
+                FfiConverterString.write(value.`value`, buf)
+                FfiConverterString.write(value.`reason`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Engine -> {
+                buf.putInt(7)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is LoadException.Consumed -> {
+                buf.putInt(8)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+sealed class ModelSource {
+    data class BundleId(
+        val `id`: kotlin.String,
+        val `quant`: kotlin.String,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class HuggingFace(
+        val `spec`: kotlin.String,
+        val `quant`: kotlin.String?,
+        val `strategy`: kotlin.String?,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Bytes(
+        val `bytes`: kotlin.ByteArray,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Parts(
+        val `parts`: uniffi.cera_ffi.ModelParts,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Path(
+        val `path`: kotlin.String,
+    ) : ModelSource() {
+        companion object
+    }
+
+    data class Files(
+        val `files`: uniffi.cera_ffi.ModelFiles,
+    ) : ModelSource() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeModelSource : FfiConverterRustBuffer<ModelSource> {
+    override fun read(buf: ByteBuffer): ModelSource =
+        when (buf.getInt()) {
+            1 -> {
+                ModelSource.BundleId(
+                    FfiConverterString.read(buf),
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            2 -> {
+                ModelSource.HuggingFace(
+                    FfiConverterString.read(buf),
+                    FfiConverterOptionalString.read(buf),
+                    FfiConverterOptionalString.read(buf),
+                )
+            }
+
+            3 -> {
+                ModelSource.Bytes(
+                    FfiConverterByteArray.read(buf),
+                )
+            }
+
+            4 -> {
+                ModelSource.Parts(
+                    FfiConverterTypeModelParts.read(buf),
+                )
+            }
+
+            5 -> {
+                ModelSource.Path(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            6 -> {
+                ModelSource.Files(
+                    FfiConverterTypeModelFiles.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: ModelSource) =
+        when (value) {
+            is ModelSource.BundleId -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`id`) +
+                        FfiConverterString.allocationSize(value.`quant`)
+                )
+            }
+
+            is ModelSource.HuggingFace -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`spec`) +
+                        FfiConverterOptionalString.allocationSize(value.`quant`) +
+                        FfiConverterOptionalString.allocationSize(value.`strategy`)
+                )
+            }
+
+            is ModelSource.Bytes -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterByteArray.allocationSize(value.`bytes`)
+                )
+            }
+
+            is ModelSource.Parts -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeModelParts.allocationSize(value.`parts`)
+                )
+            }
+
+            is ModelSource.Path -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`path`)
+                )
+            }
+
+            is ModelSource.Files -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeModelFiles.allocationSize(value.`files`)
+                )
+            }
+        }
+
+    override fun write(
+        value: ModelSource,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is ModelSource.BundleId -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`id`, buf)
+                FfiConverterString.write(value.`quant`, buf)
+                Unit
+            }
+
+            is ModelSource.HuggingFace -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`spec`, buf)
+                FfiConverterOptionalString.write(value.`quant`, buf)
+                FfiConverterOptionalString.write(value.`strategy`, buf)
+                Unit
+            }
+
+            is ModelSource.Bytes -> {
+                buf.putInt(3)
+                FfiConverterByteArray.write(value.`bytes`, buf)
+                Unit
+            }
+
+            is ModelSource.Parts -> {
+                buf.putInt(4)
+                FfiConverterTypeModelParts.write(value.`parts`, buf)
+                Unit
+            }
+
+            is ModelSource.Path -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+
+            is ModelSource.Files -> {
+                buf.putInt(6)
+                FfiConverterTypeModelFiles.write(value.`files`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Execution state after a failed whole-message append.
+ */
+
+enum class RecoveryOutcome {
+    UNCHANGED,
+    RESTORED,
+    RESET,
+    UNUSABLE,
+
+    /**
+     * A newer core outcome; conservatively recreate the session.
+     */
+    UNKNOWN,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRecoveryOutcome : FfiConverterRustBuffer<RecoveryOutcome> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            RecoveryOutcome.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: RecoveryOutcome) = 4UL
+
+    override fun write(
+        value: RecoveryOutcome,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Message author role in conversational chat.
+ */
+
+enum class Role {
+    /**
+     * System prompt setting instructions and context.
+     */
+    SYSTEM,
+
+    /**
+     * User prompt input.
+     */
+    USER,
+
+    /**
+     * Assistant model response.
+     */
+    ASSISTANT,
+
+    /**
+     * Tool result or response payload.
+     */
+    TOOL,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRole : FfiConverterRustBuffer<Role> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            Role.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: Role) = 4UL
+
+    override fun write(
+        value: Role,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Lifecycle phase of a stateful chat coordinator.
+ */
+
+enum class SessionPhase {
+    /**
+     * Clean session at position 0, ready for initial message ingestion.
+     */
+    IDLE,
+
+    /**
+     * Input messages have been appended and prefilled; ready for decode.
+     */
+    PROMPT_READY,
+
+    /**
+     * A turn finished with a terminal end-of-sequence stop marker.
+     */
+    TURN_COMPLETE,
+
+    /**
+     * Generation was interrupted by cancellation or custom nonterminal stop.
+     */
+    INTERRUPTED,
+
+    /**
+     * Underlying execution state was modified outside chat rules; replacement required.
+     */
+    RAW_CONTEXT,
+
+    /**
+     * Unrecoverable execution fault or unwind; checked reset required to restore usability.
+     */
+    UNUSABLE,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionPhase : FfiConverterRustBuffer<SessionPhase> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            SessionPhase.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: SessionPhase) = 4UL
+
+    override fun write(
+        value: SessionPhase,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
  * The tool-call wire format a model family uses. Mirrors
  * [`cera::tools::ToolFormat`]. Get one from
  * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
@@ -11004,6 +15925,359 @@ public object FfiConverterTypeToolFormat : FfiConverterRustBuffer<ToolFormat> {
         buf: ByteBuffer,
     ) {
         buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
+ * Validation failure during chat construction, preparation, or decode.
+ */
+sealed class ValidationError {
+    /**
+     * Model or tokenizer configuration does not match a supported chat profile.
+     */
+    object UnsupportedProfile : ValidationError()
+
+    /**
+     * Sliding context configuration (n_keep != 0) is not supported for chat.
+     */
+    object SlidingContext : ValidationError()
+
+    /**
+     * Model audio output is not supported for text chat.
+     */
+    object AudioOutput : ValidationError()
+
+    /**
+     * Generation parameter validation error.
+     */
+    data class Generation(
+        val `detail`: kotlin.String,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Operation refused in the current session phase.
+     */
+    data class Phase(
+        val `phase`: uniffi.cera_ffi.SessionPhase,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message batch provided to ingest was empty.
+     */
+    object EmptyBatch : ValidationError()
+
+    /**
+     * Message role sequence violates chat rules.
+     */
+    data class RoleOrder(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message role is not supported in the active profile.
+     */
+    data class UnsupportedRole(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Content part is not supported in the active profile.
+     */
+    data class UnsupportedContent(
+        val `message`: kotlin.UInt,
+        val `part`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Message text contains a reserved ChatML marker sequence.
+     */
+    data class ReservedMarker(
+        val `message`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Context tokens required exceed available capacity in the KV cache.
+     */
+    data class Capacity(
+        val `required`: kotlin.UInt,
+        val `available`: kotlin.UInt,
+    ) : ValidationError() {
+        companion object
+    }
+
+    /**
+     * Chat template rendering error.
+     */
+    data class Template(
+        val `detail`: kotlin.String,
+    ) : ValidationError() {
+        companion object
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeValidationError : FfiConverterRustBuffer<ValidationError> {
+    override fun read(buf: ByteBuffer): ValidationError =
+        when (buf.getInt()) {
+            1 -> {
+                ValidationError.UnsupportedProfile
+            }
+
+            2 -> {
+                ValidationError.SlidingContext
+            }
+
+            3 -> {
+                ValidationError.AudioOutput
+            }
+
+            4 -> {
+                ValidationError.Generation(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            5 -> {
+                ValidationError.Phase(
+                    FfiConverterTypeSessionPhase.read(buf),
+                )
+            }
+
+            6 -> {
+                ValidationError.EmptyBatch
+            }
+
+            7 -> {
+                ValidationError.RoleOrder(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            8 -> {
+                ValidationError.UnsupportedRole(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            9 -> {
+                ValidationError.UnsupportedContent(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            10 -> {
+                ValidationError.ReservedMarker(
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            11 -> {
+                ValidationError.Capacity(
+                    FfiConverterUInt.read(buf),
+                    FfiConverterUInt.read(buf),
+                )
+            }
+
+            12 -> {
+                ValidationError.Template(
+                    FfiConverterString.read(buf),
+                )
+            }
+
+            else -> {
+                throw RuntimeException("invalid enum value, something is very wrong!!")
+            }
+        }
+
+    override fun allocationSize(value: ValidationError) =
+        when (value) {
+            is ValidationError.UnsupportedProfile -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.SlidingContext -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.AudioOutput -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.Generation -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+
+            is ValidationError.Phase -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterTypeSessionPhase.allocationSize(value.`phase`)
+                )
+            }
+
+            is ValidationError.EmptyBatch -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL
+                )
+            }
+
+            is ValidationError.RoleOrder -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.UnsupportedRole -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.UnsupportedContent -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`) +
+                        FfiConverterUInt.allocationSize(value.`part`)
+                )
+            }
+
+            is ValidationError.ReservedMarker -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`message`)
+                )
+            }
+
+            is ValidationError.Capacity -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterUInt.allocationSize(value.`required`) +
+                        FfiConverterUInt.allocationSize(value.`available`)
+                )
+            }
+
+            is ValidationError.Template -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`detail`)
+                )
+            }
+        }
+
+    override fun write(
+        value: ValidationError,
+        buf: ByteBuffer,
+    ) {
+        when (value) {
+            is ValidationError.UnsupportedProfile -> {
+                buf.putInt(1)
+                Unit
+            }
+
+            is ValidationError.SlidingContext -> {
+                buf.putInt(2)
+                Unit
+            }
+
+            is ValidationError.AudioOutput -> {
+                buf.putInt(3)
+                Unit
+            }
+
+            is ValidationError.Generation -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is ValidationError.Phase -> {
+                buf.putInt(5)
+                FfiConverterTypeSessionPhase.write(value.`phase`, buf)
+                Unit
+            }
+
+            is ValidationError.EmptyBatch -> {
+                buf.putInt(6)
+                Unit
+            }
+
+            is ValidationError.RoleOrder -> {
+                buf.putInt(7)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.UnsupportedRole -> {
+                buf.putInt(8)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.UnsupportedContent -> {
+                buf.putInt(9)
+                FfiConverterUInt.write(value.`message`, buf)
+                FfiConverterUInt.write(value.`part`, buf)
+                Unit
+            }
+
+            is ValidationError.ReservedMarker -> {
+                buf.putInt(10)
+                FfiConverterUInt.write(value.`message`, buf)
+                Unit
+            }
+
+            is ValidationError.Capacity -> {
+                buf.putInt(11)
+                FfiConverterUInt.write(value.`required`, buf)
+                FfiConverterUInt.write(value.`available`, buf)
+                Unit
+            }
+
+            is ValidationError.Template -> {
+                buf.putInt(12)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
@@ -11202,6 +16476,38 @@ public object FfiConverterOptionalTypeBundleRepo : FfiConverterRustBuffer<Bundle
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeGenerativeModel : FfiConverterRustBuffer<GenerativeModel?> {
+    override fun read(buf: ByteBuffer): GenerativeModel? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeGenerativeModel.read(buf)
+    }
+
+    override fun allocationSize(value: GenerativeModel?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeGenerativeModel.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: GenerativeModel?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeGenerativeModel.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeAudioInput : FfiConverterRustBuffer<AudioInput?> {
     override fun read(buf: ByteBuffer): AudioInput? {
         if (buf.get().toInt() == 0) {
@@ -11227,6 +16533,38 @@ public object FfiConverterOptionalTypeAudioInput : FfiConverterRustBuffer<AudioI
         } else {
             buf.put(1)
             FfiConverterTypeAudioInput.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<FfiAudioPipelineConfig?> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiAudioPipelineConfig.read(buf)
+    }
+
+    override fun allocationSize(value: FfiAudioPipelineConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiAudioPipelineConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiAudioPipelineConfig?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiAudioPipelineConfig.write(value, buf)
         }
     }
 }
@@ -11362,6 +16700,38 @@ public object FfiConverterOptionalTypeFfiWhisperTranscribeOpts : FfiConverterRus
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeIngestRecovery : FfiConverterRustBuffer<IngestRecovery?> {
+    override fun read(buf: ByteBuffer): IngestRecovery? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeIngestRecovery.read(buf)
+    }
+
+    override fun allocationSize(value: IngestRecovery?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeIngestRecovery.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: IngestRecovery?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeIngestRecovery.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<SpecDecodeConfig?> {
     override fun read(buf: ByteBuffer): SpecDecodeConfig? {
         if (buf.get().toInt() == 0) {
@@ -11387,6 +16757,70 @@ public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<
         } else {
             buf.put(1)
             FfiConverterTypeSpecDecodeConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<FfiAudioPipelineEvent?> {
+    override fun read(buf: ByteBuffer): FfiAudioPipelineEvent? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiAudioPipelineEvent.read(buf)
+    }
+
+    override fun allocationSize(value: FfiAudioPipelineEvent?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiAudioPipelineEvent.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiAudioPipelineEvent?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiAudioPipelineEvent.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiError : FfiConverterRustBuffer<FfiException?> {
+    override fun read(buf: ByteBuffer): FfiException? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiError.read(buf)
+    }
+
+    override fun allocationSize(value: FfiException?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiError.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: FfiException?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiError.write(value, buf)
         }
     }
 }
@@ -11426,6 +16860,38 @@ public object FfiConverterOptionalTypeFfiVadEvent : FfiConverterRustBuffer<FfiVa
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeGenerationDefaults : FfiConverterRustBuffer<GenerationDefaults?> {
+    override fun read(buf: ByteBuffer): GenerationDefaults? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeGenerationDefaults.read(buf)
+    }
+
+    override fun allocationSize(value: GenerationDefaults?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeGenerationDefaults.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: GenerationDefaults?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeGenerationDefaults.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeKvCompression : FfiConverterRustBuffer<KvCompression?> {
     override fun read(buf: ByteBuffer): KvCompression? {
         if (buf.get().toInt() == 0) {
@@ -11458,6 +16924,38 @@ public object FfiConverterOptionalTypeKvCompression : FfiConverterRustBuffer<KvC
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeKvRewindFailure : FfiConverterRustBuffer<KvRewindFailure?> {
+    override fun read(buf: ByteBuffer): KvRewindFailure? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeKvRewindFailure.read(buf)
+    }
+
+    override fun allocationSize(value: KvRewindFailure?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeKvRewindFailure.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: KvRewindFailure?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeKvRewindFailure.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeToolFormat : FfiConverterRustBuffer<ToolFormat?> {
     override fun read(buf: ByteBuffer): ToolFormat? {
         if (buf.get().toInt() == 0) {
@@ -11483,6 +16981,38 @@ public object FfiConverterOptionalTypeToolFormat : FfiConverterRustBuffer<ToolFo
         } else {
             buf.put(1)
             FfiConverterTypeToolFormat.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceFloat : FfiConverterRustBuffer<List<kotlin.Float>?> {
+    override fun read(buf: ByteBuffer): List<kotlin.Float>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceFloat.read(buf)
+    }
+
+    override fun allocationSize(value: List<kotlin.Float>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceFloat.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: List<kotlin.Float>?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceFloat.write(value, buf)
         }
     }
 }
@@ -11714,6 +17244,34 @@ public object FfiConverterSequenceTypeLeapBundleEntry : FfiConverterRustBuffer<L
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeMessage : FfiConverterRustBuffer<List<Message>> {
+    override fun read(buf: ByteBuffer): List<Message> {
+        val len = buf.getInt()
+        return List<Message>(len) {
+            FfiConverterTypeMessage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<Message>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMessage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<Message>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMessage.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeToolCall : FfiConverterRustBuffer<List<ToolCall>> {
     override fun read(buf: ByteBuffer): List<ToolCall> {
         val len = buf.getInt()
@@ -11763,6 +17321,75 @@ public object FfiConverterSequenceTypeToolDef : FfiConverterRustBuffer<List<Tool
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeToolDef.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<List<FfiAudioPipelineEvent>> {
+    override fun read(buf: ByteBuffer): List<FfiAudioPipelineEvent> {
+        val len = buf.getInt()
+        return List<FfiAudioPipelineEvent>(len) {
+            FfiConverterTypeFfiAudioPipelineEvent.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiAudioPipelineEvent>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiAudioPipelineEvent.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<FfiAudioPipelineEvent>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiAudioPipelineEvent.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringString : FfiConverterRustBuffer<Map<kotlin.String, kotlin.String>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, kotlin.String> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, kotlin.String>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterString.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, kotlin.String>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren =
+            value
+                .map { (k, v) ->
+                    FfiConverterString.allocationSize(k) +
+                        FfiConverterString.allocationSize(v)
+                }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(
+        value: Map<kotlin.String, kotlin.String>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterString.write(v, buf)
         }
     }
 }
@@ -11928,5 +17555,102 @@ fun `whisperDefaultTranscribeOpts`(): FfiWhisperTranscribeOpts =
     FfiConverterTypeFfiWhisperTranscribeOpts.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(_status)
+        },
+    )
+
+/**
+ * Returns default configuration for the audio pipeline.
+ */
+fun `audioPipelineDefaultConfig`(): FfiAudioPipelineConfig =
+    FfiConverterTypeFfiAudioPipelineConfig.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config(_status)
+        },
+    )
+
+/**
+ * Convenience factory for an assistant text message.
+ */
+fun `chatMessageAssistant`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_assistant(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a system text message.
+ */
+fun `chatMessageSystem`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_system(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a tool text message.
+ */
+fun `chatMessageTool`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_tool(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a user text message.
+ */
+fun `chatMessageUser`(`content`: kotlin.String): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user(FfiConverterString.lower(`content`), _status)
+        },
+    )
+
+/**
+ * Convenience factory for a user audio message.
+ */
+fun `chatMessageUserAudio`(
+    `audioPcm`: List<kotlin.Float>,
+    `sampleRate`: kotlin.UInt,
+    `text`: kotlin.String?,
+): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_audio(
+                FfiConverterSequenceFloat.lower(`audioPcm`),
+                FfiConverterUInt.lower(`sampleRate`),
+                FfiConverterOptionalString.lower(`text`),
+                _status,
+            )
+        },
+    )
+
+/**
+ * Convenience factory for a user image message.
+ */
+fun `chatMessageUserImage`(
+    `imageBytes`: kotlin.ByteArray,
+    `text`: kotlin.String?,
+): Message =
+    FfiConverterTypeMessage.lift(
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_chat_message_user_image(
+                FfiConverterByteArray.lower(`imageBytes`),
+                FfiConverterOptionalString.lower(`text`),
+                _status,
+            )
+        },
+    )
+
+/**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ */
+@Throws(FfiException::class)
+fun `jsonSchemaToGrammar`(`schemaJson`: kotlin.String): kotlin.String =
+    FfiConverterString.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_json_schema_to_grammar(FfiConverterString.lower(`schemaJson`), _status)
         },
     )

@@ -38,6 +38,7 @@ pub mod engine;
 mod generated {
     include!("generated/kv_cache_generated.rs");
 }
+pub mod audio_pipeline;
 pub mod gguf;
 pub mod grammar;
 pub mod hotword;
@@ -61,12 +62,17 @@ pub mod vad;
 // Canonical public re-exports for the stateful API. Consumers should
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
 // `cera::session::*`.
+pub use audio_pipeline::{
+    AudioPipeline, AudioPipelineBuilder, AudioPipelineConfig, AudioPipelineEvent,
+    AudioPipelineState,
+};
 pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
 pub use classifier::{
     BioesPrefix, EntitySpan, detect_pii, extract_spans, parse_bioes, viterbi_decode,
 };
 pub use engine::{
-    BackendPreference, CeraEngine, EngineConfig, ModelBytes, ModelFiles, ModelMetadata,
+    BackendPreference, CeraEngine, EngineConfig, GenerativeModel, LoadConfig, LoadError,
+    ModelBytes, ModelFiles, ModelHandle, ModelKind, ModelLoader, ModelMetadata, ModelSource,
 };
 pub use hotword::{
     HotwordConfig, HotwordDetector, HotwordEvent, HotwordIterator, HotwordScore, LogMelFrontEnd,
@@ -77,6 +83,12 @@ pub use model::whisper::{
     WhisperModelCatalogEntry, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
     find_whisper_catalog_entry, is_whisper_gguf, transcribe_pcm, transcribe_pcm_with_tokens,
 };
+pub use session::chat::{
+    Chat, CompleteError, ContentPart, CoreExecution, DecodeReport, DecodeState, Execution,
+    IngestCause, IngestError, IngestSegment, IngestSummary, Message, Profile, ProfileBuilder, Role,
+    SessionChat, SessionPhase, TemplateFamily, TurnResult, ValidationError, core_chat,
+};
+pub use session::checkpoint::{ChatCheckpoint, SessionCheckpoint};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig, SpecDecode,

@@ -45,6 +45,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 accelerate-src = { workspace = true, optional = true }
 cblas-sys = { workspace = true, optional = true }
 
+# sha2 0.10 uses its ARM crypto backend only with `asm`. Limit the assembler
+# dependency to supported ARM Unix/Apple targets; other targets keep defaults.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android")))'.dependencies]
+sha2 = { workspace = true, optional = true, features = ["asm"] }
+
 # `sched_setaffinity` + `cpu_set_t` for pinning the compute thread pool's
 # workers to performance cores. Linux + Android only (Darwin ignores affinity
 # masks, uses QoS); used solely by `backend::threadpool` under the `parallel`
@@ -173,13 +178,13 @@ wasm-bindgen-test = { workspace = true }
 #                 model loader accepts an already-parsed `GgufFile`
 #                 regardless of whether the bytes came from `open` (mmap)
 #                 or `from_bytes` (in-memory, e.g. wasm).
-#   metal       ⇒ mmap    (re-opens GGUF via mmap)
+#   metal       ⇒ mmap    (shares an existing GGUF mapping with Metal)
 #   blas        — unchanged; opt-in GEMM accelerator
 #   remote      ⇒ std-fs  (BundleRepo caches downloads to a store_dir)
 parallel = ["dep:rayon"]
 std-fs = []
 mmap = ["dep:memmap2", "std-fs"]
-disk-cache = ["std-fs"]
+disk-cache = ["std-fs", "dep:sha2"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:futures-channel"]
 metal = ["dep:metal", "dep:objc", "mmap"]
 blas = ["dep:cblas-sys", "dep:accelerate-src"]

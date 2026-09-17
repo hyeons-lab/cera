@@ -16,6 +16,12 @@
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+mod loading;
+pub use loading::{
+    GenerationDefaults, GenerativeModel, LoadConfig, ModelHandle, ModelLoader, ModelParts,
+    ModelSource, SamplingDefaults,
+};
+
 #[wasm_bindgen(start)]
 pub fn wasm_init() {
     console_error_panic_hook::set_once();
@@ -49,13 +55,17 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 const TS_APPEND: &'static str = r#"
 /**
  * One entry in the chat-message array passed to
- * `Tokenizer.applyChatTemplate` / `applyChatTemplateWithTools`.
- * Mirrors the OpenAI / Anthropic SDK shape. For tool results, use
- * `role: "tool"` with the JSON result string as `content`.
+ * `Tokenizer.applyChatTemplate`, `applyChatTemplateWithTools`,
+ * or `ChatSession.ingest` / `ChatSession.ingestMessages`.
+ * Mirrors the OpenAI / Anthropic SDK shape with multimodal support.
+ * For tool results, use `role: "tool"` with the JSON result string as `content`.
  */
 export interface ChatMessage {
     role: string;
     content: string;
+    imageBytes?: Uint8Array;
+    audioPcm?: Float32Array;
+    audioSampleRate?: number;
 }
 
 /**
@@ -73,7 +83,7 @@ export interface ToolDef {
 /**
  * A tool call parsed from model output by `parseToolCalls`. `arguments` is
  * normally an object, but a malformed Hermes/Qwen reply may pass through a
- * non-object JSON value — narrow before assuming an object map.
+ * non-object JSON value: narrow before assuming an object map.
  */
 export interface ToolCall {
     name: string;
@@ -85,7 +95,7 @@ export interface ToolCall {
 
 #[wasm_bindgen]
 extern "C" {
-    /// Opaque type-label wrapper for `ChatMessage[]` — the
+    /// Opaque type-label wrapper for `ChatMessage[]`: the
     /// argument shape `Tokenizer.applyChatTemplate` accepts.
     /// At the wasm boundary this is just a JsValue array; the
     /// generated .d.ts surfaces it as `ChatMessage[]` so JS/TS
@@ -348,7 +358,7 @@ pub(crate) fn console_warn(msg: &str) {
 /// model lives until the page unloads.
 #[wasm_bindgen]
 pub struct CeraEngine {
-    inner: cera::CeraEngine,
+    inner: std::sync::Arc<cera::CeraEngine>,
 }
 
 #[wasm_bindgen]
@@ -383,7 +393,9 @@ impl CeraEngine {
             ..cera::EngineConfig::default()
         };
         cera::CeraEngine::from_bytes(bytes, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 
@@ -443,7 +455,9 @@ impl CeraEngine {
             generation_defaults: None,
         };
         cera::CeraEngine::from_parts(parts, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 
@@ -507,7 +521,9 @@ impl CeraEngine {
             ..cera::EngineConfig::default()
         };
         cera::CeraEngine::from_parts(parts, cfg)
-            .map(|inner| CeraEngine { inner })
+            .map(|inner| CeraEngine {
+                inner: std::sync::Arc::new(inner),
+            })
             .map_err(map_cera_err)
     }
 
@@ -701,7 +717,17 @@ impl CeraEngine {
             .new_session(config.inner.clone())
             .map_err(map_cera_err)?;
         let hidden_size = inner.hidden_size() as u32;
-        Ok(Session { inner, hidden_size })
+        Ok(Session {
+            inner: Some(inner),
+            hidden_size,
+        })
+    }
+
+    /// Create a new conversational `ChatSession` backed by this engine.
+    #[wasm_bindgen(js_name = newChatSession)]
+    pub fn new_chat_session(&self, config: &SessionConfig) -> Result<ChatSession, JsError> {
+        let mut session = self.new_session(config)?;
+        session.into_chat()
     }
 }
 
@@ -894,7 +920,7 @@ impl Tokenizer {
 /// The tool-call wire format a model family uses. Get one from
 /// `detectToolFormat(architecture)` or choose explicitly.
 #[wasm_bindgen]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolFormat {
     /// LFM2 / LFM2.5: Pythonic `[get_weather(city="Paris")]`.
     Lfm2Pythonic,
@@ -948,6 +974,17 @@ pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsErro
 pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsError> {
     let tools = parse_tool_defs(tools_json)?;
     cera::tools::tool_grammar(&tools, format.into()).map_err(map_err)
+}
+
+/// Compile a JSON Schema definition string into a GBNF grammar string.
+///
+/// Converts Draft 7 / 2020-12 JSON Schema definitions into valid GBNF
+/// grammars for structured output generation.
+#[wasm_bindgen(js_name = jsonSchemaToGrammar)]
+pub fn json_schema_to_grammar(schema_json: &str) -> Result<String, JsError> {
+    let val: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|e| JsError::new(&format!("invalid JSON schema: {e}")))?;
+    cera::grammar::json_schema::json_schema_to_gbnf(&val).map_err(|e| JsError::new(&e.to_string()))
 }
 
 /// Parse a JSON array of `ToolDef` into the cera core type. An empty/blank
@@ -1034,6 +1071,106 @@ fn read_string_field(
     value
         .as_string()
         .ok_or_else(|| JsError::new(&format!("messages[{index}].{field_name} must be a string")))
+}
+
+/// Parse a single JS `ChatMessage` object into the cera chat coordinator `Message` type.
+/// Supports optional multimodal content (`imageBytes`, `audioPcm`, `audioSampleRate`).
+fn parse_chat_message(
+    entry: &JsValue,
+    index: u32,
+) -> Result<cera::session::chat::Message, JsError> {
+    if !entry.is_object() {
+        return Err(JsError::new(&format!("messages[{index}] is not an object")));
+    }
+    let role_key = JsValue::from_str("role");
+    let role_str = read_string_field(entry, &role_key, "role", index)?;
+    let role = match role_str.as_str() {
+        "system" => cera::session::chat::Role::System,
+        "user" => cera::session::chat::Role::User,
+        "assistant" => cera::session::chat::Role::Assistant,
+        "tool" => cera::session::chat::Role::Tool,
+        other => {
+            return Err(JsError::new(&format!(
+                "messages[{index}].role: unknown role '{other}', expected system, user, assistant, or tool"
+            )));
+        }
+    };
+
+    let content_key = JsValue::from_str("content");
+    let content = match js_sys::Reflect::get(entry, &content_key) {
+        Ok(val) if val.is_string() => val.as_string().unwrap_or_default(),
+        Ok(val) if val.is_undefined() || val.is_null() => String::new(),
+        Ok(_) => {
+            return Err(JsError::new(&format!(
+                "messages[{index}].content must be a string"
+            )));
+        }
+        Err(_) => String::new(),
+    };
+
+    let image_bytes_key = JsValue::from_str("imageBytes");
+    let image_bytes = match js_sys::Reflect::get(entry, &image_bytes_key) {
+        Ok(val) if !val.is_undefined() && !val.is_null() => {
+            if let Some(arr) = val.dyn_ref::<js_sys::Uint8Array>() {
+                Some(arr.to_vec())
+            } else {
+                return Err(JsError::new(&format!(
+                    "messages[{index}].imageBytes must be a Uint8Array"
+                )));
+            }
+        }
+        _ => None,
+    };
+
+    let audio_pcm_key = JsValue::from_str("audioPcm");
+    let audio_pcm = match js_sys::Reflect::get(entry, &audio_pcm_key) {
+        Ok(val) if !val.is_undefined() && !val.is_null() => {
+            if let Some(arr) = val.dyn_ref::<js_sys::Float32Array>() {
+                Some(arr.to_vec())
+            } else {
+                return Err(JsError::new(&format!(
+                    "messages[{index}].audioPcm must be a Float32Array"
+                )));
+            }
+        }
+        _ => None,
+    };
+
+    let sample_rate_key = JsValue::from_str("audioSampleRate");
+    let audio_sample_rate = match js_sys::Reflect::get(entry, &sample_rate_key) {
+        Ok(val) => val.as_f64().map(|n| n as u32),
+        _ => None,
+    };
+
+    let mut parts = Vec::new();
+    if let Some(bytes) = image_bytes {
+        parts.push(cera::session::chat::ContentPart::Image(bytes));
+    }
+    if let Some(pcm) = audio_pcm {
+        let sample_rate = audio_sample_rate.unwrap_or(16000);
+        parts.push(cera::session::chat::ContentPart::Audio { pcm, sample_rate });
+    }
+    if !content.is_empty() || parts.is_empty() {
+        parts.push(cera::session::chat::ContentPart::Text(content));
+    }
+
+    Ok(cera::session::chat::Message::with_parts(role, parts))
+}
+
+fn parse_chat_messages_array(
+    array_handle: &ChatMessageArray,
+) -> Result<Vec<cera::session::chat::Message>, JsError> {
+    let js_val: &JsValue = array_handle.as_ref();
+    let array = js_val
+        .dyn_ref::<js_sys::Array>()
+        .ok_or_else(|| JsError::new("messages must be an array"))?;
+    let len = array.length();
+    let mut msgs = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let entry = array.get(i);
+        msgs.push(parse_chat_message(&entry, i)?);
+    }
+    Ok(msgs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,6 +1547,28 @@ impl GenerateOpts {
         Ok(())
     }
 
+    /// Constrain output to conform to a JSON Schema definition string.
+    /// Compiles the schema to GBNF and sets the grammar on this options instance.
+    #[wasm_bindgen(js_name = setJsonSchema)]
+    pub fn set_json_schema(&mut self, schema_json: &str) -> Result<(), JsError> {
+        let grammar = cera::grammar::Grammar::from_json_schema_str(schema_json).map_err(map_err)?;
+        self.inner.grammar = Some(std::sync::Arc::new(grammar));
+        Ok(())
+    }
+
+    /// Helper creating a new `GenerateOpts` cloned from `opts` with JSON Schema constraint applied.
+    #[wasm_bindgen(js_name = withJsonSchema)]
+    pub fn with_json_schema(
+        opts: &GenerateOpts,
+        schema_json: &str,
+    ) -> Result<GenerateOpts, JsError> {
+        let mut cloned = GenerateOpts {
+            inner: opts.inner.clone(),
+        };
+        cloned.set_json_schema(schema_json)?;
+        Ok(cloned)
+    }
+
     /// Remove any grammar constraint, returning to unconstrained decoding.
     #[wasm_bindgen(js_name = clearGrammar)]
     pub fn clear_grammar(&mut self) {
@@ -1567,13 +1726,31 @@ impl LoraAdapters {
 /// isolation in browsers.
 #[wasm_bindgen]
 pub struct Session {
-    inner: cera::Session,
+    pub(crate) inner: Option<cera::Session>,
     /// Model hidden dimension, cached at construction so `hiddenSize()` is a
     /// plain field read. wasm-bindgen guards each exported method with an
     /// internal `RefCell` borrow, so an uncached getter called from inside a
     /// `generate` callback (which holds the `&mut self` borrow) would panic with
     /// a borrow error; the cached read avoids re-borrowing `self.inner`.
     hidden_size: u32,
+}
+
+impl Session {
+    fn session(&self) -> Result<&cera::Session, JsError> {
+        self.inner.as_ref().ok_or_else(|| {
+            JsError::new(
+                "Session was moved into ChatSession; call chatSession.intoSession() to reclaim it",
+            )
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut cera::Session, JsError> {
+        self.inner.as_mut().ok_or_else(|| {
+            JsError::new(
+                "Session was moved into ChatSession; call chatSession.intoSession() to reclaim it",
+            )
+        })
+    }
 }
 
 #[wasm_bindgen]
@@ -1584,7 +1761,7 @@ impl Session {
     /// trip through JS for the encoded buffer.
     #[wasm_bindgen(js_name = appendText)]
     pub fn append_text(&mut self, text: &str) -> Result<(), JsError> {
-        self.inner.append_text(text).map_err(map_cera_err)
+        self.session_mut()?.append_text(text).map_err(map_cera_err)
     }
 
     /// Append already-tokenized IDs to the KV cache. Use when you
@@ -1592,30 +1769,32 @@ impl Session {
     /// from a previous encode.
     #[wasm_bindgen(js_name = appendTokens)]
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), JsError> {
-        self.inner.append_tokens(tokens).map_err(map_cera_err)
+        self.session_mut()?
+            .append_tokens(tokens)
+            .map_err(map_cera_err)
     }
 
-    /// Model hidden dimension `D` — reshape a `[T*D]` hidden-states buffer into
-    /// `[T][D]` with this. Reads a cached field (set at construction), so — unlike
-    /// the `&mut self` compute methods — it's safe to call from inside a `generate`
+    /// Model hidden dimension `D`: reshape a `[T*D]` hidden-states buffer into
+    /// `[T][D]` with this. Reads a cached field (set at construction), so (unlike
+    /// the `&mut self` compute methods) it is safe to call from inside a `generate`
     /// callback without a wasm-bindgen borrow panic.
     #[wasm_bindgen(js_name = hiddenSize)]
     pub fn hidden_size(&self) -> u32 {
         self.hidden_size
     }
 
-    /// Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+    /// Per-token last-layer hidden states (post-final-RMSNorm, the llama.cpp
     /// `--pooling none` vector) for `tokens`, as a `Float32Array` of length
     /// `tokens.length * hiddenSize` (row-major; token `t` channel `c` at
     /// `t*hiddenSize + c`). The wasm boundary copies the buffer into the JS heap
-    /// once. Side-effect-free — does not disturb the generation KV.
+    /// once. Side-effect-free, does not disturb the generation KV.
     #[wasm_bindgen(js_name = hiddenStatesForTokens)]
     pub fn hidden_states_for_tokens(
         &mut self,
         tokens: &[u32],
     ) -> Result<js_sys::Float32Array, JsError> {
         let hs = self
-            .inner
+            .session_mut()?
             .hidden_states_for_tokens(tokens)
             .map_err(map_cera_err)?;
         Ok(js_sys::Float32Array::from(hs.as_slice()))
@@ -1625,13 +1804,13 @@ impl Session {
     #[wasm_bindgen(js_name = hiddenStatesForText)]
     pub fn hidden_states_for_text(&mut self, text: &str) -> Result<js_sys::Float32Array, JsError> {
         let hs = self
-            .inner
+            .session_mut()?
             .hidden_states_for_text(text)
             .map_err(map_cera_err)?;
         Ok(js_sys::Float32Array::from(hs.as_slice()))
     }
 
-    /// Mean-pooled hidden state — a single `Float32Array` of length `hiddenSize`
+    /// Mean-pooled hidden state: a single `Float32Array` of length `hiddenSize`
     /// (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
     #[wasm_bindgen(js_name = hiddenStatesMeanPooled)]
     pub fn hidden_states_mean_pooled(
@@ -1639,20 +1818,20 @@ impl Session {
         tokens: &[u32],
     ) -> Result<js_sys::Float32Array, JsError> {
         let pooled = self
-            .inner
+            .session_mut()?
             .hidden_states_mean_pooled(tokens)
             .map_err(map_cera_err)?;
         Ok(js_sys::Float32Array::from(pooled.as_slice()))
     }
 
     /// Attach a [`LoraAdapters`] to this session. Applied to every subsequent
-    /// forward pass — generation **and** hidden-states extraction — until
+    /// forward pass (generation and hidden-states extraction) until
     /// removed or replaced (hot-swap), and preserved across `reset()`. Throws if
     /// the adapter's dimensions don't match the loaded model. Only affects tokens
     /// processed after the call (doesn't retroactively re-adapt cached KV).
     #[wasm_bindgen(js_name = attachLora)]
     pub fn attach_lora(&mut self, adapters: &LoraAdapters) -> Result<(), JsError> {
-        self.inner
+        self.session_mut()?
             .attach_lora_adapters(adapters.inner.clone())
             .map_err(map_cera_err)
     }
@@ -1660,13 +1839,17 @@ impl Session {
     /// Remove any attached LoRA adapter, returning to base-model inference.
     #[wasm_bindgen(js_name = removeLora)]
     pub fn remove_lora(&mut self) {
-        self.inner.remove_lora_adapters();
+        if let Ok(s) = self.session_mut() {
+            s.remove_lora_adapters();
+        }
     }
 
     /// Whether a LoRA adapter is currently attached to this session.
     #[wasm_bindgen(js_name = hasLora)]
     pub fn has_lora(&self) -> bool {
-        self.inner.has_lora_adapters()
+        self.session()
+            .map(|s| s.has_lora_adapters())
+            .unwrap_or(false)
     }
 
     /// Append PCM audio samples (mono `f32`, normalized to roughly
@@ -1675,8 +1858,8 @@ impl Session {
     /// Non-16kHz inputs are automatically linearly resampled to 16 kHz.
     /// `samples` arrives as `Float32Array` on the JS side. The
     /// wasm-bindgen boundary copies the typed-array contents into
-    /// wasm linear memory once — there's no per-element boxing
-    /// (contrast with Kotlin's `List<Float>` 4× memory overhead
+    /// wasm linear memory once; there's no per-element boxing
+    /// (contrast with Kotlin's `List<Float>` 4x memory overhead
     /// flagged in PR #78). The `&[f32]` Rust signature matches
     /// `appendTokens(&[u32])` and avoids the per-call `Vec`
     /// allocation that an owned parameter would require.
@@ -1684,7 +1867,7 @@ impl Session {
     /// Errors today are thrown as JS `Error`s; the message string
     /// is the underlying `cera::CeraError::Display` text (same as
     /// `appendText` / `appendTokens` produce):
-    /// - `"empty input"` if `samples.length === 0` — fast-fail at
+    /// - `"empty input"` if `samples.length === 0`: fast-fail at
     ///   the wasm boundary, parity with `appendText` /
     ///   `appendTokens` empty-input rejection.
     /// - `"modality not supported by this model"` when
@@ -1698,7 +1881,7 @@ impl Session {
         if samples.is_empty() {
             return Err(map_cera_err(cera::CeraError::EmptyInput));
         }
-        self.inner
+        self.session_mut()?
             .append_audio(samples, sample_rate)
             .map_err(map_cera_err)
     }
@@ -1728,14 +1911,11 @@ impl Session {
         bytes: &[u8],
         max_long_size: Option<u32>,
     ) -> Result<(), JsError> {
-        // Mirrors cera-ffi's mapping so the two bindings agree on what a
-        // `0` means. Delegating to `append_image` for `None` (rather than
-        // always calling the `_with_opts` form) is what keeps the session
-        // default reachable.
+        let session = self.session_mut()?;
         match max_long_size {
-            None => self.inner.append_image(bytes),
-            Some(0) => self.inner.append_image_with_opts(bytes, None),
-            Some(n) => self.inner.append_image_with_opts(bytes, Some(n)),
+            None => session.append_image(bytes),
+            Some(0) => session.append_image_with_opts(bytes, None),
+            Some(n) => session.append_image_with_opts(bytes, Some(n)),
         }
         .map_err(map_cera_err)
     }
@@ -1747,43 +1927,47 @@ impl Session {
     /// `maxLongSize`. A per-call value always wins.
     #[wasm_bindgen(js_name = setImageMaxLongSize)]
     pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
-        self.inner.set_image_max_long_size(max_long_size);
+        if let Ok(s) = self.session_mut() {
+            s.set_image_max_long_size(max_long_size);
+        }
     }
 
     /// Current KV cache position (number of tokens currently held).
     #[wasm_bindgen(getter)]
     pub fn position(&self) -> u32 {
-        self.inner.position()
+        self.session().map(|s| s.position()).unwrap_or(0)
     }
 
     /// Modality capability flags reported by the model backing
-    /// this session. Same shape as `CeraEngine.capabilities` —
+    /// this session. Same shape as `CeraEngine.capabilities`;
     /// see that getter for the `Capabilities` field documentation
     /// and the synthetic-text caveat that applies to all
     /// `fromGgufBytes`-loaded models today.
     #[wasm_bindgen(getter)]
     pub fn capabilities(&self) -> Capabilities {
-        capabilities_to_js(self.inner.capabilities())
+        capabilities_to_js(self.session().map(|s| s.capabilities()).unwrap_or_default())
     }
 
     /// Flip the cancel atomic, requesting that any in-flight
     /// `generate` call exit at its next checkpoint with
     /// `finishReason = "Cancelled"`. Safe to call from any thread
-    /// (including a Worker that owns this session — though wasm
+    /// (including a Worker that owns this session, though wasm
     /// without SharedArrayBuffer makes cross-thread sharing
     /// unusual).
     #[wasm_bindgen]
     pub fn cancel(&self) {
-        self.inner.cancel()
+        if let Ok(s) = self.session() {
+            s.cancel();
+        }
     }
 
     /// Clear the cancel flag without dropping any session state.
-    /// Use this after observing a cancellation signal — either a
+    /// Use this after observing a cancellation signal; either a
     /// thrown cancellation error from `appendText` / `appendTokens`
     /// (mid-prefill cancellation surfaces as a thrown error) or
     /// `summary.finishReason === "Cancelled"` on the value
     /// returned from `generate` (cancellation during decode is
-    /// reported via the finish reason, not a thrown error) — when
+    /// reported via the finish reason, not a thrown error), when
     /// you want to resume work on the same session without losing
     /// the accumulated KV cache.
     ///
@@ -1795,21 +1979,13 @@ impl Session {
     ///   re-seeds the sampler. Use for "clear conversation"
     ///   flows.
     ///
-    /// **Call sequencing:** invoke this *after* `generate` /
-    /// `appendText` / `appendTokens` has returned. Even though
-    /// the underlying cera method takes `&self`, wasm-bindgen's
-    /// JS-side borrow check on the `Session` wrapper rejects any
-    /// method call (including this `&self` one) while another
-    /// method is still borrowing the same handle — calling
-    /// `session.clearCancel()` from inside a `generate` token
-    /// callback would throw "recursive use of an object". The
-    /// `&self` Rust shape matters in the native binding
-    /// (`cera-ffi`) where there's no JS-side borrow check; in
-    /// wasm it just means there's no `&mut self` cost on the cera
-    /// core side.
+    /// Call sequencing: invoke this after `generate` /
+    /// `appendText` / `appendTokens` has returned.
     #[wasm_bindgen(js_name = clearCancel)]
     pub fn clear_cancel(&self) {
-        self.inner.clear_cancel()
+        if let Ok(s) = self.session() {
+            s.clear_cancel();
+        }
     }
 
     /// Drop accumulated state and return the session to a freshly-
@@ -1817,45 +1993,34 @@ impl Session {
     /// logits, and the cancel flag, then re-seeds the sampler from
     /// the `SessionConfig.seed` originally passed to `newSession`.
     ///
-    /// Use this for "clear conversation" UI actions — it skips the
+    /// Use this for "clear conversation" UI actions; it skips the
     /// per-session setup cost that `engine.newSession(config)`
     /// would pay (model + tokenizer Arc clones, sampler ctor),
     /// while still leaving the session indistinguishable from a
     /// fresh one.
     ///
     /// Sampler re-seed semantics:
-    /// - `SessionConfig.seed = some bigint` — deterministic
+    /// - `SessionConfig.seed = some bigint`: deterministic
     ///   sessions stay deterministic across `reset()`; the next
     ///   `generate` produces the same first token sequence as the
     ///   original.
-    /// - `SessionConfig.seed = null` — the sampler picks a new
+    /// - `SessionConfig.seed = null`: the sampler picks a new
     ///   random seed on each `reset()`, so successive
     ///   conversations decorrelate.
     ///
     /// Engine-level disk prefix cache (when configured on
-    /// `CeraEngine`) is not touched — those entries are
+    /// `CeraEngine`) is not touched; those entries are
     /// engine-scoped, not session-scoped.
-    ///
-    /// **Threading:** unlike `cancel()` (which only flips an
-    /// atomic and is safe to call concurrently with anything),
-    /// `reset()` takes `&mut self` and rebuilds non-atomic
-    /// internal state (KV cache, sampler). Must be called on
-    /// the owning thread, with no in-flight `generate` /
-    /// `appendText` / `appendTokens` running. The wasm-bindgen
-    /// borrow check enforces this within a single Worker; if
-    /// you share a `Session` across Workers via
-    /// `SharedArrayBuffer`-style schemes, it's on you to
-    /// serialize calls.
     #[wasm_bindgen]
     pub fn reset(&mut self) -> Result<(), JsError> {
-        self.inner.reset().map_err(map_cera_err)?;
+        self.session_mut()?.reset().map_err(map_cera_err)?;
         Ok(())
     }
 
     /// Decode tokens until `opts.maxTokens`, a stop token, EOS, or
     /// `cancel()` fires. The `onTextTokens` callback is invoked once
     /// per flush boundary with a `Uint32Array` of the latest tokens
-    /// (*not* the cumulative buffer — concatenate yourself if you
+    /// (not the cumulative buffer: concatenate yourself if you
     /// want the full sequence).
     ///
     /// Returns the `GenerateSummary` once decode finishes. Throws
@@ -1873,10 +2038,52 @@ impl Session {
             on_text: on_text_tokens,
             on_audio: on_audio_frames.as_ref(),
         };
-        self.inner
+        self.session_mut()?
             .generate(&opts.inner, &mut sink)
             .map(|inner| GenerateSummary { inner })
             .map_err(map_cera_err)
+    }
+
+    /// Transfer this session into a conversational `ChatSession`.
+    ///
+    /// The session must be backed by a model with a supported chat profile
+    /// (e.g. ChatML, Llama 3, Gemma). If discovery fails, this session retains
+    /// its inner handle and throws an error.
+    #[wasm_bindgen(js_name = intoChat)]
+    pub fn into_chat(&mut self) -> Result<ChatSession, JsError> {
+        let session = self.inner.take().ok_or_else(|| {
+            JsError::new(
+                "Session was moved into ChatSession; call chatSession.intoSession() to reclaim it",
+            )
+        })?;
+        match session.into_chat() {
+            Ok(chat) => Ok(ChatSession {
+                inner: Some(chat),
+                hidden_size: self.hidden_size,
+            }),
+            Err((retained, err)) => {
+                self.inner = Some(retained);
+                Err(JsError::new(&err.to_string()))
+            }
+        }
+    }
+
+    /// Export the current session checkpoint as binary bytes.
+    #[wasm_bindgen]
+    pub fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+        let cp = self.session()?.checkpoint().map_err(map_cera_err)?;
+        let bytes = cp.to_bytes();
+        let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        array.copy_from(&bytes);
+        Ok(array)
+    }
+
+    /// Restore an inference session from binary checkpoint bytes.
+    #[wasm_bindgen]
+    pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+        let cp = cera::session::SessionCheckpoint::from_bytes(data).map_err(map_cera_err)?;
+        self.session_mut()?.restore(&cp).map_err(map_cera_err)?;
+        Ok(())
     }
 }
 
@@ -1912,6 +2119,376 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
     }
 }
 
+/// Result of a completed chat turn.
+#[wasm_bindgen]
+pub struct TurnResult {
+    inner: cera::session::chat::TurnResult,
+}
+
+#[wasm_bindgen]
+impl TurnResult {
+    /// Decoded assistant response text.
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> String {
+        self.inner.text.clone()
+    }
+
+    /// Token identifiers emitted during the turn.
+    #[wasm_bindgen(getter)]
+    pub fn tokens(&self) -> Vec<u32> {
+        self.inner.tokens.clone()
+    }
+
+    /// Generation summary metrics.
+    #[wasm_bindgen(getter)]
+    pub fn summary(&self) -> GenerateSummary {
+        GenerateSummary {
+            inner: self.inner.summary.clone(),
+        }
+    }
+
+    /// Logical condition that ended generation (e.g. "Stop", "MaxTokens", "Cancelled").
+    #[wasm_bindgen(getter, js_name = finishReason)]
+    pub fn finish_reason(&self) -> String {
+        match &self.inner.summary.finish_reason {
+            cera::FinishReason::MaxTokens => "MaxTokens".to_string(),
+            cera::FinishReason::Stop => "Stop".to_string(),
+            cera::FinishReason::Cancelled => "Cancelled".to_string(),
+            cera::FinishReason::ContextFull => "ContextFull".to_string(),
+            cera::FinishReason::GrammarDeadEnd => "GrammarDeadEnd".to_string(),
+            cera::FinishReason::Error(msg) => format!("Error({msg})"),
+        }
+    }
+
+    /// Tokens processed during prompt ingestion for this turn.
+    #[wasm_bindgen(getter, js_name = promptEvalTokens)]
+    pub fn prompt_eval_tokens(&self) -> u32 {
+        self.inner.summary.prompt_eval_tokens
+    }
+
+    /// Prompt ingestion wall-clock duration in milliseconds.
+    #[wasm_bindgen(getter, js_name = promptEvalMs)]
+    pub fn prompt_eval_ms(&self) -> u32 {
+        self.inner.summary.prompt_eval_ms
+    }
+
+    /// Number of tokens generated during decode.
+    #[wasm_bindgen(getter, js_name = tokensGenerated)]
+    pub fn tokens_generated(&self) -> u32 {
+        self.inner.summary.tokens_generated
+    }
+
+    /// Decode wall-clock duration in milliseconds.
+    #[wasm_bindgen(getter, js_name = decodeMs)]
+    pub fn decode_ms(&self) -> u32 {
+        self.inner.summary.decode_ms
+    }
+
+    /// Parsed tool calls emitted by the model during the turn, as a JS array of ToolCall objects.
+    #[wasm_bindgen(getter, js_name = toolCalls)]
+    pub fn tool_calls(&self) -> Result<JsValue, JsError> {
+        let json_str = serde_json::to_string(&self.inner.tool_calls)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        js_sys::JSON::parse(&json_str)
+            .map_err(|e| JsError::new(&format!("failed to parse tool calls JSON: {e:?}")))
+    }
+
+    /// Parsed tool calls encoded as a JSON string.
+    #[wasm_bindgen(getter, js_name = toolCallsJson)]
+    pub fn tool_calls_json(&self) -> Result<String, JsError> {
+        serde_json::to_string(&self.inner.tool_calls).map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+/// Summary of a successful message ingestion.
+#[wasm_bindgen]
+pub struct IngestSummary {
+    inner: cera::session::chat::IngestSummary,
+}
+
+#[wasm_bindgen]
+impl IngestSummary {
+    /// Number of tokens encoded and appended to the context.
+    #[wasm_bindgen(getter, js_name = inputTokens)]
+    pub fn input_tokens(&self) -> u32 {
+        self.inner.input_tokens as u32
+    }
+
+    /// KV position before ingestion.
+    #[wasm_bindgen(getter, js_name = positionBefore)]
+    pub fn position_before(&self) -> u32 {
+        self.inner.position_before as u32
+    }
+
+    /// KV position after ingestion.
+    #[wasm_bindgen(getter, js_name = positionAfter)]
+    pub fn position_after(&self) -> u32 {
+        self.inner.position_after as u32
+    }
+}
+
+/// Stateful conversational chat coordinator.
+///
+/// Wraps an underlying inference session, maintaining chat template framing,
+/// turn delimiter invariants, multimodal ingestion, tool calling, and
+/// conversational state transitions.
+#[wasm_bindgen]
+pub struct ChatSession {
+    inner: Option<cera::session::chat::SessionChat>,
+    hidden_size: u32,
+}
+
+impl ChatSession {
+    fn chat(&self) -> Result<&cera::session::chat::SessionChat, JsError> {
+        self.inner.as_ref().ok_or_else(|| {
+            JsError::new("ChatSession was moved into Session; handle cannot be reused")
+        })
+    }
+
+    fn chat_mut(&mut self) -> Result<&mut cera::session::chat::SessionChat, JsError> {
+        self.inner.as_mut().ok_or_else(|| {
+            JsError::new("ChatSession was moved into Session; handle cannot be reused")
+        })
+    }
+}
+
+#[wasm_bindgen]
+impl ChatSession {
+    /// Construct a ChatSession from an existing Session, taking ownership of its state.
+    ///
+    /// If validation or template discovery fails, the session remains intact and usable.
+    #[wasm_bindgen(constructor)]
+    pub fn new(session: &mut Session) -> Result<ChatSession, JsError> {
+        session.into_chat()
+    }
+
+    /// Reclaim ownership of the underlying Session.
+    #[wasm_bindgen(js_name = intoSession)]
+    pub fn into_session(&mut self) -> Result<Session, JsError> {
+        let chat = self.inner.take().ok_or_else(|| {
+            JsError::new("ChatSession was already converted into Session; handle cannot be reused")
+        })?;
+        let session = chat.into_session();
+        Ok(Session {
+            inner: Some(session),
+            hidden_size: self.hidden_size,
+        })
+    }
+
+    /// Current session lifecycle phase ("Idle", "PromptReady", "TurnComplete", "Interrupted", "RawContext", "Unusable").
+    #[wasm_bindgen(getter)]
+    pub fn phase(&self) -> Result<String, JsError> {
+        Ok(self.chat()?.phase().as_str().to_string())
+    }
+
+    /// Current token position in the execution context.
+    #[wasm_bindgen(getter)]
+    pub fn position(&self) -> Result<u32, JsError> {
+        Ok(self.chat()?.position() as u32)
+    }
+
+    /// Model hidden dimension D.
+    #[wasm_bindgen(getter, js_name = hiddenSize)]
+    pub fn hidden_size(&self) -> u32 {
+        self.hidden_size
+    }
+
+    /// Modality capability flags reported by the model backing this session.
+    #[wasm_bindgen(getter)]
+    pub fn capabilities(&self) -> Result<Capabilities, JsError> {
+        Ok(capabilities_to_js(self.chat()?.session().capabilities()))
+    }
+
+    /// Ingest a single message into the chat context.
+    #[wasm_bindgen]
+    pub fn ingest(&mut self, message: &JsValue) -> Result<IngestSummary, JsError> {
+        let msg = parse_chat_message(message, 0)?;
+        let chat = self.chat_mut()?;
+        let summary = chat
+            .ingest(&msg)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(IngestSummary { inner: summary })
+    }
+
+    /// Ingest a batch of messages into the chat context.
+    #[wasm_bindgen(js_name = ingestMessages)]
+    pub fn ingest_messages(
+        &mut self,
+        messages: ChatMessageArray,
+    ) -> Result<IngestSummary, JsError> {
+        let msgs = parse_chat_messages_array(&messages)?;
+        let chat = self.chat_mut()?;
+        let summary = chat
+            .ingest_messages(&msgs)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(IngestSummary { inner: summary })
+    }
+
+    /// Replace conversation history by rewinding or re-prefilling the context.
+    #[wasm_bindgen(js_name = replaceMessages)]
+    pub fn replace_messages(
+        &mut self,
+        messages: ChatMessageArray,
+    ) -> Result<IngestSummary, JsError> {
+        let msgs = parse_chat_messages_array(&messages)?;
+        let chat = self.chat_mut()?;
+        let summary = chat
+            .replace_messages(&msgs)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(IngestSummary { inner: summary })
+    }
+
+    /// Execute a turn to completion, returning the assistant response.
+    #[wasm_bindgen]
+    pub fn complete(&mut self, opts: &GenerateOpts) -> Result<TurnResult, JsError> {
+        let chat = self.chat_mut()?;
+        let res = chat
+            .complete(&opts.inner)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(TurnResult { inner: res })
+    }
+
+    /// Execute a turn constrained by a JSON Schema string, returning the assistant response.
+    #[wasm_bindgen(js_name = completeJson)]
+    pub fn complete_json(
+        &mut self,
+        opts: &GenerateOpts,
+        schema_json: &str,
+    ) -> Result<TurnResult, JsError> {
+        let chat = self.chat_mut()?;
+        let res = chat
+            .complete_json(&opts.inner, schema_json)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(TurnResult { inner: res })
+    }
+
+    /// Stream generated text tokens into a callback, returning the final turn result.
+    #[wasm_bindgen(js_name = generateStreaming)]
+    pub fn generate_streaming(
+        &mut self,
+        opts: &GenerateOpts,
+        on_token: &js_sys::Function,
+    ) -> Result<TurnResult, JsError> {
+        let chat = self.chat_mut()?;
+        let res = chat
+            .stream_text(&opts.inner, |delta| {
+                let s = JsValue::from_str(delta);
+                if let Err(err) = on_token.call1(&JsValue::null(), &s) {
+                    wasm_bindgen::throw_val(err);
+                }
+            })
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(TurnResult { inner: res })
+    }
+
+    /// Stream generated text constrained by a JSON Schema string into a callback.
+    #[wasm_bindgen(js_name = generateStreamingJson)]
+    pub fn generate_streaming_json(
+        &mut self,
+        opts: &GenerateOpts,
+        schema_json: &str,
+        on_token: &js_sys::Function,
+    ) -> Result<TurnResult, JsError> {
+        let grammar = cera::grammar::Grammar::from_json_schema_str(schema_json).map_err(map_err)?;
+        let mut constrained_opts = opts.inner.clone();
+        constrained_opts.grammar = Some(std::sync::Arc::new(grammar));
+        let chat = self.chat_mut()?;
+        let res = chat
+            .stream_text(&constrained_opts, |delta| {
+                let s = JsValue::from_str(delta);
+                if let Err(err) = on_token.call1(&JsValue::null(), &s) {
+                    wasm_bindgen::throw_val(err);
+                }
+            })
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(TurnResult { inner: res })
+    }
+
+    /// Currently registered tools for function calling as a JSON string.
+    #[wasm_bindgen(getter)]
+    pub fn tools(&self) -> Result<String, JsError> {
+        let chat = self.chat()?;
+        serde_json::to_string(chat.tools()).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Register tools for function calling via a JSON array string.
+    #[wasm_bindgen(js_name = setTools)]
+    pub fn set_tools(&mut self, tools_json: &str) -> Result<(), JsError> {
+        let tools = parse_tool_defs(tools_json)?;
+        let chat = self.chat_mut()?;
+        chat.set_tools(tools);
+        Ok(())
+    }
+
+    /// Active tool wire format.
+    #[wasm_bindgen(getter, js_name = toolFormat)]
+    pub fn tool_format(&self) -> Result<ToolFormat, JsError> {
+        let chat = self.chat()?;
+        Ok(chat.tool_format().into())
+    }
+
+    /// Set the tool wire format explicitly.
+    #[wasm_bindgen(js_name = setToolFormat)]
+    pub fn set_tool_format(&mut self, format: ToolFormat) -> Result<(), JsError> {
+        let chat = self.chat_mut()?;
+        chat.set_tool_format(format.into());
+        Ok(())
+    }
+
+    /// Ingest a tool execution response back into the conversation.
+    #[wasm_bindgen(js_name = ingestToolResponse)]
+    pub fn ingest_tool_response(
+        &mut self,
+        tool_name: &str,
+        content: &str,
+    ) -> Result<IngestSummary, JsError> {
+        let chat = self.chat_mut()?;
+        let summary = chat
+            .ingest_tool_response(tool_name, content)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(IngestSummary { inner: summary })
+    }
+
+    /// Drop accumulated turn state and return to SessionPhase::Idle.
+    #[wasm_bindgen]
+    pub fn reset(&mut self) -> Result<(), JsError> {
+        self.chat_mut()?.reset().map_err(map_cera_err)?;
+        Ok(())
+    }
+
+    /// Flip the cancel atomic, requesting that any in-flight turn exit at its next checkpoint.
+    #[wasm_bindgen]
+    pub fn cancel(&self) -> Result<(), JsError> {
+        self.chat()?.cancel();
+        Ok(())
+    }
+
+    /// Clear pending cancellation without dropping conversation state.
+    #[wasm_bindgen(js_name = clearCancel)]
+    pub fn clear_cancel(&mut self) -> Result<(), JsError> {
+        self.chat_mut()?.clear_cancel();
+        Ok(())
+    }
+
+    /// Export the current chat session checkpoint as binary bytes.
+    #[wasm_bindgen]
+    pub fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+        let cp = self.chat()?.checkpoint().map_err(map_cera_err)?;
+        let bytes = cp.to_bytes().map_err(map_cera_err)?;
+        let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        array.copy_from(&bytes);
+        Ok(array)
+    }
+
+    /// Restore a chat session from binary checkpoint bytes.
+    #[wasm_bindgen]
+    pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+        let cp = cera::session::ChatCheckpoint::from_bytes(data).map_err(map_cera_err)?;
+        self.chat_mut()?.restore(&cp).map_err(map_cera_err)?;
+        Ok(())
+    }
+}
+
 // ── WebGPU (wgpu) GPU-accelerated LFM2 inference ──────────────────────────
 //
 // Gated behind the `wgpu` cargo feature (which enables `cera/gpu`). Exposes an
@@ -1921,9 +2498,72 @@ impl<'a> cera::ModalitySink for JsTextSink<'a> {
 // so the whole prefill + decode loop is `async` and reads logits back via
 // `GpuContext::download_*_async`. Prototype scope: LFM2 only, greedy decode.
 // See devlog 000169.
+/// Validate that a session checkpoint is compatible with a WebGPU session before restoring.
+///
+/// Ensures fingerprint, sequence length bounds, layer counts, precision (f16 CPU checkpoints
+/// are rejected because WebGPU uses f32 or compressed KV), and TurboQuant compression modes match.
+#[cfg(any(feature = "wgpu", test))]
+pub(crate) fn validate_webgpu_checkpoint(
+    cp: &cera::session::SessionCheckpoint,
+    config: &cera::model::ModelConfig,
+    state: &cera::kv_cache::InferenceState,
+    model_is_compressed: bool,
+) -> Result<(), wasm_bindgen::JsError> {
+    use wasm_bindgen::JsError;
+
+    let current_fp = cera::kv_cache::model_fingerprint(config, "");
+    if cp.model_fingerprint != current_fp {
+        return Err(JsError::new(&format!(
+            "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
+            cp.model_fingerprint
+        )));
+    }
+    let max_seq_len = config.max_seq_len;
+    if cp.position > max_seq_len {
+        return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+            max_seq_len: max_seq_len as u32,
+            by: (cp.position - max_seq_len) as u32,
+        }));
+    }
+    if cp.position != cp.kv_state.seq_len {
+        return Err(JsError::new(&format!(
+            "checkpoint position {} does not match KV state sequence length {}",
+            cp.position, cp.kv_state.seq_len
+        )));
+    }
+    if cp.kv_state.layers.len() != state.layers.len() {
+        return Err(JsError::new(&format!(
+            "checkpoint layer count {} does not match session layer count {}",
+            cp.kv_state.layers.len(),
+            state.layers.len()
+        )));
+    }
+    // WebGPU strictly uses f32 or compressed KV, never f16.
+    if cp.kv_state.is_f16() {
+        return Err(JsError::new(
+            "checkpoint KV precision (f16) does not match WebGpuSession (wgpu uses f32 or compressed KV)",
+        ));
+    }
+    // Ensure TurboQuant compression mode matches the active engine configuration.
+    if cp.kv_state.is_compressed() != model_is_compressed {
+        return Err(JsError::new(
+            "checkpoint compression mode (TurboQuant vs uncompressed) does not match WebGpuSession",
+        ));
+    }
+
+    state
+        .validate_snapshot(&cp.kv_state)
+        .map_err(|e| JsError::new(&e))?;
+
+    Ok(())
+}
+
 #[cfg(feature = "wgpu")]
 mod webgpu {
-    use super::{Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err};
+    use super::{
+        Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err,
+        validate_webgpu_checkpoint,
+    };
     use cera::model::Model;
     use cera::time::Instant;
     use std::sync::Arc;
@@ -1947,6 +2587,7 @@ mod webgpu {
         model: cera::model::gpu_lfm2::GpuLfm2Model,
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
         state: cera::kv_cache::InferenceState,
+        compression: cera::kv_cache::KvCompression,
         eos: Option<u32>,
         /// CPU vision-encoder weights, parsed from the mmproj passed to
         /// `createWithParts`. `None` for a text-only session. Kept even when
@@ -2015,6 +2656,29 @@ mod webgpu {
         pub fn clear_cancel(&self) {
             self.cancel
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Reset the session in-place, clearing GPU convolution rolling buffers,
+        /// resetting sequence counter to zero, and rebuilding fresh CPU state.
+        #[wasm_bindgen]
+        pub fn reset(&mut self) -> Result<(), JsError> {
+            let mut fresh = cera::kv_cache::InferenceState::from_config_with_compression(
+                self.model.config(),
+                &self.compression,
+            )
+            .map_err(crate::map_cera_err)?;
+            fresh.lora = self.state.lora.clone();
+            self.model.reset_session_state();
+            if let Some(gad) = self.gpu_audio_decoder.as_ref() {
+                gad.reset();
+            }
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.reset();
+            }
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.state = fresh;
+            Ok(())
         }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
         /// `requestDevice` resolve on the JS event loop), parse the in-memory
@@ -2152,6 +2816,7 @@ mod webgpu {
                 model,
                 tokenizer,
                 state,
+                compression,
                 eos,
                 vision_encoder: None,
                 gpu_vision_encoder: None,
@@ -2294,6 +2959,7 @@ mod webgpu {
                     model,
                     tokenizer,
                     state,
+                    compression,
                     eos,
                     vision_encoder: None,
                     gpu_vision_encoder: None,
@@ -3804,6 +4470,68 @@ mod webgpu {
             self.state.seq_len = pos;
             Ok(out)
         }
+
+        /// Export the current session checkpoint as binary bytes.
+        #[wasm_bindgen]
+        pub async fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+            self.export_checkpoint().await
+        }
+
+        /// Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
+        #[wasm_bindgen(js_name = exportCheckpoint)]
+        pub async fn export_checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+            let kv_state = self
+                .model
+                .snapshot_session_state_async()
+                .await
+                .map_err(map_err)?;
+            let fp = cera::kv_cache::model_fingerprint(self.model.config(), "");
+            let cp = cera::session::SessionCheckpoint {
+                model_fingerprint: fp,
+                position: self.state.seq_len,
+                max_seq_len: self.model.config().max_seq_len,
+                prefill_tokens: 0,
+                prefill_elapsed_ms: 0,
+                last_logits: None,
+                token_history: Vec::new(),
+                kv_state,
+            };
+            let bytes = cp.to_bytes();
+            let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+            array.copy_from(&bytes);
+            Ok(array)
+        }
+
+        /// Restore an inference session from binary checkpoint bytes.
+        #[wasm_bindgen]
+        pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+            self.import_checkpoint(data)
+        }
+
+        /// Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
+        #[wasm_bindgen(js_name = importCheckpoint)]
+        pub fn import_checkpoint(&mut self, data: &[u8]) -> Result<(), JsError> {
+            let cp =
+                cera::session::SessionCheckpoint::from_bytes(data).map_err(crate::map_cera_err)?;
+            validate_webgpu_checkpoint(
+                &cp,
+                self.model.config(),
+                &self.state,
+                self.model.is_compressed(),
+            )?;
+
+            self.state.restore(&cp.kv_state);
+            self.model.restore_session_state(&cp.kv_state);
+            if let Some(gad) = self.gpu_audio_decoder.as_ref() {
+                gad.reset();
+            }
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.reset();
+            }
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
     }
 }
 
@@ -3813,7 +4541,92 @@ pub use webgpu::{WebGpuCancelHandle, WebGpuSession};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cera::kv_cache::{InferenceState, KvCompression};
+    use cera::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
+    use cera::tokenizer::BpeTokenizer;
+    use std::sync::Arc;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    struct TestModel {
+        config: ModelConfig,
+        token_to_emit: u32,
+    }
+
+    impl TestModel {
+        fn new(token_to_emit: u32) -> Self {
+            let config = ModelConfig {
+                architecture: "wasm-test".into(),
+                n_layers: 1,
+                hidden_size: 4,
+                intermediate_size: 4,
+                n_heads: 1,
+                n_kv_heads: 1,
+                head_dim: 4,
+                vocab_size: 32,
+                max_seq_len: 256,
+                rope_theta: 10_000.0,
+                rms_norm_eps: 1e-5,
+                block_types: vec![BlockType::Attention],
+                conv_kernel_size: None,
+                ssm: None,
+                kv_heads_per_layer: vec![1],
+                scalars: ScalarMultipliers::default(),
+                moe: None,
+                is_causal: true,
+                class_labels: Vec::new(),
+            };
+            Self {
+                config,
+                token_to_emit,
+            }
+        }
+    }
+
+    impl Model for TestModel {
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+
+        fn forward(&self, tokens: &[u32], _: usize, state: &mut InferenceState) -> Vec<f32> {
+            state.seq_len += tokens.len();
+            let mut logits = vec![0.0f32; self.config.vocab_size];
+            if (self.token_to_emit as usize) < logits.len() {
+                logits[self.token_to_emit as usize] = 10.0;
+            }
+            logits
+        }
+
+        fn try_reset_kv(
+            &self,
+            state: &mut InferenceState,
+            _: &KvCompression,
+            _: usize,
+        ) -> Result<(), cera::CeraError> {
+            state.seq_len = 0;
+            Ok(())
+        }
+    }
+
+    fn create_test_session(token_to_emit: u32) -> Session {
+        let model = Arc::new(TestModel::new(token_to_emit));
+        let tokenizer = Arc::new(BpeTokenizer::chat_for_test());
+        let inner = cera::Session::new(
+            model,
+            tokenizer,
+            cera::ModalityCapabilities::text_only(),
+            cera::SessionConfig {
+                n_keep: 0,
+                ubatch_size: 1,
+                ..Default::default()
+            },
+        )
+        .expect("test session create");
+        let hidden_size = inner.hidden_size() as u32;
+        Session {
+            inner: Some(inner),
+            hidden_size,
+        }
+    }
 
     #[wasm_bindgen_test]
     fn generate_opts_spec_decode_roundtrip() {
@@ -3830,5 +4643,210 @@ mod tests {
         opts.clear_spec_decode();
         assert!(!opts.has_spec_decode());
         assert_eq!(opts.inner.spec, None);
+    }
+
+    #[wasm_bindgen_test]
+    fn json_schema_to_grammar_valid_and_invalid() {
+        let schema = r#"{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}"#;
+        let grammar = json_schema_to_grammar(schema).expect("schema should compile to grammar");
+        assert!(grammar.contains("root ::="));
+
+        let invalid = r#"{"type": "not_a_valid_type"}"#;
+        assert!(json_schema_to_grammar(invalid).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn generate_opts_json_schema() {
+        let mut opts = GenerateOpts::new();
+        let schema = r#"{"type": "object", "properties": {"count": {"type": "integer"}}, "required": ["count"]}"#;
+        opts.set_json_schema(schema).expect("set schema");
+        assert!(opts.inner.grammar.is_some());
+
+        let base = GenerateOpts::new();
+        let opts2 = GenerateOpts::with_json_schema(&base, schema).expect("with schema");
+        assert!(opts2.inner.grammar.is_some());
+    }
+
+    #[wasm_bindgen_test]
+    fn chat_session_lifecycle_and_reclamation() {
+        let mut session = create_test_session(7);
+        let mut chat = session.into_chat().expect("into_chat");
+        assert_eq!(chat.phase().unwrap(), "Idle");
+        assert_eq!(chat.position().unwrap(), 0);
+
+        let user_msg = js_sys::Object::new();
+        js_sys::Reflect::set(&user_msg, &"role".into(), &"user".into()).unwrap();
+        js_sys::Reflect::set(&user_msg, &"content".into(), &"hello".into()).unwrap();
+
+        let summary = chat.ingest(&user_msg.into()).expect("ingest message");
+        assert!(summary.input_tokens() > 0);
+        assert_eq!(chat.phase().unwrap(), "PromptReady");
+
+        let turn = chat.complete(&GenerateOpts::new()).expect("turn complete");
+        assert_eq!(turn.finish_reason(), "Stop");
+        assert_eq!(chat.phase().unwrap(), "TurnComplete");
+
+        let reclaimed = chat.into_session().expect("into_session");
+        assert_eq!(reclaimed.position(), summary.position_after());
+
+        assert!(chat.into_session().is_err());
+        assert!(chat.phase().is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_chat_message_validation() {
+        let bad_role = js_sys::Object::new();
+        js_sys::Reflect::set(&bad_role, &"role".into(), &"unsupported_role".into()).unwrap();
+        js_sys::Reflect::set(&bad_role, &"content".into(), &"test".into()).unwrap();
+        assert!(parse_chat_message(&bad_role.into(), 0).is_err());
+
+        let mm = js_sys::Object::new();
+        js_sys::Reflect::set(&mm, &"role".into(), &"user".into()).unwrap();
+        js_sys::Reflect::set(&mm, &"content".into(), &"describe this:".into()).unwrap();
+        let img = js_sys::Uint8Array::new_with_length(4);
+        js_sys::Reflect::set(&mm, &"imageBytes".into(), &img.into()).unwrap();
+        let msg = parse_chat_message(&mm.into(), 0).expect("parse multimodal message");
+        assert_eq!(msg.content.len(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn chat_session_tool_configuration() {
+        let mut session = create_test_session(7);
+        let mut chat = session.into_chat().expect("into_chat");
+        assert_eq!(chat.tools().unwrap(), "[]");
+
+        let tools_json = r#"[{"name": "weather", "description": "get weather", "parameters": {"type": "object"}}]"#;
+        chat.set_tools(tools_json).expect("set tools");
+        assert_ne!(chat.tools().unwrap(), "[]");
+
+        assert_eq!(chat.tool_format().unwrap(), ToolFormat::Lfm2Pythonic);
+        chat.set_tool_format(ToolFormat::Hermes)
+            .expect("set format");
+        assert_eq!(chat.tool_format().unwrap(), ToolFormat::Hermes);
+    }
+
+    #[wasm_bindgen_test]
+    fn session_checkpoint_and_restore_wasm() {
+        let mut session = create_test_session(7);
+        session.append_text("checkpoint test").expect("append text");
+        let pos = session.position();
+
+        let bytes = session.checkpoint().expect("session checkpoint");
+        assert!(bytes.length() > 0);
+
+        let mut session2 = create_test_session(7);
+        assert_eq!(session2.position(), 0);
+        let data = bytes.to_vec();
+        session2.restore(&data).expect("restore checkpoint");
+        assert_eq!(session2.position(), pos);
+    }
+
+    #[wasm_bindgen_test]
+    fn chat_session_checkpoint_and_restore_wasm() {
+        let mut session = create_test_session(7);
+        let mut chat = session.into_chat().expect("into_chat");
+
+        let user_msg = js_sys::Object::new();
+        js_sys::Reflect::set(&user_msg, &"role".into(), &"user".into()).unwrap();
+        js_sys::Reflect::set(&user_msg, &"content".into(), &"hello world".into()).unwrap();
+
+        chat.ingest(&user_msg.into()).expect("ingest message");
+        chat.complete(&GenerateOpts::new()).expect("turn complete");
+        assert_eq!(chat.phase().unwrap(), "TurnComplete");
+        let pos = chat.position().unwrap();
+
+        let bytes = chat.checkpoint().expect("chat checkpoint");
+        assert!(bytes.length() > 0);
+
+        let mut session2 = create_test_session(7);
+        let mut chat2 = session2.into_chat().expect("into_chat 2");
+        assert_eq!(chat2.phase().unwrap(), "Idle");
+
+        let data = bytes.to_vec();
+        chat2.restore(&data).expect("restore chat checkpoint");
+        assert_eq!(chat2.phase().unwrap(), "TurnComplete");
+        assert_eq!(chat2.position().unwrap(), pos);
+    }
+
+    #[wasm_bindgen_test]
+    fn session_checkpoint_fingerprint_mismatch_rejected() {
+        let mut session = create_test_session(7);
+        session
+            .append_text("fingerprint check")
+            .expect("append text");
+        let bytes = session.checkpoint().expect("session checkpoint");
+        let mut data = bytes.to_vec();
+
+        if data.len() >= 20 {
+            // Tamper with model fingerprint (bytes 12..20)
+            data[12] ^= 0xff;
+            let mut session2 = create_test_session(7);
+            let err = session2.restore(&data);
+            assert!(err.is_err(), "mismatched fingerprint must be rejected");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn webgpu_checkpoint_rejects_f16_and_compression_mismatch() {
+        let test_model = TestModel::new(7);
+        let config = test_model.config().clone();
+        let state = InferenceState::from_config(&config).expect("inference state");
+
+        // 1. Checkpoint with f16 layer must be rejected gracefully
+        let f16_snapshot = cera::kv_cache::StateSnapshot::new(
+            vec![cera::kv_cache::LayerSnapshot::AttentionF16 {
+                k_data: vec![0u8; 8],
+                v_data: vec![0u8; 8],
+            }],
+            4,
+        );
+        let f16_checkpoint = cera::session::SessionCheckpoint {
+            model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
+            position: 4,
+            max_seq_len: config.max_seq_len,
+            prefill_tokens: 0,
+            prefill_elapsed_ms: 0,
+            last_logits: None,
+            token_history: Vec::new(),
+            kv_state: f16_snapshot,
+        };
+
+        let res_f16 = validate_webgpu_checkpoint(&f16_checkpoint, &config, &state, false);
+        assert!(res_f16.is_err());
+        let err_msg = format!("{:?}", res_f16.unwrap_err());
+        assert!(
+            err_msg.contains("f16"),
+            "Error must mention f16 precision mismatch, got: {err_msg}"
+        );
+
+        // 2. Checkpoint with compression mode mismatch must be rejected gracefully
+        let f32_snapshot = cera::kv_cache::StateSnapshot::new(
+            vec![cera::kv_cache::LayerSnapshot::Attention {
+                k_data: vec![0u8; 16],
+                v_data: vec![0u8; 16],
+            }],
+            4,
+        );
+        let f32_checkpoint = cera::session::SessionCheckpoint {
+            model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
+            position: 4,
+            max_seq_len: config.max_seq_len,
+            prefill_tokens: 0,
+            prefill_elapsed_ms: 0,
+            last_logits: None,
+            token_history: Vec::new(),
+            kv_state: f32_snapshot,
+        };
+
+        // When model is configured with TurboQuant compression (model_is_compressed = true)
+        // but checkpoint is uncompressed, validation must reject it
+        let res_comp = validate_webgpu_checkpoint(&f32_checkpoint, &config, &state, true);
+        assert!(res_comp.is_err());
+        let comp_err_msg = format!("{:?}", res_comp.unwrap_err());
+        assert!(
+            comp_err_msg.contains("compression mode"),
+            "Error must mention compression mode mismatch, got: {comp_err_msg}"
+        );
     }
 }

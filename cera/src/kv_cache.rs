@@ -11,6 +11,9 @@ use crate::turboquant::{
     TurboQuantConfig,
 };
 
+mod rewind;
+pub use rewind::KvRewindError;
+
 /// Reserve capacity for `len` values of `T`, returning [`CeraError::OutOfMemory`]
 /// instead of aborting the process when the allocation can't be satisfied. Used
 /// for the config-driven KV-cache buffers — the uncompressed per-layer f32
@@ -1305,6 +1308,210 @@ impl InferenceState {
         Some(StateSnapshot::new(layers, self.seq_len))
     }
 
+    /// Validate that a `StateSnapshot` is structurally compatible with this state
+    /// before attempting to restore it. Checks layer count, layer variant matches,
+    /// byte alignments, and vector dimensions without panicking.
+    pub fn validate_snapshot(&self, snapshot: &StateSnapshot) -> Result<(), String> {
+        if snapshot.layers.len() != self.layers.len() {
+            return Err(format!(
+                "snapshot layer count {} does not match state layer count {}",
+                snapshot.layers.len(),
+                self.layers.len()
+            ));
+        }
+        let kv_f16 = self.kv_f16;
+        for (idx, (layer, snap)) in self.layers.iter().zip(&snapshot.layers).enumerate() {
+            match (layer, snap) {
+                (
+                    LayerState::Attention {
+                        compressed_keys, ..
+                    },
+                    snap,
+                ) => match snap {
+                    LayerSnapshot::Attention { k_data, v_data } => {
+                        if kv_f16 {
+                            return Err(format!(
+                                "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
+                            ));
+                        }
+                        if compressed_keys.is_some() {
+                            return Err(format!(
+                                "layer {idx}: uncompressed Attention snapshot cannot be restored into a compressed state"
+                            ));
+                        }
+                        if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
+                            return Err(format!(
+                                "layer {idx}: Attention byte lengths are not multiples of 4"
+                            ));
+                        }
+                    }
+                    LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                        if !kv_f16 {
+                            return Err(format!(
+                                "layer {idx}: AttentionF16 snapshot cannot be restored into a non-f16 state"
+                            ));
+                        }
+                        if !k_data.len().is_multiple_of(2) || !v_data.len().is_multiple_of(2) {
+                            return Err(format!(
+                                "layer {idx}: AttentionF16 byte lengths are not multiples of 2"
+                            ));
+                        }
+                    }
+                    LayerSnapshot::AttentionCompressed { keys, values } => {
+                        if compressed_keys.is_none() {
+                            return Err(format!(
+                                "layer {idx}: compressed snapshot provided but state is not compressed"
+                            ));
+                        }
+                        if crate::turboquant::decode_compressed_keys(keys).is_none() {
+                            return Err(format!(
+                                "layer {idx}: invalid TQK1 compressed keys blob in snapshot"
+                            ));
+                        }
+                        if crate::turboquant::decode_compressed_values(values).is_none() {
+                            return Err(format!(
+                                "layer {idx}: invalid TQV1 compressed values blob in snapshot"
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "layer {idx}: snapshot layer kind does not match Attention state"
+                        ));
+                    }
+                },
+                (LayerState::Conv { .. }, LayerSnapshot::Conv { buffer }) => {
+                    if !buffer.len().is_multiple_of(4) {
+                        return Err(format!(
+                            "layer {idx}: Conv byte length is not a multiple of 4"
+                        ));
+                    }
+                }
+                (
+                    LayerState::Mamba2 {
+                        conv_state,
+                        ssm_state,
+                    },
+                    LayerSnapshot::Mamba2 {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    if snap_conv.len() != conv_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched Mamba2 conv_state byte length (expected {}, got {})",
+                            conv_state.len() * 4,
+                            snap_conv.len()
+                        ));
+                    }
+                    if snap_ssm.len() != ssm_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched Mamba2 ssm_state byte length (expected {}, got {})",
+                            ssm_state.len() * 4,
+                            snap_ssm.len()
+                        ));
+                    }
+                }
+                (
+                    LayerState::DeltaNet { .. },
+                    LayerSnapshot::DeltaNet {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    if !snap_conv.len().is_multiple_of(4) || !snap_ssm.len().is_multiple_of(4) {
+                        return Err(format!(
+                            "layer {idx}: DeltaNet byte lengths are not multiples of 4"
+                        ));
+                    }
+                }
+                (
+                    LayerState::ParallelAttentionMamba2 {
+                        compressed_keys,
+                        conv_state,
+                        ssm_state,
+                        ..
+                    },
+                    LayerSnapshot::ParallelAttentionMamba2 {
+                        snap,
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    match &**snap {
+                        LayerSnapshot::Attention { k_data, v_data } => {
+                            if kv_f16 {
+                                return Err(format!(
+                                    "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
+                                ));
+                            }
+                            if compressed_keys.is_some() {
+                                return Err(format!(
+                                    "layer {idx}: uncompressed Attention snapshot cannot be restored into a compressed state"
+                                ));
+                            }
+                            if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
+                                return Err(format!(
+                                    "layer {idx}: Attention byte lengths are not multiples of 4"
+                                ));
+                            }
+                        }
+                        LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                            if !kv_f16 {
+                                return Err(format!(
+                                    "layer {idx}: AttentionF16 snapshot cannot be restored into a non-f16 state"
+                                ));
+                            }
+                            if !k_data.len().is_multiple_of(2) || !v_data.len().is_multiple_of(2) {
+                                return Err(format!(
+                                    "layer {idx}: AttentionF16 byte lengths are not multiples of 2"
+                                ));
+                            }
+                        }
+                        LayerSnapshot::AttentionCompressed { keys, values } => {
+                            if compressed_keys.is_none() {
+                                return Err(format!(
+                                    "layer {idx}: compressed snapshot provided but state is not compressed"
+                                ));
+                            }
+                            if crate::turboquant::decode_compressed_keys(keys).is_none() {
+                                return Err(format!(
+                                    "layer {idx}: invalid TQK1 compressed keys blob in snapshot"
+                                ));
+                            }
+                            if crate::turboquant::decode_compressed_values(values).is_none() {
+                                return Err(format!(
+                                    "layer {idx}: invalid TQV1 compressed values blob in snapshot"
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "layer {idx}: snapshot layer kind does not match Attention state"
+                            ));
+                        }
+                    }
+                    if snap_conv.len() != conv_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched ParallelAttentionMamba2 conv_state byte length"
+                        ));
+                    }
+                    if snap_ssm.len() != ssm_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched ParallelAttentionMamba2 ssm_state byte length"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "layer {idx}: snapshot layer variant does not match live session state"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Restore a previously captured `StateSnapshot` into this state's
     /// f32 caches (or compressed caches for TurboQuant layers). Inverse
     /// of [`Self::snapshot`]. Asserts that the snapshot's layer count
@@ -1376,7 +1583,7 @@ impl InferenceState {
                     // guard; panic loudly if it's ever bypassed.
                     assert!(
                         !kv_f16,
-                        "f32 Attention snapshot restored into an f16 state — \
+                        "f32 Attention snapshot restored into an f16 state: \
                          caller must gate on the snapshot/live compression mode"
                     );
                     decode_f32_into(key_cache, k_data);
@@ -1398,7 +1605,7 @@ impl InferenceState {
                 ) => {
                     assert!(
                         kv_f16,
-                        "AttentionF16 snapshot restored into a non-f16 state — \
+                        "AttentionF16 snapshot restored into a non-f16 state: \
                          caller must gate on `LayerSnapshot::is_f16()` matching \
                          the live `kv_f16` mode"
                     );
@@ -1437,8 +1644,8 @@ impl InferenceState {
                         key_cache.clear();
                         value_cache.clear();
                     } else {
-                        tracing::error!(
-                            "invalid TQK1/TQV1 compressed blob in snapshot; skipping layer restore"
+                        panic!(
+                            "invalid TQK1/TQV1 compressed blob in snapshot: caller must validate with `validate_snapshot` before calling `restore`"
                         );
                     }
                 }
@@ -2072,7 +2279,7 @@ impl From<u8> for SemanticBoundaryKind {
 
 /// Snapshot of model KV + conv state after prefilling a token sequence.
 /// Backend-agnostic: stores raw bytes that the backend knows how to restore.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StateSnapshot {
     pub layers: Vec<LayerSnapshot>,
     pub seq_len: usize,
@@ -2112,7 +2319,7 @@ impl StateSnapshot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LayerSnapshot {
     /// Raw f32 KV bytes (CPU / wgpu) or raw f16 (Metal). Backend
     /// chooses the element width; the byte length implicitly carries
@@ -2259,6 +2466,12 @@ impl StateSnapshot {
 #[derive(Clone)]
 pub struct KvCacheConfig {
     /// Directory for cold-tier (disk) cache files. None = disk caching disabled.
+    /// Built-in models loaded without a path or explicit model ID ignore this
+    /// field: anonymous models use only the warm tier to avoid sharing another
+    /// model's persisted state. Live session KV is unaffected.
+    /// Named built-in prefix caches also bind their namespace to the loaded
+    /// GGUF bytes. CPU LFM2 resolves that identity on first disk configuration;
+    /// wgpu/Metal resolve it during loading while source bytes are available.
     pub cache_dir: Option<PathBuf>,
     /// Max warm-tier (memory) entries.
     pub max_warm_entries: usize,
@@ -2299,6 +2512,8 @@ pub struct KvPrefixCache {
 }
 
 impl KvPrefixCache {
+    /// Construct a cache with a caller-managed namespace. For disk caching, the
+    /// caller must identify the weights as well as the backend and KV format.
     pub fn new(config: KvCacheConfig, model_config: &ModelConfig, model_id: &str) -> Self {
         Self {
             warm: HashMap::new(),
@@ -2307,6 +2522,21 @@ impl KvPrefixCache {
             warm_bytes: 0,
             tick: Cell::new(0),
         }
+    }
+
+    /// Built-in model policy: a backend/format namespace is insufficient to
+    /// identify anonymous weights. Keep warm reuse but prevent all cold-tier
+    /// access, including clearing files written by older anonymous loads.
+    pub(crate) fn for_model(
+        mut config: KvCacheConfig,
+        model_config: &ModelConfig,
+        model_id: &str,
+        namespace: &str,
+    ) -> Self {
+        if model_id.is_empty() {
+            config.cache_dir = None;
+        }
+        Self::new(config, model_config, namespace)
     }
 
     fn next_tick(&self) -> u64 {
@@ -2949,7 +3179,7 @@ fn hash_tokens(tokens: &[u32]) -> u64 {
 /// Compute a fingerprint for a model configuration.
 /// Two models with different fingerprints have incompatible KV cache layouts.
 /// Callers should pass a `model_id` that uniquely identifies the specific
-/// model weights (e.g. a hash of the GGUF file or the model name from metadata),
+/// model weights (e.g. a hash of the GGUF file),
 /// so different models with the same architecture don't share cache entries.
 pub fn model_fingerprint(config: &ModelConfig, model_id: &str) -> u64 {
     // Build a stable byte representation and hash it via FNV-1a. Using
@@ -3020,6 +3250,90 @@ mod tests {
             moe: None,
             is_causal: true,
             class_labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn anonymous_model_policy_keeps_warm_hits_and_limits() {
+        let cfg = tiny_config(2, 16);
+        for backend in ["cpu:", "wgpu:", "metal:"] {
+            for compression in [
+                KvCompression::None,
+                KvCompression::F16,
+                KvCompression::turboquant(7),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let namespace = format!("{backend}{}", compression.cache_tag());
+                let mut cache = KvPrefixCache::for_model(
+                    KvCacheConfig {
+                        cache_dir: Some(dir.path().join("must-not-create")),
+                        max_warm_entries: 1,
+                        max_warm_bytes: 1234,
+                        max_cold_bytes: 5678,
+                        max_warm_anchors: 1,
+                    },
+                    &cfg,
+                    "",
+                    &namespace,
+                );
+                assert!(cache.config.cache_dir.is_none());
+                assert_eq!(cache.config.max_warm_entries, 1);
+                assert_eq!(cache.config.max_warm_bytes, 1234);
+                assert_eq!(cache.config.max_cold_bytes, 5678);
+                assert_eq!(cache.config.max_warm_anchors, 1);
+                let snapshot = || StateSnapshot::new(Vec::new(), 2);
+                cache.insert(&[1, 2], snapshot());
+                assert_eq!(cache.warm_count(), 1);
+                assert_eq!(cache.find_longest_prefix(&[1, 2, 3]).unwrap().1, 2);
+                cache.insert(&[3, 4], snapshot());
+                assert_eq!(cache.warm_count(), 1);
+                assert!(cache.find_longest_prefix(&[1, 2, 3]).is_none());
+                assert_eq!(cache.find_longest_prefix(&[3, 4, 5]).unwrap().1, 2);
+                cache.clear_warm();
+                assert!(cache.find_longest_prefix(&[3, 4, 5]).is_none());
+                cache.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn named_model_policy_preserves_cold_namespaces() {
+        let cfg = tiny_config(2, 16);
+        for backend in ["cpu:", "wgpu:", "metal:"] {
+            for compression in [
+                KvCompression::None,
+                KvCompression::F16,
+                KvCompression::turboquant(7),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let config = KvCacheConfig {
+                    cache_dir: Some(dir.path().to_owned()),
+                    ..KvCacheConfig::default()
+                };
+                let namespace = format!("{backend}{}model-a", compression.cache_tag());
+                // The public constructor supplies the historical on-disk format.
+                let mut old = KvPrefixCache::new(config.clone(), &cfg, &namespace);
+                old.insert(&[1, 2], StateSnapshot::new(Vec::new(), 2));
+                drop(old);
+                let mut same =
+                    KvPrefixCache::for_model(config.clone(), &cfg, "model-a", &namespace);
+                assert_eq!(same.config.cache_dir.as_deref(), Some(dir.path()));
+                assert_eq!(same.warm_count(), 0);
+                assert_eq!(same.find_longest_prefix(&[1, 2, 3]).unwrap().1, 2);
+                let other_namespace = format!("{backend}{}model-b", compression.cache_tag());
+                let mut other = KvPrefixCache::for_model(config, &cfg, "model-b", &other_namespace);
+                assert!(other.find_longest_prefix(&[1, 2, 3]).is_none());
+                other.insert(&[1, 2], StateSnapshot::new(Vec::new(), 2));
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+                same.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+                other.clear_warm();
+                assert!(other.find_longest_prefix(&[1, 2, 3]).is_some());
+                other.clear();
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+            }
         }
     }
 
@@ -3974,5 +4288,98 @@ mod tests {
         };
         assert!(mamba2_conv_dim(&overflow_ssm).is_err());
         assert!(mamba2_d_in_proj(&overflow_ssm).is_err());
+    }
+
+    #[test]
+    fn test_validate_snapshot_rejects_corrupt_compressed_blobs() {
+        let mut cfg = tiny_config(1, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 1];
+        cfg.kv_heads_per_layer = vec![2; 1];
+
+        let state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+        assert!(state.is_compressed());
+
+        let invalid_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionCompressed {
+                keys: vec![0u8; 16],
+                values: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&invalid_snapshot).unwrap_err();
+        assert!(err.contains("invalid TQK1 compressed keys blob in snapshot"));
+    }
+
+    #[test]
+    fn validate_snapshot_rejects_uncompressed_attention_into_compressed_state() {
+        let cfg = tiny_config(1, 16);
+        let state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+        assert!(state.is_compressed());
+
+        let uncompressed_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::Attention {
+                k_data: vec![0u8; 16],
+                v_data: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&uncompressed_snapshot).unwrap_err();
+        assert!(
+            err.contains(
+                "uncompressed Attention snapshot cannot be restored into a compressed state"
+            ),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_snapshot_rejects_f16_attention_into_f32_state() {
+        let cfg = tiny_config(1, 16);
+        let state = InferenceState::from_config(&cfg).unwrap();
+        assert!(!state.kv_f16);
+
+        let f16_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionF16 {
+                k_data: vec![0u8; 8],
+                v_data: vec![0u8; 8],
+            }],
+            0,
+        );
+
+        let err = state.validate_snapshot(&f16_snapshot).unwrap_err();
+        assert!(
+            err.contains("AttentionF16 snapshot cannot be restored into a non-f16 state"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid TQK1/TQV1 compressed blob in snapshot")]
+    fn restore_corrupt_compressed_blob_panics() {
+        let mut cfg = tiny_config(1, 16);
+        cfg.architecture = "llama".into();
+        cfg.block_types = vec![BlockType::Attention; 1];
+        cfg.kv_heads_per_layer = vec![2; 1];
+
+        let mut state =
+            InferenceState::from_config_with_compression(&cfg, &KvCompression::turboquant(42))
+                .unwrap();
+
+        let invalid_snapshot = StateSnapshot::new(
+            vec![LayerSnapshot::AttentionCompressed {
+                keys: vec![0u8; 16],
+                values: vec![0u8; 16],
+            }],
+            0,
+        );
+
+        state.restore(&invalid_snapshot);
     }
 }

@@ -14,7 +14,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 
 import 'chat_controller.dart';
 import 'chat_intent.dart';
@@ -644,7 +644,7 @@ class _ChatPageState extends State<ChatPage> {
                           borderRadius: BorderRadius.circular(6),
                         ),
                         child: Text(
-                          'v0.5.6',
+                          'v0.6.0',
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 10,

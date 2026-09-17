@@ -18,7 +18,7 @@ or in the browser, from a single dependency-free core.
   bundle id; it can auto-download and cache models from Hugging Face.
 - **Multimodal.** Text, vision (image → text), and audio (in/out) models all
   load through the same session API.
-- **Wake word & speech recognition.** Native Keyword Spotting (KWS) and OpenAI Whisper ASR in pure Rust, linked through a single unified binary across mobile and desktop.
+- **Wake word & speech recognition.** Native Keyword Spotting (KWS), Silero VAD, OpenAI Whisper ASR, and the unified stateful `AudioPipeline` in pure Rust, linked through a single unified binary across mobile and desktop.
 - **Structured output.** Constrain generation to a GBNF grammar, or one flag
   for guaranteed-valid JSON.
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it
@@ -128,11 +128,11 @@ One Rust core, consumed from many places:
 | **Rust (Engine)** | [`cera`](cera/) | any Rust project (`cargo add cera`) |
 | **Rust (API client)** | [`cera-client`](cera-client/) | any Rust project (`cargo add cera-client`); OpenAI and OpenRouter endpoints |
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
-| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, VAD, KWS, Whisper) |
+| **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, ChatSession, VAD, KWS, Whisper) |
 | **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
 | **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
-| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, VAD, KWS, Whisper) |
-| **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib |
+| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, ChatSession, VAD, KWS, Whisper) |
+| **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib (ChatSession, explicit loading) |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
 A complete SwiftUI example app (streaming chat + embeddings + LoRA) that consumes
@@ -271,6 +271,40 @@ Cera includes support for **DSpark** ([arXiv:2407.08608](https://arxiv.org/abs/2
 - **Parallel GPU Verification**: Validates draft token sequences in a single forward pass with batched LM-head verification on CPU, Metal, and WebGPU.
 - **Automatic Drafter Discovery**: Bundle loader automatically discovers and attaches paired DSpark sidecar models from LeapBundles and Hugging Face repositories.
 
+## Sharing a loaded GPU model
+
+Metal and wgpu permit one live `Session` per loaded model. A second session
+returns `Busy` until the first is dropped; reset and cancellation keep ownership.
+CPU models continue to support shared weights across concurrent sessions. Load
+separate GPU models for simultaneous conversations. The
+[session ownership walkthrough](docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
+and executable CPU/Metal/wgpu checks.
+
+LFM2-Audio transcription during a live GPU conversation uses a cached secondary
+model built from retained weights. This preserves conversation KV and costs
+additional model memory and first-use setup; the walkthrough includes a native
+Dart consumer for transcription and seeded generation.
+
+## Whisper speech recognition
+
+The standalone `FfiWhisperModel` loads a Whisper GGUF from a path or owned bytes
+and transcribes 16 kHz mono float PCM through Swift and Kotlin. Use
+`transcribeAsync` for a background decode; `whisperDefaultTranscribeOpts` supplies
+language, translation, timestamps, token limit and temperature defaults.
+The [Swift/Kotlin recording examples](docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md)
+are compiled and executed against the generated bindings. Build matching wrappers
+and native libraries from the same revision.
+
+```bash
+# Exercise loading, nonempty decoding, async calls and ownership without downloads.
+cargo test -p cera-ffi --test whisper_ffi --locked --offline
+```
+
+Each call handles at most 30 seconds; segment longer recordings first. This is
+separate from LFM2-Audio's `CeraEngine.transcribe`. Dropping its Rust future
+cooperatively cancels decoding. Kotlin propagates coroutine cancellation; the
+pinned Swift wrapper does not propagate `Task.cancel()`.
+
 ## Voice Activity Detection (Silero VAD v5)
 
 Cera includes a **native, pure-Rust implementation of Silero VAD v5** (`cera::vad`), enabling zero-dependency, real-time voice activity detection across desktop, mobile, and web:
@@ -293,8 +327,8 @@ python scripts/convert_silero_vad.py silero_vad.onnx models/silero_vad.gguf
 Cera includes a **native, pure-Rust Keyword Spotting (KWS) engine** (`cera::hotword`) designed for always-on, low-power wake word detection on mobile and edge devices:
 
 - **Self-describing GGUF containers**: Stores acoustic configurations, label lists, window and hop dimensions, and detection thresholds in GGUF metadata under `kws.*`.
-- **Zero-allocation streaming hot path**: Pre-allocated scratch buffers in both `LogMelFrontEnd` (32-channel HTK mel filterbank, FFT power spectrum, log1p compression) and `HotwordDetector` (Conv1D backbone with folded BatchNorm layers and vectorized MLP head) guarantee zero dynamic heap allocations on real-time audio threads.
-- **VAD-gated streaming iterator (`HotwordIterator`)**: Interleaves 512-sample Silero VAD gating (Stage 0a) with configurable hop KWS checks (Stage 0b). Automatically bypasses heavy acoustic evaluation during ambient silence to preserve battery life.
+- **Reusable inference buffers**: `LogMelFrontEnd` and `HotwordDetector` retain scratch buffers for acoustic features and inference. Event strings, growing stream buffers and foreign argument/result marshaling can still allocate; process chunks serially on a background audio worker.
+- **VAD-gated streaming iterator (`HotwordIterator`)**: Interleaves Silero VAD gating (512 samples at 16 kHz or 256 at 8 kHz) with configurable hop KWS checks. It skips acoustic evaluation when the buffered window has no recent speech; other model sample rates disable VAD gating.
 - **Adaptive Automatic Gain Control (AGC)**: Peak normalization scales soft or far-field speech up to nominal reference levels with a 30.0x gain ceiling, preventing ambient noise floor amplification while maintaining sensitivity across desk or room distances.
 - **Cross-platform bindings**: Available in pure Rust (`cera::hotword`), Kotlin/Android, Swift/iOS, Python via `cera-ffi`, and Flutter via `cera_ffi_flutter`.
 
@@ -311,8 +345,8 @@ python tools/wake_word/train_kws.py --phrase "Hey Liquid" --epochs 25 --output m
 Cera provides a **pure-Rust implementation of OpenAI Whisper ASR** (`cera::model::whisper`), exposed across all foreign language bindings via UniFFI (`cera-ffi`):
 
 - **Unified mobile deployment**: Mobile applications link a single native library (`libcera_ffi.so` or `CeraFFI.xcframework`) for wake word detection, speech activity gating, and full speech-to-text transcription without external C++ or JNI dependencies.
-- **Cooperative async cancellation**: Long-running background transcription tasks support instant cancellation via RAII drop guards and atomic flags (`transcribe_async`), freeing audio and thread resources immediately when UI listening windows close.
-- **Multilingual and timestamp support**: Automatic language identification across 99 supported languages, optional word and segment timestamps, and custom transcription options.
+- **Cooperative async cancellation**: Dropping a `transcribe_async` Rust future signals a running decoder to stop at its next cancellation check. Kotlin propagates coroutine cancellation; the pinned Swift wrapper does not propagate `Task.cancel()`. See the [Whisper examples and limitations](docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md).
+- **Multilingual and timestamp options**: Multilingual models support language detection and selection from the standard 100-code table. The timestamp option controls decoder tokens; transcription returns plain text without structured segment or word timestamps.
 - **Cross-platform bindings**: Available in pure Rust (`cera::model::whisper`), Swift, Kotlin, Python, and Dart/Flutter.
 
 ## Hugging Face Models & Streaming Quantization
@@ -320,7 +354,7 @@ Cera provides a **pure-Rust implementation of OpenAI Whisper ASR** (`cera::model
 Cera supports direct loading and streaming execution from **Hugging Face model repositories**:
 
 - **Direct Repo Loading**: Point Cera directly at Hugging Face model IDs or URLs (`--hf org/repo`).
-- **Zero-Disk Streaming Quantization**: Quantize remote SafeTensors models on-the-fly into GGUF format directly in memory without writing intermediate full-precision weights to disk (`--quant-strategy fast-mse`, `hqq`, `quarot`).
+- **Streaming Quantization**: Convert remote SafeTensors models tensor by tensor into a cached GGUF file without storing complete source shards (`--quant-strategy fast-mse`, `hqq`, `quarot`).
 - **LeapBundles Integration**: Seamless automatic download, manifest parsing, and local caching under `$HOME/.cache/cera`.
 
 ```bash
@@ -362,20 +396,52 @@ cera chat
 cera run -m model.gguf -p "Hi" --device metal   # or: gpu, cpu, auto
 ```
 
-Using the library directly (streaming tokens through a sink):
+Using the library directly:
 
 ```rust
-use cera::{CeraEngine, EngineConfig, GenerateOpts, SessionConfig};
+use cera::{CeraEngine, EngineConfig, GenerateOpts, Message, SessionConfig};
 
 let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
-let mut session = engine.new_session(SessionConfig::default());
-session.append_text("Once upon a time")?;
+let mut session = engine.new_session(SessionConfig::default())?;
 
+// Raw prompt completion:
+session.append_text("Once upon a time")?;
 let opts = GenerateOpts { max_tokens: 128, ..Default::default() };
 let summary = session.generate(&opts, &mut sink)?; // sink: your ModalitySink
+
+// Or conversational chat coordination (delta-only prefill, live KV retention):
+let mut chat = session.into_chat().map_err(|(_, err)| err)?;
+chat.ingest(&Message::user("What is the capital of France?"))?;
+let reply = chat.complete(&opts)?;
+println!("Assistant: {}", reply.text);
 ```
 
 See the [`cera` crate README](cera/README.md) for the full library API.
+This checkout also exposes explicit loading alongside the existing constructors:
+
+```rust
+use cera::{ModelLoader, ModelSource, SessionConfig};
+
+let model = ModelLoader::new(ModelSource::path("model.gguf")).build_generative()?;
+let mut session = model.create_session(SessionConfig::default())?;
+drop(model); // The session retains its loaded resources and live KV state.
+session.append_text("Once upon a time")?;
+```
+
+Run the complete [text-completion example](cera/examples/explicit_loading.rs):
+`cargo run -p cera --example explicit_loading -- model.gguf "Once upon a time"`.
+For multi-turn chat, run the [conversational chat example](cera/examples/chat.rs):
+`cargo run -p cera --example chat -- model.gguf`.
+The API refactor also provides [runnable multi-language examples](docs/internals/API_RESHAPE_EXAMPLES.md),
+including conversational chat ([Rust](cera/examples/chat.rs), [Swift](cera-ffi/examples/Chat.swift),
+[Kotlin](cera-ffi/examples/Chat.kt), [Python](cera-ffi/examples/chat.py), [Dart](cera_ffi/example/chat.dart)),
+session continuation, and vision/draft loading. The new Rust, native and CPU WASM
+loading APIs are in this checkout; released packages have not been updated.
+The [audio walkthrough](docs/internals/API_RESHAPE_AUDIO_EXAMPLE.md) demonstrates PCM input and output with locally generated test weights.
+The [remote companion examples](docs/internals/API_RESHAPE_REMOTE_EXAMPLES.md) run HF discovery, downloads, cache repair and retained vision/audio/draft execution against a local HTTP fixture.
+The [HF revision examples](docs/internals/API_RESHAPE_HF_EXAMPLES.md) load changed GGUF revisions into separate cache entries, verify defaults and keep a CPU session live across another revision load. They also exercise failed metadata resolution and explicit commit checks.
+The [SafeTensors conversion examples](docs/internals/API_RESHAPE_CONVERSION_EXAMPLES.md) exercise real conversion, corruption repair and option-sensitive cached reloads. The examples verify checkpoint bytes, pin inputs to one upstream commit, and refresh changed revisions. Retained models execute after replacement, and sessions continue after their parent model is released.
+The [persistent cache examples](docs/internals/API_RESHAPE_CACHE_EXAMPLES.md) demonstrate same-path weight replacement, unchanged-weight disk reuse and retained live sessions.
 
 ## CLI commands
 

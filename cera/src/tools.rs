@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 /// `parameters` is a JSON Schema object describing the arguments (`type:
 /// object`, `properties`, `required`). It is passed through verbatim to the
 /// template and used to derive a constraint grammar.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolDef {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

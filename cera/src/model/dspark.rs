@@ -1006,6 +1006,9 @@ impl DSparkGpuWeightSource {
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource {
+    fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
+        Some(vec![&self.dspark.gguf, &self.dspark.base_gguf])
+    }
     fn config(&self) -> &ModelConfig {
         &self.config
     }

@@ -408,11 +408,12 @@ class FfiHotwordEvent {
   const FfiHotwordEvent({
     /// The matched keyword string.
     required this.keyword,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     required this.sampleOffset,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     required this.commandStartSample,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     required this.timestampMs,
     /// Model confidence probability (0.0 to 1.0).
     required this.confidence,
@@ -420,11 +421,12 @@ class FfiHotwordEvent {
 
   /// The matched keyword string.
   final String keyword;
-  /// Exact audio stream sample index where the keyword completed.
+  /// Exclusive end sample of the window evaluated when detection triggered.
+  /// This is a detection-hop boundary; it does not locate the spoken word's end.
   final int sampleOffset;
-  /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+  /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
   final int commandStartSample;
-  /// Timestamp in milliseconds from stream origin where keyword completed.
+  /// `sample_offset` converted to milliseconds using the model sample rate.
   final double timestampMs;
   /// Model confidence probability (0.0 to 1.0).
   final double confidence;
@@ -1585,6 +1587,652 @@ class UserMessage {
   int get hashCode => Object.hash(text, images, audio);
 }
 
+/// Configuration options for the unified audio pipeline.
+class FfiAudioPipelineConfig {
+  const FfiAudioPipelineConfig({
+    /// Whether a keyword spotting wake word must be detected before speech tracking begins.
+    required this.requireHotword,
+    /// Whether to automatically run Whisper transcription upon speech completion.
+    required this.autoTranscribe,
+    /// Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+    required this.preRollMs,
+    /// Maximum allowed utterance duration in milliseconds before forcing a boundary.
+    required this.maxUtteranceMs,
+    /// Voice Activity Detection configuration.
+    required this.vadConfig,
+    /// Keyword Spotting configuration.
+    required this.hotwordConfig,
+    /// Whisper transcription options.
+    required this.whisperOpts,
+  });
+
+  /// Whether a keyword spotting wake word must be detected before speech tracking begins.
+  final bool requireHotword;
+  /// Whether to automatically run Whisper transcription upon speech completion.
+  final bool autoTranscribe;
+  /// Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+  final int preRollMs;
+  /// Maximum allowed utterance duration in milliseconds before forcing a boundary.
+  final int maxUtteranceMs;
+  /// Voice Activity Detection configuration.
+  final FfiVadConfig? vadConfig;
+  /// Keyword Spotting configuration.
+  final FfiHotwordConfig? hotwordConfig;
+  /// Whisper transcription options.
+  final FfiWhisperTranscribeOpts? whisperOpts;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'requireHotword': this.requireHotword,
+      'autoTranscribe': this.autoTranscribe,
+      'preRollMs': this.preRollMs,
+      'maxUtteranceMs': this.maxUtteranceMs,
+      'vadConfig': this.vadConfig == null ? null : (() { final __tmp = this.vadConfig!; return __tmp.toJson(); })(),
+      'hotwordConfig': this.hotwordConfig == null ? null : (() { final __tmp = this.hotwordConfig!; return __tmp.toJson(); })(),
+      'whisperOpts': this.whisperOpts == null ? null : (() { final __tmp = this.whisperOpts!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory FfiAudioPipelineConfig.fromJson(Map<String, dynamic> json) {
+    return FfiAudioPipelineConfig(
+      requireHotword: json['requireHotword'] as bool,
+      autoTranscribe: json['autoTranscribe'] as bool,
+      preRollMs: (json['preRollMs'] as num).toInt(),
+      maxUtteranceMs: (json['maxUtteranceMs'] as num).toInt(),
+      vadConfig: json['vadConfig'] == null ? null : (() { final __tmp = json['vadConfig']; return FfiVadConfig.fromJson(__tmp as Map<String, dynamic>); })(),
+      hotwordConfig: json['hotwordConfig'] == null ? null : (() { final __tmp = json['hotwordConfig']; return FfiHotwordConfig.fromJson(__tmp as Map<String, dynamic>); })(),
+      whisperOpts: json['whisperOpts'] == null ? null : (() { final __tmp = json['whisperOpts']; return FfiWhisperTranscribeOpts.fromJson(__tmp as Map<String, dynamic>); })(),
+    );
+  }
+
+  FfiAudioPipelineConfig copyWith({
+    bool? requireHotword,
+    bool? autoTranscribe,
+    int? preRollMs,
+    int? maxUtteranceMs,
+    Object? vadConfig = _sentinel,
+    Object? hotwordConfig = _sentinel,
+    Object? whisperOpts = _sentinel,
+  }) {
+    return FfiAudioPipelineConfig(
+      requireHotword: requireHotword ?? this.requireHotword,
+      autoTranscribe: autoTranscribe ?? this.autoTranscribe,
+      preRollMs: preRollMs ?? this.preRollMs,
+      maxUtteranceMs: maxUtteranceMs ?? this.maxUtteranceMs,
+      vadConfig: vadConfig == _sentinel ? this.vadConfig : vadConfig as FfiVadConfig?,
+      hotwordConfig: hotwordConfig == _sentinel ? this.hotwordConfig : hotwordConfig as FfiHotwordConfig?,
+      whisperOpts: whisperOpts == _sentinel ? this.whisperOpts : whisperOpts as FfiWhisperTranscribeOpts?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts;
+
+  @override
+  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts);
+}
+
+/// Summary of a successful message ingestion.
+class IngestSummary {
+  const IngestSummary({
+    /// Number of tokens encoded and appended to context.
+    required this.inputTokens,
+    /// KV position before ingestion.
+    required this.positionBefore,
+    /// KV position after ingestion.
+    required this.positionAfter,
+  });
+
+  /// Number of tokens encoded and appended to context.
+  final int inputTokens;
+  /// KV position before ingestion.
+  final int positionBefore;
+  /// KV position after ingestion.
+  final int positionAfter;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'inputTokens': this.inputTokens,
+      'positionBefore': this.positionBefore,
+      'positionAfter': this.positionAfter,
+    };
+  }
+
+  factory IngestSummary.fromJson(Map<String, dynamic> json) {
+    return IngestSummary(
+      inputTokens: (json['inputTokens'] as num).toInt(),
+      positionBefore: (json['positionBefore'] as num).toInt(),
+      positionAfter: (json['positionAfter'] as num).toInt(),
+    );
+  }
+
+  IngestSummary copyWith({
+    int? inputTokens,
+    int? positionBefore,
+    int? positionAfter,
+  }) {
+    return IngestSummary(
+      inputTokens: inputTokens ?? this.inputTokens,
+      positionBefore: positionBefore ?? this.positionBefore,
+      positionAfter: positionAfter ?? this.positionAfter,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'IngestSummary(inputTokens: $inputTokens, positionBefore: $positionBefore, positionAfter: $positionAfter)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IngestSummary && inputTokens == other.inputTokens && positionBefore == other.positionBefore && positionAfter == other.positionAfter;
+
+  @override
+  int get hashCode => Object.hash(inputTokens, positionBefore, positionAfter);
+}
+
+/// A structured conversational turn message.
+class Message {
+  const Message({
+    /// Author role.
+    required this.role,
+    /// Message text content.
+    required this.content,
+    /// Optional image payload bytes.
+    this.imageBytes = null,
+    /// Optional audio PCM waveform samples.
+    this.audioPcm = null,
+    /// Audio sample rate in Hz (e.g. 16000).
+    this.audioSampleRate = null,
+  });
+
+  /// Author role.
+  final Role role;
+  /// Message text content.
+  final String content;
+  /// Optional image payload bytes.
+  final Uint8List? imageBytes;
+  /// Optional audio PCM waveform samples.
+  final List<double>? audioPcm;
+  /// Audio sample rate in Hz (e.g. 16000).
+  final int? audioSampleRate;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'role': RoleFfiCodec.encode(this.role),
+      'content': this.content,
+      'imageBytes': this.imageBytes == null ? null : (() { final __tmp = this.imageBytes!; return base64Encode(__tmp); })(),
+      'audioPcm': this.audioPcm == null ? null : (() { final __tmp = this.audioPcm!; return __tmp; })(),
+      'audioSampleRate': this.audioSampleRate,
+    };
+  }
+
+  factory Message.fromJson(Map<String, dynamic> json) {
+    return Message(
+      role: RoleFfiCodec.decode(json['role'] as String),
+      content: json['content'] as String,
+      imageBytes: json.containsKey('imageBytes') ? json['imageBytes'] == null ? null : (() { final __tmp = json['imageBytes']; return base64Decode(__tmp as String); })() : null,
+      audioPcm: json.containsKey('audioPcm') ? json['audioPcm'] == null ? null : (() { final __tmp = json['audioPcm']; return (__tmp as List).map((item) => (item as num).toDouble()).toList(); })() : null,
+      audioSampleRate: json.containsKey('audioSampleRate') ? json['audioSampleRate'] == null ? null : (json['audioSampleRate'] as num).toInt() : null,
+    );
+  }
+
+  Message copyWith({
+    Role? role,
+    String? content,
+    Object? imageBytes = _sentinel,
+    Object? audioPcm = _sentinel,
+    Object? audioSampleRate = _sentinel,
+  }) {
+    return Message(
+      role: role ?? this.role,
+      content: content ?? this.content,
+      imageBytes: imageBytes == _sentinel ? this.imageBytes : imageBytes as Uint8List?,
+      audioPcm: audioPcm == _sentinel ? this.audioPcm : audioPcm as List<double>?,
+      audioSampleRate: audioSampleRate == _sentinel ? this.audioSampleRate : audioSampleRate as int?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'Message(role: $role, content: $content, imageBytes: $imageBytes, audioPcm: $audioPcm, audioSampleRate: $audioSampleRate)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Message && role == other.role && content == other.content && imageBytes == other.imageBytes && audioPcm == other.audioPcm && audioSampleRate == other.audioSampleRate;
+
+  @override
+  int get hashCode => Object.hash(role, content, imageBytes, audioPcm, audioSampleRate);
+}
+
+/// Result of a completed chat turn.
+class TurnResult {
+  const TurnResult({
+    /// Decoded assistant response text.
+    required this.text,
+    /// Token identifiers emitted during the turn.
+    required this.tokens,
+    /// Generation summary metrics.
+    required this.summary,
+    /// Parsed tool calls emitted by the model during the turn.
+    this.toolCalls = const [],
+  });
+
+  /// Decoded assistant response text.
+  final String text;
+  /// Token identifiers emitted during the turn.
+  final List<int> tokens;
+  /// Generation summary metrics.
+  final GenerateSummary summary;
+  /// Parsed tool calls emitted by the model during the turn.
+  final List<ToolCall> toolCalls;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'text': this.text,
+      'tokens': this.tokens,
+      'summary': this.summary.toJson(),
+      'toolCalls': this.toolCalls.map((item) => item.toJson()).toList(),
+    };
+  }
+
+  factory TurnResult.fromJson(Map<String, dynamic> json) {
+    return TurnResult(
+      text: json['text'] as String,
+      tokens: (json['tokens'] as List).map((item) => (item as num).toInt()).toList(),
+      summary: GenerateSummary.fromJson(json['summary'] as Map<String, dynamic>),
+      toolCalls: json.containsKey('toolCalls') ? (json['toolCalls'] as List).map((item) => ToolCall.fromJson(item as Map<String, dynamic>)).toList() : const [],
+    );
+  }
+
+  TurnResult copyWith({
+    String? text,
+    List<int>? tokens,
+    GenerateSummary? summary,
+    List<ToolCall>? toolCalls,
+  }) {
+    return TurnResult(
+      text: text ?? this.text,
+      tokens: tokens ?? this.tokens,
+      summary: summary ?? this.summary,
+      toolCalls: toolCalls ?? this.toolCalls,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'TurnResult(text: $text, tokens: $tokens, summary: $summary, toolCalls: $toolCalls)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TurnResult && text == other.text && tokens == other.tokens && summary == other.summary && toolCalls == other.toolCalls;
+
+  @override
+  int get hashCode => Object.hash(text, tokens, summary, toolCalls);
+}
+
+class ModelFiles {
+  const ModelFiles({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.extras,
+    required this.inferenceType,
+    required this.chatTemplate,
+  });
+
+  final String model;
+  final String? multimodalProjector;
+  final String? audioDecoder;
+  final String? audioTokenizer;
+  final String? draftModel;
+  final Map<String, String> extras;
+  final String? inferenceType;
+  final String? chatTemplate;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': this.model,
+      'multimodalProjector': this.multimodalProjector,
+      'audioDecoder': this.audioDecoder,
+      'audioTokenizer': this.audioTokenizer,
+      'draftModel': this.draftModel,
+      'extras': this.extras,
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+    };
+  }
+
+  factory ModelFiles.fromJson(Map<String, dynamic> json) {
+    return ModelFiles(
+      model: json['model'] as String,
+      multimodalProjector: json['multimodalProjector'] == null ? null : json['multimodalProjector'] as String,
+      audioDecoder: json['audioDecoder'] == null ? null : json['audioDecoder'] as String,
+      audioTokenizer: json['audioTokenizer'] == null ? null : json['audioTokenizer'] as String,
+      draftModel: json['draftModel'] == null ? null : json['draftModel'] as String,
+      extras: (json['extras'] as Map<String, dynamic>).map((key, value) => MapEntry(key, value as String)),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+    );
+  }
+
+  ModelFiles copyWith({
+    String? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Map<String, String>? extras,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+  }) {
+    return ModelFiles(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as String?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as String?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as String?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as String?,
+      extras: extras ?? this.extras,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelFiles(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, extras: $extras, inferenceType: $inferenceType, chatTemplate: $chatTemplate)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelFiles && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && extras == other.extras && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, extras, inferenceType, chatTemplate);
+}
+
+class ModelParts {
+  const ModelParts({
+    required this.model,
+    required this.multimodalProjector,
+    required this.audioDecoder,
+    required this.audioTokenizer,
+    required this.draftModel,
+    required this.inferenceType,
+    required this.chatTemplate,
+    required this.generationDefaults,
+  });
+
+  final Uint8List model;
+  final Uint8List? multimodalProjector;
+  final Uint8List? audioDecoder;
+  final Uint8List? audioTokenizer;
+  final Uint8List? draftModel;
+  final String? inferenceType;
+  final String? chatTemplate;
+  final GenerationDefaults? generationDefaults;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'model': base64Encode(this.model),
+      'multimodalProjector': this.multimodalProjector == null ? null : (() { final __tmp = this.multimodalProjector!; return base64Encode(__tmp); })(),
+      'audioDecoder': this.audioDecoder == null ? null : (() { final __tmp = this.audioDecoder!; return base64Encode(__tmp); })(),
+      'audioTokenizer': this.audioTokenizer == null ? null : (() { final __tmp = this.audioTokenizer!; return base64Encode(__tmp); })(),
+      'draftModel': this.draftModel == null ? null : (() { final __tmp = this.draftModel!; return base64Encode(__tmp); })(),
+      'inferenceType': this.inferenceType,
+      'chatTemplate': this.chatTemplate,
+      'generationDefaults': this.generationDefaults == null ? null : (() { final __tmp = this.generationDefaults!; return GenerationDefaultsFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory ModelParts.fromJson(Map<String, dynamic> json) {
+    return ModelParts(
+      model: base64Decode(json['model'] as String),
+      multimodalProjector: json['multimodalProjector'] == null ? null : (() { final __tmp = json['multimodalProjector']; return base64Decode(__tmp as String); })(),
+      audioDecoder: json['audioDecoder'] == null ? null : (() { final __tmp = json['audioDecoder']; return base64Decode(__tmp as String); })(),
+      audioTokenizer: json['audioTokenizer'] == null ? null : (() { final __tmp = json['audioTokenizer']; return base64Decode(__tmp as String); })(),
+      draftModel: json['draftModel'] == null ? null : (() { final __tmp = json['draftModel']; return base64Decode(__tmp as String); })(),
+      inferenceType: json['inferenceType'] == null ? null : json['inferenceType'] as String,
+      chatTemplate: json['chatTemplate'] == null ? null : json['chatTemplate'] as String,
+      generationDefaults: json['generationDefaults'] == null ? null : (() { final __tmp = json['generationDefaults']; return GenerationDefaultsFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  ModelParts copyWith({
+    Uint8List? model,
+    Object? multimodalProjector = _sentinel,
+    Object? audioDecoder = _sentinel,
+    Object? audioTokenizer = _sentinel,
+    Object? draftModel = _sentinel,
+    Object? inferenceType = _sentinel,
+    Object? chatTemplate = _sentinel,
+    Object? generationDefaults = _sentinel,
+  }) {
+    return ModelParts(
+      model: model ?? this.model,
+      multimodalProjector: multimodalProjector == _sentinel ? this.multimodalProjector : multimodalProjector as Uint8List?,
+      audioDecoder: audioDecoder == _sentinel ? this.audioDecoder : audioDecoder as Uint8List?,
+      audioTokenizer: audioTokenizer == _sentinel ? this.audioTokenizer : audioTokenizer as Uint8List?,
+      draftModel: draftModel == _sentinel ? this.draftModel : draftModel as Uint8List?,
+      inferenceType: inferenceType == _sentinel ? this.inferenceType : inferenceType as String?,
+      chatTemplate: chatTemplate == _sentinel ? this.chatTemplate : chatTemplate as String?,
+      generationDefaults: generationDefaults == _sentinel ? this.generationDefaults : generationDefaults as GenerationDefaults?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'ModelParts(model: $model, multimodalProjector: $multimodalProjector, audioDecoder: $audioDecoder, audioTokenizer: $audioTokenizer, draftModel: $draftModel, inferenceType: $inferenceType, chatTemplate: $chatTemplate, generationDefaults: $generationDefaults)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelParts && model == other.model && multimodalProjector == other.multimodalProjector && audioDecoder == other.audioDecoder && audioTokenizer == other.audioTokenizer && draftModel == other.draftModel && inferenceType == other.inferenceType && chatTemplate == other.chatTemplate && generationDefaults == other.generationDefaults;
+
+  @override
+  int get hashCode => Object.hash(model, multimodalProjector, audioDecoder, audioTokenizer, draftModel, inferenceType, chatTemplate, generationDefaults);
+}
+
+class SamplingDefaults {
+  const SamplingDefaults({
+    required this.temperature,
+    required this.topP,
+    required this.topK,
+    required this.minP,
+    required this.repetitionPenalty,
+  });
+
+  final double? temperature;
+  final double? topP;
+  final int? topK;
+  final double? minP;
+  final double? repetitionPenalty;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'temperature': this.temperature,
+      'topP': this.topP,
+      'topK': this.topK,
+      'minP': this.minP,
+      'repetitionPenalty': this.repetitionPenalty,
+    };
+  }
+
+  factory SamplingDefaults.fromJson(Map<String, dynamic> json) {
+    return SamplingDefaults(
+      temperature: json['temperature'] == null ? null : (json['temperature'] as num).toDouble(),
+      topP: json['topP'] == null ? null : (json['topP'] as num).toDouble(),
+      topK: json['topK'] == null ? null : (json['topK'] as num).toInt(),
+      minP: json['minP'] == null ? null : (json['minP'] as num).toDouble(),
+      repetitionPenalty: json['repetitionPenalty'] == null ? null : (json['repetitionPenalty'] as num).toDouble(),
+    );
+  }
+
+  SamplingDefaults copyWith({
+    Object? temperature = _sentinel,
+    Object? topP = _sentinel,
+    Object? topK = _sentinel,
+    Object? minP = _sentinel,
+    Object? repetitionPenalty = _sentinel,
+  }) {
+    return SamplingDefaults(
+      temperature: temperature == _sentinel ? this.temperature : temperature as double?,
+      topP: topP == _sentinel ? this.topP : topP as double?,
+      topK: topK == _sentinel ? this.topK : topK as int?,
+      minP: minP == _sentinel ? this.minP : minP as double?,
+      repetitionPenalty: repetitionPenalty == _sentinel ? this.repetitionPenalty : repetitionPenalty as double?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SamplingDefaults(temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SamplingDefaults && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty;
+
+  @override
+  int get hashCode => Object.hash(temperature, topP, topK, minP, repetitionPenalty);
+}
+
+/// Recovery diagnostic retained after a failed `send_message` ingestion.
+/// The call's original error is still returned separately. Generation failures
+/// after successful ingestion do not create this report.
+class IngestRecovery {
+  const IngestRecovery({
+    required this.outcome,
+    required this.rewindError,
+    required this.resetError,
+  });
+
+  final RecoveryOutcome outcome;
+  final KvRewindFailure? rewindError;
+  final FfiError? resetError;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'outcome': RecoveryOutcomeFfiCodec.encode(this.outcome),
+      'rewindError': this.rewindError == null ? null : (() { final __tmp = this.rewindError!; return KvRewindFailureFfiCodec.encode(__tmp); })(),
+      'resetError': this.resetError == null ? null : (() { final __tmp = this.resetError!; return FfiErrorFfiCodec.encode(__tmp); })(),
+    };
+  }
+
+  factory IngestRecovery.fromJson(Map<String, dynamic> json) {
+    return IngestRecovery(
+      outcome: RecoveryOutcomeFfiCodec.decode(json['outcome'] as String),
+      rewindError: json['rewindError'] == null ? null : (() { final __tmp = json['rewindError']; return KvRewindFailureFfiCodec.decode(__tmp as String); })(),
+      resetError: json['resetError'] == null ? null : (() { final __tmp = json['resetError']; return FfiErrorFfiCodec.decode(__tmp as String); })(),
+    );
+  }
+
+  IngestRecovery copyWith({
+    RecoveryOutcome? outcome,
+    Object? rewindError = _sentinel,
+    Object? resetError = _sentinel,
+  }) {
+    return IngestRecovery(
+      outcome: outcome ?? this.outcome,
+      rewindError: rewindError == _sentinel ? this.rewindError : rewindError as KvRewindFailure?,
+      resetError: resetError == _sentinel ? this.resetError : resetError as FfiError?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'IngestRecovery(outcome: $outcome, rewindError: $rewindError, resetError: $resetError)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IngestRecovery && outcome == other.outcome && rewindError == other.rewindError && resetError == other.resetError;
+
+  @override
+  int get hashCode => Object.hash(outcome, rewindError, resetError);
+}
+
+/// Coherent snapshot of a session at the instant the lock was acquired.
+/// Another thread may change the session after this method returns.
+class SessionRecoveryStatus {
+  const SessionRecoveryStatus({
+    /// False requires a successful checked reset or recreation.
+    required this.usable,
+    /// Meaningful as reusable context only when `usable` is true.
+    required this.position,
+    /// Cleared by successful whole-message ingestion or explicit reset.
+    /// Raw append calls and cancellation controls leave it unchanged.
+    required this.lastIngestRecovery,
+  });
+
+  /// False requires a successful checked reset or recreation.
+  final bool usable;
+  /// Meaningful as reusable context only when `usable` is true.
+  final int position;
+  /// Cleared by successful whole-message ingestion or explicit reset.
+  /// Raw append calls and cancellation controls leave it unchanged.
+  final IngestRecovery? lastIngestRecovery;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'usable': this.usable,
+      'position': this.position,
+      'lastIngestRecovery': this.lastIngestRecovery == null ? null : (() { final __tmp = this.lastIngestRecovery!; return __tmp.toJson(); })(),
+    };
+  }
+
+  factory SessionRecoveryStatus.fromJson(Map<String, dynamic> json) {
+    return SessionRecoveryStatus(
+      usable: json['usable'] as bool,
+      position: (json['position'] as num).toInt(),
+      lastIngestRecovery: json['lastIngestRecovery'] == null ? null : (() { final __tmp = json['lastIngestRecovery']; return IngestRecovery.fromJson(__tmp as Map<String, dynamic>); })(),
+    );
+  }
+
+  SessionRecoveryStatus copyWith({
+    bool? usable,
+    int? position,
+    Object? lastIngestRecovery = _sentinel,
+  }) {
+    return SessionRecoveryStatus(
+      usable: usable ?? this.usable,
+      position: position ?? this.position,
+      lastIngestRecovery: lastIngestRecovery == _sentinel ? this.lastIngestRecovery : lastIngestRecovery as IngestRecovery?,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'SessionRecoveryStatus(usable: $usable, position: $position, lastIngestRecovery: $lastIngestRecovery)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SessionRecoveryStatus && usable == other.usable && position == other.position && lastIngestRecovery == other.lastIngestRecovery;
+
+  @override
+  int get hashCode => Object.hash(usable, position, lastIngestRecovery);
+}
+
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
@@ -1991,6 +2639,27 @@ final class FfiErrorLoraUnsupportedByBackend extends FfiError {
   int get hashCode => detail.hashCode;
 }
 
+/// Chat contract validation failure.
+final class FfiErrorChatValidation extends FfiError {
+  const FfiErrorChatValidation({
+    required this.error,
+  });
+  final ValidationError error;
+
+  @override
+  String toString() {
+    return 'FfiErrorChatValidation(error: $error)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiErrorChatValidation && error == other.error;
+
+  @override
+  int get hashCode => error.hashCode;
+}
+
 /// A speech boundary event emitted during streaming audio processing.
 sealed class FfiVadEvent {
   const FfiVadEvent();
@@ -2251,6 +2920,959 @@ enum ToolFormat {
   /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
   /// `<tool_call>…</tool_call>`.
   hermes,
+}
+
+/// An event emitted by the unified audio pipeline.
+sealed class FfiAudioPipelineEvent {
+  const FfiAudioPipelineEvent();
+}
+
+/// Keyword spotting detected a wake word.
+final class FfiAudioPipelineEventWakeWordDetected extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventWakeWordDetected({
+    /// Triggered keyword.
+    required this.keyword,
+    /// Confidence probability between 0.0 and 1.0.
+    required this.confidence,
+    /// Timestamp in milliseconds from stream start.
+    required this.timestampMs,
+    /// Sample offset where the detection hop completed.
+    required this.sampleOffset,
+  });
+  /// Triggered keyword.
+  final String keyword;
+  /// Confidence probability between 0.0 and 1.0.
+  final double confidence;
+  /// Timestamp in milliseconds from stream start.
+  final double timestampMs;
+  /// Sample offset where the detection hop completed.
+  final int sampleOffset;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventWakeWordDetected(keyword: $keyword, confidence: $confidence, timestampMs: $timestampMs, sampleOffset: $sampleOffset)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventWakeWordDetected && keyword == other.keyword && confidence == other.confidence && timestampMs == other.timestampMs && sampleOffset == other.sampleOffset;
+
+  @override
+  int get hashCode => Object.hash(keyword, confidence, timestampMs, sampleOffset);
+}
+
+/// Voice Activity Detection identified speech onset.
+final class FfiAudioPipelineEventSpeechStart extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventSpeechStart({
+    /// Sample index where speech began.
+    required this.sample,
+    /// Timestamp in milliseconds from stream start.
+    required this.ms,
+  });
+  /// Sample index where speech began.
+  final int sample;
+  /// Timestamp in milliseconds from stream start.
+  final double ms;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventSpeechStart(sample: $sample, ms: $ms)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventSpeechStart && sample == other.sample && ms == other.ms;
+
+  @override
+  int get hashCode => Object.hash(sample, ms);
+}
+
+/// Voice Activity Detection identified speech termination.
+final class FfiAudioPipelineEventSpeechEnd extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventSpeechEnd({
+    /// Starting sample index of the speech segment.
+    required this.startSample,
+    /// Ending sample index of the speech segment.
+    required this.endSample,
+    /// Start timestamp in milliseconds.
+    required this.startMs,
+    /// End timestamp in milliseconds.
+    required this.endMs,
+  });
+  /// Starting sample index of the speech segment.
+  final int startSample;
+  /// Ending sample index of the speech segment.
+  final int endSample;
+  /// Start timestamp in milliseconds.
+  final double startMs;
+  /// End timestamp in milliseconds.
+  final double endMs;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventSpeechEnd(startSample: $startSample, endSample: $endSample, startMs: $startMs, endMs: $endMs)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventSpeechEnd && startSample == other.startSample && endSample == other.endSample && startMs == other.startMs && endMs == other.endMs;
+
+  @override
+  int get hashCode => Object.hash(startSample, endSample, startMs, endMs);
+}
+
+/// Whisper transcription completed for a speech utterance.
+final class FfiAudioPipelineEventUtteranceTranscribed extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventUtteranceTranscribed({
+    /// Recognized text output.
+    required this.text,
+    /// Start timestamp of the utterance in milliseconds.
+    required this.startMs,
+    /// End timestamp of the utterance in milliseconds.
+    required this.endMs,
+    /// Number of 16 kHz audio samples transcribed.
+    required this.sampleCount,
+  });
+  /// Recognized text output.
+  final String text;
+  /// Start timestamp of the utterance in milliseconds.
+  final double startMs;
+  /// End timestamp of the utterance in milliseconds.
+  final double endMs;
+  /// Number of 16 kHz audio samples transcribed.
+  final int sampleCount;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventUtteranceTranscribed(text: $text, startMs: $startMs, endMs: $endMs, sampleCount: $sampleCount)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventUtteranceTranscribed && text == other.text && startMs == other.startMs && endMs == other.endMs && sampleCount == other.sampleCount;
+
+  @override
+  int get hashCode => Object.hash(text, startMs, endMs, sampleCount);
+}
+
+/// Active state of the streaming audio pipeline.
+enum FfiAudioPipelineState {
+  /// Awaiting a keyword spotting wake word before activating speech recording.
+  listeningForHotword,
+  /// Evaluating incoming audio frames to detect speech onset.
+  listeningForSpeech,
+  /// Speech onset detected; accumulating utterance samples in the audio buffer.
+  speechActive,
+  /// Transcribing the accumulated speech utterance using Whisper.
+  transcribing,
+}
+
+/// Message author role in conversational chat.
+enum Role {
+  /// System prompt setting instructions and context.
+  system,
+  /// User prompt input.
+  user,
+  /// Assistant model response.
+  assistant,
+  /// Tool result or response payload.
+  tool,
+}
+
+/// Lifecycle phase of a stateful chat coordinator.
+enum SessionPhase {
+  /// Clean session at position 0, ready for initial message ingestion.
+  idle,
+  /// Input messages have been appended and prefilled; ready for decode.
+  promptReady,
+  /// A turn finished with a terminal end-of-sequence stop marker.
+  turnComplete,
+  /// Generation was interrupted by cancellation or custom nonterminal stop.
+  interrupted,
+  /// Underlying execution state was modified outside chat rules; replacement required.
+  rawContext,
+  /// Unrecoverable execution fault or unwind; checked reset required to restore usability.
+  unusable,
+}
+
+/// Validation failure during chat construction, preparation, or decode.
+sealed class ValidationError {
+  const ValidationError();
+}
+
+/// Model or tokenizer configuration does not match a supported chat profile.
+final class ValidationErrorUnsupportedProfile extends ValidationError {
+  const ValidationErrorUnsupportedProfile();
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedProfile()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedProfile;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Sliding context configuration (n_keep != 0) is not supported for chat.
+final class ValidationErrorSlidingContext extends ValidationError {
+  const ValidationErrorSlidingContext();
+
+  @override
+  String toString() {
+    return 'ValidationErrorSlidingContext()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorSlidingContext;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Model audio output is not supported for text chat.
+final class ValidationErrorAudioOutput extends ValidationError {
+  const ValidationErrorAudioOutput();
+
+  @override
+  String toString() {
+    return 'ValidationErrorAudioOutput()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorAudioOutput;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Generation parameter validation error.
+final class ValidationErrorGeneration extends ValidationError {
+  const ValidationErrorGeneration({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'ValidationErrorGeneration(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorGeneration && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// Operation refused in the current session phase.
+final class ValidationErrorPhase extends ValidationError {
+  const ValidationErrorPhase({
+    required this.phase,
+  });
+  final SessionPhase phase;
+
+  @override
+  String toString() {
+    return 'ValidationErrorPhase(phase: $phase)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorPhase && phase == other.phase;
+
+  @override
+  int get hashCode => phase.hashCode;
+}
+
+/// Message batch provided to ingest was empty.
+final class ValidationErrorEmptyBatch extends ValidationError {
+  const ValidationErrorEmptyBatch();
+
+  @override
+  String toString() {
+    return 'ValidationErrorEmptyBatch()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorEmptyBatch;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+/// Message role sequence violates chat rules.
+final class ValidationErrorRoleOrder extends ValidationError {
+  const ValidationErrorRoleOrder({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorRoleOrder(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorRoleOrder && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Message role is not supported in the active profile.
+final class ValidationErrorUnsupportedRole extends ValidationError {
+  const ValidationErrorUnsupportedRole({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedRole(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedRole && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Content part is not supported in the active profile.
+final class ValidationErrorUnsupportedContent extends ValidationError {
+  const ValidationErrorUnsupportedContent({
+    required this.message,
+    required this.part_,
+  });
+  final int message;
+  final int part_;
+
+  @override
+  String toString() {
+    return 'ValidationErrorUnsupportedContent(message: $message, part_: $part_)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorUnsupportedContent && message == other.message && part_ == other.part_;
+
+  @override
+  int get hashCode => Object.hash(message, part_);
+}
+
+/// Message text contains a reserved ChatML marker sequence.
+final class ValidationErrorReservedMarker extends ValidationError {
+  const ValidationErrorReservedMarker({
+    required this.message,
+  });
+  final int message;
+
+  @override
+  String toString() {
+    return 'ValidationErrorReservedMarker(message: $message)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorReservedMarker && message == other.message;
+
+  @override
+  int get hashCode => message.hashCode;
+}
+
+/// Context tokens required exceed available capacity in the KV cache.
+final class ValidationErrorCapacity extends ValidationError {
+  const ValidationErrorCapacity({
+    required this.required_,
+    required this.available,
+  });
+  final int required_;
+  final int available;
+
+  @override
+  String toString() {
+    return 'ValidationErrorCapacity(required_: $required_, available: $available)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorCapacity && required_ == other.required_ && available == other.available;
+
+  @override
+  int get hashCode => Object.hash(required_, available);
+}
+
+/// Chat template rendering error.
+final class ValidationErrorTemplate extends ValidationError {
+  const ValidationErrorTemplate({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'ValidationErrorTemplate(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ValidationErrorTemplate && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+sealed class LoadError {
+  const LoadError();
+}
+
+final class LoadErrorKindMismatch extends LoadError {
+  const LoadErrorKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorKindMismatch && expected == other.expected && actual == other.actual && architecture == other.architecture;
+
+  @override
+  int get hashCode => Object.hash(expected, actual, architecture);
+}
+
+final class LoadErrorUnsupportedArchitecture extends LoadError {
+  const LoadErrorUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedArchitecture(architecture: $architecture)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedArchitecture && architecture == other.architecture;
+
+  @override
+  int get hashCode => architecture.hashCode;
+}
+
+final class LoadErrorUnsupportedInferenceType extends LoadError {
+  const LoadErrorUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorUnsupportedInferenceType && inferenceType == other.inferenceType;
+
+  @override
+  int get hashCode => inferenceType.hashCode;
+}
+
+final class LoadErrorSource extends LoadError {
+  const LoadErrorSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorSource && sourceKind == other.sourceKind && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(sourceKind, detail);
+}
+
+final class LoadErrorAssembly extends LoadError {
+  const LoadErrorAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorAssembly(backend: $backend, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorAssembly && backend == other.backend && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(backend, detail);
+}
+
+final class LoadErrorInvalidConfig extends LoadError {
+  const LoadErrorInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorInvalidConfig && field == other.field && value == other.value && reason == other.reason && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(field, value, reason, detail);
+}
+
+final class LoadErrorEngine extends LoadError {
+  const LoadErrorEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorEngine(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorEngine && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+final class LoadErrorConsumed extends LoadError {
+  const LoadErrorConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorConsumed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LoadErrorConsumed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+sealed class ModelSource {
+  const ModelSource();
+}
+
+final class ModelSourceBundleId extends ModelSource {
+  const ModelSourceBundleId({
+    required this.id,
+    required this.quant,
+  });
+  final String id;
+  final String quant;
+
+  @override
+  String toString() {
+    return 'ModelSourceBundleId(id: $id, quant: $quant)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBundleId && id == other.id && quant == other.quant;
+
+  @override
+  int get hashCode => Object.hash(id, quant);
+}
+
+final class ModelSourceHuggingFace extends ModelSource {
+  const ModelSourceHuggingFace({
+    required this.spec,
+    required this.quant,
+    required this.strategy,
+  });
+  final String spec;
+  final String? quant;
+  final String? strategy;
+
+  @override
+  String toString() {
+    return 'ModelSourceHuggingFace(spec: $spec, quant: $quant, strategy: $strategy)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceHuggingFace && spec == other.spec && quant == other.quant && strategy == other.strategy;
+
+  @override
+  int get hashCode => Object.hash(spec, quant, strategy);
+}
+
+final class ModelSourceBytes extends ModelSource {
+  const ModelSourceBytes({
+    required this.bytes,
+  });
+  final Uint8List bytes;
+
+  @override
+  String toString() {
+    return 'ModelSourceBytes(bytes: $bytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceBytes && bytes == other.bytes;
+
+  @override
+  int get hashCode => bytes.hashCode;
+}
+
+final class ModelSourceParts extends ModelSource {
+  const ModelSourceParts({
+    required this.parts,
+  });
+  final ModelParts parts;
+
+  @override
+  String toString() {
+    return 'ModelSourceParts(parts: $parts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceParts && parts == other.parts;
+
+  @override
+  int get hashCode => parts.hashCode;
+}
+
+final class ModelSourcePath extends ModelSource {
+  const ModelSourcePath({
+    required this.path,
+  });
+  final String path;
+
+  @override
+  String toString() {
+    return 'ModelSourcePath(path: $path)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourcePath && path == other.path;
+
+  @override
+  int get hashCode => path.hashCode;
+}
+
+final class ModelSourceFiles extends ModelSource {
+  const ModelSourceFiles({
+    required this.files,
+  });
+  final ModelFiles files;
+
+  @override
+  String toString() {
+    return 'ModelSourceFiles(files: $files)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ModelSourceFiles && files == other.files;
+
+  @override
+  int get hashCode => files.hashCode;
+}
+
+sealed class GenerationDefaults {
+  const GenerationDefaults();
+}
+
+final class GenerationDefaultsText extends GenerationDefaults {
+  const GenerationDefaultsText({
+    required this.sampling,
+  });
+  final SamplingDefaults sampling;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsText(sampling: $sampling)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsText && sampling == other.sampling;
+
+  @override
+  int get hashCode => sampling.hashCode;
+}
+
+final class GenerationDefaultsAudio extends GenerationDefaults {
+  const GenerationDefaultsAudio({
+    required this.sampling,
+    required this.numberOfDecodingThreads,
+    required this.audioTemperature,
+    required this.audioTopK,
+  });
+  final SamplingDefaults sampling;
+  final int? numberOfDecodingThreads;
+  final double? audioTemperature;
+  final int? audioTopK;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsAudio(sampling: $sampling, numberOfDecodingThreads: $numberOfDecodingThreads, audioTemperature: $audioTemperature, audioTopK: $audioTopK)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsAudio && sampling == other.sampling && numberOfDecodingThreads == other.numberOfDecodingThreads && audioTemperature == other.audioTemperature && audioTopK == other.audioTopK;
+
+  @override
+  int get hashCode => Object.hash(sampling, numberOfDecodingThreads, audioTemperature, audioTopK);
+}
+
+final class GenerationDefaultsOther extends GenerationDefaults {
+  const GenerationDefaultsOther({
+    required this.rawJson,
+  });
+  final String rawJson;
+
+  @override
+  String toString() {
+    return 'GenerationDefaultsOther(rawJson: $rawJson)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is GenerationDefaultsOther && rawJson == other.rawJson;
+
+  @override
+  int get hashCode => rawJson.hashCode;
+}
+
+/// Why checked tail rewind was unavailable. Numeric positions are token counts.
+sealed class KvRewindFailure {
+  const KvRewindFailure();
+}
+
+final class KvRewindFailureOutOfBounds extends KvRewindFailure {
+  const KvRewindFailureOutOfBounds({
+    required this.requested,
+    required this.current,
+  });
+  final int requested;
+  final int current;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureOutOfBounds(requested: $requested, current: $current)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureOutOfBounds && requested == other.requested && current == other.current;
+
+  @override
+  int get hashCode => Object.hash(requested, current);
+}
+
+final class KvRewindFailureCompressed extends KvRewindFailure {
+  const KvRewindFailureCompressed();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureCompressed()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureCompressed;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureNonCausal extends KvRewindFailure {
+  const KvRewindFailureNonCausal();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureNonCausal()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureNonCausal;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureMissingConvolutionCheckpoint extends KvRewindFailure {
+  const KvRewindFailureMissingConvolutionCheckpoint({
+    required this.layer,
+    required this.position,
+  });
+  final int layer;
+  final int position;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureMissingConvolutionCheckpoint(layer: $layer, position: $position)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureMissingConvolutionCheckpoint && layer == other.layer && position == other.position;
+
+  @override
+  int get hashCode => Object.hash(layer, position);
+}
+
+final class KvRewindFailureInvalidCacheLayout extends KvRewindFailure {
+  const KvRewindFailureInvalidCacheLayout({
+    required this.layer,
+    required this.detail,
+  });
+  final int layer;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureInvalidCacheLayout(layer: $layer, detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureInvalidCacheLayout && layer == other.layer && detail == other.detail;
+
+  @override
+  int get hashCode => Object.hash(layer, detail);
+}
+
+final class KvRewindFailureBackendUnsupported extends KvRewindFailure {
+  const KvRewindFailureBackendUnsupported();
+
+  @override
+  String toString() {
+    return 'KvRewindFailureBackendUnsupported()';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureBackendUnsupported;
+
+  @override
+  int get hashCode => runtimeType.hashCode;
+}
+
+final class KvRewindFailureUnknown extends KvRewindFailure {
+  const KvRewindFailureUnknown({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'KvRewindFailureUnknown(detail: $detail)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is KvRewindFailureUnknown && detail == other.detail;
+
+  @override
+  int get hashCode => detail.hashCode;
+}
+
+/// Execution state after a failed whole-message append.
+enum RecoveryOutcome {
+  unchanged,
+  restored,
+  reset,
+  unusable,
+  /// A newer core outcome; conservatively recreate the session.
+  unknown,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -2534,6 +4156,130 @@ final class FfiErrorExceptionLoraUnsupportedByBackend extends FfiErrorException 
   }
 }
 
+/// Chat contract validation failure.
+final class FfiErrorExceptionChatValidation extends FfiErrorException {
+  const FfiErrorExceptionChatValidation({
+    required this.error,
+  });
+  final ValidationError error;
+
+  @override
+  String toString() {
+    return 'FfiErrorExceptionChatValidation(error: $error)';
+  }
+}
+
+sealed class LoadErrorException implements Exception {
+  const LoadErrorException();
+}
+
+final class LoadErrorExceptionKindMismatch extends LoadErrorException {
+  const LoadErrorExceptionKindMismatch({
+    required this.expected,
+    required this.actual,
+    required this.architecture,
+  });
+  final String expected;
+  final String actual;
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionKindMismatch(expected: $expected, actual: $actual, architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedArchitecture extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedArchitecture({
+    required this.architecture,
+  });
+  final String architecture;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedArchitecture(architecture: $architecture)';
+  }
+}
+
+final class LoadErrorExceptionUnsupportedInferenceType extends LoadErrorException {
+  const LoadErrorExceptionUnsupportedInferenceType({
+    required this.inferenceType,
+  });
+  final String inferenceType;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionUnsupportedInferenceType(inferenceType: $inferenceType)';
+  }
+}
+
+final class LoadErrorExceptionSource extends LoadErrorException {
+  const LoadErrorExceptionSource({
+    required this.sourceKind,
+    required this.detail,
+  });
+  final String sourceKind;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionSource(sourceKind: $sourceKind, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionAssembly extends LoadErrorException {
+  const LoadErrorExceptionAssembly({
+    required this.backend,
+    required this.detail,
+  });
+  final String backend;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionAssembly(backend: $backend, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionInvalidConfig extends LoadErrorException {
+  const LoadErrorExceptionInvalidConfig({
+    required this.field,
+    required this.value,
+    required this.reason,
+    required this.detail,
+  });
+  final String field;
+  final String value;
+  final String reason;
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionInvalidConfig(field: $field, value: $value, reason: $reason, detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionEngine extends LoadErrorException {
+  const LoadErrorExceptionEngine({
+    required this.detail,
+  });
+  final String detail;
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionEngine(detail: $detail)';
+  }
+}
+
+final class LoadErrorExceptionConsumed extends LoadErrorException {
+  const LoadErrorExceptionConsumed();
+
+  @override
+  String toString() {
+    return 'LoadErrorExceptionConsumed()';
+  }
+}
+
 String _encodeBackendPreference(BackendPreference value) {
   return switch (value) {
     BackendPreference.auto => 'auto',
@@ -2637,6 +4383,12 @@ String _encodeFfiError(FfiError value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorChatValidation) {
+    return jsonEncode({
+      'tag': 'chatValidation',
+      'error': ValidationErrorFfiCodec.encode(value.error),
+    });
+  }
   throw StateError('Unknown FfiError variant instance: $value');
 }
 
@@ -2698,6 +4450,10 @@ FfiError _decodeFfiError(String raw) {
     case 'loraUnsupportedByBackend':
       return FfiErrorLoraUnsupportedByBackend(
         detail: map['detail'] as String,
+      );
+    case 'chatValidation':
+      return FfiErrorChatValidation(
+        error: ValidationErrorFfiCodec.decode(map['error'] as String),
       );
     default:
       throw StateError('Unknown FfiError variant tag: $tag');
@@ -2881,6 +4637,606 @@ ToolFormat _decodeToolFormat(String raw) {
   };
 }
 
+String _encodeFfiAudioPipelineEvent(FfiAudioPipelineEvent value) {
+  if (value is FfiAudioPipelineEventWakeWordDetected) {
+    return jsonEncode({
+      'tag': 'wakeWordDetected',
+      'keyword': value.keyword,
+      'confidence': value.confidence,
+      'timestampMs': value.timestampMs,
+      'sampleOffset': value.sampleOffset,
+    });
+  }
+  if (value is FfiAudioPipelineEventSpeechStart) {
+    return jsonEncode({
+      'tag': 'speechStart',
+      'sample': value.sample,
+      'ms': value.ms,
+    });
+  }
+  if (value is FfiAudioPipelineEventSpeechEnd) {
+    return jsonEncode({
+      'tag': 'speechEnd',
+      'startSample': value.startSample,
+      'endSample': value.endSample,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+    });
+  }
+  if (value is FfiAudioPipelineEventUtteranceTranscribed) {
+    return jsonEncode({
+      'tag': 'utteranceTranscribed',
+      'text': value.text,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+      'sampleCount': value.sampleCount,
+    });
+  }
+  throw StateError('Unknown FfiAudioPipelineEvent variant instance: $value');
+}
+
+FfiAudioPipelineEvent _decodeFfiAudioPipelineEvent(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'wakeWordDetected':
+      return FfiAudioPipelineEventWakeWordDetected(
+        keyword: map['keyword'] as String,
+        confidence: (map['confidence'] as num).toDouble(),
+        timestampMs: (map['timestampMs'] as num).toDouble(),
+        sampleOffset: (map['sampleOffset'] as num).toInt(),
+      );
+    case 'speechStart':
+      return FfiAudioPipelineEventSpeechStart(
+        sample: (map['sample'] as num).toInt(),
+        ms: (map['ms'] as num).toDouble(),
+      );
+    case 'speechEnd':
+      return FfiAudioPipelineEventSpeechEnd(
+        startSample: (map['startSample'] as num).toInt(),
+        endSample: (map['endSample'] as num).toInt(),
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+      );
+    case 'utteranceTranscribed':
+      return FfiAudioPipelineEventUtteranceTranscribed(
+        text: map['text'] as String,
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+        sampleCount: (map['sampleCount'] as num).toInt(),
+      );
+    default:
+      throw StateError('Unknown FfiAudioPipelineEvent variant tag: $tag');
+  }
+}
+
+String _encodeFfiAudioPipelineState(FfiAudioPipelineState value) {
+  return switch (value) {
+    FfiAudioPipelineState.listeningForHotword => 'listeningForHotword',
+    FfiAudioPipelineState.listeningForSpeech => 'listeningForSpeech',
+    FfiAudioPipelineState.speechActive => 'speechActive',
+    FfiAudioPipelineState.transcribing => 'transcribing',
+  };
+}
+
+FfiAudioPipelineState _decodeFfiAudioPipelineState(String raw) {
+  return switch (raw) {
+    'listeningForHotword' => FfiAudioPipelineState.listeningForHotword,
+    'listeningForSpeech' => FfiAudioPipelineState.listeningForSpeech,
+    'speechActive' => FfiAudioPipelineState.speechActive,
+    'transcribing' => FfiAudioPipelineState.transcribing,
+    _ => throw StateError('Unknown FfiAudioPipelineState variant: $raw'),
+  };
+}
+
+String _encodeRole(Role value) {
+  return switch (value) {
+    Role.system => 'system',
+    Role.user => 'user',
+    Role.assistant => 'assistant',
+    Role.tool => 'tool',
+  };
+}
+
+Role _decodeRole(String raw) {
+  return switch (raw) {
+    'system' => Role.system,
+    'user' => Role.user,
+    'assistant' => Role.assistant,
+    'tool' => Role.tool,
+    _ => throw StateError('Unknown Role variant: $raw'),
+  };
+}
+
+String _encodeSessionPhase(SessionPhase value) {
+  return switch (value) {
+    SessionPhase.idle => 'idle',
+    SessionPhase.promptReady => 'promptReady',
+    SessionPhase.turnComplete => 'turnComplete',
+    SessionPhase.interrupted => 'interrupted',
+    SessionPhase.rawContext => 'rawContext',
+    SessionPhase.unusable => 'unusable',
+  };
+}
+
+SessionPhase _decodeSessionPhase(String raw) {
+  return switch (raw) {
+    'idle' => SessionPhase.idle,
+    'promptReady' => SessionPhase.promptReady,
+    'turnComplete' => SessionPhase.turnComplete,
+    'interrupted' => SessionPhase.interrupted,
+    'rawContext' => SessionPhase.rawContext,
+    'unusable' => SessionPhase.unusable,
+    _ => throw StateError('Unknown SessionPhase variant: $raw'),
+  };
+}
+
+String _encodeValidationError(ValidationError value) {
+  if (value is ValidationErrorUnsupportedProfile) {
+    return jsonEncode({
+      'tag': 'unsupportedProfile',
+    });
+  }
+  if (value is ValidationErrorSlidingContext) {
+    return jsonEncode({
+      'tag': 'slidingContext',
+    });
+  }
+  if (value is ValidationErrorAudioOutput) {
+    return jsonEncode({
+      'tag': 'audioOutput',
+    });
+  }
+  if (value is ValidationErrorGeneration) {
+    return jsonEncode({
+      'tag': 'generation',
+      'detail': value.detail,
+    });
+  }
+  if (value is ValidationErrorPhase) {
+    return jsonEncode({
+      'tag': 'phase',
+      'phase': SessionPhaseFfiCodec.encode(value.phase),
+    });
+  }
+  if (value is ValidationErrorEmptyBatch) {
+    return jsonEncode({
+      'tag': 'emptyBatch',
+    });
+  }
+  if (value is ValidationErrorRoleOrder) {
+    return jsonEncode({
+      'tag': 'roleOrder',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorUnsupportedRole) {
+    return jsonEncode({
+      'tag': 'unsupportedRole',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorUnsupportedContent) {
+    return jsonEncode({
+      'tag': 'unsupportedContent',
+      'message': value.message,
+      'part_': value.part_,
+    });
+  }
+  if (value is ValidationErrorReservedMarker) {
+    return jsonEncode({
+      'tag': 'reservedMarker',
+      'message': value.message,
+    });
+  }
+  if (value is ValidationErrorCapacity) {
+    return jsonEncode({
+      'tag': 'capacity',
+      'required_': value.required_,
+      'available': value.available,
+    });
+  }
+  if (value is ValidationErrorTemplate) {
+    return jsonEncode({
+      'tag': 'template',
+      'detail': value.detail,
+    });
+  }
+  throw StateError('Unknown ValidationError variant instance: $value');
+}
+
+ValidationError _decodeValidationError(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'unsupportedProfile':
+      return ValidationErrorUnsupportedProfile(
+      );
+    case 'slidingContext':
+      return ValidationErrorSlidingContext(
+      );
+    case 'audioOutput':
+      return ValidationErrorAudioOutput(
+      );
+    case 'generation':
+      return ValidationErrorGeneration(
+        detail: map['detail'] as String,
+      );
+    case 'phase':
+      return ValidationErrorPhase(
+        phase: SessionPhaseFfiCodec.decode(map['phase'] as String),
+      );
+    case 'emptyBatch':
+      return ValidationErrorEmptyBatch(
+      );
+    case 'roleOrder':
+      return ValidationErrorRoleOrder(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'unsupportedRole':
+      return ValidationErrorUnsupportedRole(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'unsupportedContent':
+      return ValidationErrorUnsupportedContent(
+        message: (map['message'] as num).toInt(),
+        part_: (map['part_'] as num).toInt(),
+      );
+    case 'reservedMarker':
+      return ValidationErrorReservedMarker(
+        message: (map['message'] as num).toInt(),
+      );
+    case 'capacity':
+      return ValidationErrorCapacity(
+        required_: (map['required_'] as num).toInt(),
+        available: (map['available'] as num).toInt(),
+      );
+    case 'template':
+      return ValidationErrorTemplate(
+        detail: map['detail'] as String,
+      );
+    default:
+      throw StateError('Unknown ValidationError variant tag: $tag');
+  }
+}
+
+String _encodeLoadError(LoadError value) {
+  if (value is LoadErrorKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadError variant instance: $value');
+}
+
+LoadError _decodeLoadError(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return LoadErrorConsumed(
+      );
+    default:
+      throw StateError('Unknown LoadError variant tag: $tag');
+  }
+}
+
+String _encodeModelSource(ModelSource value) {
+  if (value is ModelSourceBundleId) {
+    return jsonEncode({
+      'tag': 'bundleId',
+      'id': value.id,
+      'quant': value.quant,
+    });
+  }
+  if (value is ModelSourceHuggingFace) {
+    return jsonEncode({
+      'tag': 'huggingFace',
+      'spec': value.spec,
+      'quant': value.quant,
+      'strategy': value.strategy,
+    });
+  }
+  if (value is ModelSourceBytes) {
+    return jsonEncode({
+      'tag': 'bytes',
+      'bytes': base64Encode(value.bytes),
+    });
+  }
+  if (value is ModelSourceParts) {
+    return jsonEncode({
+      'tag': 'parts',
+      'parts': value.parts.toJson(),
+    });
+  }
+  if (value is ModelSourcePath) {
+    return jsonEncode({
+      'tag': 'path',
+      'path': value.path,
+    });
+  }
+  if (value is ModelSourceFiles) {
+    return jsonEncode({
+      'tag': 'files',
+      'files': value.files.toJson(),
+    });
+  }
+  throw StateError('Unknown ModelSource variant instance: $value');
+}
+
+ModelSource _decodeModelSource(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'bundleId':
+      return ModelSourceBundleId(
+        id: map['id'] as String,
+        quant: map['quant'] as String,
+      );
+    case 'huggingFace':
+      return ModelSourceHuggingFace(
+        spec: map['spec'] as String,
+        quant: map['quant'] == null ? null : map['quant'] as String,
+        strategy: map['strategy'] == null ? null : map['strategy'] as String,
+      );
+    case 'bytes':
+      return ModelSourceBytes(
+        bytes: base64Decode(map['bytes'] as String),
+      );
+    case 'parts':
+      return ModelSourceParts(
+        parts: ModelParts.fromJson(map['parts'] as Map<String, dynamic>),
+      );
+    case 'path':
+      return ModelSourcePath(
+        path: map['path'] as String,
+      );
+    case 'files':
+      return ModelSourceFiles(
+        files: ModelFiles.fromJson(map['files'] as Map<String, dynamic>),
+      );
+    default:
+      throw StateError('Unknown ModelSource variant tag: $tag');
+  }
+}
+
+String _encodeGenerationDefaults(GenerationDefaults value) {
+  if (value is GenerationDefaultsText) {
+    return jsonEncode({
+      'tag': 'text',
+      'sampling': value.sampling.toJson(),
+    });
+  }
+  if (value is GenerationDefaultsAudio) {
+    return jsonEncode({
+      'tag': 'audio',
+      'sampling': value.sampling.toJson(),
+      'numberOfDecodingThreads': value.numberOfDecodingThreads,
+      'audioTemperature': value.audioTemperature,
+      'audioTopK': value.audioTopK,
+    });
+  }
+  if (value is GenerationDefaultsOther) {
+    return jsonEncode({
+      'tag': 'other',
+      'rawJson': value.rawJson,
+    });
+  }
+  throw StateError('Unknown GenerationDefaults variant instance: $value');
+}
+
+GenerationDefaults _decodeGenerationDefaults(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'text':
+      return GenerationDefaultsText(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+      );
+    case 'audio':
+      return GenerationDefaultsAudio(
+        sampling: SamplingDefaults.fromJson(map['sampling'] as Map<String, dynamic>),
+        numberOfDecodingThreads: map['numberOfDecodingThreads'] == null ? null : (map['numberOfDecodingThreads'] as num).toInt(),
+        audioTemperature: map['audioTemperature'] == null ? null : (map['audioTemperature'] as num).toDouble(),
+        audioTopK: map['audioTopK'] == null ? null : (map['audioTopK'] as num).toInt(),
+      );
+    case 'other':
+      return GenerationDefaultsOther(
+        rawJson: map['rawJson'] as String,
+      );
+    default:
+      throw StateError('Unknown GenerationDefaults variant tag: $tag');
+  }
+}
+
+String _encodeKvRewindFailure(KvRewindFailure value) {
+  if (value is KvRewindFailureOutOfBounds) {
+    return jsonEncode({
+      'tag': 'outOfBounds',
+      'requested': value.requested,
+      'current': value.current,
+    });
+  }
+  if (value is KvRewindFailureCompressed) {
+    return jsonEncode({
+      'tag': 'compressed',
+    });
+  }
+  if (value is KvRewindFailureNonCausal) {
+    return jsonEncode({
+      'tag': 'nonCausal',
+    });
+  }
+  if (value is KvRewindFailureMissingConvolutionCheckpoint) {
+    return jsonEncode({
+      'tag': 'missingConvolutionCheckpoint',
+      'layer': value.layer,
+      'position': value.position,
+    });
+  }
+  if (value is KvRewindFailureInvalidCacheLayout) {
+    return jsonEncode({
+      'tag': 'invalidCacheLayout',
+      'layer': value.layer,
+      'detail': value.detail,
+    });
+  }
+  if (value is KvRewindFailureBackendUnsupported) {
+    return jsonEncode({
+      'tag': 'backendUnsupported',
+    });
+  }
+  if (value is KvRewindFailureUnknown) {
+    return jsonEncode({
+      'tag': 'unknown',
+      'detail': value.detail,
+    });
+  }
+  throw StateError('Unknown KvRewindFailure variant instance: $value');
+}
+
+KvRewindFailure _decodeKvRewindFailure(String raw) {
+  final Map<String, dynamic> map = jsonDecode(raw) as Map<String, dynamic>;
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'outOfBounds':
+      return KvRewindFailureOutOfBounds(
+        requested: (map['requested'] as num).toInt(),
+        current: (map['current'] as num).toInt(),
+      );
+    case 'compressed':
+      return KvRewindFailureCompressed(
+      );
+    case 'nonCausal':
+      return KvRewindFailureNonCausal(
+      );
+    case 'missingConvolutionCheckpoint':
+      return KvRewindFailureMissingConvolutionCheckpoint(
+        layer: (map['layer'] as num).toInt(),
+        position: (map['position'] as num).toInt(),
+      );
+    case 'invalidCacheLayout':
+      return KvRewindFailureInvalidCacheLayout(
+        layer: (map['layer'] as num).toInt(),
+        detail: map['detail'] as String,
+      );
+    case 'backendUnsupported':
+      return KvRewindFailureBackendUnsupported(
+      );
+    case 'unknown':
+      return KvRewindFailureUnknown(
+        detail: map['detail'] as String,
+      );
+    default:
+      throw StateError('Unknown KvRewindFailure variant tag: $tag');
+  }
+}
+
+String _encodeRecoveryOutcome(RecoveryOutcome value) {
+  return switch (value) {
+    RecoveryOutcome.unchanged => 'unchanged',
+    RecoveryOutcome.restored => 'restored',
+    RecoveryOutcome.reset => 'reset',
+    RecoveryOutcome.unusable => 'unusable',
+    RecoveryOutcome.unknown => 'unknown',
+  };
+}
+
+RecoveryOutcome _decodeRecoveryOutcome(String raw) {
+  return switch (raw) {
+    'unchanged' => RecoveryOutcome.unchanged,
+    'restored' => RecoveryOutcome.restored,
+    'reset' => RecoveryOutcome.reset,
+    'unusable' => RecoveryOutcome.unusable,
+    'unknown' => RecoveryOutcome.unknown,
+    _ => throw StateError('Unknown RecoveryOutcome variant: $raw'),
+  };
+}
+
 String _encodeFfiErrorException(FfiErrorException value) {
   if (value is FfiErrorExceptionUnsupportedModality) {
     return jsonEncode({
@@ -2965,6 +5321,12 @@ String _encodeFfiErrorException(FfiErrorException value) {
       'detail': value.detail,
     });
   }
+  if (value is FfiErrorExceptionChatValidation) {
+    return jsonEncode({
+      'tag': 'chatValidation',
+      'error': ValidationErrorFfiCodec.encode(value.error),
+    });
+  }
   throw StateError('Unknown FfiErrorException exception instance: $value');
 }
 
@@ -3023,8 +5385,116 @@ FfiErrorException _decodeFfiErrorException(Object? raw) {
       return FfiErrorExceptionLoraUnsupportedByBackend(
         detail: map['detail'] as String,
       );
+    case 'chatValidation':
+      return FfiErrorExceptionChatValidation(
+        error: ValidationErrorFfiCodec.decode(map['error'] as String),
+      );
     default:
       throw StateError('Unknown FfiErrorException exception tag: $tag');
+  }
+}
+
+String _encodeLoadErrorException(LoadErrorException value) {
+  if (value is LoadErrorExceptionKindMismatch) {
+    return jsonEncode({
+      'tag': 'kindMismatch',
+      'expected': value.expected,
+      'actual': value.actual,
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedArchitecture) {
+    return jsonEncode({
+      'tag': 'unsupportedArchitecture',
+      'architecture': value.architecture,
+    });
+  }
+  if (value is LoadErrorExceptionUnsupportedInferenceType) {
+    return jsonEncode({
+      'tag': 'unsupportedInferenceType',
+      'inferenceType': value.inferenceType,
+    });
+  }
+  if (value is LoadErrorExceptionSource) {
+    return jsonEncode({
+      'tag': 'source',
+      'sourceKind': value.sourceKind,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionAssembly) {
+    return jsonEncode({
+      'tag': 'assembly',
+      'backend': value.backend,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionInvalidConfig) {
+    return jsonEncode({
+      'tag': 'invalidConfig',
+      'field': value.field,
+      'value': value.value,
+      'reason': value.reason,
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionEngine) {
+    return jsonEncode({
+      'tag': 'engine',
+      'detail': value.detail,
+    });
+  }
+  if (value is LoadErrorExceptionConsumed) {
+    return jsonEncode({
+      'tag': 'consumed',
+    });
+  }
+  throw StateError('Unknown LoadErrorException exception instance: $value');
+}
+
+LoadErrorException _decodeLoadErrorException(Object? raw) {
+  final Map<String, dynamic> map = raw is String ? (jsonDecode(raw) as Map<String, dynamic>) : (raw as Map<String, dynamic>);
+  final String? tag = map['tag'] as String?;
+  switch (tag) {
+    case 'kindMismatch':
+      return LoadErrorExceptionKindMismatch(
+        expected: map['expected'] as String,
+        actual: map['actual'] as String,
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedArchitecture':
+      return LoadErrorExceptionUnsupportedArchitecture(
+        architecture: map['architecture'] as String,
+      );
+    case 'unsupportedInferenceType':
+      return LoadErrorExceptionUnsupportedInferenceType(
+        inferenceType: map['inferenceType'] as String,
+      );
+    case 'source':
+      return LoadErrorExceptionSource(
+        sourceKind: map['sourceKind'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'assembly':
+      return LoadErrorExceptionAssembly(
+        backend: map['backend'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'invalidConfig':
+      return LoadErrorExceptionInvalidConfig(
+        field: map['field'] as String,
+        value: map['value'] as String,
+        reason: map['reason'] as String,
+        detail: map['detail'] as String,
+      );
+    case 'engine':
+      return LoadErrorExceptionEngine(
+        detail: map['detail'] as String,
+      );
+    case 'consumed':
+      return const LoadErrorExceptionConsumed();
+    default:
+      throw StateError('Unknown LoadErrorException exception tag: $tag');
   }
 }
 
@@ -3084,12 +5554,100 @@ final class ToolFormatFfiCodec {
   static ToolFormat decode(String raw) => _decodeToolFormat(raw);
 }
 
+final class FfiAudioPipelineEventFfiCodec {
+  const FfiAudioPipelineEventFfiCodec._();
+
+  static String encode(FfiAudioPipelineEvent value) => _encodeFfiAudioPipelineEvent(value);
+
+  static FfiAudioPipelineEvent decode(String raw) => _decodeFfiAudioPipelineEvent(raw);
+}
+
+final class FfiAudioPipelineStateFfiCodec {
+  const FfiAudioPipelineStateFfiCodec._();
+
+  static String encode(FfiAudioPipelineState value) => _encodeFfiAudioPipelineState(value);
+
+  static FfiAudioPipelineState decode(String raw) => _decodeFfiAudioPipelineState(raw);
+}
+
+final class RoleFfiCodec {
+  const RoleFfiCodec._();
+
+  static String encode(Role value) => _encodeRole(value);
+
+  static Role decode(String raw) => _decodeRole(raw);
+}
+
+final class SessionPhaseFfiCodec {
+  const SessionPhaseFfiCodec._();
+
+  static String encode(SessionPhase value) => _encodeSessionPhase(value);
+
+  static SessionPhase decode(String raw) => _decodeSessionPhase(raw);
+}
+
+final class ValidationErrorFfiCodec {
+  const ValidationErrorFfiCodec._();
+
+  static String encode(ValidationError value) => _encodeValidationError(value);
+
+  static ValidationError decode(String raw) => _decodeValidationError(raw);
+}
+
+final class LoadErrorFfiCodec {
+  const LoadErrorFfiCodec._();
+
+  static String encode(LoadError value) => _encodeLoadError(value);
+
+  static LoadError decode(String raw) => _decodeLoadError(raw);
+}
+
+final class ModelSourceFfiCodec {
+  const ModelSourceFfiCodec._();
+
+  static String encode(ModelSource value) => _encodeModelSource(value);
+
+  static ModelSource decode(String raw) => _decodeModelSource(raw);
+}
+
+final class GenerationDefaultsFfiCodec {
+  const GenerationDefaultsFfiCodec._();
+
+  static String encode(GenerationDefaults value) => _encodeGenerationDefaults(value);
+
+  static GenerationDefaults decode(String raw) => _decodeGenerationDefaults(raw);
+}
+
+final class KvRewindFailureFfiCodec {
+  const KvRewindFailureFfiCodec._();
+
+  static String encode(KvRewindFailure value) => _encodeKvRewindFailure(value);
+
+  static KvRewindFailure decode(String raw) => _decodeKvRewindFailure(raw);
+}
+
+final class RecoveryOutcomeFfiCodec {
+  const RecoveryOutcomeFfiCodec._();
+
+  static String encode(RecoveryOutcome value) => _encodeRecoveryOutcome(value);
+
+  static RecoveryOutcome decode(String raw) => _decodeRecoveryOutcome(raw);
+}
+
 final class FfiErrorExceptionFfiCodec {
   const FfiErrorExceptionFfiCodec._();
 
   static String encode(FfiErrorException value) => _encodeFfiErrorException(value);
 
   static FfiErrorException decode(Object? raw) => _decodeFfiErrorException(raw);
+}
+
+final class LoadErrorExceptionFfiCodec {
+  const LoadErrorExceptionFfiCodec._();
+
+  static String encode(LoadErrorException value) => _encodeLoadErrorException(value);
+
+  static LoadErrorException decode(Object? raw) => _decodeLoadErrorException(raw);
 }
 
 
@@ -3449,10 +6007,13 @@ final class CeraEngine {
   /// max context, etc.). Returns a `Clone` of the stored metadata.
   ModelMetadata metadata() => _unsupportedOnWeb('CeraEngine.metadata');
 
-  /// Open a new [`Session`] sharing this engine's model + tokenizer
+  /// Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+  ChatSession newChatSession(SessionConfig config) => _unsupportedOnWeb('CeraEngine.newChatSession');
+
+  /// Open a new [`Session`] sharing this engine's model and tokenizer
   /// by `Arc` clone. The returned session outlives `&self`; the
   /// engine keeps the shared state live for every session it hands
-  /// out. Cheap — no model load, just config + state allocation.
+  /// out. Cheap: no model load, just config and state allocation.
   Session newSession(SessionConfig config) => _unsupportedOnWeb('CeraEngine.newSession');
 
   /// Look up a special token by name (e.g. `<|im_start|>`,
@@ -3681,9 +6242,12 @@ final class FfiWhisperModel {
   List<String> languages() => _unsupportedOnWeb('FfiWhisperModel.languages');
 
   /// Transcribe 16 kHz mono PCM audio samples synchronously.
+  /// Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
   String transcribe(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribe');
 
   /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+  /// Dropping the returned future aborts queued work and signals an already-running decoder
+  /// to stop at its next cooperative cancellation check.
   Future<String> transcribeAsync(List<double> pcm, FfiWhisperTranscribeOpts? opts) => _unsupportedOnWeb('FfiWhisperModel.transcribeAsync');
 }
 
@@ -3955,6 +6519,9 @@ final class Session {
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
 
+  /// Export current inference session checkpoint as serialized binary bytes.
+  Uint8List exportCheckpoint() => _unsupportedOnWeb('Session.exportCheckpoint');
+
   /// Run autoregressive decode and return all emitted text, tokens, and
   /// summary. Synchronous: the call blocks until the decode loop exits
   /// (`max_tokens`, EOS, `cancel()`, or error).
@@ -4080,10 +6647,34 @@ final class Session {
   /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
   List<double> hiddenStatesMeanPooled(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesMeanPooled');
 
+  /// Import and restore an inference session checkpoint from serialized binary bytes.
+  void importCheckpoint(Uint8List data) => _unsupportedOnWeb('Session.importCheckpoint');
+
+  /// Wrap this session in a stateful chat coordinator.
+  ///
+  /// On success, ownership of the inner inference state is transferred to the returned
+  /// [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+  /// If validation fails, the session remains intact and usable.
+  ChatSession intoChat() => _unsupportedOnWeb('Session.intoChat');
+
+  /// Load and restore an inference session checkpoint from a file.
+  void loadCheckpoint(String path) => _unsupportedOnWeb('Session.loadCheckpoint');
+
   /// Current KV position — how many tokens live in the cache.
   /// Atomic-backed; safe to call from a different thread while
   /// `generate()` is in flight.
   int position() => _unsupportedOnWeb('Session.position');
+
+  /// Observe recovery after a failed whole-message call without changing KV,
+  /// cancellation or the retained report. Returns `Busy` if any call holds
+  /// the session lock, including a streaming callback's enclosing operation.
+  /// A poisoned lock returns `Backend`; recreate that session.
+  ///
+  /// `Reset` requires replaying prior context. `Restored` and `Unchanged`
+  /// retain it when `usable` is true. Clear cancellation explicitly before
+  /// retrying a cancelled append. A missing report gives no recovery guarantee
+  /// for raw append operations, which retain their partial-prefill behavior.
+  SessionRecoveryStatus recoveryStatus() => _unsupportedOnWeb('Session.recoveryStatus');
 
   /// Remove any attached LoRA adapter, returning to base-model inference.
   void removeLora() => _unsupportedOnWeb('Session.removeLora');
@@ -4096,16 +6687,28 @@ final class Session {
   /// instead of panicking across the FFI boundary.
   void reset() => _unsupportedOnWeb('Session.reset');
 
+  /// Save current inference session checkpoint to a file.
+  void saveCheckpoint(String path) => _unsupportedOnWeb('Session.saveCheckpoint');
+
   /// Append a multimodal message, automatically enforcing model-canonical
   /// media ordering, boundary token envelopes, and sample rate normalization.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   void sendMessage(UserMessage message) => _unsupportedOnWeb('Session.sendMessage');
 
   /// Append a multimodal message and run generation synchronously while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateOutput sendMessageAndGenerate(UserMessage message, GenerateOpts opts) => _unsupportedOnWeb('Session.sendMessageAndGenerate');
 
   /// Append a multimodal message and run streaming generation while holding
   /// the session lock continuously across prefill and decode.
+  ///
+  /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+  /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended
@@ -4122,6 +6725,248 @@ final class Session {
 final class SessionFfiCodec {
   static int lower(Session value) => _unsupportedOnWeb('SessionFfiCodec.lower');
   static Session lift(int handle) => _unsupportedOnWeb('SessionFfiCodec.lift');
+}
+
+/// Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+final class FfiAudioPipeline {
+  FfiAudioPipeline._();
+
+  bool get isClosed => _unsupportedOnWeb('FfiAudioPipeline.isClosed');
+
+  void close() => _unsupportedOnWeb('FfiAudioPipeline.close');
+
+  /// Construct a pipeline from in-memory GGUF byte buffers.
+  static FfiAudioPipeline fromBytes(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytes');
+
+  /// Construct a pipeline from filesystem model paths.
+  static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
+
+  /// Cooperatively cancel any active transcription.
+  ///
+  /// Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+  /// before subsequent speech segments to resume transcription.
+  void cancel() => _unsupportedOnWeb('FfiAudioPipeline.cancel');
+
+  /// Clear cooperative cancellation flag.
+  void clearCancel() => _unsupportedOnWeb('FfiAudioPipeline.clearCancel');
+
+  /// Total audio samples processed since start or reset.
+  int currentSample() => _unsupportedOnWeb('FfiAudioPipeline.currentSample');
+
+  /// Flush any in-flight speech segment at the end of the audio stream.
+  List<FfiAudioPipelineEvent> flush() => _unsupportedOnWeb('FfiAudioPipeline.flush');
+
+  /// Whether the pipeline is currently awaiting a wake word trigger.
+  bool isListeningForHotword() => _unsupportedOnWeb('FfiAudioPipeline.isListeningForHotword');
+
+  /// Whether speech activity is currently ongoing.
+  bool isSpeechActive() => _unsupportedOnWeb('FfiAudioPipeline.isSpeechActive');
+
+  /// Return a copy of the most recently finished utterance audio samples.
+  List<double> lastUtterance() => _unsupportedOnWeb('FfiAudioPipeline.lastUtterance');
+
+  /// Pop a queued event emitted by previous chunk evaluations.
+  FfiAudioPipelineEvent? popEvent() => _unsupportedOnWeb('FfiAudioPipeline.popEvent');
+
+  /// Process a streaming chunk of 16 kHz mono PCM audio samples.
+  List<FfiAudioPipelineEvent> processChunk(List<double> chunk) => _unsupportedOnWeb('FfiAudioPipeline.processChunk');
+
+  /// Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+  void reset() => _unsupportedOnWeb('FfiAudioPipeline.reset');
+
+  /// Current lifecycle state of the pipeline.
+  FfiAudioPipelineState state() => _unsupportedOnWeb('FfiAudioPipeline.state');
+
+  /// Take ownership of the most recently completed utterance audio samples.
+  List<double> takeLastUtterance() => _unsupportedOnWeb('FfiAudioPipeline.takeLastUtterance');
+
+  /// Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+  String transcribePcm(List<double> pcm) => _unsupportedOnWeb('FfiAudioPipeline.transcribePcm');
+}
+
+final class FfiAudioPipelineFfiCodec {
+  static int lower(FfiAudioPipeline value) => _unsupportedOnWeb('FfiAudioPipelineFfiCodec.lower');
+  static FfiAudioPipeline lift(int handle) => _unsupportedOnWeb('FfiAudioPipelineFfiCodec.lift');
+}
+
+/// Stateful chat coordinator wrapping an inference session.
+final class ChatSession {
+  ChatSession._();
+
+  bool get isClosed => _unsupportedOnWeb('ChatSession.isClosed');
+
+  void close() => _unsupportedOnWeb('ChatSession.close');
+
+  /// Construct a ChatSession from an existing Session, taking ownership of its state.
+  ///
+  /// If validation fails, the session remains intact and usable on the caller side.
+  static ChatSession fromSession(Session session) => _unsupportedOnWeb('ChatSession.fromSession');
+
+  /// Flip cancellation flag to interrupt in-flight prefill or decode.
+  ///
+  /// Wait-free and safe from any thread. If the session has already been reclaimed
+  /// via `into_session()`, this call is a no-op to prevent cross-session cancellation.
+  void cancel() => _unsupportedOnWeb('ChatSession.cancel');
+
+  /// Clear pending cancellation.
+  void clearCancel() => _unsupportedOnWeb('ChatSession.clearCancel');
+
+  /// Complete generation synchronously and return the assistant response.
+  TurnResult complete(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.complete');
+
+  /// Async variant of [`ChatSession::complete`].
+  Future<TurnResult> completeAsync(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.completeAsync');
+
+  /// Async variant of [`ChatSession::complete_json`].
+  Future<TurnResult> completeAsyncJson(GenerateOpts opts, String schemaJson) => _unsupportedOnWeb('ChatSession.completeAsyncJson');
+
+  /// Complete generation synchronously constrained by a JSON Schema.
+  TurnResult completeJson(GenerateOpts opts, String schemaJson) => _unsupportedOnWeb('ChatSession.completeJson');
+
+  /// Export current chat session checkpoint as serialized binary bytes.
+  Uint8List exportCheckpoint() => _unsupportedOnWeb('ChatSession.exportCheckpoint');
+
+  /// Stream generation output tokens into the specified sink.
+  GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
+
+  /// Async variant of [`ChatSession::generate_streaming`].
+  Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingAsync');
+
+  /// Async variant of [`ChatSession::generate_streaming_json`].
+  Future<GenerateSummary> generateStreamingAsyncJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingAsyncJson');
+
+  /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+  GenerateSummary generateStreamingJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingJson');
+
+  /// Import and restore a chat session checkpoint from serialized binary bytes.
+  void importCheckpoint(Uint8List data) => _unsupportedOnWeb('ChatSession.importCheckpoint');
+
+  /// Ingest a single message into the chat context.
+  ///
+  /// Single-message ingestion requires a user message to trigger assistant turn
+  /// completion. To start a multi-turn conversation with a system prompt, supply both
+  /// messages via [`ChatSession::ingest_messages`].
+  IngestSummary ingest(Message message) => _unsupportedOnWeb('ChatSession.ingest');
+
+  /// Ingest a batch of messages into the chat context.
+  IngestSummary ingestMessages(List<Message> messages) => _unsupportedOnWeb('ChatSession.ingestMessages');
+
+  /// Ingest a tool execution response back into the conversation.
+  IngestSummary ingestToolResponse(String name, String content) => _unsupportedOnWeb('ChatSession.ingestToolResponse');
+
+  /// Reclaim the underlying Session, consuming this ChatSession.
+  Session intoSession() => _unsupportedOnWeb('ChatSession.intoSession');
+
+  /// Load and restore a chat session checkpoint from a file.
+  void loadCheckpoint(String path) => _unsupportedOnWeb('ChatSession.loadCheckpoint');
+
+  /// Current session lifecycle phase.
+  ///
+  /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+  SessionPhase phase() => _unsupportedOnWeb('ChatSession.phase');
+
+  /// Current token position in the execution context.
+  ///
+  /// Lock-free and safe to query concurrently while generation is in flight.
+  int position() => _unsupportedOnWeb('ChatSession.position');
+
+  /// Observe recovery status after an ingestion failure.
+  ///
+  /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+  SessionRecoveryStatus recoveryStatus() => _unsupportedOnWeb('ChatSession.recoveryStatus');
+
+  /// Replace conversational history with a fresh message batch.
+  IngestSummary replaceMessages(List<Message> messages) => _unsupportedOnWeb('ChatSession.replaceMessages');
+
+  /// Reset execution state and return to Idle phase.
+  void reset() => _unsupportedOnWeb('ChatSession.reset');
+
+  /// Save current chat session checkpoint to a file.
+  void saveCheckpoint(String path) => _unsupportedOnWeb('ChatSession.saveCheckpoint');
+
+  /// Set tool wire format explicitly.
+  void setToolFormat(ToolFormat format) => _unsupportedOnWeb('ChatSession.setToolFormat');
+
+  /// Register tools for function calling.
+  void setTools(List<ToolDef> tools) => _unsupportedOnWeb('ChatSession.setTools');
+
+  /// Current tool wire format.
+  ToolFormat toolFormat() => _unsupportedOnWeb('ChatSession.toolFormat');
+
+  /// Currently registered tools for function calling.
+  List<ToolDef> tools() => _unsupportedOnWeb('ChatSession.tools');
+}
+
+final class ChatSessionFfiCodec {
+  static int lower(ChatSession value) => _unsupportedOnWeb('ChatSessionFfiCodec.lower');
+  static ChatSession lift(int handle) => _unsupportedOnWeb('ChatSessionFfiCodec.lift');
+}
+
+/// A shared generative engine. Creating handles never reloads the source or copies live KV.
+final class GenerativeModel {
+  GenerativeModel._();
+
+  bool get isClosed => _unsupportedOnWeb('GenerativeModel.isClosed');
+
+  void close() => _unsupportedOnWeb('GenerativeModel.close');
+
+  /// Create an existing production Session with the caller's full configuration.
+  /// Sessions retain their resources after all loader/model/engine handles close.
+  /// Existing backend sharing restrictions and Session/FfiError behavior apply.
+  Session createSession(SessionConfig config) => _unsupportedOnWeb('GenerativeModel.createSession');
+
+  /// Access all retained engine operations through the already loaded engine.
+  CeraEngine engine() => _unsupportedOnWeb('GenerativeModel.engine');
+}
+
+final class GenerativeModelFfiCodec {
+  static int lower(GenerativeModel value) => _unsupportedOnWeb('GenerativeModelFfiCodec.lower');
+  static GenerativeModel lift(int handle) => _unsupportedOnWeb('GenerativeModelFfiCodec.lift');
+}
+
+/// Dynamic loaded-model handle. Typed accessors share ownership.
+final class ModelHandle {
+  ModelHandle._();
+
+  bool get isClosed => _unsupportedOnWeb('ModelHandle.isClosed');
+
+  void close() => _unsupportedOnWeb('ModelHandle.close');
+
+  /// Share a generative model if present; the result can outlive this handle.
+  GenerativeModel? asGenerative() => _unsupportedOnWeb('ModelHandle.asGenerative');
+
+  /// Kind of the loaded model. A string allows future kinds without enum decoding.
+  String kind() => _unsupportedOnWeb('ModelHandle.kind');
+}
+
+final class ModelHandleFfiCodec {
+  static int lower(ModelHandle value) => _unsupportedOnWeb('ModelHandleFfiCodec.lower');
+  static ModelHandle lift(int handle) => _unsupportedOnWeb('ModelHandleFfiCodec.lift');
+}
+
+/// Synchronous, single-use model loader. Both build methods consume the source,
+/// including on failure. Dispatch remote or expensive loads off the UI thread.
+final class ModelLoader {
+  ModelLoader._();
+
+  bool get isClosed => _unsupportedOnWeb('ModelLoader.isClosed');
+
+  void close() => _unsupportedOnWeb('ModelLoader.close');
+
+  /// Retain explicit source data and the existing production engine options.
+  /// Construction does not load weights or contact a remote service.
+  static ModelLoader create(ModelSource source, EngineConfig config) => _unsupportedOnWeb('ModelLoader.create');
+
+  /// Load a dynamic model handle. Generative loading is currently supported.
+  ModelHandle build() => _unsupportedOnWeb('ModelLoader.build');
+
+  /// Load a generative model, reporting other known kinds before assembly.
+  GenerativeModel buildGenerative() => _unsupportedOnWeb('ModelLoader.buildGenerative');
+}
+
+final class ModelLoaderFfiCodec {
+  static int lower(ModelLoader value) => _unsupportedOnWeb('ModelLoaderFfiCodec.lower');
+  static ModelLoader lift(int handle) => _unsupportedOnWeb('ModelLoaderFfiCodec.lift');
 }
 
 /// Mirrors the native entry point. `dynamicLibrary` is `Object?` here
@@ -4204,3 +7049,27 @@ String toolGrammar(List<ToolDef> tools, ToolFormat format) => _unsupportedOnWeb(
 
 /// Default transcription options for Whisper ASR.
 FfiWhisperTranscribeOpts whisperDefaultTranscribeOpts() => _unsupportedOnWeb('whisperDefaultTranscribeOpts');
+
+/// Returns default configuration for the audio pipeline.
+FfiAudioPipelineConfig audioPipelineDefaultConfig() => _unsupportedOnWeb('audioPipelineDefaultConfig');
+
+/// Convenience factory for an assistant text message.
+Message chatMessageAssistant(String content) => _unsupportedOnWeb('chatMessageAssistant');
+
+/// Convenience factory for a system text message.
+Message chatMessageSystem(String content) => _unsupportedOnWeb('chatMessageSystem');
+
+/// Convenience factory for a tool text message.
+Message chatMessageTool(String content) => _unsupportedOnWeb('chatMessageTool');
+
+/// Convenience factory for a user text message.
+Message chatMessageUser(String content) => _unsupportedOnWeb('chatMessageUser');
+
+/// Convenience factory for a user audio message.
+Message chatMessageUserAudio(List<double> audioPcm, int sampleRate, String? text) => _unsupportedOnWeb('chatMessageUserAudio');
+
+/// Convenience factory for a user image message.
+Message chatMessageUserImage(Uint8List imageBytes, String? text) => _unsupportedOnWeb('chatMessageUserImage');
+
+/// Compile a JSON Schema definition string into a GBNF grammar string.
+String jsonSchemaToGrammar(String schemaJson) => _unsupportedOnWeb('jsonSchemaToGrammar');

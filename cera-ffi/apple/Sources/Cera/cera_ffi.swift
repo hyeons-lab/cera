@@ -1003,10 +1003,15 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func metadata()  -> ModelMetadata
     
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+    func newChatSession(config: SessionConfig) throws  -> ChatSession
+    
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
     func newSession(config: SessionConfig) throws  -> Session
     
@@ -1607,10 +1612,22 @@ open func metadata() -> ModelMetadata  {
 }
     
     /**
-     * Open a new [`Session`] sharing this engine's model + tokenizer
+     * Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+     */
+open func newChatSession(config: SessionConfig)throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSessionConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Open a new [`Session`] sharing this engine's model and tokenizer
      * by `Arc` clone. The returned session outlives `&self`; the
      * engine keeps the shared state live for every session it hands
-     * out. Cheap — no model load, just config + state allocation.
+     * out. Cheap: no model load, just config and state allocation.
      */
 open func newSession(config: SessionConfig)throws  -> Session  {
     return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -1749,6 +1766,635 @@ public func FfiConverterTypeCeraEngine_lift(_ handle: UInt64) throws -> CeraEngi
 #endif
 public func FfiConverterTypeCeraEngine_lower(_ value: CeraEngine) -> UInt64 {
     return FfiConverterTypeCeraEngine.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+public protocol ChatSessionProtocol: AnyObject, Sendable {
+    
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
+     */
+    func cancel() 
+    
+    /**
+     * Clear pending cancellation.
+     */
+    func clearCancel() throws 
+    
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+    func complete(opts: GenerateOpts) throws  -> TurnResult
+    
+    /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    func completeAsync(opts: GenerateOpts) async throws  -> TurnResult
+    
+    /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+    func completeAsyncJson(opts: GenerateOpts, schemaJson: String) async throws  -> TurnResult
+    
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+    func completeJson(opts: GenerateOpts, schemaJson: String) throws  -> TurnResult
+    
+    /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    func exportCheckpoint() throws  -> Data
+    
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+    func generateStreaming(opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink) async throws  -> GenerateSummary
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+    func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) async throws  -> GenerateSummary
+    
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+    func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) throws  -> GenerateSummary
+    
+    /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    func importCheckpoint(data: Data) throws 
+    
+    /**
+     * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
+     */
+    func ingest(message: Message) throws  -> IngestSummary
+    
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    func ingestMessages(messages: [Message]) throws  -> IngestSummary
+    
+    /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    func ingestToolResponse(name: String, content: String) throws  -> IngestSummary
+    
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+    func intoSession() throws  -> Session
+    
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    func loadCheckpoint(path: String) throws 
+    
+    /**
+     * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    func phase() throws  -> SessionPhase
+    
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+    func position() throws  -> UInt32
+    
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+    func recoveryStatus() throws  -> SessionRecoveryStatus
+    
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+    func replaceMessages(messages: [Message]) throws  -> IngestSummary
+    
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+    func reset() throws 
+    
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    func saveCheckpoint(path: String) throws 
+    
+    /**
+     * Set tool wire format explicitly.
+     */
+    func setToolFormat(format: ToolFormat) throws 
+    
+    /**
+     * Register tools for function calling.
+     */
+    func setTools(tools: [ToolDef]) throws 
+    
+    /**
+     * Current tool wire format.
+     */
+    func toolFormat() throws  -> ToolFormat
+    
+    /**
+     * Currently registered tools for function calling.
+     */
+    func tools() throws  -> [ToolDef]
+    
+}
+/**
+ * Stateful chat coordinator wrapping an inference session.
+ */
+open class ChatSession: ChatSessionProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_chatsession(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_chatsession(handle, $0) }
+    }
+
+    
+    /**
+     * Construct a ChatSession from an existing Session, taking ownership of its state.
+     *
+     * If validation fails, the session remains intact and usable on the caller side.
+     */
+public static func fromSession(session: Session)throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_chatsession_from_session(
+        FfiConverterTypeSession_lower(session),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Flip cancellation flag to interrupt in-flight prefill or decode.
+     *
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
+     */
+open func cancel()  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_chatsession_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Clear pending cancellation.
+     */
+open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Complete generation synchronously and return the assistant response.
+     */
+open func complete(opts: GenerateOpts)throws  -> TurnResult  {
+    return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_complete(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),$0
+    )
+})
+}
+    
+    /**
+     * Async variant of [`ChatSession::complete`].
+     */
+open func completeAsync(opts: GenerateOpts)async throws  -> TurnResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_complete_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTurnResult_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Async variant of [`ChatSession::complete_json`].
+     */
+open func completeAsyncJson(opts: GenerateOpts, schemaJson: String)async throws  -> TurnResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTurnResult_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Complete generation synchronously constrained by a JSON Schema.
+     */
+open func completeJson(opts: GenerateOpts, schemaJson: String)throws  -> TurnResult  {
+    return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_complete_json(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterString.lower(schemaJson),$0
+    )
+})
+}
+    
+    /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+open func exportCheckpoint()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Stream generation output tokens into the specified sink.
+     */
+open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
+    return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterTypeModalitySink_lower(sink),$0
+    )
+})
+}
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async throws  -> GenerateSummary  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGenerateSummary_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming_json`].
+     */
+open func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink)async throws  -> GenerateSummary  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson),FfiConverterTypeModalitySink_lower(sink)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGenerateSummary_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+     */
+open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink)throws  -> GenerateSummary  {
+    return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGenerateOpts_lower(opts),
+        FfiConverterString.lower(schemaJson),
+        FfiConverterTypeModalitySink_lower(sink),$0
+    )
+})
+}
+    
+    /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
+     * Ingest a single message into the chat context.
+     *
+     * Single-message ingestion requires a user message to trigger assistant turn
+     * completion. To start a multi-turn conversation with a system prompt, supply both
+     * messages via [`ChatSession::ingest_messages`].
+     */
+open func ingest(message: Message)throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMessage_lower(message),$0
+    )
+})
+}
+    
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+open func ingestMessages(messages: [Message])throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeMessage.lower(messages),$0
+    )
+})
+}
+    
+    /**
+     * Ingest a tool execution response back into the conversation.
+     */
+open func ingestToolResponse(name: String, content: String)throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+    
+    /**
+     * Reclaim the underlying Session, consuming this ChatSession.
+     */
+open func intoSession()throws  -> Session  {
+    return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_into_session(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+open func phase()throws  -> SessionPhase  {
+    return try  FfiConverterTypeSessionPhase_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_phase(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Current token position in the execution context.
+     *
+     * Lock-free and safe to query concurrently while generation is in flight.
+     */
+open func position()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_position(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Observe recovery status after an ingestion failure.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
+     */
+open func recoveryStatus()throws  -> SessionRecoveryStatus  {
+    return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_recovery_status(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Replace conversational history with a fresh message batch.
+     */
+open func replaceMessages(messages: [Message])throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_replace_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeMessage.lower(messages),$0
+    )
+})
+}
+    
+    /**
+     * Reset execution state and return to Idle phase.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Set tool wire format explicitly.
+     */
+open func setToolFormat(format: ToolFormat)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+}
+}
+    
+    /**
+     * Register tools for function calling.
+     */
+open func setTools(tools: [ToolDef])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_tools(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeToolDef.lower(tools),$0
+    )
+}
+}
+    
+    /**
+     * Current tool wire format.
+     */
+open func toolFormat()throws  -> ToolFormat  {
+    return try  FfiConverterTypeToolFormat_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_tool_format(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Currently registered tools for function calling.
+     */
+open func tools()throws  -> [ToolDef]  {
+    return try  FfiConverterSequenceTypeToolDef.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_tools(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChatSession: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ChatSession
+
+    public static func lift(_ handle: UInt64) throws -> ChatSession {
+        return ChatSession(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ChatSession) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChatSession {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ChatSession, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatSession_lift(_ handle: UInt64) throws -> ChatSession {
+    return try FfiConverterTypeChatSession.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChatSession_lower(_ value: ChatSession) -> UInt64 {
+    return FfiConverterTypeChatSession.lower(value)
 }
 
 
@@ -2008,6 +2654,359 @@ public func FfiConverterTypeDownloadProgressSink_lift(_ handle: UInt64) throws -
 #endif
 public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgressSink) -> UInt64 {
     return FfiConverterTypeDownloadProgressSink.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
+    
+    /**
+     * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
+     */
+    func cancel() throws 
+    
+    /**
+     * Clear cooperative cancellation flag.
+     */
+    func clearCancel() throws 
+    
+    /**
+     * Total audio samples processed since start or reset.
+     */
+    func currentSample() throws  -> UInt64
+    
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+    func flush() throws  -> [FfiAudioPipelineEvent]
+    
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+    func isListeningForHotword() throws  -> Bool
+    
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+    func isSpeechActive() throws  -> Bool
+    
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+    func lastUtterance() throws  -> [Float]
+    
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+    func popEvent() throws  -> FfiAudioPipelineEvent?
+    
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+    func processChunk(chunk: [Float]) throws  -> [FfiAudioPipelineEvent]
+    
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+    func reset() throws 
+    
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+    func state() throws  -> FfiAudioPipelineState
+    
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+    func takeLastUtterance() throws  -> [Float]
+    
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+    func transcribePcm(pcm: [Float]) throws  -> String
+    
+}
+/**
+ * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
+ */
+open class FfiAudioPipeline: FfiAudioPipelineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_ffiaudiopipeline(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_ffiaudiopipeline(handle, $0) }
+    }
+
+    
+    /**
+     * Construct a pipeline from in-memory GGUF byte buffers.
+     */
+public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
+        FfiConverterOptionData.lower(vadBytes),
+        FfiConverterOptionData.lower(hotwordBytes),
+        FfiConverterOptionData.lower(whisperBytes),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Construct a pipeline from filesystem model paths.
+     */
+public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath: String?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
+        FfiConverterOptionString.lower(vadPath),
+        FfiConverterOptionString.lower(hotwordPath),
+        FfiConverterOptionString.lower(whisperPath),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
+     */
+open func cancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Clear cooperative cancellation flag.
+     */
+open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Total audio samples processed since start or reset.
+     */
+open func currentSample()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Flush any in-flight speech segment at the end of the audio stream.
+     */
+open func flush()throws  -> [FfiAudioPipelineEvent]  {
+    return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether the pipeline is currently awaiting a wake word trigger.
+     */
+open func isListeningForHotword()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether speech activity is currently ongoing.
+     */
+open func isSpeechActive()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Return a copy of the most recently finished utterance audio samples.
+     */
+open func lastUtterance()throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Pop a queued event emitted by previous chunk evaluations.
+     */
+open func popEvent()throws  -> FfiAudioPipelineEvent?  {
+    return try  FfiConverterOptionTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Process a streaming chunk of 16 kHz mono PCM audio samples.
+     */
+open func processChunk(chunk: [Float])throws  -> [FfiAudioPipelineEvent]  {
+    return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(chunk),$0
+    )
+})
+}
+    
+    /**
+     * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
+     */
+open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Current lifecycle state of the pipeline.
+     */
+open func state()throws  -> FfiAudioPipelineState  {
+    return try  FfiConverterTypeFfiAudioPipelineState_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Take ownership of the most recently completed utterance audio samples.
+     */
+open func takeLastUtterance()throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
+     */
+open func transcribePcm(pcm: [Float])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceFloat.lower(pcm),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipeline: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = FfiAudioPipeline
+
+    public static func lift(_ handle: UInt64) throws -> FfiAudioPipeline {
+        return FfiAudioPipeline(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: FfiAudioPipeline) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipeline {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: FfiAudioPipeline, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipeline_lift(_ handle: UInt64) throws -> FfiAudioPipeline {
+    return try FfiConverterTypeFfiAudioPipeline.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipeline_lower(_ value: FfiAudioPipeline) -> UInt64 {
+    return FfiConverterTypeFfiAudioPipeline.lower(value)
 }
 
 
@@ -2824,11 +3823,14 @@ public protocol FfiWhisperModelProtocol: AnyObject, Sendable {
     
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
     func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?) throws  -> String
     
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
     func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?) async throws  -> String
     
@@ -2935,6 +3937,7 @@ open func languages() -> [String]  {
     
     /**
      * Transcribe 16 kHz mono PCM audio samples synchronously.
+     * Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
      */
 open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2948,6 +3951,8 @@ open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> St
     
     /**
      * Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+     * Dropping the returned future aborts queued work and signals an already-running decoder
+     * to stop at its next cooperative cancellation check.
      */
 open func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?)async throws  -> String  {
     return
@@ -3009,6 +4014,155 @@ public func FfiConverterTypeFfiWhisperModel_lift(_ handle: UInt64) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiWhisperModel_lower(_ value: FfiWhisperModel) -> UInt64 {
     return FfiConverterTypeFfiWhisperModel.lower(value)
+}
+
+
+
+
+
+
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+public protocol GenerativeModelProtocol: AnyObject, Sendable {
+    
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+    func createSession(config: SessionConfig) throws  -> Session
+    
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+    func engine()  -> CeraEngine
+    
+}
+/**
+ * A shared generative engine. Creating handles never reloads the source or copies live KV.
+ */
+open class GenerativeModel: GenerativeModelProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_generativemodel(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_generativemodel(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Create an existing production Session with the caller's full configuration.
+     * Sessions retain their resources after all loader/model/engine handles close.
+     * Existing backend sharing restrictions and Session/FfiError behavior apply.
+     */
+open func createSession(config: SessionConfig)throws  -> Session  {
+    return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_generativemodel_create_session(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSessionConfig_lower(config),$0
+    )
+})
+}
+    
+    /**
+     * Access all retained engine operations through the already loaded engine.
+     */
+open func engine() -> CeraEngine  {
+    return try!  FfiConverterTypeCeraEngine_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_generativemodel_engine(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGenerativeModel: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = GenerativeModel
+
+    public static func lift(_ handle: UInt64) throws -> GenerativeModel {
+        return GenerativeModel(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: GenerativeModel) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenerativeModel {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: GenerativeModel, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerativeModel_lift(_ handle: UInt64) throws -> GenerativeModel {
+    return try FfiConverterTypeGenerativeModel.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerativeModel_lower(_ value: GenerativeModel) -> UInt64 {
+    return FfiConverterTypeGenerativeModel.lower(value)
 }
 
 
@@ -3560,6 +4714,309 @@ public func FfiConverterTypeModalitySink_lower(_ value: ModalitySink) -> UInt64 
 
 
 /**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+public protocol ModelHandleProtocol: AnyObject, Sendable {
+    
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+    func asGenerative()  -> GenerativeModel?
+    
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+    func kind()  -> String
+    
+}
+/**
+ * Dynamic loaded-model handle. Typed accessors share ownership.
+ */
+open class ModelHandle: ModelHandleProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_modelhandle(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_modelhandle(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Share a generative model if present; the result can outlive this handle.
+     */
+open func asGenerative() -> GenerativeModel?  {
+    return try!  FfiConverterOptionTypeGenerativeModel.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_modelhandle_as_generative(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Kind of the loaded model. A string allows future kinds without enum decoding.
+     */
+open func kind() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_modelhandle_kind(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelHandle: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ModelHandle
+
+    public static func lift(_ handle: UInt64) throws -> ModelHandle {
+        return ModelHandle(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ModelHandle) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelHandle {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ModelHandle, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelHandle_lift(_ handle: UInt64) throws -> ModelHandle {
+    return try FfiConverterTypeModelHandle.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelHandle_lower(_ value: ModelHandle) -> UInt64 {
+    return FfiConverterTypeModelHandle.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+public protocol ModelLoaderProtocol: AnyObject, Sendable {
+    
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+    func build() throws  -> ModelHandle
+    
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+    func buildGenerative() throws  -> GenerativeModel
+    
+}
+/**
+ * Synchronous, single-use model loader. Both build methods consume the source,
+ * including on failure. Dispatch remote or expensive loads off the UI thread.
+ */
+open class ModelLoader: ModelLoaderProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_modelloader(self.handle, $0) }
+    }
+    /**
+     * Retain explicit source data and the existing production engine options.
+     * Construction does not load weights or contact a remote service.
+     */
+public convenience init(source: ModelSource, config: EngineConfig) {
+    let handle =
+        try! rustCall() {
+    uniffi_cera_ffi_fn_constructor_modelloader_new(
+        FfiConverterTypeModelSource_lower(source),
+        FfiConverterTypeEngineConfig_lower(config),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_modelloader(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Load a dynamic model handle. Generative loading is currently supported.
+     */
+open func build()throws  -> ModelHandle  {
+    return try  FfiConverterTypeModelHandle_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+    uniffi_cera_ffi_fn_method_modelloader_build(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Load a generative model, reporting other known kinds before assembly.
+     */
+open func buildGenerative()throws  -> GenerativeModel  {
+    return try  FfiConverterTypeGenerativeModel_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+    uniffi_cera_ffi_fn_method_modelloader_build_generative(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelLoader: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = ModelLoader
+
+    public static func lift(_ handle: UInt64) throws -> ModelLoader {
+        return ModelLoader(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: ModelLoader) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelLoader {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: ModelLoader, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelLoader_lift(_ handle: UInt64) throws -> ModelLoader {
+    return try FfiConverterTypeModelLoader.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelLoader_lower(_ value: ModelLoader) -> UInt64 {
+    return FfiConverterTypeModelLoader.lower(value)
+}
+
+
+
+
+
+
+/**
  * Zero-dependency PII Classifier for named entity recognition.
  */
 public protocol PiiClassifierProtocol: AnyObject, Sendable {
@@ -3895,6 +5352,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func defaultGenerateOpts() throws  -> GenerateOpts
     
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    func exportCheckpoint() throws  -> Data
+    
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -4038,6 +5500,25 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesMeanPooled(tokens: [UInt32]) throws  -> [Float]
     
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    func importCheckpoint(data: Data) throws 
+    
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+    func intoChat() throws  -> ChatSession
+    
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    func loadCheckpoint(path: String) throws 
+    
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -4060,20 +5541,34 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func reset() throws 
     
     /**
+     * Save current inference session checkpoint to a file.
+     */
+    func saveCheckpoint(path: String) throws 
+    
+    /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessage(message: UserMessage) throws 
     
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts) throws  -> GenerateOutput
     
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
     func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
     
@@ -4088,6 +5583,19 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * precedence over the model's minimum-resolution floor).
      */
     func setImageMaxLongSize(maxLongSize: UInt32?) throws 
+    
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+    func recoveryStatus() throws  -> SessionRecoveryStatus
     
 }
 /**
@@ -4379,6 +5887,17 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
 }
     
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+open func exportCheckpoint()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_export_checkpoint(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -4600,6 +6119,43 @@ open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
 }
     
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_import_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
+     * Wrap this session in a stateful chat coordinator.
+     *
+     * On success, ownership of the inner inference state is transferred to the returned
+     * [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+     * If validation fails, the session remains intact and usable.
+     */
+open func intoChat()throws  -> ChatSession  {
+    return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_into_chat(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_load_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
      * Current KV position — how many tokens live in the cache.
      * Atomic-backed; safe to call from a different thread while
      * `generate()` is in flight.
@@ -4638,8 +6194,22 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
 }
     
     /**
+     * Save current inference session checkpoint to a file.
+     */
+open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_save_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
      * Append a multimodal message, automatically enforcing model-canonical
      * media ordering, boundary token envelopes, and sample rate normalization.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_send_message(
@@ -4652,6 +6222,9 @@ open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiCo
     /**
      * Append a multimodal message and run generation synchronously while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -4666,6 +6239,9 @@ open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws
     /**
      * Append a multimodal message and run streaming generation while holding
      * the session lock continuously across prefill and decode.
+     *
+     * Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+     * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -4694,6 +6270,25 @@ open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithErr
         FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
+}
+    
+    /**
+     * Observe recovery after a failed whole-message call without changing KV,
+     * cancellation or the retained report. Returns `Busy` if any call holds
+     * the session lock, including a streaming callback's enclosing operation.
+     * A poisoned lock returns `Backend`; recreate that session.
+     *
+     * `Reset` requires replaying prior context. `Restored` and `Unchanged`
+     * retain it when `usable` is true. Clear cancellation explicitly before
+     * retrying a cancelled append. A missing report gives no recovery guarantee
+     * for raw append operations, which retain their partial-prefill behavior.
+     */
+open func recoveryStatus()throws  -> SessionRecoveryStatus  {
+    return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_recovery_status(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
 
@@ -4982,6 +6577,125 @@ public func FfiConverterTypeEngineConfig_lower(_ value: EngineConfig) -> RustBuf
 
 
 /**
+ * Configuration options for the unified audio pipeline.
+ */
+public struct FfiAudioPipelineConfig: Equatable, Hashable {
+    /**
+     * Whether a keyword spotting wake word must be detected before speech tracking begins.
+     */
+    public var requireHotword: Bool
+    /**
+     * Whether to automatically run Whisper transcription upon speech completion.
+     */
+    public var autoTranscribe: Bool
+    /**
+     * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+     */
+    public var preRollMs: UInt32
+    /**
+     * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+     */
+    public var maxUtteranceMs: UInt32
+    /**
+     * Voice Activity Detection configuration.
+     */
+    public var vadConfig: FfiVadConfig?
+    /**
+     * Keyword Spotting configuration.
+     */
+    public var hotwordConfig: FfiHotwordConfig?
+    /**
+     * Whisper transcription options.
+     */
+    public var whisperOpts: FfiWhisperTranscribeOpts?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Whether a keyword spotting wake word must be detected before speech tracking begins.
+         */requireHotword: Bool, 
+        /**
+         * Whether to automatically run Whisper transcription upon speech completion.
+         */autoTranscribe: Bool, 
+        /**
+         * Audio pre-roll duration in milliseconds to retain prior to wake word or speech onset.
+         */preRollMs: UInt32, 
+        /**
+         * Maximum allowed utterance duration in milliseconds before forcing a boundary.
+         */maxUtteranceMs: UInt32, 
+        /**
+         * Voice Activity Detection configuration.
+         */vadConfig: FfiVadConfig?, 
+        /**
+         * Keyword Spotting configuration.
+         */hotwordConfig: FfiHotwordConfig?, 
+        /**
+         * Whisper transcription options.
+         */whisperOpts: FfiWhisperTranscribeOpts?) {
+        self.requireHotword = requireHotword
+        self.autoTranscribe = autoTranscribe
+        self.preRollMs = preRollMs
+        self.maxUtteranceMs = maxUtteranceMs
+        self.vadConfig = vadConfig
+        self.hotwordConfig = hotwordConfig
+        self.whisperOpts = whisperOpts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineConfig {
+        return
+            try FfiAudioPipelineConfig(
+                requireHotword: FfiConverterBool.read(from: &buf), 
+                autoTranscribe: FfiConverterBool.read(from: &buf), 
+                preRollMs: FfiConverterUInt32.read(from: &buf), 
+                maxUtteranceMs: FfiConverterUInt32.read(from: &buf), 
+                vadConfig: FfiConverterOptionTypeFfiVadConfig.read(from: &buf), 
+                hotwordConfig: FfiConverterOptionTypeFfiHotwordConfig.read(from: &buf), 
+                whisperOpts: FfiConverterOptionTypeFfiWhisperTranscribeOpts.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiAudioPipelineConfig, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.requireHotword, into: &buf)
+        FfiConverterBool.write(value.autoTranscribe, into: &buf)
+        FfiConverterUInt32.write(value.preRollMs, into: &buf)
+        FfiConverterUInt32.write(value.maxUtteranceMs, into: &buf)
+        FfiConverterOptionTypeFfiVadConfig.write(value.vadConfig, into: &buf)
+        FfiConverterOptionTypeFfiHotwordConfig.write(value.hotwordConfig, into: &buf)
+        FfiConverterOptionTypeFfiWhisperTranscribeOpts.write(value.whisperOpts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineConfig_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineConfig {
+    return try FfiConverterTypeFfiAudioPipelineConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineConfig_lower(_ value: FfiAudioPipelineConfig) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineConfig.lower(value)
+}
+
+
+/**
  * An identified PII entity span in source text.
  */
 public struct FfiEntitySpan: Equatable, Hashable {
@@ -5218,15 +6932,16 @@ public struct FfiHotwordEvent: Equatable, Hashable {
      */
     public var keyword: String
     /**
-     * Exact audio stream sample index where the keyword completed.
+     * Exclusive end sample of the window evaluated when detection triggered.
+     * This is a detection-hop boundary; it does not locate the spoken word's end.
      */
     public var sampleOffset: UInt64
     /**
-     * Audio stream sample index including pre-roll safety margin for downstream ASR.
+     * `sample_offset` minus the configured pre-roll samples, saturating at zero.
      */
     public var commandStartSample: UInt64
     /**
-     * Timestamp in milliseconds from stream origin where keyword completed.
+     * `sample_offset` converted to milliseconds using the model sample rate.
      */
     public var timestampMs: Float
     /**
@@ -5241,13 +6956,14 @@ public struct FfiHotwordEvent: Equatable, Hashable {
          * The matched keyword string.
          */keyword: String, 
         /**
-         * Exact audio stream sample index where the keyword completed.
+         * Exclusive end sample of the window evaluated when detection triggered.
+         * This is a detection-hop boundary; it does not locate the spoken word's end.
          */sampleOffset: UInt64, 
         /**
-         * Audio stream sample index including pre-roll safety margin for downstream ASR.
+         * `sample_offset` minus the configured pre-roll samples, saturating at zero.
          */commandStartSample: UInt64, 
         /**
-         * Timestamp in milliseconds from stream origin where keyword completed.
+         * `sample_offset` converted to milliseconds using the model sample rate.
          */timestampMs: Float, 
         /**
          * Model confidence probability (0.0 to 1.0).
@@ -5957,6 +7673,148 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
 
 
 /**
+ * Recovery diagnostic retained after a failed `send_message` ingestion.
+ * The call's original error is still returned separately. Generation failures
+ * after successful ingestion do not create this report.
+ */
+public struct IngestRecovery: Equatable, Hashable {
+    public var outcome: RecoveryOutcome
+    public var rewindError: KvRewindFailure?
+    public var resetError: FfiError?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: RecoveryOutcome, rewindError: KvRewindFailure?, resetError: FfiError?) {
+        self.outcome = outcome
+        self.rewindError = rewindError
+        self.resetError = resetError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IngestRecovery: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIngestRecovery: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IngestRecovery {
+        return
+            try IngestRecovery(
+                outcome: FfiConverterTypeRecoveryOutcome.read(from: &buf), 
+                rewindError: FfiConverterOptionTypeKvRewindFailure.read(from: &buf), 
+                resetError: FfiConverterOptionTypeFfiError.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IngestRecovery, into buf: inout [UInt8]) {
+        FfiConverterTypeRecoveryOutcome.write(value.outcome, into: &buf)
+        FfiConverterOptionTypeKvRewindFailure.write(value.rewindError, into: &buf)
+        FfiConverterOptionTypeFfiError.write(value.resetError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestRecovery_lift(_ buf: RustBuffer) throws -> IngestRecovery {
+    return try FfiConverterTypeIngestRecovery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestRecovery_lower(_ value: IngestRecovery) -> RustBuffer {
+    return FfiConverterTypeIngestRecovery.lower(value)
+}
+
+
+/**
+ * Summary of a successful message ingestion.
+ */
+public struct IngestSummary: Equatable, Hashable {
+    /**
+     * Number of tokens encoded and appended to context.
+     */
+    public var inputTokens: UInt32
+    /**
+     * KV position before ingestion.
+     */
+    public var positionBefore: UInt32
+    /**
+     * KV position after ingestion.
+     */
+    public var positionAfter: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Number of tokens encoded and appended to context.
+         */inputTokens: UInt32, 
+        /**
+         * KV position before ingestion.
+         */positionBefore: UInt32, 
+        /**
+         * KV position after ingestion.
+         */positionAfter: UInt32) {
+        self.inputTokens = inputTokens
+        self.positionBefore = positionBefore
+        self.positionAfter = positionAfter
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IngestSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIngestSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IngestSummary {
+        return
+            try IngestSummary(
+                inputTokens: FfiConverterUInt32.read(from: &buf), 
+                positionBefore: FfiConverterUInt32.read(from: &buf), 
+                positionAfter: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IngestSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.inputTokens, into: &buf)
+        FfiConverterUInt32.write(value.positionBefore, into: &buf)
+        FfiConverterUInt32.write(value.positionAfter, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestSummary_lift(_ buf: RustBuffer) throws -> IngestSummary {
+    return try FfiConverterTypeIngestSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestSummary_lower(_ value: IngestSummary) -> RustBuffer {
+    return FfiConverterTypeIngestSummary.lower(value)
+}
+
+
+/**
  * One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
  * model directory plus every per-quant manifest inside it. Feed
  * `name` and one element of `quants` straight to
@@ -6016,6 +7874,105 @@ public func FfiConverterTypeLeapBundleEntry_lift(_ buf: RustBuffer) throws -> Le
 #endif
 public func FfiConverterTypeLeapBundleEntry_lower(_ value: LeapBundleEntry) -> RustBuffer {
     return FfiConverterTypeLeapBundleEntry.lower(value)
+}
+
+
+/**
+ * A structured conversational turn message.
+ */
+public struct Message: Equatable, Hashable {
+    /**
+     * Author role.
+     */
+    public var role: Role
+    /**
+     * Message text content.
+     */
+    public var content: String
+    /**
+     * Optional image payload bytes.
+     */
+    public var imageBytes: Data?
+    /**
+     * Optional audio PCM waveform samples.
+     */
+    public var audioPcm: [Float]?
+    /**
+     * Audio sample rate in Hz (e.g. 16000).
+     */
+    public var audioSampleRate: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Author role.
+         */role: Role, 
+        /**
+         * Message text content.
+         */content: String, 
+        /**
+         * Optional image payload bytes.
+         */imageBytes: Data? = nil, 
+        /**
+         * Optional audio PCM waveform samples.
+         */audioPcm: [Float]? = nil, 
+        /**
+         * Audio sample rate in Hz (e.g. 16000).
+         */audioSampleRate: UInt32? = nil) {
+        self.role = role
+        self.content = content
+        self.imageBytes = imageBytes
+        self.audioPcm = audioPcm
+        self.audioSampleRate = audioSampleRate
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension Message: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Message {
+        return
+            try Message(
+                role: FfiConverterTypeRole.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                imageBytes: FfiConverterOptionData.read(from: &buf), 
+                audioPcm: FfiConverterOptionSequenceFloat.read(from: &buf), 
+                audioSampleRate: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Message, into buf: inout [UInt8]) {
+        FfiConverterTypeRole.write(value.role, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterOptionData.write(value.imageBytes, into: &buf)
+        FfiConverterOptionSequenceFloat.write(value.audioPcm, into: &buf)
+        FfiConverterOptionUInt32.write(value.audioSampleRate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessage_lift(_ buf: RustBuffer) throws -> Message {
+    return try FfiConverterTypeMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
+    return FfiConverterTypeMessage.lower(value)
 }
 
 
@@ -6086,6 +8043,84 @@ public func FfiConverterTypeModalityCapabilities_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypeModalityCapabilities_lower(_ value: ModalityCapabilities) -> RustBuffer {
     return FfiConverterTypeModalityCapabilities.lower(value)
+}
+
+
+public struct ModelFiles: Equatable, Hashable {
+    public var model: String
+    public var multimodalProjector: String?
+    public var audioDecoder: String?
+    public var audioTokenizer: String?
+    public var draftModel: String?
+    public var extras: [String: String]
+    public var inferenceType: String?
+    public var chatTemplate: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(model: String, multimodalProjector: String?, audioDecoder: String?, audioTokenizer: String?, draftModel: String?, extras: [String: String], inferenceType: String?, chatTemplate: String?) {
+        self.model = model
+        self.multimodalProjector = multimodalProjector
+        self.audioDecoder = audioDecoder
+        self.audioTokenizer = audioTokenizer
+        self.draftModel = draftModel
+        self.extras = extras
+        self.inferenceType = inferenceType
+        self.chatTemplate = chatTemplate
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ModelFiles: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelFiles: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelFiles {
+        return
+            try ModelFiles(
+                model: FfiConverterString.read(from: &buf), 
+                multimodalProjector: FfiConverterOptionString.read(from: &buf), 
+                audioDecoder: FfiConverterOptionString.read(from: &buf), 
+                audioTokenizer: FfiConverterOptionString.read(from: &buf), 
+                draftModel: FfiConverterOptionString.read(from: &buf), 
+                extras: FfiConverterDictionaryStringString.read(from: &buf), 
+                inferenceType: FfiConverterOptionString.read(from: &buf), 
+                chatTemplate: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelFiles, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.model, into: &buf)
+        FfiConverterOptionString.write(value.multimodalProjector, into: &buf)
+        FfiConverterOptionString.write(value.audioDecoder, into: &buf)
+        FfiConverterOptionString.write(value.audioTokenizer, into: &buf)
+        FfiConverterOptionString.write(value.draftModel, into: &buf)
+        FfiConverterDictionaryStringString.write(value.extras, into: &buf)
+        FfiConverterOptionString.write(value.inferenceType, into: &buf)
+        FfiConverterOptionString.write(value.chatTemplate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelFiles_lift(_ buf: RustBuffer) throws -> ModelFiles {
+    return try FfiConverterTypeModelFiles.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelFiles_lower(_ value: ModelFiles) -> RustBuffer {
+    return FfiConverterTypeModelFiles.lower(value)
 }
 
 
@@ -6202,6 +8237,150 @@ public func FfiConverterTypeModelMetadata_lower(_ value: ModelMetadata) -> RustB
 }
 
 
+public struct ModelParts: Equatable, Hashable {
+    public var model: Data
+    public var multimodalProjector: Data?
+    public var audioDecoder: Data?
+    public var audioTokenizer: Data?
+    public var draftModel: Data?
+    public var inferenceType: String?
+    public var chatTemplate: String?
+    public var generationDefaults: GenerationDefaults?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(model: Data, multimodalProjector: Data?, audioDecoder: Data?, audioTokenizer: Data?, draftModel: Data?, inferenceType: String?, chatTemplate: String?, generationDefaults: GenerationDefaults?) {
+        self.model = model
+        self.multimodalProjector = multimodalProjector
+        self.audioDecoder = audioDecoder
+        self.audioTokenizer = audioTokenizer
+        self.draftModel = draftModel
+        self.inferenceType = inferenceType
+        self.chatTemplate = chatTemplate
+        self.generationDefaults = generationDefaults
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ModelParts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelParts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelParts {
+        return
+            try ModelParts(
+                model: FfiConverterData.read(from: &buf), 
+                multimodalProjector: FfiConverterOptionData.read(from: &buf), 
+                audioDecoder: FfiConverterOptionData.read(from: &buf), 
+                audioTokenizer: FfiConverterOptionData.read(from: &buf), 
+                draftModel: FfiConverterOptionData.read(from: &buf), 
+                inferenceType: FfiConverterOptionString.read(from: &buf), 
+                chatTemplate: FfiConverterOptionString.read(from: &buf), 
+                generationDefaults: FfiConverterOptionTypeGenerationDefaults.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelParts, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.model, into: &buf)
+        FfiConverterOptionData.write(value.multimodalProjector, into: &buf)
+        FfiConverterOptionData.write(value.audioDecoder, into: &buf)
+        FfiConverterOptionData.write(value.audioTokenizer, into: &buf)
+        FfiConverterOptionData.write(value.draftModel, into: &buf)
+        FfiConverterOptionString.write(value.inferenceType, into: &buf)
+        FfiConverterOptionString.write(value.chatTemplate, into: &buf)
+        FfiConverterOptionTypeGenerationDefaults.write(value.generationDefaults, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelParts_lift(_ buf: RustBuffer) throws -> ModelParts {
+    return try FfiConverterTypeModelParts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelParts_lower(_ value: ModelParts) -> RustBuffer {
+    return FfiConverterTypeModelParts.lower(value)
+}
+
+
+public struct SamplingDefaults: Equatable, Hashable {
+    public var temperature: Float?
+    public var topP: Float?
+    public var topK: UInt32?
+    public var minP: Float?
+    public var repetitionPenalty: Float?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(temperature: Float?, topP: Float?, topK: UInt32?, minP: Float?, repetitionPenalty: Float?) {
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.repetitionPenalty = repetitionPenalty
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SamplingDefaults: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSamplingDefaults: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SamplingDefaults {
+        return
+            try SamplingDefaults(
+                temperature: FfiConverterOptionFloat.read(from: &buf), 
+                topP: FfiConverterOptionFloat.read(from: &buf), 
+                topK: FfiConverterOptionUInt32.read(from: &buf), 
+                minP: FfiConverterOptionFloat.read(from: &buf), 
+                repetitionPenalty: FfiConverterOptionFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SamplingDefaults, into buf: inout [UInt8]) {
+        FfiConverterOptionFloat.write(value.temperature, into: &buf)
+        FfiConverterOptionFloat.write(value.topP, into: &buf)
+        FfiConverterOptionUInt32.write(value.topK, into: &buf)
+        FfiConverterOptionFloat.write(value.minP, into: &buf)
+        FfiConverterOptionFloat.write(value.repetitionPenalty, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSamplingDefaults_lift(_ buf: RustBuffer) throws -> SamplingDefaults {
+    return try FfiConverterTypeSamplingDefaults.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSamplingDefaults_lower(_ value: SamplingDefaults) -> RustBuffer {
+    return FfiConverterTypeSamplingDefaults.lower(value)
+}
+
+
 /**
  * Per-session configuration. Mirrors [`cera::SessionConfig`].
  */
@@ -6312,6 +8491,88 @@ public func FfiConverterTypeSessionConfig_lift(_ buf: RustBuffer) throws -> Sess
 #endif
 public func FfiConverterTypeSessionConfig_lower(_ value: SessionConfig) -> RustBuffer {
     return FfiConverterTypeSessionConfig.lower(value)
+}
+
+
+/**
+ * Coherent snapshot of a session at the instant the lock was acquired.
+ * Another thread may change the session after this method returns.
+ */
+public struct SessionRecoveryStatus: Equatable, Hashable {
+    /**
+     * False requires a successful checked reset or recreation.
+     */
+    public var usable: Bool
+    /**
+     * Meaningful as reusable context only when `usable` is true.
+     */
+    public var position: UInt32
+    /**
+     * Cleared by successful whole-message ingestion or explicit reset.
+     * Raw append calls and cancellation controls leave it unchanged.
+     */
+    public var lastIngestRecovery: IngestRecovery?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * False requires a successful checked reset or recreation.
+         */usable: Bool, 
+        /**
+         * Meaningful as reusable context only when `usable` is true.
+         */position: UInt32, 
+        /**
+         * Cleared by successful whole-message ingestion or explicit reset.
+         * Raw append calls and cancellation controls leave it unchanged.
+         */lastIngestRecovery: IngestRecovery?) {
+        self.usable = usable
+        self.position = position
+        self.lastIngestRecovery = lastIngestRecovery
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionRecoveryStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionRecoveryStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionRecoveryStatus {
+        return
+            try SessionRecoveryStatus(
+                usable: FfiConverterBool.read(from: &buf), 
+                position: FfiConverterUInt32.read(from: &buf), 
+                lastIngestRecovery: FfiConverterOptionTypeIngestRecovery.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionRecoveryStatus, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.usable, into: &buf)
+        FfiConverterUInt32.write(value.position, into: &buf)
+        FfiConverterOptionTypeIngestRecovery.write(value.lastIngestRecovery, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionRecoveryStatus_lift(_ buf: RustBuffer) throws -> SessionRecoveryStatus {
+    return try FfiConverterTypeSessionRecoveryStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionRecoveryStatus_lower(_ value: SessionRecoveryStatus) -> RustBuffer {
+    return FfiConverterTypeSessionRecoveryStatus.lower(value)
 }
 
 
@@ -6529,6 +8790,95 @@ public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
 
 
 /**
+ * Result of a completed chat turn.
+ */
+public struct TurnResult: Equatable, Hashable {
+    /**
+     * Decoded assistant response text.
+     */
+    public var text: String
+    /**
+     * Token identifiers emitted during the turn.
+     */
+    public var tokens: [UInt32]
+    /**
+     * Generation summary metrics.
+     */
+    public var summary: GenerateSummary
+    /**
+     * Parsed tool calls emitted by the model during the turn.
+     */
+    public var toolCalls: [ToolCall]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Decoded assistant response text.
+         */text: String, 
+        /**
+         * Token identifiers emitted during the turn.
+         */tokens: [UInt32], 
+        /**
+         * Generation summary metrics.
+         */summary: GenerateSummary, 
+        /**
+         * Parsed tool calls emitted by the model during the turn.
+         */toolCalls: [ToolCall] = []) {
+        self.text = text
+        self.tokens = tokens
+        self.summary = summary
+        self.toolCalls = toolCalls
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TurnResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTurnResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TurnResult {
+        return
+            try TurnResult(
+                text: FfiConverterString.read(from: &buf), 
+                tokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                summary: FfiConverterTypeGenerateSummary.read(from: &buf), 
+                toolCalls: FfiConverterSequenceTypeToolCall.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TurnResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterSequenceUInt32.write(value.tokens, into: &buf)
+        FfiConverterTypeGenerateSummary.write(value.summary, into: &buf)
+        FfiConverterSequenceTypeToolCall.write(value.toolCalls, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTurnResult_lift(_ buf: RustBuffer) throws -> TurnResult {
+    return try FfiConverterTypeTurnResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTurnResult_lower(_ value: TurnResult) -> RustBuffer {
+    return FfiConverterTypeTurnResult.lower(value)
+}
+
+
+/**
  * User-facing multimodal input envelope.
  */
 public struct UserMessage: Equatable, Hashable {
@@ -6680,6 +9030,262 @@ public func FfiConverterTypeBackendPreference_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) -> RustBuffer {
     return FfiConverterTypeBackendPreference.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * An event emitted by the unified audio pipeline.
+ */
+
+public enum FfiAudioPipelineEvent: Equatable, Hashable {
+    
+    /**
+     * Keyword spotting detected a wake word.
+     */
+    case wakeWordDetected(
+        /**
+         * Triggered keyword.
+         */keyword: String, 
+        /**
+         * Confidence probability between 0.0 and 1.0.
+         */confidence: Float, 
+        /**
+         * Timestamp in milliseconds from stream start.
+         */timestampMs: Float, 
+        /**
+         * Sample offset where the detection hop completed.
+         */sampleOffset: UInt64
+    )
+    /**
+     * Voice Activity Detection identified speech onset.
+     */
+    case speechStart(
+        /**
+         * Sample index where speech began.
+         */sample: UInt64, 
+        /**
+         * Timestamp in milliseconds from stream start.
+         */ms: Float
+    )
+    /**
+     * Voice Activity Detection identified speech termination.
+     */
+    case speechEnd(
+        /**
+         * Starting sample index of the speech segment.
+         */startSample: UInt64, 
+        /**
+         * Ending sample index of the speech segment.
+         */endSample: UInt64, 
+        /**
+         * Start timestamp in milliseconds.
+         */startMs: Float, 
+        /**
+         * End timestamp in milliseconds.
+         */endMs: Float
+    )
+    /**
+     * Whisper transcription completed for a speech utterance.
+     */
+    case utteranceTranscribed(
+        /**
+         * Recognized text output.
+         */text: String, 
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */startMs: Float, 
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */endMs: Float, 
+        /**
+         * Number of 16 kHz audio samples transcribed.
+         */sampleCount: UInt64
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .wakeWordDetected(keyword: try FfiConverterString.read(from: &buf), confidence: try FfiConverterFloat.read(from: &buf), timestampMs: try FfiConverterFloat.read(from: &buf), sampleOffset: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 2: return .speechStart(sample: try FfiConverterUInt64.read(from: &buf), ms: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        case 3: return .speechEnd(startSample: try FfiConverterUInt64.read(from: &buf), endSample: try FfiConverterUInt64.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf)
+        )
+        
+        case 4: return .utteranceTranscribed(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), sampleCount: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAudioPipelineEvent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .wakeWordDetected(keyword,confidence,timestampMs,sampleOffset):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(keyword, into: &buf)
+            FfiConverterFloat.write(confidence, into: &buf)
+            FfiConverterFloat.write(timestampMs, into: &buf)
+            FfiConverterUInt64.write(sampleOffset, into: &buf)
+            
+        
+        case let .speechStart(sample,ms):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(sample, into: &buf)
+            FfiConverterFloat.write(ms, into: &buf)
+            
+        
+        case let .speechEnd(startSample,endSample,startMs,endMs):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt64.write(startSample, into: &buf)
+            FfiConverterUInt64.write(endSample, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            
+        
+        case let .utteranceTranscribed(text,startMs,endMs,sampleCount):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(text, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            FfiConverterUInt64.write(sampleCount, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineEvent_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineEvent {
+    return try FfiConverterTypeFfiAudioPipelineEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineEvent_lower(_ value: FfiAudioPipelineEvent) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Active state of the streaming audio pipeline.
+ */
+
+public enum FfiAudioPipelineState: Equatable, Hashable {
+    
+    /**
+     * Awaiting a keyword spotting wake word before activating speech recording.
+     */
+    case listeningForHotword
+    /**
+     * Evaluating incoming audio frames to detect speech onset.
+     */
+    case listeningForSpeech
+    /**
+     * Speech onset detected; accumulating utterance samples in the audio buffer.
+     */
+    case speechActive
+    /**
+     * Transcribing the accumulated speech utterance using Whisper.
+     */
+    case transcribing
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAudioPipelineState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAudioPipelineState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAudioPipelineState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .listeningForHotword
+        
+        case 2: return .listeningForSpeech
+        
+        case 3: return .speechActive
+        
+        case 4: return .transcribing
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAudioPipelineState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .listeningForHotword:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .listeningForSpeech:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .speechActive:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .transcribing:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineState_lift(_ buf: RustBuffer) throws -> FfiAudioPipelineState {
+    return try FfiConverterTypeFfiAudioPipelineState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAudioPipelineState_lower(_ value: FfiAudioPipelineState) -> RustBuffer {
+    return FfiConverterTypeFfiAudioPipelineState.lower(value)
 }
 
 
@@ -6857,6 +9463,11 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      */
     case LoraUnsupportedByBackend(detail: String
     )
+    /**
+     * Chat contract validation failure.
+     */
+    case ChatValidation(error: ValidationError
+    )
 
     
 
@@ -6922,6 +9533,9 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
             )
         case 14: return .LoraUnsupportedByBackend(
             detail: try FfiConverterString.read(from: &buf)
+            )
+        case 15: return .ChatValidation(
+            error: try FfiConverterTypeValidationError.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -7002,6 +9616,11 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         case let .LoraUnsupportedByBackend(detail):
             writeInt(&buf, Int32(14))
             FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .ChatValidation(error):
+            writeInt(&buf, Int32(15))
+            FfiConverterTypeValidationError.write(error, into: &buf)
             
         }
     }
@@ -7280,6 +9899,92 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum GenerationDefaults: Equatable, Hashable {
+    
+    case text(sampling: SamplingDefaults
+    )
+    case audio(sampling: SamplingDefaults, numberOfDecodingThreads: UInt32?, audioTemperature: Float?, audioTopK: UInt32?
+    )
+    case other(rawJson: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension GenerationDefaults: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGenerationDefaults: FfiConverterRustBuffer {
+    typealias SwiftType = GenerationDefaults
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GenerationDefaults {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text(sampling: try FfiConverterTypeSamplingDefaults.read(from: &buf)
+        )
+        
+        case 2: return .audio(sampling: try FfiConverterTypeSamplingDefaults.read(from: &buf), numberOfDecodingThreads: try FfiConverterOptionUInt32.read(from: &buf), audioTemperature: try FfiConverterOptionFloat.read(from: &buf), audioTopK: try FfiConverterOptionUInt32.read(from: &buf)
+        )
+        
+        case 3: return .other(rawJson: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: GenerationDefaults, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .text(sampling):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeSamplingDefaults.write(sampling, into: &buf)
+            
+        
+        case let .audio(sampling,numberOfDecodingThreads,audioTemperature,audioTopK):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeSamplingDefaults.write(sampling, into: &buf)
+            FfiConverterOptionUInt32.write(numberOfDecodingThreads, into: &buf)
+            FfiConverterOptionFloat.write(audioTemperature, into: &buf)
+            FfiConverterOptionUInt32.write(audioTopK, into: &buf)
+            
+        
+        case let .other(rawJson):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(rawJson, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerationDefaults_lift(_ buf: RustBuffer) throws -> GenerationDefaults {
+    return try FfiConverterTypeGenerationDefaults.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGenerationDefaults_lower(_ value: GenerationDefaults) -> RustBuffer {
+    return FfiConverterTypeGenerationDefaults.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
  * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
@@ -7383,6 +10088,702 @@ public func FfiConverterTypeKvCompression_lower(_ value: KvCompression) -> RustB
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Why checked tail rewind was unavailable. Numeric positions are token counts.
+ */
+
+public enum KvRewindFailure: Equatable, Hashable {
+    
+    case outOfBounds(requested: UInt64, current: UInt64
+    )
+    case compressed
+    case nonCausal
+    case missingConvolutionCheckpoint(layer: UInt64, position: UInt64
+    )
+    case invalidCacheLayout(layer: UInt64, detail: String
+    )
+    case backendUnsupported
+    case unknown(detail: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension KvRewindFailure: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKvRewindFailure: FfiConverterRustBuffer {
+    typealias SwiftType = KvRewindFailure
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KvRewindFailure {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .outOfBounds(requested: try FfiConverterUInt64.read(from: &buf), current: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 2: return .compressed
+        
+        case 3: return .nonCausal
+        
+        case 4: return .missingConvolutionCheckpoint(layer: try FfiConverterUInt64.read(from: &buf), position: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 5: return .invalidCacheLayout(layer: try FfiConverterUInt64.read(from: &buf), detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .backendUnsupported
+        
+        case 7: return .unknown(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: KvRewindFailure, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .outOfBounds(requested,current):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt64.write(requested, into: &buf)
+            FfiConverterUInt64.write(current, into: &buf)
+            
+        
+        case .compressed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .nonCausal:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .missingConvolutionCheckpoint(layer,position):
+            writeInt(&buf, Int32(4))
+            FfiConverterUInt64.write(layer, into: &buf)
+            FfiConverterUInt64.write(position, into: &buf)
+            
+        
+        case let .invalidCacheLayout(layer,detail):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt64.write(layer, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case .backendUnsupported:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .unknown(detail):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(detail, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKvRewindFailure_lift(_ buf: RustBuffer) throws -> KvRewindFailure {
+    return try FfiConverterTypeKvRewindFailure.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKvRewindFailure_lower(_ value: KvRewindFailure) -> RustBuffer {
+    return FfiConverterTypeKvRewindFailure.lower(value)
+}
+
+
+
+public enum LoadError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    case KindMismatch(expected: String, actual: String, architecture: String
+    )
+    case UnsupportedArchitecture(architecture: String
+    )
+    case UnsupportedInferenceType(inferenceType: String
+    )
+    case Source(sourceKind: String, detail: String
+    )
+    case Assembly(backend: String, detail: String
+    )
+    case InvalidConfig(field: String, value: String, reason: String, detail: String
+    )
+    case Engine(detail: String
+    )
+    case Consumed
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension LoadError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoadError: FfiConverterRustBuffer {
+    typealias SwiftType = LoadError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoadError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .KindMismatch(
+            expected: try FfiConverterString.read(from: &buf), 
+            actual: try FfiConverterString.read(from: &buf), 
+            architecture: try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .UnsupportedArchitecture(
+            architecture: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .UnsupportedInferenceType(
+            inferenceType: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .Source(
+            sourceKind: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 5: return .Assembly(
+            backend: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 6: return .InvalidConfig(
+            field: try FfiConverterString.read(from: &buf), 
+            value: try FfiConverterString.read(from: &buf), 
+            reason: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 7: return .Engine(
+            detail: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .Consumed
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LoadError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .KindMismatch(expected,actual,architecture):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(expected, into: &buf)
+            FfiConverterString.write(actual, into: &buf)
+            FfiConverterString.write(architecture, into: &buf)
+            
+        
+        case let .UnsupportedArchitecture(architecture):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(architecture, into: &buf)
+            
+        
+        case let .UnsupportedInferenceType(inferenceType):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(inferenceType, into: &buf)
+            
+        
+        case let .Source(sourceKind,detail):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(sourceKind, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .Assembly(backend,detail):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(backend, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .InvalidConfig(field,value,reason,detail):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(field, into: &buf)
+            FfiConverterString.write(value, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .Engine(detail):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case .Consumed:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadError_lift(_ buf: RustBuffer) throws -> LoadError {
+    return try FfiConverterTypeLoadError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadError_lower(_ value: LoadError) -> RustBuffer {
+    return FfiConverterTypeLoadError.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ModelSource: Equatable, Hashable {
+    
+    case bundleId(id: String, quant: String
+    )
+    case huggingFace(spec: String, quant: String?, strategy: String?
+    )
+    case bytes(bytes: Data
+    )
+    case parts(parts: ModelParts
+    )
+    case path(path: String
+    )
+    case files(files: ModelFiles
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ModelSource: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelSource: FfiConverterRustBuffer {
+    typealias SwiftType = ModelSource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelSource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bundleId(id: try FfiConverterString.read(from: &buf), quant: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .huggingFace(spec: try FfiConverterString.read(from: &buf), quant: try FfiConverterOptionString.read(from: &buf), strategy: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 3: return .bytes(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 4: return .parts(parts: try FfiConverterTypeModelParts.read(from: &buf)
+        )
+        
+        case 5: return .path(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .files(files: try FfiConverterTypeModelFiles.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ModelSource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .bundleId(id,quant):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(quant, into: &buf)
+            
+        
+        case let .huggingFace(spec,quant,strategy):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(spec, into: &buf)
+            FfiConverterOptionString.write(quant, into: &buf)
+            FfiConverterOptionString.write(strategy, into: &buf)
+            
+        
+        case let .bytes(bytes):
+            writeInt(&buf, Int32(3))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        
+        case let .parts(parts):
+            writeInt(&buf, Int32(4))
+            FfiConverterTypeModelParts.write(parts, into: &buf)
+            
+        
+        case let .path(path):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case let .files(files):
+            writeInt(&buf, Int32(6))
+            FfiConverterTypeModelFiles.write(files, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSource_lift(_ buf: RustBuffer) throws -> ModelSource {
+    return try FfiConverterTypeModelSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSource_lower(_ value: ModelSource) -> RustBuffer {
+    return FfiConverterTypeModelSource.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Execution state after a failed whole-message append.
+ */
+
+public enum RecoveryOutcome: Equatable, Hashable {
+    
+    case unchanged
+    case restored
+    case reset
+    case unusable
+    /**
+     * A newer core outcome; conservatively recreate the session.
+     */
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RecoveryOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRecoveryOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = RecoveryOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecoveryOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unchanged
+        
+        case 2: return .restored
+        
+        case 3: return .reset
+        
+        case 4: return .unusable
+        
+        case 5: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RecoveryOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unchanged:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .restored:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .reset:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unusable:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecoveryOutcome_lift(_ buf: RustBuffer) throws -> RecoveryOutcome {
+    return try FfiConverterTypeRecoveryOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecoveryOutcome_lower(_ value: RecoveryOutcome) -> RustBuffer {
+    return FfiConverterTypeRecoveryOutcome.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Message author role in conversational chat.
+ */
+
+public enum Role: Equatable, Hashable {
+    
+    /**
+     * System prompt setting instructions and context.
+     */
+    case system
+    /**
+     * User prompt input.
+     */
+    case user
+    /**
+     * Assistant model response.
+     */
+    case assistant
+    /**
+     * Tool result or response payload.
+     */
+    case tool
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Role: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRole: FfiConverterRustBuffer {
+    typealias SwiftType = Role
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Role {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .system
+        
+        case 2: return .user
+        
+        case 3: return .assistant
+        
+        case 4: return .tool
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Role, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .system:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .user:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .assistant:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .tool:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRole_lift(_ buf: RustBuffer) throws -> Role {
+    return try FfiConverterTypeRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRole_lower(_ value: Role) -> RustBuffer {
+    return FfiConverterTypeRole.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Lifecycle phase of a stateful chat coordinator.
+ */
+
+public enum SessionPhase: Equatable, Hashable {
+    
+    /**
+     * Clean session at position 0, ready for initial message ingestion.
+     */
+    case idle
+    /**
+     * Input messages have been appended and prefilled; ready for decode.
+     */
+    case promptReady
+    /**
+     * A turn finished with a terminal end-of-sequence stop marker.
+     */
+    case turnComplete
+    /**
+     * Generation was interrupted by cancellation or custom nonterminal stop.
+     */
+    case interrupted
+    /**
+     * Underlying execution state was modified outside chat rules; replacement required.
+     */
+    case rawContext
+    /**
+     * Unrecoverable execution fault or unwind; checked reset required to restore usability.
+     */
+    case unusable
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionPhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionPhase: FfiConverterRustBuffer {
+    typealias SwiftType = SessionPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .idle
+        
+        case 2: return .promptReady
+        
+        case 3: return .turnComplete
+        
+        case 4: return .interrupted
+        
+        case 5: return .rawContext
+        
+        case 6: return .unusable
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .idle:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .promptReady:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .turnComplete:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .interrupted:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .rawContext:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unusable:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionPhase_lift(_ buf: RustBuffer) throws -> SessionPhase {
+    return try FfiConverterTypeSessionPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionPhase_lower(_ value: SessionPhase) -> RustBuffer {
+    return FfiConverterTypeSessionPhase.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The tool-call wire format a model family uses. Mirrors
  * [`cera::tools::ToolFormat`]. Get one from
  * [`CeraEngine::tool_format`] (auto-detected from the model) or set it
@@ -7458,6 +10859,208 @@ public func FfiConverterTypeToolFormat_lift(_ buf: RustBuffer) throws -> ToolFor
 #endif
 public func FfiConverterTypeToolFormat_lower(_ value: ToolFormat) -> RustBuffer {
     return FfiConverterTypeToolFormat.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Validation failure during chat construction, preparation, or decode.
+ */
+
+public enum ValidationError: Equatable, Hashable {
+    
+    /**
+     * Model or tokenizer configuration does not match a supported chat profile.
+     */
+    case unsupportedProfile
+    /**
+     * Sliding context configuration (n_keep != 0) is not supported for chat.
+     */
+    case slidingContext
+    /**
+     * Model audio output is not supported for text chat.
+     */
+    case audioOutput
+    /**
+     * Generation parameter validation error.
+     */
+    case generation(detail: String
+    )
+    /**
+     * Operation refused in the current session phase.
+     */
+    case phase(phase: SessionPhase
+    )
+    /**
+     * Message batch provided to ingest was empty.
+     */
+    case emptyBatch
+    /**
+     * Message role sequence violates chat rules.
+     */
+    case roleOrder(message: UInt32
+    )
+    /**
+     * Message role is not supported in the active profile.
+     */
+    case unsupportedRole(message: UInt32
+    )
+    /**
+     * Content part is not supported in the active profile.
+     */
+    case unsupportedContent(message: UInt32, part: UInt32
+    )
+    /**
+     * Message text contains a reserved ChatML marker sequence.
+     */
+    case reservedMarker(message: UInt32
+    )
+    /**
+     * Context tokens required exceed available capacity in the KV cache.
+     */
+    case capacity(required: UInt32, available: UInt32
+    )
+    /**
+     * Chat template rendering error.
+     */
+    case template(detail: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ValidationError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeValidationError: FfiConverterRustBuffer {
+    typealias SwiftType = ValidationError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ValidationError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unsupportedProfile
+        
+        case 2: return .slidingContext
+        
+        case 3: return .audioOutput
+        
+        case 4: return .generation(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .phase(phase: try FfiConverterTypeSessionPhase.read(from: &buf)
+        )
+        
+        case 6: return .emptyBatch
+        
+        case 7: return .roleOrder(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 8: return .unsupportedRole(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 9: return .unsupportedContent(message: try FfiConverterUInt32.read(from: &buf), part: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 10: return .reservedMarker(message: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 11: return .capacity(required: try FfiConverterUInt32.read(from: &buf), available: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 12: return .template(detail: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ValidationError, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unsupportedProfile:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .slidingContext:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .audioOutput:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .generation(detail):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .phase(phase):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeSessionPhase.write(phase, into: &buf)
+            
+        
+        case .emptyBatch:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .roleOrder(message):
+            writeInt(&buf, Int32(7))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .unsupportedRole(message):
+            writeInt(&buf, Int32(8))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .unsupportedContent(message,part):
+            writeInt(&buf, Int32(9))
+            FfiConverterUInt32.write(message, into: &buf)
+            FfiConverterUInt32.write(part, into: &buf)
+            
+        
+        case let .reservedMarker(message):
+            writeInt(&buf, Int32(10))
+            FfiConverterUInt32.write(message, into: &buf)
+            
+        
+        case let .capacity(required,available):
+            writeInt(&buf, Int32(11))
+            FfiConverterUInt32.write(required, into: &buf)
+            FfiConverterUInt32.write(available, into: &buf)
+            
+        
+        case let .template(detail):
+            writeInt(&buf, Int32(12))
+            FfiConverterString.write(detail, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeValidationError_lift(_ buf: RustBuffer) throws -> ValidationError {
+    return try FfiConverterTypeValidationError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeValidationError_lower(_ value: ValidationError) -> RustBuffer {
+    return FfiConverterTypeValidationError.lower(value)
 }
 
 
@@ -7608,6 +11211,30 @@ fileprivate struct FfiConverterOptionTypeBundleRepo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeGenerativeModel: FfiConverterRustBuffer {
+    typealias SwiftType = GenerativeModel?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGenerativeModel.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGenerativeModel.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
     typealias SwiftType = AudioInput?
 
@@ -7624,6 +11251,30 @@ fileprivate struct FfiConverterOptionTypeAudioInput: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeAudioInput.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiAudioPipelineConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiAudioPipelineConfig.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7728,6 +11379,30 @@ fileprivate struct FfiConverterOptionTypeFfiWhisperTranscribeOpts: FfiConverterR
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeIngestRecovery: FfiConverterRustBuffer {
+    typealias SwiftType = IngestRecovery?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeIngestRecovery.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeIngestRecovery.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffer {
     typealias SwiftType = SpecDecodeConfig?
 
@@ -7744,6 +11419,54 @@ fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSpecDecodeConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAudioPipelineEvent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiAudioPipelineEvent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiAudioPipelineEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiError: FfiConverterRustBuffer {
+    typealias SwiftType = FfiError?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiError.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiError.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7776,6 +11499,30 @@ fileprivate struct FfiConverterOptionTypeFfiVadEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeGenerationDefaults: FfiConverterRustBuffer {
+    typealias SwiftType = GenerationDefaults?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGenerationDefaults.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGenerationDefaults.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
     typealias SwiftType = KvCompression?
 
@@ -7800,6 +11547,30 @@ fileprivate struct FfiConverterOptionTypeKvCompression: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeKvRewindFailure: FfiConverterRustBuffer {
+    typealias SwiftType = KvRewindFailure?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeKvRewindFailure.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeKvRewindFailure.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeToolFormat: FfiConverterRustBuffer {
     typealias SwiftType = ToolFormat?
 
@@ -7816,6 +11587,30 @@ fileprivate struct FfiConverterOptionTypeToolFormat: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeToolFormat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceFloat: FfiConverterRustBuffer {
+    typealias SwiftType = [Float]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceFloat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceFloat.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -8024,6 +11819,31 @@ fileprivate struct FfiConverterSequenceTypeLeapBundleEntry: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMessage: FfiConverterRustBuffer {
+    typealias SwiftType = [Message]
+
+    public static func write(_ value: [Message], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMessage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Message] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Message]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeToolCall: FfiConverterRustBuffer {
     typealias SwiftType = [ToolCall]
 
@@ -8068,6 +11888,57 @@ fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
             seq.append(try FfiConverterTypeToolDef.read(from: &buf))
         }
         return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiAudioPipelineEvent]
+
+    public static func write(_ value: [FfiAudioPipelineEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiAudioPipelineEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiAudioPipelineEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiAudioPipelineEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiAudioPipelineEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
+    public static func write(_ value: [String: String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterString.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: String] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: String]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterString.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
     }
 }
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
@@ -8261,6 +12132,88 @@ public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
     )
 })
 }
+/**
+ * Returns default configuration for the audio pipeline.
+ */
+public func audioPipelineDefaultConfig() -> FfiAudioPipelineConfig  {
+    return try!  FfiConverterTypeFfiAudioPipelineConfig_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_audio_pipeline_default_config($0
+    )
+})
+}
+/**
+ * Convenience factory for an assistant text message.
+ */
+public func chatMessageAssistant(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_assistant(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a system text message.
+ */
+public func chatMessageSystem(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_system(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a tool text message.
+ */
+public func chatMessageTool(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_tool(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a user text message.
+ */
+public func chatMessageUser(content: String) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Convenience factory for a user audio message.
+ */
+public func chatMessageUserAudio(audioPcm: [Float], sampleRate: UInt32, text: String?) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user_audio(
+        FfiConverterSequenceFloat.lower(audioPcm),
+        FfiConverterUInt32.lower(sampleRate),
+        FfiConverterOptionString.lower(text),$0
+    )
+})
+}
+/**
+ * Convenience factory for a user image message.
+ */
+public func chatMessageUserImage(imageBytes: Data, text: String?) -> Message  {
+    return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_func_chat_message_user_image(
+        FfiConverterData.lower(imageBytes),
+        FfiConverterOptionString.lower(text),$0
+    )
+})
+}
+/**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ */
+public func jsonSchemaToGrammar(schemaJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_json_schema_to_grammar(
+        FfiConverterString.lower(schemaJson),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -8305,6 +12258,30 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
@@ -8364,7 +12341,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 13030) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
@@ -8439,10 +12419,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 20385) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 33011) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
@@ -8490,6 +12470,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8517,6 +12500,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8526,16 +12518,160 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message() != 5757) {
+    if (uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 44503) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 14947) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
@@ -8602,6 +12738,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
         return InitializationResult.apiChecksumMismatch
     }
 

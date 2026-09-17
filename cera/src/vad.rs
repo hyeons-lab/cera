@@ -516,6 +516,11 @@ impl SileroVad {
         self.context_8k.fill(0.0);
     }
 
+    /// Expose the current LSTM cell hidden state vectors (h, c) for inspection and diagnostics.
+    pub fn hidden_states(&self) -> (&[f32; 128], &[f32; 128]) {
+        (&self.h, &self.c)
+    }
+
     /// Process a single chunk of audio and return the speech probability in `[0.0, 1.0]`.
     ///
     /// - For [`VadSampleRate::Rate16kHz`], `chunk` must have exactly 512 samples.

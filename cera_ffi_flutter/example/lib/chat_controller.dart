@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
-import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'chat_intent.dart';
@@ -19,7 +19,7 @@ class ChatController extends ValueNotifier<ChatState> {
       super(const ChatState()) {
     const kAppRevisionBadge = 'rev26-kws-whisper';
     debugPrint(
-      '[cera:chat:version] ChatController v0.5.6 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.6.0 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
@@ -32,7 +32,11 @@ class ChatController extends ValueNotifier<ChatState> {
   Cera? _ceraEngine;
   StreamSubscription<String>? _generationSub;
   Completer<void>? _generationCompleter;
+  SessionPhase _sessionPhase = SessionPhase.idle;
   bool _disposed = false;
+
+  /// Active session coordinator phase.
+  SessionPhase get sessionPhase => _sessionPhase;
 
   /// Audio player service instance.
   AudioPlayerService get audioPlayer => _audioPlayer;
@@ -99,6 +103,7 @@ class ChatController extends ValueNotifier<ChatState> {
   /// Explicitly and cleanly unloads the currently active Cera model and frees
   /// all underlying memory and native resources.
   Future<void> _unloadCurrentModel() async {
+    _sessionPhase = SessionPhase.idle;
     _loadSessionId++;
     _generationId++;
     _audioPlayer.stop();
@@ -446,6 +451,7 @@ class ChatController extends ValueNotifier<ChatState> {
       }
 
       _ceraEngine = cera;
+      _sessionPhase = SessionPhase.idle;
       final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
       final voiceTag = voiceTagFor(cera.capabilities);
 
@@ -532,6 +538,7 @@ class ChatController extends ValueNotifier<ChatState> {
     if ((prompt.trim().isEmpty && imageBytes == null) ||
         cera == null ||
         value.isBusy ||
+        _sessionPhase == SessionPhase.unusable ||
         _disposed) {
       return;
     }
@@ -594,22 +601,45 @@ class ChatController extends ValueNotifier<ChatState> {
       '(image: ${imageBytes != null ? "${imageBytes.length} bytes" : "none"}, audioMode: ${audioMode.name})',
     );
 
-    final systemPrompt = systemPromptFor(
-      settings: value.settings,
-      uiMode: value.uiMode,
-      isAudioPrompt: false,
-    );
-
-    final messages = <CeraMessage>[
-      if (systemPrompt != null) CeraMessage.system(systemPrompt),
-      CeraMessage.user(framedPromptText),
-    ];
-
+    final isInitial = _sessionPhase == SessionPhase.idle;
     String formattedPrompt;
-    try {
-      formattedPrompt = await cera.applyChatTemplate(messages);
-    } catch (_) {
-      formattedPrompt = framedPromptText;
+    if (isInitial) {
+      final systemPrompt = systemPromptFor(
+        settings: value.settings,
+        uiMode: value.uiMode,
+        isAudioPrompt: false,
+      );
+      final messages = <CeraMessage>[
+        if (systemPrompt != null) CeraMessage.system(systemPrompt),
+        CeraMessage.user(framedPromptText),
+      ];
+      try {
+        formattedPrompt = await cera.applyChatTemplate(messages);
+      } catch (_) {
+        formattedPrompt = framedPromptText;
+      }
+    } else {
+      try {
+        var delta = await cera.applyChatTemplate([
+          CeraMessage.user(framedPromptText),
+        ]);
+        if (delta.startsWith('<|startoftext|>')) {
+          delta = delta.substring('<|startoftext|>'.length);
+        } else if (delta.startsWith('<s>')) {
+          delta = delta.substring('<s>'.length);
+        } else if (delta.startsWith('<|begin_of_text|>')) {
+          delta = delta.substring('<|begin_of_text|>'.length);
+        }
+        if (delta.startsWith('\n')) {
+          delta = delta.substring(1);
+        }
+        // Autoregressive decode terminates upon sampling EOS without committing it
+        // to the KV cache. Both turnComplete and interrupted continuation turns
+        // must prepend <|im_end|>\n to seal the prior assistant turn.
+        formattedPrompt = '<|im_end|>\n$delta';
+      } catch (_) {
+        formattedPrompt = '<|im_end|>\n$framedPromptText';
+      }
     }
     if (_disposed || generationId != _generationId) return;
 
@@ -661,6 +691,7 @@ class ChatController extends ValueNotifier<ChatState> {
     if (intent.pcmSamples.isEmpty ||
         cera == null ||
         value.isBusy ||
+        _sessionPhase == SessionPhase.unusable ||
         _disposed) {
       return;
     }
@@ -756,7 +787,7 @@ class ChatController extends ValueNotifier<ChatState> {
         intent.pcmSamples,
         sampleRate: intent.sampleRate,
         prompt: promptText,
-        systemPrompt: systemPrompt,
+        systemPrompt: _sessionPhase == SessionPhase.idle ? systemPrompt : null,
       );
       debugPrint(
         '[cera:chat] Audio successfully encoded and seeded into KV cache',
@@ -813,6 +844,7 @@ class ChatController extends ValueNotifier<ChatState> {
     }
 
     final generationId = ++_generationId;
+    _sessionPhase = SessionPhase.promptReady;
     final stopwatch = Stopwatch()..start();
     int? firstTokenMs;
     int tokenCount = 0;
@@ -893,6 +925,7 @@ class ChatController extends ValueNotifier<ChatState> {
         },
         onError: (err) {
           hasError = true;
+          _sessionPhase = SessionPhase.interrupted;
           if (!_disposed && _generationId == generationId) {
             _updateLastTurn(
               (t) => t.copyWith(
@@ -917,6 +950,7 @@ class ChatController extends ValueNotifier<ChatState> {
       await done.future;
     } catch (err) {
       hasError = true;
+      _sessionPhase = SessionPhase.interrupted;
       if (!_disposed && _generationId == generationId) {
         _updateLastTurn(
           (t) => t.copyWith(
@@ -931,6 +965,10 @@ class ChatController extends ValueNotifier<ChatState> {
       _audioPlayer.finishStream();
       _generationSub = null;
       _generationCompleter = null;
+    }
+
+    if (!hasError && _generationId == generationId) {
+      _sessionPhase = SessionPhase.turnComplete;
     }
 
     TurnStats? stats;
@@ -1020,6 +1058,9 @@ class ChatController extends ValueNotifier<ChatState> {
   Future<void> _onStopGeneration() async {
     _generationId++;
     _audioPlayer.stop();
+    if (value.isGenerating) {
+      _sessionPhase = SessionPhase.interrupted;
+    }
     if (_ceraEngine != null) {
       try {
         await _ceraEngine?.cancel();
@@ -1061,51 +1102,16 @@ class ChatController extends ValueNotifier<ChatState> {
     await _onStopGeneration();
     try {
       await _ceraEngine?.reset();
-    } on UnsupportedError {
-      // The WebGPU backend owns its KV cache on the GPU with no in-place reset;
-      // reopen the engine with the current model to clear it cleanly.
-      final current = value.loadedModel;
-      if (current != null) {
-        final resetId = ++_loadSessionId;
-        value = value.copyWith(isLoading: true, status: 'Resetting session...');
-        try {
-          await _ceraEngine?.close();
-          _ceraEngine = null;
-          final reloaded = await current.open(
-            options: value.settings.ceraOptions,
-          );
-          if (_disposed || _loadSessionId != resetId) {
-            await reloaded.close();
-            return;
-          }
-          _ceraEngine = reloaded;
-          final visionTag = reloaded.capabilities.imageIn ? ' · Vision' : '';
-          final voiceTag = voiceTagFor(reloaded.capabilities);
-          value = value.copyWith(
-            isLoading: false,
-            capabilities: () => reloaded.capabilities,
-            backend: () => reloaded.backend,
-            status: '${current.name} · ${reloaded.backend}$visionTag$voiceTag',
-          );
-        } catch (err) {
-          if (_disposed || _loadSessionId != resetId) return;
-          value = value.copyWith(
-            isLoading: false,
-            loadedModel: () => null,
-            backend: () => null,
-            capabilities: () => null,
-            status: 'Failed to reload model: $err',
-          );
-        }
+      _sessionPhase = SessionPhase.idle;
+      if (!_disposed) {
+        value = value.copyWith(turns: []);
       }
     } catch (err) {
+      _sessionPhase = SessionPhase.unusable;
       debugPrint('[cera:chat] Engine reset failed: $err');
       if (!_disposed) {
-        value = value.copyWith(isLoading: false);
+        value = value.copyWith(status: 'Engine reset failed: $err');
       }
-    }
-    if (!_disposed) {
-      value = value.copyWith(turns: []);
     }
   }
 

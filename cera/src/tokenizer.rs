@@ -1144,7 +1144,7 @@ fn unescape_token(s: &str) -> Vec<u8> {
     s.into_bytes()
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 impl BpeTokenizer {
     pub fn empty_for_test() -> Self {
         Self {
@@ -1162,6 +1162,84 @@ impl BpeTokenizer {
             byte_to_unicode: build_byte_to_unicode(),
             unicode_to_byte: build_unicode_to_byte(),
         }
+    }
+
+    /// Creates a minimal test tokenizer satisfying chat profile discovery.
+    pub fn chat_for_test() -> Self {
+        let mut t = Self::empty_for_test();
+        t.bos_id = Some(1);
+        t.eos_id = Some(7);
+        t.special_tokens.insert("<|startoftext|>".to_string(), 1);
+        t.special_tokens.insert("<|image_start|>".to_string(), 2);
+        t.special_tokens.insert("<|image_end|>".to_string(), 3);
+        t.special_tokens.insert("<image>".to_string(), 4);
+        t.special_tokens.insert("<|reserved_4|>".to_string(), 5);
+        t.special_tokens.insert("<|im_start|>".to_string(), 6);
+        t.special_tokens.insert("<|im_end|>".to_string(), 7);
+        t.chat_template = Some(crate::session::chat::TEMPLATE.to_string());
+        t.vocab = vec![
+            vec![],                      // 0
+            b"<|startoftext|>".to_vec(), // 1
+            b"<|image_start|>".to_vec(), // 2
+            b"<|image_end|>".to_vec(),   // 3
+            b"<image>".to_vec(),         // 4
+            b"<|reserved_4|>".to_vec(),  // 5
+            b"<|im_start|>".to_vec(),    // 6
+            b"<|im_end|>".to_vec(),      // 7
+            vec![],                      // 8
+            vec![],                      // 9
+            b"hi ".to_vec(),             // 10
+        ];
+        t
+    }
+
+    /// Creates a minimal test tokenizer for Llama 3 chat profile discovery.
+    pub fn llama3_for_test() -> Self {
+        let mut t = Self::empty_for_test();
+        t.bos_id = Some(128000);
+        t.eos_id = Some(128009);
+        t.special_tokens
+            .insert("<|begin_of_text|>".to_string(), 128000);
+        t.special_tokens
+            .insert("<|start_header_id|>".to_string(), 128006);
+        t.special_tokens
+            .insert("<|end_header_id|>".to_string(), 128007);
+        t.special_tokens.insert("<|eot_id|>".to_string(), 128009);
+        t.chat_template = Some("{{ bos_token }}{% for message in messages %}{{'<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>'}}{% endfor %}{% if add_generation_prompt %}{{'<|start_header_id|>assistant<|end_header_id|>\n\n'}}{% endif %}".to_string());
+        t.vocab = vec![
+            vec![],
+            b"<|begin_of_text|>".to_vec(),
+            b"<|start_header_id|>".to_vec(),
+            b"<|end_header_id|>".to_vec(),
+            b"<|eot_id|>".to_vec(),
+        ];
+        t
+    }
+
+    /// Creates a minimal test tokenizer for Gemma chat profile discovery.
+    pub fn gemma_for_test() -> Self {
+        let mut t = Self::empty_for_test();
+        t.bos_id = Some(2);
+        t.eos_id = Some(1);
+        t.special_tokens.insert("<bos>".to_string(), 2);
+        t.special_tokens.insert("<start_of_turn>".to_string(), 106);
+        t.special_tokens.insert("<end_of_turn>".to_string(), 107);
+        t.chat_template = Some("{{ bos_token }}{% for message in messages %}{{'<start_of_turn>' + message['role'] + '\n' + message['content'] | trim + '<end_of_turn>\n'}}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}".to_string());
+        t.vocab = vec![
+            vec![],
+            b"<end_of_turn>".to_vec(),
+            b"<bos>".to_vec(),
+            b"<start_of_turn>".to_vec(),
+        ];
+        t
+    }
+
+    /// Creates a minimal test tokenizer with a custom chat template.
+    pub fn with_custom_template_for_test(template: &str, eos: Option<u32>) -> Self {
+        let mut t = Self::empty_for_test();
+        t.eos_id = eos;
+        t.chat_template = Some(template.to_string());
+        t
     }
 }
 

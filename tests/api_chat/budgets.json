@@ -1,0 +1,36 @@
+{
+  "version": "1.0.0",
+  "scope": "Phase 1 / Section 8.1 Warm Session Performance and Memory Regression Budgets",
+  "reference_architecture": "native-cpu-arm64 (Phase 1 reference gate; x86_64 and GPU targets pending Phase 2 measurement)",
+  "deterministic_work_invariants": {
+    "delta_only_prompt_evaluation": true,
+    "history_replay_on_normal_turn": false,
+    "normal_turn_resets": 0,
+    "full_cache_checkpoint_copies": 0,
+    "kv_cache_bit_exact_retention": true
+  },
+  "profiles": {
+    "lfm2-350m-gguf-simple-text-v1": {
+      "targets": {
+        "native-cpu-arm64": {
+          "max_turn_framing_overhead_ms": 1.5,
+          "max_warm_ttft_ratio_vs_raw": 1.05,
+          "min_decode_throughput_ratio_vs_raw": 0.98,
+          "max_wrapper_heap_overhead_bytes": 16384,
+          "max_per_turn_allocation_bytes": 8192
+        }
+      }
+    },
+    "lfm2.5-350m-gguf-text-v1": {
+      "targets": {
+        "native-cpu-arm64": {
+          "max_turn_framing_overhead_ms": 1.5,
+          "max_warm_ttft_ratio_vs_raw": 1.05,
+          "min_decode_throughput_ratio_vs_raw": 0.98,
+          "max_wrapper_heap_overhead_bytes": 16384,
+          "max_per_turn_allocation_bytes": 8192
+        }
+      }
+    }
+  }
+}

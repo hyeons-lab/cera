@@ -579,8 +579,7 @@ abstract interface class Cera {
 
   /// Clears the conversation, keeping the model loaded.
   ///
-  /// Throws [UnsupportedError] on the web's GPU backend, whose KV cache lives
-  /// on the GPU with no way to clear it; close and reopen the engine there.
+  /// Supported across all backends: native CPU/GPU and web CPU/WebGPU.
   ///
   /// Cancels any generation still running, waits for it and for anything
   /// queued behind it, and only then clears: dropping the conversation out from

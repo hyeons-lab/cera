@@ -93,6 +93,24 @@ use std::sync::Arc;
 
 uniffi::setup_scaffolding!();
 
+mod audio_pipeline;
+mod chat;
+mod loading;
+mod recovery;
+pub use audio_pipeline::{
+    FfiAudioPipeline, FfiAudioPipelineConfig, FfiAudioPipelineEvent, FfiAudioPipelineState,
+    audio_pipeline_default_config,
+};
+pub use chat::{
+    ChatSession, IngestSummary, Message, Role, SessionPhase, TurnResult, ValidationError,
+    chat_message_assistant, chat_message_system, chat_message_tool, chat_message_user,
+};
+pub use loading::{
+    GenerationDefaults, GenerativeModel, LoadError, ModelFiles, ModelHandle, ModelLoader,
+    ModelParts, ModelSource, SamplingDefaults,
+};
+pub use recovery::{IngestRecovery, KvRewindFailure, RecoveryOutcome, SessionRecoveryStatus};
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -120,7 +138,7 @@ uniffi::setup_scaffolding!();
 /// every shared variant, so `Display` output is identical whether the
 /// error originates from cera directly or routes through the FFI
 /// wrapper. Pinned by `ffi_error_display_matches_cera_error_for_every_shared_variant`.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     /// The loaded model doesn't support the modality the caller
     /// requested (e.g. `append_audio` on a text-only LLM).
@@ -261,42 +279,69 @@ pub enum FfiError {
     /// ordinal. New variants go at the end.
     #[error("LoRA adapter not supported by this backend: {detail}")]
     LoraUnsupportedByBackend { detail: String },
+
+    /// Chat contract validation failure.
+    #[error("chat validation: {error}")]
+    ChatValidation { error: ValidationError },
+}
+
+impl From<ValidationError> for FfiError {
+    fn from(error: ValidationError) -> Self {
+        Self::ChatValidation { error }
+    }
+}
+
+impl From<cera::session::chat::ValidationError> for FfiError {
+    fn from(error: cera::session::chat::ValidationError) -> Self {
+        Self::ChatValidation {
+            error: ValidationError::from(error),
+        }
+    }
 }
 
 impl From<cera::CeraError> for FfiError {
-    fn from(e: cera::CeraError) -> Self {
+    fn from(error: cera::CeraError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&cera::CeraError> for FfiError {
+    fn from(e: &cera::CeraError) -> Self {
         // Match exhaustively on the upstream enum so a future cera
         // variant-add breaks compilation here loudly rather than
         // silently routing through the `Backend` catch-all.
         match e {
             cera::CeraError::UnsupportedModality => FfiError::UnsupportedModality,
-            cera::CeraError::UnsupportedInferenceType(s) => {
-                FfiError::UnsupportedInferenceType { inference_type: s }
-            }
+            cera::CeraError::UnsupportedInferenceType(s) => FfiError::UnsupportedInferenceType {
+                inference_type: s.clone(),
+            },
             cera::CeraError::Busy => FfiError::Busy,
             cera::CeraError::Cancelled => FfiError::Cancelled,
-            cera::CeraError::ContextOverflow { max_seq_len, by } => {
-                FfiError::ContextOverflow { max_seq_len, by }
-            }
+            cera::CeraError::ContextOverflow { max_seq_len, by } => FfiError::ContextOverflow {
+                max_seq_len: *max_seq_len,
+                by: *by,
+            },
             cera::CeraError::EmptyInput => FfiError::EmptyInput,
-            cera::CeraError::InvalidToken { id, vocab_size } => {
-                FfiError::InvalidToken { id, vocab_size }
-            }
-            cera::CeraError::Backend(s) => FfiError::Backend { detail: s },
-            cera::CeraError::OutOfMemory { requested_bytes } => {
-                FfiError::OutOfMemory { requested_bytes }
-            }
+            cera::CeraError::InvalidToken { id, vocab_size } => FfiError::InvalidToken {
+                id: *id,
+                vocab_size: *vocab_size,
+            },
+            cera::CeraError::Backend(s) => FfiError::Backend { detail: s.clone() },
+            cera::CeraError::OutOfMemory { requested_bytes } => FfiError::OutOfMemory {
+                requested_bytes: *requested_bytes,
+            },
             cera::CeraError::KvCompressionConflict {
                 configured,
                 requested,
             } => FfiError::KvCompressionConflict {
-                configured,
-                requested,
+                configured: configured.clone(),
+                requested: requested.clone(),
             },
-            cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s },
+            cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s.clone() },
             cera::CeraError::LoraUnsupportedByBackend(s) => {
-                FfiError::LoraUnsupportedByBackend { detail: s }
+                FfiError::LoraUnsupportedByBackend { detail: s.clone() }
             }
+            cera::CeraError::Format(s) => FfiError::Backend { detail: s.clone() },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
             },
@@ -634,7 +679,18 @@ impl From<cera::tools::ToolCall> for ToolCall {
     }
 }
 
-fn to_core_tools(tools: Vec<ToolDef>) -> Result<Vec<cera::tools::ToolDef>, FfiError> {
+impl From<cera::tools::ToolDef> for ToolDef {
+    fn from(t: cera::tools::ToolDef) -> Self {
+        ToolDef {
+            name: t.name,
+            description: t.description,
+            parameters_json: serde_json::to_string(&t.parameters)
+                .unwrap_or_else(|_| "{}".to_string()),
+        }
+    }
+}
+
+pub(crate) fn to_core_tools(tools: Vec<ToolDef>) -> Result<Vec<cera::tools::ToolDef>, FfiError> {
     tools.into_iter().map(TryInto::try_into).collect()
 }
 
@@ -914,7 +970,7 @@ impl cera::bundle::DownloadProgress for DownloadProgressAdapter {
 /// the underlying engine is already used internally.
 #[derive(uniffi::Object)]
 pub struct CeraEngine {
-    inner: cera::CeraEngine,
+    inner: Arc<cera::CeraEngine>,
 }
 
 #[uniffi::export]
@@ -931,7 +987,9 @@ impl CeraEngine {
     #[uniffi::constructor]
     pub fn from_path(path: String, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_path(&path, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a model from GGUF bytes already in memory.
@@ -965,7 +1023,9 @@ impl CeraEngine {
     #[uniffi::constructor]
     pub fn from_bytes(bytes: Vec<u8>, config: EngineConfig) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_bytes(bytes, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a multi-file bundle from memory: the model GGUF plus its
@@ -1024,7 +1084,9 @@ impl CeraEngine {
             generation_defaults: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Load a model by LeapBundles ID + quantization selector, e.g.
@@ -1050,7 +1112,9 @@ impl CeraEngine {
         config: EngineConfig,
     ) -> Result<Arc<Self>, FfiError> {
         let inner = cera::CeraEngine::from_bundle_id(&bundle_id, &quant, config.try_into()?)?;
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Short summary of the loaded model (architecture, vocab size,
@@ -1562,7 +1626,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
 }
 
 /// Why a decode loop exited. Mirrors [`cera::FinishReason`].
-#[derive(Debug, Clone, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FinishReason {
     MaxTokens,
     Stop,
@@ -1806,17 +1870,20 @@ impl StreamingThinkingParser {
 /// [`cera::ModalitySink`]. Decodes tokens to valid UTF-8 text chunks
 /// incrementally using the session's tokenizer, and forwards audio frames
 /// and terminal completion events.
-struct ForeignSinkAdapter {
+pub(crate) struct ForeignSinkAdapter {
     inner: Arc<dyn ModalitySink>,
     tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
     pending_bytes: Vec<u8>,
     parser: StreamingThinkingParser,
-    done_called: bool,
+    pub(crate) done_called: bool,
     done_reason: Option<FinishReason>,
 }
 
 impl ForeignSinkAdapter {
-    fn new(inner: Arc<dyn ModalitySink>, tokenizer: Arc<cera::tokenizer::BpeTokenizer>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn ModalitySink>,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+    ) -> Self {
         Self {
             inner,
             tokenizer,
@@ -1837,7 +1904,7 @@ impl ForeignSinkAdapter {
         }
     }
 
-    fn flush_pending(&mut self) {
+    pub(crate) fn flush_pending(&mut self) {
         if !self.pending_bytes.is_empty() {
             let piece = String::from_utf8_lossy(&self.pending_bytes);
             if !piece.is_empty() {
@@ -1852,7 +1919,7 @@ impl ForeignSinkAdapter {
         }
     }
 
-    fn notify_done(&mut self, fallback: Option<FinishReason>) {
+    pub(crate) fn notify_done(&mut self, fallback: Option<FinishReason>) {
         if let Some(reason) = self.done_reason.take() {
             self.inner.on_done(reason);
         } else if let Some(fallback_reason) = fallback {
@@ -1968,11 +2035,11 @@ impl LoraAdapters {
 /// Call [`CeraEngine::new_session`] to open a session; the engine's
 /// `Arc<Model>` and `Arc<BpeTokenizer>` are cloned into the new
 /// session so it outlives the engine handle across FFI calls.
-#[derive(uniffi::Object)]
+#[derive(Debug, uniffi::Object)]
 pub struct Session {
-    inner: std::sync::Mutex<cera::Session>,
+    inner: std::sync::Mutex<Option<cera::Session>>,
     /// Cloned from the inner session at construction time. Shared
-    /// atomic — `position()` / `cancel()` don't need to acquire the
+    /// atomic: `position()` / `cancel()` don't need to acquire the
     /// mutex, so they're safe to call from a different thread while
     /// `generate()` is running.
     position: Arc<std::sync::atomic::AtomicU32>,
@@ -1980,31 +2047,76 @@ pub struct Session {
     /// Stored at construction so `capabilities()` doesn't need a lock.
     capabilities: ModalityCapabilities,
     /// Model hidden dimension, cached at construction so `hidden_size()` is a
-    /// lock-free read — safe to call from a `generate_streaming` sink callback
+    /// lock-free read: safe to call from a `generate_streaming` sink callback
     /// (which runs while `generate` holds the mutex), same as `position()`.
     hidden_size: u32,
+}
+
+pub(crate) struct SessionGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<cera::Session>>,
+}
+
+impl<'a> std::ops::Deref for SessionGuard<'a> {
+    type Target = cera::Session;
+    fn deref(&self) -> &Self::Target {
+        // Invariant: SessionGuard is constructible only via lock_inner, which
+        // verifies guard.is_some() before returning this guard.
+        match self.guard.as_ref() {
+            Some(session) => session,
+            None => unreachable!("session guard invariant violated: inner session is None"),
+        }
+    }
+}
+
+impl<'a> std::ops::DerefMut for SessionGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Invariant: SessionGuard is constructible only via lock_inner, which
+        // verifies guard.is_some() before returning this guard.
+        match self.guard.as_mut() {
+            Some(session) => session,
+            None => unreachable!("session guard invariant violated: inner session is None"),
+        }
+    }
 }
 
 impl Session {
     /// Lock the inner session, converting `PoisonError` into
     /// `FfiError::Backend` instead of panicking. `expect` on a
     /// poisoned mutex would propagate as a panic across the FFI
-    /// boundary — Kotlin / Swift / Python callers see that as an
+    /// boundary: Kotlin / Swift / Python callers see that as an
     /// uncatchable abort of the host process, which is unusable in
     /// production. Returning an error lets callers decide whether to
     /// retry, reset, or surface the failure.
-    ///
-    /// A poisoned mutex here means a prior session method panicked
-    /// while holding the lock — the session's internal state (KV
-    /// cache, sampler, position counters) is therefore in an unknown
-    /// state. The error message gives the caller enough context to
-    /// decide whether to reset or drop the session entirely.
-    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, cera::Session>, FfiError> {
-        self.inner.lock().map_err(|e| FfiError::Backend {
+    pub(crate) fn lock_inner(&self) -> Result<SessionGuard<'_>, FfiError> {
+        let guard = self.inner.lock().map_err(|e| FfiError::Backend {
             detail: format!(
                 "session mutex poisoned (a prior call panicked mid-lock; session state is \
                  inconsistent): {e}"
             ),
+        })?;
+        if guard.is_none() {
+            return Err(FfiError::Backend {
+                detail: "session has been moved into a ChatSession".into(),
+            });
+        }
+        Ok(SessionGuard { guard })
+    }
+
+    pub(crate) fn inner_mutex(&self) -> &std::sync::Mutex<Option<cera::Session>> {
+        &self.inner
+    }
+
+    pub(crate) fn from_core(session: cera::Session) -> Arc<Self> {
+        let position = session.position_handle();
+        let cancel = session.cancel_handle();
+        let capabilities = session.capabilities().into();
+        let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(Some(session)),
+            position,
+            cancel,
+            capabilities,
+            hidden_size,
         })
     }
 }
@@ -2042,6 +2154,15 @@ impl cera::ModalitySink for TokenCollectSink {
 
 #[uniffi::export]
 impl Session {
+    /// Wrap this session in a stateful chat coordinator.
+    ///
+    /// On success, ownership of the inner inference state is transferred to the returned
+    /// [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
+    /// If validation fails, the session remains intact and usable.
+    pub fn into_chat(&self) -> Result<Arc<ChatSession>, FfiError> {
+        ChatSession::from_session(self)
+    }
+
     /// Append raw text to the context, running a prefill over just
     /// the new tokens. `EmptyInput` error if `text` is empty.
     pub fn append_text(&self, text: String) -> Result<(), FfiError> {
@@ -2372,6 +2493,10 @@ impl Session {
 
     /// Append a multimodal message, automatically enforcing model-canonical
     /// media ordering, boundary token envelopes, and sample rate normalization.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message(&self, message: UserMessage) -> Result<(), FfiError> {
         let mut guard = self.lock_inner()?;
         let core_msg: cera::tokenizer::UserMessage = message.into();
@@ -2380,6 +2505,10 @@ impl Session {
 
     /// Append a multimodal message and run generation synchronously while holding
     /// the session lock continuously across prefill and decode.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message_and_generate(
         &self,
         message: UserMessage,
@@ -2402,6 +2531,10 @@ impl Session {
 
     /// Append a multimodal message and run streaming generation while holding
     /// the session lock continuously across prefill and decode.
+    ///
+    /// Note: Prefer [`Session::into_chat`] and [`ChatSession`] for transactional
+    /// multi-turn conversations with delta-only prompt evaluation and live KV retention.
+    #[allow(deprecated)]
     pub fn send_message_streaming(
         &self,
         message: UserMessage,
@@ -2519,6 +2652,31 @@ impl Session {
         Ok(())
     }
 
+    /// Save current inference session checkpoint to a file.
+    pub fn save_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.lock_inner()?.save_checkpoint(path)?;
+        Ok(())
+    }
+
+    /// Load and restore an inference session checkpoint from a file.
+    pub fn load_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.lock_inner()?.load_checkpoint(path)?;
+        Ok(())
+    }
+
+    /// Export current inference session checkpoint as serialized binary bytes.
+    pub fn export_checkpoint(&self) -> Result<Vec<u8>, FfiError> {
+        let cp = self.lock_inner()?.checkpoint()?;
+        Ok(cp.to_bytes())
+    }
+
+    /// Import and restore an inference session checkpoint from serialized binary bytes.
+    pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError> {
+        let cp = cera::session::SessionCheckpoint::from_bytes(&data)?;
+        self.lock_inner()?.restore(&cp)?;
+        Ok(())
+    }
+
     /// Capabilities reported by the loaded model. Cheap — reads a
     /// cached copy, no lock.
     pub fn capabilities(&self) -> ModalityCapabilities {
@@ -2618,8 +2776,9 @@ impl Drop for AsyncCancelGuard {
 /// Lighter-weight sibling of [`AsyncCancelGuard`] for `spawn_blocking`
 /// tasks that don't share mutable state with anything the caller can
 /// signal. Reached through `spawn_blocking_guarded`, so it covers the
-/// three async [`CeraEngine`] constructors (via `spawn_engine_build`)
-/// and `list_leap_bundles_async`: engine construction holds no cross-thread
+/// four async [`CeraEngine`] constructors (via `spawn_engine_build`)
+/// and `list_leap_bundles_async`: engine
+/// construction holds no cross-thread
 /// cancel flag, and neither the tokenizer build nor (for
 /// `from_bundle_id`) the `reqwest::blocking` download can be
 /// cooperatively cancelled, so there's nothing like `Session::cancel`
@@ -2744,7 +2903,8 @@ impl Session {
 /// The one place the `spawn_blocking` + guard + join-error-mapping sequence
 /// lives, for the exports whose blocking work has no cooperative cancel point:
 /// the async engine constructors (via [`spawn_engine_build`]) and
-/// [`list_leap_bundles_async`]. They differ only in `what`, the name in the
+/// [`list_leap_bundles_async`]. They differ
+/// only in `what`, the name in the
 /// join-error message, and in what they do with the value.
 ///
 /// Not for [`Session::generate_async`] or `generate_streaming_async`. Those
@@ -2774,9 +2934,9 @@ where
 
 /// Runs a blocking engine construction on tokio and wraps the result.
 ///
-/// The three async constructors differ only in the call they make and the name
+/// The four async constructors differ only in the call they make and the name
 /// in their join-error message, so this adds the one thing they share on top of
-/// [`spawn_blocking_guarded`]: the `Arc` wrap. Three copies of it is how
+/// [`spawn_blocking_guarded`]: the `Arc` wrap. Separate copies of it are how
 /// families of near-identical methods start to diverge, so there is one.
 ///
 /// Cancellation is the weak form the constructors document: dropping the
@@ -2788,7 +2948,11 @@ where
 {
     spawn_blocking_guarded(what, move || build().map_err(FfiError::from))
         .await
-        .map(|inner| Arc::new(CeraEngine { inner }))
+        .map(|inner| {
+            Arc::new(CeraEngine {
+                inner: Arc::new(inner),
+            })
+        })
 }
 
 // Async CeraEngine constructors (PR 11).
@@ -2925,23 +3089,19 @@ impl CeraEngine {
 // Session-level method on CeraEngine.
 #[uniffi::export]
 impl CeraEngine {
-    /// Open a new [`Session`] sharing this engine's model + tokenizer
+    /// Open a new [`Session`] sharing this engine's model and tokenizer
     /// by `Arc` clone. The returned session outlives `&self`; the
     /// engine keeps the shared state live for every session it hands
-    /// out. Cheap — no model load, just config + state allocation.
+    /// out. Cheap: no model load, just config and state allocation.
     pub fn new_session(&self, config: SessionConfig) -> Result<Arc<Session>, FfiError> {
         let session = self.inner.new_session(config.into())?;
-        let position = session.position_handle();
-        let cancel = session.cancel_handle();
-        let capabilities = session.capabilities().into();
-        let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
-        Ok(Arc::new(Session {
-            inner: std::sync::Mutex::new(session),
-            position,
-            cancel,
-            capabilities,
-            hidden_size,
-        }))
+        Ok(Session::from_core(session))
+    }
+
+    /// Open a new [`ChatSession`] sharing this engine's model and tokenizer.
+    pub fn new_chat_session(&self, config: SessionConfig) -> Result<Arc<ChatSession>, FfiError> {
+        let session = self.inner.new_session(config.into())?;
+        ChatSession::from_core_session(session)
     }
 }
 
@@ -3345,11 +3505,12 @@ impl From<cera::hotword::HotwordScore> for FfiHotwordScore {
 pub struct FfiHotwordEvent {
     /// The matched keyword string.
     pub keyword: String,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     pub sample_offset: u64,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     pub command_start_sample: u64,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     pub timestamp_ms: f32,
     /// Model confidence probability (0.0 to 1.0).
     pub confidence: f32,
@@ -3549,7 +3710,8 @@ impl From<cera::WhisperTranscribeOpts> for FfiWhisperTranscribeOpts {
             language: opts.language,
             translate: opts.translate,
             timestamps: opts.timestamps,
-            max_tokens: Some(opts.max_tokens as u32),
+            // GGUF text context is u32-sized; saturating preserves the effective cap.
+            max_tokens: Some(u32::try_from(opts.max_tokens).unwrap_or(u32::MAX)),
             temperature: Some(opts.temperature),
         }
     }
@@ -3592,6 +3754,7 @@ impl FfiWhisperModel {
     }
 
     /// Transcribe 16 kHz mono PCM audio samples synchronously.
+    /// Runs the full decoder on the calling thread; use `transcribe_async` from UI code.
     pub fn transcribe(
         &self,
         pcm: Vec<f32>,
@@ -3628,6 +3791,8 @@ impl FfiWhisperModel {
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiWhisperModel {
     /// Transcribe 16 kHz mono PCM audio samples asynchronously on a background blocking worker.
+    /// Dropping the returned future aborts queued work and signals an already-running decoder
+    /// to stop at its next cooperative cancellation check.
     pub async fn transcribe_async(
         self: Arc<Self>,
         pcm: Vec<f32>,

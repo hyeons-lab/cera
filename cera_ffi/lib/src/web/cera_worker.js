@@ -31,7 +31,7 @@
 
 'use strict';
 
-console.info('[cera:worker:version] v0.5.6 (build: 2026-09-10-rev26-kws-whisper)');
+console.info('[cera:worker:version] v0.6.0 (build: 2026-09-17-rev27-api-reshape)');
 
 const LOCAL_MODELS_DIR = '/models-local';
 
@@ -1058,12 +1058,17 @@ const OPS = {
   /**
    * Drop the conversation, keeping the loaded weights.
    *
-   * `WebGpuSession` has no reset, so the GPU path reports the limitation rather
-   * than silently continuing a conversation the caller believes it cleared.
+   * Both CPU and WebGPU sessions support in-place reset.
    */
   reset() {
     pendingAudioSuffixTokens = null;
     pendingImage = null;
+    isCancelled = false;
+    if (cancelArray) {
+      try {
+        Atomics.store(cancelArray, 0, 0);
+      } catch (_) {}
+    }
     if (cpu) {
       // `Session.reset`, not a fresh session. It clears KV, position and token
       // history and lowers the cancel flag, which is all rebuilding did, while
@@ -1072,11 +1077,14 @@ const OPS = {
       cpu.session.reset();
       return null;
     }
-    throw unsupported(
-      'reset is not supported on the WebGPU backend: WebGpuSession owns its ' +
-        'KV cache on the GPU and exposes no way to clear it. Close the engine ' +
-        'and open it again to start a new conversation.',
-    );
+    if (gpu) {
+      if (typeof gpu.session.reset === 'function') {
+        gpu.session.reset();
+        return null;
+      }
+      throw unsupported('WebGPU session does not support in-place reset in this build');
+    }
+    throw unsupported('No session open to reset');
   },
 
   /**

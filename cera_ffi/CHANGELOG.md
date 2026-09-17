@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- **Conversational Chat Coordinator (`ChatSession`)**: Transactional multi-turn conversational coordinator with prompt template discovery, reactive streaming, first-class tool calling, JSON schema compilation, and multimodal turns.
+- **Unified Streaming Audio Pipeline (`FfiAudioPipeline`)**: Low-latency voice facade coordinating Silero VAD v5, Hotword keyword spotting, and Whisper speech-to-text with wait-free cancellation.
+- **Session Checkpointing & Persistence**: Binary snapshot export and restore with structural integrity validation and WebGPU direct VRAM persistence.
+
+### Changed
+
+- **Version Alignment**: Bumped workspace version to 0.6.0 in lockstep with `cera_ffi_flutter` and the underlying native engine crates.
+
 ## 0.5.6
 
 ### Added

@@ -100,11 +100,12 @@ pub struct HotwordScore {
 pub struct HotwordEvent {
     /// The matched keyword string.
     pub keyword: String,
-    /// Exact audio stream sample index where the keyword completed.
+    /// Exclusive end sample of the window evaluated when detection triggered.
+    /// This is a detection-hop boundary; it does not locate the spoken word's end.
     pub sample_offset: u64,
-    /// Audio stream sample index including pre-roll safety margin for downstream ASR.
+    /// `sample_offset` minus the configured pre-roll samples, saturating at zero.
     pub command_start_sample: u64,
-    /// Timestamp in milliseconds from stream origin where keyword completed.
+    /// `sample_offset` converted to milliseconds using the model sample rate.
     pub timestamp_ms: f32,
     /// Model confidence probability (0.0 to 1.0).
     pub confidence: f32,
@@ -919,6 +920,15 @@ impl HotwordIterator {
         self.latest_score = 0.0;
         self.recent_peak_score = 0.0;
         self.last_log_sample = 0;
+    }
+
+    /// Read the most recent `n` samples from the circular ring buffer.
+    ///
+    /// If fewer than `n` samples have been ingested, the missing prefix is zero-padded.
+    pub fn read_last_samples(&self, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        self.ring_buffer.read_last(n, &mut out);
+        out
     }
 
     /// Process a streaming chunk of audio samples and return a detection event if triggered.
