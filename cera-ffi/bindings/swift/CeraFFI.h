@@ -969,9 +969,19 @@ void uniffi_cera_ffi_fn_method_chatsession_clear_cancel(uint64_t ptr, RustCallSt
 RustBuffer uniffi_cera_ffi_fn_method_chatsession_complete(uint64_t ptr, RustBuffer opts, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_COMPLETE_ASYNC
+uint64_t uniffi_cera_ffi_fn_method_chatsession_complete_async(uint64_t ptr, RustBuffer opts
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING
 RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming(uint64_t ptr, RustBuffer opts, uint64_t sink, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
+uint64_t uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(uint64_t ptr, RustBuffer opts, uint64_t sink
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST
@@ -1998,9 +2008,21 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_COMPLETE_ASYNC
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_complete_async(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_GENERATE_STREAMING_ASYNC
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(void
     
 );
 #endif

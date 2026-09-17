@@ -1781,7 +1781,8 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     /**
      * Flip cancellation flag to interrupt in-flight prefill or decode.
      *
-     * Wait-free and safe from any thread.
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
      */
     func cancel() 
     
@@ -1796,9 +1797,19 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func complete(opts: GenerateOpts) throws  -> TurnResult
     
     /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    func completeAsync(opts: GenerateOpts) async throws  -> TurnResult
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
     func generateStreaming(opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink) async throws  -> GenerateSummary
     
     /**
      * Ingest a single message into the chat context.
@@ -1821,6 +1832,8 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     
     /**
      * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
      */
     func phase() throws  -> SessionPhase
     
@@ -1921,7 +1934,8 @@ public static func fromSession(session: Session)throws  -> ChatSession  {
     /**
      * Flip cancellation flag to interrupt in-flight prefill or decode.
      *
-     * Wait-free and safe from any thread.
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
      */
 open func cancel()  {try! rustCall() {
     uniffi_cera_ffi_fn_method_chatsession_cancel(
@@ -1953,6 +1967,26 @@ open func complete(opts: GenerateOpts)throws  -> TurnResult  {
 }
     
     /**
+     * Async variant of [`ChatSession::complete`].
+     */
+open func completeAsync(opts: GenerateOpts)async throws  -> TurnResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_complete_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTurnResult_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
 open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
@@ -1963,6 +1997,26 @@ open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> Ge
         FfiConverterTypeModalitySink_lower(sink),$0
     )
 })
+}
+    
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async throws  -> GenerateSummary  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGenerateSummary_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
 }
     
     /**
@@ -2006,6 +2060,8 @@ open func intoSession()throws  -> Session  {
     
     /**
      * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
      */
 open func phase()throws  -> SessionPhase  {
     return try  FfiConverterTypeSessionPhase_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -11252,7 +11308,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
@@ -11261,7 +11317,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
@@ -11273,7 +11335,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {

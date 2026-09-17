@@ -1040,7 +1040,11 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_complete(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_complete_async(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
 
@@ -1880,12 +1884,23 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_complete_async(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+    ): Long
+
     external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
         `ptr`: Long,
         `opts`: RustBuffer.ByValue,
         `sink`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+        `ptr`: Long,
+        `opts`: RustBuffer.ByValue,
+        `sink`: Long,
+    ): Long
 
     external fun uniffi_cera_ffi_fn_method_chatsession_ingest(
         `ptr`: Long,
@@ -2544,7 +2559,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746) {
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
@@ -2553,7 +2568,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
@@ -2565,7 +2586,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361) {
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
@@ -4830,7 +4851,8 @@ public interface ChatSessionInterface {
     /**
      * Flip cancellation flag to interrupt in-flight prefill or decode.
      *
-     * Wait-free and safe from any thread.
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
      */
     fun `cancel`()
 
@@ -4845,9 +4867,22 @@ public interface ChatSessionInterface {
     fun `complete`(`opts`: GenerateOpts): TurnResult
 
     /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    suspend fun `completeAsync`(`opts`: GenerateOpts): TurnResult
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     fun `generateStreaming`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    suspend fun `generateStreamingAsync`(
         `opts`: GenerateOpts,
         `sink`: ModalitySink,
     ): GenerateSummary
@@ -4873,6 +4908,8 @@ public interface ChatSessionInterface {
 
     /**
      * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
      */
     fun `phase`(): SessionPhase
 
@@ -5008,7 +5045,8 @@ open class ChatSession :
     /**
      * Flip cancellation flag to interrupt in-flight prefill or decode.
      *
-     * Wait-free and safe from any thread.
+     * Wait-free and safe from any thread. If the session has already been reclaimed
+     * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
      */
     override fun `cancel`() =
         callWithHandle {
@@ -5052,6 +5090,28 @@ open class ChatSession :
         )
 
     /**
+     * Async variant of [`ChatSession::complete`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `completeAsync`(`opts`: GenerateOpts): TurnResult =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeTurnResult.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
+        )
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     @Throws(FfiException::class)
@@ -5070,6 +5130,32 @@ open class ChatSession :
                     )
                 }
             },
+        )
+
+    /**
+     * Async variant of [`ChatSession::generate_streaming`].
+     */
+    @Throws(FfiException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `generateStreamingAsync`(
+        `opts`: GenerateOpts,
+        `sink`: ModalitySink,
+    ): GenerateSummary =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
+                    uniffiHandle,
+                    FfiConverterTypeGenerateOpts.lower(`opts`),
+                    FfiConverterTypeModalitySink.lower(`sink`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer(future, continuation) },
+            { future -> UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer(future) },
+            // lift function
+            { FfiConverterTypeGenerateSummary.lift(it) },
+            // Error FFI converter
+            FfiException.ErrorHandler,
         )
 
     /**
@@ -5128,6 +5214,8 @@ open class ChatSession :
 
     /**
      * Current session lifecycle phase.
+     *
+     * Non-blocking observation; returns `FfiError::Busy` if another operation is active.
      */
     @Throws(FfiException::class)
     override fun `phase`(): SessionPhase =

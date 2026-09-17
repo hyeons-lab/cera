@@ -52,6 +52,7 @@
 library;
 
 export 'src/async/cera.dart';
+export 'src/chat_streaming.dart';
 export 'src/library_loader.dart';
 
 // The stub is the DEFAULT and the real bindings are the conditional branch,

@@ -8694,8 +8694,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel != 45746) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_cancel`: expected 45746, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel != 14090) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_cancel`: expected 14090, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel;
     try {
@@ -8717,6 +8717,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete != 7176) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete`: expected 7176, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_chatsession_complete_async');
+      _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_complete_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async != 39595) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_async`: expected 39595, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_chatsession_generate_streaming');
@@ -8726,6 +8736,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming != 33536) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming`: expected 33536, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async');
+      _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async != 53642) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async`: expected 53642, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest;
     try {
@@ -8764,8 +8784,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_phase`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase != 34361) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_phase`: expected 34361, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase != 3748) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_phase`: expected 3748, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_position;
     try {
@@ -21037,6 +21057,171 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _chatSessionCompleteAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_chatsession_complete_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _chatSessionCompleteAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_rust_buffer');
+  late final void Function(int handle) _chatSessionCompleteAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_rust_buffer');
+  late final _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _chatSessionCompleteAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<_UniFfiRustBuffer Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_rust_buffer');
+  late final void Function(int handle) _chatSessionCompleteAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_rust_buffer');
+
+  Future<TurnResult> chatSessionInvokeCompleteAsync(int handle, GenerateOpts opts) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _chatSessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List optsBytes = _uniffiEncodeGenerateOpts(opts);
+      final ffi.Pointer<ffi.Uint8> optsPtr = optsBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(optsBytes.length);
+      if (optsBytes.isNotEmpty) { optsPtr.asTypedList(optsBytes.length).setAll(0, optsBytes); }
+      foreignArgPtrs.add(optsPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> optsFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      optsFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      optsFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> optsForeignPtr = calloc<_UniFfiForeignBytes>();
+      optsForeignPtr.ref
+        ..len = optsBytes.length
+        ..data = optsPtr;
+      final _UniFfiRustBuffer optsRustBuffer = _uniFfiRustBufferFromBytes(optsForeignPtr.ref, optsFromBytesStatusPtr);
+      calloc.free(optsForeignPtr);
+      final int optsFromBytesCode = optsFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer optsFromBytesErrBuf = optsFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(optsFromBytesStatusPtr);
+      if (optsFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> optsFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        optsFromBytesErrBufPtr.ref
+          ..capacity = optsFromBytesErrBuf.capacity
+          ..len = optsFromBytesErrBuf.len
+          ..data = optsFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(optsFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $optsFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = optsRustBuffer.len;
+      (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
+      _chatSessionCompleteAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _chatSessionCompleteAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _chatSessionCompleteAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for complete_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final _UniFfiRustBuffer resultValue = _chatSessionCompleteAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();
+            resultBufPtr.ref
+              ..capacity = resultValue.capacity
+              ..len = resultValue.len
+              ..data = resultValue.data;
+            rustRetBufferPtrs.add(resultBufPtr);
+            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));
+            return _uniffiDecodeTurnResult(resultBytes);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for complete_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for complete_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _chatSessionCompleteAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _chatSessionCompleteAsyncFfiBufferRustFutureFree(futureHandle);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _chatSessionGenerateStreamingFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_chatsession_generate_streaming');
 
   GenerateSummary chatSessionInvokeGenerateStreaming(int handle, GenerateOpts opts, ModalitySink sink) {
@@ -21119,6 +21304,172 @@ class CeraFfiFfi {
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
       final decodedValue = _uniffiDecodeGenerateSummary(retBytes);
       return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _chatSessionGenerateStreamingAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_chatsession_generate_streaming_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _chatSessionGenerateStreamingAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_rust_buffer');
+  late final void Function(int handle) _chatSessionGenerateStreamingAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_rust_buffer');
+  late final _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _chatSessionGenerateStreamingAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<_UniFfiRustBuffer Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_rust_buffer');
+  late final void Function(int handle) _chatSessionGenerateStreamingAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_rust_buffer');
+
+  Future<GenerateSummary> chatSessionInvokeGenerateStreamingAsync(int handle, GenerateOpts opts, ModalitySink sink) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _chatSessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List optsBytes = _uniffiEncodeGenerateOpts(opts);
+      final ffi.Pointer<ffi.Uint8> optsPtr = optsBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(optsBytes.length);
+      if (optsBytes.isNotEmpty) { optsPtr.asTypedList(optsBytes.length).setAll(0, optsBytes); }
+      foreignArgPtrs.add(optsPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> optsFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      optsFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      optsFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> optsForeignPtr = calloc<_UniFfiForeignBytes>();
+      optsForeignPtr.ref
+        ..len = optsBytes.length
+        ..data = optsPtr;
+      final _UniFfiRustBuffer optsRustBuffer = _uniFfiRustBufferFromBytes(optsForeignPtr.ref, optsFromBytesStatusPtr);
+      calloc.free(optsForeignPtr);
+      final int optsFromBytesCode = optsFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer optsFromBytesErrBuf = optsFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(optsFromBytesStatusPtr);
+      if (optsFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> optsFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        optsFromBytesErrBufPtr.ref
+          ..capacity = optsFromBytesErrBuf.capacity
+          ..len = optsFromBytesErrBuf.len
+          ..data = optsFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(optsFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $optsFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = optsRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = optsRustBuffer.len;
+      (argBuf + 3).ref.ptr = optsRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 4).ref.u64 = ModalitySinkFfiCodec.lower(sink);
+      _chatSessionGenerateStreamingAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _chatSessionGenerateStreamingAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _chatSessionGenerateStreamingAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for generate_streaming_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final _UniFfiRustBuffer resultValue = _chatSessionGenerateStreamingAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();
+            resultBufPtr.ref
+              ..capacity = resultValue.capacity
+              ..len = resultValue.len
+              ..data = resultValue.data;
+            rustRetBufferPtrs.add(resultBufPtr);
+            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));
+            return _uniffiDecodeGenerateSummary(resultBytes);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for generate_streaming_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for generate_streaming_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _chatSessionGenerateStreamingAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _chatSessionGenerateStreamingAsyncFfiBufferRustFutureFree(futureHandle);
+      }
     } finally {
       for (final ptr in foreignArgPtrs) {
         if (ptr != ffi.nullptr) {
@@ -24516,7 +24867,8 @@ final class ChatSession {
 
   /// Flip cancellation flag to interrupt in-flight prefill or decode.
   ///
-  /// Wait-free and safe from any thread.
+  /// Wait-free and safe from any thread. If the session has already been reclaimed
+  /// via `into_session()`, this call is a no-op to prevent cross-session cancellation.
   void cancel() {
     _ensureOpen();
     _ffi.chatSessionInvokeCancel(_handle);
@@ -24534,10 +24886,22 @@ final class ChatSession {
     return _ffi.chatSessionInvokeComplete(_handle, opts);
   }
 
+  /// Async variant of [`ChatSession::complete`].
+  Future<TurnResult> completeAsync(GenerateOpts opts) {
+    _ensureOpen();
+    return _ffi.chatSessionInvokeCompleteAsync(_handle, opts);
+  }
+
   /// Stream generation output tokens into the specified sink.
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) {
     _ensureOpen();
     return _ffi.chatSessionInvokeGenerateStreaming(_handle, opts, sink);
+  }
+
+  /// Async variant of [`ChatSession::generate_streaming`].
+  Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) {
+    _ensureOpen();
+    return _ffi.chatSessionInvokeGenerateStreamingAsync(_handle, opts, sink);
   }
 
   /// Ingest a single message into the chat context.
@@ -24563,6 +24927,8 @@ final class ChatSession {
   }
 
   /// Current session lifecycle phase.
+  ///
+  /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
   SessionPhase phase() {
     _ensureOpen();
     return _ffi.chatSessionInvokePhase(_handle);

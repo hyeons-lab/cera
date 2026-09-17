@@ -1295,3 +1295,22 @@ fn chat_cancel_handle_mid_turn_cancels_and_recovers() {
     assert_eq!(turn2.text, "a");
     assert_eq!(chat.phase(), SessionPhase::TurnComplete);
 }
+
+#[test]
+fn chat_stream_text_emits_fragments_and_returns_complete_turn() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    chat.ingest(&user("stream me")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let mut emitted = Vec::new();
+    let turn = chat
+        .stream_text(&opts(0.0), |delta| {
+            emitted.push(delta.to_string());
+        })
+        .unwrap();
+
+    assert_eq!(turn.text, "a");
+    assert_eq!(turn.summary.finish_reason, FinishReason::Stop);
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+    assert_eq!(emitted.concat(), "a");
+}

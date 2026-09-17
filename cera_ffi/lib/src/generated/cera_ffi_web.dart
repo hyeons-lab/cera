@@ -6349,7 +6349,8 @@ final class ChatSession {
 
   /// Flip cancellation flag to interrupt in-flight prefill or decode.
   ///
-  /// Wait-free and safe from any thread.
+  /// Wait-free and safe from any thread. If the session has already been reclaimed
+  /// via `into_session()`, this call is a no-op to prevent cross-session cancellation.
   void cancel() => _unsupportedOnWeb('ChatSession.cancel');
 
   /// Clear pending cancellation.
@@ -6358,8 +6359,14 @@ final class ChatSession {
   /// Complete generation synchronously and return the assistant response.
   TurnResult complete(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.complete');
 
+  /// Async variant of [`ChatSession::complete`].
+  Future<TurnResult> completeAsync(GenerateOpts opts) => _unsupportedOnWeb('ChatSession.completeAsync');
+
   /// Stream generation output tokens into the specified sink.
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
+
+  /// Async variant of [`ChatSession::generate_streaming`].
+  Future<GenerateSummary> generateStreamingAsync(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingAsync');
 
   /// Ingest a single message into the chat context.
   ///
@@ -6375,6 +6382,8 @@ final class ChatSession {
   Session intoSession() => _unsupportedOnWeb('ChatSession.intoSession');
 
   /// Current session lifecycle phase.
+  ///
+  /// Non-blocking observation; returns `FfiError::Busy` if another operation is active.
   SessionPhase phase() => _unsupportedOnWeb('ChatSession.phase');
 
   /// Current token position in the execution context.

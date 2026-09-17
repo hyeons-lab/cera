@@ -513,3 +513,53 @@ fn chat_session_cancel_after_into_session_does_not_cancel_reclaimed_session() {
     // Reclaimed session's cancellation atomic must remain false
     assert!(!reclaimed.cancel.load(std::sync::atomic::Ordering::Relaxed));
 }
+
+#[tokio::test]
+async fn chat_session_complete_async_produces_turn_result() {
+    let session = test_session_with_token(0, 10);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    chat.ingest(chat_message_user("hello async".into()))
+        .expect("ingest succeeds");
+
+    let opts = GenerateOpts {
+        max_tokens: 1,
+        temperature: 0.0,
+        ..Default::default()
+    };
+
+    let result = Arc::clone(&chat)
+        .complete_async(opts)
+        .await
+        .expect("complete_async succeeds");
+    assert_eq!(result.text, "hi ");
+    assert_eq!(result.summary.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(chat.phase().unwrap(), SessionPhase::Interrupted);
+}
+
+#[tokio::test]
+async fn chat_session_generate_streaming_async_produces_stream() {
+    let session = test_session_with_token(0, 10);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    chat.ingest(chat_message_user("stream async".into()))
+        .expect("ingest succeeds");
+
+    let opts = GenerateOpts {
+        max_tokens: 1,
+        temperature: 0.0,
+        ..Default::default()
+    };
+
+    let sink = Arc::new(TestSink::new());
+
+    let summary = Arc::clone(&chat)
+        .generate_streaming_async(opts, sink.clone())
+        .await
+        .expect("generate_streaming_async succeeds");
+
+    assert_eq!(summary.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(sink.chunks.lock().unwrap().concat(), "hi ");
+    assert_eq!(*sink.done.lock().unwrap(), Some(FinishReason::MaxTokens));
+    assert_eq!(chat.phase().unwrap(), SessionPhase::Interrupted);
+}

@@ -673,5 +673,62 @@ impl ChatSession {
     }
 }
 
+struct AsyncChatCancelGuard {
+    chat: Arc<ChatSession>,
+    abort: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl Drop for AsyncChatCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abort.abort();
+            self.chat.cancel();
+        }
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl ChatSession {
+    /// Async variant of [`ChatSession::complete`].
+    pub async fn complete_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+    ) -> Result<TurnResult, FfiError> {
+        let chat_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.complete(opts));
+        let mut guard = AsyncChatCancelGuard {
+            chat: chat_for_guard,
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            detail: format!("complete_async join error: {e}"),
+        })?
+    }
+
+    /// Async variant of [`ChatSession::generate_streaming`].
+    pub async fn generate_streaming_async(
+        self: Arc<Self>,
+        opts: GenerateOpts,
+        sink: Arc<dyn ModalitySink>,
+    ) -> Result<GenerateSummary, FfiError> {
+        let chat_for_guard = Arc::clone(&self);
+        let handle = tokio::task::spawn_blocking(move || self.generate_streaming(opts, sink));
+        let mut guard = AsyncChatCancelGuard {
+            chat: chat_for_guard,
+            abort: handle.abort_handle(),
+            armed: true,
+        };
+        let join_result = handle.await;
+        guard.armed = false;
+        join_result.map_err(|e| FfiError::Backend {
+            detail: format!("generate_streaming_async join error: {e}"),
+        })?
+    }
+}
+
 #[cfg(test)]
 mod tests;

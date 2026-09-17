@@ -700,6 +700,56 @@ impl<E: Execution> Chat<E> {
         })
     }
 
+    /// Stream generated tokens into a text callback, returning the final turn result.
+    pub fn stream_text<F>(
+        &mut self,
+        opts: &GenerateOpts,
+        on_text: F,
+    ) -> Result<TurnResult, CompleteError>
+    where
+        F: FnMut(&str),
+    {
+        struct StreamingCollector<F> {
+            tokens: Vec<u32>,
+            tokenizer: Arc<BpeTokenizer>,
+            on_text: F,
+            last_decoded_len: usize,
+        }
+
+        impl<F: FnMut(&str)> ModalitySink for StreamingCollector<F> {
+            fn on_text_tokens(&mut self, new_tokens: &[u32]) {
+                self.tokens.extend_from_slice(new_tokens);
+                let current_text = self.tokenizer.decode(&self.tokens);
+                if current_text.len() > self.last_decoded_len {
+                    let delta = &current_text[self.last_decoded_len..];
+                    (self.on_text)(delta);
+                    self.last_decoded_len = current_text.len();
+                }
+            }
+
+            fn on_done(&mut self, _reason: FinishReason) {}
+        }
+
+        let capacity = (opts.max_tokens as usize).min(4096);
+        let tokenizer = Arc::clone(&self.profile.tokenizer);
+        let mut collector = StreamingCollector {
+            tokens: Vec::with_capacity(capacity),
+            tokenizer,
+            on_text,
+            last_decoded_len: 0,
+        };
+        let report = self
+            .generate_into(opts, &mut collector)
+            .map_err(CompleteError::Validation)?;
+        let summary = report.result.map_err(CompleteError::Execution)?;
+        let full_text = self.profile.tokenizer.decode(&collector.tokens);
+        Ok(TurnResult {
+            text: full_text,
+            tokens: collector.tokens,
+            summary,
+        })
+    }
+
     /// Reset execution state and return to `SessionPhase::Idle`.
     pub fn reset(&mut self) -> Result<(), CeraError> {
         self.phase = SessionPhase::Unusable;

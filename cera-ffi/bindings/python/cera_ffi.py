@@ -583,13 +583,17 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 45746:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -597,7 +601,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 34361:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1520,6 +1524,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1527,6 +1536,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2150,9 +2165,15 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.restype = ct
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
@@ -9759,7 +9780,8 @@ class ChatSessionProtocol(typing.Protocol):
         """
         Flip cancellation flag to interrupt in-flight prefill or decode.
 
-        Wait-free and safe from any thread.
+        Wait-free and safe from any thread. If the session has already been reclaimed
+        via `into_session()`, this call is a no-op to prevent cross-session cancellation.
 """
         raise NotImplementedError
     def clear_cancel(self, ) -> None:
@@ -9772,9 +9794,19 @@ class ChatSessionProtocol(typing.Protocol):
         Complete generation synchronously and return the assistant response.
 """
         raise NotImplementedError
+    async def complete_async(self, opts: GenerateOpts) -> TurnResult:
+        """
+        Async variant of [`ChatSession::complete`].
+"""
+        raise NotImplementedError
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
+"""
+        raise NotImplementedError
+    async def generate_streaming_async(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Async variant of [`ChatSession::generate_streaming`].
 """
         raise NotImplementedError
     def ingest(self, message: Message) -> IngestSummary:
@@ -9799,6 +9831,8 @@ class ChatSessionProtocol(typing.Protocol):
     def phase(self, ) -> SessionPhase:
         """
         Current session lifecycle phase.
+
+        Non-blocking observation; returns `FfiError::Busy` if another operation is active.
 """
         raise NotImplementedError
     def position(self, ) -> int:
@@ -9877,7 +9911,8 @@ class ChatSession(ChatSessionProtocol):
         """
         Flip cancellation flag to interrupt in-flight prefill or decode.
 
-        Wait-free and safe from any thread.
+        Wait-free and safe from any thread. If the session has already been reclaimed
+        via `into_session()`, this call is a no-op to prevent cross-session cancellation.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -9923,6 +9958,26 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    async def complete_async(self, opts: GenerateOpts) -> TurnResult:
+        """
+        Async variant of [`ChatSession::complete`].
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeTurnResult.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
@@ -9944,6 +9999,29 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    async def generate_streaming_async(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
+        """
+        Async variant of [`ChatSession::generate_streaming`].
+"""
+        
+        _UniffiFfiConverterTypeGenerateOpts.check_lower(opts)
+
+        _UniffiFfiConverterTypeModalitySink.check_lower(sink)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeGenerateOpts.lower(opts),
+            _UniffiFfiConverterTypeModalitySink.lower(sink),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeGenerateSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
     def ingest(self, message: Message) -> IngestSummary:
         """
         Ingest a single message into the chat context.
@@ -10002,6 +10080,8 @@ class ChatSession(ChatSessionProtocol):
     def phase(self, ) -> SessionPhase:
         """
         Current session lifecycle phase.
+
+        Non-blocking observation; returns `FfiError::Busy` if another operation is active.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
