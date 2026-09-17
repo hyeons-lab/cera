@@ -11,6 +11,7 @@ extension ChatSession {
         AsyncThrowingStream { continuation in
             final class StreamSink: ModalitySink, @unchecked Sendable {
                 let continuation: AsyncThrowingStream<String, Error>.Continuation
+                var hasFinished = false
 
                 init(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
                     self.continuation = continuation
@@ -25,6 +26,7 @@ extension ChatSession {
                 func onAudioFrames(pcm: [Float], sampleRate: UInt32) {}
 
                 func onDone(reason: FinishReason) {
+                    hasFinished = true
                     switch reason {
                     case .stop, .maxTokens, .contextFull, .cancelled, .grammarDeadEnd:
                         continuation.finish()
@@ -51,7 +53,9 @@ extension ChatSession {
                 do {
                     _ = try await self.generateStreamingAsync(opts: opts, sink: sink)
                 } catch {
-                    continuation.finish(throwing: error)
+                    if !sink.hasFinished {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
         }

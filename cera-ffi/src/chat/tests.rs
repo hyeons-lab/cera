@@ -817,3 +817,56 @@ fn chat_session_checkpoint_rejects_corrupted_data() {
     let err = chat.import_checkpoint(vec![1, 2, 3, 4]).unwrap_err();
     assert!(matches!(err, FfiError::Backend { .. }));
 }
+
+#[test]
+fn tool_def_try_from_validates_parameters_json() {
+    use crate::ToolDef;
+
+    // Empty parameters_json defaults to empty object
+    let empty_tool = ToolDef {
+        name: "test_empty".to_string(),
+        description: None,
+        parameters_json: "".to_string(),
+    };
+    let core_empty: cera::tools::ToolDef = empty_tool.try_into().unwrap();
+    assert_eq!(core_empty.name, "test_empty");
+    assert!(core_empty.parameters.is_object());
+
+    // Valid object schema succeeds
+    let valid_tool = ToolDef {
+        name: "test_valid".to_string(),
+        description: Some("valid tool".to_string()),
+        parameters_json: r#"{"type":"object","properties":{"location":{"type":"string"}}}"#
+            .to_string(),
+    };
+    let core_valid: cera::tools::ToolDef = valid_tool.try_into().unwrap();
+    assert_eq!(core_valid.name, "test_valid");
+    assert_eq!(core_valid.description.as_deref(), Some("valid tool"));
+
+    // Invalid JSON fails
+    let invalid_json_tool = ToolDef {
+        name: "test_invalid_json".to_string(),
+        description: None,
+        parameters_json: "{not_valid_json}".to_string(),
+    };
+    let err = cera::tools::ToolDef::try_from(invalid_json_tool).unwrap_err();
+    assert!(matches!(err, FfiError::Backend { .. }));
+
+    // Scalar JSON fails
+    let scalar_tool = ToolDef {
+        name: "test_scalar".to_string(),
+        description: None,
+        parameters_json: "42".to_string(),
+    };
+    let err = cera::tools::ToolDef::try_from(scalar_tool).unwrap_err();
+    assert!(matches!(err, FfiError::Backend { .. }));
+
+    // Array JSON fails
+    let array_tool = ToolDef {
+        name: "test_array".to_string(),
+        description: None,
+        parameters_json: "[]".to_string(),
+    };
+    let err = cera::tools::ToolDef::try_from(array_tool).unwrap_err();
+    assert!(matches!(err, FfiError::Backend { .. }));
+}

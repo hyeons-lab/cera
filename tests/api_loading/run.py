@@ -54,6 +54,12 @@ def main():
         default=Path("/private/tmp/cera-leap-api-baseline/jna-5.16.0.jar"),
     )
     parser.add_argument(
+        "--java-home",
+        type=Path,
+        default=None,
+        help="Path to Java 21 home directory",
+    )
+    parser.add_argument(
         "--wasm-bindgen",
         type=Path,
         default=Path.home()
@@ -80,7 +86,12 @@ def main():
     target.mkdir(parents=True, exist_ok=False)
     environment["CARGO_TARGET_DIR"] = str(target)
     environment["CERA_GIT_SHA"] = "loading-probe"
-    environment["JAVA_HOME"] = "/Users/dberrios/.sdkman/candidates/java/21.0.9-zulu"
+    if args.java_home:
+        environment["JAVA_HOME"] = str(args.java_home)
+    elif "JAVA_HOME" not in environment:
+        sdkman_path = Path.home() / ".sdkman/candidates/java/21.0.9-zulu"
+        if sdkman_path.exists():
+            environment["JAVA_HOME"] = str(sdkman_path)
     environment["LOADING_JNA"] = str(args.jna.resolve())
     commands = Commands(output, environment, workspace)
     report["commands"] = commands.results

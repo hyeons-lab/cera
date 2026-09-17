@@ -158,7 +158,7 @@ impl SessionCheckpoint {
             size += 4 + logits.len() * 4;
         }
         size += self.token_history.len() * 4;
-        size += self.kv_state.byte_size() + 25 + self.kv_state.layers.len() * 8;
+        size += self.kv_state.byte_size() + 29 + self.kv_state.layers.len() * 9;
         size
     }
 

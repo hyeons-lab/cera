@@ -98,7 +98,6 @@ Future<void> runProbe(List<String> args) async {
   } finally {
     for (final model in opened.reversed) {
       await model.close();
-      await model.close();
     }
   }
 }

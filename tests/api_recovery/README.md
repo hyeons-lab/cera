@@ -11,7 +11,7 @@ and compressed modes.
 Build the native library and regenerate bindings with the repository's existing
 `just bindings` and `just dart-bindings` recipes. For device runs, build the library
 with `cera-ffi` features `gpu,metal,ffi-buffer`. The runner takes an explicit dylib
-and a two-token `a`/`b` hybrid LFM2 fixture with at least32 tokens of context (the
+and a two-token `a`/`b` hybrid LFM2 fixture with at least 32 tokens of context (the
 existing GPU ownership fixture's `conversation.gguf`). This synthetic fixture
 proves execution and recovery contracts, not language quality.
 
@@ -23,7 +23,7 @@ python3 tests/api_recovery/run.py \
 # Repeat with --backend metal and --backend wgpu on supported hardware.
 ```
 
-The runner uses Java21, the pinned JNA/coroutines jars from
+The runner uses Java 21, the pinned JNA/coroutines jars from
 `tests/leap_compat/artifacts.json` (default directory
 `/private/tmp/cera-leap-api-baseline`; override with `--dependencies`), and the
 checked-in bindings. It stages and hashes the library, verifies Swift's actual
@@ -32,7 +32,7 @@ source/artifact hashes and results in a fresh directory. No device fallback or
 successful skip is accepted. Run device consumers with GPU access.
 
 Rust FFI unit tests additionally inject a failed reset, preserving original
-cancellation alongside a typed64-bit allocation failure, and check same-thread
+cancellation alongside a typed 64-bit allocation failure, and check same-thread
 reentrancy, concurrent lock contention, poison and wide rewind payloads:
 
 ```sh

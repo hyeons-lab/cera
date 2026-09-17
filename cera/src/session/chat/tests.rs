@@ -2013,6 +2013,30 @@ fn chat_checkpoint_rejects_layer_variant_mismatch_without_panic() {
 }
 
 #[test]
+fn chat_checkpoint_rejects_precision_mismatch() {
+    let tok = fixtures::tokenizer();
+    let (_model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("test precision mismatch")).unwrap();
+    let mut cp = chat.checkpoint().unwrap();
+    if let Some(crate::kv_cache::LayerSnapshot::Attention { k_data, v_data }) =
+        cp.session_checkpoint.kv_state.layers.first().cloned()
+    {
+        cp.session_checkpoint.kv_state.layers[0] =
+            crate::kv_cache::LayerSnapshot::AttentionF16 { k_data, v_data };
+    }
+
+    let (_model2, mut chat2) = setup(tok);
+    let err = chat2.restore(&cp).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("precision") || msg.contains("f16 vs f32"));
+        }
+        other => panic!("expected format error for precision mismatch, got {other:?}"),
+    }
+}
+
+#[test]
 fn profile_discovery_for_llama3_template_and_framing() {
     let tok = BpeTokenizer::llama3_for_test();
     let profile = Profile::discover(Arc::new(tok)).unwrap();

@@ -22,12 +22,18 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--backend", choices=("cpu", "metal", "wgpu"), default="cpu")
     parser.add_argument("--dependencies", type=Path, default=Path("/private/tmp/cera-leap-api-baseline"))
+    parser.add_argument("--java-home", type=Path, default=None, help="Path to Java 21 home directory")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     out = Path(tempfile.mkdtemp(prefix=f"{args.backend}-", dir=args.output))
     env = probe_environment(os.environ)
     env["PATH"] = "/opt/homebrew/bin:" + env["PATH"]
-    env["JAVA_HOME"] = str(Path.home() / ".sdkman/candidates/java/21.0.9-zulu")
+    if args.java_home:
+        env["JAVA_HOME"] = str(args.java_home)
+    elif "JAVA_HOME" not in env:
+        sdkman_path = Path.home() / ".sdkman/candidates/java/21.0.9-zulu"
+        if sdkman_path.exists():
+            env["JAVA_HOME"] = str(sdkman_path)
     commands = Commands(out, env, REPO)
     bindings = REPO / "cera-ffi/bindings"
     pins = json.loads((REPO / "tests/leap_compat/artifacts.json").read_text())

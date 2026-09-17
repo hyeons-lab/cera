@@ -989,8 +989,9 @@ impl CeraEngine {
 
         let split = Self::split_tokens_at_marker(&toks, marker_id, marker_name)?;
 
-        // Declare the guard first so the helper Session drops before unlocking.
-        // Another transcription must not acquire the helper's still-held lease.
+        // Outer scope guard lifecycle: single-flight instantiation across threads is
+        // enforced, and the helper Session drops before releasing the mutex. Another
+        // transcription must not acquire the helper's still-held lease.
         let mut transcription_model;
         let mut session = match self.new_session(SessionConfig::default()) {
             Ok(session) => session,

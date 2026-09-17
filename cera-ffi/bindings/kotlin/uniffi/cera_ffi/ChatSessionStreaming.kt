@@ -3,6 +3,7 @@
 package uniffi.cera_ffi
 
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
@@ -20,7 +21,7 @@ fun ChatSession.stream(opts: GenerateOpts): Flow<String> =
                 override fun onThoughtChunk(text: String) {}
 
                 override fun onTextChunk(text: String) {
-                    trySend(text)
+                    trySendBlocking(text)
                 }
 
                 override fun onAudioFrames(

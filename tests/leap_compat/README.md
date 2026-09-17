@@ -9,7 +9,7 @@ From the implementation worktree, on macOS arm64:
 
 ```sh
 export PATH="/opt/homebrew/bin:$PATH"
-export JAVA_HOME="/Users/dberrios/.sdkman/candidates/java/21.0.9-zulu"
+export JAVA_HOME="${JAVA_HOME:-$(/usr/libexec/java_home -v 21 2>/dev/null || echo "$HOME/.sdkman/candidates/java/21.0.9-zulu")}"
 python3 tests/leap_compat/run_probes.py --fetch --with-kmp --with-native
 ```
 
