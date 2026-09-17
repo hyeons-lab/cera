@@ -566,6 +566,7 @@
         "has_chat_template": "pub fn has_chat_template(&self) -> bool",
         "max_seq_len": "pub fn max_seq_len(&self) -> u32",
         "metadata": "pub fn metadata(&self) -> ModelMetadata",
+        "new_chat_session": "pub fn new_chat_session(&self, config: &SessionConfig) -> Result<ChatSession, JsError>",
         "new_session": "pub fn new_session(&self, config: &SessionConfig) -> Result<Session, JsError>",
         "quantization": "pub fn quantization(&self) -> String",
         "tokenizer": "pub fn tokenizer(&self) -> Tokenizer",
@@ -652,6 +653,7 @@
         "set_grammar": "pub fn set_grammar(&mut self, gbnf: &str) -> Result<(), JsError>",
         "set_grammar_trigger_tokens": "pub fn set_grammar_trigger_tokens(&mut self, v: Vec<u32>)",
         "set_ignore_eos": "pub fn set_ignore_eos(&mut self, v: bool)",
+        "set_json_schema": "pub fn set_json_schema(&mut self, schema_json: &str) -> Result<(), JsError>",
         "set_max_tokens": "pub fn set_max_tokens(&mut self, v: u32)",
         "set_min_p": "pub fn set_min_p(&mut self, v: f32)",
         "set_repetition_penalty": "pub fn set_repetition_penalty(&mut self, v: f32)",
@@ -663,7 +665,8 @@
         "stop_tokens": "pub fn stop_tokens(&self) -> Vec<u32>",
         "temperature": "pub fn temperature(&self) -> f32",
         "top_k": "pub fn top_k(&self) -> u32",
-        "top_p": "pub fn top_p(&self) -> f32"
+        "top_p": "pub fn top_p(&self) -> f32",
+        "with_json_schema": "pub fn with_json_schema( opts: &GenerateOpts, schema_json: &str, ) -> Result<GenerateOpts, JsError>"
       }
     },
     {
@@ -710,6 +713,7 @@
         "hidden_states_for_text": "pub fn hidden_states_for_text(&mut self, text: &str) -> Result<js_sys::Float32Array, JsError>",
         "hidden_states_for_tokens": "pub fn hidden_states_for_tokens( &mut self, tokens: &[u32], ) -> Result<js_sys::Float32Array, JsError>",
         "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled( &mut self, tokens: &[u32], ) -> Result<js_sys::Float32Array, JsError>",
+        "into_chat": "pub fn into_chat(&mut self) -> Result<ChatSession, JsError>",
         "position": "pub fn position(&self) -> u32",
         "remove_lora": "pub fn remove_lora(&mut self)",
         "reset": "pub fn reset(&mut self) -> Result<(), JsError>",
@@ -771,6 +775,7 @@
         "cera_version": "pub fn cera_version() -> String",
         "cpu_backend_report": "pub fn cpu_backend_report() -> String",
         "detect_tool_format": "pub fn detect_tool_format(architecture: &str) -> Option<ToolFormat>",
+        "json_schema_to_grammar": "pub fn json_schema_to_grammar(schema_json: &str) -> Result<String, JsError>",
         "parse_tool_calls": "pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<String, JsError>",
         "tool_grammar": "pub fn tool_grammar(tools_json: &str, format: ToolFormat) -> Result<String, JsError>",
         "wasm_init": "pub fn wasm_init()"

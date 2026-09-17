@@ -26,13 +26,17 @@ export interface Capabilities {
 
 /**
  * One entry in the chat-message array passed to
- * `Tokenizer.applyChatTemplate` / `applyChatTemplateWithTools`.
- * Mirrors the OpenAI / Anthropic SDK shape. For tool results, use
- * `role: "tool"` with the JSON result string as `content`.
+ * `Tokenizer.applyChatTemplate`, `applyChatTemplateWithTools`,
+ * or `ChatSession.ingest` / `ChatSession.ingestMessages`.
+ * Mirrors the OpenAI / Anthropic SDK shape with multimodal support.
+ * For tool results, use `role: "tool"` with the JSON result string as `content`.
  */
 export interface ChatMessage {
     role: string;
     content: string;
+    imageBytes?: Uint8Array;
+    audioPcm?: Float32Array;
+    audioSampleRate?: number;
 }
 
 /**
@@ -50,7 +54,7 @@ export interface ToolDef {
 /**
  * A tool call parsed from model output by `parseToolCalls`. `arguments` is
  * normally an object, but a malformed Hermes/Qwen reply may pass through a
- * non-object JSON value - narrow before assuming an object map.
+ * non-object JSON value: narrow before assuming an object map.
  */
 export interface ToolCall {
     name: string;
@@ -282,6 +286,10 @@ export class CeraEngine {
      */
     static fromManifestUrl(repo: BundleRepo, manifest_url: string, context_size?: number | null, on_progress?: Function | null): Promise<CeraEngine>;
     /**
+     * Create a new conversational `ChatSession` backed by this engine.
+     */
+    newChatSession(config: SessionConfig): ChatSession;
+    /**
      * Construct a new `Session` for this engine. The `config`
      * freezes per-session knobs - sampler `seed`, `nKeep`
      * pinned-prefix size, `ubatchSize` chunked-prefill batch,
@@ -424,6 +432,104 @@ export class CeraEngine {
 }
 
 /**
+ * Stateful conversational chat coordinator.
+ *
+ * Wraps an underlying inference session, maintaining chat template framing,
+ * turn delimiter invariants, multimodal ingestion, tool calling, and
+ * conversational state transitions.
+ */
+export class ChatSession {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Flip the cancel atomic, requesting that any in-flight turn exit at its next checkpoint.
+     */
+    cancel(): void;
+    /**
+     * Clear pending cancellation without dropping conversation state.
+     */
+    clearCancel(): void;
+    /**
+     * Execute a turn to completion, returning the assistant response.
+     */
+    complete(opts: GenerateOpts): TurnResult;
+    /**
+     * Execute a turn constrained by a JSON Schema string, returning the assistant response.
+     */
+    completeJson(opts: GenerateOpts, schema_json: string): TurnResult;
+    /**
+     * Stream generated text tokens into a callback, returning the final turn result.
+     */
+    generateStreaming(opts: GenerateOpts, on_token: Function): TurnResult;
+    /**
+     * Stream generated text constrained by a JSON Schema string into a callback.
+     */
+    generateStreamingJson(opts: GenerateOpts, schema_json: string, on_token: Function): TurnResult;
+    /**
+     * Ingest a single message into the chat context.
+     */
+    ingest(message: any): IngestSummary;
+    /**
+     * Ingest a batch of messages into the chat context.
+     */
+    ingestMessages(messages: ChatMessage[]): IngestSummary;
+    /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    ingestToolResponse(tool_name: string, content: string): IngestSummary;
+    /**
+     * Reclaim ownership of the underlying Session.
+     */
+    intoSession(): Session;
+    /**
+     * Construct a ChatSession from an existing Session, taking ownership of its state.
+     *
+     * If validation or template discovery fails, the session remains intact and usable.
+     */
+    constructor(session: Session);
+    /**
+     * Replace conversation history by rewinding or re-prefilling the context.
+     */
+    replaceMessages(messages: ChatMessage[]): IngestSummary;
+    /**
+     * Drop accumulated turn state and return to SessionPhase::Idle.
+     */
+    reset(): void;
+    /**
+     * Set the tool wire format explicitly.
+     */
+    setToolFormat(format: ToolFormat): void;
+    /**
+     * Register tools for function calling via a JSON array string.
+     */
+    setTools(tools_json: string): void;
+    /**
+     * Modality capability flags reported by the model backing this session.
+     */
+    readonly capabilities: Capabilities;
+    /**
+     * Model hidden dimension D.
+     */
+    readonly hiddenSize: number;
+    /**
+     * Current session lifecycle phase ("Idle", "PromptReady", "TurnComplete", "Interrupted", "RawContext", "Unusable").
+     */
+    readonly phase: string;
+    /**
+     * Current token position in the execution context.
+     */
+    readonly position: number;
+    /**
+     * Active tool wire format.
+     */
+    readonly toolFormat: ToolFormat;
+    /**
+     * Currently registered tools for function calling as a JSON string.
+     */
+    readonly tools: string;
+}
+
+/**
  * Per-call generation options. Constructed via `new GenerateOpts()`
  * in JS (returns the cera defaults: `maxTokens=256`,
  * `temperature=0.7`, `topP=0.9`, `topK=40`, no stop tokens, flush
@@ -439,6 +545,10 @@ export class GenerateOpts {
      * Remove any grammar constraint, returning to unconstrained decoding.
      */
     clearGrammar(): void;
+    /**
+     * Clear speculative decoding, returning to standard non-speculative decoding.
+     */
+    clearSpecDecode(): void;
     constructor();
     /**
      * Constrain decoding to a GBNF grammar (source text, e.g. a JSON grammar).
@@ -448,6 +558,22 @@ export class GenerateOpts {
      * this is a method rather than a `grammar` property.
      */
     setGrammar(gbnf: string): void;
+    /**
+     * Constrain output to conform to a JSON Schema definition string.
+     * Compiles the schema to GBNF and sets the grammar on this options instance.
+     */
+    setJsonSchema(schema_json: string): void;
+    /**
+     * Configure speculative decoding with prompt-lookup drafting.
+     *
+     * `ngram` specifies the lookup context length (clamped to 1..=32).
+     * `k` specifies the number of candidate draft tokens proposed per step (clamped to 1..=64).
+     */
+    setSpecDecode(ngram: number, k: number): void;
+    /**
+     * Helper creating a new `GenerateOpts` cloned from `opts` with JSON Schema constraint applied.
+     */
+    static withJsonSchema(opts: GenerateOpts, schema_json: string): GenerateOpts;
     flushEveryMs: number;
     flushEveryTokens: number;
     /**
@@ -463,6 +589,10 @@ export class GenerateOpts {
      * Whether a grammar constraint is currently set.
      */
     readonly hasGrammar: boolean;
+    /**
+     * Whether speculative decoding is currently configured.
+     */
+    readonly hasSpecDecode: boolean;
     /**
      * Ignore end-of-generation: EOS and `stopTokens` are not honored, so
      * decode always runs to `maxTokens`. For benchmark loops that must
@@ -508,6 +638,68 @@ export class GenerateSummary {
     readonly promptEvalMs: number;
     readonly promptEvalTokens: number;
     readonly tokensGenerated: number;
+}
+
+export class GenerationDefaults {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static audio(sampling: SamplingDefaults, number_of_decoding_threads?: number | null, audio_temperature?: number | null, audio_top_k?: number | null): GenerationDefaults;
+    static other(raw_json: string): GenerationDefaults;
+    static text(sampling: SamplingDefaults): GenerationDefaults;
+    toJson(): string;
+}
+
+/**
+ * A loaded generative engine with shared weights and independent CPU sessions.
+ */
+export class GenerativeModel {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Create a production Session that can outlive all loading and engine handles.
+     */
+    createSession(config: SessionConfig): Session;
+    /**
+     * Share the already loaded engine, including its tokenizer and cache.
+     */
+    engine(): CeraEngine;
+}
+
+/**
+ * Summary of a successful message ingestion.
+ */
+export class IngestSummary {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Number of tokens encoded and appended to the context.
+     */
+    readonly inputTokens: number;
+    /**
+     * KV position after ingestion.
+     */
+    readonly positionAfter: number;
+    /**
+     * KV position before ingestion.
+     */
+    readonly positionBefore: number;
+}
+
+/**
+ * CPU loading options. A zero context uses the core engine's existing semantics.
+ */
+export class LoadConfig {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor(context_size: number, backend: string);
+    backend: string;
+    context_size: number;
+    get draft_model(): string | undefined;
+    set draft_model(value: string | null | undefined);
+    gpu_depthformer: boolean;
 }
 
 /**
@@ -576,6 +768,10 @@ export class Manifest {
      */
     readonly chatTemplate: string | undefined;
     /**
+     * URL of the companion DSpark draft model GGUF for speculative decoding.
+     */
+    readonly draftModelUrl: string | undefined;
+    /**
      * Raw `inference_type` string (e.g. `llama.cpp/text-to-text`).
      * Round-trips through cera's enum, so unknown variants come back
      * as their original string - no information loss.
@@ -586,15 +782,86 @@ export class Manifest {
      */
     readonly modelUrl: string;
     /**
-     * URL of the companion DSpark draft model GGUF for speculative decoding.
-     */
-    readonly draftModelUrl: string | undefined;
-    /**
      * URL of the multimodal projector GGUF if the manifest declares
      * one (VL / audio models). `undefined` for plain text models.
      */
     readonly multimodalProjectorUrl: string | undefined;
     readonly schemaVersion: string;
+}
+
+/**
+ * Dynamic loaded model; its typed accessor shares ownership.
+ */
+export class ModelHandle {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    asGenerative(): GenerativeModel | undefined;
+    kind(): string;
+}
+
+/**
+ * Single-use synchronous loader. Both build methods consume the source even on failure.
+ */
+export class ModelLoader {
+    free(): void;
+    [Symbol.dispose](): void;
+    build(): ModelHandle;
+    buildGenerative(): GenerativeModel;
+    constructor(source: ModelSource, config: LoadConfig);
+}
+
+/**
+ * Multi-component model parts for WASM loading.
+ *
+ * Constructed from JavaScript and passed by value into `ModelSource::parts`.
+ * Property getters use `getter_with_clone` to conform to the TypeScript binding
+ * contract in `tests/api_contracts/wasm_loading.json`; JS consumers should avoid
+ * reading `.model` directly to prevent cloning the byte buffer into JS memory.
+ */
+export class ModelParts {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor(model: Uint8Array);
+    get audio_decoder(): Uint8Array | undefined;
+    set audio_decoder(value: Uint8Array | null | undefined);
+    get audio_tokenizer(): Uint8Array | undefined;
+    set audio_tokenizer(value: Uint8Array | null | undefined);
+    get chat_template(): string | undefined;
+    set chat_template(value: string | null | undefined);
+    get draft_model(): Uint8Array | undefined;
+    set draft_model(value: Uint8Array | null | undefined);
+    get generation_defaults(): GenerationDefaults | undefined;
+    set generation_defaults(value: GenerationDefaults | null | undefined);
+    get inference_type(): string | undefined;
+    set inference_type(value: string | null | undefined);
+    model: Uint8Array;
+    get multimodal_projector(): Uint8Array | undefined;
+    set multimodal_projector(value: Uint8Array | null | undefined);
+}
+
+export class ModelSource {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static bytes(bytes: Uint8Array): ModelSource;
+    static parts(parts: ModelParts): ModelSource;
+}
+
+export class SamplingDefaults {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    get min_p(): number | undefined;
+    set min_p(value: number | null | undefined);
+    get repetition_penalty(): number | undefined;
+    set repetition_penalty(value: number | null | undefined);
+    get temperature(): number | undefined;
+    set temperature(value: number | null | undefined);
+    get top_k(): number | undefined;
+    set top_k(value: number | null | undefined);
+    get top_p(): number | undefined;
+    set top_p(value: number | null | undefined);
 }
 
 /**
@@ -639,8 +906,8 @@ export class Session {
      * Non-16kHz inputs are automatically linearly resampled to 16 kHz.
      * `samples` arrives as `Float32Array` on the JS side. The
      * wasm-bindgen boundary copies the typed-array contents into
-     * wasm linear memory once - there's no per-element boxing
-     * (contrast with Kotlin's `List<Float>` 4× memory overhead
+     * wasm linear memory once; there's no per-element boxing
+     * (contrast with Kotlin's `List<Float>` 4x memory overhead
      * flagged in PR #78). The `&[f32]` Rust signature matches
      * `appendTokens(&[u32])` and avoids the per-call `Vec`
      * allocation that an owned parameter would require.
@@ -648,7 +915,7 @@ export class Session {
      * Errors today are thrown as JS `Error`s; the message string
      * is the underlying `cera::CeraError::Display` text (same as
      * `appendText` / `appendTokens` produce):
-     * - `"empty input"` if `samples.length === 0` - fast-fail at
+     * - `"empty input"` if `samples.length === 0`: fast-fail at
      *   the wasm boundary, parity with `appendText` /
      *   `appendTokens` empty-input rejection.
      * - `"modality not supported by this model"` when
@@ -696,7 +963,7 @@ export class Session {
     appendTokens(tokens: Uint32Array): void;
     /**
      * Attach a [`LoraAdapters`] to this session. Applied to every subsequent
-     * forward pass - generation **and** hidden-states extraction - until
+     * forward pass (generation and hidden-states extraction) until
      * removed or replaced (hot-swap), and preserved across `reset()`. Throws if
      * the adapter's dimensions don't match the loaded model. Only affects tokens
      * processed after the call (doesn't retroactively re-adapt cached KV).
@@ -706,19 +973,19 @@ export class Session {
      * Flip the cancel atomic, requesting that any in-flight
      * `generate` call exit at its next checkpoint with
      * `finishReason = "Cancelled"`. Safe to call from any thread
-     * (including a Worker that owns this session - though wasm
+     * (including a Worker that owns this session, though wasm
      * without SharedArrayBuffer makes cross-thread sharing
      * unusual).
      */
     cancel(): void;
     /**
      * Clear the cancel flag without dropping any session state.
-     * Use this after observing a cancellation signal - either a
+     * Use this after observing a cancellation signal; either a
      * thrown cancellation error from `appendText` / `appendTokens`
      * (mid-prefill cancellation surfaces as a thrown error) or
      * `summary.finishReason === "Cancelled"` on the value
      * returned from `generate` (cancellation during decode is
-     * reported via the finish reason, not a thrown error) - when
+     * reported via the finish reason, not a thrown error), when
      * you want to resume work on the same session without losing
      * the accumulated KV cache.
      *
@@ -730,25 +997,15 @@ export class Session {
      *   re-seeds the sampler. Use for "clear conversation"
      *   flows.
      *
-     * **Call sequencing:** invoke this *after* `generate` /
-     * `appendText` / `appendTokens` has returned. Even though
-     * the underlying cera method takes `&self`, wasm-bindgen's
-     * JS-side borrow check on the `Session` wrapper rejects any
-     * method call (including this `&self` one) while another
-     * method is still borrowing the same handle - calling
-     * `session.clearCancel()` from inside a `generate` token
-     * callback would throw "recursive use of an object". The
-     * `&self` Rust shape matters in the native binding
-     * (`cera-ffi`) where there's no JS-side borrow check; in
-     * wasm it just means there's no `&mut self` cost on the cera
-     * core side.
+     * Call sequencing: invoke this after `generate` /
+     * `appendText` / `appendTokens` has returned.
      */
     clearCancel(): void;
     /**
      * Decode tokens until `opts.maxTokens`, a stop token, EOS, or
      * `cancel()` fires. The `onTextTokens` callback is invoked once
      * per flush boundary with a `Uint32Array` of the latest tokens
-     * (*not* the cumulative buffer - concatenate yourself if you
+     * (not the cumulative buffer: concatenate yourself if you
      * want the full sequence).
      *
      * Returns the `GenerateSummary` once decode finishes. Throws
@@ -762,9 +1019,9 @@ export class Session {
      */
     hasLora(): boolean;
     /**
-     * Model hidden dimension `D` - reshape a `[T*D]` hidden-states buffer into
-     * `[T][D]` with this. Reads a cached field (set at construction), so - unlike
-     * the `&mut self` compute methods - it's safe to call from inside a `generate`
+     * Model hidden dimension `D`: reshape a `[T*D]` hidden-states buffer into
+     * `[T][D]` with this. Reads a cached field (set at construction), so (unlike
+     * the `&mut self` compute methods) it is safe to call from inside a `generate`
      * callback without a wasm-bindgen borrow panic.
      */
     hiddenSize(): number;
@@ -773,18 +1030,26 @@ export class Session {
      */
     hiddenStatesForText(text: string): Float32Array;
     /**
-     * Per-token last-layer hidden states (post-final-RMSNorm - the llama.cpp
+     * Per-token last-layer hidden states (post-final-RMSNorm, the llama.cpp
      * `--pooling none` vector) for `tokens`, as a `Float32Array` of length
      * `tokens.length * hiddenSize` (row-major; token `t` channel `c` at
      * `t*hiddenSize + c`). The wasm boundary copies the buffer into the JS heap
-     * once. Side-effect-free - does not disturb the generation KV.
+     * once. Side-effect-free, does not disturb the generation KV.
      */
     hiddenStatesForTokens(tokens: Uint32Array): Float32Array;
     /**
-     * Mean-pooled hidden state - a single `Float32Array` of length `hiddenSize`
+     * Mean-pooled hidden state: a single `Float32Array` of length `hiddenSize`
      * (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
      */
     hiddenStatesMeanPooled(tokens: Uint32Array): Float32Array;
+    /**
+     * Transfer this session into a conversational `ChatSession`.
+     *
+     * The session must be backed by a model with a supported chat profile
+     * (e.g. ChatML, Llama 3, Gemma). If discovery fails, this session retains
+     * its inner handle and throws an error.
+     */
+    intoChat(): ChatSession;
     /**
      * Remove any attached LoRA adapter, returning to base-model inference.
      */
@@ -795,35 +1060,24 @@ export class Session {
      * logits, and the cancel flag, then re-seeds the sampler from
      * the `SessionConfig.seed` originally passed to `newSession`.
      *
-     * Use this for "clear conversation" UI actions - it skips the
+     * Use this for "clear conversation" UI actions; it skips the
      * per-session setup cost that `engine.newSession(config)`
      * would pay (model + tokenizer Arc clones, sampler ctor),
      * while still leaving the session indistinguishable from a
      * fresh one.
      *
      * Sampler re-seed semantics:
-     * - `SessionConfig.seed = some bigint` - deterministic
+     * - `SessionConfig.seed = some bigint`: deterministic
      *   sessions stay deterministic across `reset()`; the next
      *   `generate` produces the same first token sequence as the
      *   original.
-     * - `SessionConfig.seed = null` - the sampler picks a new
+     * - `SessionConfig.seed = null`: the sampler picks a new
      *   random seed on each `reset()`, so successive
      *   conversations decorrelate.
      *
      * Engine-level disk prefix cache (when configured on
-     * `CeraEngine`) is not touched - those entries are
+     * `CeraEngine`) is not touched; those entries are
      * engine-scoped, not session-scoped.
-     *
-     * **Threading:** unlike `cancel()` (which only flips an
-     * atomic and is safe to call concurrently with anything),
-     * `reset()` takes `&mut self` and rebuilds non-atomic
-     * internal state (KV cache, sampler). Must be called on
-     * the owning thread, with no in-flight `generate` /
-     * `appendText` / `appendTokens` running. The wasm-bindgen
-     * borrow check enforces this within a single Worker; if
-     * you share a `Session` across Workers via
-     * `SharedArrayBuffer`-style schemes, it's on you to
-     * serialize calls.
      */
     reset(): void;
     /**
@@ -836,7 +1090,7 @@ export class Session {
     setImageMaxLongSize(max_long_size?: number | null): void;
     /**
      * Modality capability flags reported by the model backing
-     * this session. Same shape as `CeraEngine.capabilities` -
+     * this session. Same shape as `CeraEngine.capabilities`;
      * see that getter for the `Capabilities` field documentation
      * and the synthetic-text caveat that applies to all
      * `fromGgufBytes`-loaded models today.
@@ -1129,6 +1383,55 @@ export class TurboQuantConfig {
     values: boolean;
 }
 
+/**
+ * Result of a completed chat turn.
+ */
+export class TurnResult {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decode wall-clock duration in milliseconds.
+     */
+    readonly decodeMs: number;
+    /**
+     * Logical condition that ended generation (e.g. "Stop", "MaxTokens", "Cancelled").
+     */
+    readonly finishReason: string;
+    /**
+     * Prompt ingestion wall-clock duration in milliseconds.
+     */
+    readonly promptEvalMs: number;
+    /**
+     * Tokens processed during prompt ingestion for this turn.
+     */
+    readonly promptEvalTokens: number;
+    /**
+     * Generation summary metrics.
+     */
+    readonly summary: GenerateSummary;
+    /**
+     * Decoded assistant response text.
+     */
+    readonly text: string;
+    /**
+     * Token identifiers emitted during the turn.
+     */
+    readonly tokens: Uint32Array;
+    /**
+     * Number of tokens generated during decode.
+     */
+    readonly tokensGenerated: number;
+    /**
+     * Parsed tool calls emitted by the model during the turn, as a JS array of ToolCall objects.
+     */
+    readonly toolCalls: any;
+    /**
+     * Parsed tool calls encoded as a JSON string.
+     */
+    readonly toolCallsJson: string;
+}
+
 export class WebGpuCancelHandle {
     private constructor();
     free(): void;
@@ -1175,16 +1478,11 @@ export class WebGpuSession {
     cancelHandle(): WebGpuCancelHandle;
     clearCancel(): void;
     /**
-     * Clear all conversation state from the KV cache and convolution buffers,
-     * resetting the session back to position zero.
-     */
-    reset(): void;
-    /**
      * Async constructor: initialize WebGPU (`requestAdapter` /
      * `requestDevice` resolve on the JS event loop), parse the in-memory
      * GGUF, upload the model to the GPU, and build a fresh inference
      * state. `contextSize` defaults to 4096. Throws if WebGPU is
-     * unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+     * unavailable, the bytes aren't a valid GGUF, or the device
      * rejects the model.
      *
      * `kvCompression` is optional and defaults to `null` (uncompressed f32
@@ -1194,7 +1492,7 @@ export class WebGpuSession {
      * (token, KV head) vector, so against f32's 32 bits the KV slabs shrink
      * ~10.7x rather than the ~12.8x the bit rates alone suggest. Concretely,
      * for LFM2-1.2B (6 attention layers, 8 KV heads x head_dim 64) that is
-     * 24 KiB per token down to 2.25 KiB - at a 16K context, 384 MiB
+     * 24 KiB per token down to 2.25 KiB: at a 16K context, 384 MiB
      * (~403 MB) of GPU-side KV becomes 36 MiB (~38 MB).
      *
      * Both trailing parameters are optional, so to request compression while
@@ -1268,10 +1566,10 @@ export class WebGpuSession {
      * on a single JS `ArrayBuffer` that loading through `create` runs into,
      * and costs one copy of the model rather than two.
      *
-     * Throws for every reason `create` does, plus a bundle the GPU path
-     * cannot serve: it is LFM2-only. A caller wanting a fallback should catch
-     * and retry through `CeraEngine.fromBundleId`, which is what
-     * `cera_worker.js` does for `backend: 'auto'`.
+     * Throws for every reason `create` does, plus bundle download/manifest errors.
+     * A caller wanting a fallback should catch and retry through
+     * `CeraEngine.fromBundleId`, which is what `cera_worker.js` does for
+     * `backend: 'auto'`.
      */
     static fromBundleId(repo: BundleRepo, bundle_id: string, quant: string, context_size?: number | null, kv_compression?: TurboQuantConfig | null, on_progress?: Function | null): Promise<WebGpuSession>;
     /**
@@ -1307,6 +1605,11 @@ export class WebGpuSession {
      * pays nothing for its availability.
      */
     generateTokens(tokens: Uint32Array, max_tokens: number, temperature: number | null | undefined, top_p: number | null | undefined, top_k: number | null | undefined, seed: bigint | null | undefined, on_token: Function, on_audio?: Function | null): Promise<string>;
+    /**
+     * Reset the session in-place, clearing GPU convolution rolling buffers,
+     * resetting sequence counter to zero, and rebuilding fresh CPU state.
+     */
+    reset(): void;
     /**
      * Set the session-default cap on an appended image's longest side in
      * pixels; `null` clears it. A per-call `maxLongSize` still wins.
@@ -1426,6 +1729,14 @@ export function cpuBackendReport(): string;
 export function detectToolFormat(architecture: string): ToolFormat | undefined;
 
 /**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ *
+ * Converts Draft 7 / 2020-12 JSON Schema definitions into valid GBNF
+ * grammars for structured output generation.
+ */
+export function jsonSchemaToGrammar(schema_json: string): string;
+
+/**
  * Bundles published on `LiquidAI/LeapBundles`, as
  * `[{ name, quants: [...] }]`.
  *
@@ -1475,155 +1786,177 @@ export function toolGrammar(tools_json: string, format: ToolFormat): string;
 
 export function wasm_init(): void;
 
-export class GenerationDefaults {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    static audio(sampling: SamplingDefaults, number_of_decoding_threads?: number | null, audio_temperature?: number | null, audio_top_k?: number | null): GenerationDefaults;
-    static other(raw_json: string): GenerationDefaults;
-    static text(sampling: SamplingDefaults): GenerationDefaults;
-    toJson(): string;
-}
-
-export class GenerativeModel {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    createSession(config: SessionConfig): Session;
-    engine(): CeraEngine;
-}
-
-export class LoadConfig {
-    free(): void;
-    [Symbol.dispose](): void;
-    constructor(context_size: number, backend: string);
-    backend: string;
-    context_size: number;
-    get draft_model(): string | undefined;
-    set draft_model(value: string | null | undefined);
-    gpu_depthformer: boolean;
-}
-
-export class ModelHandle {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    asGenerative(): GenerativeModel | undefined;
-    kind(): string;
-}
-
-export class ModelLoader {
-    free(): void;
-    [Symbol.dispose](): void;
-    build(): ModelHandle;
-    buildGenerative(): GenerativeModel;
-    constructor(source: ModelSource, config: LoadConfig);
-}
-
-export class ModelParts {
-    free(): void;
-    [Symbol.dispose](): void;
-    constructor(model: Uint8Array);
-    get audio_decoder(): Uint8Array | undefined;
-    set audio_decoder(value: Uint8Array | null | undefined);
-    get audio_tokenizer(): Uint8Array | undefined;
-    set audio_tokenizer(value: Uint8Array | null | undefined);
-    get chat_template(): string | undefined;
-    set chat_template(value: string | null | undefined);
-    get draft_model(): Uint8Array | undefined;
-    set draft_model(value: Uint8Array | null | undefined);
-    get generation_defaults(): GenerationDefaults | undefined;
-    set generation_defaults(value: GenerationDefaults | null | undefined);
-    get inference_type(): string | undefined;
-    set inference_type(value: string | null | undefined);
-    model: Uint8Array;
-    get multimodal_projector(): Uint8Array | undefined;
-    set multimodal_projector(value: Uint8Array | null | undefined);
-}
-
-export class ModelSource {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    static bytes(bytes: Uint8Array): ModelSource;
-    static parts(parts: ModelParts): ModelSource;
-}
-
-export class SamplingDefaults {
-    free(): void;
-    [Symbol.dispose](): void;
-    constructor();
-    get min_p(): number | undefined;
-    set min_p(value: number | null | undefined);
-    get repetition_penalty(): number | undefined;
-    set repetition_penalty(value: number | null | undefined);
-    get temperature(): number | undefined;
-    set temperature(value: number | null | undefined);
-    get top_k(): number | undefined;
-    set top_k(value: number | null | undefined);
-    get top_p(): number | undefined;
-    set top_p(value: number | null | undefined);
-}
-
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_bundlerepo_free: (a: number, b: number) => void;
+    readonly bundlerepo_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
+    readonly bundlerepo_cacheSize: (a: number) => any;
+    readonly bundlerepo_clearCache: (a: number) => any;
+    readonly bundlerepo_download: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
+    readonly bundlerepo_isCached: (a: number, b: number, c: number) => any;
+    readonly bundlerepo_new: (a: number, b: number) => [number, number, number];
+    readonly bundlerepo_remove: (a: number, b: number, c: number) => any;
+    readonly bundlerepo_storeDir: (a: number) => [number, number];
+    readonly bundlerepo_text: (a: number, b: number, c: number) => any;
+    readonly listLeapBundles: () => any;
+    readonly persistStorage: () => any;
+    readonly __wbg_generativemodel_free: (a: number, b: number) => void;
+    readonly __wbg_get_loadconfig_backend: (a: number) => [number, number];
+    readonly __wbg_get_loadconfig_context_size: (a: number) => number;
+    readonly __wbg_get_loadconfig_draft_model: (a: number) => [number, number];
+    readonly __wbg_get_loadconfig_gpu_depthformer: (a: number) => number;
+    readonly __wbg_get_modelparts_audio_decoder: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_audio_tokenizer: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_chat_template: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_draft_model: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_generation_defaults: (a: number) => number;
+    readonly __wbg_get_modelparts_inference_type: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_model: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_multimodal_projector: (a: number) => [number, number];
+    readonly __wbg_get_samplingdefaults_min_p: (a: number) => number;
+    readonly __wbg_get_samplingdefaults_repetition_penalty: (a: number) => number;
+    readonly __wbg_get_samplingdefaults_temperature: (a: number) => number;
+    readonly __wbg_get_samplingdefaults_top_k: (a: number) => number;
+    readonly __wbg_get_samplingdefaults_top_p: (a: number) => number;
+    readonly __wbg_loadconfig_free: (a: number, b: number) => void;
+    readonly __wbg_modelhandle_free: (a: number, b: number) => void;
+    readonly __wbg_modelloader_free: (a: number, b: number) => void;
+    readonly __wbg_modelparts_free: (a: number, b: number) => void;
+    readonly __wbg_modelsource_free: (a: number, b: number) => void;
+    readonly __wbg_samplingdefaults_free: (a: number, b: number) => void;
+    readonly __wbg_set_loadconfig_backend: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_loadconfig_context_size: (a: number, b: number) => void;
+    readonly __wbg_set_loadconfig_draft_model: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_loadconfig_gpu_depthformer: (a: number, b: number) => void;
+    readonly __wbg_set_modelparts_audio_decoder: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_audio_tokenizer: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_chat_template: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_draft_model: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_generation_defaults: (a: number, b: number) => void;
+    readonly __wbg_set_modelparts_inference_type: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_model: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_modelparts_multimodal_projector: (a: number, b: number, c: number) => void;
+    readonly __wbg_set_samplingdefaults_min_p: (a: number, b: number) => void;
+    readonly __wbg_set_samplingdefaults_repetition_penalty: (a: number, b: number) => void;
+    readonly __wbg_set_samplingdefaults_temperature: (a: number, b: number) => void;
+    readonly __wbg_set_samplingdefaults_top_k: (a: number, b: number) => void;
+    readonly __wbg_set_samplingdefaults_top_p: (a: number, b: number) => void;
+    readonly generativemodel_createSession: (a: number, b: number) => [number, number, number];
+    readonly generativemodel_engine: (a: number) => number;
+    readonly loadconfig_new: (a: number, b: number, c: number) => number;
+    readonly modelhandle_asGenerative: (a: number) => number;
+    readonly modelhandle_kind: (a: number) => [number, number];
+    readonly modelloader_build: (a: number) => [number, number, number];
+    readonly modelloader_buildGenerative: (a: number) => [number, number, number];
+    readonly modelloader_new: (a: number, b: number) => number;
+    readonly modelparts_new: (a: number, b: number) => number;
+    readonly modelsource_bytes: (a: number, b: number) => number;
+    readonly modelsource_parts: (a: number) => number;
+    readonly samplingdefaults_new: () => number;
+    readonly __wbg_webgpucancelhandle_free: (a: number, b: number) => void;
+    readonly __wbg_webgpusession_free: (a: number, b: number) => void;
+    readonly webgpucancelhandle_cancel: (a: number) => void;
+    readonly webgpucancelhandle_clearCancel: (a: number) => void;
+    readonly webgpusession_adapter: (a: number) => [number, number];
+    readonly webgpusession_appendAudio: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly webgpusession_appendImage: (a: number, b: number, c: number, d: number) => any;
+    readonly webgpusession_appendTokens: (a: number, b: number, c: number) => [number, number];
+    readonly webgpusession_audioIn: (a: number) => number;
+    readonly webgpusession_audioOut: (a: number) => number;
+    readonly webgpusession_cancel: (a: number) => void;
+    readonly webgpusession_cancelHandle: (a: number) => number;
+    readonly webgpusession_capabilities: (a: number) => any;
+    readonly webgpusession_clearCancel: (a: number) => void;
+    readonly webgpusession_create: (a: number, b: number, c: number, d: number) => any;
+    readonly webgpusession_createWithParts: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
+    readonly webgpusession_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => any;
+    readonly webgpusession_generate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: any) => any;
+    readonly webgpusession_generateTokens: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: any, k: number) => any;
+    readonly webgpusession_imageIn: (a: number) => number;
+    readonly webgpusession_kvCompression: (a: number) => [number, number];
+    readonly webgpusession_position: (a: number) => number;
+    readonly webgpusession_reset: (a: number) => [number, number];
+    readonly webgpusession_setImageMaxLongSize: (a: number, b: number) => void;
+    readonly webgpusession_tokenizer: (a: number) => number;
+    readonly __wbg_generationdefaults_free: (a: number, b: number) => void;
+    readonly generationdefaults_audio: (a: number, b: number, c: number, d: number) => number;
+    readonly generationdefaults_other: (a: number, b: number) => number;
+    readonly generationdefaults_text: (a: number) => number;
+    readonly generationdefaults_toJson: (a: number) => [number, number, number, number];
     readonly __wbg_ceraengine_free: (a: number, b: number) => void;
+    readonly __wbg_chatsession_free: (a: number, b: number) => void;
     readonly __wbg_generateopts_free: (a: number, b: number) => void;
     readonly __wbg_generatesummary_free: (a: number, b: number) => void;
+    readonly __wbg_ingestsummary_free: (a: number, b: number) => void;
     readonly __wbg_loraadapters_free: (a: number, b: number) => void;
     readonly __wbg_manifest_free: (a: number, b: number) => void;
     readonly __wbg_session_free: (a: number, b: number) => void;
     readonly __wbg_sessionconfig_free: (a: number, b: number) => void;
     readonly __wbg_tokenizer_free: (a: number, b: number) => void;
     readonly __wbg_turboquantconfig_free: (a: number, b: number) => void;
-    readonly __wbg_webgpucancelhandle_free: (a: number, b: number) => void;
-    readonly __wbg_webgpusession_free: (a: number, b: number) => void;
-    readonly bundlerepo_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
-    readonly bundlerepo_cacheSize: (a: number) => number;
-    readonly bundlerepo_clearCache: (a: number) => number;
-    readonly bundlerepo_download: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
-    readonly bundlerepo_isCached: (a: number, b: number, c: number) => number;
-    readonly bundlerepo_new: (a: number, b: number, c: number) => void;
-    readonly bundlerepo_remove: (a: number, b: number, c: number) => number;
-    readonly bundlerepo_storeDir: (a: number, b: number) => void;
-    readonly bundlerepo_text: (a: number, b: number, c: number) => number;
-    readonly ceraVersion: (a: number) => void;
+    readonly __wbg_turnresult_free: (a: number, b: number) => void;
+    readonly ceraVersion: () => [number, number];
     readonly ceraengine_addBosToken: (a: number) => number;
     readonly ceraengine_addEosToken: (a: number) => number;
-    readonly ceraengine_architecture: (a: number, b: number) => void;
-    readonly ceraengine_capabilities: (a: number) => number;
+    readonly ceraengine_architecture: (a: number) => [number, number];
+    readonly ceraengine_capabilities: (a: number) => any;
     readonly ceraengine_contextSize: (a: number) => number;
     readonly ceraengine_defaultGenerateOpts: (a: number) => number;
-    readonly ceraengine_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => number;
-    readonly ceraengine_fromGgufBytes: (a: number, b: number, c: number, d: number) => void;
-    readonly ceraengine_fromGgufParts: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-    readonly ceraengine_fromManifestUrl: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly ceraengine_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
+    readonly ceraengine_fromGgufBytes: (a: number, b: number, c: number) => [number, number, number];
+    readonly ceraengine_fromGgufParts: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
+    readonly ceraengine_fromManifestUrl: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly ceraengine_hasChatTemplate: (a: number) => number;
     readonly ceraengine_maxSeqLen: (a: number) => number;
-    readonly ceraengine_metadata: (a: number) => number;
-    readonly ceraengine_newSession: (a: number, b: number, c: number) => void;
-    readonly ceraengine_quantization: (a: number, b: number) => void;
+    readonly ceraengine_metadata: (a: number) => any;
+    readonly ceraengine_newChatSession: (a: number, b: number) => [number, number, number];
+    readonly ceraengine_newSession: (a: number, b: number) => [number, number, number];
+    readonly ceraengine_quantization: (a: number) => [number, number];
     readonly ceraengine_tokenizer: (a: number) => number;
     readonly ceraengine_toolCallStartToken: (a: number, b: number) => number;
     readonly ceraengine_toolFormat: (a: number) => number;
-    readonly ceraengine_transcribe: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly ceraengine_transcribe: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly ceraengine_vocabSize: (a: number) => number;
-    readonly cpuBackendReport: (a: number) => void;
+    readonly chatsession_cancel: (a: number) => [number, number];
+    readonly chatsession_capabilities: (a: number) => [number, number, number];
+    readonly chatsession_clearCancel: (a: number) => [number, number];
+    readonly chatsession_complete: (a: number, b: number) => [number, number, number];
+    readonly chatsession_completeJson: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly chatsession_generateStreaming: (a: number, b: number, c: any) => [number, number, number];
+    readonly chatsession_generateStreamingJson: (a: number, b: number, c: number, d: number, e: any) => [number, number, number];
+    readonly chatsession_hiddenSize: (a: number) => number;
+    readonly chatsession_ingest: (a: number, b: any) => [number, number, number];
+    readonly chatsession_ingestMessages: (a: number, b: any) => [number, number, number];
+    readonly chatsession_ingestToolResponse: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly chatsession_intoSession: (a: number) => [number, number, number];
+    readonly chatsession_new: (a: number) => [number, number, number];
+    readonly chatsession_phase: (a: number) => [number, number, number, number];
+    readonly chatsession_position: (a: number) => [number, number, number];
+    readonly chatsession_replaceMessages: (a: number, b: any) => [number, number, number];
+    readonly chatsession_reset: (a: number) => [number, number];
+    readonly chatsession_setToolFormat: (a: number, b: number) => [number, number];
+    readonly chatsession_setTools: (a: number, b: number, c: number) => [number, number];
+    readonly chatsession_toolFormat: (a: number) => [number, number, number];
+    readonly chatsession_tools: (a: number) => [number, number, number, number];
+    readonly cpuBackendReport: () => [number, number];
     readonly detectToolFormat: (a: number, b: number) => number;
     readonly generateopts_clearGrammar: (a: number) => void;
+    readonly generateopts_clearSpecDecode: (a: number) => void;
     readonly generateopts_flushEveryMs: (a: number) => number;
     readonly generateopts_flushEveryTokens: (a: number) => number;
-    readonly generateopts_grammarTriggerTokens: (a: number, b: number) => void;
+    readonly generateopts_grammarTriggerTokens: (a: number) => [number, number];
     readonly generateopts_hasGrammar: (a: number) => number;
+    readonly generateopts_hasSpecDecode: (a: number) => number;
     readonly generateopts_ignoreEos: (a: number) => number;
     readonly generateopts_maxTokens: (a: number) => number;
     readonly generateopts_minP: (a: number) => number;
     readonly generateopts_new: () => number;
     readonly generateopts_repetitionPenalty: (a: number) => number;
-    readonly generateopts_setGrammar: (a: number, b: number, c: number, d: number) => void;
+    readonly generateopts_setGrammar: (a: number, b: number, c: number) => [number, number];
+    readonly generateopts_setJsonSchema: (a: number, b: number, c: number) => [number, number];
+    readonly generateopts_setSpecDecode: (a: number, b: number, c: number) => void;
     readonly generateopts_set_flushEveryMs: (a: number, b: number) => void;
     readonly generateopts_set_flushEveryTokens: (a: number, b: number) => void;
     readonly generateopts_set_grammarTriggerTokens: (a: number, b: number, c: number) => void;
@@ -1635,69 +1968,76 @@ export interface InitOutput {
     readonly generateopts_set_temperature: (a: number, b: number) => void;
     readonly generateopts_set_topK: (a: number, b: number) => void;
     readonly generateopts_set_topP: (a: number, b: number) => void;
-    readonly generateopts_stopTokens: (a: number, b: number) => void;
+    readonly generateopts_stopTokens: (a: number) => [number, number];
     readonly generateopts_temperature: (a: number) => number;
     readonly generateopts_topK: (a: number) => number;
     readonly generateopts_topP: (a: number) => number;
+    readonly generateopts_withJsonSchema: (a: number, b: number, c: number) => [number, number, number];
     readonly generatesummary_decodeMs: (a: number) => number;
-    readonly generatesummary_finishReason: (a: number, b: number) => void;
+    readonly generatesummary_finishReason: (a: number) => [number, number];
     readonly generatesummary_promptEvalMs: (a: number) => number;
     readonly generatesummary_promptEvalTokens: (a: number) => number;
     readonly generatesummary_tokensGenerated: (a: number) => number;
-    readonly listLeapBundles: () => number;
-    readonly loraadapters_fromGgufBytes: (a: number, b: number, c: number) => void;
-    readonly loraadapters_fromSafetensorsBytes: (a: number, b: number, c: number, d: number) => void;
+    readonly ingestsummary_inputTokens: (a: number) => number;
+    readonly ingestsummary_positionAfter: (a: number) => number;
+    readonly ingestsummary_positionBefore: (a: number) => number;
+    readonly jsonSchemaToGrammar: (a: number, b: number) => [number, number, number, number];
+    readonly loraadapters_fromGgufBytes: (a: number, b: number) => [number, number, number];
+    readonly loraadapters_fromSafetensorsBytes: (a: number, b: number, c: number) => [number, number, number];
     readonly loraadapters_targetCount: (a: number) => number;
-    readonly manifest_audioDecoderUrl: (a: number, b: number) => void;
-    readonly manifest_audioTokenizerUrl: (a: number, b: number) => void;
-    readonly manifest_chatTemplate: (a: number, b: number) => void;
-    readonly manifest_inferenceType: (a: number, b: number) => void;
-    readonly manifest_modelUrl: (a: number, b: number) => void;
-    readonly manifest_multimodalProjectorUrl: (a: number, b: number) => void;
-    readonly manifest_parse: (a: number, b: number, c: number) => void;
-    readonly manifest_schemaVersion: (a: number, b: number) => void;
-    readonly parseToolCalls: (a: number, b: number, c: number, d: number) => void;
-    readonly persistStorage: () => number;
-    readonly session_appendAudio: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly session_appendImage: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly session_appendText: (a: number, b: number, c: number, d: number) => void;
-    readonly session_appendTokens: (a: number, b: number, c: number, d: number) => void;
-    readonly session_attachLora: (a: number, b: number, c: number) => void;
+    readonly manifest_audioDecoderUrl: (a: number) => [number, number];
+    readonly manifest_audioTokenizerUrl: (a: number) => [number, number];
+    readonly manifest_chatTemplate: (a: number) => [number, number];
+    readonly manifest_draftModelUrl: (a: number) => [number, number];
+    readonly manifest_inferenceType: (a: number) => [number, number];
+    readonly manifest_modelUrl: (a: number) => [number, number];
+    readonly manifest_multimodalProjectorUrl: (a: number) => [number, number];
+    readonly manifest_parse: (a: number, b: number) => [number, number, number];
+    readonly manifest_schemaVersion: (a: number) => [number, number];
+    readonly parseToolCalls: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly session_appendAudio: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly session_appendImage: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly session_appendText: (a: number, b: number, c: number) => [number, number];
+    readonly session_appendTokens: (a: number, b: number, c: number) => [number, number];
+    readonly session_attachLora: (a: number, b: number) => [number, number];
     readonly session_cancel: (a: number) => void;
-    readonly session_capabilities: (a: number) => number;
+    readonly session_capabilities: (a: number) => any;
     readonly session_clearCancel: (a: number) => void;
-    readonly session_generate: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly session_generate: (a: number, b: number, c: any, d: number) => [number, number, number];
     readonly session_hasLora: (a: number) => number;
     readonly session_hiddenSize: (a: number) => number;
-    readonly session_hiddenStatesForText: (a: number, b: number, c: number, d: number) => void;
-    readonly session_hiddenStatesForTokens: (a: number, b: number, c: number, d: number) => void;
-    readonly session_hiddenStatesMeanPooled: (a: number, b: number, c: number, d: number) => void;
+    readonly session_hiddenStatesForText: (a: number, b: number, c: number) => [number, number, number];
+    readonly session_hiddenStatesForTokens: (a: number, b: number, c: number) => [number, number, number];
+    readonly session_hiddenStatesMeanPooled: (a: number, b: number, c: number) => [number, number, number];
+    readonly session_intoChat: (a: number) => [number, number, number];
     readonly session_position: (a: number) => number;
     readonly session_removeLora: (a: number) => void;
-    readonly session_reset: (a: number, b: number) => void;
+    readonly session_reset: (a: number) => [number, number];
     readonly session_setImageMaxLongSize: (a: number, b: number) => void;
     readonly sessionconfig_kvCompression: (a: number) => number;
     readonly sessionconfig_maxSeqLen: (a: number) => number;
     readonly sessionconfig_nKeep: (a: number) => number;
     readonly sessionconfig_new: () => number;
-    readonly sessionconfig_seed: (a: number, b: number) => void;
+    readonly sessionconfig_seed: (a: number) => [number, bigint];
     readonly sessionconfig_set_kvCompression: (a: number, b: number) => void;
     readonly sessionconfig_set_maxSeqLen: (a: number, b: number) => void;
     readonly sessionconfig_set_nKeep: (a: number, b: number) => void;
     readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
+    readonly sessionconfig_set_ubatchSize: (a: number, b: number) => void;
+    readonly sessionconfig_ubatchSize: (a: number) => number;
     readonly tokenizer_addBosToken: (a: number) => number;
-    readonly tokenizer_applyChatTemplate: (a: number, b: number, c: number, d: number) => void;
-    readonly tokenizer_applyChatTemplateWithTools: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly tokenizer_applyChatTemplate: (a: number, b: any, c: number) => [number, number, number, number];
+    readonly tokenizer_applyChatTemplateWithTools: (a: number, b: any, c: number, d: number, e: number) => [number, number, number, number];
     readonly tokenizer_bosToken: (a: number) => number;
-    readonly tokenizer_chatTemplate: (a: number, b: number) => void;
-    readonly tokenizer_decode: (a: number, b: number, c: number, d: number) => void;
-    readonly tokenizer_encode: (a: number, b: number, c: number, d: number) => void;
-    readonly tokenizer_encodeSpecial: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly tokenizer_chatTemplate: (a: number) => [number, number];
+    readonly tokenizer_decode: (a: number, b: number, c: number) => [number, number];
+    readonly tokenizer_encode: (a: number, b: number, c: number) => [number, number];
+    readonly tokenizer_encodeSpecial: (a: number, b: number, c: number, d: number) => [number, number];
     readonly tokenizer_eosToken: (a: number) => number;
     readonly tokenizer_isSpecialToken: (a: number, b: number) => number;
     readonly tokenizer_specialTokenId: (a: number, b: number, c: number) => number;
     readonly tokenizer_vocabSize: (a: number) => number;
-    readonly toolGrammar: (a: number, b: number, c: number, d: number) => void;
+    readonly toolGrammar: (a: number, b: number, c: number) => [number, number, number, number];
     readonly turboquantconfig_keys: (a: number) => number;
     readonly turboquantconfig_new: (a: bigint) => number;
     readonly turboquantconfig_seed: (a: number) => bigint;
@@ -1705,42 +2045,34 @@ export interface InitOutput {
     readonly turboquantconfig_set_seed: (a: number, b: bigint) => void;
     readonly turboquantconfig_set_values: (a: number, b: number) => void;
     readonly turboquantconfig_values: (a: number) => number;
-    readonly webgpucancelhandle_cancel: (a: number) => void;
-    readonly webgpucancelhandle_clearCancel: (a: number) => void;
-    readonly webgpusession_adapter: (a: number, b: number) => void;
-    readonly webgpusession_appendAudio: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly webgpusession_appendImage: (a: number, b: number, c: number, d: number) => number;
-    readonly webgpusession_appendTokens: (a: number, b: number, c: number, d: number) => void;
-    readonly webgpusession_audioIn: (a: number) => number;
-    readonly webgpusession_audioOut: (a: number) => number;
-    readonly webgpusession_cancel: (a: number) => void;
-    readonly webgpusession_cancelHandle: (a: number) => number;
-    readonly webgpusession_capabilities: (a: number) => number;
-    readonly webgpusession_clearCancel: (a: number) => void;
-    readonly webgpusession_create: (a: number, b: number, c: number, d: number) => number;
-    readonly webgpusession_createWithParts: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
-    readonly webgpusession_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
-    readonly webgpusession_generate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number) => number;
-    readonly webgpusession_generateTokens: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number, k: number) => number;
-    readonly webgpusession_imageIn: (a: number) => number;
-    readonly webgpusession_kvCompression: (a: number, b: number) => void;
-    readonly webgpusession_position: (a: number) => number;
-    readonly webgpusession_setImageMaxLongSize: (a: number, b: number) => void;
-    readonly webgpusession_tokenizer: (a: number) => number;
+    readonly turnresult_decodeMs: (a: number) => number;
+    readonly turnresult_finishReason: (a: number) => [number, number];
+    readonly turnresult_promptEvalMs: (a: number) => number;
+    readonly turnresult_promptEvalTokens: (a: number) => number;
+    readonly turnresult_summary: (a: number) => number;
+    readonly turnresult_text: (a: number) => [number, number];
+    readonly turnresult_tokens: (a: number) => [number, number];
+    readonly turnresult_tokensGenerated: (a: number) => number;
+    readonly turnresult_toolCalls: (a: number) => [number, number, number];
+    readonly turnresult_toolCallsJson: (a: number) => [number, number, number, number];
     readonly wasm_init: () => void;
-    readonly sessionconfig_set_ubatchSize: (a: number, b: number) => void;
-    readonly sessionconfig_ubatchSize: (a: number) => number;
-    readonly __wasm_bindgen_func_elem_6863: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_5690: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_5690_2: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_5690_3: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6878: (a: number, b: number, c: number, d: number) => void;
-    readonly __wbindgen_export: (a: number, b: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_export3: (a: number) => void;
-    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export5: (a: number, b: number) => void;
-    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___JsValue__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuDevice__GpuDevice__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__JsOption_wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__JsOption_wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuAdapter__GpuAdapter___core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__Undefined__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___js_sys_1fcd217b704f9fe4___Function_fn_wasm_bindgen_c0aede8f3a24923c___JsValue_____wasm_bindgen_c0aede8f3a24923c___sys__Undefined___js_sys_1fcd217b704f9fe4___Function_fn_wasm_bindgen_c0aede8f3a24923c___JsValue_____wasm_bindgen_c0aede8f3a24923c___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuDeviceLostInfo__GpuDeviceLostInfo______true_: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuUncapturedErrorEvent__GpuUncapturedErrorEvent______true_: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___bool__true_: (a: number, b: number) => number;
+    readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
+    readonly __wbindgen_externrefs: WebAssembly.Table;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_destroy_closure: (a: number, b: number) => void;
+    readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_start: () => void;
 }
 
