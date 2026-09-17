@@ -7013,7 +7013,7 @@ impl GpuLfm2Model {
     /// Asynchronously captures a resumable snapshot of GPU session state
     /// (attention KV buffers, rolling conv buffers, and sequence counter).
     ///
-    /// Unlike the blocking [`Self::snapshot_state_locked`], this method
+    /// Unlike the blocking `snapshot_state_locked` helper, this method
     /// dispatches GPU staging buffer readbacks under `infer_lock`, releases
     /// the lock, and asynchronously awaits buffer mapping without blocking
     /// the browser event loop.
