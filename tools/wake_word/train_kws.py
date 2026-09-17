@@ -12,11 +12,12 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import wave
-from typing import Dict, List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,7 +34,18 @@ from scripts.convert_kws import (
 )
 
 
-# Natural English voices available on macOS
+def seed_everything(seed: int = 42) -> None:
+    """Seed all random number generators for reproducible dataset generation and training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+
+
+# Natural English voices available on macOS (excluding eval held-out voices like Tara)
 VOICES = [
     "Samantha",
     "Daniel",
@@ -46,47 +58,196 @@ VOICES = [
     "Fred",
     "Albert",
     "Aman",
+    "Junior",
+    "Eddy",
+    "Flo",
+    "Reed",
+    "Sandy",
+    "Shelley",
+    "Rocko",
 ]
 
-# Rates in words per minute
+# Rates in words per minute covering natural speech range
 RATES = [150, 175, 200]
 
-def get_training_texts(phrase: str = "Hey Liquid") -> Tuple[List[str], List[str]]:
+
+def is_phrase_in_text(phrase: str, text: str) -> bool:
+    """Check if the sequence of words in phrase appears as a contiguous subsequence in text."""
+    phrase_words = [w for w in re.findall(r"\b\w+\b", phrase.lower()) if w]
+    text_words = [w for w in re.findall(r"\b\w+\b", text.lower()) if w]
+    if not phrase_words or len(text_words) < len(phrase_words):
+        return False
+    k = len(phrase_words)
+    for i in range(len(text_words) - k + 1):
+        if text_words[i : i + k] == phrase_words:
+            return True
+    return False
+
+
+def get_training_texts(
+    phrase: str = "Hey Liquid",
+    extra_negatives: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str]]:
     """Generate positive variations and negative confusers for a target phrase."""
     pos_texts = [
         phrase,
         phrase.lower(),
+        f"{phrase}.",
+        f"{phrase.lower()}.",
+        f"{phrase}!",
+        f"{phrase}?",
+        f"{phrase},",
         f"{phrase} please",
-        f"{phrase} wake up",
-        f"{phrase} what time is it",
-        f"{phrase} turn on the lights",
-        f"{phrase} can you help me",
-        f"{phrase} what is the weather",
-        f"{phrase} add milk to my list",
-        f"{phrase} set a timer",
-        f"{phrase} open messages",
+        f"{phrase} now",
     ]
-    words = phrase.split()
+    words = [w for w in re.findall(r"\b\w+\b", phrase) if w]
     if len(words) == 2 and words[0].lower() in ("hey", "hi", "okay", "ok"):
+        w0 = words[0]
+        w1 = words[1]
         pos_texts.extend([
-            f"Hey {words[1]}",
-            f"Hi {words[1]}",
-            f"Okay {words[1]}",
+            f"{w0.capitalize()} {w1}",
+            f"{w0.capitalize()}, {w1}",
+            f"{w0.capitalize()} {w1}.",
+            f"{w0.capitalize()}, {w1}.",
+            f"{w0.capitalize()} {w1}!",
+            f"{w0.lower()} {w1.lower()}",
+            f"{w0.lower()}, {w1.lower()}",
+            f"{w0.lower()} {w1.lower()}.",
+            f"{w0.lower()}, {w1.lower()}.",
+            f"{w0.capitalize()} {w1} please",
+            f"{w0.capitalize()} {w1}, please",
+            f"{w0.capitalize()} {w1} now",
+            f"{w0.capitalize()} {w1}, can you",
+            f"{w0.capitalize()} {w1} can you",
+            f"{w0.capitalize()} {w1}, help",
+            f"{w0.capitalize()} {w1} help",
+            f"{w0.capitalize()} {w1}, start",
+            f"{w0.capitalize()} {w1}, turn on the lights",
+            f"{w0.capitalize()} {w1}, what time is it",
+            f"{w0.capitalize()} {w1}, how are you",
         ])
 
-    neg_texts = list(NEGATIVE_TEXTS) + list(NEGATIVE_CONVERSATIONAL) + list(NEGATIVE_LIQUID) + list(NEGATIVE_HEY)
-    if phrase.lower() != "hey liquid":
-        if len(words) > 1 and words[0].lower() == "hey":
-            for prefix in ["they", "play", "say", "may", "bay", "way", "ray", "pay", "day"]:
-                neg_texts.append(f"{prefix} {' '.join(words[1:])}")
-        for w in words:
-            neg_texts.append(w)
+    phrase_lower = phrase.lower()
+    neg_texts = list(NEGATIVE_TEXTS) + list(NEGATIVE_CONVERSATIONAL) + list(NEGATIVE_HEY)
+    if "liquid" in phrase_lower:
+        neg_texts.extend(NEGATIVE_LIQUID)
 
-    return list(dict.fromkeys(pos_texts)), list(dict.fromkeys(neg_texts))
+    if len(words) > 1 and words[0].lower() in ("hey", "hi", "okay", "ok"):
+        target_name = " ".join(words[1:])
+        # Competing onset prefixes
+        synonyms = {"ok", "okay"}
+        w0_lower = words[0].lower()
+        for prefix in [
+            "they", "play", "say", "may", "bay", "way", "ray", "pay", "day",
+            "stay", "gray", "pray", "lay", "delay", "relay", "decay", "today",
+            "away", "bye", "why", "no", "yes", "oh", "yo", "hello", "good", "bad",
+            "okay", "hi", "hey",
+        ]:
+            is_synonym = prefix.lower() in synonyms and w0_lower in synonyms
+            if prefix.lower() != w0_lower and not is_synonym:
+                neg_texts.append(f"{prefix} {target_name}")
+                neg_texts.append(f"{prefix.capitalize()} {target_name}")
+
+        # In-cabin / conversational usage of target_name without wake intent
+        neg_texts.extend([
+            target_name,
+            f"a {target_name}",
+            f"the {target_name}",
+            f"my {target_name}",
+            f"this {target_name}",
+            f"that {target_name}",
+            f"our {target_name}",
+            f"your {target_name}",
+            f"his {target_name}",
+            f"her {target_name}",
+            f"in the {target_name}",
+            f"inside the {target_name}",
+            f"with the {target_name}",
+            f"about the {target_name}",
+            f"I like the {target_name}",
+            f"I love my {target_name}",
+            f"Where is the {target_name}",
+            f"Look at that {target_name}",
+            f"This is a {target_name}",
+            f"Is that a {target_name}",
+            f"The new {target_name} looks great",
+            f"That old {target_name}",
+            f"An old {target_name}",
+            f"{target_name} is fast",
+            f"{target_name} is in the shop",
+            f"park the {target_name}",
+            f"we took the {target_name}",
+            f"driving a {target_name}",
+            f"drives a {target_name}",
+            f"she drives a {target_name}",
+            f"he drives a {target_name}",
+            f"my {target_name} needs service",
+            f"my {target_name} needs gas",
+            f"talking about {target_name}",
+            f"rent a {target_name}",
+            f"buy a {target_name}",
+            f"sold the {target_name}",
+            f"start the {target_name}",
+            f"stop the {target_name}",
+        ])
+
+        # Target name as leading noun/modifier without wake onset
+        for suffix in [
+            "car", "vehicle", "app", "system", "model", "sedan", "brand",
+            "company", "assistant", "software", "group", "engine", "driver",
+            "service", "dealership", "parts",
+        ]:
+            neg_texts.append(f"{target_name} {suffix}")
+            neg_texts.append(f"{target_name.capitalize()} {suffix}")
+
+    if extra_negatives:
+        neg_texts.extend(extra_negatives)
+
+    # Prevent target phrase contamination: eliminate any negative texts
+    # whose lowercased representation overlaps with the positive variations
+    # or that contain the target phrase as a word subsequence.
+    pos_set_lower = {p.lower() for p in pos_texts}
+    cleaned_neg_texts = [
+        t.strip() for t in neg_texts
+        if t and t.strip() and t.lower() not in pos_set_lower and not is_phrase_in_text(phrase, t)
+    ]
+
+    return list(dict.fromkeys(pos_texts)), list(dict.fromkeys(cleaned_neg_texts))
+
 
 
 NEGATIVE_LIQUID = [
-    # Crucial hard negatives: 'liquid' without 'hey'
+    # Phonetic near-rhymes
+    "they liquid",
+    "play liquid",
+    "say liquid",
+    "may liquid",
+    "bay liquid",
+    "way liquid",
+    "ray liquid",
+    "pay liquid",
+    "nay liquid",
+    "day liquid",
+    # Phonetic target confusers
+    "hey squid",
+    "hey livid",
+    "hey lipid",
+    "hey lizard",
+    "hey limit",
+    "hey rigid",
+    "hey frigid",
+    "hey wicked",
+    "hey vivid",
+    # Single words
+    "liquid",
+    "squid",
+    "livid",
+    "limit",
+    "rigid",
+    "frigid",
+    "wicked",
+    "vivid",
+    # Hard negatives: 'liquid' without 'hey'
     "liquid agent",
     "liquid mobile app",
     "liquid soap",
@@ -110,7 +271,7 @@ NEGATIVE_LIQUID = [
 ]
 
 NEGATIVE_HEY = [
-    # Crucial hard negatives: 'hey' without 'liquid'
+    # Hard negatives: 'hey' without target keyword
     "hey there",
     "hey how are you doing",
     "hey what is up",
@@ -130,6 +291,7 @@ NEGATIVE_HEY = [
     "hey wait for me",
     "hey please help me with this",
 ]
+
 
 
 NEGATIVE_CONVERSATIONAL = [
@@ -177,92 +339,130 @@ NEGATIVE_CONVERSATIONAL = [
 
 
 NEGATIVE_TEXTS = [
-    # Phonetic near-rhymes
-    "they liquid",
-    "play liquid",
-    "say liquid",
-    "may liquid",
-    "bay liquid",
-    "way liquid",
-    "ray liquid",
-    "pay liquid",
-    "nay liquid",
-    "day liquid",
-    # Phonetic target confusers
-    "hey squid",
-    "hey livid",
-    "hey lipid",
-    "hey lizard",
-    "hey limit",
-    "hey rigid",
-    "hey frigid",
-    "hey wicked",
-    "hey vivid",
-    # Single words
-    "liquid",
-    "squid",
-    "livid",
-    "limit",
-    "rigid",
-    "frigid",
-    "wicked",
-    "vivid",
-    # Collocations & phrases with 'liquid'
-    "liquid soap",
-    "liquid nitrogen",
-    "liquid paper",
-    "liquid detergent",
-    "clear liquid",
-    "dishwashing liquid",
-    "spilled some liquid on the desk",
-    "drinking cold liquid after exercise",
-    "is this a solid or a liquid state of matter",
-    # Competitor wake words
-    "Hey Siri",
-    "Hey Google",
-    "Okay Google",
-    "Alexa",
+    # Voice assistant wake phrases
+    "Hey Assistant",
+    "Okay Assistant",
+    "Hey Device",
+    "Hey System",
     "Computer",
     "Jarvis",
-    # General conversational phrases
+    # Phonetic and sibilant rhyming near-misses
+    "Hey series",
+    "Hey ferris",
+    "Hey service",
+    "Hey serious",
+    "Hey surface",
+    "Hey cereals",
+    "Hey circus",
+    "Hey secret",
+    "Hey server",
+    "Hey setup",
+    "Hey safety",
+    "Hey sensor",
+    # Common voice commands
     "what time is it",
     "turn on the lights",
+    "turn off the lights",
     "play some music",
+    "stop the music",
     "call mom",
     "set an alarm",
     "how is the weather today",
     "hello world",
     "good morning",
     "cancel that",
-    "stop music",
+    "navigate home",
+    "turn on the air conditioner",
+    "turn off the air conditioner",
+    "set the temperature",
+    "lower the temperature",
+    "turn up the volume",
+    "turn down the volume",
+    "mute audio",
 ]
 
 
-def check_voice_available(voice: str) -> bool:
-    """Check if a specific TTS voice is installed and functional."""
+def get_available_voices() -> List[str]:
+    """Return available voices from macOS say system with resilient fallbacks."""
     if sys.platform != "darwin":
+        return []
+    try:
+        res = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10.0)
+        if res.returncode != 0:
+            return []
+
+        installed_voices: List[Tuple[str, str]] = []
+        for line in res.stdout.splitlines():
+            line_str = line.strip()
+            if not line_str or "#" not in line_str:
+                continue
+            left = line_str.split("#")[0].strip()
+            parts = left.rsplit(maxsplit=1)
+            if len(parts) == 2:
+                installed_voices.append((parts[0].strip(), parts[1].strip()))
+
+        installed_names = {v[0] for v in installed_voices} | {v[0].split()[0] for v in installed_voices}
+        matched = [v for v in VOICES if v in installed_names]
+        if matched:
+            return matched
+
+        # Resilient fallback 1: Any installed English voice
+        en_voices = [v[0] for v in installed_voices if v[1].lower().startswith("en")]
+        if en_voices:
+            return en_voices
+
+        # Resilient fallback 2: Any installed system voice
+        return [v[0] for v in installed_voices] if installed_voices else []
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return []
+
+
+def _is_valid_wav(path: str) -> bool:
+    """Verify that path exists, has sufficient size, and matches 16 kHz mono 16-bit PCM."""
+    if not os.path.exists(path) or os.path.getsize(path) <= 100:
         return False
     try:
-        cmd = ["say", "-v", voice, "test"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        return res.returncode == 0
-    except (FileNotFoundError, subprocess.SubprocessError):
+        with wave.open(path, "rb") as wf:
+            return wf.getnchannels() == 1 and wf.getsampwidth() == 2 and wf.getframerate() == 16000
+    except Exception:
         return False
 
 
 def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
-    """Render text to 16 kHz mono 16-bit PCM WAV using macOS say and afconvert."""
+    """Render text to 16 kHz mono 16-bit PCM WAV using macOS say."""
     if sys.platform != "darwin":
         return False
+    say_cmd = [
+        "say",
+        "-v", voice,
+        "-r", str(rate),
+        "--data-format=LEI16@16000",
+        "-o", output_wav,
+        text,
+    ]
+    try:
+        res = subprocess.run(say_cmd, capture_output=True, timeout=30.0)
+        if res.returncode == 0 and _is_valid_wav(output_wav):
+            return True
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+
+    # Clean up any partial output from primary attempt before fallback
+    if os.path.exists(output_wav):
+        try:
+            os.remove(output_wav)
+        except OSError:
+            pass
+
+    # Fallback to AIFF + afconvert
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp_aiff:
         aiff_path = tmp_aiff.name
     try:
-        # 1. Render speech to AIFF
         say_cmd = ["say", "-v", voice, "-r", str(rate), "-o", aiff_path, text]
-        if subprocess.run(say_cmd, capture_output=True).returncode != 0:
+        res_say = subprocess.run(say_cmd, capture_output=True, timeout=30.0)
+        if res_say.returncode != 0 or not os.path.exists(aiff_path) or os.path.getsize(aiff_path) == 0:
             return False
 
-        # 2. Convert to 16 kHz mono 16-bit PCM WAV via afconvert
         convert_cmd = [
             "afconvert",
             "-f", "WAVE",
@@ -271,21 +471,43 @@ def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
             aiff_path,
             output_wav,
         ]
-        if subprocess.run(convert_cmd, capture_output=True).returncode != 0:
+        res_conv = subprocess.run(convert_cmd, capture_output=True, timeout=30.0)
+        if res_conv.returncode != 0:
             return False
 
-        return os.path.exists(output_wav) and os.path.getsize(output_wav) > 100
+        return _is_valid_wav(output_wav)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
     finally:
         if os.path.exists(aiff_path):
-            os.remove(aiff_path)
+            try:
+                os.remove(aiff_path)
+            except OSError:
+                pass
+        if os.path.exists(output_wav) and not _is_valid_wav(output_wav):
+            try:
+                os.remove(output_wav)
+            except OSError:
+                pass
 
 
 def read_wav(path: str) -> np.ndarray:
     """Read a 16 kHz mono 16-bit PCM WAV into float32 array in [-1.0, 1.0]."""
     with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
         n_frames = wf.getnframes()
         data = wf.readframes(n_frames)
+    if sampwidth != 2:
+        raise ValueError(f"Expected 16-bit PCM audio, got sample width {sampwidth} in {path}")
+    if framerate != 16000:
+        raise ValueError(f"Expected 16 kHz audio, got framerate {framerate} in {path}")
+    if n_frames == 0 or len(data) == 0:
+        return np.empty(0, dtype=np.float32)
     audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    if n_channels > 1:
+        audio = audio.reshape(-1, n_channels).mean(axis=1)
     return audio
 
 
@@ -293,40 +515,67 @@ def extract_framed_windows(audio: np.ndarray, is_positive: bool, target_len: int
     """
     Extract multiple 19200-sample windows from audio to ensure temporal invariance.
     For positives: generate multiple alignments (left, center, right, intermediate jitter).
-    For negatives: slide across long clips with 400ms overlap.
+    For negatives: slide across long clips with 300ms hop (900ms overlap).
     """
     windows = []
     n = len(audio)
+    if n == 0:
+        return windows
+
+    if n <= target_len:
+        max_offset = target_len - n
+        offsets = {
+            0,
+            max_offset // 5,
+            (2 * max_offset) // 5,
+            (3 * max_offset) // 5,
+            (4 * max_offset) // 5,
+            max_offset,
+        }
+        for off in sorted(offsets):
+            w = np.zeros(target_len, dtype=np.float32)
+            w[off : off + n] = audio
+            windows.append(w)
+        return windows
+
     if is_positive:
-        if n <= target_len:
-            max_offset = target_len - n
-            offsets = {0, max_offset // 3, (2 * max_offset) // 3, max_offset}
-            for off in sorted(offsets):
-                w = np.zeros(target_len, dtype=np.float32)
-                w[off : off + n] = audio
-                windows.append(w)
-        else:
-            for off in [0, 800, 1600]:
-                if off + target_len <= n:
-                    windows.append(audio[off : off + target_len])
-            if n > target_len and (n - target_len) not in [0, 800, 1600]:
-                windows.append(audio[n - target_len :])
+        # Positive wake word starts near the beginning of the clip.
+        # Slice strictly near the front (0 to 300ms jitter) so the wake word
+        # onset and core phonemes are fully present in the window.
+        max_start = min(n - target_len, 4800)
+        offsets = {0, max_start // 3, (2 * max_start) // 3, max_start}
+        for off in sorted(offsets):
+            if off + target_len <= n:
+                windows.append(audio[off : off + target_len])
     else:
-        if n <= target_len:
-            max_offset = target_len - n
-            offsets = {0, max_offset // 3, (2 * max_offset) // 3, max_offset}
-            for off in sorted(offsets):
-                w = np.zeros(target_len, dtype=np.float32)
-                w[off : off + n] = audio
-                windows.append(w)
-        else:
-            hop = 6400  # 400 ms hop
-            for start in range(0, n - target_len + 1, hop):
-                windows.append(audio[start : start + target_len])
-            if (n - target_len) % hop != 0:
-                windows.append(audio[n - target_len :])
+        hop = 4800  # 300 ms hop
+        for start in range(0, n - target_len + 1, hop):
+            windows.append(audio[start : start + target_len])
+        if (n - target_len) % hop != 0:
+            windows.append(audio[n - target_len :])
 
     return windows
+
+
+def apply_spec_augment(mel: np.ndarray) -> np.ndarray:
+    """Apply SpecAugment (frequency and time masking) to log-mel spectrogram."""
+    out = mel.copy()
+    num_mels, num_frames = out.shape
+
+    # Frequency masking (mask 1 to 3 mel channels)
+    if random.random() < 0.6:
+        f0 = random.randint(0, max(0, num_mels - 3))
+        f_width = random.randint(1, 3)
+        out[f0 : f0 + f_width, :] = 0.0
+
+    # Time masking (mask 3 to 10 frames)
+    if random.random() < 0.6 and num_frames > 15:
+        t0 = random.randint(0, max(0, num_frames - 10))
+        t_width = random.randint(3, 10)
+        out[:, t0 : t0 + t_width] = 0.0
+
+    return out
+
 
 
 
@@ -351,29 +600,57 @@ def add_acoustic_perturbations(audio: np.ndarray) -> np.ndarray:
 
 
 class KwsDataset(Dataset):
-    """PyTorch Dataset yielding (mel_spectrogram, label)."""
+    """PyTorch Dataset yielding (mel_spectrogram, label, weight)."""
 
-    def __init__(self, samples: List[Tuple[np.ndarray, float]]):
-        self.samples = samples
+    def __init__(self, samples: List[Tuple[np.ndarray, float, float]]):
+        self.samples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = [
+            (
+                torch.from_numpy(mel) if isinstance(mel, np.ndarray) else mel,
+                torch.tensor([label], dtype=torch.float32) if not isinstance(label, torch.Tensor) else label,
+                torch.tensor([weight], dtype=torch.float32) if not isinstance(weight, torch.Tensor) else weight,
+            )
+            for mel, label, weight in samples
+        ]
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        mel, label = self.samples[idx]
-        return torch.from_numpy(mel), torch.tensor([label], dtype=torch.float32)
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.samples[idx]
 
 
-def synthesize_dataset(output_dir: str, phrase: str = "Hey Liquid") -> List[Tuple[np.ndarray, float]]:
+def load_negatives_file(path: str) -> List[str]:
+    """Load negative phrases from a text file (one per line, skipping comments)."""
+    if not os.path.exists(path) or not os.path.isfile(path):
+        raise FileNotFoundError(f"Negatives file not found or is not a regular file: {path}")
+    negatives = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                normalized = " ".join(line.split())
+                if normalized:
+                    negatives.append(normalized)
+    return list(dict.fromkeys(negatives))
+
+
+def synthesize_dataset(
+    output_dir: str,
+    phrase: str = "Hey Liquid",
+    extra_negatives: Optional[List[str]] = None,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> Tuple[List[Tuple[np.ndarray, float, float]], List[Tuple[np.ndarray, float, float]]]:
     """Synthesize positive and negative speech clips in parallel and extract mel spectrograms."""
+    seed_everything(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    available_voices = [v for v in VOICES if check_voice_available(v)]
+    available_voices = get_available_voices()
     print(f"Available voices ({len(available_voices)}): {', '.join(available_voices)}", flush=True)
     if not available_voices:
         raise RuntimeError("No suitable macOS TTS voices found")
 
-    pos_texts, neg_texts = get_training_texts(phrase)
+    pos_texts, neg_texts = get_training_texts(phrase, extra_negatives=extra_negatives)
     tasks = []
 
     # 1. Plan positive tasks
@@ -382,96 +659,176 @@ def synthesize_dataset(output_dir: str, phrase: str = "Hey Liquid") -> List[Tupl
         for voice in available_voices:
             for rate in RATES:
                 wav_path = os.path.join(output_dir, f"pos_{pos_idx:04d}.wav")
-                tasks.append((text, voice, rate, wav_path, 1.0))
+                tasks.append((text, voice, rate, wav_path, 1.0, False))
                 pos_idx += 1
 
     # 2. Plan negative tasks
     neg_idx = 0
-    words = [w.lower() for w in phrase.split()]
+    words = [w.lower() for w in re.findall(r"\b\w+\b", phrase) if w]
+    if not words:
+        raise ValueError(f"The target wake word '--phrase' cannot be empty or whitespace, got: {phrase!r}")
+    target_name = " ".join(words[1:]) if len(words) > 1 else words[0]
+    extra_set = {t.lower() for t in (extra_negatives or [])}
+    onset = words[0] if words else ""
+
     for text in neg_texts:
         text_lower = text.lower()
-        is_hard_negative = any(w in text_lower for w in words if len(w) > 2)
+        # Hard negatives include target name mentions, user extra negatives, and wake onset confusers
+        is_hard_negative = (
+            is_phrase_in_text(target_name, text_lower)
+            or (text_lower in extra_set)
+            or (bool(onset) and (text_lower == onset or text_lower.startswith(f"{onset} ")))
+        )
         if is_hard_negative:
-            for voice in available_voices:
-                for rate in RATES:
-                    wav_path = os.path.join(output_dir, f"neg_{neg_idx:04d}.wav")
-                    tasks.append((text, voice, rate, wav_path, 0.0))
-                    neg_idx += 1
+            for v_idx, voice in enumerate(available_voices):
+                rate = 175 if (v_idx % 3 == 0) else (150 if v_idx % 3 == 1 else 200)
+                wav_path = os.path.join(output_dir, f"neg_{neg_idx:04d}.wav")
+                tasks.append((text, voice, rate, wav_path, 0.0, True))
+                neg_idx += 1
         else:
-            for voice in available_voices[:7]:
+            for voice in available_voices[:6]:
                 rate = random.choice(RATES)
                 wav_path = os.path.join(output_dir, f"neg_{neg_idx:04d}.wav")
-                tasks.append((text, voice, rate, wav_path, 0.0))
+                tasks.append((text, voice, rate, wav_path, 0.0, False))
                 neg_idx += 1
 
     print(f"Synthesizing {len(tasks)} audio clips using 8 parallel workers...", flush=True)
 
     # Parallel TTS rendering
     def run_task(task):
-        text, voice, rate, wav_path, label = task
+        text, voice, rate, wav_path, label, is_hard_neg = task
         ok = render_tts(text, voice, rate, wav_path)
-        return (wav_path, label, ok)
+        return (wav_path, label, is_hard_neg, ok)
 
     rendered_results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         for res in executor.map(run_task, tasks):
             rendered_results.append(res)
 
-    print(f"Rendered {sum(1 for _, _, ok in rendered_results if ok)} clips successfully. Processing features...", flush=True)
+    valid_results = [r for r in rendered_results if r[3] and os.path.exists(r[0])]
+    print(
+        f"Rendered {len(valid_results)} clips successfully. Partitioning dataset at source level...",
+        flush=True,
+    )
 
-    samples: List[Tuple[np.ndarray, float]] = []
-    pos_count = 0
-    neg_count = 0
+    # Stratified split at the source audio recording level to prevent data leakage across train/val
+    rng = random.Random(seed)
+    pos_records = [r for r in valid_results if r[1] > 0.5]
+    if not pos_records:
+        raise RuntimeError(
+            f"No positive audio clips were successfully rendered for phrase '{phrase}'. "
+            "Cannot train model with zero positive samples."
+        )
+    hard_neg_records = [r for r in valid_results if r[1] <= 0.5 and r[2]]
+    soft_neg_records = [r for r in valid_results if r[1] <= 0.5 and not r[2]]
 
-    for wav_path, label, ok in rendered_results:
-        if not ok or not os.path.exists(wav_path):
-            continue
-        audio = read_wav(wav_path)
-        is_pos = label > 0.5
-        framed_list = extract_framed_windows(audio, is_pos)
-        for framed in framed_list:
-            augmented = add_acoustic_perturbations(framed)
-            mel = extract_log_mel_spectrogram(augmented)
-            samples.append((mel, label))
-            if is_pos:
-                pos_count += 1
-            else:
-                neg_count += 1
+    rng.shuffle(pos_records)
+    rng.shuffle(hard_neg_records)
+    rng.shuffle(soft_neg_records)
 
-    # 3. Add synthetic silence and noise negatives
-    for _ in range(150):
-        silence = np.random.randn(19200).astype(np.float32) * random.uniform(0.0001, 0.02)
-        mel = extract_log_mel_spectrogram(silence)
-        samples.append((mel, 0.0))
-        neg_count += 1
+    def split_records(records: List, ratio: float):
+        if not records:
+            return [], []
+        if ratio <= 0.0:
+            return list(records), []
+        split_idx = max(1, int(len(records) * (1.0 - ratio))) if len(records) > 1 else 1
+        return records[:split_idx], records[split_idx:]
 
-    print(f"Total dataset size: {len(samples)} samples (Pos: {pos_count}, Neg: {neg_count})", flush=True)
-    return samples
+    train_pos, val_pos = split_records(pos_records, val_ratio)
+    train_hard, val_hard = split_records(hard_neg_records, val_ratio)
+    train_soft, val_soft = split_records(soft_neg_records, val_ratio)
+
+    train_records = train_pos + train_hard + train_soft
+    val_records = val_pos + val_hard + val_soft
+    rng.shuffle(train_records)
+    rng.shuffle(val_records)
+
+    def process_records(records: List, is_training: bool) -> List[Tuple[np.ndarray, float, float]]:
+        samples: List[Tuple[np.ndarray, float, float]] = []
+        for wav_path, label, is_hard_neg, _ in records:
+            audio = read_wav(wav_path)
+            is_pos = label > 0.5
+            # Tiered penalty: hard negatives get 3.8x penalty; general negatives get 1.0x; positives get 1.5x
+            sample_weight = 1.5 if is_pos else (3.8 if is_hard_neg else 1.0)
+            framed_list = extract_framed_windows(audio, is_pos)
+            for framed in framed_list:
+                if is_training:
+                    augmented = add_acoustic_perturbations(framed)
+                    mel = extract_log_mel_spectrogram(augmented)
+                    samples.append((mel, label, sample_weight))
+                    # Add SpecAugment version to enhance acoustic invariance
+                    mel_spec = apply_spec_augment(mel)
+                    samples.append((mel_spec, label, sample_weight))
+                else:
+                    mel = extract_log_mel_spectrogram(framed)
+                    samples.append((mel, label, sample_weight))
+        return samples
+
+    train_samples = process_records(train_records, is_training=True)
+    val_samples = process_records(val_records, is_training=False)
+
+    # 3. Add synthetic silence and noise negatives (split proportionally)
+    silence_count = 150
+    train_silence = int(silence_count * (1.0 - val_ratio))
+    val_silence = silence_count - train_silence
+
+    def _generate_silence_samples(count: int) -> List[Tuple[np.ndarray, float, float]]:
+        items = []
+        for _ in range(count):
+            silence = np.random.randn(19200).astype(np.float32) * random.uniform(0.0001, 0.02)
+            mel = extract_log_mel_spectrogram(silence)
+            items.append((mel, 0.0, 2.0))
+        return items
+
+    train_samples.extend(_generate_silence_samples(train_silence))
+    val_samples.extend(_generate_silence_samples(val_silence))
+
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+
+    train_pos_cnt = sum(1 for _, l, _ in train_samples if l > 0.5)
+    train_neg_cnt = len(train_samples) - train_pos_cnt
+    val_pos_cnt = sum(1 for _, l, _ in val_samples if l > 0.5)
+    val_neg_cnt = len(val_samples) - val_pos_cnt
+
+    if train_pos_cnt == 0:
+        raise RuntimeError(f"Training split contains zero positive samples for phrase '{phrase}'.")
+    if val_pos_cnt == 0 and val_ratio > 0.0:
+        raise RuntimeError(f"Validation split contains zero positive samples for phrase '{phrase}'.")
+
+    print(
+        f"Train dataset: {len(train_samples)} samples (Pos: {train_pos_cnt}, Neg: {train_neg_cnt}) | "
+        f"Val dataset: {len(val_samples)} samples (Pos: {val_pos_cnt}, Neg: {val_neg_cnt})",
+        flush=True,
+    )
+    return train_samples, val_samples
 
 
 def train_model(
-    samples: List[Tuple[np.ndarray, float]],
-    epochs: int = 35,
-    batch_size: int = 32,
+    train_samples: List[Tuple[np.ndarray, float, float]],
+    val_samples: List[Tuple[np.ndarray, float, float]],
+    epochs: int = 30,
+    batch_size: int = 64,
     lr: float = 1e-3,
+    seed: int = 42,
 ) -> KwsModel:
     """Train KwsModel on acoustic mel spectrograms."""
-    random.seed(42)
-    random.shuffle(samples)
-    split_idx = int(len(samples) * 0.85)
-    train_data = samples[:split_idx]
-    val_data = samples[split_idx:]
+    seed_everything(seed)
+    train_loader = DataLoader(KwsDataset(train_samples), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(KwsDataset(val_samples), batch_size=batch_size, shuffle=False)
 
-    train_loader = DataLoader(KwsDataset(train_data), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(KwsDataset(val_data), batch_size=batch_size, shuffle=False)
-
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"\nTraining on device: {device}", flush=True)
 
     model = KwsModel(mel_bins=32, emb_dim=64, num_keywords=1).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-    # Weighted BCE: penalize false positives 2.5x higher than false negatives
     criterion = nn.BCELoss(reduction="none")
 
     print("\n--- Starting Training ---", flush=True)
@@ -480,20 +837,22 @@ def train_model(
         model.train()
         train_loss = 0.0
 
-        for mels, labels in train_loader:
-            mels, labels = mels.to(device), labels.to(device)
+        for mels, labels, weights in train_loader:
+            mels, labels, weights = mels.to(device), labels.to(device), weights.to(device)
             optimizer.zero_grad()
 
             preds = model(mels)
             loss_raw = criterion(preds, labels)
-            weights = torch.where(labels < 0.5, 2.5, 1.0)
             loss = (loss_raw * weights).mean()
 
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(labels)
 
-        train_loss /= len(train_data)
+        # Query active learning rate used during this epoch's training pass
+        current_lr = optimizer.param_groups[0]["lr"]
+        train_loss /= len(train_samples)
+        scheduler.step()
 
         # Validation
         model.eval()
@@ -502,28 +861,27 @@ def train_model(
         neg_scores: List[float] = []
 
         with torch.no_grad():
-            for mels, labels in val_loader:
-                mels, labels = mels.to(device), labels.to(device)
+            for mels, labels, weights in val_loader:
+                mels, labels, weights = mels.to(device), labels.to(device), weights.to(device)
                 preds = model(mels)
                 loss_raw = criterion(preds, labels)
-                weights = torch.where(labels < 0.5, 2.5, 1.0)
                 loss = (loss_raw * weights).mean()
                 val_loss += loss.item() * len(labels)
 
-                for p, l in zip(preds.squeeze(-1).cpu().numpy(), labels.squeeze(-1).cpu().numpy()):
-                    if l > 0.5:
-                        pos_scores.append(float(p))
-                    else:
-                        neg_scores.append(float(p))
+                p_flat = preds.squeeze(-1)
+                l_flat = labels.squeeze(-1)
+                mask_pos = l_flat > 0.5
+                pos_scores.extend(p_flat[mask_pos].cpu().tolist())
+                neg_scores.extend(p_flat[~mask_pos].cpu().tolist())
 
-        val_loss /= len(val_data)
+        val_loss = (val_loss / len(val_samples)) if val_samples else 0.0
         pos_min = min(pos_scores) if pos_scores else 0.0
         pos_mean = sum(pos_scores) / len(pos_scores) if pos_scores else 0.0
         neg_max = max(neg_scores) if neg_scores else 0.0
         neg_mean = sum(neg_scores) / len(neg_scores) if neg_scores else 0.0
 
         print(
-            f"Epoch {epoch:02d}/{epochs} | "
+            f"Epoch {epoch:02d}/{epochs} (lr: {current_lr:.6f}) | "
             f"Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
             f"Pos [mean: {pos_mean:.2f}, min: {pos_min:.2f}] | "
@@ -537,7 +895,12 @@ def train_model(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train KWS model for wake word detection")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train KWS model for wake word detection. "
+            "NOTE: This pipeline requires macOS (darwin) for parallel TTS speech synthesis."
+        )
+    )
     parser.add_argument(
         "--phrase",
         default="Hey Liquid",
@@ -562,23 +925,79 @@ def main() -> None:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=25,
-        help="Training epochs (default: 25)",
+        default=30,
+        help="Training epochs (default: 30)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for dataset split and model training (default: 42)",
+    )
+    parser.add_argument(
+        "--extra-negatives",
+        nargs="*",
+        default=None,
+        help="Additional custom negative phrases to synthesize",
+    )
+    parser.add_argument(
+        "--negatives-file",
+        default=None,
+        help="Optional path to a text file with negative phrases (one per line)",
     )
     args = parser.parse_args()
-    keywords = args.keywords if args.keywords is not None else [args.phrase]
+
+    if sys.platform != "darwin":
+        print(
+            "Error: train_kws.py requires macOS ('darwin') to synthesize training datasets "
+            "using native macOS speech synthesis ('say').",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    seed_everything(args.seed)
+
+    if not args.phrase or not args.phrase.strip():
+        raise ValueError("The target wake word '--phrase' cannot be empty or whitespace.")
+    phrase = " ".join(args.phrase.strip().split())
+
+    if args.keywords is not None:
+        keywords = [" ".join(k.strip().split()) for k in args.keywords if k and k.strip()]
+    else:
+        keywords = [phrase]
+
     if len(keywords) != 1:
         raise ValueError(
             f"train_kws.py currently only supports training single-keyword models, got {len(keywords)} keywords: {keywords}"
         )
 
+    if args.epochs < 1:
+        raise ValueError(f"Epoch count '--epochs' must be positive, got: {args.epochs}")
+
+    if not args.output or not args.output.strip():
+        raise ValueError("The output model path '--output' cannot be empty or whitespace.")
+
+    extra_negs = [
+        " ".join(item.strip().split())
+        for item in (args.extra_negatives or [])
+        if item and item.strip()
+    ]
+    if args.negatives_file:
+        extra_negs.extend(load_negatives_file(args.negatives_file))
+    extra_negs = list(dict.fromkeys(extra_negs))
+
     # 1. Synthesize audio dataset
     with tempfile.TemporaryDirectory() as tmpdir:
-        print(f"Synthesizing dataset for '{args.phrase}' in {tmpdir}...", flush=True)
-        samples = synthesize_dataset(tmpdir, phrase=args.phrase)
+        print(f"Synthesizing dataset for '{phrase}' in {tmpdir}...", flush=True)
+        train_samples, val_samples = synthesize_dataset(
+            tmpdir,
+            phrase=phrase,
+            extra_negatives=extra_negs,
+            seed=args.seed,
+        )
 
         # 2. Train model
-        model = train_model(samples, epochs=args.epochs)
+        model = train_model(train_samples, val_samples, epochs=args.epochs, seed=args.seed)
 
     # 3. Export to GGUF with folded BatchNorm
     print(f"\n--- Exporting Trained GGUF to {args.output} ---", flush=True)
@@ -597,7 +1016,7 @@ def main() -> None:
             fixture_path=args.fixture,
             model=model,
             keywords=keywords,
-            seed=42,
+            seed=args.seed,
         )
 
     print("\nTraining and GGUF export complete!", flush=True)
