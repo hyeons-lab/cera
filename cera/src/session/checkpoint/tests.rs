@@ -189,4 +189,78 @@ fn checkpoint_file_persistence() {
     checkpoint.save_to_file(&file_path).expect("save_to_file");
     let loaded = SessionCheckpoint::load_from_file(&file_path).expect("load_from_file");
     assert_eq!(checkpoint, loaded);
+
+    // Verify no temporary files remain in directory
+    let entries: Vec<_> = std::fs::read_dir(temp_dir.path())
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_name(), "session.cchk");
+}
+
+#[test]
+fn checkpoint_trailing_bytes_rejection() {
+    let kv_state = StateSnapshot::new(Vec::new(), 0);
+    let session_checkpoint = SessionCheckpoint {
+        model_fingerprint: 0x1122,
+        position: 0,
+        max_seq_len: 256,
+        prefill_tokens: 0,
+        prefill_elapsed_ms: 0,
+        last_logits: None,
+        token_history: Vec::new(),
+        kv_state,
+    };
+
+    let mut session_bytes = session_checkpoint.to_bytes();
+    session_bytes.extend_from_slice(b"extra_trailing_bytes");
+    let err = SessionCheckpoint::from_bytes(&session_bytes).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("unexpected trailing bytes in session checkpoint"));
+        }
+        other => panic!("expected format error for trailing bytes, got {other:?}"),
+    }
+
+    let chat_checkpoint = ChatCheckpoint {
+        session_checkpoint,
+        phase: SessionPhase::Idle,
+        tool_format: ToolFormat::Lfm2Pythonic,
+        tools: Vec::new(),
+    };
+    let mut chat_bytes = chat_checkpoint.to_bytes().expect("to_bytes");
+    chat_bytes.extend_from_slice(b"extra_junk");
+    let err = ChatCheckpoint::from_bytes(&chat_bytes).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("unexpected trailing bytes in chat checkpoint"));
+        }
+        other => panic!("expected format error for trailing bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn checkpoint_reader_overflow_length_rejection() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"CERASCHK");
+    buf.extend_from_slice(&1u32.to_le_bytes()); // version
+    buf.extend_from_slice(&0x1234u64.to_le_bytes()); // model_fingerprint
+    buf.extend_from_slice(&0u64.to_le_bytes()); // position
+    buf.extend_from_slice(&256u64.to_le_bytes()); // max_seq_len
+    buf.extend_from_slice(&0u32.to_le_bytes()); // prefill_tokens
+    buf.extend_from_slice(&0u64.to_le_bytes()); // prefill_elapsed_ms
+    buf.push(1); // has_logits = 1
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // huge logits count to test bounds check
+
+    let err = SessionCheckpoint::from_bytes(&buf).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(
+                msg.contains("unexpected EOF reading byte buffer in checkpoint")
+                    || msg.contains("overflow")
+            );
+        }
+        other => panic!("expected format error for huge count EOF, got {other:?}"),
+    }
 }

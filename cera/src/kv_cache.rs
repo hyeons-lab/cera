@@ -1308,6 +1308,180 @@ impl InferenceState {
         Some(StateSnapshot::new(layers, self.seq_len))
     }
 
+    /// Validate that a `StateSnapshot` is structurally compatible with this state
+    /// before attempting to restore it. Checks layer count, layer variant matches,
+    /// byte alignments, and vector dimensions without panicking.
+    pub fn validate_snapshot(&self, snapshot: &StateSnapshot) -> Result<(), String> {
+        if snapshot.layers.len() != self.layers.len() {
+            return Err(format!(
+                "snapshot layer count {} does not match state layer count {}",
+                snapshot.layers.len(),
+                self.layers.len()
+            ));
+        }
+        let kv_f16 = self.kv_f16;
+        for (idx, (layer, snap)) in self.layers.iter().zip(&snapshot.layers).enumerate() {
+            match (layer, snap) {
+                (
+                    LayerState::Attention {
+                        compressed_keys, ..
+                    },
+                    snap,
+                ) => match snap {
+                    LayerSnapshot::Attention { k_data, v_data } => {
+                        if kv_f16 {
+                            return Err(format!(
+                                "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
+                            ));
+                        }
+                        if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
+                            return Err(format!(
+                                "layer {idx}: Attention byte lengths are not multiples of 4"
+                            ));
+                        }
+                    }
+                    LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                        if !kv_f16 {
+                            return Err(format!(
+                                "layer {idx}: AttentionF16 snapshot cannot be restored into a non-f16 state"
+                            ));
+                        }
+                        if !k_data.len().is_multiple_of(2) || !v_data.len().is_multiple_of(2) {
+                            return Err(format!(
+                                "layer {idx}: AttentionF16 byte lengths are not multiples of 2"
+                            ));
+                        }
+                    }
+                    LayerSnapshot::AttentionCompressed { .. } => {
+                        if compressed_keys.is_none() {
+                            return Err(format!(
+                                "layer {idx}: compressed snapshot provided but state is not compressed"
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "layer {idx}: snapshot layer kind does not match Attention state"
+                        ));
+                    }
+                },
+                (LayerState::Conv { .. }, LayerSnapshot::Conv { buffer }) => {
+                    if !buffer.len().is_multiple_of(4) {
+                        return Err(format!(
+                            "layer {idx}: Conv byte length is not a multiple of 4"
+                        ));
+                    }
+                }
+                (
+                    LayerState::Mamba2 {
+                        conv_state,
+                        ssm_state,
+                    },
+                    LayerSnapshot::Mamba2 {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    if snap_conv.len() != conv_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched Mamba2 conv_state byte length (expected {}, got {})",
+                            conv_state.len() * 4,
+                            snap_conv.len()
+                        ));
+                    }
+                    if snap_ssm.len() != ssm_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched Mamba2 ssm_state byte length (expected {}, got {})",
+                            ssm_state.len() * 4,
+                            snap_ssm.len()
+                        ));
+                    }
+                }
+                (
+                    LayerState::DeltaNet { .. },
+                    LayerSnapshot::DeltaNet {
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    if !snap_conv.len().is_multiple_of(4) || !snap_ssm.len().is_multiple_of(4) {
+                        return Err(format!(
+                            "layer {idx}: DeltaNet byte lengths are not multiples of 4"
+                        ));
+                    }
+                }
+                (
+                    LayerState::ParallelAttentionMamba2 {
+                        compressed_keys,
+                        conv_state,
+                        ssm_state,
+                        ..
+                    },
+                    LayerSnapshot::ParallelAttentionMamba2 {
+                        snap,
+                        conv_state: snap_conv,
+                        ssm_state: snap_ssm,
+                    },
+                ) => {
+                    match &**snap {
+                        LayerSnapshot::Attention { k_data, v_data } => {
+                            if kv_f16 {
+                                return Err(format!(
+                                    "layer {idx}: f32 Attention snapshot cannot be restored into an f16 state"
+                                ));
+                            }
+                            if !k_data.len().is_multiple_of(4) || !v_data.len().is_multiple_of(4) {
+                                return Err(format!(
+                                    "layer {idx}: Attention byte lengths are not multiples of 4"
+                                ));
+                            }
+                        }
+                        LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                            if !kv_f16 {
+                                return Err(format!(
+                                    "layer {idx}: AttentionF16 snapshot cannot be restored into a non-f16 state"
+                                ));
+                            }
+                            if !k_data.len().is_multiple_of(2) || !v_data.len().is_multiple_of(2) {
+                                return Err(format!(
+                                    "layer {idx}: AttentionF16 byte lengths are not multiples of 2"
+                                ));
+                            }
+                        }
+                        LayerSnapshot::AttentionCompressed { .. } => {
+                            if compressed_keys.is_none() {
+                                return Err(format!(
+                                    "layer {idx}: compressed snapshot provided but state is not compressed"
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "layer {idx}: snapshot layer kind does not match Attention state"
+                            ));
+                        }
+                    }
+                    if snap_conv.len() != conv_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched ParallelAttentionMamba2 conv_state byte length"
+                        ));
+                    }
+                    if snap_ssm.len() != ssm_state.len() * 4 {
+                        return Err(format!(
+                            "layer {idx}: mismatched ParallelAttentionMamba2 ssm_state byte length"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "layer {idx}: snapshot layer variant does not match live session state"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Restore a previously captured `StateSnapshot` into this state's
     /// f32 caches (or compressed caches for TurboQuant layers). Inverse
     /// of [`Self::snapshot`]. Asserts that the snapshot's layer count
@@ -1379,7 +1553,7 @@ impl InferenceState {
                     // guard; panic loudly if it's ever bypassed.
                     assert!(
                         !kv_f16,
-                        "f32 Attention snapshot restored into an f16 state — \
+                        "f32 Attention snapshot restored into an f16 state: \
                          caller must gate on the snapshot/live compression mode"
                     );
                     decode_f32_into(key_cache, k_data);
@@ -1401,7 +1575,7 @@ impl InferenceState {
                 ) => {
                     assert!(
                         kv_f16,
-                        "AttentionF16 snapshot restored into a non-f16 state — \
+                        "AttentionF16 snapshot restored into a non-f16 state: \
                          caller must gate on `LayerSnapshot::is_f16()` matching \
                          the live `kv_f16` mode"
                     );

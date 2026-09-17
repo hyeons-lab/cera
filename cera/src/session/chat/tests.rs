@@ -1948,3 +1948,66 @@ fn chat_checkpoint_rejects_incompatible_model_architecture() {
         other => panic!("expected format error for fingerprint mismatch, got {other:?}"),
     }
 }
+
+#[test]
+fn chat_checkpoint_rejects_unusable_phase() {
+    let tok = fixtures::tokenizer();
+    let (_model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("test unusable checkpoint rejection"))
+        .unwrap();
+    let mut cp = chat.checkpoint().unwrap();
+    cp.phase = SessionPhase::Unusable;
+
+    let (_model2, mut chat2) = setup(tok);
+    let err = chat2.restore(&cp).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("cannot restore chat checkpoint in Unusable phase"));
+        }
+        other => panic!("expected format error for unusable phase, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_checkpoint_rejects_mismatched_position_and_seq_len() {
+    let tok = fixtures::tokenizer();
+    let (_model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("test position sync")).unwrap();
+    let mut cp = chat.checkpoint().unwrap();
+    cp.session_checkpoint.position += 1;
+
+    let (_model2, mut chat2) = setup(tok);
+    let err = chat2.restore(&cp).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("does not match KV state sequence length"));
+        }
+        other => panic!("expected format error for position mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_checkpoint_rejects_layer_variant_mismatch_without_panic() {
+    let tok = fixtures::tokenizer();
+    let (_model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("test layer mismatch")).unwrap();
+    let mut cp = chat.checkpoint().unwrap();
+    // Replace layer 0 with a Conv snapshot when model expects Attention
+    if let Some(first_layer) = cp.session_checkpoint.kv_state.layers.first_mut() {
+        *first_layer = crate::kv_cache::LayerSnapshot::Conv {
+            buffer: vec![0, 0, 0, 0],
+        };
+    }
+
+    let (_model2, mut chat2) = setup(tok);
+    let err = chat2.restore(&cp).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("snapshot layer kind does not match") || msg.contains("variant"));
+        }
+        other => panic!("expected format error for layer kind mismatch, got {other:?}"),
+    }
+}

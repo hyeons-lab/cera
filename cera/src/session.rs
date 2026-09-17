@@ -1092,6 +1092,12 @@ impl Session {
                 by: (checkpoint.position - self.max_seq_len) as u32,
             });
         }
+        if checkpoint.position != checkpoint.kv_state.seq_len {
+            return Err(CeraError::Format(format!(
+                "checkpoint position {} does not match KV state sequence length {}",
+                checkpoint.position, checkpoint.kv_state.seq_len
+            )));
+        }
         if checkpoint.kv_state.layers.len() != self.state.layers.len() {
             return Err(CeraError::Format(format!(
                 "checkpoint layer count {} does not match session layer count {}",
@@ -1104,6 +1110,10 @@ impl Session {
                 "checkpoint KV precision (f16 vs f32) does not match session".to_string(),
             ));
         }
+
+        self.state
+            .validate_snapshot(&checkpoint.kv_state)
+            .map_err(CeraError::Format)?;
 
         self.state.restore(&checkpoint.kv_state);
         self.current_pos = checkpoint.position;

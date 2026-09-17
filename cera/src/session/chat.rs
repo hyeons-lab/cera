@@ -789,6 +789,11 @@ impl<E: Execution> Chat<E> {
 
     /// Restore a previously captured checkpoint into this chat session.
     pub fn restore(&mut self, checkpoint: &checkpoint::ChatCheckpoint) -> Result<(), CeraError> {
+        if checkpoint.phase == SessionPhase::Unusable {
+            return Err(CeraError::Format(
+                "cannot restore chat checkpoint in Unusable phase".to_string(),
+            ));
+        }
         self.execution.restore(&checkpoint.session_checkpoint)?;
         self.phase = checkpoint.phase;
         self.tool_format = checkpoint.tool_format;
@@ -1023,8 +1028,7 @@ impl<E: Execution> Chat<E> {
                     }
                 }
             }
-        } else if let Some(split) = audio_split_opt {
-            let (pcm, sample_rate) = audio.unwrap();
+        } else if let (Some(split), Some((pcm, sample_rate))) = (audio_split_opt, audio) {
             if split > 0 {
                 segments.push(IngestSegment::Tokens(&tokens[..split]));
             }
@@ -1199,8 +1203,9 @@ impl<E: Execution> Chat<E> {
             fn on_text_tokens(&mut self, new_tokens: &[u32]) {
                 self.tokens.extend_from_slice(new_tokens);
                 let current_text = self.tokenizer.decode(&self.tokens);
-                if current_text.len() > self.last_decoded_len {
-                    let delta = &current_text[self.last_decoded_len..];
+                if current_text.len() > self.last_decoded_len
+                    && let Some(delta) = current_text.get(self.last_decoded_len..)
+                {
                     (self.on_text)(delta);
                     self.last_decoded_len = current_text.len();
                 }

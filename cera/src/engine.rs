@@ -1237,7 +1237,7 @@ fn resolve_bundle_source(
 ) -> Result<ResolvedPathSource, CeraError> {
     let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
         CeraError::Backend(
-            "`CeraEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set — \
+            "`CeraEngine::from_bundle_id` requires `EngineConfig::bundle_repo` to be set: \
              construct a `BundleRepo` rooted at your desired store directory and assign it \
              before calling this constructor."
                 .to_string(),
@@ -1284,7 +1284,7 @@ fn resolve_hf_source(
 ) -> Result<ResolvedPathSource, CeraError> {
     let repo = cfg.bundle_repo.as_ref().ok_or_else(|| {
         CeraError::Backend(
-            "`CeraEngine::from_hf` requires `EngineConfig::bundle_repo` to be set — \
+            "`CeraEngine::from_hf` requires `EngineConfig::bundle_repo` to be set: \
              construct a `BundleRepo` rooted at your desired store directory and assign it \
              before calling this constructor."
                 .to_string(),
@@ -1346,7 +1346,7 @@ fn resolve_path_source_checked<E: From<CeraError>>(
         // files for audio (mmproj) are manifest-driven and
         // consumers who need them must load via manifest or
         // `from_files`. VL is refused at this gate because a
-        // bare GGUF can't possibly carry the vision tower —
+        // bare GGUF can't possibly carry the vision tower:
         // silently downgrading to text would surprise users who
         // later reach for `--image`. Today this arm is
         // unreachable (every published VL main GGUF reports
@@ -1381,7 +1381,7 @@ fn resolve_path_source_checked<E: From<CeraError>>(
         }
     } else {
         Err(CeraError::Backend(format!(
-            "don't know how to load `{}` — expected a .gguf file, a .json manifest, or a directory containing one",
+            "don't know how to load `{}`: expected a .gguf file, a .json manifest, or a directory containing one",
             path.display()
         )).into())
     }
@@ -1511,16 +1511,16 @@ fn find_single_manifest(dir: &Path) -> Result<PathBuf, CeraError> {
 ///
 /// Fields walked (in declaration order):
 /// - `files.model` (required)
-/// - `files.multimodal_projector` (optional — VL + audio bundles)
-/// - `files.audio_decoder` (optional — audio-out bundles)
-/// - `files.audio_tokenizer` (optional — audio-in bundles)
-/// - `files.extras` (every entry — forward-compat aux roles)
+/// - `files.multimodal_projector` (optional: VL + audio bundles)
+/// - `files.audio_decoder` (optional: audio-out bundles)
+/// - `files.audio_tokenizer` (optional: audio-in bundles)
+/// - `files.extras` (every entry: forward-compat aux roles)
 ///
 /// Consumers downstream of the loader (audio pipeline, VL loader, etc.)
 /// read back from `engine.manifest().files.*` and expect local paths,
 /// so every URL must be rewritten before we hand the manifest on.
 ///
-/// Gated on `mmap` — the callers (`resolve_manifest_source`, `resolve_files_source`)
+/// Gated on `mmap`: the callers (`resolve_manifest_source`, `resolve_files_source`)
 /// are both `mmap`-only. `from_bytes` / `from_reader` skip path
 /// resolution entirely since they receive bytes.
 #[cfg(feature = "mmap")]

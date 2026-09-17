@@ -39,11 +39,16 @@ impl SchemaCompiler {
     }
 
     fn extract_defs(&mut self, root: &Value) {
-        if let Some(obj) = root.as_object()
-            && let Some(Value::Object(defs)) = obj.get("$defs").or_else(|| obj.get("definitions"))
-        {
-            for (k, v) in defs {
-                self.defs.insert(k.clone(), v.clone());
+        if let Some(obj) = root.as_object() {
+            if let Some(Value::Object(defs)) = obj.get("definitions") {
+                for (k, v) in defs {
+                    self.defs.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(Value::Object(defs)) = obj.get("$defs") {
+                for (k, v) in defs {
+                    self.defs.insert(k.clone(), v.clone());
+                }
             }
         }
     }

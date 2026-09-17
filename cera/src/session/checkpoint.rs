@@ -5,7 +5,8 @@
 //! phases. Checkpoints validate model architectural compatibility using an FNV-1a
 //! fingerprint before modifying any session state.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::kv_cache::StateSnapshot;
 use crate::session::CeraError;
@@ -14,6 +15,21 @@ use crate::tools::{ToolDef, ToolFormat};
 
 #[cfg(test)]
 mod tests;
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temp_checkpoint_path(path: &Path) -> PathBuf {
+    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    match path.file_name() {
+        Some(name) => path.with_file_name(format!(
+            "{}.tmp.{}.{}",
+            name.to_string_lossy(),
+            std::process::id(),
+            count
+        )),
+        None => path.with_extension(format!("tmp.{}.{}", std::process::id(), count)),
+    }
+}
 
 const SESSION_CHECKPOINT_MAGIC: &[u8; 8] = b"CERASCHK";
 const SESSION_CHECKPOINT_VERSION: u32 = 1;
@@ -97,7 +113,8 @@ impl SessionCheckpoint {
         let has_logits = reader.read_u8()?;
         let last_logits = if has_logits == 1 {
             let count = reader.read_u32()? as usize;
-            let mut logits = Vec::with_capacity(count);
+            let cap = count.min(reader.remaining_bytes() / 4);
+            let mut logits = Vec::with_capacity(cap);
             for _ in 0..count {
                 let b = reader.read_bytes(4)?;
                 let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -109,12 +126,18 @@ impl SessionCheckpoint {
         };
 
         let history_len = reader.read_u32()? as usize;
-        let mut token_history = Vec::with_capacity(history_len);
+        let cap = history_len.min(reader.remaining_bytes() / 4);
+        let mut token_history = Vec::with_capacity(cap);
         for _ in 0..history_len {
             token_history.push(reader.read_u32()?);
         }
 
         let kv_state = read_state_snapshot(&mut reader)?;
+        if reader.pos != reader.buf.len() {
+            return Err(CeraError::Format(
+                "unexpected trailing bytes in session checkpoint".into(),
+            ));
+        }
 
         Ok(Self {
             model_fingerprint,
@@ -139,10 +162,17 @@ impl SessionCheckpoint {
         size
     }
 
-    /// Save this checkpoint directly to a filesystem path.
+    /// Save this checkpoint directly to a filesystem path using an atomic rename.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), CeraError> {
         let bytes = self.to_bytes();
-        std::fs::write(path, bytes).map_err(CeraError::Io)
+        let path = path.as_ref();
+        let tmp_path = temp_checkpoint_path(path);
+        std::fs::write(&tmp_path, bytes).map_err(CeraError::Io)?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(CeraError::Io(e));
+        }
+        Ok(())
     }
 
     /// Load a checkpoint from a filesystem path.
@@ -258,6 +288,11 @@ impl ChatCheckpoint {
         let session_len = reader.read_u32()? as usize;
         let session_bytes = reader.read_bytes(session_len)?;
         let session_checkpoint = SessionCheckpoint::from_bytes(session_bytes)?;
+        if reader.pos != reader.buf.len() {
+            return Err(CeraError::Format(
+                "unexpected trailing bytes in chat checkpoint".into(),
+            ));
+        }
 
         Ok(Self {
             session_checkpoint,
@@ -267,10 +302,17 @@ impl ChatCheckpoint {
         })
     }
 
-    /// Save this chat checkpoint directly to a filesystem path.
+    /// Save this chat checkpoint directly to a filesystem path using an atomic rename.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), CeraError> {
         let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes).map_err(CeraError::Io)
+        let path = path.as_ref();
+        let tmp_path = temp_checkpoint_path(path);
+        std::fs::write(&tmp_path, bytes).map_err(CeraError::Io)?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(CeraError::Io(e));
+        }
+        Ok(())
     }
 
     /// Load a chat checkpoint from a filesystem path.
@@ -292,6 +334,10 @@ struct BufferReader<'a> {
 impl<'a> BufferReader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
 
     fn read_u8(&mut self) -> Result<u8, CeraError> {
@@ -337,9 +383,12 @@ impl<'a> BufferReader<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], CeraError> {
-        if self.pos + len <= self.buf.len() {
-            let slice = &self.buf[self.pos..self.pos + len];
-            self.pos += len;
+        let end = self.pos.checked_add(len).ok_or_else(|| {
+            CeraError::Format("buffer length overflow in checkpoint reader".into())
+        })?;
+        if end <= self.buf.len() {
+            let slice = &self.buf[self.pos..end];
+            self.pos = end;
             Ok(slice)
         } else {
             Err(CeraError::Format(
@@ -530,7 +579,8 @@ fn read_state_snapshot(reader: &mut BufferReader<'_>) -> Result<StateSnapshot, C
     let semantic_hash = reader.read_u64()?;
     let shift_offset = reader.read_u32()?;
     let layer_count = reader.read_u32()? as usize;
-    let mut layers = Vec::with_capacity(layer_count);
+    let cap = layer_count.min(reader.remaining_bytes() / 8).min(1024);
+    let mut layers = Vec::with_capacity(cap);
     for _ in 0..layer_count {
         layers.push(read_layer_snapshot(reader)?);
     }
