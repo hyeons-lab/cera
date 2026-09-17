@@ -1,5 +1,6 @@
 //! UniFFI lowering for the unified AudioPipeline facade.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{FfiError, FfiHotwordConfig, FfiVadConfig, FfiWhisperTranscribeOpts};
@@ -179,7 +180,8 @@ pub fn audio_pipeline_default_config() -> FfiAudioPipelineConfig {
 /// Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
 #[derive(uniffi::Object)]
 pub struct FfiAudioPipeline {
-    inner: Mutex<cera::audio_pipeline::AudioPipeline>,
+    pub(crate) inner: Mutex<cera::audio_pipeline::AudioPipeline>,
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 impl FfiAudioPipeline {
@@ -230,8 +232,10 @@ impl FfiAudioPipeline {
         let pipeline = builder.build().map_err(|e| FfiError::Backend {
             detail: format!("failed to build audio pipeline: {e}"),
         })?;
+        let cancel = pipeline.cancel_handle();
         Ok(Arc::new(Self {
             inner: Mutex::new(pipeline),
+            cancel,
         }))
     }
 
@@ -271,8 +275,10 @@ impl FfiAudioPipeline {
         let pipeline = builder.build().map_err(|e| FfiError::Backend {
             detail: format!("failed to build audio pipeline: {e}"),
         })?;
+        let cancel = pipeline.cancel_handle();
         Ok(Arc::new(Self {
             inner: Mutex::new(pipeline),
+            cancel,
         }))
     }
 
@@ -324,20 +330,22 @@ impl FfiAudioPipeline {
     pub fn reset(&self) -> Result<(), FfiError> {
         let mut pipeline = self.lock_inner()?;
         pipeline.reset();
+        self.cancel.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     /// Cooperatively cancel any active transcription.
+    ///
+    /// Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+    /// before subsequent speech segments to resume transcription.
     pub fn cancel(&self) -> Result<(), FfiError> {
-        let pipeline = self.lock_inner()?;
-        pipeline.cancel();
+        self.cancel.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// Clear cooperative cancellation flag.
     pub fn clear_cancel(&self) -> Result<(), FfiError> {
-        let pipeline = self.lock_inner()?;
-        pipeline.clear_cancel();
+        self.cancel.store(false, Ordering::Relaxed);
         Ok(())
     }
 

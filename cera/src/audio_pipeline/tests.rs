@@ -134,6 +134,54 @@ fn test_audio_pipeline_max_utterance_boundary() {
 }
 
 #[test]
+fn test_audio_pipeline_events_preserved_in_pending_queue() {
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .build()
+        .expect("builder succeeds");
+
+    let chunk = vec![0.1f32; 1600];
+    let events = pipeline.process_chunk(&chunk).expect("process chunk");
+    assert_eq!(events.len(), 1);
+
+    // pop_event must return the identical SpeechStart event
+    let popped = pipeline.pop_event().expect("event in queue");
+    assert!(matches!(popped, AudioPipelineEvent::SpeechStart { .. }));
+    assert!(pipeline.pop_event().is_none());
+
+    // Flush generates SpeechEnd
+    let flush_events = pipeline.flush().expect("flush succeeds");
+    assert_eq!(flush_events.len(), 1);
+
+    let popped_end = pipeline.pop_event().expect("end event in queue");
+    assert!(matches!(popped_end, AudioPipelineEvent::SpeechEnd { .. }));
+    assert!(pipeline.pop_event().is_none());
+}
+
+#[test]
+fn test_audio_pipeline_pending_events_bounded_cap() {
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .build()
+        .expect("builder succeeds");
+
+    let chunk = vec![0.1f32; 1600];
+    // Each iteration produces SpeechStart on chunk and SpeechEnd on flush (2 events)
+    for _ in 0..100 {
+        let _ = pipeline.process_chunk(&chunk).expect("process chunk");
+        let _ = pipeline.flush().expect("flush succeeds");
+    }
+
+    let mut count = 0;
+    while pipeline.pop_event().is_some() {
+        count += 1;
+    }
+    // High water mark must cap at MAX_PENDING_EVENTS (128)
+    assert_eq!(count, 128);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation() {
     let candidates = [
         std::path::PathBuf::from("../../models/silero_vad.gguf"),
@@ -280,6 +328,7 @@ fn test_audio_pipeline_pop_event_and_take_utterance() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn test_audio_pipeline_listening_for_speech_handles_speech_end_in_same_chunk() {
     let candidates = [
         std::path::PathBuf::from("../../models/silero_vad.gguf"),

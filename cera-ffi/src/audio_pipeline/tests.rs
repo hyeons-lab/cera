@@ -77,3 +77,21 @@ fn test_ffi_audio_pipeline_reset_and_cancel() {
     );
     assert_eq!(pipeline.current_sample().expect("current_sample"), 0);
 }
+
+#[test]
+fn test_ffi_audio_pipeline_wait_free_cancel() {
+    let pipeline =
+        FfiAudioPipeline::from_bytes(None, None, None, None).expect("pipeline creation succeeds");
+
+    // Hold inner lock simulating active processing on another thread
+    let _guard = pipeline.inner.lock().expect("lock held");
+
+    // cancel() and clear_cancel() must succeed without deadlocking on inner lock
+    pipeline.cancel().expect("cancel succeeds wait-free");
+    assert!(pipeline.cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+    pipeline
+        .clear_cancel()
+        .expect("clear_cancel succeeds wait-free");
+    assert!(!pipeline.cancel.load(std::sync::atomic::Ordering::Relaxed));
+}

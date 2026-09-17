@@ -336,6 +336,9 @@ impl AudioPipelineBuilder {
     }
 }
 
+/// Maximum queued pending events before oldest events are dropped.
+const MAX_PENDING_EVENTS: usize = 128;
+
 /// Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
 pub struct AudioPipeline {
     vad: Option<SileroVad>,
@@ -434,6 +437,9 @@ impl AudioPipeline {
     }
 
     /// Trigger cooperative cancellation of any active transcription.
+    ///
+    /// Cancellation is sticky across utterances. Call [`clear_cancel`](Self::clear_cancel)
+    /// or [`reset`](Self::reset) before subsequent speech segments to resume transcription.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -482,6 +488,13 @@ impl AudioPipeline {
         };
     }
 
+    fn enqueue_event(&mut self, ev: AudioPipelineEvent) {
+        if self.pending_events.len() >= MAX_PENDING_EVENTS {
+            self.pending_events.pop_front();
+        }
+        self.pending_events.push_back(ev);
+    }
+
     /// Process a streaming chunk of 16 kHz mono PCM audio samples.
     ///
     /// Evaluates wake words, speech boundaries, and automatic transcription according to
@@ -492,6 +505,19 @@ impl AudioPipeline {
         }
 
         let mut events = Vec::new();
+        let res = self.process_chunk_inner(chunk, &mut events);
+        for ev in &events {
+            self.enqueue_event(ev.clone());
+        }
+        res?;
+        Ok(events)
+    }
+
+    fn process_chunk_inner(
+        &mut self,
+        chunk: &[f32],
+        events: &mut Vec<AudioPipelineEvent>,
+    ) -> Result<()> {
         let chunk_len = chunk.len() as u64;
 
         // Sanitize incoming PCM samples against non-finite values (NaN / Inf)
@@ -544,7 +570,7 @@ impl AudioPipeline {
                 } else {
                     // No hotword attached; transition directly to speech listening
                     self.state = AudioPipelineState::ListeningForSpeech;
-                    return self.process_chunk(chunk);
+                    return self.process_chunk_inner(chunk, events);
                 }
             }
 
@@ -582,7 +608,7 @@ impl AudioPipeline {
                                         start_ms,
                                         end_ms,
                                     });
-                                    self.finish_utterance(&mut events, true)?;
+                                    self.finish_utterance(events, true)?;
                                 }
                             }
                         }
@@ -623,7 +649,7 @@ impl AudioPipeline {
                             end_ms: end_m,
                         });
 
-                        self.finish_utterance(&mut events, true)?;
+                        self.finish_utterance(events, true)?;
                     }
                 }
             }
@@ -691,7 +717,7 @@ impl AudioPipeline {
                         });
 
                         let reset_vad = speech_ended;
-                        self.finish_utterance(&mut events, reset_vad)?;
+                        self.finish_utterance(events, reset_vad)?;
                     }
                 } else {
                     self.current_sample = self.current_sample.saturating_add(chunk_len);
@@ -708,7 +734,7 @@ impl AudioPipeline {
                             end_ms: end_m,
                         });
 
-                        self.finish_utterance(&mut events, true)?;
+                        self.finish_utterance(events, true)?;
                     }
                 }
             }
@@ -719,12 +745,7 @@ impl AudioPipeline {
             }
         }
 
-        // Store any excess events in pending queue
-        for ev in &events {
-            self.pending_events.push_back(ev.clone());
-        }
-
-        Ok(events)
+        Ok(())
     }
 
     /// Flush any active speech segment at the end of the audio stream.
@@ -733,7 +754,15 @@ impl AudioPipeline {
     /// terminal events.
     pub fn flush(&mut self) -> Result<Vec<AudioPipelineEvent>> {
         let mut events = Vec::new();
+        let res = self.flush_inner(&mut events);
+        for ev in &events {
+            self.enqueue_event(ev.clone());
+        }
+        res?;
+        Ok(events)
+    }
 
+    fn flush_inner(&mut self, events: &mut Vec<AudioPipelineEvent>) -> Result<()> {
         if self.state == AudioPipelineState::SpeechActive {
             let mut end_payload = None;
             if let Some(vad_iter) = &mut self.vad_iter
@@ -762,14 +791,10 @@ impl AudioPipeline {
                 end_ms,
             });
 
-            self.finish_utterance(&mut events, true)?;
+            self.finish_utterance(events, true)?;
         }
 
-        for ev in &events {
-            self.pending_events.push_back(ev.clone());
-        }
-
-        Ok(events)
+        Ok(())
     }
 
     /// Internal helper: finalize an utterance buffer, perform optional Whisper transcription,
@@ -825,6 +850,12 @@ impl AudioPipeline {
                             if let Some(vad_iter) = &mut self.vad_iter {
                                 vad_iter.reset();
                             }
+                        } else {
+                            let ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
+                            events.push(AudioPipelineEvent::SpeechStart {
+                                sample: self.current_sample,
+                                ms,
+                            });
                         }
                         return Err(e);
                     }

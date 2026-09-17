@@ -4794,50 +4794,56 @@ mod tests {
         let state = InferenceState::from_config(&config).expect("inference state");
 
         // 1. Checkpoint with f16 layer must be rejected gracefully
-        let f16_snapshot = cera::kv_cache::StateSnapshot {
-            seq_len: 4,
-            layers: vec![cera::kv_cache::LayerSnapshot::AttentionF16 {
+        let f16_snapshot = cera::kv_cache::StateSnapshot::new(
+            vec![cera::kv_cache::LayerSnapshot::AttentionF16 {
                 k_data: vec![0u8; 8],
                 v_data: vec![0u8; 8],
             }],
-        };
+            4,
+        );
         let f16_checkpoint = cera::session::SessionCheckpoint {
             model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
             position: 4,
-            terminal_committed: false,
+            max_seq_len: config.max_seq_len,
+            prefill_tokens: 0,
+            prefill_elapsed_ms: 0,
+            last_logits: None,
+            token_history: Vec::new(),
             kv_state: f16_snapshot,
-            generator_state: None,
         };
 
         let res_f16 = validate_webgpu_checkpoint(&f16_checkpoint, &config, &state, false);
         assert!(res_f16.is_err());
-        let err_msg = format!("{}", res_f16.unwrap_err());
+        let err_msg = format!("{:?}", res_f16.unwrap_err());
         assert!(
             err_msg.contains("f16"),
             "Error must mention f16 precision mismatch, got: {err_msg}"
         );
 
         // 2. Checkpoint with compression mode mismatch must be rejected gracefully
-        let f32_snapshot = cera::kv_cache::StateSnapshot {
-            seq_len: 4,
-            layers: vec![cera::kv_cache::LayerSnapshot::Attention {
+        let f32_snapshot = cera::kv_cache::StateSnapshot::new(
+            vec![cera::kv_cache::LayerSnapshot::Attention {
                 k_data: vec![0u8; 16],
                 v_data: vec![0u8; 16],
             }],
-        };
+            4,
+        );
         let f32_checkpoint = cera::session::SessionCheckpoint {
             model_fingerprint: cera::kv_cache::model_fingerprint(&config, ""),
             position: 4,
-            terminal_committed: false,
+            max_seq_len: config.max_seq_len,
+            prefill_tokens: 0,
+            prefill_elapsed_ms: 0,
+            last_logits: None,
+            token_history: Vec::new(),
             kv_state: f32_snapshot,
-            generator_state: None,
         };
 
         // When model is configured with TurboQuant compression (model_is_compressed = true)
         // but checkpoint is uncompressed, validation must reject it
         let res_comp = validate_webgpu_checkpoint(&f32_checkpoint, &config, &state, true);
         assert!(res_comp.is_err());
-        let comp_err_msg = format!("{}", res_comp.unwrap_err());
+        let comp_err_msg = format!("{:?}", res_comp.unwrap_err());
         assert!(
             comp_err_msg.contains("compression mode"),
             "Error must mention compression mode mismatch, got: {comp_err_msg}"
