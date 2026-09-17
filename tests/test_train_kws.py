@@ -5,28 +5,49 @@ from __future__ import annotations
 
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 import wave
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 try:
     import numpy as np
     import torch
+    import tools.wake_word.train_kws as train_kws
     from tools.wake_word.train_kws import (
         KwsDataset,
+        extract_framed_windows,
+        get_available_voices,
         get_training_texts,
         is_phrase_in_text,
+        load_negatives_file,
         read_wav,
         seed_everything,
         synthesize_dataset,
+        train_model,
     )
     from scripts.convert_kws import KwsModel
     HAS_DEPS = True
 except ImportError:
     HAS_DEPS = False
+
+
+def train_model_cpu(train_samples, val_samples, epochs=1, batch_size=2, lr=1e-3, seed=42):
+    """Helper to run train_model explicitly on CPU in test environments."""
+    with patch("torch.cuda.is_available", return_value=False):
+        with patch("torch.backends.mps.is_available", return_value=False):
+            return train_model(
+                train_samples,
+                val_samples,
+                epochs=epochs,
+                batch_size=batch_size,
+                lr=lr,
+                seed=seed,
+            )
 
 
 @unittest.skipUnless(HAS_DEPS, "torch and numpy required for train_kws tests")
@@ -241,14 +262,162 @@ class TestTrainKws(unittest.TestCase):
 
     def test_empty_positive_split_safeguard(self):
         """Verify synthesize_dataset raises RuntimeError when 0 positive clips are rendered."""
-        from unittest.mock import patch
-
         with tempfile.TemporaryDirectory() as tmpdir:
             # Mock render_tts to always fail (returning False)
             with patch("tools.wake_word.train_kws.render_tts", return_value=False):
                 with self.assertRaises(RuntimeError) as ctx:
                     synthesize_dataset(tmpdir, phrase="Hey Liquid")
                 self.assertIn("No positive audio clips were successfully rendered", str(ctx.exception))
+
+    def test_load_negatives_file_valid(self):
+        """Verify load_negatives_file strips whitespace, ignores comments and empty lines, and deduplicates."""
+        content = """# Header comment
+        phrase one
+        phrase two
+
+        # Middle comment
+        phrase one
+        phrase three
+        """
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write(content)
+            tmp_path = f.name
+
+        try:
+            results = load_negatives_file(tmp_path)
+            self.assertEqual(results, ["phrase one", "phrase two", "phrase three"])
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def test_load_negatives_file_missing(self):
+        """Verify load_negatives_file raises FileNotFoundError for non-existent paths."""
+        with self.assertRaises(FileNotFoundError):
+            load_negatives_file("/path/to/nonexistent/negatives.txt")
+
+    def test_load_negatives_file_directory(self):
+        """Verify load_negatives_file raises FileNotFoundError when given a directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(FileNotFoundError):
+                load_negatives_file(tmpdir)
+
+    def test_is_phrase_in_text_word_boundaries(self):
+        """Verify is_phrase_in_text adheres strictly to word boundaries."""
+        self.assertTrue(is_phrase_in_text("liquid", "they liquid"))
+        self.assertTrue(is_phrase_in_text("hey liquid", "hey, liquid!"))
+        self.assertTrue(is_phrase_in_text("hey liquid", "well hey liquid can you"))
+        # Sub-word matches should be False
+        self.assertFalse(is_phrase_in_text("liquid", "liquidity crisis"))
+        self.assertFalse(is_phrase_in_text("car", "scare tactics"))
+        self.assertFalse(is_phrase_in_text("al", "call mom"))
+        self.assertFalse(is_phrase_in_text("hey liquid", "hey solid"))
+
+    def test_get_training_texts_generation_and_deduplication(self):
+        """Verify get_training_texts produces clean variations and prevents leakage."""
+        pos, neg = get_training_texts("Hey Liquid")
+        self.assertIn("Hey Liquid", pos)
+        self.assertIn("hey liquid", pos)
+
+        # No positive variations should leak into negative list
+        pos_set_lower = {p.lower() for p in pos}
+        for n in neg:
+            self.assertNotIn(n.lower(), pos_set_lower)
+            self.assertFalse(is_phrase_in_text("Hey Liquid", n))
+
+        # Check exact deduplication in negatives
+        self.assertEqual(len(neg), len(dict.fromkeys(neg)))
+
+    def test_get_training_texts_punctuation_handling(self):
+        """Verify get_training_texts parses words correctly even when phrase contains punctuation."""
+        pos, neg = get_training_texts("Hey, Liquid!")
+        self.assertTrue(any("help" in p for p in pos))
+        self.assertTrue(any("they liquid" == n.lower() for n in neg))
+
+    def test_get_available_voices_parsing_and_fallback(self):
+        """Verify get_available_voices parses installed voices and falls back cleanly."""
+        mock_output = (
+            "Samantha            en_US    # Hello! My name is Samantha.\n"
+            "Daniel              en_GB    # Hello! My name is Daniel.\n"
+            "Eddy (English (US)) en_US    # Hello! My name is Eddy.\n"
+        )
+        with patch("sys.platform", "darwin"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout=mock_output)
+                voices = get_available_voices()
+                self.assertIn("Samantha", voices)
+                self.assertIn("Daniel", voices)
+                self.assertIn("Eddy", voices)
+
+        # Test fallback when standard voices are missing
+        mock_custom_en = "Alex                en_US    # Hello! My name is Alex.\n"
+        with patch("sys.platform", "darwin"):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout=mock_custom_en)
+                voices = get_available_voices()
+                self.assertEqual(voices, ["Alex"])
+
+        # Test non-darwin platform returns empty list
+        with patch("sys.platform", "linux"):
+            self.assertEqual(get_available_voices(), [])
+
+    def test_extract_framed_windows_empty_audio(self):
+        """Verify extract_framed_windows returns empty list for empty audio input."""
+        empty_audio = np.array([], dtype=np.float32)
+        self.assertEqual(extract_framed_windows(empty_audio, is_positive=True), [])
+        self.assertEqual(extract_framed_windows(empty_audio, is_positive=False), [])
+
+    def test_extract_framed_windows_short_audio(self):
+        """Verify short audio is padded into 6 distinct alignment windows."""
+        short_audio = np.ones(8000, dtype=np.float32)
+        windows = extract_framed_windows(short_audio, is_positive=True, target_len=19200)
+        self.assertEqual(len(windows), 6)
+        for w in windows:
+            self.assertEqual(len(w), 19200)
+
+    def test_extract_framed_windows_long_audio(self):
+        """Verify long positive audio slices near the front and long negative audio slides."""
+        long_audio = np.ones(32000, dtype=np.float32)
+        pos_windows = extract_framed_windows(long_audio, is_positive=True, target_len=19200)
+        self.assertGreater(len(pos_windows), 0)
+        for w in pos_windows:
+            self.assertEqual(len(w), 19200)
+
+        neg_windows = extract_framed_windows(long_audio, is_positive=False, target_len=19200)
+        self.assertGreater(len(neg_windows), 0)
+        for w in neg_windows:
+            self.assertEqual(len(w), 19200)
+
+    def test_train_model_execution(self):
+        """Verify train_model completes a single epoch on mock dataset without raising exceptions."""
+        dummy_mel = np.ones((32, 118), dtype=np.float32)
+        train_samples = [(dummy_mel, 1.0, 1.5), (dummy_mel * 0.5, 0.0, 3.8)]
+        val_samples = [(dummy_mel, 1.0, 1.5), (dummy_mel * 0.5, 0.0, 3.8)]
+
+        model = train_model_cpu(
+            train_samples,
+            val_samples,
+            epochs=1,
+            batch_size=2,
+            lr=1e-3,
+            seed=42,
+        )
+        self.assertIsInstance(model, KwsModel)
+
+    def test_train_model_empty_validation(self):
+        """Verify train_model handles empty validation set without ZeroDivisionError."""
+        dummy_mel = np.ones((32, 118), dtype=np.float32)
+        train_samples = [(dummy_mel, 1.0, 1.5), (dummy_mel * 0.5, 0.0, 3.8)]
+        val_samples = []
+
+        model = train_model_cpu(
+            train_samples,
+            val_samples,
+            epochs=1,
+            batch_size=2,
+            lr=1e-3,
+            seed=42,
+        )
+        self.assertIsInstance(model, KwsModel)
 
 
 if __name__ == "__main__":
