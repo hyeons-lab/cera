@@ -4407,6 +4407,98 @@ mod webgpu {
             self.state.seq_len = pos;
             Ok(out)
         }
+
+        /// Export the current session checkpoint as binary bytes.
+        #[wasm_bindgen]
+        pub async fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+            self.export_checkpoint().await
+        }
+
+        /// Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
+        #[wasm_bindgen(js_name = exportCheckpoint)]
+        pub async fn export_checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+            let kv_state = self
+                .model
+                .snapshot_session_state_async()
+                .await
+                .map_err(map_err)?;
+            let fp = cera::kv_cache::model_fingerprint(self.model.config(), "");
+            let cp = cera::session::SessionCheckpoint {
+                model_fingerprint: fp,
+                position: self.state.seq_len,
+                max_seq_len: self.model.config().max_seq_len,
+                prefill_tokens: 0,
+                prefill_elapsed_ms: 0,
+                last_logits: None,
+                token_history: Vec::new(),
+                kv_state,
+            };
+            let bytes = cp.to_bytes();
+            let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+            array.copy_from(&bytes);
+            Ok(array)
+        }
+
+        /// Restore an inference session from binary checkpoint bytes.
+        #[wasm_bindgen]
+        pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+            self.import_checkpoint(data)
+        }
+
+        /// Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
+        #[wasm_bindgen(js_name = importCheckpoint)]
+        pub fn import_checkpoint(&mut self, data: &[u8]) -> Result<(), JsError> {
+            let cp =
+                cera::session::SessionCheckpoint::from_bytes(data).map_err(crate::map_cera_err)?;
+            let current_fp = cera::kv_cache::model_fingerprint(self.model.config(), "");
+            if cp.model_fingerprint != current_fp {
+                return Err(JsError::new(&format!(
+                    "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
+                    cp.model_fingerprint
+                )));
+            }
+            let max_seq_len = self.model.config().max_seq_len;
+            if cp.position > max_seq_len {
+                return Err(crate::map_cera_err(cera::CeraError::ContextOverflow {
+                    max_seq_len: max_seq_len as u32,
+                    by: (cp.position - max_seq_len) as u32,
+                }));
+            }
+            if cp.position != cp.kv_state.seq_len {
+                return Err(JsError::new(&format!(
+                    "checkpoint position {} does not match KV state sequence length {}",
+                    cp.position, cp.kv_state.seq_len
+                )));
+            }
+            if cp.kv_state.layers.len() != self.state.layers.len() {
+                return Err(JsError::new(&format!(
+                    "checkpoint layer count {} does not match session layer count {}",
+                    cp.kv_state.layers.len(),
+                    self.state.layers.len()
+                )));
+            }
+            if cp.kv_state.is_f16() != self.state.kv_f16 {
+                return Err(JsError::new(
+                    "checkpoint KV precision (f16 vs f32) does not match session",
+                ));
+            }
+
+            self.state
+                .validate_snapshot(&cp.kv_state)
+                .map_err(|e| JsError::new(&e))?;
+
+            self.state.restore(&cp.kv_state);
+            self.model.restore_session_state(&cp.kv_state);
+            if let Some(gad) = self.gpu_audio_decoder.as_ref() {
+                gad.reset();
+            }
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.reset();
+            }
+            self.cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
     }
 }
 
@@ -4641,5 +4733,23 @@ mod tests {
         chat2.restore(&data).expect("restore chat checkpoint");
         assert_eq!(chat2.phase().unwrap(), "TurnComplete");
         assert_eq!(chat2.position().unwrap(), pos);
+    }
+
+    #[wasm_bindgen_test]
+    fn session_checkpoint_fingerprint_mismatch_rejected() {
+        let mut session = create_test_session(7);
+        session
+            .append_text("fingerprint check")
+            .expect("append text");
+        let bytes = session.checkpoint().expect("session checkpoint");
+        let mut data = bytes.to_vec();
+
+        if data.len() >= 20 {
+            // Tamper with model fingerprint (bytes 12..20)
+            data[12] ^= 0xff;
+            let mut session2 = create_test_session(7);
+            let err = session2.restore(&data);
+            assert!(err.is_err(), "mismatched fingerprint must be rejected");
+        }
     }
 }

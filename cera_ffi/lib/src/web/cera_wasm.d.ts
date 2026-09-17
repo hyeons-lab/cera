@@ -1627,6 +1627,22 @@ export class WebGpuSession {
      */
     reset(): void;
     /**
+     * Export the current session checkpoint as binary bytes.
+     */
+    checkpoint(): Promise<Uint8Array>;
+    /**
+     * Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
+     */
+    exportCheckpoint(): Promise<Uint8Array>;
+    /**
+     * Restore an inference session from binary checkpoint bytes.
+     */
+    restore(data: Uint8Array): void;
+    /**
+     * Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
+     */
+    importCheckpoint(data: Uint8Array): void;
+    /**
      * Set the session-default cap on an appended image's longest side in
      * pixels; `null` clears it. A per-call `maxLongSize` still wins.
      */

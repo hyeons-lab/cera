@@ -6884,8 +6884,12 @@ impl GpuLfm2Model {
                          must reject a mode-mismatched snapshot"
                     );
                     let (k_buf, v_buf) = self.active_kv(i);
-                    self.ctx.queue.write_buffer(k_buf, 0, k_data);
-                    self.ctx.queue.write_buffer(v_buf, 0, v_data);
+                    if !k_data.is_empty() {
+                        self.ctx.queue.write_buffer(k_buf, 0, k_data);
+                    }
+                    if !v_data.is_empty() {
+                        self.ctx.queue.write_buffer(v_buf, 0, v_data);
+                    }
                 }
                 LayerSnapshot::Conv { buffer } => {
                     assert_eq!(
@@ -6896,7 +6900,9 @@ impl GpuLfm2Model {
                     let conv_buf = self.gpu_state.conv_buffers[i]
                         .as_ref()
                         .expect("conv layer must have rolling buffer");
-                    self.ctx.queue.write_buffer(conv_buf, 0, buffer);
+                    if !buffer.is_empty() {
+                        self.ctx.queue.write_buffer(conv_buf, 0, buffer);
+                    }
                 }
                 LayerSnapshot::AttentionCompressed { keys, values } => {
                     assert_eq!(
@@ -7002,6 +7008,94 @@ impl GpuLfm2Model {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.gpu_state.seq_len.store(0, Ordering::Relaxed);
         self.zero_conv_buffers_locked();
+    }
+
+    /// Asynchronously captures a resumable snapshot of GPU session state
+    /// (attention KV buffers, rolling conv buffers, and sequence counter).
+    ///
+    /// Unlike the blocking [`Self::snapshot_state_locked`], this method
+    /// dispatches GPU staging buffer readbacks under `infer_lock`, releases
+    /// the lock, and asynchronously awaits buffer mapping without blocking
+    /// the browser event loop.
+    pub async fn snapshot_session_state_async(&self) -> Result<StateSnapshot, anyhow::Error> {
+        let (seq_len, pending_layers) = {
+            let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.tq_cache().is_some() {
+                anyhow::bail!("async session snapshot is not supported with GPU TurboQuant cache");
+            }
+            let seq_len = self.gpu_state.seq_len.load(Ordering::Relaxed);
+            let cfg = &self.config;
+            let head_dim = cfg.head_dim;
+            let kernel_size = cfg.conv_kernel_size.unwrap_or(3);
+            let d_conv = kernel_size.saturating_sub(1);
+
+            let mut pending_layers = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let count = seq_len * kv_dim;
+                    let size = (count * std::mem::size_of::<f32>()) as u64;
+                    let (k_buf, v_buf) = self.active_kv(i);
+                    let (k_pending, v_pending) = if size > 0 {
+                        (
+                            Some(self.ctx.begin_download(k_buf, size)),
+                            Some(self.ctx.begin_download(v_buf, size)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    pending_layers.push((true, k_pending, v_pending));
+                } else {
+                    let count = d_conv * cfg.hidden_size;
+                    let size = (count * std::mem::size_of::<f32>()) as u64;
+                    let conv_buf = self.gpu_state.conv_buffers[i].as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("conv layer {i} must have rolling buffer")
+                    })?;
+                    let pending = if size > 0 {
+                        Some(self.ctx.begin_download(conv_buf, size))
+                    } else {
+                        None
+                    };
+                    pending_layers.push((false, pending, None));
+                }
+            }
+            (seq_len, pending_layers)
+        };
+
+        let mut layers = Vec::with_capacity(pending_layers.len());
+        for (is_attention, p1, p2) in pending_layers {
+            if is_attention {
+                let k_data = if let Some(p) = p1 {
+                    p.recv().await?
+                } else {
+                    Vec::new()
+                };
+                let v_data = if let Some(p) = p2 {
+                    p.recv().await?
+                } else {
+                    Vec::new()
+                };
+                layers.push(LayerSnapshot::Attention { k_data, v_data });
+            } else {
+                let buffer = if let Some(p) = p1 {
+                    p.recv().await?
+                } else {
+                    Vec::new()
+                };
+                layers.push(LayerSnapshot::Conv { buffer });
+            }
+        }
+        Ok(StateSnapshot::new(layers, seq_len))
+    }
+
+    /// Restores GPU session state (attention KV buffers, rolling conv buffers,
+    /// and sequence counter) from a snapshot.
+    ///
+    /// Acquires `infer_lock` and updates VRAM buffers via non-blocking queue
+    /// writes.
+    pub fn restore_session_state(&self, snapshot: &StateSnapshot) {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.restore_state_locked(snapshot);
     }
 }
 
