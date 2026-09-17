@@ -80,8 +80,8 @@ pub use model::whisper::{
 };
 pub use session::chat::{
     Chat, CompleteError, ContentPart, CoreExecution, DecodeReport, DecodeState, Execution,
-    IngestCause, IngestError, IngestSegment, IngestSummary, Message, Profile, Role, SessionChat,
-    SessionPhase, TurnResult, ValidationError, core_chat,
+    IngestCause, IngestError, IngestSegment, IngestSummary, Message, Profile, ProfileBuilder, Role,
+    SessionChat, SessionPhase, TemplateFamily, TurnResult, ValidationError, core_chat,
 };
 pub use session::checkpoint::{ChatCheckpoint, SessionCheckpoint};
 pub use session::{

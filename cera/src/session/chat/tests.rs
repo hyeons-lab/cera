@@ -2011,3 +2011,65 @@ fn chat_checkpoint_rejects_layer_variant_mismatch_without_panic() {
         other => panic!("expected format error for layer kind mismatch, got {other:?}"),
     }
 }
+
+#[test]
+fn profile_discovery_for_llama3_template_and_framing() {
+    let tok = BpeTokenizer::llama3_for_test();
+    let profile = Profile::discover(Arc::new(tok)).unwrap();
+    assert_eq!(profile.family(), TemplateFamily::Llama3);
+    assert_eq!(profile.turn_end(), "<|eot_id|>");
+    assert_eq!(profile.eos(), 128009);
+
+    let messages = [Message::user("Hello Llama")];
+    let rendered_initial = profile.render(&messages, true, &[]).unwrap();
+    assert!(
+        rendered_initial
+            .contains("<|start_header_id|>user<|end_header_id|>\n\nHello Llama<|eot_id|>")
+    );
+    assert!(rendered_initial.contains("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+    let rendered_cont = profile.render(&messages, false, &[]).unwrap();
+    assert!(!rendered_cont.starts_with("<|begin_of_text|>"));
+    assert!(
+        rendered_cont.contains("<|start_header_id|>user<|end_header_id|>\n\nHello Llama<|eot_id|>")
+    );
+}
+
+#[test]
+fn profile_discovery_for_gemma_template_and_framing() {
+    let tok = BpeTokenizer::gemma_for_test();
+    let profile = Profile::discover(Arc::new(tok)).unwrap();
+    assert_eq!(profile.family(), TemplateFamily::Gemma);
+    assert_eq!(profile.turn_end(), "<end_of_turn>");
+    assert_eq!(profile.eos(), 107);
+
+    let messages = [Message::user("Hello Gemma")];
+    let rendered_initial = profile.render(&messages, true, &[]).unwrap();
+    assert!(rendered_initial.contains("<start_of_turn>user\nHello Gemma<end_of_turn>\n"));
+    assert!(rendered_initial.contains("<start_of_turn>model\n"));
+
+    let rendered_cont = profile.render(&messages, false, &[]).unwrap();
+    assert!(!rendered_cont.starts_with("<bos>"));
+    assert!(rendered_cont.contains("<start_of_turn>user\nHello Gemma<end_of_turn>\n"));
+}
+
+#[test]
+fn profile_custom_builder_and_continuation() {
+    let tok = Arc::new(BpeTokenizer::with_custom_template_for_test(
+        TEMPLATE,
+        Some(7),
+    ));
+
+    let profile = Profile::builder(tok)
+        .family(TemplateFamily::Custom)
+        .turn_prefix(">>>")
+        .turn_end("<<<")
+        .eos(99)
+        .build()
+        .unwrap();
+
+    assert_eq!(profile.family(), TemplateFamily::Custom);
+    assert_eq!(profile.turn_prefix(), ">>>");
+    assert_eq!(profile.turn_end(), "<<<");
+    assert_eq!(profile.eos(), 99);
+}

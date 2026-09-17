@@ -449,11 +449,107 @@ impl ModalitySink for Collector {
     fn on_done(&mut self, _: FinishReason) {}
 }
 
+/// Chat template family identifying turn framing semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TemplateFamily {
+    /// ChatML, Hermes, Qwen style with `<|im_start|>` and `<|im_end|>`.
+    ChatML,
+    /// Llama 3 style with `<|start_header_id|>` and `<|eot_id|>`.
+    Llama3,
+    /// Gemma style with `<start_of_turn>` and `<end_of_turn>`.
+    Gemma,
+    /// Custom or dynamically probed template.
+    Custom,
+}
+
+/// Builder for constructing custom chat profiles.
+#[derive(Clone)]
+pub struct ProfileBuilder {
+    tokenizer: Arc<BpeTokenizer>,
+    family: TemplateFamily,
+    turn_prefix: Option<String>,
+    turn_end: Option<String>,
+    eos: Option<u32>,
+}
+
+impl ProfileBuilder {
+    /// Create a new profile builder for the given tokenizer.
+    pub fn new(tokenizer: Arc<BpeTokenizer>) -> Self {
+        Self {
+            tokenizer,
+            family: TemplateFamily::ChatML,
+            turn_prefix: None,
+            turn_end: None,
+            eos: None,
+        }
+    }
+
+    /// Set the template family.
+    pub fn family(mut self, family: TemplateFamily) -> Self {
+        self.family = family;
+        self
+    }
+
+    /// Set the turn prefix text stripped on continuation turns.
+    pub fn turn_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.turn_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set the turn end delimiter text.
+    pub fn turn_end(mut self, end: impl Into<String>) -> Self {
+        self.turn_end = Some(end.into());
+        self
+    }
+
+    /// Set the end-of-sequence token ID.
+    pub fn eos(mut self, eos: u32) -> Self {
+        self.eos = Some(eos);
+        self
+    }
+
+    /// Build the profile.
+    pub fn build(self) -> Result<Profile, ValidationError> {
+        let (turn_prefix, turn_end, default_eos) = match self.family {
+            TemplateFamily::ChatML => (BOS.to_string(), END.to_string(), 7),
+            TemplateFamily::Llama3 => (
+                "<|begin_of_text|>".to_string(),
+                "<|eot_id|>".to_string(),
+                self.tokenizer
+                    .special_token_id("<|eot_id|>")
+                    .unwrap_or(128009),
+            ),
+            TemplateFamily::Gemma => (
+                "<bos>".to_string(),
+                "<end_of_turn>".to_string(),
+                self.tokenizer
+                    .special_token_id("<end_of_turn>")
+                    .unwrap_or(1),
+            ),
+            TemplateFamily::Custom => (
+                String::new(),
+                "\n".to_string(),
+                self.tokenizer.eos_token().unwrap_or(2),
+            ),
+        };
+        let turn_prefix = self.turn_prefix.unwrap_or(turn_prefix);
+        let turn_end = self.turn_end.unwrap_or(turn_end);
+        let eos = self
+            .eos
+            .or_else(|| self.tokenizer.eos_token())
+            .unwrap_or(default_eos);
+        Profile::new_with_family(self.tokenizer, self.family, turn_prefix, turn_end, eos)
+    }
+}
+
 /// Chat rendering profile holding tokenizer and template rules.
 #[derive(Clone)]
 pub struct Profile {
     tokenizer: Arc<BpeTokenizer>,
     eos: u32,
+    family: TemplateFamily,
+    turn_prefix: String,
+    turn_end: String,
     newline_tokens: Vec<u32>,
     image_marker: Option<u32>,
     image_start: Option<u32>,
@@ -465,6 +561,9 @@ impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Profile")
             .field("eos", &self.eos)
+            .field("family", &self.family)
+            .field("turn_prefix", &self.turn_prefix)
+            .field("turn_end", &self.turn_end)
             .field("newline_tokens", &self.newline_tokens)
             .field("image_marker", &self.image_marker)
             .field("image_start", &self.image_start)
@@ -477,19 +576,123 @@ impl std::fmt::Debug for Profile {
 impl Profile {
     /// Discover and validate a chat profile from a tokenizer's metadata.
     pub fn discover(tokenizer: Arc<BpeTokenizer>) -> Result<Self, ValidationError> {
-        let template_ok = matches!(
-            tokenizer.chat_template(),
-            Some(t) if t == TEMPLATE || t == LFM2_5_TEMPLATE
-        );
-        if !template_ok
-            || tokenizer.bos_token() != Some(1)
-            || tokenizer.eos_token() != Some(7)
-            || tokenizer.encode(BOS) != [1]
-            || tokenizer.encode(END) != [7]
-            || tokenizer.encode("<|im_start|>") != [6]
+        let template_str = tokenizer
+            .chat_template()
+            .ok_or(ValidationError::UnsupportedProfile)?;
+
+        // 1. Check ChatML (LFM2, LFM2.5, Qwen, DeepSeek, Hermes)
+        if template_str == TEMPLATE
+            || template_str == LFM2_5_TEMPLATE
+            || (template_str.contains("<|im_start|>") && template_str.contains("<|im_end|>"))
         {
-            return Err(ValidationError::UnsupportedProfile);
+            if template_str == TEMPLATE || template_str == LFM2_5_TEMPLATE {
+                if tokenizer.bos_token() != Some(1)
+                    || tokenizer.eos_token() != Some(7)
+                    || tokenizer.encode(BOS) != [1]
+                    || tokenizer.encode(END) != [7]
+                    || tokenizer.encode("<|im_start|>") != [6]
+                {
+                    return Err(ValidationError::UnsupportedProfile);
+                }
+            } else if tokenizer.encode("<|im_start|>").is_empty()
+                || tokenizer.encode("<|im_end|>").is_empty()
+            {
+                return Err(ValidationError::UnsupportedProfile);
+            }
+            let eos = tokenizer
+                .eos_token()
+                .or_else(|| tokenizer.special_token_id("<|im_end|>"))
+                .unwrap_or(7);
+            return Self::new_with_family(
+                tokenizer,
+                TemplateFamily::ChatML,
+                BOS.to_string(),
+                END.to_string(),
+                eos,
+            );
         }
+
+        // 2. Check Llama 3 / 3.1 / 3.2
+        if template_str.contains("<|start_header_id|>")
+            && (template_str.contains("<|eot_id|>") || template_str.contains("<|end_header_id|>"))
+        {
+            let turn_end = "<|eot_id|>";
+            let turn_prefix = if tokenizer.bos_token().is_some() {
+                "<|begin_of_text|>"
+            } else {
+                "<|start_header_id|>"
+            };
+            let eos = tokenizer
+                .special_token_id(turn_end)
+                .or_else(|| tokenizer.eos_token())
+                .ok_or(ValidationError::UnsupportedProfile)?;
+            return Self::new_with_family(
+                tokenizer,
+                TemplateFamily::Llama3,
+                turn_prefix.to_string(),
+                turn_end.to_string(),
+                eos,
+            );
+        }
+
+        // 3. Check Gemma 2 / 3
+        if template_str.contains("<start_of_turn>") && template_str.contains("<end_of_turn>") {
+            let turn_end = "<end_of_turn>";
+            let turn_prefix = if tokenizer.bos_token().is_some() {
+                "<bos>"
+            } else {
+                "<start_of_turn>"
+            };
+            let eos = tokenizer
+                .special_token_id(turn_end)
+                .or_else(|| tokenizer.eos_token())
+                .ok_or(ValidationError::UnsupportedProfile)?;
+            return Self::new_with_family(
+                tokenizer,
+                TemplateFamily::Gemma,
+                turn_prefix.to_string(),
+                turn_end.to_string(),
+                eos,
+            );
+        }
+
+        // 4. Dynamic probe for generic Jinja templates
+        let probe = [ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        if let (Ok(rendered), Some(eos)) = (
+            apply_chat_template(&tokenizer, &probe, true),
+            tokenizer.eos_token(),
+        ) {
+            let turn_end = if rendered.contains("<|im_end|>") {
+                "<|im_end|>"
+            } else if rendered.contains("<|eot_id|>") {
+                "<|eot_id|>"
+            } else if rendered.contains("<end_of_turn>") {
+                "<end_of_turn>"
+            } else {
+                "\n"
+            };
+            return Self::new_with_family(
+                tokenizer,
+                TemplateFamily::Custom,
+                String::new(),
+                turn_end.to_string(),
+                eos,
+            );
+        }
+
+        Err(ValidationError::UnsupportedProfile)
+    }
+
+    fn new_with_family(
+        tokenizer: Arc<BpeTokenizer>,
+        family: TemplateFamily,
+        turn_prefix: String,
+        turn_end: String,
+        eos: u32,
+    ) -> Result<Self, ValidationError> {
         let newline_tokens = tokenizer.encode("\n");
         let image_marker = {
             let probed = tokenizer.encode("<image>");
@@ -506,13 +709,50 @@ impl Profile {
             .find_map(|name| tokenizer.special_token_id(name).map(|id| (id, name)));
         Ok(Self {
             tokenizer,
-            eos: 7,
+            eos,
+            family,
+            turn_prefix,
+            turn_end,
             newline_tokens,
             image_marker,
             image_start,
             image_end,
             audio_marker,
         })
+    }
+
+    /// Builder for configuring custom profiles.
+    pub fn builder(tokenizer: Arc<BpeTokenizer>) -> ProfileBuilder {
+        ProfileBuilder::new(tokenizer)
+    }
+
+    /// Create a profile with explicit family and delimiters.
+    pub fn custom(
+        tokenizer: Arc<BpeTokenizer>,
+        family: TemplateFamily,
+        turn_prefix: impl Into<String>,
+        turn_end: impl Into<String>,
+        eos: Option<u32>,
+    ) -> Result<Self, ValidationError> {
+        let eos = eos
+            .or_else(|| tokenizer.eos_token())
+            .ok_or(ValidationError::UnsupportedProfile)?;
+        Self::new_with_family(tokenizer, family, turn_prefix.into(), turn_end.into(), eos)
+    }
+
+    /// Template family identifying turn framing semantics.
+    pub fn family(&self) -> TemplateFamily {
+        self.family
+    }
+
+    /// Turn prefix text stripped on continuation turns.
+    pub fn turn_prefix(&self) -> &str {
+        &self.turn_prefix
+    }
+
+    /// Turn end delimiter text.
+    pub fn turn_end(&self) -> &str {
+        &self.turn_end
     }
 
     /// End-of-sequence token ID.
@@ -569,6 +809,10 @@ impl Profile {
             Tool,
         }
         let mut state = MessageState::Start;
+        let assistant_role = match self.family {
+            TemplateFamily::Gemma => "model",
+            _ => "assistant",
+        };
         for (index, message) in messages.iter().enumerate() {
             if message.role == Role::Tool && tools.is_empty() {
                 return Err(ValidationError::UnsupportedRole { message: index });
@@ -598,7 +842,7 @@ impl Profile {
                 }
                 (MessageState::User | MessageState::Tool, Role::Assistant) => {
                     state = MessageState::Assistant;
-                    "assistant"
+                    assistant_role
                 }
                 _ => return Err(ValidationError::RoleOrder { message: index }),
             };
@@ -645,7 +889,17 @@ impl Profile {
                     }
                 }
             }
-            if user_text.contains("<|") {
+            let has_reserved = match self.family {
+                TemplateFamily::ChatML | TemplateFamily::Llama3 => user_text.contains("<|"),
+                TemplateFamily::Gemma => {
+                    user_text.contains("<start_of_turn>") || user_text.contains("<end_of_turn>")
+                }
+                TemplateFamily::Custom => {
+                    (!self.turn_prefix.is_empty() && user_text.contains(&self.turn_prefix))
+                        || (!self.turn_end.is_empty() && user_text.contains(&self.turn_end))
+                }
+            };
+            if has_reserved {
                 return Err(ValidationError::ReservedMarker { message: index });
             }
             serialized.push(ChatMessage {
@@ -695,17 +949,27 @@ impl Profile {
         .map_err(|e| ValidationError::Template(e.to_string()))?;
         if initial {
             Ok(rendered)
-        } else if rendered.starts_with(BOS) {
+        } else {
             let mut s = rendered;
-            s.drain(..BOS.len());
+            let candidate_prefixes = [
+                self.turn_prefix.as_str(),
+                BOS,
+                "<|begin_of_text|>",
+                "<bos>",
+                "<s>",
+            ];
+            for prefix in candidate_prefixes {
+                if !prefix.is_empty() && s.starts_with(prefix) {
+                    s.drain(..prefix.len());
+                    break;
+                }
+            }
             if s.starts_with("\r\n") {
                 s.drain(..2);
             } else if s.starts_with('\n') {
                 s.drain(..1);
             }
             Ok(s)
-        } else {
-            Err(ValidationError::UnsupportedProfile)
         }
     }
 }
