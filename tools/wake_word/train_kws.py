@@ -415,6 +415,11 @@ def render_tts(text: str, voice: str, rate: int, output_wav: str) -> bool:
                         return True
             except Exception:
                 pass
+    if os.path.exists(output_wav):
+        try:
+            os.remove(output_wav)
+        except OSError:
+            pass
 
     # Fallback to AIFF + afconvert
     with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp_aiff:
@@ -846,7 +851,12 @@ def main() -> None:
         )
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="Train KWS model for wake word detection")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train KWS model for wake word detection. "
+            "NOTE: This pipeline requires macOS (darwin) for parallel TTS speech synthesis."
+        )
+    )
     parser.add_argument(
         "--phrase",
         default="Hey Liquid",
