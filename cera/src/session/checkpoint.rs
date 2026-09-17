@@ -373,7 +373,7 @@ impl<'a> BufferReader<'a> {
     }
 
     fn read_u8(&mut self) -> Result<u8, CeraError> {
-        if self.pos < self.buf.len() {
+        if self.remaining_bytes() >= 1 {
             let b = self.buf[self.pos];
             self.pos += 1;
             Ok(b)
@@ -385,7 +385,7 @@ impl<'a> BufferReader<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32, CeraError> {
-        if self.pos + 4 <= self.buf.len() {
+        if self.remaining_bytes() >= 4 {
             let bytes = [
                 self.buf[self.pos],
                 self.buf[self.pos + 1],
@@ -402,7 +402,7 @@ impl<'a> BufferReader<'a> {
     }
 
     fn read_u64(&mut self) -> Result<u64, CeraError> {
-        if self.pos + 8 <= self.buf.len() {
+        if self.remaining_bytes() >= 8 {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
             self.pos += 8;

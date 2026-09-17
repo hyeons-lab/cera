@@ -119,6 +119,72 @@ impl SchemaCompiler {
             return Ok(format!("( {} )", exprs.join(" | ")));
         }
 
+        // Handle allOf
+        if let Some(Value::Array(subschemas)) = schema.get("allOf") {
+            ensure!(!subschemas.is_empty(), "allOf array must not be empty");
+            if subschemas.len() == 1
+                && schema.get("properties").is_none()
+                && schema.get("required").is_none()
+            {
+                return self.compile_value(&subschemas[0]);
+            }
+            // Merge subschemas and any sibling root properties into a unified object definition
+            let mut merged = serde_json::Map::new();
+            let mut merged_props = serde_json::Map::new();
+            let mut merged_required = Vec::new();
+
+            if let Some(Value::Object(p)) = schema.get("properties") {
+                for (k, v) in p {
+                    merged_props.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(Value::Array(r)) = schema.get("required") {
+                for item in r {
+                    if !merged_required.contains(item) {
+                        merged_required.push(item.clone());
+                    }
+                }
+            }
+
+            for sub in subschemas {
+                // If sub has $ref, resolve it
+                let resolved_sub = if let Some(r) = sub.get("$ref").and_then(|v| v.as_str()) {
+                    let def_name = r
+                        .strip_prefix("#/$defs/")
+                        .or_else(|| r.strip_prefix("#/definitions/"))
+                        .unwrap_or(r);
+                    if let Some(target) = self.defs.get(def_name) {
+                        target.clone()
+                    } else {
+                        bail!("unresolved $ref in allOf: {r}");
+                    }
+                } else {
+                    sub.clone()
+                };
+
+                if let Some(obj) = resolved_sub.as_object() {
+                    if let Some(Value::Object(p)) = obj.get("properties") {
+                        for (k, v) in p {
+                            merged_props.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if let Some(Value::Array(r)) = obj.get("required") {
+                        for item in r {
+                            if !merged_required.contains(item) {
+                                merged_required.push(item.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            merged.insert("type".to_string(), Value::String("object".to_string()));
+            merged.insert("properties".to_string(), Value::Object(merged_props));
+            if !merged_required.is_empty() {
+                merged.insert("required".to_string(), Value::Array(merged_required));
+            }
+            return self.compile_object(&Value::Object(merged));
+        }
+
         // Handle const
         if let Some(const_val) = schema.get("const") {
             if let Some(lit) = format_json_literal(const_val) {
@@ -421,5 +487,98 @@ json-ws ::= [ \t\n\r]*
         assert!(state.accepts(b" "));
         state.accept(b" ");
         assert!(state.accepts(b"\""));
+    }
+
+    #[test]
+    fn all_of_single_ref_wrapper() {
+        let schema = json!({
+            "$defs": {
+                "Coordinates": {
+                    "type": "object",
+                    "properties": {
+                        "lat": { "type": "number" },
+                        "lon": { "type": "number" }
+                    },
+                    "required": ["lat", "lon"]
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/Coordinates" }
+            ]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+    }
+
+    #[test]
+    fn all_of_merged_schemas() {
+        let schema = json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/Base" },
+                {
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            ]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+        assert!(gbnf.contains(r#"\"id\""#));
+        assert!(gbnf.contains(r#"\"name\""#));
+    }
+
+    #[test]
+    fn empty_all_of_fails() {
+        let schema = json!({
+            "allOf": []
+        });
+        assert!(json_schema_to_gbnf(&schema).is_err());
+    }
+
+    #[test]
+    fn all_of_unresolved_ref_fails() {
+        let schema = json!({
+            "allOf": [
+                { "$ref": "#/$defs/DoesNotExist" }
+            ]
+        });
+        assert!(json_schema_to_gbnf(&schema).is_err());
+    }
+
+    #[test]
+    fn all_of_sibling_properties_merging() {
+        let schema = json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": {
+                        "base_field": { "type": "string" }
+                    },
+                    "required": ["base_field"]
+                }
+            },
+            "allOf": [
+                { "$ref": "#/$defs/Base" }
+            ],
+            "properties": {
+                "sibling_field": { "type": "integer" }
+            },
+            "required": ["sibling_field"]
+        });
+        let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
+        Grammar::parse(&gbnf).expect("valid grammar");
+        assert!(gbnf.contains(r#"\"base_field\""#));
+        assert!(gbnf.contains(r#"\"sibling_field\""#));
     }
 }

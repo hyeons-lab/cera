@@ -495,11 +495,17 @@ impl AudioPipeline {
         let chunk_len = chunk.len() as u64;
 
         // Sanitize incoming PCM samples against non-finite values (NaN / Inf)
-        let sanitized: Vec<f32> = chunk
-            .iter()
-            .map(|&s| if s.is_finite() { s } else { 0.0 })
-            .collect();
-        let chunk_slice = &sanitized[..];
+        let sanitized: Option<Vec<f32>> = if chunk.iter().any(|s| !s.is_finite()) {
+            Some(
+                chunk
+                    .iter()
+                    .map(|&s| if s.is_finite() { s } else { 0.0 })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let chunk_slice = sanitized.as_deref().unwrap_or(chunk);
 
         match self.state {
             AudioPipelineState::ListeningForHotword => {
@@ -523,7 +529,7 @@ impl AudioPipeline {
                         self.utterance_buffer.clear();
                         self.utterance_buffer.extend_from_slice(&pre_roll);
                         self.current_utterance_start_sample =
-                            self.current_sample.saturating_sub(pre_roll_samples as u64);
+                            self.current_sample.saturating_sub(pre_roll.len() as u64);
 
                         // Reset VAD so speech tracking starts fresh on wake word transition
                         if let Some(vad) = &mut self.vad {
@@ -563,7 +569,22 @@ impl AudioPipeline {
                                 self.current_utterance_start_sample = sample;
                                 self.utterance_buffer.extend_from_slice(chunk_slice);
                             }
-                            VadEvent::SpeechEnd { .. } => {}
+                            VadEvent::SpeechEnd {
+                                start_sample,
+                                end_sample,
+                                start_ms,
+                                end_ms,
+                            } => {
+                                if self.state == AudioPipelineState::SpeechActive {
+                                    events.push(AudioPipelineEvent::SpeechEnd {
+                                        start_sample,
+                                        end_sample,
+                                        start_ms,
+                                        end_ms,
+                                    });
+                                    self.finish_utterance(&mut events, true)?;
+                                }
+                            }
                         }
                     }
 
@@ -787,6 +808,24 @@ impl AudioPipeline {
                     if e.to_string().contains("cancelled") {
                         tracing::debug!("Whisper transcription was cancelled cooperatively");
                     } else {
+                        self.state = if reset_vad {
+                            if self.config.require_hotword && self.hotword.is_some() {
+                                AudioPipelineState::ListeningForHotword
+                            } else {
+                                AudioPipelineState::ListeningForSpeech
+                            }
+                        } else {
+                            self.current_utterance_start_sample = self.current_sample;
+                            AudioPipelineState::SpeechActive
+                        };
+                        if reset_vad {
+                            if let Some(vad) = &mut self.vad {
+                                vad.reset();
+                            }
+                            if let Some(vad_iter) = &mut self.vad_iter {
+                                vad_iter.reset();
+                            }
+                        }
                         return Err(e);
                     }
                 }

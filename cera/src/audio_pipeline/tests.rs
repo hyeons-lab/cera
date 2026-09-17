@@ -278,3 +278,66 @@ fn test_audio_pipeline_pop_event_and_take_utterance() {
     assert_eq!(utterance.len(), 1600);
     assert!(pipeline.last_utterance().is_empty());
 }
+
+#[test]
+fn test_audio_pipeline_listening_for_speech_handles_speech_end_in_same_chunk() {
+    let candidates = [
+        std::path::PathBuf::from("../../models/silero_vad.gguf"),
+        std::path::PathBuf::from("models/silero_vad.gguf"),
+        std::path::PathBuf::from("../models/silero_vad.gguf"),
+    ];
+    let Some(vad_path) = candidates.into_iter().find(|p| p.exists()) else {
+        eprintln!(
+            "Skipping test_audio_pipeline_listening_for_speech_handles_speech_end_in_same_chunk: models/silero_vad.gguf not found"
+        );
+        return;
+    };
+
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .with_vad_from_file(vad_path)
+        .expect("load vad")
+        .build()
+        .expect("builder succeeds");
+
+    // First warm up with silence so VAD baseline is stable
+    let silence = vec![0.0f32; 512];
+    for _ in 0..5 {
+        pipeline.process_chunk(&silence).expect("process chunk");
+    }
+    assert_eq!(pipeline.state(), AudioPipelineState::ListeningForSpeech);
+
+    // Create a multi-frame buffer: 30 speech frames followed by 40 silence frames
+    let mut multi_frame_chunk = Vec::with_capacity(70 * 512);
+    for _ in 0..30 {
+        multi_frame_chunk.extend_from_slice(&[0.35f32; 512]);
+    }
+    for _ in 0..40 {
+        multi_frame_chunk.extend_from_slice(&[0.0f32; 512]);
+    }
+
+    let events = pipeline
+        .process_chunk(&multi_frame_chunk)
+        .expect("process multi-frame chunk");
+
+    let has_speech_start = events
+        .iter()
+        .any(|ev| matches!(ev, AudioPipelineEvent::SpeechStart { .. }));
+    let has_speech_end = events
+        .iter()
+        .any(|ev| matches!(ev, AudioPipelineEvent::SpeechEnd { .. }));
+
+    assert!(
+        has_speech_start,
+        "Chunk should emit SpeechStart when speech frames trigger VAD"
+    );
+    assert!(
+        has_speech_end,
+        "Chunk should emit SpeechEnd when trailing silence ends speech"
+    );
+    assert_eq!(
+        pipeline.state(),
+        AudioPipelineState::ListeningForSpeech,
+        "Pipeline must return to ListeningForSpeech after utterance completes"
+    );
+}

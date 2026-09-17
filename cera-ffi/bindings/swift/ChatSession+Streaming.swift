@@ -11,7 +11,14 @@ extension ChatSession {
         AsyncThrowingStream { continuation in
             final class StreamSink: ModalitySink, @unchecked Sendable {
                 let continuation: AsyncThrowingStream<String, Error>.Continuation
-                var hasFinished = false
+                private let lock = NSLock()
+                private var _hasFinished = false
+
+                var hasFinished: Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    return _hasFinished
+                }
 
                 init(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
                     self.continuation = continuation
@@ -26,7 +33,9 @@ extension ChatSession {
                 func onAudioFrames(pcm: [Float], sampleRate: UInt32) {}
 
                 func onDone(reason: FinishReason) {
-                    hasFinished = true
+                    lock.lock()
+                    _hasFinished = true
+                    lock.unlock()
                     switch reason {
                     case .stop, .maxTokens, .contextFull, .cancelled, .grammarDeadEnd:
                         continuation.finish()
