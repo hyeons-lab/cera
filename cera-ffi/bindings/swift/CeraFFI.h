@@ -1014,6 +1014,11 @@ RustBuffer uniffi_cera_ffi_fn_method_chatsession_ingest(uint64_t ptr, RustBuffer
 RustBuffer uniffi_cera_ffi_fn_method_chatsession_ingest_messages(uint64_t ptr, RustBuffer messages, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST_TOOL_RESPONSE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INGEST_TOOL_RESPONSE
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(uint64_t ptr, RustBuffer name, RustBuffer content, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INTO_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_INTO_SESSION
 uint64_t uniffi_cera_ffi_fn_method_chatsession_into_session(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -1042,6 +1047,26 @@ RustBuffer uniffi_cera_ffi_fn_method_chatsession_replace_messages(uint64_t ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_RESET
 void uniffi_cera_ffi_fn_method_chatsession_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_TOOL_FORMAT
+void uniffi_cera_ffi_fn_method_chatsession_set_tool_format(uint64_t ptr, RustBuffer format, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_TOOLS
+void uniffi_cera_ffi_fn_method_chatsession_set_tools(uint64_t ptr, RustBuffer tools, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_TOOL_FORMAT
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_tool_format(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_TOOLS
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_tools(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_GENERATIVEMODEL
@@ -2093,6 +2118,12 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST_TOOL_RESPONSE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INGEST_TOOL_RESPONSE
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INTO_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_INTO_SESSION
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_into_session(void
@@ -2126,6 +2157,30 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_replace_messages(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_RESET
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_TOOL_FORMAT
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_TOOLS
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_set_tools(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_TOOL_FORMAT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_TOOL_FORMAT
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_tool_format(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_TOOLS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_TOOLS
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_tools(void
     
 );
 #endif

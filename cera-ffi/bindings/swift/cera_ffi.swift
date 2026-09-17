@@ -1846,6 +1846,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func ingestMessages(messages: [Message]) throws  -> IngestSummary
     
     /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    func ingestToolResponse(name: String, content: String) throws  -> IngestSummary
+    
+    /**
      * Reclaim the underlying Session, consuming this ChatSession.
      */
     func intoSession() throws  -> Session
@@ -1880,6 +1885,26 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Reset execution state and return to Idle phase.
      */
     func reset() throws 
+    
+    /**
+     * Set tool wire format explicitly.
+     */
+    func setToolFormat(format: ToolFormat) throws 
+    
+    /**
+     * Register tools for function calling.
+     */
+    func setTools(tools: [ToolDef]) throws 
+    
+    /**
+     * Current tool wire format.
+     */
+    func toolFormat() throws  -> ToolFormat
+    
+    /**
+     * Currently registered tools for function calling.
+     */
+    func tools() throws  -> [ToolDef]
     
 }
 /**
@@ -2135,6 +2160,19 @@ open func ingestMessages(messages: [Message])throws  -> IngestSummary  {
 }
     
     /**
+     * Ingest a tool execution response back into the conversation.
+     */
+open func ingestToolResponse(name: String, content: String)throws  -> IngestSummary  {
+    return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+    
+    /**
      * Reclaim the underlying Session, consuming this ChatSession.
      */
 open func intoSession()throws  -> Session  {
@@ -2204,6 +2242,50 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * Set tool wire format explicitly.
+     */
+open func setToolFormat(format: ToolFormat)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeToolFormat_lower(format),$0
+    )
+}
+}
+    
+    /**
+     * Register tools for function calling.
+     */
+open func setTools(tools: [ToolDef])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_tools(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeToolDef.lower(tools),$0
+    )
+}
+}
+    
+    /**
+     * Current tool wire format.
+     */
+open func toolFormat()throws  -> ToolFormat  {
+    return try  FfiConverterTypeToolFormat_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_tool_format(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Currently registered tools for function calling.
+     */
+open func tools()throws  -> [ToolDef]  {
+    return try  FfiConverterSequenceTypeToolDef.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_tools(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
 
@@ -8093,6 +8175,10 @@ public struct TurnResult: Equatable, Hashable {
      * Generation summary metrics.
      */
     public var summary: GenerateSummary
+    /**
+     * Parsed tool calls emitted by the model during the turn.
+     */
+    public var toolCalls: [ToolCall]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8105,10 +8191,14 @@ public struct TurnResult: Equatable, Hashable {
          */tokens: [UInt32], 
         /**
          * Generation summary metrics.
-         */summary: GenerateSummary) {
+         */summary: GenerateSummary, 
+        /**
+         * Parsed tool calls emitted by the model during the turn.
+         */toolCalls: [ToolCall] = []) {
         self.text = text
         self.tokens = tokens
         self.summary = summary
+        self.toolCalls = toolCalls
     }
 
     
@@ -8129,7 +8219,8 @@ public struct FfiConverterTypeTurnResult: FfiConverterRustBuffer {
             try TurnResult(
                 text: FfiConverterString.read(from: &buf), 
                 tokens: FfiConverterSequenceUInt32.read(from: &buf), 
-                summary: FfiConverterTypeGenerateSummary.read(from: &buf)
+                summary: FfiConverterTypeGenerateSummary.read(from: &buf), 
+                toolCalls: FfiConverterSequenceTypeToolCall.read(from: &buf)
         )
     }
 
@@ -8137,6 +8228,7 @@ public struct FfiConverterTypeTurnResult: FfiConverterRustBuffer {
         FfiConverterString.write(value.text, into: &buf)
         FfiConverterSequenceUInt32.write(value.tokens, into: &buf)
         FfiConverterTypeGenerateSummary.write(value.summary, into: &buf)
+        FfiConverterSequenceTypeToolCall.write(value.toolCalls, into: &buf)
     }
 }
 
@@ -11444,6 +11536,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11460,6 +11555,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {

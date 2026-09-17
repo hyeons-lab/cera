@@ -17,7 +17,10 @@ use super::{
 use crate as core_api;
 use crate::kv_cache::KvRewindError;
 use crate::model::Model;
-use crate::tokenizer::{BpeTokenizer, ChatMessage, apply_chat_template};
+use crate::tokenizer::{
+    BpeTokenizer, ChatMessage, apply_chat_template, apply_chat_template_with_tools,
+};
+use crate::tools::{ToolCall, ToolDef, ToolFormat, parse_tool_calls, tool_grammar};
 
 /// ChatML chat template used by LFM2 models.
 pub const TEMPLATE: &str = "{{bos_token}}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
@@ -295,7 +298,7 @@ pub trait Execution: std::fmt::Debug {
 }
 
 /// Result of a completed chat turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnResult {
     /// Decoded assistant response text.
     pub text: String,
@@ -303,6 +306,8 @@ pub struct TurnResult {
     pub tokens: Vec<u32>,
     /// Generation summary metrics.
     pub summary: GenerateSummary,
+    /// Parsed tool calls if emitted by the model.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Error returned by `complete()`.
@@ -388,30 +393,57 @@ impl Profile {
         &self.tokenizer
     }
 
-    fn render(&self, messages: &[Message], initial: bool) -> Result<String, ValidationError> {
+    fn render(
+        &self,
+        messages: &[Message],
+        initial: bool,
+        tools: &[ToolDef],
+    ) -> Result<String, ValidationError> {
         if messages.is_empty() {
             return Err(ValidationError::EmptyBatch);
         }
         let mut serialized = Vec::with_capacity(messages.len());
-        let mut expected = Role::User;
+        #[derive(Clone, Copy, PartialEq)]
+        enum MessageState {
+            Start,
+            System,
+            User,
+            Assistant,
+            Tool,
+        }
+        let mut state = MessageState::Start;
         for (index, message) in messages.iter().enumerate() {
-            if message.role == Role::Tool {
+            if message.role == Role::Tool && tools.is_empty() {
                 return Err(ValidationError::UnsupportedRole { message: index });
             }
-            let role = if initial && index == 0 && message.role == Role::System {
-                "system"
-            } else {
-                match message.role {
-                    Role::User if expected == Role::User => {
-                        expected = Role::Assistant;
-                        "user"
-                    }
-                    Role::Assistant if expected == Role::Assistant => {
-                        expected = Role::User;
-                        "assistant"
-                    }
-                    _ => return Err(ValidationError::RoleOrder { message: index }),
+            let role = match (state, message.role) {
+                (MessageState::Start, Role::System) if initial && index == 0 => {
+                    state = MessageState::System;
+                    "system"
                 }
+                (
+                    MessageState::Start | MessageState::System | MessageState::Assistant,
+                    Role::User,
+                ) => {
+                    state = MessageState::User;
+                    "user"
+                }
+                (
+                    MessageState::Start | MessageState::Assistant | MessageState::Tool,
+                    Role::Tool,
+                ) if !initial => {
+                    state = MessageState::Tool;
+                    "tool"
+                }
+                (MessageState::Assistant | MessageState::Tool, Role::Tool) => {
+                    state = MessageState::Tool;
+                    "tool"
+                }
+                (MessageState::User | MessageState::Tool, Role::Assistant) => {
+                    state = MessageState::Assistant;
+                    "assistant"
+                }
+                _ => return Err(ValidationError::RoleOrder { message: index }),
             };
             let mut text = String::new();
             for (part, content) in message.content.iter().enumerate() {
@@ -433,13 +465,46 @@ impl Profile {
                 content: text,
             });
         }
-        if messages.last().is_none_or(|msg| msg.role != Role::User) {
+        if messages
+            .last()
+            .is_none_or(|msg| msg.role != Role::User && msg.role != Role::Tool)
+        {
             return Err(ValidationError::RoleOrder {
                 message: messages.len().saturating_sub(1),
             });
         }
-        let rendered = apply_chat_template(&self.tokenizer, &serialized, true)
-            .map_err(|e| ValidationError::Template(e.to_string()))?;
+        let template_has_tools = self
+            .tokenizer
+            .chat_template()
+            .is_some_and(|t| t.contains("tools"));
+        if initial && !tools.is_empty() && !template_has_tools {
+            let tools_json = tools
+                .iter()
+                .map(|t| serde_json::to_string(t).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tool_block = format!("List of tools: [{tools_json}]");
+            if let Some(first) = serialized.first_mut()
+                && first.role == "system"
+            {
+                first.content.push('\n');
+                first.content.push_str(&tool_block);
+            } else {
+                serialized.insert(
+                    0,
+                    ChatMessage {
+                        role: "system".into(),
+                        content: tool_block,
+                    },
+                );
+            }
+        }
+        let rendered = if initial && !tools.is_empty() {
+            apply_chat_template_with_tools(&self.tokenizer, &serialized, tools, true)
+        } else {
+            apply_chat_template(&self.tokenizer, &serialized, true)
+        }
+        .map_err(|e| ValidationError::Template(e.to_string()))?;
         if initial {
             Ok(rendered)
         } else if rendered.starts_with(BOS) {
@@ -463,6 +528,8 @@ pub struct Chat<E = CoreExecution> {
     profile: Profile,
     phase: SessionPhase,
     terminal_committed: Option<bool>,
+    tools: Vec<ToolDef>,
+    tool_format: ToolFormat,
 }
 
 impl<E: Execution> std::fmt::Debug for Chat<E> {
@@ -496,6 +563,8 @@ impl<E: Execution> Chat<E> {
             profile,
             phase,
             terminal_committed: None,
+            tools: Vec::new(),
+            tool_format: ToolFormat::Lfm2Pythonic,
         })
     }
 
@@ -527,6 +596,35 @@ impl<E: Execution> Chat<E> {
     /// Active chat rendering profile.
     pub fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// Currently registered tools for function calling.
+    pub fn tools(&self) -> &[ToolDef] {
+        &self.tools
+    }
+
+    /// Register tools for function calling.
+    pub fn set_tools(&mut self, tools: Vec<ToolDef>) {
+        self.tools = tools;
+    }
+
+    /// Active tool wire format.
+    pub fn tool_format(&self) -> ToolFormat {
+        self.tool_format
+    }
+
+    /// Set the tool wire format explicitly.
+    pub fn set_tool_format(&mut self, format: ToolFormat) {
+        self.tool_format = format;
+    }
+
+    /// Ingest a tool execution response back into the conversation.
+    pub fn ingest_tool_response(
+        &mut self,
+        _name: &str,
+        content: &str,
+    ) -> Result<IngestSummary, IngestError> {
+        self.ingest(&Message::tool(content))
     }
 
     /// Current token cursor position in the execution engine.
@@ -571,7 +669,7 @@ impl<E: Execution> Chat<E> {
         }
         let before = self.position();
         let initial = replace || self.phase == SessionPhase::Idle;
-        let rendered = self.profile.render(messages, initial)?;
+        let rendered = self.profile.render(messages, initial, &self.tools)?;
         let mut tokens = Vec::with_capacity(
             rendered.len().saturating_div(2) + self.profile.newline_tokens.len() + 1,
         );
@@ -655,6 +753,39 @@ impl<E: Execution> Chat<E> {
         if self.phase != SessionPhase::PromptReady {
             return Err(ValidationError::Phase(self.phase));
         }
+        let effective_opts;
+        let opts = if opts.grammar.is_none() && !self.tools.is_empty() {
+            if let Ok(gbnf) = tool_grammar(&self.tools, self.tool_format) {
+                if let Ok(grammar) = crate::grammar::Grammar::parse(&gbnf) {
+                    let mut modified = opts.clone();
+                    modified.grammar = Some(Arc::new(grammar));
+                    if modified.grammar_trigger_tokens.is_empty() {
+                        let trigger = self
+                            .profile
+                            .tokenizer
+                            .special_token_id(self.tool_format.call_start_marker())
+                            .or_else(|| {
+                                let t = self
+                                    .profile
+                                    .tokenizer
+                                    .encode(self.tool_format.call_start_marker());
+                                if t.len() == 1 { Some(t[0]) } else { None }
+                            });
+                        if let Some(tok) = trigger {
+                            modified.grammar_trigger_tokens = vec![tok];
+                        }
+                    }
+                    effective_opts = modified;
+                    &effective_opts
+                } else {
+                    opts
+                }
+            } else {
+                opts
+            }
+        } else {
+            opts
+        };
         self.execution.validate_decode(opts)?;
         if self.execution.audio_output() {
             return Err(ValidationError::AudioOutput);
@@ -693,10 +824,13 @@ impl<E: Execution> Chat<E> {
             .generate_into(opts, &mut collector)
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
+        let text = self.profile.tokenizer.decode(&collector.0);
+        let tool_calls = parse_tool_calls(&text, self.tool_format).unwrap_or_default();
         Ok(TurnResult {
-            text: self.profile.tokenizer.decode(&collector.0),
+            text,
             tokens: collector.0,
             summary,
+            tool_calls,
         })
     }
 
@@ -743,10 +877,12 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let full_text = self.profile.tokenizer.decode(&collector.tokens);
+        let tool_calls = parse_tool_calls(&full_text, self.tool_format).unwrap_or_default();
         Ok(TurnResult {
             text: full_text,
             tokens: collector.tokens,
             summary,
+            tool_calls,
         })
     }
 
@@ -756,8 +892,11 @@ impl<E: Execution> Chat<E> {
         opts: &GenerateOpts,
         schema_str: &str,
     ) -> Result<TurnResult, CompleteError> {
-        let grammar = crate::grammar::Grammar::from_json_schema_str(schema_str)
-            .map_err(|e| CompleteError::Validation(ValidationError::Generation(format!("invalid JSON schema: {e}"))))?;
+        let grammar = crate::grammar::Grammar::from_json_schema_str(schema_str).map_err(|e| {
+            CompleteError::Validation(ValidationError::Generation(format!(
+                "invalid JSON schema: {e}"
+            )))
+        })?;
         let mut constrained_opts = opts.clone();
         constrained_opts.grammar = Some(Arc::new(grammar));
         self.complete(&constrained_opts)

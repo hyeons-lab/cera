@@ -39,11 +39,11 @@ impl SchemaCompiler {
     }
 
     fn extract_defs(&mut self, root: &Value) {
-        if let Some(obj) = root.as_object() {
-            if let Some(Value::Object(defs)) = obj.get("$defs").or_else(|| obj.get("definitions")) {
-                for (k, v) in defs {
-                    self.defs.insert(k.clone(), v.clone());
-                }
+        if let Some(obj) = root.as_object()
+            && let Some(Value::Object(defs)) = obj.get("$defs").or_else(|| obj.get("definitions"))
+        {
+            for (k, v) in defs {
+                self.defs.insert(k.clone(), v.clone());
             }
         }
     }
@@ -156,10 +156,7 @@ impl SchemaCompiler {
             "json-value".into()
         };
 
-        let min_items = schema
-            .get("minItems")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let min_items = schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0);
 
         let expr = if min_items > 0 {
             format!(
@@ -224,8 +221,7 @@ impl SchemaCompiler {
             let key_lit = gbnf_quoted_json_string(key);
             pair_alts.push(format!("{key_lit} json-ws \":\" json-ws {val_expr}"));
         }
-        self.rules
-            .push((pair_rule.clone(), pair_alts.join(" | ")));
+        self.rules.push((pair_rule.clone(), pair_alts.join(" | ")));
 
         let expr = format!(
             "\"{{\" json-ws ( {pair_rule} ( json-ws \",\" json-ws {pair_rule} )* )? json-ws \"}}\""

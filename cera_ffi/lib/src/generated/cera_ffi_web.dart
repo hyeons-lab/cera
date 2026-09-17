@@ -1708,6 +1708,8 @@ class TurnResult {
     required this.tokens,
     /// Generation summary metrics.
     required this.summary,
+    /// Parsed tool calls emitted by the model during the turn.
+    this.toolCalls = const [],
   });
 
   /// Decoded assistant response text.
@@ -1716,12 +1718,15 @@ class TurnResult {
   final List<int> tokens;
   /// Generation summary metrics.
   final GenerateSummary summary;
+  /// Parsed tool calls emitted by the model during the turn.
+  final List<ToolCall> toolCalls;
 
   Map<String, dynamic> toJson() {
     return {
       'text': this.text,
       'tokens': this.tokens,
       'summary': this.summary.toJson(),
+      'toolCalls': this.toolCalls.map((item) => item.toJson()).toList(),
     };
   }
 
@@ -1730,6 +1735,7 @@ class TurnResult {
       text: json['text'] as String,
       tokens: (json['tokens'] as List).map((item) => (item as num).toInt()).toList(),
       summary: GenerateSummary.fromJson(json['summary'] as Map<String, dynamic>),
+      toolCalls: json.containsKey('toolCalls') ? (json['toolCalls'] as List).map((item) => ToolCall.fromJson(item as Map<String, dynamic>)).toList() : const [],
     );
   }
 
@@ -1737,26 +1743,28 @@ class TurnResult {
     String? text,
     List<int>? tokens,
     GenerateSummary? summary,
+    List<ToolCall>? toolCalls,
   }) {
     return TurnResult(
       text: text ?? this.text,
       tokens: tokens ?? this.tokens,
       summary: summary ?? this.summary,
+      toolCalls: toolCalls ?? this.toolCalls,
     );
   }
 
   @override
   String toString() {
-    return 'TurnResult(text: $text, tokens: $tokens, summary: $summary)';
+    return 'TurnResult(text: $text, tokens: $tokens, summary: $summary, toolCalls: $toolCalls)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is TurnResult && text == other.text && tokens == other.tokens && summary == other.summary;
+      other is TurnResult && text == other.text && tokens == other.tokens && summary == other.summary && toolCalls == other.toolCalls;
 
   @override
-  int get hashCode => Object.hash(text, tokens, summary);
+  int get hashCode => Object.hash(text, tokens, summary, toolCalls);
 }
 
 class ModelFiles {
@@ -6390,6 +6398,9 @@ final class ChatSession {
   /// Ingest a batch of messages into the chat context.
   IngestSummary ingestMessages(List<Message> messages) => _unsupportedOnWeb('ChatSession.ingestMessages');
 
+  /// Ingest a tool execution response back into the conversation.
+  IngestSummary ingestToolResponse(String name, String content) => _unsupportedOnWeb('ChatSession.ingestToolResponse');
+
   /// Reclaim the underlying Session, consuming this ChatSession.
   Session intoSession() => _unsupportedOnWeb('ChatSession.intoSession');
 
@@ -6413,6 +6424,18 @@ final class ChatSession {
 
   /// Reset execution state and return to Idle phase.
   void reset() => _unsupportedOnWeb('ChatSession.reset');
+
+  /// Set tool wire format explicitly.
+  void setToolFormat(ToolFormat format) => _unsupportedOnWeb('ChatSession.setToolFormat');
+
+  /// Register tools for function calling.
+  void setTools(List<ToolDef> tools) => _unsupportedOnWeb('ChatSession.setTools');
+
+  /// Current tool wire format.
+  ToolFormat toolFormat() => _unsupportedOnWeb('ChatSession.toolFormat');
+
+  /// Currently registered tools for function calling.
+  List<ToolDef> tools() => _unsupportedOnWeb('ChatSession.tools');
 }
 
 final class ChatSessionFfiCodec {

@@ -1060,6 +1060,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_into_session(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_phase(): Int
@@ -1071,6 +1073,14 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_chatsession_replace_messages(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_tools(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_tool_format(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_tools(): Int
 
     external fun uniffi_cera_ffi_checksum_method_generativemodel_create_session(): Int
 
@@ -1952,6 +1962,13 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+        `ptr`: Long,
+        `name`: RustBuffer.ByValue,
+        `content`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_chatsession_into_session(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -1982,6 +1999,28 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+        `ptr`: Long,
+        `format`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_tools(
+        `ptr`: Long,
+        `tools`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_tool_format(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_tools(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_clone_generativemodel(
         `handle`: Long,
@@ -2641,6 +2680,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2657,6 +2699,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
@@ -4994,6 +5048,14 @@ public interface ChatSessionInterface {
     fun `ingestMessages`(`messages`: List<Message>): IngestSummary
 
     /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    fun `ingestToolResponse`(
+        `name`: kotlin.String,
+        `content`: kotlin.String,
+    ): IngestSummary
+
+    /**
      * Reclaim the underlying Session, consuming this ChatSession.
      */
     fun `intoSession`(): Session
@@ -5028,6 +5090,26 @@ public interface ChatSessionInterface {
      * Reset execution state and return to Idle phase.
      */
     fun `reset`()
+
+    /**
+     * Set tool wire format explicitly.
+     */
+    fun `setToolFormat`(`format`: ToolFormat)
+
+    /**
+     * Register tools for function calling.
+     */
+    fun `setTools`(`tools`: List<ToolDef>)
+
+    /**
+     * Current tool wire format.
+     */
+    fun `toolFormat`(): ToolFormat
+
+    /**
+     * Currently registered tools for function calling.
+     */
+    fun `tools`(): List<ToolDef>
 
     companion object
 }
@@ -5387,6 +5469,27 @@ open class ChatSession :
         )
 
     /**
+     * Ingest a tool execution response back into the conversation.
+     */
+    @Throws(FfiException::class)
+    override fun `ingestToolResponse`(
+        `name`: kotlin.String,
+        `content`: kotlin.String,
+    ): IngestSummary =
+        FfiConverterTypeIngestSummary.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
+                        it,
+                        FfiConverterString.lower(`name`),
+                        FfiConverterString.lower(`content`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Reclaim the underlying Session, consuming this ChatSession.
      */
     @Throws(FfiException::class)
@@ -5486,6 +5589,68 @@ open class ChatSession :
                 )
             }
         }
+
+    /**
+     * Set tool wire format explicitly.
+     */
+    @Throws(FfiException::class)
+    override fun `setToolFormat`(`format`: ToolFormat) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
+                    it,
+                    FfiConverterTypeToolFormat.lower(`format`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Register tools for function calling.
+     */
+    @Throws(FfiException::class)
+    override fun `setTools`(`tools`: List<ToolDef>) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tools(
+                    it,
+                    FfiConverterSequenceTypeToolDef.lower(`tools`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Current tool wire format.
+     */
+    @Throws(FfiException::class)
+    override fun `toolFormat`(): ToolFormat =
+        FfiConverterTypeToolFormat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tool_format(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Currently registered tools for function calling.
+     */
+    @Throws(FfiException::class)
+    override fun `tools`(): List<ToolDef> =
+        FfiConverterSequenceTypeToolDef.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
 
     companion object {
         /**
@@ -12374,6 +12539,10 @@ data class TurnResult(
      * Generation summary metrics.
      */
     var `summary`: GenerateSummary,
+    /**
+     * Parsed tool calls emitted by the model during the turn.
+     */
+    var `toolCalls`: List<ToolCall> = listOf(),
 ) {
     companion object
 }
@@ -12387,13 +12556,15 @@ public object FfiConverterTypeTurnResult : FfiConverterRustBuffer<TurnResult> {
             FfiConverterString.read(buf),
             FfiConverterSequenceUInt.read(buf),
             FfiConverterTypeGenerateSummary.read(buf),
+            FfiConverterSequenceTypeToolCall.read(buf),
         )
 
     override fun allocationSize(value: TurnResult) =
         (
             FfiConverterString.allocationSize(value.`text`) +
                 FfiConverterSequenceUInt.allocationSize(value.`tokens`) +
-                FfiConverterTypeGenerateSummary.allocationSize(value.`summary`)
+                FfiConverterTypeGenerateSummary.allocationSize(value.`summary`) +
+                FfiConverterSequenceTypeToolCall.allocationSize(value.`toolCalls`)
         )
 
     override fun write(
@@ -12403,6 +12574,7 @@ public object FfiConverterTypeTurnResult : FfiConverterRustBuffer<TurnResult> {
         FfiConverterString.write(value.`text`, buf)
         FfiConverterSequenceUInt.write(value.`tokens`, buf)
         FfiConverterTypeGenerateSummary.write(value.`summary`, buf)
+        FfiConverterSequenceTypeToolCall.write(value.`toolCalls`, buf)
     }
 }
 

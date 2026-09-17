@@ -604,3 +604,82 @@ fn chat_session_complete_json_rejects_invalid_schema() {
     }
 }
 
+#[test]
+fn chat_session_tool_registration_and_accessors() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    assert!(chat.tools().unwrap().is_empty());
+    assert_eq!(chat.tool_format().unwrap(), ToolFormat::Lfm2Pythonic);
+
+    let tool = ToolDef {
+        name: "get_weather".into(),
+        description: Some("Get weather for a given city".into()),
+        parameters_json: r#"{"type": "object", "properties": {"city": {"type": "string"}}}"#.into(),
+    };
+
+    chat.set_tools(vec![tool]).expect("set_tools succeeds");
+    let tools = chat.tools().expect("tools query succeeds");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "get_weather");
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("Get weather for a given city")
+    );
+
+    chat.set_tool_format(ToolFormat::Hermes)
+        .expect("set_tool_format succeeds");
+    assert_eq!(chat.tool_format().unwrap(), ToolFormat::Hermes);
+}
+
+#[test]
+fn chat_session_tool_execution_flow() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    let tool = ToolDef {
+        name: "calculator".into(),
+        description: Some("Calculate mathematical expression".into()),
+        parameters_json: r#"{"type": "object", "properties": {"expr": {"type": "string"}}}"#.into(),
+    };
+    chat.set_tools(vec![tool]).expect("set_tools succeeds");
+
+    chat.ingest(chat_message_user("Calculate 2 + 2".into()))
+        .expect("user message ingests");
+    assert_eq!(chat.phase().unwrap(), SessionPhase::PromptReady);
+
+    // Ingesting tool response directly in Idle/PromptReady phase returns validation error:
+    let err = chat
+        .ingest_tool_response("calculator".into(), "4".into())
+        .unwrap_err();
+    assert!(matches!(err, FfiError::ChatValidation { .. }));
+}
+
+#[test]
+fn turn_result_tool_calls_field() {
+    let core_turn = cera::session::chat::TurnResult {
+        text: "response".into(),
+        tokens: vec![1, 2, 3],
+        summary: cera::session::GenerateSummary {
+            tokens_generated: 3,
+            prompt_eval_tokens: 10,
+            prompt_eval_ms: 5,
+            decode_ms: 10,
+            finish_reason: cera::session::FinishReason::Stop,
+        },
+        tool_calls: vec![cera::tools::ToolCall {
+            name: "test_call".into(),
+            arguments: serde_json::json!({"arg": "val"}),
+        }],
+    };
+
+    let ffi_turn = TurnResult::from(core_turn);
+    assert_eq!(ffi_turn.text, "response");
+    assert_eq!(ffi_turn.tool_calls.len(), 1);
+    assert_eq!(ffi_turn.tool_calls[0].name, "test_call");
+    assert!(
+        ffi_turn.tool_calls[0]
+            .arguments_json
+            .contains("\"arg\":\"val\"")
+    );
+}

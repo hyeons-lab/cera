@@ -609,6 +609,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748:
@@ -620,6 +622,14 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1597,6 +1607,13 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_messages.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1628,6 +1645,28 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tools.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tools.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tool_format.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tool_format.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2238,6 +2277,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.restype = ctypes.c_uint16
@@ -2256,6 +2298,18 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.restype 
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
@@ -7145,27 +7199,56 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.description, buf)
         _UniffiFfiConverterString.write(value.parameters_json, buf)
 
+class _UniffiFfiConverterSequenceTypeToolCall(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeToolCall.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeToolCall.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeToolCall.read(buf) for i in range(count)
+        ]
+
 @dataclass
 class TurnResult:
     """
     Result of a completed chat turn.
 """
-    def __init__(self, *, text:str, tokens:typing.List[int], summary:GenerateSummary):
+    def __init__(self, *, text:str, tokens:typing.List[int], summary:GenerateSummary, tool_calls:typing.List[ToolCall] = _DEFAULT):
         self.text = text
         self.tokens = tokens
         self.summary = summary
+        if tool_calls is _DEFAULT:
+            self.tool_calls = []
+        else:
+            self.tool_calls = tool_calls
         
         
 
     
     def __str__(self):
-        return "TurnResult(text={}, tokens={}, summary={})".format(self.text, self.tokens, self.summary)
+        return "TurnResult(text={}, tokens={}, summary={}, tool_calls={})".format(self.text, self.tokens, self.summary, self.tool_calls)
     def __eq__(self, other):
         if self.text != other.text:
             return False
         if self.tokens != other.tokens:
             return False
         if self.summary != other.summary:
+            return False
+        if self.tool_calls != other.tool_calls:
             return False
         return True
 
@@ -7176,6 +7259,7 @@ class _UniffiFfiConverterTypeTurnResult(_UniffiConverterRustBuffer):
             text=_UniffiFfiConverterString.read(buf),
             tokens=_UniffiFfiConverterSequenceUInt32.read(buf),
             summary=_UniffiFfiConverterTypeGenerateSummary.read(buf),
+            tool_calls=_UniffiFfiConverterSequenceTypeToolCall.read(buf),
         )
 
     @staticmethod
@@ -7183,12 +7267,14 @@ class _UniffiFfiConverterTypeTurnResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.check_lower(value.text)
         _UniffiFfiConverterSequenceUInt32.check_lower(value.tokens)
         _UniffiFfiConverterTypeGenerateSummary.check_lower(value.summary)
+        _UniffiFfiConverterSequenceTypeToolCall.check_lower(value.tool_calls)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterString.write(value.text, buf)
         _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
         _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
+        _UniffiFfiConverterSequenceTypeToolCall.write(value.tool_calls, buf)
 
 class _UniffiFfiConverterSequenceBytes(_UniffiConverterRustBuffer):
     @classmethod
@@ -9901,6 +9987,11 @@ class ChatSessionProtocol(typing.Protocol):
         Ingest a batch of messages into the chat context.
 """
         raise NotImplementedError
+    def ingest_tool_response(self, name: str,content: str) -> IngestSummary:
+        """
+        Ingest a tool execution response back into the conversation.
+"""
+        raise NotImplementedError
     def into_session(self, ) -> Session:
         """
         Reclaim the underlying Session, consuming this ChatSession.
@@ -9935,6 +10026,26 @@ class ChatSessionProtocol(typing.Protocol):
     def reset(self, ) -> None:
         """
         Reset execution state and return to Idle phase.
+"""
+        raise NotImplementedError
+    def set_tool_format(self, format: ToolFormat) -> None:
+        """
+        Set tool wire format explicitly.
+"""
+        raise NotImplementedError
+    def set_tools(self, tools: typing.List[ToolDef]) -> None:
+        """
+        Register tools for function calling.
+"""
+        raise NotImplementedError
+    def tool_format(self, ) -> ToolFormat:
+        """
+        Current tool wire format.
+"""
+        raise NotImplementedError
+    def tools(self, ) -> typing.List[ToolDef]:
+        """
+        Currently registered tools for function calling.
 """
         raise NotImplementedError
 
@@ -10234,6 +10345,27 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def ingest_tool_response(self, name: str,content: str) -> IngestSummary:
+        """
+        Ingest a tool execution response back into the conversation.
+"""
+        
+        _UniffiFfiConverterString.check_lower(name)
+
+        _UniffiFfiConverterString.check_lower(content)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(name),
+            _UniffiFfiConverterString.lower(content),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeIngestSummary.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def into_session(self, ) -> Session:
         """
         Reclaim the underlying Session, consuming this ChatSession.
@@ -10330,6 +10462,72 @@ class ChatSession(ChatSessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_tool_format(self, format: ToolFormat) -> None:
+        """
+        Set tool wire format explicitly.
+"""
+        
+        _UniffiFfiConverterTypeToolFormat.check_lower(format)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterTypeToolFormat.lower(format),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_tools(self, tools: typing.List[ToolDef]) -> None:
+        """
+        Register tools for function calling.
+"""
+        
+        _UniffiFfiConverterSequenceTypeToolDef.check_lower(tools)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceTypeToolDef.lower(tools),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tools,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def tool_format(self, ) -> ToolFormat:
+        """
+        Current tool wire format.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeToolFormat.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tool_format,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def tools(self, ) -> typing.List[ToolDef]:
+        """
+        Currently registered tools for function calling.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceTypeToolDef.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -13205,29 +13403,6 @@ class _UniffiFfiConverterSequenceTypeLeapBundleEntry(_UniffiConverterRustBuffer)
 
         return [
             _UniffiFfiConverterTypeLeapBundleEntry.read(buf) for i in range(count)
-        ]
-
-class _UniffiFfiConverterSequenceTypeToolCall(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterTypeToolCall.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterTypeToolCall.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterTypeToolCall.read(buf) for i in range(count)
         ]
 
 class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):

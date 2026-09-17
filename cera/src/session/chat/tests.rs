@@ -1420,3 +1420,138 @@ fn chat_complete_json_rejects_invalid_schema() {
         other => panic!("expected Validation(Generation), got: {other:?}"),
     }
 }
+
+#[test]
+fn chat_tool_registration_and_accessors() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    assert!(chat.tools().is_empty());
+    assert_eq!(chat.tool_format(), ToolFormat::Lfm2Pythonic);
+
+    let tool = ToolDef {
+        name: "calculator".into(),
+        description: Some("Perform math calculations".into()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "expr": { "type": "string" }
+            },
+            "required": ["expr"]
+        }),
+    };
+
+    chat.set_tools(vec![tool.clone()]);
+    assert_eq!(chat.tools().len(), 1);
+    assert_eq!(chat.tools()[0].name, "calculator");
+    assert_eq!(
+        chat.tools()[0].description.as_deref(),
+        Some("Perform math calculations")
+    );
+
+    chat.set_tool_format(ToolFormat::Hermes);
+    assert_eq!(chat.tool_format(), ToolFormat::Hermes);
+}
+
+#[test]
+fn chat_initial_render_with_tools_injects_tool_definitions() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+    let tool = ToolDef {
+        name: "get_weather".into(),
+        description: Some("Get weather for a city".into()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" }
+            }
+        }),
+    };
+    chat.set_tools(vec![tool]);
+
+    let summary = chat.ingest(&user("What is the weather in Paris?")).unwrap();
+    assert!(summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+}
+
+#[test]
+fn chat_tool_execution_loop_parses_call_and_ingests_response() {
+    let tokenizer = fixtures::tokenizer();
+    let tool_call_text = "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>";
+    let call_tokens = tokenizer.encode(tool_call_text);
+
+    let scripted = Arc::new(JsonScriptedModel {
+        config: fixtures::model_config("tool-scripted-test", tokenizer.vocab_size()),
+        tokens: call_tokens,
+        step: AtomicUsize::new(0),
+    });
+    let session = Session::new(
+        scripted,
+        tokenizer,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+    let mut chat = core_chat(session).unwrap();
+
+    let tool = ToolDef {
+        name: "get_weather".into(),
+        description: Some("Get weather for city".into()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" }
+            }
+        }),
+    };
+    chat.set_tools(vec![tool]);
+
+    chat.ingest(&user("weather in Paris?")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let mut generate_opts = opts(0.0);
+    generate_opts.max_tokens = 128;
+    let turn = chat.complete(&generate_opts).unwrap();
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "get_weather");
+    assert_eq!(
+        turn.tool_calls[0].arguments,
+        serde_json::json!({ "city": "Paris" })
+    );
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+
+    let ingest_summary = chat
+        .ingest_tool_response("get_weather", "{\"temperature\": 20}")
+        .unwrap();
+    assert!(ingest_summary.input_tokens > 0);
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+}
+
+#[test]
+fn chat_tool_validation_rules() {
+    let (_model, mut chat) = setup(fixtures::tokenizer());
+
+    // Without tools, Role::Tool is an UnsupportedRole:
+    let err = chat
+        .replace_messages(&[Message::tool("tool response")])
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(val, ValidationError::UnsupportedRole { message: 0 });
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+
+    // With tools registered, Role::Tool at the start of initial messages violates role order:
+    chat.set_tools(vec![ToolDef {
+        name: "test".into(),
+        description: None,
+        parameters: serde_json::json!({}),
+    }]);
+    let err = chat
+        .replace_messages(&[Message::tool("tool response")])
+        .unwrap_err();
+    match err.cause {
+        IngestCause::Validation(val) => {
+            assert_eq!(val, ValidationError::RoleOrder { message: 0 });
+        }
+        other => panic!("expected validation error, got {other:?}"),
+    }
+}

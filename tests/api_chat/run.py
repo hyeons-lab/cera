@@ -15,7 +15,7 @@ REPO = ROOT.parents[1]
 # Exact case counts per mode. Adding or removing a fixture must update these so
 # a silently dropped test cannot pass as complete evidence.
 ISOLATED_CASES = 15
-CORE_CASES = 43
+CORE_CASES = 47
 
 sys.path.insert(0, str(ROOT.parent / "api_loading"))
 from commands import Commands, cargo_artifact  # noqa: E402

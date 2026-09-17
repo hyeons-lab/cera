@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use crate::{
     FfiError, FinishReason, ForeignSinkAdapter, GenerateOpts, GenerateSummary, ModalitySink,
-    Session, SessionRecoveryStatus,
+    Session, SessionRecoveryStatus, ToolCall, ToolDef, ToolFormat,
 };
 
 /// Message author role in conversational chat.
@@ -127,10 +127,9 @@ pub fn chat_message_tool(content: String) -> Message {
 /// Compile a JSON Schema definition string into a GBNF grammar string.
 #[uniffi::export]
 pub fn json_schema_to_grammar(schema_json: String) -> Result<String, FfiError> {
-    cera::grammar::json_schema_to_gbnf_str(&schema_json)
-        .map_err(|e| FfiError::GrammarParse {
-            detail: format!("invalid JSON schema: {e}"),
-        })
+    cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| FfiError::GrammarParse {
+        detail: format!("invalid JSON schema: {e}"),
+    })
 }
 
 /// Lifecycle phase of a stateful chat coordinator.
@@ -312,6 +311,9 @@ pub struct TurnResult {
     pub tokens: Vec<u32>,
     /// Generation summary metrics.
     pub summary: GenerateSummary,
+    /// Parsed tool calls emitted by the model during the turn.
+    #[uniffi(default = [])]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl From<cera::session::chat::TurnResult> for TurnResult {
@@ -320,6 +322,7 @@ impl From<cera::session::chat::TurnResult> for TurnResult {
             text: res.text,
             tokens: res.tokens,
             summary: res.summary.into(),
+            tool_calls: res.tool_calls.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -618,10 +621,11 @@ impl ChatSession {
         opts: GenerateOpts,
         schema_json: String,
     ) -> Result<TurnResult, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
-            .map_err(|e| FfiError::GrammarParse {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
+            FfiError::GrammarParse {
                 detail: format!("invalid JSON schema: {e}"),
-            })?;
+            }
+        })?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.complete(constrained_opts)
@@ -634,13 +638,66 @@ impl ChatSession {
         schema_json: String,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
-            .map_err(|e| FfiError::GrammarParse {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
+            FfiError::GrammarParse {
                 detail: format!("invalid JSON schema: {e}"),
-            })?;
+            }
+        })?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.generate_streaming(constrained_opts, sink)
+    }
+
+    /// Register tools for function calling.
+    pub fn set_tools(&self, tools: Vec<ToolDef>) -> Result<(), FfiError> {
+        let core_tools = crate::to_core_tools(tools)?;
+        self.with_chat(|chat| {
+            chat.set_tools(core_tools);
+            Ok(())
+        })
+    }
+
+    /// Currently registered tools for function calling.
+    pub fn tools(&self) -> Result<Vec<ToolDef>, FfiError> {
+        self.with_chat(|chat| Ok(chat.tools().iter().cloned().map(Into::into).collect()))
+    }
+
+    /// Set tool wire format explicitly.
+    pub fn set_tool_format(&self, format: ToolFormat) -> Result<(), FfiError> {
+        self.with_chat(|chat| {
+            chat.set_tool_format(format.into());
+            Ok(())
+        })
+    }
+
+    /// Current tool wire format.
+    pub fn tool_format(&self) -> Result<ToolFormat, FfiError> {
+        self.with_chat(|chat| Ok(chat.tool_format().into()))
+    }
+
+    /// Ingest a tool execution response back into the conversation.
+    pub fn ingest_tool_response(
+        &self,
+        name: String,
+        content: String,
+    ) -> Result<IngestSummary, FfiError> {
+        self.with_chat(|chat| match chat.ingest_tool_response(&name, &content) {
+            Ok(summary) => {
+                self.set_last_ingest_recovery(None);
+                Ok(summary.into())
+            }
+            Err(err) => {
+                self.set_last_ingest_recovery(Some(crate::IngestRecovery {
+                    outcome: err.recovery.into(),
+                    rewind_error: err.rewind_error.as_deref().map(Into::into),
+                    reset_error: err.recovery_error.as_ref().map(Into::into),
+                }));
+                Err(match err.cause {
+                    cera::session::chat::IngestCause::Validation(val) => FfiError::from(val),
+                    cera::session::chat::IngestCause::Execution(exec) => FfiError::from(exec),
+                })
+            }
+        })
     }
 
     /// Reset execution state and return to Idle phase.
@@ -775,10 +832,11 @@ impl ChatSession {
         opts: GenerateOpts,
         schema_json: String,
     ) -> Result<TurnResult, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
-            .map_err(|e| FfiError::GrammarParse {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
+            FfiError::GrammarParse {
                 detail: format!("invalid JSON schema: {e}"),
-            })?;
+            }
+        })?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.complete_async(constrained_opts).await
@@ -791,10 +849,11 @@ impl ChatSession {
         schema_json: String,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json)
-            .map_err(|e| FfiError::GrammarParse {
+        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
+            FfiError::GrammarParse {
                 detail: format!("invalid JSON schema: {e}"),
-            })?;
+            }
+        })?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.generate_streaming_async(constrained_opts, sink).await

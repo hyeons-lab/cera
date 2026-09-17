@@ -673,7 +673,18 @@ impl From<cera::tools::ToolCall> for ToolCall {
     }
 }
 
-fn to_core_tools(tools: Vec<ToolDef>) -> Result<Vec<cera::tools::ToolDef>, FfiError> {
+impl From<cera::tools::ToolDef> for ToolDef {
+    fn from(t: cera::tools::ToolDef) -> Self {
+        ToolDef {
+            name: t.name,
+            description: t.description,
+            parameters_json: serde_json::to_string(&t.parameters)
+                .unwrap_or_else(|_| "{}".to_string()),
+        }
+    }
+}
+
+pub(crate) fn to_core_tools(tools: Vec<ToolDef>) -> Result<Vec<cera::tools::ToolDef>, FfiError> {
     tools.into_iter().map(TryInto::try_into).collect()
 }
 
