@@ -2871,7 +2871,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
@@ -6520,6 +6520,9 @@ public object FfiConverterTypeDownloadProgressSink : FfiConverter<DownloadProgre
 public interface FfiAudioPipelineInterface {
     /**
      * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
      */
     fun `cancel`()
 
@@ -6690,6 +6693,9 @@ open class FfiAudioPipeline :
 
     /**
      * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
      */
     @Throws(FfiException::class)
     override fun `cancel`() =

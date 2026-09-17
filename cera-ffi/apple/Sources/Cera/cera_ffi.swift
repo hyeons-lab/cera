@@ -2668,6 +2668,9 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
     
     /**
      * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
      */
     func cancel() throws 
     
@@ -2818,6 +2821,9 @@ public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath
     
     /**
      * Cooperatively cancel any active transcription.
+     *
+     * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+     * before subsequent speech segments to resume transcription.
      */
 open func cancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
@@ -12530,7 +12536,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {

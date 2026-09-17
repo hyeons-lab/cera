@@ -651,7 +651,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 21951:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -12957,6 +12957,9 @@ class FfiAudioPipelineProtocol(typing.Protocol):
     def cancel(self, ) -> None:
         """
         Cooperatively cancel any active transcription.
+
+        Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+        before subsequent speech segments to resume transcription.
 """
         raise NotImplementedError
     def clear_cancel(self, ) -> None:
@@ -13104,6 +13107,9 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
     def cancel(self, ) -> None:
         """
         Cooperatively cancel any active transcription.
+
+        Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+        before subsequent speech segments to resume transcription.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),

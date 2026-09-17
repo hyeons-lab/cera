@@ -9359,8 +9359,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel != 21951) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: expected 21951, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel != 57820) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: expected 57820, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel;
     try {
@@ -29584,6 +29584,9 @@ final class FfiAudioPipeline {
   }
 
   /// Cooperatively cancel any active transcription.
+  ///
+  /// Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+  /// before subsequent speech segments to resume transcription.
   void cancel() {
     _ensureOpen();
     _ffi.ffiAudioPipelineInvokeCancel(_handle);

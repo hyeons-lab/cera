@@ -6742,6 +6742,9 @@ final class FfiAudioPipeline {
   static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
 
   /// Cooperatively cancel any active transcription.
+  ///
+  /// Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
+  /// before subsequent speech segments to resume transcription.
   void cancel() => _unsupportedOnWeb('FfiAudioPipeline.cancel');
 
   /// Clear cooperative cancellation flag.
