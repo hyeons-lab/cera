@@ -440,3 +440,46 @@ fn test_audio_pipeline_take_last_utterance_reserves_capacity_on_next_turn() {
     pipeline.flush().expect("flush 2");
     assert_eq!(pipeline.last_utterance().len(), 1600);
 }
+
+#[test]
+fn test_audio_pipeline_flush_clamps_speech_end_to_utterance_start_sample() {
+    let config = AudioPipelineConfig {
+        auto_transcribe: false,
+        max_utterance_ms: 100, // 1600 samples
+        ..Default::default()
+    };
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_config(config)
+        .build()
+        .expect("builder succeeds");
+
+    // Push 3200 samples (2 chunks of 1600) to exceed max utterance duration
+    let chunk = vec![0.1f32; 1600];
+    pipeline.process_chunk(&chunk).expect("chunk 1");
+    let cutoff_start = pipeline.current_utterance_start_sample;
+
+    // Flush active speech
+    let events = pipeline.flush().expect("flush succeeds");
+    for event in &events {
+        if let AudioPipelineEvent::SpeechEnd {
+            start_sample,
+            end_sample,
+            start_ms,
+            end_ms,
+        } = event
+        {
+            assert!(
+                start_sample <= end_sample,
+                "start_sample ({start_sample}) must not exceed end_sample ({end_sample})"
+            );
+            assert!(
+                start_ms <= end_ms,
+                "start_ms ({start_ms}) must not exceed end_ms ({end_ms})"
+            );
+            assert!(
+                start_sample >= &cutoff_start,
+                "start_sample ({start_sample}) must be clamped to cutoff boundary ({cutoff_start})"
+            );
+        }
+    }
+}

@@ -692,22 +692,8 @@ impl AudioPipeline {
                     }
 
                     if speech_ended || duration_exceeded {
-                        let (start_sample, end_sample, start_ms, end_ms) = match end_payload {
-                            Some((start_s, end_s, _, end_m)) => {
-                                let clamped_start =
-                                    start_s.max(self.current_utterance_start_sample);
-                                let clamped_start_m =
-                                    (clamped_start as f64 * 1000.0 / 16000.0) as f32;
-                                (clamped_start, end_s, clamped_start_m, end_m)
-                            }
-                            None => {
-                                let end_s = self.current_sample;
-                                let start_s = self.current_utterance_start_sample;
-                                let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
-                                let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
-                                (start_s, end_s, start_m, end_m)
-                            }
-                        };
+                        let (start_sample, end_sample, start_ms, end_ms) =
+                            self.resolve_speech_end_boundary(end_payload);
 
                         events.push(AudioPipelineEvent::SpeechEnd {
                             start_sample,
@@ -776,13 +762,8 @@ impl AudioPipeline {
                 end_payload = Some((start_sample, end_sample, start_ms, end_ms));
             }
 
-            let (start_sample, end_sample, start_ms, end_ms) = end_payload.unwrap_or_else(|| {
-                let end_s = self.current_sample;
-                let start_s = self.current_utterance_start_sample;
-                let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
-                let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
-                (start_s, end_s, start_m, end_m)
-            });
+            let (start_sample, end_sample, start_ms, end_ms) =
+                self.resolve_speech_end_boundary(end_payload);
 
             events.push(AudioPipelineEvent::SpeechEnd {
                 start_sample,
@@ -795,6 +776,29 @@ impl AudioPipeline {
         }
 
         Ok(())
+    }
+
+    /// Resolve and clamp SpeechEnd event boundaries monotonically against current utterance start.
+    fn resolve_speech_end_boundary(
+        &self,
+        end_payload: Option<(u64, u64, f32, f32)>,
+    ) -> (u64, u64, f32, f32) {
+        match end_payload {
+            Some((start_s, end_s, _, _)) => {
+                let clamped_start = start_s.max(self.current_utterance_start_sample);
+                let clamped_end = end_s.max(clamped_start);
+                let clamped_start_m = (clamped_start as f64 * 1000.0 / 16000.0) as f32;
+                let clamped_end_m = (clamped_end as f64 * 1000.0 / 16000.0) as f32;
+                (clamped_start, clamped_end, clamped_start_m, clamped_end_m)
+            }
+            None => {
+                let end_s = self.current_sample;
+                let start_s = self.current_utterance_start_sample;
+                let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
+                let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
+                (start_s, end_s, start_m, end_m)
+            }
+        }
     }
 
     /// Internal helper: finalize an utterance buffer, perform optional Whisper transcription,

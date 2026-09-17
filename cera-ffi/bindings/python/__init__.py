@@ -1,5 +1,6 @@
 """Python bindings for cera inference engine."""
 
+import copy
 import queue
 import threading
 from typing import Iterator
@@ -81,14 +82,23 @@ def chat_stream(session: ChatSession, opts: GenerateOpts) -> Iterator[str]:
 
 def chat_stream_json(session: ChatSession, opts: GenerateOpts, schema_json: str) -> Iterator[str]:
     """Stream generated text fragments constrained by a JSON Schema as a Python iterator."""
+    constrained_opts = copy.copy(opts)
     grammar = json_schema_to_grammar(schema_json)
-    opts.grammar = grammar
-    return chat_stream(session, opts)
+    constrained_opts.grammar = grammar
+    return chat_stream(session, constrained_opts)
+
+
+def with_json_schema(opts: GenerateOpts, schema_json: str) -> GenerateOpts:
+    """Return a copy of GenerateOpts constrained by the provided JSON Schema."""
+    new_opts = copy.copy(opts)
+    new_opts.grammar = json_schema_to_grammar(schema_json)
+    return new_opts
 
 
 # Attach stream methods to ChatSession for idiomatic object-oriented calling
 setattr(ChatSession, "stream", chat_stream)
 setattr(ChatSession, "stream_json", chat_stream_json)
+setattr(GenerateOpts, "with_json_schema", with_json_schema)
 
 __all__ = [
     "CeraEngine",
@@ -112,4 +122,5 @@ __all__ = [
     "chat_stream",
     "chat_stream_json",
     "json_schema_to_grammar",
+    "with_json_schema",
 ]

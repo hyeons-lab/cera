@@ -587,6 +587,42 @@ async fn chat_session_generate_streaming_async_produces_stream() {
     assert_eq!(chat.phase().unwrap(), SessionPhase::Interrupted);
 }
 
+#[tokio::test]
+async fn chat_session_consecutive_streaming_async_generations_succeed() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    // Turn 1 completes cleanly to TurnComplete
+    chat.ingest(chat_message_user("turn 1".into()))
+        .expect("turn 1 ingest succeeds");
+    let opts = GenerateOpts {
+        max_tokens: 16,
+        temperature: 0.0,
+        top_k: 1,
+        ..Default::default()
+    };
+    let sink1 = Arc::new(TestSink::new());
+    let summary1 = Arc::clone(&chat)
+        .generate_streaming_async(opts.clone(), sink1.clone())
+        .await
+        .expect("turn 1 streaming succeeds");
+    assert_eq!(summary1.finish_reason, FinishReason::Stop);
+    assert_eq!(*sink1.done.lock().unwrap(), Some(FinishReason::Stop));
+    assert_eq!(chat.phase().unwrap(), SessionPhase::TurnComplete);
+
+    // Turn 2 on same session proves stream exhaustion does not set sticky cancellation
+    chat.ingest(chat_message_user("turn 2".into()))
+        .expect("turn 2 ingest succeeds");
+    let sink2 = Arc::new(TestSink::new());
+    let summary2 = Arc::clone(&chat)
+        .generate_streaming_async(opts, sink2.clone())
+        .await
+        .expect("turn 2 streaming succeeds");
+    assert_eq!(summary2.finish_reason, FinishReason::Stop);
+    assert_eq!(*sink2.done.lock().unwrap(), Some(FinishReason::Stop));
+    assert_eq!(chat.phase().unwrap(), SessionPhase::TurnComplete);
+}
+
 #[test]
 fn json_schema_to_grammar_compiles_valid_schema() {
     let schema = r#"{"type": "string", "enum": ["apple", "banana"]}"#;

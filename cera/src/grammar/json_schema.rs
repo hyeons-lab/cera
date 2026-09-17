@@ -23,6 +23,8 @@ pub fn json_schema_to_gbnf(schema: &Value) -> Result<String> {
     compiler.compile(schema)
 }
 
+const MAX_REF_DEPTH: usize = 32;
+
 struct SchemaCompiler {
     rule_counter: usize,
     rules: Vec<(String, String)>,
@@ -133,7 +135,7 @@ impl SchemaCompiler {
                 let mut depth = 0;
                 while let Some(r) = target.get("$ref").and_then(|v| v.as_str()) {
                     depth += 1;
-                    if depth > 32 {
+                    if depth > MAX_REF_DEPTH {
                         break;
                     }
                     let def_name = r
@@ -178,7 +180,6 @@ impl SchemaCompiler {
                 // Resolve $ref chains recursively, accumulating sibling properties and required keys
                 let mut current = sub;
                 let mut depth = 0;
-                const MAX_REF_DEPTH: usize = 32;
 
                 loop {
                     if let Some(obj) = current.as_object() {

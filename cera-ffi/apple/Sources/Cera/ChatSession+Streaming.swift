@@ -20,6 +20,14 @@ extension ChatSession {
                     return _hasFinished
                 }
 
+                func markFinished() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    let was = _hasFinished
+                    _hasFinished = true
+                    return was
+                }
+
                 init(_ continuation: AsyncThrowingStream<String, Error>.Continuation) {
                     self.continuation = continuation
                 }
@@ -33,9 +41,7 @@ extension ChatSession {
                 func onAudioFrames(pcm: [Float], sampleRate: UInt32) {}
 
                 func onDone(reason: FinishReason) {
-                    lock.lock()
-                    _hasFinished = true
-                    lock.unlock()
+                    _ = markFinished()
                     switch reason {
                     case .stop, .maxTokens, .contextFull, .cancelled, .grammarDeadEnd:
                         continuation.finish()
@@ -50,8 +56,8 @@ extension ChatSession {
             }
 
             let sink = StreamSink(continuation)
-            continuation.onTermination = { @Sendable [weak self] _ in
-                if !sink.hasFinished {
+            continuation.onTermination = { @Sendable [weak self] termination in
+                if case .cancelled = termination, !sink.hasFinished {
                     self?.cancel()
                 }
             }
@@ -64,7 +70,8 @@ extension ChatSession {
                 do {
                     _ = try await self.generateStreamingAsync(opts: opts, sink: sink)
                 } catch {
-                    if !sink.hasFinished {
+                    let alreadyFinished = sink.markFinished()
+                    if !alreadyFinished {
                         continuation.finish(throwing: error)
                     }
                 }
