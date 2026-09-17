@@ -83,6 +83,7 @@ pub use session::chat::{
     IngestCause, IngestError, IngestSegment, IngestSummary, Message, Profile, Role, SessionChat,
     SessionPhase, TurnResult, ValidationError, core_chat,
 };
+pub use session::checkpoint::{ChatCheckpoint, SessionCheckpoint};
 pub use session::{
     CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
     Session, SessionConfig, SpecDecode,

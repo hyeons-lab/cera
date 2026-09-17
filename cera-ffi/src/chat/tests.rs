@@ -706,3 +706,114 @@ fn turn_result_tool_calls_field() {
             .contains("\"arg\":\"val\"")
     );
 }
+
+#[test]
+fn chat_session_checkpoint_export_import_and_file_persistence() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    chat.ingest(chat_message_user("hello".into()))
+        .expect("ingest succeeds");
+    chat.complete(GenerateOpts::default())
+        .expect("complete succeeds");
+    assert_eq!(chat.phase().unwrap(), SessionPhase::TurnComplete);
+    let expected_pos = chat.position().unwrap();
+
+    let tool = ToolDef {
+        name: "math".into(),
+        description: Some("evaluate math".into()),
+        parameters_json: r#"{"type":"object"}"#.into(),
+    };
+    chat.set_tools(vec![tool]).expect("set_tools succeeds");
+    chat.set_tool_format(ToolFormat::Hermes)
+        .expect("set_tool_format succeeds");
+
+    let bytes = chat
+        .export_checkpoint()
+        .expect("export_checkpoint succeeds");
+    assert!(!bytes.is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir succeeds");
+    let file_path = dir
+        .path()
+        .join("chat_ffi.chk")
+        .to_str()
+        .unwrap()
+        .to_string();
+    chat.save_checkpoint(file_path.clone())
+        .expect("save_checkpoint succeeds");
+
+    let session2 = test_session(0);
+    let chat2 = session2.into_chat().expect("into_chat succeeds");
+    assert_eq!(chat2.phase().unwrap(), SessionPhase::Idle);
+
+    chat2
+        .load_checkpoint(file_path)
+        .expect("load_checkpoint succeeds");
+    assert_eq!(chat2.phase().unwrap(), SessionPhase::TurnComplete);
+    assert_eq!(chat2.position().unwrap(), expected_pos);
+    assert_eq!(chat2.tool_format().unwrap(), ToolFormat::Hermes);
+    assert_eq!(chat2.tools().unwrap().len(), 1);
+
+    let session3 = test_session(0);
+    let chat3 = session3.into_chat().expect("into_chat succeeds");
+    chat3
+        .import_checkpoint(bytes)
+        .expect("import_checkpoint succeeds");
+    assert_eq!(chat3.phase().unwrap(), SessionPhase::TurnComplete);
+    assert_eq!(chat3.position().unwrap(), expected_pos);
+
+    chat3.set_tools(Vec::new()).expect("clear tools succeeds");
+    chat3
+        .ingest(chat_message_user("next turn".into()))
+        .expect("ingest turn 2 succeeds");
+    let turn2 = chat3
+        .complete(GenerateOpts::default())
+        .expect("complete turn 2 succeeds");
+    assert_eq!(turn2.text, "");
+    assert!(chat3.position().unwrap() > expected_pos);
+}
+
+#[test]
+fn session_checkpoint_export_import_and_file_persistence() {
+    let session = test_session(0);
+    session
+        .append_text("testing persistence".into())
+        .expect("append_text succeeds");
+    let expected_pos = session.position();
+
+    let bytes = session
+        .export_checkpoint()
+        .expect("export_checkpoint succeeds");
+    let dir = tempfile::tempdir().expect("tempdir succeeds");
+    let file_path = dir
+        .path()
+        .join("sess_ffi.chk")
+        .to_str()
+        .unwrap()
+        .to_string();
+    session
+        .save_checkpoint(file_path.clone())
+        .expect("save_checkpoint succeeds");
+
+    let session2 = test_session(0);
+    assert_eq!(session2.position(), 0);
+    session2
+        .load_checkpoint(file_path)
+        .expect("load_checkpoint succeeds");
+    assert_eq!(session2.position(), expected_pos);
+
+    let session3 = test_session(0);
+    session3
+        .import_checkpoint(bytes)
+        .expect("import_checkpoint succeeds");
+    assert_eq!(session3.position(), expected_pos);
+}
+
+#[test]
+fn chat_session_checkpoint_rejects_corrupted_data() {
+    let session = test_session(0);
+    let chat = session.into_chat().expect("into_chat succeeds");
+    let err = chat.import_checkpoint(vec![1, 2, 3, 4]).unwrap_err();
+    assert!(matches!(err, FfiError::Backend { .. }));
+}

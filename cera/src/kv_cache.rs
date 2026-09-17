@@ -2075,7 +2075,7 @@ impl From<u8> for SemanticBoundaryKind {
 
 /// Snapshot of model KV + conv state after prefilling a token sequence.
 /// Backend-agnostic: stores raw bytes that the backend knows how to restore.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StateSnapshot {
     pub layers: Vec<LayerSnapshot>,
     pub seq_len: usize,
@@ -2115,7 +2115,7 @@ impl StateSnapshot {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LayerSnapshot {
     /// Raw f32 KV bytes (CPU / wgpu) or raw f16 (Metal). Backend
     /// chooses the element width; the byte length implicitly carries

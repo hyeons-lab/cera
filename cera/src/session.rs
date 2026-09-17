@@ -25,8 +25,10 @@ use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::BpeTokenizer;
 
 pub mod chat;
+pub mod checkpoint;
 mod decode;
 mod recovery;
+pub use checkpoint::{ChatCheckpoint, SessionCheckpoint};
 use decode::{DecodeObservation, ObservedGeneration};
 pub use recovery::{IngestRecovery, RecoveryOutcome};
 
@@ -430,6 +432,8 @@ pub enum CeraError {
         configured: String,
         requested: String,
     },
+    #[error("format: {0}")]
+    Format(String),
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
@@ -1041,6 +1045,91 @@ impl Session {
     #[allow(clippy::result_large_err)]
     pub fn into_chat(self) -> Result<chat::SessionChat, (Session, chat::ValidationError)> {
         chat::core_chat(self)
+    }
+
+    /// Calculate structural model fingerprint to verify compatibility upon restore.
+    pub fn model_fingerprint(&self) -> u64 {
+        crate::kv_cache::model_fingerprint(self.model.config(), "")
+    }
+
+    /// Capture a resumable checkpoint of the current inference session.
+    pub fn checkpoint(&self) -> Result<checkpoint::SessionCheckpoint, CeraError> {
+        if !self.usable {
+            return Err(CeraError::Format(
+                "cannot checkpoint session in unusable state".to_string(),
+            ));
+        }
+        let kv_state = self.state.snapshot().ok_or_else(|| {
+            CeraError::Format(
+                "failed to capture KV cache snapshot (unsupported or mixed compression)"
+                    .to_string(),
+            )
+        })?;
+        Ok(checkpoint::SessionCheckpoint {
+            model_fingerprint: self.model_fingerprint(),
+            position: self.current_pos,
+            max_seq_len: self.max_seq_len,
+            prefill_tokens: self.prefill_tokens,
+            prefill_elapsed_ms: self.prefill_elapsed.as_millis() as u64,
+            last_logits: self.last_logits.clone(),
+            token_history: self.token_history.clone(),
+            kv_state,
+        })
+    }
+
+    /// Restore a previously captured checkpoint into this session.
+    pub fn restore(&mut self, checkpoint: &checkpoint::SessionCheckpoint) -> Result<(), CeraError> {
+        let current_fp = self.model_fingerprint();
+        if checkpoint.model_fingerprint != current_fp {
+            return Err(CeraError::Format(format!(
+                "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
+                checkpoint.model_fingerprint
+            )));
+        }
+        if checkpoint.position > self.max_seq_len {
+            return Err(CeraError::ContextOverflow {
+                max_seq_len: self.max_seq_len as u32,
+                by: (checkpoint.position - self.max_seq_len) as u32,
+            });
+        }
+        if checkpoint.kv_state.layers.len() != self.state.layers.len() {
+            return Err(CeraError::Format(format!(
+                "checkpoint layer count {} does not match session layer count {}",
+                checkpoint.kv_state.layers.len(),
+                self.state.layers.len()
+            )));
+        }
+        if checkpoint.kv_state.is_f16() != self.state.kv_f16 {
+            return Err(CeraError::Format(
+                "checkpoint KV precision (f16 vs f32) does not match session".to_string(),
+            ));
+        }
+
+        self.state.restore(&checkpoint.kv_state);
+        self.current_pos = checkpoint.position;
+        self.position_atomic
+            .store(checkpoint.position as u32, Ordering::Release);
+        self.token_history = checkpoint.token_history.clone();
+        self.last_logits = checkpoint.last_logits.clone();
+        self.prefill_tokens = checkpoint.prefill_tokens;
+        self.prefill_elapsed = Duration::from_millis(checkpoint.prefill_elapsed_ms);
+        self.usable = true;
+        self.ingest_mutation = None;
+        self.last_ingest_recovery = None;
+        self.cancel.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Save current session checkpoint to file.
+    pub fn save_checkpoint(&self, path: impl AsRef<std::path::Path>) -> Result<(), CeraError> {
+        let cp = self.checkpoint()?;
+        cp.save_to_file(path)
+    }
+
+    /// Load and restore a session checkpoint from file.
+    pub fn load_checkpoint(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), CeraError> {
+        let cp = checkpoint::SessionCheckpoint::load_from_file(path)?;
+        self.restore(&cp)
     }
 
     /// Clear KV state and reset position to 0. Rebuilds the sampler from

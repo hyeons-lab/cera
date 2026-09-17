@@ -1844,3 +1844,107 @@ fn chat_multimodal_validation_rules() {
         other => panic!("expected validation error, got {other:?}"),
     }
 }
+
+#[test]
+fn chat_checkpoint_roundtrip_persistence_and_continuation() {
+    let tok = fixtures::tokenizer();
+    let (model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("hello")).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::PromptReady);
+
+    let result = chat.complete(&opts(0.0)).unwrap();
+    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+    assert_eq!(result.text, "a");
+    let pos_before_checkpoint = chat.position();
+
+    let tools = vec![ToolDef {
+        name: "calculator".to_string(),
+        description: Some("Evaluates arithmetic expressions".to_string()),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "expr": { "type": "string" }
+            },
+            "required": ["expr"]
+        }),
+    }];
+    chat.set_tools(tools.clone());
+    chat.set_tool_format(ToolFormat::Hermes);
+
+    let cp = chat.checkpoint().unwrap();
+    assert_eq!(cp.phase, SessionPhase::TurnComplete);
+    assert_eq!(cp.tools.len(), 1);
+    assert_eq!(cp.tool_format, ToolFormat::Hermes);
+    assert_eq!(cp.session_checkpoint.position, pos_before_checkpoint);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_chat.chk");
+    chat.save_checkpoint(&path).unwrap();
+
+    let session2 = Session::new(
+        model,
+        tok,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+    let mut chat2 = core_chat(session2).unwrap();
+    assert_eq!(chat2.phase(), SessionPhase::Idle);
+    assert!(chat2.tools().is_empty());
+
+    chat2.load_checkpoint(&path).unwrap();
+    assert_eq!(chat2.phase(), SessionPhase::TurnComplete);
+    assert_eq!(chat2.tools(), tools.as_slice());
+    assert_eq!(chat2.tool_format(), ToolFormat::Hermes);
+    assert_eq!(chat2.position(), pos_before_checkpoint);
+
+    // Clear tools for normal dialogue continuation:
+    chat2.set_tools(Vec::new());
+    chat2.ingest(&user("follow up")).unwrap();
+    assert_eq!(chat2.phase(), SessionPhase::PromptReady);
+    let result2 = chat2.complete(&opts(0.0)).unwrap();
+    assert_eq!(chat2.phase(), SessionPhase::TurnComplete);
+    assert_eq!(result2.text, "a");
+    assert!(chat2.position() > pos_before_checkpoint);
+}
+
+#[test]
+fn chat_checkpoint_rejects_incompatible_model_architecture() {
+    let tok = fixtures::tokenizer();
+    let (_model, mut chat) = setup(tok.clone());
+
+    chat.ingest(&user("hello world")).unwrap();
+    chat.complete(&opts(0.0)).unwrap();
+
+    let cp = chat.checkpoint().unwrap();
+
+    let mut cfg2 = fixtures::model_config("chat-transaction-test", tok.vocab_size());
+    cfg2.hidden_size = 4;
+    cfg2.head_dim = 4;
+    let model2 = Arc::new(StateModel {
+        config: cfg2,
+        answer: tok.encode("a")[0],
+        calls: Mutex::new(Vec::new()),
+        rewinds: AtomicUsize::new(0),
+        resets: AtomicUsize::new(0),
+        rewind_supported: AtomicBool::new(true),
+        fault: AtomicU8::new(NO_FAULT),
+    });
+    let session2 = Session::new(
+        model2,
+        tok,
+        ModalityCapabilities::text_only(),
+        session_config(),
+    )
+    .unwrap();
+    let mut chat2 = core_chat(session2).unwrap();
+
+    let err = chat2.restore(&cp).unwrap_err();
+    match err {
+        CeraError::Format(msg) => {
+            assert!(msg.contains("model fingerprint mismatch"));
+        }
+        other => panic!("expected format error for fingerprint mismatch, got {other:?}"),
+    }
+}

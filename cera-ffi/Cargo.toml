@@ -92,6 +92,7 @@ serde_json.workspace = true
 # get a runtime + macro expansion. Kept dev-only — non-test builds
 # stay minimal.
 tokio = { version = "1", features = ["full"] }
+tempfile.workspace = true
 
 # No `[build-dependencies]` block: the proc-macro path doesn't need
 # UDL-scaffolding generation at build time, so `uniffi = { features =

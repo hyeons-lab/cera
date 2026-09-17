@@ -336,6 +336,7 @@ impl From<&cera::CeraError> for FfiError {
             cera::CeraError::LoraUnsupportedByBackend(s) => {
                 FfiError::LoraUnsupportedByBackend { detail: s.clone() }
             }
+            cera::CeraError::Format(s) => FfiError::Backend { detail: s.clone() },
             cera::CeraError::Io(io_err) => FfiError::Io {
                 detail: io_err.to_string(),
             },
@@ -2643,6 +2644,31 @@ impl Session {
     /// instead of panicking across the FFI boundary.
     pub fn reset(&self) -> Result<(), FfiError> {
         self.lock_inner()?.reset()?;
+        Ok(())
+    }
+
+    /// Save current inference session checkpoint to a file.
+    pub fn save_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.lock_inner()?.save_checkpoint(path)?;
+        Ok(())
+    }
+
+    /// Load and restore an inference session checkpoint from a file.
+    pub fn load_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.lock_inner()?.load_checkpoint(path)?;
+        Ok(())
+    }
+
+    /// Export current inference session checkpoint as serialized binary bytes.
+    pub fn export_checkpoint(&self) -> Result<Vec<u8>, FfiError> {
+        let cp = self.lock_inner()?.checkpoint()?;
+        Ok(cp.to_bytes())
+    }
+
+    /// Import and restore an inference session checkpoint from serialized binary bytes.
+    pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError> {
+        let cp = cera::session::SessionCheckpoint::from_bytes(&data)?;
+        self.lock_inner()?.restore(&cp)?;
         Ok(())
     }
 

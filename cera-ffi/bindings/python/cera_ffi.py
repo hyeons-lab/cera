@@ -601,6 +601,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642:
@@ -609,6 +611,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400:
@@ -616,6 +620,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -626,6 +632,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -743,6 +751,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 58489:
@@ -761,7 +771,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_position() != 13264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -770,6 +784,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1584,6 +1600,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_complete_json.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_export_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_export_checkpoint.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1612,6 +1633,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.argtype
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_ingest.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1636,6 +1663,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_load_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_load_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_phase.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1662,6 +1695,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1992,6 +2031,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_generate.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2044,11 +2088,23 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.argtypes 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_session_load_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_load_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_position.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2069,6 +2125,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_reset.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_save_checkpoint.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_save_checkpoint.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_send_message.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2282,6 +2344,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.resty
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
@@ -2294,6 +2359,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
@@ -2306,6 +2374,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.rest
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.restype = ctypes.c_uint16
@@ -2321,6 +2392,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.restype 
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
@@ -2495,6 +2569,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.restype = ctypes.c_uint16
@@ -2522,9 +2599,15 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.rest
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_position.restype = ctypes.c_uint16
@@ -2537,6 +2620,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.restype = ctypes.
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.restype = ctypes.c_uint16
@@ -8958,6 +9044,11 @@ class SessionProtocol(typing.Protocol):
         advisory sampling defaults from the bundle manifest (if any) or standard defaults.
 """
         raise NotImplementedError
+    def export_checkpoint(self, ) -> bytes:
+        """
+        Export current inference session checkpoint as serialized binary bytes.
+"""
+        raise NotImplementedError
     def generate(self, opts: GenerateOpts) -> GenerateOutput:
         """
         Run autoregressive decode and return all emitted text, tokens, and
@@ -9101,6 +9192,11 @@ class SessionProtocol(typing.Protocol):
         `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
 """
         raise NotImplementedError
+    def import_checkpoint(self, data: bytes) -> None:
+        """
+        Import and restore an inference session checkpoint from serialized binary bytes.
+"""
+        raise NotImplementedError
     def into_chat(self, ) -> ChatSession:
         """
         Wrap this session in a stateful chat coordinator.
@@ -9108,6 +9204,11 @@ class SessionProtocol(typing.Protocol):
         On success, ownership of the inner inference state is transferred to the returned
         [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
         If validation fails, the session remains intact and usable.
+"""
+        raise NotImplementedError
+    def load_checkpoint(self, path: str) -> None:
+        """
+        Load and restore an inference session checkpoint from a file.
 """
         raise NotImplementedError
     def position(self, ) -> int:
@@ -9143,6 +9244,11 @@ class SessionProtocol(typing.Protocol):
 
         Returns `Result` so a poisoned-mutex case surfaces as an error
         instead of panicking across the FFI boundary.
+"""
+        raise NotImplementedError
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Save current inference session checkpoint to a file.
 """
         raise NotImplementedError
     def send_message(self, message: UserMessage) -> None:
@@ -9501,6 +9607,21 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def export_checkpoint(self, ) -> bytes:
+        """
+        Export current inference session checkpoint as serialized binary bytes.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def generate(self, opts: GenerateOpts) -> GenerateOutput:
         """
         Run autoregressive decode and return all emitted text, tokens, and
@@ -9765,6 +9886,24 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def import_checkpoint(self, data: bytes) -> None:
+        """
+        Import and restore an inference session checkpoint from serialized binary bytes.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(data)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterBytes.lower(data),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def into_chat(self, ) -> ChatSession:
         """
         Wrap this session in a stateful chat coordinator.
@@ -9781,6 +9920,24 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_into_chat,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def load_checkpoint(self, path: str) -> None:
+        """
+        Load and restore an inference session checkpoint from a file.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_load_checkpoint,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -9856,6 +10013,24 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Save current inference session checkpoint to a file.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_save_checkpoint,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10028,6 +10203,11 @@ class ChatSessionProtocol(typing.Protocol):
         Complete generation synchronously constrained by a JSON Schema.
 """
         raise NotImplementedError
+    def export_checkpoint(self, ) -> bytes:
+        """
+        Export current chat session checkpoint as serialized binary bytes.
+"""
+        raise NotImplementedError
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
@@ -10046,6 +10226,11 @@ class ChatSessionProtocol(typing.Protocol):
     def generate_streaming_json(self, opts: GenerateOpts,schema_json: str,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink, constrained by a JSON Schema.
+"""
+        raise NotImplementedError
+    def import_checkpoint(self, data: bytes) -> None:
+        """
+        Import and restore a chat session checkpoint from serialized binary bytes.
 """
         raise NotImplementedError
     def ingest(self, message: Message) -> IngestSummary:
@@ -10070,6 +10255,11 @@ class ChatSessionProtocol(typing.Protocol):
     def into_session(self, ) -> Session:
         """
         Reclaim the underlying Session, consuming this ChatSession.
+"""
+        raise NotImplementedError
+    def load_checkpoint(self, path: str) -> None:
+        """
+        Load and restore a chat session checkpoint from a file.
 """
         raise NotImplementedError
     def phase(self, ) -> SessionPhase:
@@ -10101,6 +10291,11 @@ class ChatSessionProtocol(typing.Protocol):
     def reset(self, ) -> None:
         """
         Reset execution state and return to Idle phase.
+"""
+        raise NotImplementedError
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Save current chat session checkpoint to a file.
 """
         raise NotImplementedError
     def set_tool_format(self, format: ToolFormat) -> None:
@@ -10286,6 +10481,21 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def export_checkpoint(self, ) -> bytes:
+        """
+        Export current chat session checkpoint as serialized binary bytes.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_export_checkpoint,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def generate_streaming(self, opts: GenerateOpts,sink: ModalitySink) -> GenerateSummary:
         """
         Stream generation output tokens into the specified sink.
@@ -10380,6 +10590,24 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def import_checkpoint(self, data: bytes) -> None:
+        """
+        Import and restore a chat session checkpoint from serialized binary bytes.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(data)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterBytes.lower(data),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def ingest(self, message: Message) -> IngestSummary:
         """
         Ingest a single message into the chat context.
@@ -10453,6 +10681,24 @@ class ChatSession(ChatSessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_into_session,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def load_checkpoint(self, path: str) -> None:
+        """
+        Load and restore a chat session checkpoint from a file.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_load_checkpoint,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10537,6 +10783,24 @@ class ChatSession(ChatSessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def save_checkpoint(self, path: str) -> None:
+        """
+        Save current chat session checkpoint to a file.
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

@@ -450,6 +450,14 @@ export class ChatSession {
      */
     clearCancel(): void;
     /**
+     * Export the current chat session checkpoint as binary bytes.
+     */
+    checkpoint(): Uint8Array;
+    /**
+     * Restore a chat session from binary checkpoint bytes.
+     */
+    restore(data: Uint8Array): void;
+    /**
      * Execute a turn to completion, returning the assistant response.
      */
     complete(opts: GenerateOpts): TurnResult;
@@ -1001,6 +1009,14 @@ export class Session {
      * `appendText` / `appendTokens` has returned.
      */
     clearCancel(): void;
+    /**
+     * Export the current session checkpoint as binary bytes.
+     */
+    checkpoint(): Uint8Array;
+    /**
+     * Restore an inference session from binary checkpoint bytes.
+     */
+    restore(data: Uint8Array): void;
     /**
      * Decode tokens until `opts.maxTokens`, a stop token, EOS, or
      * `cancel()` fires. The `onTextTokens` callback is invoked once

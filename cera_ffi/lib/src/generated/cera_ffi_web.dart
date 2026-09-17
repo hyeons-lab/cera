@@ -6170,6 +6170,9 @@ final class Session {
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
 
+  /// Export current inference session checkpoint as serialized binary bytes.
+  Uint8List exportCheckpoint() => _unsupportedOnWeb('Session.exportCheckpoint');
+
   /// Run autoregressive decode and return all emitted text, tokens, and
   /// summary. Synchronous: the call blocks until the decode loop exits
   /// (`max_tokens`, EOS, `cancel()`, or error).
@@ -6295,12 +6298,18 @@ final class Session {
   /// `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
   List<double> hiddenStatesMeanPooled(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesMeanPooled');
 
+  /// Import and restore an inference session checkpoint from serialized binary bytes.
+  void importCheckpoint(Uint8List data) => _unsupportedOnWeb('Session.importCheckpoint');
+
   /// Wrap this session in a stateful chat coordinator.
   ///
   /// On success, ownership of the inner inference state is transferred to the returned
   /// [`ChatSession`], and subsequent operations on this [`Session`] will return an error.
   /// If validation fails, the session remains intact and usable.
   ChatSession intoChat() => _unsupportedOnWeb('Session.intoChat');
+
+  /// Load and restore an inference session checkpoint from a file.
+  void loadCheckpoint(String path) => _unsupportedOnWeb('Session.loadCheckpoint');
 
   /// Current KV position — how many tokens live in the cache.
   /// Atomic-backed; safe to call from a different thread while
@@ -6328,6 +6337,9 @@ final class Session {
   /// Returns `Result` so a poisoned-mutex case surfaces as an error
   /// instead of panicking across the FFI boundary.
   void reset() => _unsupportedOnWeb('Session.reset');
+
+  /// Save current inference session checkpoint to a file.
+  void saveCheckpoint(String path) => _unsupportedOnWeb('Session.saveCheckpoint');
 
   /// Append a multimodal message, automatically enforcing model-canonical
   /// media ordering, boundary token envelopes, and sample rate normalization.
@@ -6400,6 +6412,9 @@ final class ChatSession {
   /// Complete generation synchronously constrained by a JSON Schema.
   TurnResult completeJson(GenerateOpts opts, String schemaJson) => _unsupportedOnWeb('ChatSession.completeJson');
 
+  /// Export current chat session checkpoint as serialized binary bytes.
+  Uint8List exportCheckpoint() => _unsupportedOnWeb('ChatSession.exportCheckpoint');
+
   /// Stream generation output tokens into the specified sink.
   GenerateSummary generateStreaming(GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreaming');
 
@@ -6411,6 +6426,9 @@ final class ChatSession {
 
   /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
   GenerateSummary generateStreamingJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingJson');
+
+  /// Import and restore a chat session checkpoint from serialized binary bytes.
+  void importCheckpoint(Uint8List data) => _unsupportedOnWeb('ChatSession.importCheckpoint');
 
   /// Ingest a single message into the chat context.
   ///
@@ -6427,6 +6445,9 @@ final class ChatSession {
 
   /// Reclaim the underlying Session, consuming this ChatSession.
   Session intoSession() => _unsupportedOnWeb('ChatSession.intoSession');
+
+  /// Load and restore a chat session checkpoint from a file.
+  void loadCheckpoint(String path) => _unsupportedOnWeb('ChatSession.loadCheckpoint');
 
   /// Current session lifecycle phase.
   ///
@@ -6448,6 +6469,9 @@ final class ChatSession {
 
   /// Reset execution state and return to Idle phase.
   void reset() => _unsupportedOnWeb('ChatSession.reset');
+
+  /// Save current chat session checkpoint to a file.
+  void saveCheckpoint(String path) => _unsupportedOnWeb('ChatSession.saveCheckpoint');
 
   /// Set tool wire format explicitly.
   void setToolFormat(ToolFormat format) => _unsupportedOnWeb('ChatSession.setToolFormat');

@@ -449,6 +449,7 @@ dependencies = [
  "bytemuck",
  "cera",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "uniffi",

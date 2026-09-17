@@ -849,6 +849,36 @@ impl ChatSession {
         let session = chat.into_session();
         Ok(Session::from_core(session))
     }
+
+    /// Save current chat session checkpoint to a file.
+    pub fn save_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.with_chat(|chat| chat.save_checkpoint(path).map_err(FfiError::from))
+    }
+
+    /// Load and restore a chat session checkpoint from a file.
+    pub fn load_checkpoint(&self, path: String) -> Result<(), FfiError> {
+        self.with_chat(|chat| {
+            self.set_last_ingest_recovery(None);
+            chat.load_checkpoint(path).map_err(FfiError::from)
+        })
+    }
+
+    /// Export current chat session checkpoint as serialized binary bytes.
+    pub fn export_checkpoint(&self) -> Result<Vec<u8>, FfiError> {
+        self.with_chat(|chat| {
+            let cp = chat.checkpoint().map_err(FfiError::from)?;
+            cp.to_bytes().map_err(FfiError::from)
+        })
+    }
+
+    /// Import and restore a chat session checkpoint from serialized binary bytes.
+    pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError> {
+        self.with_chat(|chat| {
+            self.set_last_ingest_recovery(None);
+            let cp = cera::session::ChatCheckpoint::from_bytes(&data).map_err(FfiError::from)?;
+            chat.restore(&cp).map_err(FfiError::from)
+        })
+    }
 }
 
 struct AsyncChatCancelGuard {

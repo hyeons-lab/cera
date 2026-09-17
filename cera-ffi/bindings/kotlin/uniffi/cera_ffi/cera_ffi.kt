@@ -1004,6 +1004,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_default_generate_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_export_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_generate(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_generate_async(): Int
@@ -1022,13 +1024,19 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_import_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_into_chat(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_load_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_position(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_remove_lora(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_save_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_send_message(): Int
 
@@ -1052,6 +1060,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_complete_json(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async(): Int
@@ -1060,6 +1070,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_messages(): Int
@@ -1067,6 +1079,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_into_session(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_phase(): Int
 
@@ -1077,6 +1091,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_chatsession_replace_messages(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(): Int
 
@@ -1773,6 +1789,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_export_checkpoint(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_session_generate(
         `ptr`: Long,
         `opts`: RustBuffer.ByValue,
@@ -1825,10 +1846,22 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_import_checkpoint(
+        `ptr`: Long,
+        `data`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_into_chat(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
+
+    external fun uniffi_cera_ffi_fn_method_session_load_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_method_session_position(
         `ptr`: Long,
@@ -1842,6 +1875,12 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_session_reset(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_save_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1926,6 +1965,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
         `ptr`: Long,
         `opts`: RustBuffer.ByValue,
@@ -1954,6 +1998,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+        `ptr`: Long,
+        `data`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_chatsession_ingest(
         `ptr`: Long,
         `message`: RustBuffer.ByValue,
@@ -1978,6 +2028,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_chatsession_phase(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -2001,6 +2057,12 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_chatsession_reset(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -2613,6 +2675,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2640,7 +2705,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
@@ -2650,6 +2721,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
@@ -2685,6 +2759,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2697,6 +2774,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2707,6 +2787,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
@@ -2722,6 +2805,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
@@ -5023,6 +5109,11 @@ public interface ChatSessionInterface {
     ): TurnResult
 
     /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    fun `exportCheckpoint`(): kotlin.ByteArray
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     fun `generateStreaming`(
@@ -5057,6 +5148,11 @@ public interface ChatSessionInterface {
     ): GenerateSummary
 
     /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    fun `importCheckpoint`(`data`: kotlin.ByteArray)
+
+    /**
      * Ingest a single message into the chat context.
      *
      * Single-message ingestion requires a user message to trigger assistant turn
@@ -5082,6 +5178,11 @@ public interface ChatSessionInterface {
      * Reclaim the underlying Session, consuming this ChatSession.
      */
     fun `intoSession`(): Session
+
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    fun `loadCheckpoint`(`path`: kotlin.String)
 
     /**
      * Current session lifecycle phase.
@@ -5113,6 +5214,11 @@ public interface ChatSessionInterface {
      * Reset execution state and return to Idle phase.
      */
     fun `reset`()
+
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    fun `saveCheckpoint`(`path`: kotlin.String)
 
     /**
      * Set tool wire format explicitly.
@@ -5356,6 +5462,22 @@ open class ChatSession :
         )
 
     /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `exportCheckpoint`(): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Stream generation output tokens into the specified sink.
      */
     @Throws(FfiException::class)
@@ -5454,6 +5576,21 @@ open class ChatSession :
         )
 
     /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `importCheckpoint`(`data`: kotlin.ByteArray) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+                    it,
+                    FfiConverterByteArray.lower(`data`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Ingest a single message into the chat context.
      *
      * Single-message ingestion requires a user message to trigger assistant turn
@@ -5527,6 +5664,21 @@ open class ChatSession :
                 }
             },
         )
+
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    @Throws(FfiException::class)
+    override fun `loadCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
 
     /**
      * Current session lifecycle phase.
@@ -5608,6 +5760,21 @@ open class ChatSession :
             uniffiRustCallWithError(FfiException) { _status ->
                 UniffiLib.uniffi_cera_ffi_fn_method_chatsession_reset(
                     it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    @Throws(FfiException::class)
+    override fun `saveCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
                     _status,
                 )
             }
@@ -9953,6 +10120,11 @@ public interface SessionInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    fun `exportCheckpoint`(): kotlin.ByteArray
+
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -10102,6 +10274,11 @@ public interface SessionInterface {
     fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float>
 
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    fun `importCheckpoint`(`data`: kotlin.ByteArray)
+
+    /**
      * Wrap this session in a stateful chat coordinator.
      *
      * On success, ownership of the inner inference state is transferred to the returned
@@ -10109,6 +10286,11 @@ public interface SessionInterface {
      * If validation fails, the session remains intact and usable.
      */
     fun `intoChat`(): ChatSession
+
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    fun `loadCheckpoint`(`path`: kotlin.String)
 
     /**
      * Current KV position — how many tokens live in the cache.
@@ -10131,6 +10313,11 @@ public interface SessionInterface {
      * instead of panicking across the FFI boundary.
      */
     fun `reset`()
+
+    /**
+     * Save current inference session checkpoint to a file.
+     */
+    fun `saveCheckpoint`(`path`: kotlin.String)
 
     /**
      * Append a multimodal message, automatically enforcing model-canonical
@@ -10568,6 +10755,22 @@ open class Session :
         )
 
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `exportCheckpoint`(): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -10834,6 +11037,21 @@ open class Session :
         )
 
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    @Throws(FfiException::class)
+    override fun `importCheckpoint`(`data`: kotlin.ByteArray) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint(
+                    it,
+                    FfiConverterByteArray.lower(`data`),
+                    _status,
+                )
+            }
+        }
+
+    /**
      * Wrap this session in a stateful chat coordinator.
      *
      * On success, ownership of the inner inference state is transferred to the returned
@@ -10852,6 +11070,21 @@ open class Session :
                 }
             },
         )
+
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    @Throws(FfiException::class)
+    override fun `loadCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_load_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
 
     /**
      * Current KV position — how many tokens live in the cache.
@@ -10898,6 +11131,21 @@ open class Session :
             uniffiRustCallWithError(FfiException) { _status ->
                 UniffiLib.uniffi_cera_ffi_fn_method_session_reset(
                     it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Save current inference session checkpoint to a file.
+     */
+    @Throws(FfiException::class)
+    override fun `saveCheckpoint`(`path`: kotlin.String) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_save_checkpoint(
+                    it,
+                    FfiConverterString.lower(`path`),
                     _status,
                 )
             }

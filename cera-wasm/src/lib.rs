@@ -2067,6 +2067,24 @@ impl Session {
             }
         }
     }
+
+    /// Export the current session checkpoint as binary bytes.
+    #[wasm_bindgen]
+    pub fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+        let cp = self.session()?.checkpoint().map_err(map_cera_err)?;
+        let bytes = cp.to_bytes();
+        let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        array.copy_from(&bytes);
+        Ok(array)
+    }
+
+    /// Restore an inference session from binary checkpoint bytes.
+    #[wasm_bindgen]
+    pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+        let cp = cera::session::SessionCheckpoint::from_bytes(data).map_err(map_cera_err)?;
+        self.session_mut()?.restore(&cp).map_err(map_cera_err)?;
+        Ok(())
+    }
 }
 
 /// Internal `ModalitySink` implementation that trampolines text
@@ -2449,6 +2467,24 @@ impl ChatSession {
     #[wasm_bindgen(js_name = clearCancel)]
     pub fn clear_cancel(&mut self) -> Result<(), JsError> {
         self.chat_mut()?.clear_cancel();
+        Ok(())
+    }
+
+    /// Export the current chat session checkpoint as binary bytes.
+    #[wasm_bindgen]
+    pub fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError> {
+        let cp = self.chat()?.checkpoint().map_err(map_cera_err)?;
+        let bytes = cp.to_bytes().map_err(map_cera_err)?;
+        let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        array.copy_from(&bytes);
+        Ok(array)
+    }
+
+    /// Restore a chat session from binary checkpoint bytes.
+    #[wasm_bindgen]
+    pub fn restore(&mut self, data: &[u8]) -> Result<(), JsError> {
+        let cp = cera::session::ChatCheckpoint::from_bytes(data).map_err(map_cera_err)?;
+        self.chat_mut()?.restore(&cp).map_err(map_cera_err)?;
         Ok(())
     }
 }
@@ -4562,5 +4598,48 @@ mod tests {
         chat.set_tool_format(ToolFormat::Hermes)
             .expect("set format");
         assert_eq!(chat.tool_format().unwrap(), ToolFormat::Hermes);
+    }
+
+    #[wasm_bindgen_test]
+    fn session_checkpoint_and_restore_wasm() {
+        let mut session = create_test_session(7);
+        session.append_text("checkpoint test").expect("append text");
+        let pos = session.position();
+
+        let bytes = session.checkpoint().expect("session checkpoint");
+        assert!(bytes.length() > 0);
+
+        let mut session2 = create_test_session(7);
+        assert_eq!(session2.position(), 0);
+        let data = bytes.to_vec();
+        session2.restore(&data).expect("restore checkpoint");
+        assert_eq!(session2.position(), pos);
+    }
+
+    #[wasm_bindgen_test]
+    fn chat_session_checkpoint_and_restore_wasm() {
+        let mut session = create_test_session(7);
+        let mut chat = session.into_chat().expect("into_chat");
+
+        let user_msg = js_sys::Object::new();
+        js_sys::Reflect::set(&user_msg, &"role".into(), &"user".into()).unwrap();
+        js_sys::Reflect::set(&user_msg, &"content".into(), &"hello world".into()).unwrap();
+
+        chat.ingest(&user_msg.into()).expect("ingest message");
+        chat.complete(&GenerateOpts::new()).expect("turn complete");
+        assert_eq!(chat.phase().unwrap(), "TurnComplete");
+        let pos = chat.position().unwrap();
+
+        let bytes = chat.checkpoint().expect("chat checkpoint");
+        assert!(bytes.length() > 0);
+
+        let mut session2 = create_test_session(7);
+        let mut chat2 = session2.into_chat().expect("into_chat 2");
+        assert_eq!(chat2.phase().unwrap(), "Idle");
+
+        let data = bytes.to_vec();
+        chat2.restore(&data).expect("restore chat checkpoint");
+        assert_eq!(chat2.phase().unwrap(), "TurnComplete");
+        assert_eq!(chat2.position().unwrap(), pos);
     }
 }

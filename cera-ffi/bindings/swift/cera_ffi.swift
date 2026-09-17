@@ -1812,6 +1812,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func completeJson(opts: GenerateOpts, schemaJson: String) throws  -> TurnResult
     
     /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+    func exportCheckpoint() throws  -> Data
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
     func generateStreaming(opts: GenerateOpts, sink: ModalitySink) throws  -> GenerateSummary
@@ -1830,6 +1835,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Stream generation output tokens into the specified sink, constrained by a JSON Schema.
      */
     func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) throws  -> GenerateSummary
+    
+    /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+    func importCheckpoint(data: Data) throws 
     
     /**
      * Ingest a single message into the chat context.
@@ -1854,6 +1864,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Reclaim the underlying Session, consuming this ChatSession.
      */
     func intoSession() throws  -> Session
+    
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+    func loadCheckpoint(path: String) throws 
     
     /**
      * Current session lifecycle phase.
@@ -1885,6 +1900,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Reset execution state and return to Idle phase.
      */
     func reset() throws 
+    
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+    func saveCheckpoint(path: String) throws 
     
     /**
      * Set tool wire format explicitly.
@@ -2065,6 +2085,17 @@ open func completeJson(opts: GenerateOpts, schemaJson: String)throws  -> TurnRes
 }
     
     /**
+     * Export current chat session checkpoint as serialized binary bytes.
+     */
+open func exportCheckpoint()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Stream generation output tokens into the specified sink.
      */
 open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
@@ -2132,6 +2163,17 @@ open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: Mo
 }
     
     /**
+     * Import and restore a chat session checkpoint from serialized binary bytes.
+     */
+open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
      * Ingest a single message into the chat context.
      *
      * Single-message ingestion requires a user message to trigger assistant turn
@@ -2181,6 +2223,17 @@ open func intoSession()throws  -> Session  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Load and restore a chat session checkpoint from a file.
+     */
+open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
 }
     
     /**
@@ -2240,6 +2293,17 @@ open func replaceMessages(messages: [Message])throws  -> IngestSummary  {
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_chatsession_reset(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Save current chat session checkpoint to a file.
+     */
+open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
     )
 }
 }
@@ -4935,6 +4999,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func defaultGenerateOpts() throws  -> GenerateOpts
     
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+    func exportCheckpoint() throws  -> Data
+    
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -5078,6 +5147,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesMeanPooled(tokens: [UInt32]) throws  -> [Float]
     
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+    func importCheckpoint(data: Data) throws 
+    
+    /**
      * Wrap this session in a stateful chat coordinator.
      *
      * On success, ownership of the inner inference state is transferred to the returned
@@ -5085,6 +5159,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * If validation fails, the session remains intact and usable.
      */
     func intoChat() throws  -> ChatSession
+    
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+    func loadCheckpoint(path: String) throws 
     
     /**
      * Current KV position — how many tokens live in the cache.
@@ -5107,6 +5186,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * instead of panicking across the FFI boundary.
      */
     func reset() throws 
+    
+    /**
+     * Save current inference session checkpoint to a file.
+     */
+    func saveCheckpoint(path: String) throws 
     
     /**
      * Append a multimodal message, automatically enforcing model-canonical
@@ -5450,6 +5534,17 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
 }
     
     /**
+     * Export current inference session checkpoint as serialized binary bytes.
+     */
+open func exportCheckpoint()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_export_checkpoint(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Run autoregressive decode and return all emitted text, tokens, and
      * summary. Synchronous: the call blocks until the decode loop exits
      * (`max_tokens`, EOS, `cancel()`, or error).
@@ -5671,6 +5766,17 @@ open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
 }
     
     /**
+     * Import and restore an inference session checkpoint from serialized binary bytes.
+     */
+open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_import_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
      * Wrap this session in a stateful chat coordinator.
      *
      * On success, ownership of the inner inference state is transferred to the returned
@@ -5683,6 +5789,17 @@ open func intoChat()throws  -> ChatSession  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Load and restore an inference session checkpoint from a file.
+     */
+open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_load_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
+    )
+}
 }
     
     /**
@@ -5719,6 +5836,17 @@ open func removeLora()throws   {try rustCallWithError(FfiConverterTypeFfiError_l
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_reset(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Save current inference session checkpoint to a file.
+     */
+open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_save_checkpoint(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(path),$0
     )
 }
 }
@@ -11529,6 +11657,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11556,7 +11687,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {
@@ -11566,6 +11703,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
@@ -11601,6 +11741,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11613,6 +11756,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11623,6 +11769,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
@@ -11638,6 +11787,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {

@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use super::{
     CeraError, DecodeObservation, FinishReason, GenerateOpts, GenerateSummary, IngestRecovery,
-    ModalitySink, RecoveryOutcome, Session,
+    ModalitySink, RecoveryOutcome, Session, checkpoint,
 };
 #[cfg(test)]
 use crate as core_api;
@@ -394,6 +394,19 @@ pub trait Execution: std::fmt::Debug {
     fn cancel(&self) {}
     /// Clear pending cancellation.
     fn clear_cancel(&mut self) {}
+    /// Capture a snapshot of underlying session state if supported.
+    fn checkpoint(&self) -> Result<checkpoint::SessionCheckpoint, CeraError> {
+        Err(CeraError::Format(
+            "execution backend does not support checkpointing".to_string(),
+        ))
+    }
+    /// Restore a snapshot of underlying session state if supported.
+    fn restore(&mut self, checkpoint: &checkpoint::SessionCheckpoint) -> Result<(), CeraError> {
+        let _ = checkpoint;
+        Err(CeraError::Format(
+            "execution backend does not support restoring checkpoints".to_string(),
+        ))
+    }
 }
 
 /// Result of a completed chat turn.
@@ -761,6 +774,39 @@ impl<E: Execution> Chat<E> {
     /// Clear pending cancellation non-destructively.
     pub fn clear_cancel(&mut self) {
         self.execution.clear_cancel();
+    }
+
+    /// Capture a checkpoint of current conversational state and underlying execution.
+    pub fn checkpoint(&self) -> Result<checkpoint::ChatCheckpoint, CeraError> {
+        let session_checkpoint = self.execution.checkpoint()?;
+        Ok(checkpoint::ChatCheckpoint {
+            session_checkpoint,
+            phase: self.phase,
+            tool_format: self.tool_format,
+            tools: self.tools.clone(),
+        })
+    }
+
+    /// Restore a previously captured checkpoint into this chat session.
+    pub fn restore(&mut self, checkpoint: &checkpoint::ChatCheckpoint) -> Result<(), CeraError> {
+        self.execution.restore(&checkpoint.session_checkpoint)?;
+        self.phase = checkpoint.phase;
+        self.tool_format = checkpoint.tool_format;
+        self.tools = checkpoint.tools.clone();
+        self.terminal_committed = None;
+        Ok(())
+    }
+
+    /// Save chat session checkpoint to file.
+    pub fn save_checkpoint(&self, path: impl AsRef<std::path::Path>) -> Result<(), CeraError> {
+        let cp = self.checkpoint()?;
+        cp.save_to_file(path)
+    }
+
+    /// Load and restore chat session checkpoint from file.
+    pub fn load_checkpoint(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), CeraError> {
+        let cp = checkpoint::ChatCheckpoint::load_from_file(path)?;
+        self.restore(&cp)
     }
 
     /// Current session lifecycle phase.
@@ -1464,6 +1510,12 @@ impl Execution for CoreExecution {
     }
     fn clear_cancel(&mut self) {
         self.session.clear_cancel();
+    }
+    fn checkpoint(&self) -> Result<checkpoint::SessionCheckpoint, CeraError> {
+        self.session.checkpoint()
+    }
+    fn restore(&mut self, checkpoint: &checkpoint::SessionCheckpoint) -> Result<(), CeraError> {
+        self.session.restore(checkpoint)
     }
 }
 
