@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)

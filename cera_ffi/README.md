@@ -3,7 +3,7 @@
 Dart bindings for the [Cera](https://github.com/hyeons-lab/cera) on-device
 inference engine. Runs GGUF language models locally through `dart:ffi`.
 
-> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming (`Stream<String>`), native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming (`Stream<String>`), native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 **Building a Flutter app? Use
 [`cera_ffi_flutter`](https://pub.dev/packages/cera_ffi_flutter) instead.** It
@@ -53,7 +53,7 @@ CERA_FFI_LIB=/absolute/path/to/libcera_ffi.dylib \
   dart run example/explicit_loading.dart /absolute/path/to/model.gguf "The capital of France is"
 ```
 
-This synchronous path belongs on a worker in UI applications. Version 0.6.0 is published
+This synchronous path belongs on a worker in UI applications. Version 0.6.1 is published
 on pub.dev; the portable async `Cera` facade retains its existing API. The native loader's
 web stubs do not load models in a browser.
 

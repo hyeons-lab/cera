@@ -2,7 +2,7 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat`), language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat`), language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
@@ -21,7 +21,7 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 cera = "0.6"
 ```
 
-## Highlights in 0.6.0
+## Highlights in 0.6.0 / 0.6.1
 
 - **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, template profile discovery (ChatML, Llama 3, Gemma, generic Jinja), and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
 - **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.

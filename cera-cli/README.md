@@ -4,7 +4,7 @@ Command-line interface for the [`cera`](https://github.com/hyeons-lab/cera/tree/
 a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
-> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination, language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination, language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
 > internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).

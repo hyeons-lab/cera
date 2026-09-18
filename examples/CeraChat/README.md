@@ -21,7 +21,7 @@ Three screens:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/hyeons-lab/cera", from: "0.6.0"),
+    .package(url: "https://github.com/hyeons-lab/cera", from: "0.6.1"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [

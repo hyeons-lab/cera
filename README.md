@@ -5,7 +5,7 @@ on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
 > [!NOTE]
-> Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat` / `ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
+> Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat` / `ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 ## Why Cera
 

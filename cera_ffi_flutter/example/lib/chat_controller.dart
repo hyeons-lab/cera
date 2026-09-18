@@ -19,7 +19,7 @@ class ChatController extends ValueNotifier<ChatState> {
       super(const ChatState()) {
     const kAppRevisionBadge = 'rev26-kws-whisper';
     debugPrint(
-      '[cera:chat:version] ChatController v0.6.0 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.6.1 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
