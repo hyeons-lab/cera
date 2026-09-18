@@ -69,6 +69,7 @@ filesystem tree manually" workaround.
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
 | 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
+| 28+ | Native CUDA Backend: `BackendPreference.cuda` for NVIDIA datacenter, desktop, and automotive Jetson Orin |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.

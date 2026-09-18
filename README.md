@@ -91,9 +91,10 @@ or you can pin one:
 |---------|-----------|-----------|-------|
 | **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature |
 | **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
+| **Native CUDA** | `cuda` | Linux, Windows, Jetson Orin | Native CUDA driver, Tensor Core GEMV/GEMM, Slang/PTX, automotive blocking sync |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` uses native Metal on macOS and iOS, and wgpu where a GPU is
+`--device auto` uses native Metal on macOS and iOS, native CUDA on NVIDIA systems, and wgpu where another GPU is
 available, falling back to CPU otherwise.
 
 ### Quantization
@@ -181,6 +182,17 @@ local `$defs`/`definitions` and chained `$ref` resolution. `allOf` accepts only
 supported scalar wrappers and compatible object merges. Numeric ranges, string
 patterns and other unimplemented keywords are not enforced. See the
 [supported subset](docs/API_0_6.md#json-schema-constraints) before relying on a schema.
+
+### Native JSON Schema compilation
+
+Cera compiles standard JSON Schemas directly to GBNF grammars without external tooling:
+
+- **CLI**: `cera run -m model.gguf -p "..." --json-schema @schema.json`
+- **Rust**: `let grammar = Grammar::from_json_schema(&schema_json)?;` or `opts = opts.with_json_schema(&schema_json);`
+- **Swift / Kotlin / Python / Dart**: `opts.withJsonSchema(schema)` (or `with_json_schema` in Python)
+- **Browser / Node WASM**: `GenerateOpts.fromJsonSchema(schema)`
+
+Supports nested objects, arrays, string enums, `$defs`/`definitions`, recursive chained `$ref` resolution, and `allOf` schema composition.
 
 ## Tool calling
 

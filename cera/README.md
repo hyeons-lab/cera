@@ -8,7 +8,7 @@ Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 > benchmarks and design notes.
 
 `cera` is the core library: GGUF loading, a quantized CPU kernel stack
-(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU and BLAS backends, a
+(AVX2/AVX-512, NEON dotprod/i8mm) with optional native CUDA, Metal, wgpu GPU, and BLAS backends, a
 stateful session API with prefix caching, and a streaming token sink. It powers
 the [`cera-cli`](https://github.com/hyeons-lab/cera/tree/main/cera-cli) CLI, the
 [`cera-ffi`](https://github.com/hyeons-lab/cera/tree/main/cera-ffi) mobile
