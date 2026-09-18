@@ -2,7 +2,7 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat`), language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
 
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
@@ -18,23 +18,23 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.5"
+cera = "0.6"
 ```
 
-## Highlights in 0.5.0
+## Highlights in 0.6.0
 
+- **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, template profile discovery (ChatML, Llama 3, Gemma, generic Jinja), and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
+- **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.
+- **Native JSON Schema Compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles standard JSON Schemas directly to GBNF grammars without external dependencies, with `$defs`/`definitions` and recursive chained `$ref` resolution, `allOf` schema composition, and `GenerateOpts::with_json_schema`.
+- **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
+- **Session Checkpointing & Persistence (`cera::session::checkpoint`)**: Complete binary snapshot format (`CERASCHK` / `CERACHAT`), 64-bit FNV-1a model structural fingerprint validation, CPU/Metal/WebGPU state serialization, atomic file persistence, and multi-turn state resumption.
+- **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD v5, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and wait-free cancellation across FFI boundaries.
+- **Expanded Model Architectures**: Native support for Mamba-2 SSM and hybrid architectures, Gemma 2, Olmo 2, Gemma 4 (PLE and cross-layer KV sharing), Olmo 3 (sliding window and YaRN RoPE), MiniCPM, Nanbeige 4.2, Qwen 3.5 / Ornith 1.0, Ministral 3, Phi-3 / Phi-4-mini, and Ling 3.0 Tiny.
 - **FreeToken: Semantic Anchor Caching ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588))**: Two-tier prefix caching (`cera::kv_cache::KvPrefixCache`) with semantic anchor points, TurboQuant cold storage compression, and FlatBuffers v2 disk persistence.
 - **DSpark: Neural Speculative Decoding ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608))**: Neural speculative drafting via lightweight sidecars (`cera::spec::dspark`), parallel multi-token GPU verification on Metal and WebGPU, and batched LM-head verification.
 - **TurboQuant KV-Cache Compression ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874))**: Pure-Rust PolarQuant + QJL compression achieving ~12x KV-cache memory reduction across CPU, Metal, and WebGPU backends.
 - **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`SileroVad`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
-- **Hugging Face Model Repositories & Streaming Quantization (`cera::bundle::hf`, `cera::convert`)**: Direct download and loading of Hugging Face repositories, with streaming conversion of remote SafeTensors tensors into a cached GGUF file without storing complete source shards.
-- **WebGPU Depthformer Acceleration & Voice Modes**: High-performance compute shaders for Depthformer audio decoder, unified web runtime, and 4 dedicated voice interaction modes.
-- **Multimodal Vision ViT Optimization**: High-resolution image encoding improvements and async WebGPU readbacks.
-- **Native Keyword Spotting Engine (`cera::hotword`)**: Streaming wake word detection in Rust. Includes a parameterized log-mel front-end (`LogMelFrontEnd`), self-describing GGUF model containers, reusable forward scratch buffers (`HotwordDetector`), 30.0x AGC peak normalization, and the Silero VAD gating state machine (`HotwordIterator`). Process chunks serially on a background audio worker; event creation and stream buffer growth can allocate.
 - **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
-- **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and thread-safe cancellation across FFI boundaries.
-
-- **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
 
 The additive API work also includes a [checked raw KV rewind example](examples/checked_rewind.rs)
 and a [backend recovery matrix](../docs/internals/API_RESHAPE_RECOVERY.md).

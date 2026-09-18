@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> **Note:** Version 0.6.0 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases/tag/v0.6.0).
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
@@ -62,6 +62,11 @@ filesystem tree manually" workaround.
 | 20+ | Native Keyword Spotting (KWS): `FfiHotwordConfig`, `FfiHotwordScore`, `FfiHotwordEvent`, `FfiHotwordDetector`, and `FfiHotwordIterator` (`process_chunk`, `reset`) |
 | 21+ | OpenAI Whisper ASR: `FfiWhisperModel`, `FfiWhisperTranscribeOpts`, `whisper_default_transcribe_opts` with synchronous/asynchronous transcription and cooperative cancellation on Rust future drop |
 | 22+ | Conversational Chat: `ChatSession`, `Message`, `Role`, `SessionPhase`, `TurnResult`, `Session::into_chat`, `CeraEngine::new_chat_session`, wait-free cancellation, and streaming decode |
+| 23+ | Reactive Streaming: `AsyncThrowingStream` (Swift), `Flow` (Kotlin), `Iterator` generator (Python), and `Stream` (Dart) |
+| 24+ | Structured Outputs: JSON Schema compilation to GBNF, `GenerateOpts.withJsonSchema`, and `completeJson` |
+| 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
+| 26+ | Session Checkpointing: binary snapshot export and import, atomic file persistence, and multi-turn state resumption |
+| 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -69,8 +74,7 @@ idiomatic Rust surface, and everything UniFFI-specific lives here.
 ## Explicit model loading
 
 This checkout exposes `ModelSource`, `ModelLoader`, `ModelHandle` and
-`GenerativeModel` in the generated native bindings. Build the library and wrappers
-from this branch together; released packages have not been updated by this work.
+`GenerativeModel` in the generated native bindings.
 A loader is single-use, including after a failed build. Loading is synchronous;
 run it on a worker thread in a UI application. Existing engine constructors remain
 available.
@@ -163,8 +167,6 @@ Kotlin coroutine cancellation frees that future. The pinned Swift wrapper has
 no task cancellation handler, so `Task.cancel()` alone leaves transcription
 running; the guide records this remaining binding limitation.
 This standalone API is distinct from `CeraEngine.transcribe` (LFM2-Audio).
-Build the matching native library and wrappers from this branch; published
-packages have not been updated by this work.
 
 ## Crate types
 
@@ -1018,9 +1020,9 @@ one directly with `engine.newChatSession(config)`.
 ### Message constructors
 
 Foreign bindings provide convenience functions to construct `Message` records:
-- `chatMessageUser(text: String)`
-- `chatMessageSystem(text: String)`
-- `chatMessageAssistant(text: String)`
+- `chatMessageUser(content: String)`
+- `chatMessageSystem(content: String)`
+- `chatMessageAssistant(content: String)`
 - `chatMessageTool(callId: String, content: String)`
 
 ### Swift example
@@ -1034,8 +1036,8 @@ let chat = try session.intoChat()
 
 // Ingest system prompt and first user message
 try chat.ingestMessages(messages: [
-    chatMessageSystem(text: "You are a concise, helpful assistant."),
-    chatMessageUser(text: "What is the capital of France?"),
+    chatMessageSystem(content: "You are a concise, helpful assistant."),
+    chatMessageUser(content: "What is the capital of France?"),
 ])
 
 // Generate assistant reply
@@ -1045,7 +1047,7 @@ let turn1 = try chat.complete(opts: opts)
 print("Assistant: \(turn1.text)")
 
 // Continuation turn: only the new message is prefilled into KV
-try chat.ingest(message: chatMessageUser(text: "What is its population?"))
+try chat.ingest(message: chatMessageUser(content: "What is its population?"))
 let turn2 = try chat.complete(opts: opts)
 print("Assistant: \(turn2.text)")
 
