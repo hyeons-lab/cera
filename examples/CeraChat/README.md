@@ -35,9 +35,7 @@ In Xcode: **File → Add Package Dependencies…**, paste the URL, and add the
 Metal-enabled `CeraFFI.xcframework` (arm64 device + arm64 simulator + arm64
 macOS), so you never compile Rust.
 
-> The XCFramework is a Metal-enabled **static** library, so the linker needs
-> `Metal.framework` + `Foundation` linked explicitly. The `Cera` package target
-> already declares these; a hand-rolled integration must add them.
+> The XCFramework slices are Metal-enabled **dynamic** frameworks that embed their own load commands for `Metal.framework` and `Foundation`, which dyld resolves automatically.
 
 ## Minimal load + generate
 

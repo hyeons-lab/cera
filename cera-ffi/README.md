@@ -1023,7 +1023,7 @@ Foreign bindings provide convenience functions to construct `Message` records:
 - `chatMessageUser(content: String)`
 - `chatMessageSystem(content: String)`
 - `chatMessageAssistant(content: String)`
-- `chatMessageTool(callId: String, content: String)`
+- `chatMessageTool(content: String)`
 
 ### Swift example
 

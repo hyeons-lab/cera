@@ -165,7 +165,7 @@ natively, so mobile and web apps get the same guaranteed-valid output.
 Cera compiles standard JSON Schemas directly to GBNF grammars without external tooling:
 
 - **Rust**: `let grammar = Grammar::from_json_schema_str(&schema_json)?;` or `opts = opts.with_json_schema(&schema_json)?;`
-- **Swift / Kotlin / Python**: `opts.withJsonSchema(schema)` (or `with_json_schema` in Python)
+- **Swift / Kotlin / Python**: `try opts.withJsonSchema(schema)` in Swift, `opts.withJsonSchema(schema)` in Kotlin, `opts.with_json_schema(schema)` in Python
 - **Dart**: `chat.streamJson(opts, schemaJson)`
 - **Browser / Node WASM**: `opts.setJsonSchema(schema)` or `GenerateOpts.withJsonSchema(opts, schema)`
 
@@ -521,6 +521,7 @@ The [persistent cache examples](docs/internals/API_RESHAPE_CACHE_EXAMPLES.md) de
 | `download-bundles` | Prefetch bundle manifests + model files without loading |
 | `vad` | Voice activity detection on audio files using Silero VAD v5 |
 | `transcribe` | Speech-to-text transcription on audio files using OpenAI Whisper |
+| `compare-quants` | Audit metadata, tensor inventory, quantization fidelity, and logit parity between Cera-converted models and reference community GGUFs |
 
 ## Tuning
 
