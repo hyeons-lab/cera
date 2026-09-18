@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+### Changed
+
+- **Version Alignment & Documentation**: Bumped workspace patch version to 0.6.1 in lockstep with `cera_ffi_flutter` and the underlying native engine crates; updated README documentation and examples for chat coordination and reactive streaming.
+
 ## 0.6.0
 
 ### Added

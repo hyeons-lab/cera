@@ -5,7 +5,7 @@ on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
 > [!NOTE]
-> In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat` / `ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 ## Why Cera
 
@@ -160,6 +160,17 @@ while the Kotlin/Swift FFI (`GenerateOpts.grammar`) and browser/Node WASM
 (`GenerateOpts.setGrammar(gbnf)`) take the GBNF string directly and compile it
 natively, so mobile and web apps get the same guaranteed-valid output.
 
+### Native JSON Schema compilation
+
+Cera compiles standard JSON Schemas directly to GBNF grammars without external tooling:
+
+- **Rust**: `let grammar = Grammar::from_json_schema_str(&schema_json)?;` or `opts = opts.with_json_schema(&schema_json)?;`
+- **Swift / Kotlin / Python**: `try opts.withJsonSchema(schema)` in Swift, `opts.withJsonSchema(schema)` in Kotlin, `opts.with_json_schema(schema)` in Python
+- **Dart**: `chat.streamJson(opts, schemaJson)`
+- **Browser / Node WASM**: `opts.setJsonSchema(schema)` or `GenerateOpts.withJsonSchema(opts, schema)`
+
+Supports nested objects, arrays, string enums, `$defs`/`definitions`, recursive chained `$ref` resolution, and `allOf` schema composition.
+
 ## Tool calling
 
 Give the model a set of tools (OpenAI "function" schemas) and get the calls it
@@ -192,6 +203,47 @@ Available from **every binding**, not just the CLI: Rust (`cera::tools`),
 Kotlin/Swift (`applyChatTemplateWithTools`, `parseToolCalls`, `toolGrammar`,
 `detectToolFormat`), and browser/Node WASM (the same names); see each crate's
 README for the API surface.
+
+## Conversational chat coordination
+
+Cera promotes the high-level **`SessionChat` coordinator** (`cera::session::chat` / `ChatSession` in FFI) to the public API:
+
+- **Transactional state machine**: Transitions explicitly across `Idle` -> `Generating` -> `TurnComplete`, with non-destructive recovery upon `Interrupted` or `Unusable` states.
+- **Delta-only prompt evaluation**: Continuation turns evaluate only the newly appended user message delta, preserving warm KV cache resident state without repeating full prompt history prefill.
+- **Dynamic template profile discovery**: Detects and applies ChatML, Llama 3, Gemma, and generic Jinja templates (`TemplateFamily`, `ProfileBuilder`).
+- **First-class tool loop**: Register tool schemas directly on the coordinator via `chat.set_tools(tools)`; tool calls are parsed into `TurnResult.tool_calls` and tool execution outputs are ingested with `chat.ingest_tool_response(...)`.
+
+```rust
+let mut chat = session.into_chat().map_err(|(_, err)| err)?;
+chat.ingest(&Message::user("Hello!"))?;
+let result = chat.complete(&opts)?;
+println!("Assistant: {}", result.text);
+
+// Next turn evaluates delta only with warm KV retention:
+chat.ingest(&Message::user("What did I just say?"))?;
+let reply = chat.complete(&opts)?;
+```
+
+## Language-native reactive streaming
+
+Cera provides native reactive streaming wrappers tailored for each language ecosystem:
+
+- **Swift**: `AsyncThrowingStream<String, Error>` via `chat.stream(opts: opts)` and `chat.streamJson(opts: opts, schemaJson: schema)`.
+- **Kotlin**: `Flow<String>` via `chat.stream(opts)` and `chat.streamJson(opts, schema)`.
+- **Python**: Python generator `Iterator[str]` via `chat.stream(opts)` and `chat.stream_json(opts, schema)`.
+- **Dart**: `Stream<String>` via `chat.stream(opts)` and `chat.streamJson(opts, schema)`.
+- **Rust**: `chat.stream_text(&opts, |chunk| { ... })?` yielding real-time text fragments into a callback closure.
+
+Every stream wrapper guards against sticky cancellation, isolating normal stream completion and errors so sessions remain fully reusable across multi-turn conversations.
+
+## Session checkpointing & persistence
+
+Export, persist, and restore live session state across CPU, Metal, and WebGPU:
+
+- **Binary serialization**: Fast, compact `SessionCheckpoint` format with magic headers (`CERASCHK` / `CERACHAT`), 64-bit FNV-1a model structural fingerprint validation, and versioned headers.
+- **Atomic file operations**: `checkpoint.save_to_file(path)` and `SessionCheckpoint::load_from_file(path)` with atomic writes and clean error recovery.
+- **WebGPU VRAM checkpointing**: Asynchronous GPU buffer staging readbacks and restores without blocking the browser event loop.
+- **Continuation state preservation**: Restores live sequence length, KV cache states, and terminal token commitment for seamless multi-turn resumption.
 
 ## LoRA adapters & hidden states
 
@@ -349,6 +401,16 @@ Cera provides a **pure-Rust implementation of OpenAI Whisper ASR** (`cera::model
 - **Multilingual and timestamp options**: Multilingual models support language detection and selection from the standard 100-code table. The timestamp option controls decoder tokens; transcription returns plain text without structured segment or word timestamps.
 - **Cross-platform bindings**: Available in pure Rust (`cera::model::whisper`), Swift, Kotlin, Python, and Dart/Flutter.
 
+## Unified Audio Pipeline (AudioPipeline)
+
+Cera provides a **unified stateful streaming audio pipeline** (`cera::audio_pipeline::AudioPipeline` and `cera-ffi` `FfiAudioPipeline`) connecting Silero VAD v5, Keyword Spotting, and Whisper ASR:
+
+- **State machine lifecycle**: Tracks `ListeningForHotword`, `ListeningForSpeech`, `SpeechActive`, and `Transcribing` states with independent audio buffer ownership.
+- **Pre-roll sample preservation**: Automatically captures and preserves pre-roll audio ring buffers upon wake word detection so trailing speech onset is never clipped.
+- **Utterance chunking with VAD state preservation**: Splits long continuous speech at `max_utterance_ms` without resetting Silero VAD recurrent hidden states across continuation segments.
+- **Wait-free cancellation**: Fast cooperative cancellation via atomic handles without mutex contention during active Whisper inference.
+- **Cross-platform bindings**: Available in Rust (`AudioPipeline`), Swift, Kotlin, Python, and Dart/Flutter (`FfiAudioPipeline`).
+
 ## Hugging Face Models & Streaming Quantization
 
 Cera supports direct loading and streaming execution from **Hugging Face model repositories**:
@@ -435,8 +497,7 @@ For multi-turn chat, run the [conversational chat example](cera/examples/chat.rs
 The API refactor also provides [runnable multi-language examples](docs/internals/API_RESHAPE_EXAMPLES.md),
 including conversational chat ([Rust](cera/examples/chat.rs), [Swift](cera-ffi/examples/Chat.swift),
 [Kotlin](cera-ffi/examples/Chat.kt), [Python](cera-ffi/examples/chat.py), [Dart](cera_ffi/example/chat.dart)),
-session continuation, and vision/draft loading. The new Rust, native and CPU WASM
-loading APIs are in this checkout; released packages have not been updated.
+session continuation, and vision/draft loading.
 The [audio walkthrough](docs/internals/API_RESHAPE_AUDIO_EXAMPLE.md) demonstrates PCM input and output with locally generated test weights.
 The [remote companion examples](docs/internals/API_RESHAPE_REMOTE_EXAMPLES.md) run HF discovery, downloads, cache repair and retained vision/audio/draft execution against a local HTTP fixture.
 The [HF revision examples](docs/internals/API_RESHAPE_HF_EXAMPLES.md) load changed GGUF revisions into separate cache entries, verify defaults and keep a CPU session live across another revision load. They also exercise failed metadata resolution and explicit commit checks.
@@ -456,7 +517,11 @@ The [persistent cache examples](docs/internals/API_RESHAPE_CACHE_EXAMPLES.md) de
 | `tokenize` | Encode text to token IDs (e.g. to compare against Hugging Face) |
 | `bench` | Measure decode/prefill throughput with p10/p50/p90/mean/stddev |
 | `list-bundles` | List bundles available on `LiquidAI/LeapBundles` |
+| `list-hf` | Discover and list GGUF model files in a Hugging Face repository |
 | `download-bundles` | Prefetch bundle manifests + model files without loading |
+| `vad` | Voice activity detection on audio files using Silero VAD v5 |
+| `transcribe` | Speech-to-text transcription on audio files using OpenAI Whisper |
+| `compare-quants` | Audit metadata, tensor inventory, quantization fidelity, and logit parity between Cera-converted models and reference community GGUFs |
 
 ## Tuning
 

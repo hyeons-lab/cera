@@ -4,7 +4,7 @@ Command-line interface for the [`cera`](https://github.com/hyeons-lab/cera/tree/
 a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
-> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination, language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
 > internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).
@@ -81,13 +81,18 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
 | `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
+| `list-hf` | Discover and list GGUF model files in a Hugging Face repository. |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
 | `vad` | Run Voice Activity Detection (VAD) on audio files using pure-Rust Silero VAD v5 with timestamp segmentation and `--json` export. |
+| `transcribe` | Transcribe speech audio to text using OpenAI Whisper ASR with multi-language and timestamp support. |
 | `compare-quants` | Audit metadata, tensor inventory, quantization fidelity (cosine similarity, SNR, RMSE), and inference logit parity between Cera-converted models and reference community GGUFs. |
 
 ```sh
 # Run Voice Activity Detection on a WAV audio file
 cera vad --model models/silero_vad.gguf --audio test.wav --threshold 0.5 --json
+
+# Transcribe speech audio using OpenAI Whisper ASR
+cera transcribe --model models/whisper-tiny.gguf --audio speech.wav --language en
 
 # Run directly from any Hugging Face model repository
 cera run --hf LiquidAI/LFM2.5-1.2B-Instruct-GGUF --quant Q4_0 --prompt "Hello"

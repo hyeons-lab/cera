@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+### Changed
+
+- **Version Alignment**: Bumped dependency on `cera_ffi` to `0.6.1` and aligned platform manifests across Android, iOS, macOS, Linux, and Windows.
+
 ## 0.6.0
 
 ### Added

@@ -3,7 +3,7 @@
 `wasm-bindgen` browser / Node bindings for the
 [cera](https://github.com/hyeons-lab/cera) inference engine.
 
-> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), native JSON Schema compilation, first-class tool calling, and WebGPU session checkpoint persistence. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 > Status: pre-1.0. Today's surface covers manifest parsing, model
 > loading (CPU-only), engine metadata + capability probes, full
@@ -20,7 +20,7 @@
 
 This checkout exports `ModelSource`, `ModelLoader`, `ModelHandle` and
 `GenerativeModel` alongside the existing engine, browser factories and WebGPU API.
-Package releases have not been updated by this work. The loader accepts owned
+Version 0.6.1 provides these capabilities alongside `ChatSession` and WebGPU checkpointing. The loader accepts owned
 GGUF bytes or `ModelParts` containing companion bytes, inference type, chat
 template and complete Text/Audio/Other generation defaults.
 
@@ -83,7 +83,7 @@ Existing async browser resolution and WebGPU loading use their existing APIs.
 ## Install
 
 ```sh
-npm install @hyeons-lab/cera-wasm  # not yet published
+npm install @hyeons-lab/cera-wasm
 ```
 
 For now, download the artifact matching your consumer shape from

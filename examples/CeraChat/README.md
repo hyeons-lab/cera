@@ -21,7 +21,7 @@ Three screens:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/hyeons-lab/cera", from: "0.4.0"),
+    .package(url: "https://github.com/hyeons-lab/cera", from: "0.6.1"),
 ],
 targets: [
     .target(name: "YourApp", dependencies: [
@@ -35,9 +35,7 @@ In Xcode: **File → Add Package Dependencies…**, paste the URL, and add the
 Metal-enabled `CeraFFI.xcframework` (arm64 device + arm64 simulator + arm64
 macOS), so you never compile Rust.
 
-> The XCFramework is a Metal-enabled **static** library, so the linker needs
-> `Metal.framework` + `Foundation` linked explicitly. The `Cera` package target
-> already declares these; a hand-rolled integration must add them.
+> The XCFramework slices are Metal-enabled **dynamic** frameworks that embed their own load commands for `Metal.framework` and `Foundation`, which dyld resolves automatically.
 
 ## Minimal load + generate
 
@@ -50,38 +48,23 @@ let config = EngineConfig(contextSize: 4096, backend: .auto, bundleRepo: repo)
 let engine = try await CeraEngine.fromBundleIdAsync(
     bundleId: "LFM2.5-1.2B-Instruct-GGUF", quant: "Q4_0", config: config)
 
-// 2. Open a session.
-let session = engine.newSession(config: SessionConfig(
+// 2. Open a session and enter conversational chat.
+let session = try engine.newSession(config: SessionConfig(
     maxSeqLen: nil, kvCompression: .none, nKeep: 0, seed: nil, ubatchSize: 0))
+let chat = try session.intoChat()
 
-// 3. Render the chat template, prefill, and stream the reply.
-let prompt = try engine.applyChatTemplate(
-    messages: [ChatMessage(role: "user", content: "Hello!")],
-    addGenerationPrompt: true)
-try session.appendText(text: prompt)
+// 3. Ingest message and stream reply using AsyncThrowingStream.
+try chat.ingest(message: Message(role: .user, content: "Hello!"))
+let opts = GenerateOpts(maxTokens: 256, temperature: 0.7)
 
-final class Sink: ModalitySink, @unchecked Sendable {
-    let engine: CeraEngine; var ids: [UInt32] = []
-    init(_ e: CeraEngine) { engine = e }
-    func onTextTokens(tokens: [UInt32]) {
-        ids += tokens
-        print(engine.decodeTokens(tokens: ids.filter { !engine.isSpecialToken(id: $0) }))
-    }
-    func onAudioFrames(pcm: [Float], sampleRate: UInt32) {}
-    func onDone(reason: FinishReason) {}
+for try await chunk in chat.stream(opts: opts) {
+    print(chunk, terminator: "")
 }
-
-let opts = GenerateOpts(
-    maxTokens: 256, temperature: 0.7, topP: 0.95, topK: 40, minP: 0,
-    repetitionPenalty: 1.1, stopTokens: engine.eosToken().map { [$0] } ?? [],
-    grammar: nil, flushEveryTokens: 0, flushEveryMs: 0)
-_ = try await session.generateStreamingAsync(opts: opts, sink: Sink(engine))
 ```
 
-`decodeTokens` reassembles multi-byte UTF-8 / BPE merges correctly, so decode
-the accumulated token run rather than one token at a time. `ModalitySink`
-callbacks fire on the decode worker thread; marshal to `@MainActor` before
-touching UI state.
+`chat.stream(opts:)` returns an `AsyncThrowingStream<String, Error>` yielding decoded
+text chunks asynchronously, handling multi-byte UTF-8 and BPE merge reassembly automatically.
+Consume it directly in an `async` task on `@MainActor` to update SwiftUI state.
 
 ## Backend note
 

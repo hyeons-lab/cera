@@ -3,7 +3,7 @@
 Dart bindings for the [Cera](https://github.com/hyeons-lab/cera) on-device
 inference engine. Runs GGUF language models locally through `dart:ffi`.
 
-> **Note:** In version 0.6.0, Cera will introduce breaking API changes to simplify usage and consolidate several APIs across the engine and language bindings. Follow updates in [Releases](https://github.com/hyeons-lab/cera/releases).
+> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming (`Stream<String>`), native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
 
 **Building a Flutter app? Use
 [`cera_ffi_flutter`](https://pub.dev/packages/cera_ffi_flutter) instead.** It
@@ -20,6 +20,24 @@ and the retained recovery report, including typed rewind/reset errors. Read it a
 a failed turn or append call; `Reset` requires context replay and `Unusable` requires
 a successful reset or recreation. Legacy `sendMessage` is deprecated in favor of
 `ChatSession` (`session.intoChat()`).
+
+`ChatSession` provides reactive streaming through standard Dart `Stream<String>`:
+
+```dart
+final chat = session.intoChat();
+chat.ingest(chatMessageUser('Hello!'));
+
+// Stream text tokens reactively
+await for (final chunk in chat.stream(opts)) {
+  stdout.write(chunk);
+}
+
+// Or constrained by a JSON Schema
+await for (final chunk in chat.streamJson(opts, schemaJson)) {
+  stdout.write(chunk);
+}
+```
+
 See the [recovery contract](../docs/internals/API_RESHAPE_RECOVERY.md#native-recovery-status)
 and the [conversational chat example](example/chat.dart).
 
@@ -35,9 +53,9 @@ CERA_FFI_LIB=/absolute/path/to/libcera_ffi.dylib \
   dart run example/explicit_loading.dart /absolute/path/to/model.gguf "The capital of France is"
 ```
 
-This synchronous path belongs on a worker in UI applications. Released packages
-have not been updated by this work; the portable async `Cera` facade retains its
-existing API. The native loader's web stubs do not load models in a browser.
+This synchronous path belongs on a worker in UI applications. Version 0.6.1 is published
+on pub.dev; the portable async `Cera` facade retains its existing API. The native loader's
+web stubs do not load models in a browser.
 
 ## Install
 
@@ -156,7 +174,7 @@ use `ChatSession` via `session.intoChat()`:
 
 ```dart
 final chat = session.intoChat();
-chat.ingest(chatMessageUser(text: 'Why is the sky blue?'));
+chat.ingest(chatMessageUser('Why is the sky blue?'));
 final reply = chat.complete(const GenerateOpts(maxTokens: 128));
 print(reply.text);
 ```
