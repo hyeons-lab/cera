@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.2
+
+- Fix chat stopping, streamed UTF-8, moved-handle cancellation and terminal callbacks.
+- Validate checkpoint geometry and compression identity; reject unsupported native GPU checkpoints without changing session state.
+- Enforce supported JSON Schema constraints and reject unsupported intersections.
+- Fix audio timing, wake transitions, retained samples and configuration precedence.
+- Align package and native artifact versions at 0.6.2.
+
 ## 0.6.1
 
 ### Changed

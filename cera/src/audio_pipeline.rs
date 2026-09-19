@@ -102,7 +102,8 @@ pub struct AudioPipelineConfig {
     pub max_utterance_ms: usize,
     /// Voice Activity Detection configuration.
     pub vad_config: VadConfig,
-    /// Keyword Spotting configuration.
+    /// Keyword Spotting configuration. Overrides detector defaults; an explicit
+    /// configuration passed to `with_hotword*` or an attached iterator takes precedence.
     pub hotword_config: Option<HotwordConfig>,
     /// Whisper transcription options.
     pub whisper_opts: Option<WhisperTranscribeOpts>,
@@ -144,6 +145,7 @@ pub struct AudioPipelineBuilder {
     vad_config: Option<VadConfig>,
     vad_sample_rate: Option<VadSampleRate>,
     hotword: Option<HotwordIterator>,
+    hotword_config_explicit: bool,
     whisper: Option<WhisperModel>,
     whisper_tokenizer: Option<BpeTokenizer>,
     config: Option<AudioPipelineConfig>,
@@ -174,13 +176,21 @@ impl AudioPipelineBuilder {
         detector: HotwordDetector,
         config: Option<HotwordConfig>,
     ) -> Self {
+        self.set_hotword_detector(detector, config);
+        self
+    }
+
+    /// Record a detector plus whether its config was explicit (explicit wins
+    /// over pipeline defaults in [`Self::build`]).
+    fn set_hotword_detector(&mut self, detector: HotwordDetector, config: Option<HotwordConfig>) {
+        self.hotword_config_explicit = config.is_some();
         let cfg = config.unwrap_or_else(|| detector.default_config());
         self.hotword = Some(HotwordIterator::new(detector, None, cfg));
-        self
     }
 
     /// Attach an existing Keyword Spotting iterator.
     pub fn with_hotword_iterator(mut self, iterator: HotwordIterator) -> Self {
+        self.hotword_config_explicit = true;
         self.hotword = Some(iterator);
         self
     }
@@ -252,8 +262,7 @@ impl AudioPipelineBuilder {
     ) -> Result<Self> {
         let detector = HotwordDetector::from_file(path)
             .context("failed to load Hotword detector from file")?;
-        let cfg = config.unwrap_or_else(|| detector.default_config());
-        self.hotword = Some(HotwordIterator::new(detector, None, cfg));
+        self.set_hotword_detector(detector, config);
         Ok(self)
     }
 
@@ -265,8 +274,7 @@ impl AudioPipelineBuilder {
     ) -> Result<Self> {
         let detector = HotwordDetector::from_bytes(bytes)
             .context("failed to load Hotword detector from bytes")?;
-        let cfg = config.unwrap_or_else(|| detector.default_config());
-        self.hotword = Some(HotwordIterator::new(detector, None, cfg));
+        self.set_hotword_detector(detector, config);
         Ok(self)
     }
 
@@ -300,7 +308,20 @@ impl AudioPipelineBuilder {
             config.require_hotword = true;
         }
 
-        let vad_config = self.vad_config.unwrap_or(config.vad_config.clone());
+        let vad_config = self
+            .vad_config
+            .unwrap_or(config.vad_config.clone())
+            .sanitized();
+        config.vad_config = vad_config.clone();
+        let hotword = self.hotword.map(|iterator| {
+            if !self.hotword_config_explicit
+                && let Some(cfg) = config.hotword_config.clone()
+            {
+                iterator.with_config(cfg)
+            } else {
+                iterator
+            }
+        });
         let vad_sample_rate = self.vad_sample_rate.unwrap_or(VadSampleRate::Rate16kHz);
         let vad_iter = if self.vad.is_some() {
             Some(VadIterator::new(vad_sample_rate, vad_config))
@@ -321,12 +342,15 @@ impl AudioPipelineBuilder {
         Ok(AudioPipeline {
             vad: self.vad,
             vad_iter,
-            hotword: self.hotword,
+            hotword,
             whisper: self.whisper,
             whisper_tokenizer: self.whisper_tokenizer,
             config,
             state: initial_state,
             current_sample: 0,
+            hotword_paused_at: 0,
+            vad_sample_offset: 0,
+            speech_history: VecDeque::new(),
             utterance_buffer: Vec::with_capacity(32_000),
             last_utterance: Vec::with_capacity(32_000),
             current_utterance_start_sample: 0,
@@ -349,6 +373,9 @@ pub struct AudioPipeline {
     config: AudioPipelineConfig,
     state: AudioPipelineState,
     current_sample: u64,
+    hotword_paused_at: u64,
+    vad_sample_offset: u64,
+    speech_history: VecDeque<f32>,
     utterance_buffer: Vec<f32>,
     last_utterance: Vec<f32>,
     current_utterance_start_sample: u64,
@@ -476,6 +503,9 @@ impl AudioPipeline {
             hotword.reset();
         }
         self.current_sample = 0;
+        self.hotword_paused_at = 0;
+        self.vad_sample_offset = 0;
+        self.speech_history.clear();
         self.utterance_buffer.clear();
         self.last_utterance.clear();
         self.current_utterance_start_sample = 0;
@@ -518,220 +548,161 @@ impl AudioPipeline {
         chunk: &[f32],
         events: &mut Vec<AudioPipelineEvent>,
     ) -> Result<()> {
-        let chunk_len = chunk.len() as u64;
-
-        // Sanitize incoming PCM samples against non-finite values (NaN / Inf)
-        let sanitized: Option<Vec<f32>> = if chunk.iter().any(|s| !s.is_finite()) {
-            Some(
-                chunk
-                    .iter()
-                    .map(|&s| if s.is_finite() { s } else { 0.0 })
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let chunk_slice = sanitized.as_deref().unwrap_or(chunk);
-
-        match self.state {
-            AudioPipelineState::ListeningForHotword => {
-                if let Some(hotword) = &mut self.hotword {
-                    let maybe_event = hotword.process_chunk(chunk_slice)?;
-                    self.current_sample = self.current_sample.saturating_add(chunk_len);
-
-                    if let Some(hw_ev) = maybe_event {
-                        let ev = AudioPipelineEvent::WakeWordDetected {
-                            keyword: hw_ev.keyword,
-                            confidence: hw_ev.confidence,
-                            timestamp_ms: hw_ev.timestamp_ms,
-                            sample_offset: hw_ev.sample_offset,
-                        };
-                        events.push(ev);
-
-                        // Extract pre-roll audio from the circular buffer
-                        let pre_roll_samples = (self.config.pre_roll_ms * 16).min(48_000);
-                        let pre_roll = hotword.read_last_samples(pre_roll_samples);
-
-                        self.utterance_buffer.clear();
-                        self.utterance_buffer.extend_from_slice(&pre_roll);
-                        self.current_utterance_start_sample =
-                            self.current_sample.saturating_sub(pre_roll.len() as u64);
-
-                        // Reset VAD so speech tracking starts fresh on wake word transition
-                        if let Some(vad) = &mut self.vad {
-                            vad.reset();
-                        }
-                        if let Some(vad_iter) = &mut self.vad_iter {
-                            vad_iter.reset();
-                        }
-
-                        self.state = AudioPipelineState::ListeningForSpeech;
-                    }
-                } else {
-                    // No hotword attached; transition directly to speech listening
+        let sanitized: Option<Vec<f32>> = chunk.iter().any(|s| !s.is_finite()).then(|| {
+            chunk
+                .iter()
+                .map(|&s| if s.is_finite() { s } else { 0.0 })
+                .collect()
+        });
+        let mut remaining = sanitized.as_deref().unwrap_or(chunk);
+        let max_samples = self.config.max_utterance_ms * 16;
+        // Loop-invariant: attachment presence and config never change mid-chunk.
+        let has_vad = self.vad.is_some() && self.vad_iter.is_some();
+        let history_limit =
+            (self.config.pre_roll_ms + self.config.vad_config.speech_pad_ms) * 16 + 512;
+        while !remaining.is_empty() {
+            if self.state == AudioPipelineState::ListeningForHotword {
+                let Some(hotword) = &mut self.hotword else {
                     self.state = AudioPipelineState::ListeningForSpeech;
-                    return self.process_chunk_inner(chunk, events);
-                }
-            }
-
-            AudioPipelineState::ListeningForSpeech => {
-                if let (Some(vad), Some(vad_iter)) = (&mut self.vad, &mut self.vad_iter) {
-                    let initial_event = vad_iter.process_chunk(vad, chunk_slice)?;
-                    self.current_sample = self.current_sample.saturating_add(chunk_len);
-
-                    let mut vad_events = Vec::new();
-                    if let Some(ev) = initial_event {
-                        vad_events.push(ev);
-                    }
-                    while let Some(ev) = vad_iter.pop_event() {
-                        vad_events.push(ev);
-                    }
-
-                    for v_ev in vad_events {
-                        match v_ev {
-                            VadEvent::SpeechStart { sample, ms } => {
-                                self.state = AudioPipelineState::SpeechActive;
-                                events.push(AudioPipelineEvent::SpeechStart { sample, ms });
-                                self.current_utterance_start_sample = sample;
-                                self.utterance_buffer.extend_from_slice(chunk_slice);
-                            }
-                            VadEvent::SpeechEnd {
-                                start_sample,
-                                end_sample,
-                                start_ms,
-                                end_ms,
-                            } => {
-                                if self.state == AudioPipelineState::SpeechActive {
-                                    events.push(AudioPipelineEvent::SpeechEnd {
-                                        start_sample,
-                                        end_sample,
-                                        start_ms,
-                                        end_ms,
-                                    });
-                                    self.finish_utterance(events, true)?;
-                                }
-                            }
-                        }
-                    }
-
-                    // Keep pre-roll window populated while awaiting speech start
-                    if self.state == AudioPipelineState::ListeningForSpeech {
-                        let pre_roll_samples = (self.config.pre_roll_ms * 16).min(48_000);
-                        self.utterance_buffer.extend_from_slice(chunk_slice);
-                        if self.utterance_buffer.len() > pre_roll_samples {
-                            let excess = self.utterance_buffer.len() - pre_roll_samples;
-                            self.utterance_buffer.drain(..excess);
-                        }
-                    }
-                } else {
-                    // No VAD attached: treat incoming audio as immediate speech onset
-                    self.state = AudioPipelineState::SpeechActive;
-                    let ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
-                    events.push(AudioPipelineEvent::SpeechStart {
-                        sample: self.current_sample,
-                        ms,
+                    continue;
+                };
+                let count = remaining.len().min(hotword.samples_until_hop());
+                let (part, rest) = remaining.split_at(count);
+                let detected = hotword.process_chunk(part)?;
+                self.current_sample += count as u64;
+                remaining = rest;
+                if let Some(detected) = detected {
+                    self.hotword_paused_at = self.current_sample;
+                    events.push(AudioPipelineEvent::WakeWordDetected {
+                        keyword: detected.keyword,
+                        confidence: detected.confidence,
+                        timestamp_ms: sample_ms(self.current_sample),
+                        sample_offset: self.current_sample,
                     });
-                    self.current_utterance_start_sample = self.current_sample;
-                    self.current_sample = self.current_sample.saturating_add(chunk_len);
-                    self.utterance_buffer.extend_from_slice(chunk_slice);
-
-                    let max_samples = (self.config.max_utterance_ms * 16).max(16_000);
-                    if self.utterance_buffer.len() >= max_samples {
-                        let start_s = self.current_utterance_start_sample;
-                        let end_s = self.current_sample;
-                        let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
-                        let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
-
-                        events.push(AudioPipelineEvent::SpeechEnd {
-                            start_sample: start_s,
-                            end_sample: end_s,
-                            start_ms: start_m,
-                            end_ms: end_m,
-                        });
-
-                        self.finish_utterance(events, true)?;
-                    }
+                    let pre_roll = (self.config.pre_roll_ms * 16)
+                        .min(48_000)
+                        .min(max_samples.saturating_sub(512))
+                        .min(self.current_sample as usize)
+                        .min(hotword.available_samples());
+                    self.speech_history = hotword.read_last_samples(pre_roll).into();
+                    self.utterance_buffer.clear();
+                    self.reset_vad_clock();
+                    self.state = AudioPipelineState::ListeningForSpeech;
                 }
+                continue;
             }
 
-            AudioPipelineState::SpeechActive => {
-                self.utterance_buffer.extend_from_slice(chunk_slice);
-
-                let max_samples = (self.config.max_utterance_ms * 16).max(16_000);
-                let duration_exceeded = self.utterance_buffer.len() >= max_samples;
-
-                if let (Some(vad), Some(vad_iter)) = (&mut self.vad, &mut self.vad_iter) {
-                    let initial_event = vad_iter.process_chunk(vad, chunk_slice)?;
-                    self.current_sample = self.current_sample.saturating_add(chunk_len);
-
-                    let mut speech_ended = false;
-                    let mut end_payload = None;
-
-                    if let Some(VadEvent::SpeechEnd {
-                        start_sample,
-                        end_sample,
-                        start_ms,
-                        end_ms,
-                    }) = initial_event
-                    {
-                        speech_ended = true;
-                        end_payload = Some((start_sample, end_sample, start_ms, end_ms));
-                    }
-
-                    while let Some(ev) = vad_iter.pop_event() {
-                        if let VadEvent::SpeechEnd {
-                            start_sample,
-                            end_sample,
-                            start_ms,
-                            end_ms,
-                        } = ev
-                        {
-                            speech_ended = true;
-                            end_payload = Some((start_sample, end_sample, start_ms, end_ms));
-                        }
-                    }
-
-                    if speech_ended || duration_exceeded {
-                        let (start_sample, end_sample, start_ms, end_ms) =
-                            self.resolve_speech_end_boundary(end_payload);
-
-                        events.push(AudioPipelineEvent::SpeechEnd {
-                            start_sample,
-                            end_sample,
-                            start_ms,
-                            end_ms,
-                        });
-
-                        let reset_vad = speech_ended;
-                        self.finish_utterance(events, reset_vad)?;
-                    }
-                } else {
-                    self.current_sample = self.current_sample.saturating_add(chunk_len);
-                    if duration_exceeded {
-                        let start_s = self.current_utterance_start_sample;
-                        let end_s = self.current_sample;
-                        let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
-                        let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
-
-                        events.push(AudioPipelineEvent::SpeechEnd {
-                            start_sample: start_s,
-                            end_sample: end_s,
-                            start_ms: start_m,
-                            end_ms: end_m,
-                        });
-
-                        self.finish_utterance(events, true)?;
-                    }
-                }
+            if !has_vad && self.state == AudioPipelineState::ListeningForSpeech {
+                self.current_utterance_start_sample = self
+                    .current_sample
+                    .saturating_sub(self.speech_history.len() as u64);
+                self.utterance_buffer.extend(self.speech_history.drain(..));
+                self.state = AudioPipelineState::SpeechActive;
+                events.push(AudioPipelineEvent::SpeechStart {
+                    sample: self.current_utterance_start_sample,
+                    ms: sample_ms(self.current_utterance_start_sample),
+                });
             }
 
-            AudioPipelineState::Transcribing => {
-                // If chunk arrives while already transcribing, queue sample position advance
-                self.current_sample = self.current_sample.saturating_add(chunk_len);
+            let mut count = remaining.len();
+            if let Some(vad_iter) = &self.vad_iter {
+                count = count.min(vad_iter.samples_until_window());
+            }
+            if self.state == AudioPipelineState::SpeechActive {
+                // Saturating: the cap is enforced below, so a buffer already at
+                // the cap yields an empty part and the utterance-end path clears
+                // it instead of stalling or underflowing here.
+                count = count.min(max_samples.saturating_sub(self.utterance_buffer.len()));
+            }
+            let (part, rest) = remaining.split_at(count);
+            if has_vad {
+                self.speech_history.extend(part.iter().copied());
+                let excess = self.speech_history.len().saturating_sub(history_limit);
+                self.speech_history.drain(..excess);
+            }
+            if self.state == AudioPipelineState::SpeechActive {
+                self.utterance_buffer.extend_from_slice(part);
+            }
+            let vad_event = if let (Some(vad), Some(vad_iter)) = (&mut self.vad, &mut self.vad_iter)
+            {
+                vad_iter.process_chunk(vad, part)?
+            } else {
+                None
+            };
+            self.current_sample += count as u64;
+            remaining = rest;
+
+            match vad_event {
+                Some(VadEvent::SpeechStart { sample, .. }) => {
+                    let start = (self.vad_sample_offset + sample)
+                        .saturating_sub((self.config.pre_roll_ms * 16) as u64)
+                        .max(
+                            self.current_sample
+                                .saturating_sub(self.speech_history.len() as u64),
+                        )
+                        .max(self.current_sample.saturating_sub(max_samples as u64));
+                    // `start` is clamped to `<= current_sample` above and to the
+                    // retained history window, so these saturate only if a future
+                    // VAD stride ever breaks that clock invariant (cf. SpeechEnd).
+                    let samples = (self.current_sample.saturating_sub(start) as usize)
+                        .min(self.speech_history.len());
+                    self.utterance_buffer.clear();
+                    self.utterance_buffer.extend(
+                        self.speech_history
+                            .iter()
+                            .skip(self.speech_history.len() - samples)
+                            .copied(),
+                    );
+                    self.current_utterance_start_sample = start;
+                    self.state = AudioPipelineState::SpeechActive;
+                    events.push(AudioPipelineEvent::SpeechStart {
+                        sample: start,
+                        ms: sample_ms(start),
+                    });
+                }
+                Some(VadEvent::SpeechEnd { end_sample, .. })
+                    if self.state == AudioPipelineState::SpeechActive =>
+                {
+                    let end = (self.vad_sample_offset + end_sample)
+                        .clamp(self.current_utterance_start_sample, self.current_sample);
+                    self.utterance_buffer
+                        .truncate((end - self.current_utterance_start_sample) as usize);
+                    self.end_utterance(events, end, false)?;
+                }
+                _ => {}
+            }
+            if self.state == AudioPipelineState::SpeechActive
+                && self.utterance_buffer.len() >= max_samples
+            {
+                self.end_utterance(events, self.current_sample, has_vad)?;
             }
         }
-
         Ok(())
+    }
+
+    fn reset_vad_clock(&mut self) {
+        if let Some(vad) = &mut self.vad {
+            vad.reset();
+        }
+        if let Some(vad_iter) = &mut self.vad_iter {
+            vad_iter.reset();
+        }
+        self.vad_sample_offset = self.current_sample;
+    }
+
+    fn end_utterance(
+        &mut self,
+        events: &mut Vec<AudioPipelineEvent>,
+        end: u64,
+        continue_speech: bool,
+    ) -> Result<()> {
+        events.push(AudioPipelineEvent::SpeechEnd {
+            start_sample: self.current_utterance_start_sample,
+            end_sample: end,
+            start_ms: sample_ms(self.current_utterance_start_sample),
+            end_ms: sample_ms(end),
+        });
+        self.finish_utterance(events, end, continue_speech)
     }
 
     /// Flush any active speech segment at the end of the audio stream.
@@ -750,156 +721,80 @@ impl AudioPipeline {
 
     fn flush_inner(&mut self, events: &mut Vec<AudioPipelineEvent>) -> Result<()> {
         if self.state == AudioPipelineState::SpeechActive {
-            let mut end_payload = None;
-            if let Some(vad_iter) = &mut self.vad_iter
-                && let Some(VadEvent::SpeechEnd {
-                    start_sample,
-                    end_sample,
-                    start_ms,
-                    end_ms,
-                }) = vad_iter.flush()
-            {
-                end_payload = Some((start_sample, end_sample, start_ms, end_ms));
-            }
-
-            let (start_sample, end_sample, start_ms, end_ms) =
-                self.resolve_speech_end_boundary(end_payload);
-
-            events.push(AudioPipelineEvent::SpeechEnd {
-                start_sample,
-                end_sample,
-                start_ms,
-                end_ms,
-            });
-
-            self.finish_utterance(events, true)?;
+            let end = match self.vad_iter.as_mut().and_then(|iter| iter.flush()) {
+                Some(VadEvent::SpeechEnd { end_sample, .. }) => (self.vad_sample_offset
+                    + end_sample)
+                    .clamp(self.current_utterance_start_sample, self.current_sample),
+                _ => self.current_sample,
+            };
+            self.utterance_buffer
+                .truncate((end - self.current_utterance_start_sample) as usize);
+            let result = self.end_utterance(events, end, false);
+            self.reset_vad_clock();
+            self.speech_history.clear();
+            result?;
         }
-
         Ok(())
     }
 
-    /// Resolve and clamp SpeechEnd event boundaries monotonically against current utterance start.
-    fn resolve_speech_end_boundary(
-        &self,
-        end_payload: Option<(u64, u64, f32, f32)>,
-    ) -> (u64, u64, f32, f32) {
-        match end_payload {
-            Some((start_s, end_s, _, _)) => {
-                let clamped_start = start_s.max(self.current_utterance_start_sample);
-                let clamped_end = end_s.max(clamped_start);
-                let clamped_start_m = (clamped_start as f64 * 1000.0 / 16000.0) as f32;
-                let clamped_end_m = (clamped_end as f64 * 1000.0 / 16000.0) as f32;
-                (clamped_start, clamped_end, clamped_start_m, clamped_end_m)
-            }
-            None => {
-                let end_s = self.current_sample;
-                let start_s = self.current_utterance_start_sample;
-                let start_m = (start_s as f64 * 1000.0 / 16000.0) as f32;
-                let end_m = (end_s as f64 * 1000.0 / 16000.0) as f32;
-                (start_s, end_s, start_m, end_m)
-            }
-        }
-    }
-
-    /// Internal helper: finalize an utterance buffer, perform optional Whisper transcription,
-    /// and transition back to listening or continue active speech.
+    /// Complete one bounded utterance while retaining the continuous VAD clock.
     fn finish_utterance(
         &mut self,
         events: &mut Vec<AudioPipelineEvent>,
-        reset_vad: bool,
+        end_sample: u64,
+        continue_speech: bool,
     ) -> Result<()> {
-        std::mem::swap(&mut self.last_utterance, &mut self.utterance_buffer);
-        self.utterance_buffer.clear();
-        if self.utterance_buffer.capacity() < 32_000 {
-            self.utterance_buffer
-                .reserve(32_000 - self.utterance_buffer.capacity());
+        let has_audio = !self.utterance_buffer.is_empty();
+        if has_audio {
+            std::mem::swap(&mut self.last_utterance, &mut self.utterance_buffer);
+            self.utterance_buffer.clear();
+            if self.utterance_buffer.capacity() < 32_000 {
+                self.utterance_buffer
+                    .reserve(32_000 - self.utterance_buffer.capacity());
+            }
         }
-        let sample_count = self.last_utterance.len();
-
-        if self.config.auto_transcribe
+        let mut transcription_result = Ok(());
+        if has_audio
+            && self.config.auto_transcribe
             && let (Some(whisper), Some(tokenizer)) = (&self.whisper, &self.whisper_tokenizer)
         {
             self.state = AudioPipelineState::Transcribing;
-
             let mut opts = self.config.whisper_opts.clone().unwrap_or_default();
             opts.cancel = Some(self.cancel.clone());
-
             match whisper.transcribe(tokenizer, &self.last_utterance, &opts) {
-                Ok(text) => {
-                    let start_ms =
-                        (self.current_utterance_start_sample as f64 * 1000.0 / 16000.0) as f32;
-                    let end_ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
-
-                    events.push(AudioPipelineEvent::UtteranceTranscribed {
-                        text,
-                        start_ms,
-                        end_ms,
-                        sample_count,
-                    });
+                Ok(text) => events.push(AudioPipelineEvent::UtteranceTranscribed {
+                    text,
+                    start_ms: sample_ms(self.current_utterance_start_sample),
+                    end_ms: sample_ms(end_sample),
+                    sample_count: self.last_utterance.len(),
+                }),
+                Err(e) if e.to_string().contains("cancelled") => {
+                    tracing::debug!("Whisper transcription was cancelled cooperatively");
                 }
-                Err(e) => {
-                    // Check if failure was cooperative cancellation
-                    if e.to_string().contains("cancelled") {
-                        tracing::debug!("Whisper transcription was cancelled cooperatively");
-                    } else {
-                        self.state = if reset_vad {
-                            if self.config.require_hotword && self.hotword.is_some() {
-                                AudioPipelineState::ListeningForHotword
-                            } else {
-                                AudioPipelineState::ListeningForSpeech
-                            }
-                        } else {
-                            self.current_utterance_start_sample = self.current_sample;
-                            AudioPipelineState::SpeechActive
-                        };
-                        if reset_vad {
-                            if let Some(vad) = &mut self.vad {
-                                vad.reset();
-                            }
-                            if let Some(vad_iter) = &mut self.vad_iter {
-                                vad_iter.reset();
-                            }
-                        } else {
-                            let ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
-                            events.push(AudioPipelineEvent::SpeechStart {
-                                sample: self.current_sample,
-                                ms,
-                            });
-                        }
-                        return Err(e);
-                    }
-                }
+                Err(e) => transcription_result = Err(e),
             }
         }
-
-        if reset_vad {
-            // Return to listening state
+        if continue_speech {
+            self.state = AudioPipelineState::SpeechActive;
+            self.current_utterance_start_sample = end_sample;
+            events.push(AudioPipelineEvent::SpeechStart {
+                sample: end_sample,
+                ms: sample_ms(end_sample),
+            });
+        } else {
             self.state = if self.config.require_hotword && self.hotword.is_some() {
+                self.speech_history.clear();
+                // KWS was paused during speech. Its old ring and local clock
+                // cannot describe a contiguous prefix of the next wake cycle.
+                if let Some(hotword) = &mut self.hotword {
+                    hotword.resume_after_pause(self.current_sample - self.hotword_paused_at);
+                }
                 AudioPipelineState::ListeningForHotword
             } else {
                 AudioPipelineState::ListeningForSpeech
             };
-
-            if let Some(vad) = &mut self.vad {
-                vad.reset();
-            }
-            if let Some(vad_iter) = &mut self.vad_iter {
-                vad_iter.reset();
-            }
-        } else {
-            // Speech is still active across max utterance duration cutoff:
-            // cycle the utterance buffer while preserving the VAD model's internal
-            // hidden states and trigger state so continuations do not lose leading phonemes.
-            self.state = AudioPipelineState::SpeechActive;
-            self.current_utterance_start_sample = self.current_sample;
-            let ms = (self.current_sample as f64 * 1000.0 / 16000.0) as f32;
-            events.push(AudioPipelineEvent::SpeechStart {
-                sample: self.current_sample,
-                ms,
-            });
         }
-
-        Ok(())
+        transcription_result
     }
 
     /// Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples using the attached Whisper model.
@@ -918,4 +813,8 @@ impl AudioPipeline {
 
         whisper.transcribe(tokenizer, pcm, &opts)
     }
+}
+
+fn sample_ms(sample: u64) -> f32 {
+    (sample as f64 / 16.0) as f32
 }

@@ -3,7 +3,7 @@
 Flutter and Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine: on-device LLM inference with no network round trip.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 plugin aligns native artifacts with the core chat, checkpoint, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 This is the package Flutter apps depend on. It is an **FFI plugin**: the native
 library is fetched and linked by each platform's own build system, with no
@@ -21,6 +21,12 @@ constraint.
 
 Both wrap the **`cera-ffi` UniFFI surface**, the same C ABI that backs the
 Kotlin (`cera-ffi-kotlin`) and Swift bindings.
+
+The portable `Cera` facade accepts caller-rendered prompts. Native `ChatSession`
+is a separate coordinator with phases and ownership transfer; it is not
+available through generated web stubs. Check its phase before continuing a
+conversation, and reset or replace messages after `Interrupted`.
+CPU checkpoints are supported; native Metal/wgpu checkpoints are rejected.
 
 ## Supported platforms
 
@@ -150,18 +156,24 @@ or use `Cera` and skip the question.
 
 ### Voice Modes & Speech Processing
 
-The Flutter package supports multimodal audio pipelines and 4 interactive voice modes:
-- **`SpeechToText`**: Microphone input streaming with automatic silence trimming and audio transcription.
-- **`VoiceChat`**: Full-duplex interleaved text and audio conversations.
-- **`TextToSpeech`**: Synthesizes speech outputs on device with streaming audio playback via `AudioPlayerService`.
-- **`TextOnly`**: Standard LLM text turn generation.
+The [example app](example/README.md) implements four voice modes in its own
+[`AudioChatMode`](example/lib/chat_state.dart) state and
+[`AudioPlayerService`](example/lib/services/audio_player_service.dart) playback
+service. These application types are not package exports:
+
+- **Speech to text**: Microphone input with silence trimming and transcription.
+- **Voice chat**: Text and audio conversations.
+- **Text to speech**: Speech output and playback.
+- **Text only**: LLM text generation.
+
+The package reexports the native audio bindings used by the example:
 
 ```dart
 // Voice Activity Detection with Silero VAD v5 (re-exported from cera_ffi)
 final vad = FfiSileroVad.fromFile('/path/to/silero_vad.gguf');
-final iterator = FfiVadIterator(
-  rate: FfiVadSampleRate.rate16kHz,
-  config: sileroVadDefaultConfig(),
+final iterator = FfiVadIterator.create(
+  FfiVadSampleRate.rate16kHz,
+  sileroVadDefaultConfig(),
 );
 final event = iterator.processChunk(vad, audioFrame512);
 
@@ -217,8 +229,8 @@ What is narrower on the web than on native:
 - **The generated bindings are stubs**, as they have always been on the web:
   `dart:ffi` does not exist there. Everything in "The generated bindings" above
   is native-only.
-- **`reset` throws on the GPU path.** Its KV cache lives on the GPU with no way
-  to clear it in place. Close the engine and open it again.
+- **`reset` is supported on CPU and GPU.** Wait for active generation to finish;
+  the worker clears session state while retaining the loaded model.
 - **`cancel` is best-effort.** Cancelling the `generate` stream's
   subscription stops delivery to your app immediately, which is what
   a Stop button needs.
@@ -348,7 +360,9 @@ The vendored generator adds fixes on top of upstream 0.1.3, to be upstreamed:
 The full engine API works end to end on macOS and in plain Dart: model load,
 sessions, sync and async `generate`, sync and async streaming, `transcribe`,
 tokenizer access, chat templates, `BundleRepo` with download progress, and
-`fromBundleIdAsync`. No method throws `UnsupportedError`; CI asserts that.
+`fromBundleIdAsync`. CI checks that the native generator emits no placeholder
+"not implemented yet" method bodies. This does not imply every API/backend
+combination is supported: native GPU checkpoint operations are explicitly rejected.
 
 Not yet verified on real devices: **Android, iOS, Linux, and Windows builds.**
 The Apple manifests resolve `CeraFFI.xcframework` from a tagged release, so

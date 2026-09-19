@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 bindings include chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
@@ -21,7 +21,9 @@ may already be available inside those callbacks.
 For conversational chat, use the dedicated `ChatSession` coordinator via `session.intoChat()`
 or `engine.newChatSession(config)`. The complete [Swift](examples/Chat.swift),
 [Kotlin](examples/Chat.kt), and [Python](examples/chat.py) examples demonstrate multi-turn
-chat with delta-only prefill, bit-exact KV cache retention, and session reclamation.
+chat with delta-only prefill, retained KV state, and session reclamation. They
+check for `TurnComplete` before continuing; a token-limit stop can instead leave
+`Interrupted` even when generation returned successfully.
 The legacy [Swift](examples/IngestionRecovery.swift) and [Kotlin](examples/IngestionRecovery.kt)
 examples demonstrate raw append recovery.
 See the [recovery contract and target limits](../docs/internals/API_RESHAPE_RECOVERY.md)
@@ -55,7 +57,7 @@ filesystem tree manually" workaround.
 | 13 | Tokenizer + chat-template surface on `CeraEngine` (encode/decode, `ChatMessage`, `apply_chat_template`) |
 | 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
 | 15 | Parity harness (`cera-parity` Kotlin/Swift legs + perf gate) |
-| 16+ | Session-API expansion: `Session::append_audio` placeholder, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
+| 16+ | Session-API expansion: `Session::append_audio`, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
 | 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
 | 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
 | 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`); both shipped |
@@ -65,7 +67,7 @@ filesystem tree manually" workaround.
 | 23+ | Reactive Streaming: `AsyncThrowingStream` (Swift), `Flow` (Kotlin), `Iterator` generator (Python), and `Stream` (Dart) |
 | 24+ | Structured Outputs: JSON Schema compilation to GBNF, `GenerateOpts.withJsonSchema`, and `completeJson` |
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
-| 26+ | Session Checkpointing: binary snapshot export and import, atomic file persistence, and multi-turn state resumption |
+| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
@@ -239,6 +241,13 @@ and fails if the resulting files differ from what's committed. If
 you see that job fail, run `just bindings` locally and commit the
 diff; it means a Rust-side `#[uniffi::*]` export changed without
 the vendored bindings being regenerated.
+
+Python's generated `cera_ffi.py` imports the adjacent `cera_ffi_streaming.py`
+helper. Distribute both files with the matching native library: the helper adds
+`chat.stream`, `chat.stream_json` and `opts.with_json_schema`. `just bindings`
+applies the import patch after regeneration. Swift and Kotlin stream helpers
+likewise live beside the generated declarations; include their extension files
+when compiling bindings manually.
 
 ### Why vendor?
 
@@ -772,7 +781,7 @@ thread:
 
 ```kotlin
 // Kotlin coroutine
-val sizeMb = withContext(Dispatchers.IO) { repo.cacheSize() } / 1_048_576
+val sizeMb = withContext(Dispatchers.IO) { repo.cacheSize() } / 1_048_576uL
 ```
 
 ```swift
@@ -998,6 +1007,11 @@ across turns without full history replay, and supports wait-free cancellation.
 Obtain a `ChatSession` by calling `session.intoChat()` on an existing `Session`, or instantiate
 one directly with `engine.newChatSession(config)`.
 
+Successful conversion consumes the original Session's execution state. Its
+cancellation controls become no-ops; use Chat's controls. Failed conversion
+preserves the original Session. `chat.intoSession()` moves the state back and
+invalidates further operations on that Chat handle.
+
 ### Surface
 
 | Method | Signature | Notes |
@@ -1008,13 +1022,13 @@ one directly with `engine.newChatSession(config)`.
 | `chat.ingestMessages(messages)` | `(Vec<Message>) -> Result<IngestSummary, FfiError>` | Ingest a sequence of messages (for example, System prompt followed by initial User turn). |
 | `chat.replaceMessages(messages)` | `(Vec<Message>) -> Result<IngestSummary, FfiError>` | Replace conversation history and restart framing without full engine re-allocation. |
 | `chat.complete(opts)` | `(GenerateOpts) -> Result<TurnResult, FfiError>` | Complete the current turn synchronously (delta prefill + decode). |
-| `chat.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<TurnResult, FfiError>` | Stream turn generation to a `ModalitySink` callback. |
-| `chat.phase()` | `() -> SessionPhase` | Non-blocking query of the current coordinator phase (`idle`, `promptReady`, `turnComplete`, `turnRefused`, `cancelled`, `rawContext`). |
-| `chat.position()` | `() -> u32` | Lock-free query of current KV tokens. |
+| `chat.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Stream text through the callback; return timing and finish metadata. |
+| `chat.phase()` | `() -> Result<SessionPhase, FfiError>` | Non-blocking query; can return Busy. Phases: Idle, PromptReady, TurnComplete, Interrupted, RawContext, Unusable. |
+| `chat.position()` | `() -> Result<u32, FfiError>` | Atomic position query; fails after ownership moves back to Session. |
 | `chat.cancel()` | `() -> ()` | Wait-free cancellation atomic flip. Safe to call from any thread or callback. |
-| `chat.clearCancel()` | `() -> ()` | Clear cancellation flag while preserving KV cache and conversation position. |
+| `chat.clearCancel()` | `() -> Result<(), FfiError>` | Clear cancellation while preserving position; fails on a moved Chat handle. |
 | `chat.reset()` | `() -> Result<(), FfiError>` | Reset conversation history and clear KV cache. |
-| `chat.recoveryStatus()` | `() -> Result<RecoveryOutcome, FfiError>` | Non-blocking diagnostic query returning outcome of failed ingestion or reset. |
+| `chat.recoveryStatus()` | `() -> Result<SessionRecoveryStatus, FfiError>` | Usability plus retained ingestion recovery report; can return Busy. |
 | `chat.intoSession()` | `() -> Result<Arc<Session>, FfiError>` | Non-destructively reclaim the underlying raw Session. |
 
 ### Message constructors
@@ -1024,6 +1038,14 @@ Foreign bindings provide convenience functions to construct `Message` records:
 - `chatMessageSystem(content: String)`
 - `chatMessageAssistant(content: String)`
 - `chatMessageTool(content: String)`
+
+Only `TurnComplete` permits ordinary warm continuation. A token limit,
+cancellation or nonterminal stop can leave `Interrupted`; reset or replace the
+conversation before adding another user turn. Clearing cancellation alone does
+not change this phase. A zero-token/no-progress call can instead preserve
+`PromptReady`; clear cancellation if needed and retry generation directly.
+Recovery diagnostics distinguish preserved context from
+context that needs replay or recreation.
 
 ### Swift example
 
@@ -1046,10 +1068,12 @@ opts.maxTokens = 64
 let turn1 = try chat.complete(opts: opts)
 print("Assistant: \(turn1.text)")
 
-// Continuation turn: only the new message is prefilled into KV
-try chat.ingest(message: chatMessageUser(content: "What is its population?"))
-let turn2 = try chat.complete(opts: opts)
-print("Assistant: \(turn2.text)")
+// Continue only after the profile terminal ended the first turn.
+if try chat.phase() == .turnComplete {
+    try chat.ingest(message: chatMessageUser(content: "What is its population?"))
+    let turn2 = try chat.complete(opts: opts)
+    print("Assistant: \(turn2.text)")
+}
 
 // Reclaim raw session if needed
 let reclaimedSession = try chat.intoSession()
@@ -1072,15 +1096,40 @@ engine.newChatSession(SessionConfig()).use { chat ->
     val turn1 = chat.complete(opts)
     println("Assistant: ${turn1.text}")
 
-    // Continuation turn (delta-only prefill, live KV retention)
-    chat.ingest(chatMessageUser("What is its population?"))
-    val turn2 = chat.complete(opts)
-    println("Assistant: ${turn2.text}")
+    // A token limit can leave Interrupted instead of TurnComplete.
+    if (chat.phase() == SessionPhase.TURN_COMPLETE) {
+        chat.ingest(chatMessageUser("What is its population?"))
+        val turn2 = chat.complete(opts)
+        println("Assistant: ${turn2.text}")
+    }
 }
 ```
 
 See runnable multi-language examples in [`examples/Chat.swift`](examples/Chat.swift),
 [`examples/Chat.kt`](examples/Chat.kt), and [`examples/chat.py`](examples/chat.py).
+
+### Streaming, schemas and checkpoints
+
+The stream extensions emit text fragments. Normal completion must not cancel a
+following operation; abandoning an active stream requests cancellation. Let
+generation finish before reusing the handle. Sink callbacks may run under the
+Chat lock, so collect output or call `cancel()` rather than synchronously
+re-entering a mutating Chat method.
+
+`completeJson` and `streamJson` compile the same
+[JSON Schema subset](../docs/API_0_6.md#json-schema-constraints) as Rust. Required
+keys and array bounds are enforced within supported object/array forms. Union
+siblings are not combined: for example, `minItems` alongside `anyOf` is rejected.
+Arbitrary schema validation is not provided.
+Truncated output still needs handling, and option helpers return a constrained
+copy rather than mutating the original `GenerateOpts`.
+
+Session and Chat expose `exportCheckpoint` / `importCheckpoint` and
+`saveCheckpoint` / `loadCheckpoint` (snake_case in Python). CPU snapshots validate
+layer geometry, KV precision and compression/seed identity. Native Metal/wgpu
+calls fail explicitly because these snapshots omit backend-owned device state.
+Recreate older f16/TurboQuant snapshots with fingerprints that lack compression
+identity. See [checkpoint compatibility](../docs/API_0_6.md#checkpoints-and-compatibility).
 
 ## Session API
 
@@ -1106,8 +1155,8 @@ see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifeti
 | `session.sendMessageStreaming(message, opts, sink)` | `(UserMessage, GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. |
 | `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full text + token list + summary in one shot. |
 | `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text chunks or audio frames per the model's modality). Returns the summary only; text chunks flow through the sink. |
-| `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Cancel by dropping the future. |
-| `session.generateStreamingAsync(opts, sink)` | `async (GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Async + streaming. Cancel by dropping the future (also fires `Session::cancel` via the internal `AbortOnDrop` guard). |
+| `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Dropping the Rust future requests cancellation; raw Swift callers must call `session.cancel()` explicitly. |
+| `session.generateStreamingAsync(opts, sink)` | `async (GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Async + streaming with the same cancellation rules as `generateAsync`. |
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
 | `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
 | `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
@@ -1195,16 +1244,18 @@ do {
   / `capabilities` are atomic-only and safe to call concurrently
   with anything (including from inside a `ModalitySink` callback
   on a different thread).
-- **Cancel + drop semantics.** `generate*` calls held by an
-  async task that gets dropped also fire the cancel atomic via
-  the internal `AbortOnDrop` guard; no need to manually
-  `session.cancel()` before letting a Swift `Task` go out of scope.
-- **Streaming sink errors aren't recoverable mid-decode.** A
-  `ModalitySink` implementation that throws an exception will
-  unwind the decode loop. The `GenerateOutput` returned will
-  carry whatever tokens decoded before the throw, but the session
-  is left in a partial state; call `reset()` (or `clearCancel()`
-  if you want to keep the partial KV) before the next `generate`.
+- **Cancel + drop semantics.** Dropping the Rust async generation future
+  aborts queued work and signals a running decode. The generated Swift wrapper
+  does not propagate `Task.cancel()` or dropping the Task handle to that future.
+  For raw Swift Session calls, explicitly call `session.cancel()` and wait for
+  the operation to finish before reusing the session. The separate Chat stream
+  helper requests cancellation through its termination handler.
+- **Sink callbacks must not throw.** Catch application exceptions inside the
+  callback and request `session.cancel()` for cooperative stopping. An escaping
+  foreign exception can panic while the session mutex is held; no partial
+  `GenerateOutput` is promised, and streaming normally returns only a
+  `GenerateSummary`. A poisoned session must be recreated: `reset()` also needs
+  that mutex, and `clearCancel()` cannot repair it.
 - **`appendImage(bytes, maxLongSize)`** appends an encoded image
   (PNG / JPEG) to the context for VL bundles, mirroring
   `appendAudio`. `CeraEngine.newSession` auto-attaches the vision
@@ -1224,8 +1275,9 @@ do {
   one-shot ASR convenience on `CeraEngine` (not `Session`): it runs a full prefill +
   greedy decode over mono `f32` PCM using the model's trained
   `"Perform ASR."` chat mode and returns the transcript. Requires an
-  audio-capable bundle (`UnsupportedModality` otherwise) and `sampleRate`
-  must match the encoder's expected rate. Blocking; wrap it in
+  audio-capable bundle with its encoder and required template/tokenizer markers;
+  missing prerequisites return an error. Accepts `sampleRate` from 1000 through
+  192000 Hz and resamples to 16 kHz before encoding. Blocking; wrap it in
   `spawn_blocking` / `Task.detached` from an async context.
 
 ## Keyword Spotting & Whisper ASR

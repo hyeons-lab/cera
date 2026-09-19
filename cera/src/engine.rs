@@ -946,11 +946,11 @@ impl CeraEngine {
     ///
     /// Renders the chat template with a system `"Perform ASR."` turn and an audio-marker placeholder
     /// in the user turn, prefills `prefix tokens → audio → suffix tokens`, then greedily decodes and
-    /// returns the trimmed transcription. Requires an audio-capable bundle (one whose mmproj / audio
-    /// encoder is attached); on a text-only model `append_audio` returns
-    /// [`CeraError::UnsupportedModality`].
+    /// returns the trimmed transcription. Requires an audio-capable bundle with an attached
+    /// encoder and the required chat template/tokenizer markers. Missing prerequisites
+    /// return an error; a text-only model need not reach the modality check in `append_audio`.
     ///
-    /// `sample_rate` must match the audio encoder's expected rate (resample beforehand if needed).
+    /// Accepts sample rates from 1000 through 192000 Hz and resamples to 16 kHz before encoding.
     ///
     /// If a live GPU session owns the primary context, transcription lazily loads
     /// a separate model/context from the retained weights and reuses it on later

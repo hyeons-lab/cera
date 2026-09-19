@@ -67,7 +67,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat.position()
     );
     println!("Phase after completion: {:?}", chat.phase());
-    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
+    if chat.phase() != SessionPhase::TurnComplete {
+        println!(
+            "Turn stopped before its terminal marker; reset or replace messages before a new user turn."
+        );
+        let reclaimed_session = chat.into_session();
+        println!(
+            "Reclaimed raw session at position {}",
+            reclaimed_session.position()
+        );
+        return Ok(());
+    }
 
     // --- Turn 2: Warm Continuation ---
     // The previous context remains in the KV cache. We only ingest the new user turn.
@@ -88,8 +98,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat.position()
     );
     println!("Phase after completion: {:?}", chat.phase());
-    assert_eq!(chat.phase(), SessionPhase::TurnComplete);
-
     // --- Reclaim raw Session ---
     let reclaimed_session = chat.into_session();
     println!(

@@ -2,7 +2,7 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat`), language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 API corrects chat lifecycle, streaming, checkpoint validation, structured output and audio processing. See the [0.6 API guide](../docs/API_0_6.md) for migration and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
@@ -21,17 +21,17 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 cera = "0.6"
 ```
 
-## Highlights in 0.6.0 / 0.6.1
+## The 0.6 API
 
-- **Transactional Chat Coordinator (`cera::session::chat`)**: High-level conversational chat API (`Session::into_chat()`, `Chat`, `SessionChat`, `Message`, `Role`, `SessionPhase`, `TurnResult`) providing delta-only prefill, bit-exact KV retention across turns, template profile discovery (ChatML, Llama 3, Gemma, generic Jinja), and in-place recovery. Legacy unstructured message appending (`Session::append_user_message`) is deprecated in favor of `Session::into_chat()`.
+- **Chat coordinator (`cera::session::chat`)**: `Session::into_chat()` transfers execution into `SessionChat`, with delta-only prefill and validated template profiles. Ingest another turn only from `TurnComplete`. Interrupted generation requires reset or replacement before a new user turn; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery can restore, reset or leave the session unusable. Legacy `Session::append_user_message` is deprecated in favor of this API.
 - **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.
-- **Native JSON Schema Compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles standard JSON Schemas directly to GBNF grammars without external dependencies, with `$defs`/`definitions` and recursive chained `$ref` resolution, `allOf` schema composition, and `GenerateOpts::with_json_schema`.
+- **JSON Schema compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles a [documented subset](../docs/API_0_6.md#json-schema-constraints) with required/optional properties, bounded arrays, local refs and restricted `allOf` composition. Use `GenerateOpts::with_json_schema`; still check for truncated output and validate constraints outside the supported subset.
 - **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
-- **Session Checkpointing & Persistence (`cera::session::checkpoint`)**: Complete binary snapshot format (`CERASCHK` / `CERACHAT`), 64-bit FNV-1a model structural fingerprint validation, CPU/Metal/WebGPU state serialization, atomic file persistence, and multi-turn state resumption.
+- **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
 - **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD v5, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and wait-free cancellation across FFI boundaries.
 - **Expanded Model Architectures**: Native support for Mamba-2 SSM and hybrid architectures, Gemma 2, Olmo 2, Gemma 4 (PLE and cross-layer KV sharing), Olmo 3 (sliding window and YaRN RoPE), MiniCPM, Nanbeige 4.2, Qwen 3.5 / Ornith 1.0, Ministral 3, Phi-3 / Phi-4-mini, and Ling 3.0 Tiny.
-- **FreeToken: Semantic Anchor Caching ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588))**: Two-tier prefix caching (`cera::kv_cache::KvPrefixCache`) with semantic anchor points, TurboQuant cold storage compression, and FlatBuffers v2 disk persistence.
-- **DSpark: Neural Speculative Decoding ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608))**: Neural speculative drafting via lightweight sidecars (`cera::spec::dspark`), parallel multi-token GPU verification on Metal and WebGPU, and batched LM-head verification.
+- **Prefix cache anchors (`cera::kv_cache::KvPrefixCache`)**: Warm memory and optional disk caching with caller-supplied anchor metadata. FlatBuffers v2 persistence retains existing snapshot precision; the engine does not automatically extract anchors or recompress cold entries.
+- **DSpark: Neural Speculative Decoding ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608))**: Neural speculative drafting via lightweight sidecars (`cera::model::dspark`), parallel multi-token GPU verification on Metal and WebGPU, and batched LM-head verification.
 - **TurboQuant KV-Cache Compression ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874))**: Pure-Rust PolarQuant + QJL compression achieving ~12x KV-cache memory reduction across CPU, Metal, and WebGPU backends.
 - **Pure-Rust Silero VAD v5 (`cera::vad`)**: Native ONNX-free voice activity detection engine (`SileroVad`, `VadIterator`, `VadConfig`, `VadSampleRate`) operating on 512-sample streaming audio frames with automatic speech segment timestamping.
 - **OpenAI Whisper ASR (`cera::model::whisper`)**: Pure-Rust Whisper speech-to-text inference with multi-language identification, timestamp support, and cooperative cancellation.
@@ -147,7 +147,8 @@ reports real prefill wall time paired with `prompt_eval_tokens`.
 
 cera loads **GGUF** weights, either a raw `.gguf` file or a
 [LeapBundles](https://huggingface.co/LiquidAI/LeapBundles) manifest that points
-at one. Dispatch is on the GGUF `general.architecture` string:
+at one. Dispatch is on the GGUF `general.architecture` string; selected families
+are listed below:
 
 | Architecture | Examples |
 |--------------|----------|
@@ -163,12 +164,11 @@ at one. Dispatch is on the GGUF `general.architecture` string:
 | `phi3`, `phi` | Microsoft Phi-3-mini, Phi-3.5-mini, and Phi-4-mini (fused QKV, packed SwiGLU FFN) |
 | `bailingmoe3`, `bailingmoe` | Ling 3.0 Tiny (hybrid KDA linear, MLA latent attention, and MoE) |
 
-Any other architecture errors out with `unsupported architecture: <name>` (this
-includes unsupported layouts such as `mistral4`). No Granite 4.0 model loads
-today: the 4.0-H hybrids convert to the separate arch `granitehybrid`; the
-non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do convert to `granite`,
-but write `attention.head_count_kv` as a per-layer array the loader does not yet
-accept. Granite 4.1 is unaffected.
+The CPU loader also accepts Gemma 2/4, Olmo 2/3, Granite Hybrid, Falcon H1 and
+Mamba-2 families. See [model loading](src/model/mod.rs) for architecture aliases
+and backend admission rules. Tensor layouts and quantization must also match
+the selected loader. An architecture outside that dispatch returns
+`unsupported architecture: <name>`; the table above is not exhaustive.
 
 **Modalities:** text-to-text is fully supported for every architecture above.
 **LFM2-Audio** (`lfm2-audio-v1`, text+audio in/out) also loads. **Vision (VL,
@@ -216,8 +216,9 @@ Whisper/VAD/hotword loader remains planned separately from the generative API re
 
 ## API refactor examples
 
-The `ModelLoader` / `GenerativeModel` API is public in this checkout; its generated
-foreign loaders remain isolated candidates.
+The `ModelLoader` / `GenerativeModel` API is public in Rust and the generated
+native bindings. The linked refactor walkthroughs also retain historical
+validation details from before promotion.
 [Run the Rust, Swift and Kotlin examples](../docs/internals/API_RESHAPE_EXAMPLES.md)
 to load a fixture, create a session and generate, or exercise paired vision and
 DSpark companions. The guide links complete executable sources and explains
@@ -267,35 +268,37 @@ and KV cache retention automatically. Run the [conversational chat example](exam
 cargo run -p cera --example chat -- model.gguf
 ```
 
-Load a local GGUF and stream tokens to stdout as they decode:
+Load a local GGUF and collect streamed tokens. Decode the combined result so
+UTF-8 sequences split across batches remain intact:
 
 ```rust
 use cera::{CeraEngine, EngineConfig, FinishReason, GenerateOpts, ModalitySink, SessionConfig};
-use cera::tokenizer::BpeTokenizer;
 
 /// A `ModalitySink` receives decoded tokens as generation streams. Only
 /// `on_done` is required; `on_text_tokens` defaults to a no-op.
-struct Printer<'a> {
-    tokenizer: &'a BpeTokenizer,
+#[derive(Default)]
+struct TokenCollector {
+    tokens: Vec<u32>,
 }
 
-impl ModalitySink for Printer<'_> {
+impl ModalitySink for TokenCollector {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
-        print!("{}", self.tokenizer.decode(tokens));
+        self.tokens.extend_from_slice(tokens);
     }
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
-fn main() -> Result<(), cera::CeraError> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A `.gguf` file, a `.json` LeapBundles manifest, or a directory with one.
     let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
 
     let mut session = engine.new_session(SessionConfig::default())?;
     session.append_text("Once upon a time")?;
 
-    let mut sink = Printer { tokenizer: engine.tokenizer() };
+    let mut sink = TokenCollector::default();
     let opts = GenerateOpts { max_tokens: 128, ..Default::default() };
     let summary = session.generate(&opts, &mut sink)?;
+    println!("{}", engine.tokenizer().decode(&sink.tokens));
 
     eprintln!("\n[{} tokens, {:?}]", summary.tokens_generated, summary.finish_reason);
     Ok(())
@@ -303,27 +306,25 @@ fn main() -> Result<(), cera::CeraError> {
 ```
 
 `Session` retains live KV across `append_text` / `generate` calls. Continue by
-appending new input to the same session.
+appending new input to the same session. For incremental chat text, use
+`SessionChat::stream_text`, which buffers incomplete UTF-8 sequences.
 
 ### Conversational chat coordinator (`Session::into_chat`)
 
 For chat models, use `Session::into_chat()` instead of manual string formatting.
 `SessionChat` discovers the model's chat template, tracks conversation phases,
 enforces role alternation, evaluates only new tokens on continuation turns (delta-only prefill),
-and maintains bit-exact KV retention across turns:
+and retains live KV state across turns:
 
 ```rust
-use cera::{CeraEngine, EngineConfig, GenerateOpts, Message, SessionConfig};
+use cera::{CeraEngine, EngineConfig, GenerateOpts, Message, SessionConfig, SessionPhase};
 
-fn main() -> Result<(), cera::CeraError> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = CeraEngine::from_path("model.gguf", EngineConfig::default())?;
     let session = engine.new_session(SessionConfig::default())?;
 
     // Transition the session into a chat coordinator.
-    let mut chat = match session.into_chat() {
-        Ok(chat) => chat,
-        Err((_session, err)) => panic!("chat setup refused: {err:?}"),
-    };
+    let mut chat = session.into_chat().map_err(|(_, err)| err)?;
 
     // Ingest conversation history or initial prompt.
     chat.ingest_messages(&[
@@ -336,10 +337,12 @@ fn main() -> Result<(), cera::CeraError> {
     let reply = chat.complete(&opts)?;
     println!("Assistant: {}", reply.text);
 
-    // Continuation turn: only the new user message is prefilled into KV.
-    chat.ingest(&Message::user("And what is its population?"))?;
-    let reply2 = chat.complete(&opts)?;
-    println!("Assistant: {}", reply2.text);
+    // Continue only after the profile's terminal marker ended the first turn.
+    if chat.phase() == SessionPhase::TurnComplete {
+        chat.ingest(&Message::user("And what is its population?"))?;
+        let reply2 = chat.complete(&opts)?;
+        println!("Assistant: {}", reply2.text);
+    }
 
     // Reclaim the underlying session when raw completion access is needed.
     let mut session = chat.into_session();
@@ -407,16 +410,15 @@ guaranteed bit-identical to a *sequential* greedy run: the verifier forwards a
 batch where a sequential loop forwards one token at a time, and the two
 reduction orders can pick opposite sides of a near-tie. It engages only on the
 plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar), with a model
-that reports
-`supports_all_logits()` and an uncompressed (f32/f16) KV cache. In practice
-that means **the CPU dense (`llama`-family) path only**: `LlamaModel` is the
-one implementor, and the trait default is `false`, so LFM2 and every GPU model
-fall through. Any other configuration falls back to normal decode transparently
-rather than erroring, so setting `spec` unconditionally is safe; it is a
-no-op where unsupported.
+that reports `supports_all_logits()`, an uncompressed (f32/f16) KV cache, and no
+audio decoder. CPU dense transformers and LFM2, native Metal models, and wgpu
+models with batched prefill and compatible matrix weights advertise this
+capability. Configurations excluded by these gates use normal decode. Backend
+rewind support and the draft size still constrain execution; benchmark with the
+intended model/backend rather than assuming a speedup.
 
-The CLI exposes it on `bench` (`--spec`, `--spec-ngram`, `--spec-k`) for
-measuring the win; it is not wired into `run` or `chat`.
+The CLI exposes prompt-lookup knobs on `bench` (`--spec`, `--spec-ngram`,
+`--spec-k`). `run` and `chat` expose separate draft-model options.
 
 ## Tool calling
 
@@ -424,16 +426,22 @@ measuring the win; it is not wired into `run` or `chat`.
 back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
 Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
 
-Continuing from the Quick start (which sets up `engine`, `session`, and the
-chat `messages`, and produces the decoded `reply_text`), the schema below uses
-the `serde_json` crate, which `cera` does not re-export, so add it to your
-`Cargo.toml`:
+Using `engine`, the mutable `session`, and `TokenCollector` from the raw-token
+quickstart, replace its prompt/generation block with the sequence below. It
+resets existing raw context, renders a tool-aware prompt, generates and parses
+the reply. Add `serde_json` to your `Cargo.toml`; `cera` does not re-export it:
 
 ```rust
 use std::sync::Arc;
 use cera::grammar::Grammar;
 use cera::tools::{ToolDef, ToolFormat, tool_grammar, parse_tool_calls};
-use cera::tokenizer::apply_chat_template_with_tools;
+use cera::tokenizer::{ChatMessage, apply_chat_template_with_tools};
+
+session.reset()?;
+let messages = vec![ChatMessage {
+    role: "user".into(),
+    content: "What is the weather in Paris?".into(),
+}];
 
 let tools = vec![ToolDef {
     name: "get_weather".into(),
@@ -451,20 +459,26 @@ let format = ToolFormat::detect(&engine.model().config().architecture)
 let prompt = apply_chat_template_with_tools(engine.tokenizer(), &messages, &tools, true)?;
 session.append_text(&prompt)?;
 
-// Optional: constrain to a valid call via grammar + lazy start-marker trigger.
+// Optional: constrain tool-call syntax via grammar + lazy start-marker trigger.
 let mut opts = GenerateOpts::default();
 if let Some(trigger) = engine.tokenizer().special_token_id(format.call_start_marker()) {
     opts.grammar = Some(Arc::new(Grammar::parse(&tool_grammar(&tools, format)?)?));
     opts.grammar_trigger_tokens = vec![trigger];
 }
 
-// After generating, parse the reply. `ToolCall { name, arguments }`.
+let mut sink = TokenCollector::default();
+session.generate(&opts, &mut sink)?;
+let reply_text = engine.tokenizer().decode(&sink.tokens);
+
+// Parse the generated reply. `ToolCall { name, arguments }`.
 let calls = parse_tool_calls(&reply_text, format)?; // empty vec == answered in prose
 ```
 
-The constrained path guarantees a well-formed call (valid function name, valid
-argument names, correctly-typed values via JSON-Schema → GBNF); without it the
-model decides freely whether and how to call a tool.
+The constrained path limits function names, argument names and value syntax to
+the supported tool grammar. Its separate compiler does not enforce required
+arguments, uniqueness or nested item/property schemas. A token limit or
+cancellation can still truncate a call; parse and validate it before execution.
+Without constraints, the model decides freely whether and how to call a tool.
 
 ## LoRA adapters & hidden states
 

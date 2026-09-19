@@ -18,7 +18,7 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 
 | Script | Shows |
 |---|---|
-| `chat.dart` | Multi-turn conversational chat coordinator (`ChatSession`), delta-only prefill, and live KV cache retention |
+| `chat.dart` | Native `ChatSession` with phase-checked continuation, retained KV state, and reclamation after token-limit interruption |
 | `explicit_loading.dart` | Explicit model loading with `ModelLoader` and raw prompt completion |
 | `cera_chat.dart` | Chat template, tokenize, generate, decode back to text |
 | `cera_generate.dart` | Minimal synchronous generate, token IDs only |
@@ -30,3 +30,10 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 They print to stdout by design; `analysis_options.yaml` disables `avoid_print`
 for that reason rather than excluding the directory from analysis, so these
 still get type-checked.
+
+`chat.dart` continues only after `SessionPhase.turnComplete`. If its token budget
+leaves the turn `interrupted`, it reclaims Session and exits rather than ingesting
+another user message into an incomplete turn. Reset or replace messages to start
+again. See the [0.6 API guide](../../docs/API_0_6.md) for lifecycle, streaming,
+schema and checkpoint limits. These native examples require a matching library
+built with `ffi-buffer`; their generated bindings do not run on the web.

@@ -213,6 +213,23 @@ pub fn json_schema_to_grammar(schema_json: String) -> Result<String, FfiError> {
     })
 }
 
+/// Compile a schema for a streaming call, notifying the sink of the terminal
+/// error when compilation fails so the stream observes exactly one `on_done`.
+fn schema_grammar_for_sink(
+    schema_json: &str,
+    sink: &Arc<dyn ModalitySink>,
+) -> Result<String, FfiError> {
+    cera::grammar::json_schema_to_gbnf_str(schema_json).map_err(|e| {
+        let error = FfiError::GrammarParse {
+            detail: format!("invalid JSON schema: {e}"),
+        };
+        sink.on_done(FinishReason::Error {
+            message: error.to_string(),
+        });
+        error
+    })
+}
+
 /// Lifecycle phase of a stateful chat coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SessionPhase {
@@ -408,6 +425,9 @@ impl From<cera::session::chat::TurnResult> for TurnResult {
     }
 }
 
+/// Reported when a handle is used after its chat was moved back into a `Session`.
+const MOVED_BACK_DETAIL: &str = "chat session has been moved back into a Session";
+
 /// Stateful chat coordinator wrapping an inference session.
 #[derive(Debug, uniffi::Object)]
 pub struct ChatSession {
@@ -452,7 +472,7 @@ impl ChatSession {
     ) -> Result<R, FfiError> {
         let mut guard = self.lock_inner()?;
         let chat = guard.as_mut().ok_or_else(|| FfiError::Backend {
-            detail: "chat session has been moved back into a Session".into(),
+            detail: MOVED_BACK_DETAIL.into(),
         })?;
         f(chat)
     }
@@ -485,6 +505,7 @@ impl ChatSession {
         let position = core_session.position_handle();
         match cera::session::chat::core_chat(core_session) {
             Ok(chat) => {
+                session.mark_moved();
                 let cancel = chat
                     .cancel_handle()
                     .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
@@ -514,7 +535,7 @@ impl ChatSession {
             },
         })?;
         let chat = guard.as_ref().ok_or_else(|| FfiError::Backend {
-            detail: "chat session has been moved back into a Session".into(),
+            detail: MOVED_BACK_DETAIL.into(),
         })?;
         Ok(chat.phase().into())
     }
@@ -525,7 +546,7 @@ impl ChatSession {
     pub fn position(&self) -> Result<u32, FfiError> {
         if self.moved.load(Ordering::Acquire) {
             return Err(FfiError::Backend {
-                detail: "chat session has been moved back into a Session".into(),
+                detail: MOVED_BACK_DETAIL.into(),
             });
         }
         Ok(self.position.load(Ordering::Relaxed))
@@ -644,8 +665,9 @@ impl ChatSession {
                 Some(chat) => chat,
                 None => {
                     let err = FfiError::Backend {
-                        detail: "chat session has been moved back into a Session".into(),
+                        detail: MOVED_BACK_DETAIL.into(),
                     };
+                    drop(guard);
                     sink.on_done(FinishReason::Error {
                         message: err.to_string(),
                     });
@@ -719,11 +741,7 @@ impl ChatSession {
         schema_json: String,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
-            FfiError::GrammarParse {
-                detail: format!("invalid JSON schema: {e}"),
-            }
-        })?;
+        let grammar_str = schema_grammar_for_sink(&schema_json, &sink)?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.generate_streaming(constrained_opts, sink)
@@ -804,7 +822,7 @@ impl ChatSession {
     pub fn clear_cancel(&self) -> Result<(), FfiError> {
         if self.moved.load(Ordering::Acquire) {
             return Err(FfiError::Backend {
-                detail: "chat session has been moved back into a Session".into(),
+                detail: MOVED_BACK_DETAIL.into(),
             });
         }
         self.cancel.store(false, Ordering::Relaxed);
@@ -822,7 +840,7 @@ impl ChatSession {
             },
         })?;
         let chat = guard.as_ref().ok_or_else(|| FfiError::Backend {
-            detail: "chat session has been moved back into a Session".into(),
+            detail: MOVED_BACK_DETAIL.into(),
         })?;
         let session = chat.session();
         let ingest_recovery = self
@@ -960,11 +978,7 @@ impl ChatSession {
         schema_json: String,
         sink: Arc<dyn ModalitySink>,
     ) -> Result<GenerateSummary, FfiError> {
-        let grammar_str = cera::grammar::json_schema_to_gbnf_str(&schema_json).map_err(|e| {
-            FfiError::GrammarParse {
-                detail: format!("invalid JSON schema: {e}"),
-            }
-        })?;
+        let grammar_str = schema_grammar_for_sink(&schema_json, &sink)?;
         let mut constrained_opts = opts;
         constrained_opts.grammar = Some(grammar_str);
         self.generate_streaming_async(constrained_opts, sink).await

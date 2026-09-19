@@ -4,7 +4,7 @@ Command-line interface for the [`cera`](https://github.com/hyeons-lab/cera/tree/
 a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination, language-native reactive streaming, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> This checkout uses the 0.6.2 core. The CLI commands below are distinct from the library's Session/Chat APIs; see the [0.6 API guide](../docs/API_0_6.md) for those contracts and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
 > internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).
@@ -40,13 +40,13 @@ cera run --model model.gguf --prompt "Explain quantization in one sentence."
 # Auto-download a bundle and generate
 cera run --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0 --prompt "Hello"
 
-# Constrain output to valid JSON (bundled grammar) or a custom GBNF
+# Constrain output to JSON or custom GBNF prefixes; token limits can truncate
 cera run -m model.gguf -p "List 3 colors as JSON" --json
 cera run -m model.gguf -p "..." --grammar @schema.gbnf
 
 # Tool calling: pass tool schemas (inline JSON or @file). stdout gets ONLY the
 # JSON array of calls (the assistant reply + timing stream to stderr), so it
-# pipes cleanly. Add --constrain-tools to force a valid call.
+# pipes cleanly. Add --constrain-tools to constrain syntax after a call marker.
 cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json | jq .
 cera run -m model.gguf -p "Weather in Paris?" --tools @tools.json --constrain-tools
 
@@ -110,8 +110,11 @@ Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--lora` to attach a LoRA adapter. For tool calling, `--tools <JSON|@file>`
 passes an array of OpenAI-style function schemas (rendered into the chat
 template; the reply's tool calls are parsed to a JSON array on stdout), and
-`--constrain-tools` (requires `--tools`) forces a well-formed, correctly-typed
-call via a grammar + lazy trigger. `run`, `chat`, and `embed` all accept
+`--constrain-tools` (requires `--tools`) constrains tool-call syntax after a lazy
+trigger. It permits prose before the marker and does not ensure a complete call
+or full parameter-schema validation. Parse and validate calls before execution;
+see the [tool grammar limits](../docs/API_0_6.md#tool-call-constraints).
+`run`, `chat`, and `embed` all accept
 `--lora <PATH>` (a llama.cpp `.gguf` or PEFT `.safetensors` adapter); it applies
 to every forward pass, generation and hidden-state extraction alike. For a PEFT
 `.safetensors` adapter whose `alpha` differs from its rank, pass

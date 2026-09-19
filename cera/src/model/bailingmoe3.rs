@@ -1650,6 +1650,17 @@ impl Model for BailingMoe3Model {
         &self.config
     }
 
+    fn validate_checkpoint_state(
+        &self,
+        snapshot: &crate::kv_cache::StateSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate_for_model_with_head_dims(
+            &self.config,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.kv_lora_rank,
+        )
+    }
+
     fn f16_kv_supported(&self) -> bool {
         true
     }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+- Include the core chat, checkpoint, schema and audio corrections from `cera_ffi` 0.6.2.
+- Fix example chat continuation for Llama and Gemma templates; report unsupported templates before changing native state.
+- Align platform manifests and the dependency on `cera_ffi` at 0.6.2.
+
 ## 0.6.1
 
 ### Changed

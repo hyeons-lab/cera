@@ -19,7 +19,7 @@ class ChatController extends ValueNotifier<ChatState> {
       super(const ChatState()) {
     const kAppRevisionBadge = 'rev27-api-reshape';
     debugPrint(
-      '[cera:chat:version] ChatController v0.6.1 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.6.2 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
@@ -629,16 +629,38 @@ class ChatController extends ValueNotifier<ChatState> {
           delta = delta.substring('<s>'.length);
         } else if (delta.startsWith('<|begin_of_text|>')) {
           delta = delta.substring('<|begin_of_text|>'.length);
+        } else if (delta.startsWith('<bos>')) {
+          delta = delta.substring('<bos>'.length);
         }
         if (delta.startsWith('\n')) {
           delta = delta.substring(1);
         }
-        // Autoregressive decode terminates upon sampling EOS without committing it
-        // to the KV cache. Both turnComplete and interrupted continuation turns
-        // must prepend <|im_end|>\n to seal the prior assistant turn.
-        formattedPrompt = '<|im_end|>\n$delta';
+        // Seal the uncommitted assistant turn with this template's delimiter.
+        // Match the user header, not marker text that may occur in user content.
+        if (delta.startsWith('<|im_start|>user\n')) {
+          formattedPrompt = '<|im_end|>\n$delta';
+        } else if (delta.startsWith(
+          '<|start_header_id|>user<|end_header_id|>',
+        )) {
+          formattedPrompt = '<|eot_id|>$delta';
+        } else if (delta.startsWith('<start_of_turn>user\n')) {
+          formattedPrompt = '<end_of_turn>\n$delta';
+        } else {
+          throw StateError('Unsupported continuation template');
+        }
       } catch (_) {
-        formattedPrompt = '<|im_end|>\n$framedPromptText';
+        if (_disposed || generationId != _generationId) return;
+        _updateLastTurn(
+          (t) => t.copyWith(
+            isGenerating: false,
+            statusText: () => null,
+            text:
+                'This model’s chat format does not support continuing this '
+                'conversation. Start a new chat.',
+          ),
+        );
+        value = value.copyWith(isGenerating: false);
+        return;
       }
     }
     if (_disposed || generationId != _generationId) return;

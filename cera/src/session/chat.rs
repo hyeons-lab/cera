@@ -1326,12 +1326,13 @@ impl<E: Execution> Chat<E> {
                 recovery_error: None,
             });
         }
+        let ingest_start = self.position();
         match self.execution.append_segments(&segments) {
             Ok(()) => {
                 self.phase = SessionPhase::PromptReady;
                 self.terminal_committed = None;
                 Ok(IngestSummary {
-                    input_tokens: self.position().saturating_sub(before),
+                    input_tokens: self.position().saturating_sub(ingest_start),
                     position_before: before,
                     position_after: self.position(),
                 })
@@ -1373,6 +1374,11 @@ impl<E: Execution> Chat<E> {
         if self.phase != SessionPhase::PromptReady {
             return Err(ValidationError::Phase(self.phase));
         }
+        let mut profile_opts = opts.clone();
+        if !profile_opts.stop_tokens.contains(&self.profile.eos) {
+            profile_opts.stop_tokens.push(self.profile.eos);
+        }
+        let opts = &profile_opts;
         let effective_opts;
         let opts = if opts.grammar.is_none() && !self.tools.is_empty() {
             if let Ok(gbnf) = tool_grammar(&self.tools, self.tool_format) {
@@ -1467,22 +1473,48 @@ impl<E: Execution> Chat<E> {
             tokens: Vec<u32>,
             tokenizer: Arc<BpeTokenizer>,
             on_text: F,
-            last_decoded_len: usize,
+            pending: Vec<u8>,
         }
 
         impl<F: FnMut(&str)> ModalitySink for StreamingCollector<F> {
             fn on_text_tokens(&mut self, new_tokens: &[u32]) {
                 self.tokens.extend_from_slice(new_tokens);
-                let current_text = self.tokenizer.decode(&self.tokens);
-                if current_text.len() > self.last_decoded_len
-                    && let Some(delta) = current_text.get(self.last_decoded_len..)
-                {
-                    (self.on_text)(delta);
-                    self.last_decoded_len = current_text.len();
+                for &token in new_tokens {
+                    self.pending
+                        .extend(self.tokenizer.token_output_bytes(token));
+                }
+                while !self.pending.is_empty() {
+                    match std::str::from_utf8(&self.pending) {
+                        Ok(text) => {
+                            (self.on_text)(text);
+                            self.pending.clear();
+                        }
+                        Err(error) => {
+                            let valid = error.valid_up_to();
+                            if valid > 0 {
+                                (self.on_text)(
+                                    std::str::from_utf8(&self.pending[..valid])
+                                        .expect("valid_up_to is a UTF-8 boundary"),
+                                );
+                            }
+                            self.pending.drain(..valid);
+                            if let Some(invalid) = error.error_len() {
+                                (self.on_text)("\u{fffd}");
+                                self.pending.drain(..invalid);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
-            fn on_done(&mut self, _reason: FinishReason) {}
+            fn on_done(&mut self, _reason: FinishReason) {
+                if !self.pending.is_empty() {
+                    (self.on_text)(&String::from_utf8_lossy(&self.pending));
+                    self.pending.clear();
+                }
+            }
         }
 
         let capacity = (opts.max_tokens as usize).min(4096);
@@ -1491,7 +1523,7 @@ impl<E: Execution> Chat<E> {
             tokens: Vec::with_capacity(capacity),
             tokenizer,
             on_text,
-            last_decoded_len: 0,
+            pending: Vec::new(),
         };
         let report = self
             .generate_into(opts, &mut collector)

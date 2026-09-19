@@ -52,22 +52,8 @@ extension ChatSessionStreaming on ChatSession {
   /// Streams generated text tokens conforming to a JSON Schema as an asynchronous Dart [Stream].
   Stream<String> streamJson(GenerateOpts opts, String schemaJson) {
     final grammar = jsonSchemaToGrammar(schemaJson);
-    final constrainedOpts = GenerateOpts(
-      maxTokens: opts.maxTokens,
-      temperature: opts.temperature,
-      topP: opts.topP,
-      topK: opts.topK,
-      minP: opts.minP,
-      repetitionPenalty: opts.repetitionPenalty,
-      stopTokens: opts.stopTokens,
-      ignoreEos: opts.ignoreEos,
-      grammar: grammar,
-      grammarTriggerTokens: opts.grammarTriggerTokens,
-      flushEveryTokens: opts.flushEveryTokens,
-      flushEveryMs: opts.flushEveryMs,
-      spec: opts.spec,
-    );
-    return stream(constrainedOpts);
+    // copyWith keeps this future-proof: new GenerateOpts fields ride along.
+    return stream(opts.copyWith(grammar: grammar));
   }
 }
 

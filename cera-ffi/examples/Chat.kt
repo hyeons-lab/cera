@@ -19,7 +19,7 @@ import uniffi.cera_ffi.chatMessageUser
 // Run:
 //   kotlinc -jvm-target 21 -classpath "jna.jar:kotlinx-coroutines-core.jar" \
 //     cera-ffi/bindings/kotlin/uniffi/cera_ffi/cera_ffi.kt cera-ffi/examples/Chat.kt -include-runtime -d Chat.jar
-//   java -Djava.library.path=target/debug -jar Chat.jar model.gguf
+//   java -Djna.library.path=target/debug -cp "Chat.jar:jna.jar:kotlinx-coroutines-core.jar" ChatKt model.gguf
 fun main(args: Array<String>) {
     require(args.size >= 1) { "usage: ChatKt <model.gguf>" }
     val modelPath = args[0]
@@ -50,7 +50,13 @@ fun main(args: Array<String>) {
                     println("Assistant: ${turn1.text.trim()}")
                     println("Generated ${turn1.summary.tokensGenerated} tokens (final position: ${chat.position()})")
                     println("Phase after completion: ${chat.phase()}")
-                    check(chat.phase() == SessionPhase.TURN_COMPLETE)
+                    if (chat.phase() != SessionPhase.TURN_COMPLETE) {
+                        println("Turn stopped before its terminal marker; reset or replace messages before a new user turn.")
+                        chat.intoSession().use { reclaimedSession ->
+                            println("Reclaimed raw session at position ${reclaimedSession.position()}")
+                        }
+                        return
+                    }
 
                     // --- Turn 2: Warm Continuation ---
                     // The previous context remains in the KV cache; only new user input is ingested.
@@ -63,8 +69,6 @@ fun main(args: Array<String>) {
                     println("Assistant: ${turn2.text.trim()}")
                     println("Generated ${turn2.summary.tokensGenerated} tokens (final position: ${chat.position()})")
                     println("Phase after completion: ${chat.phase()}")
-                    check(chat.phase() == SessionPhase.TURN_COMPLETE)
-
                     // --- Reclaim raw Session ---
                     chat.intoSession().use { reclaimedSession ->
                         println("\nReclaimed raw session at position ${reclaimedSession.position()}")
