@@ -329,7 +329,13 @@ fn require_generative(gguf: &GgufFile) -> Result<(), LoadError> {
         ModelKind::Whisper
     } else {
         match architecture {
-            "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "granite" => ModelKind::Generative,
+            "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "granite" | "gemma2" | "olmo2"
+            | "olmo3" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3" | "ministral3"
+            | "phi3" | "phi" | "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1"
+            | "mamba2" | "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant"
+            | "qwen35" | "qwen3_5" | "qwen3.5" | "bailingmoe3" | "bailingmoe" | "bailingmoe2" => {
+                ModelKind::Generative
+            }
             "bert" | "modernbert" => ModelKind::Encoder,
             "silero_vad" => ModelKind::Vad,
             "kws" => ModelKind::Hotword,

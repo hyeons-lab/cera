@@ -180,6 +180,75 @@ fn test_audio_pipeline_pending_events_bounded_cap() {
     assert_eq!(count, 128);
 }
 
+/// Deterministic pseudo-speech frame for tests that drive the real VAD model.
+///
+/// A real Silero VAD classifies a constant-DC signal as non-speech
+/// (probability ~0.02), so flat-amplitude frames can never trigger
+/// `SpeechStart`. This generator instead emits a syllabic voiced / noise-burst
+/// / gap rhythm (LCG-driven, fully deterministic) that the model sustains as
+/// speech across dozens of frames. Frame `i` always yields the same samples,
+/// so multi-chunk tests stay aligned by passing the chunk index.
+fn speech_like_frame(frame: usize) -> Vec<f32> {
+    const TAU: f32 = 2.0 * std::f32::consts::PI;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as f32) / (u32::MAX as f32)
+        }
+    }
+
+    // Walk the deterministic segment map up to `frame`: voiced (3-9 frames) /
+    // noise burst (3-9 frames) / gap (1-2 frames), rotating.
+    let mut rng = Rng(99);
+    let mut start = 0;
+    let mut kind = 0;
+    let (mut seg_kind, mut seg_start) = (0, 0);
+    loop {
+        if start > frame {
+            break;
+        }
+        seg_kind = kind;
+        seg_start = start;
+        let len = if kind == 2 {
+            1 + (rng.next() * 2.0) as usize
+        } else {
+            3 + (rng.next() * 7.0) as usize
+        };
+        start += len;
+        kind = (kind + 1) % 3;
+    }
+    if seg_kind == 2 {
+        return vec![0.0f32; 512];
+    }
+
+    let mut rng = Rng(1000 + seg_start as u64 * 131);
+    let f0 = 110.0 + 160.0 * rng.next();
+    let amp = 0.18 + 0.12 * rng.next();
+    let offset = frame * 512;
+    if seg_kind == 1 {
+        return (0..512)
+            .map(|n| {
+                let env = 1.0 - n as f32 / 512.0;
+                (Rng(n as u64 * 17 + offset as u64).next() - 0.5) * 0.5 * env
+            })
+            .collect();
+    }
+    (0..512)
+        .map(|n| {
+            let t = (offset + n) as f32 / 16000.0;
+            let s = (TAU * f0 * t).sin()
+                + 0.5 * (TAU * 2.02 * f0 * t).sin()
+                + 0.25 * (TAU * 2.97 * f0 * t).sin();
+            amp * s
+        })
+        .collect()
+}
+
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation() {
@@ -208,13 +277,13 @@ fn test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation() {
         .build()
         .expect("builder succeeds");
 
-    // Feed non-zero audio to warm up VAD hidden states
-    // 512 samples per frame (standard 16kHz window)
-    let speech_frame = vec![0.3f32; 512];
+    // Feed speech-like audio to warm up VAD hidden states
+    // 512 samples per frame (standard 16kHz window). Frames are indexed so the
+    // syllabic rhythm stays aligned across chunks.
     let mut triggered = false;
-    for _ in 0..40 {
+    for i in 0..40 {
         let events = pipeline
-            .process_chunk(&speech_frame)
+            .process_chunk(&speech_like_frame(i))
             .expect("process chunk");
         for ev in &events {
             if matches!(ev, AudioPipelineEvent::SpeechStart { .. }) {
@@ -238,9 +307,9 @@ fn test_audio_pipeline_max_utterance_preserves_vad_state_on_continuation() {
     // Continue feeding speech until max utterance (16,000 samples = 1s) is exceeded
     let mut hit_speech_end = false;
     let mut hit_new_speech_start = false;
-    for _ in 0..40 {
+    for i in 40..80 {
         let events = pipeline
-            .process_chunk(&speech_frame)
+            .process_chunk(&speech_like_frame(i))
             .expect("process chunk");
         for ev in &events {
             match ev {
@@ -356,10 +425,12 @@ fn test_audio_pipeline_listening_for_speech_handles_speech_end_in_same_chunk() {
     }
     assert_eq!(pipeline.state(), AudioPipelineState::ListeningForSpeech);
 
-    // Create a multi-frame buffer: 30 speech frames followed by 40 silence frames
+    // Create a multi-frame buffer: 30 speech-like frames followed by 40
+    // silence frames. Flat-DC frames never trigger a real Silero VAD, so the
+    // speech section uses the same syllabic stimulus as the other VAD tests.
     let mut multi_frame_chunk = Vec::with_capacity(70 * 512);
-    for _ in 0..30 {
-        multi_frame_chunk.extend_from_slice(&[0.35f32; 512]);
+    for i in 0..30 {
+        multi_frame_chunk.extend_from_slice(&speech_like_frame(i));
     }
     for _ in 0..40 {
         multi_frame_chunk.extend_from_slice(&[0.0f32; 512]);

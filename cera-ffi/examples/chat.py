@@ -24,8 +24,8 @@ try:
 except (ImportError, OSError) as err:
     print(f"Error loading cera_ffi Python module or shared library: {err}")
     print(
-        "Ensure the cera-ffi shared library (libcera_ffi.dylib/so) is compiled "
-        "and placed in the bindings directory or on the system dynamic linker path."
+        "Build the matching cera-ffi shared library and place it beside cera_ffi.py "
+        "in bindings/python (libcera_ffi.dylib, libcera_ffi.so, or cera_ffi.dll)."
     )
     sys.exit(1)
 
@@ -39,7 +39,7 @@ def main():
     print(f"Loading model from: {model_path}")
 
     loader = cera_ffi.ModelLoader(
-        cera_ffi.ModelSource.Path(model_path),
+        cera_ffi.ModelSource.PATH(model_path),
         cera_ffi.EngineConfig(backend=cera_ffi.BackendPreference.CPU),
     )
     model = loader.build_generative()
@@ -70,7 +70,11 @@ def main():
     print(f"Assistant: {turn1.text.strip()}")
     print(f"Generated {turn1.summary.tokens_generated} tokens (final position: {chat.position()})")
     print(f"Phase after completion: {chat.phase()}")
-    assert chat.phase() == cera_ffi.SessionPhase.TURN_COMPLETE
+    if chat.phase() != cera_ffi.SessionPhase.TURN_COMPLETE:
+        print("Turn stopped before its terminal marker; reset or replace messages before a new user turn.")
+        reclaimed_session = chat.into_session()
+        print(f"Reclaimed raw session at position {reclaimed_session.position()}")
+        return
 
     # --- Turn 2: Warm Continuation ---
     # The previous context remains in the KV cache; only new user input is ingested.
@@ -86,8 +90,6 @@ def main():
     print(f"Assistant: {turn2.text.strip()}")
     print(f"Generated {turn2.summary.tokens_generated} tokens (final position: {chat.position()})")
     print(f"Phase after completion: {chat.phase()}")
-    assert chat.phase() == cera_ffi.SessionPhase.TURN_COMPLETE
-
     # --- Reclaim raw Session ---
     # UniFFI Python bindings manage underlying Rust handles via reference counting and finalizers.
     reclaimed_session = chat.into_session()

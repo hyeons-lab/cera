@@ -1716,22 +1716,19 @@ impl LoraAdapters {
 /// `generate`, the worker's own `onmessage` handler can't run —
 /// incoming `postMessage({kind:'cancel'})` queues but doesn't
 /// dispatch until `generate` returns, so a flag set by that
-/// handler can't be updated mid-decode. To cancel during a
-/// running `generate` call, either call `session.cancel()` from inside
-/// the token callback based on state it can observe directly
-/// (elapsed time, token budget, accumulated content), or use
-/// cross-thread shared memory signalling (`SharedArrayBuffer` +
-/// `Atomics`) — see `cera-wasm/README.md` for the full
-/// `SharedArrayBuffer` pattern, which requires cross-origin
-/// isolation in browsers.
+/// handler can't be updated mid-decode. Do not call `session.cancel()` or
+/// otherwise re-enter this handle from a callback: generation holds a mutable
+/// WASM borrow, and recursive access can leave the handle unusable. A shared
+/// JS flag does not bypass that restriction. Set cancellation between calls,
+/// bound decode work with `maxTokens`, or terminate the worker and recreate its
+/// execution state. The independent cancellation handle on browser WebGPU is
+/// a separate API; see `cera-wasm/README.md`.
 #[wasm_bindgen]
 pub struct Session {
     pub(crate) inner: Option<cera::Session>,
-    /// Model hidden dimension, cached at construction so `hiddenSize()` is a
-    /// plain field read. wasm-bindgen guards each exported method with an
-    /// internal `RefCell` borrow, so an uncached getter called from inside a
-    /// `generate` callback (which holds the `&mut self` borrow) would panic with
-    /// a borrow error; the cached read avoids re-borrowing `self.inner`.
+    /// Model hidden dimension retained independently of transferred execution
+    /// state. The exported getter still borrows this WASM handle and must not
+    /// be called from a generation callback.
     hidden_size: u32,
 }
 
@@ -1775,9 +1772,9 @@ impl Session {
     }
 
     /// Model hidden dimension `D`: reshape a `[T*D]` hidden-states buffer into
-    /// `[T][D]` with this. Reads a cached field (set at construction), so (unlike
-    /// the `&mut self` compute methods) it is safe to call from inside a `generate`
-    /// callback without a wasm-bindgen borrow panic.
+    /// `[T][D]` with this. Read and cache the dimension before generation. Even
+    /// though the field is cached, this exported getter borrows the WASM handle
+    /// and must not be called from a `generate` callback.
     #[wasm_bindgen(js_name = hiddenSize)]
     pub fn hidden_size(&self) -> u32 {
         self.hidden_size
@@ -1950,10 +1947,8 @@ impl Session {
 
     /// Flip the cancel atomic, requesting that any in-flight
     /// `generate` call exit at its next checkpoint with
-    /// `finishReason = "Cancelled"`. Safe to call from any thread
-    /// (including a Worker that owns this session, though wasm
-    /// without SharedArrayBuffer makes cross-thread sharing
-    /// unusual).
+    /// `finishReason = "Cancelled"`. Call only between operations; a callback
+    /// cannot re-enter this handle while generation holds its mutable WASM borrow.
     #[wasm_bindgen]
     pub fn cancel(&self) {
         if let Ok(s) = self.session() {
@@ -2363,6 +2358,11 @@ impl ChatSession {
     }
 
     /// Stream generated text tokens into a callback, returning the final turn result.
+    ///
+    /// If the callback throws, generation is cancelled and this returns a
+    /// `"stream callback failed"` error with the cancel latch left armed: call
+    /// `clearCancel()` before the next turn or it will cancel immediately,
+    /// then reset or replace messages if the turn was interrupted.
     #[wasm_bindgen(js_name = generateStreaming)]
     pub fn generate_streaming(
         &mut self,
@@ -2370,14 +2370,26 @@ impl ChatSession {
         on_token: &js_sys::Function,
     ) -> Result<TurnResult, JsError> {
         let chat = self.chat_mut()?;
-        let res = chat
-            .stream_text(&opts.inner, |delta| {
-                let s = JsValue::from_str(delta);
-                if let Err(err) = on_token.call1(&JsValue::null(), &s) {
-                    wasm_bindgen::throw_val(err);
+        let cancel = chat.cancel_handle();
+        let mut callback_error = None;
+        let res = chat.stream_text(&opts.inner, |delta| {
+            if callback_error.is_some() {
+                return;
+            }
+            let s = JsValue::from_str(delta);
+            if let Err(err) = on_token.call1(&JsValue::null(), &s) {
+                callback_error = Some(err);
+                if let Some(cancel) = &cancel {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-            })
-            .map_err(|e| JsError::new(&e.to_string()))?;
+            }
+        });
+        if callback_error.is_some() {
+            // Debug/String conversion of an arbitrary JS value can itself throw,
+            // skipping Rust destructors and leaking the exported object's borrow.
+            return Err(JsError::new("stream callback failed"));
+        }
+        let res = res.map_err(|e| JsError::new(&e.to_string()))?;
         Ok(TurnResult { inner: res })
     }
 
@@ -2392,16 +2404,12 @@ impl ChatSession {
         let grammar = cera::grammar::Grammar::from_json_schema_str(schema_json).map_err(map_err)?;
         let mut constrained_opts = opts.inner.clone();
         constrained_opts.grammar = Some(std::sync::Arc::new(grammar));
-        let chat = self.chat_mut()?;
-        let res = chat
-            .stream_text(&constrained_opts, |delta| {
-                let s = JsValue::from_str(delta);
-                if let Err(err) = on_token.call1(&JsValue::null(), &s) {
-                    wasm_bindgen::throw_val(err);
-                }
-            })
-            .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(TurnResult { inner: res })
+        self.generate_streaming(
+            &GenerateOpts {
+                inner: constrained_opts,
+            },
+            on_token,
+        )
     }
 
     /// Currently registered tools for function calling as a JSON string.
@@ -2457,6 +2465,7 @@ impl ChatSession {
     }
 
     /// Flip the cancel atomic, requesting that any in-flight turn exit at its next checkpoint.
+    /// Call only between operations; do not re-enter this Chat handle from its callback.
     #[wasm_bindgen]
     pub fn cancel(&self) -> Result<(), JsError> {
         self.chat()?.cancel();
@@ -2496,22 +2505,56 @@ impl ChatSession {
 // bypasses the synchronous `cera::Session`: the WebGPU backend can only be
 // driven from the JS event loop (no blocking GPU readback on the main thread),
 // so the whole prefill + decode loop is `async` and reads logits back via
-// `GpuContext::download_*_async`. Prototype scope: LFM2 only, greedy decode.
+// `GpuContext::download_*_async`. Supports the GPU loader's LFM2/MoE and dense
+// transformer families, with greedy decoding and stochastic sampling.
 // See devlog 000169.
 /// Validate that a session checkpoint is compatible with a WebGPU session before restoring.
 ///
 /// Ensures fingerprint, sequence length bounds, layer counts, precision (f16 CPU checkpoints
 /// are rejected because WebGPU uses f32 or compressed KV), and TurboQuant compression modes match.
+/// Normalize requested compression to the model's actual stored state: keep it
+/// when the model stores compressed KV, else fall back to uncompressed so the
+/// session constructors and checkpoint paths agree.
+#[cfg(feature = "wgpu")]
+fn effective_compression(
+    model_is_compressed: bool,
+    compression: cera::kv_cache::KvCompression,
+) -> cera::kv_cache::KvCompression {
+    if model_is_compressed {
+        compression
+    } else {
+        cera::kv_cache::KvCompression::None
+    }
+}
+
+/// Fingerprint tag for the active KV compression: the compression cache tag
+/// when the model actually stores compressed KV, empty otherwise. Shared by
+/// checkpoint validation and export so the two fingerprints cannot drift.
+/// (`model_is_compressed` is the actual stored state, not the requested mode.)
+#[cfg(any(feature = "wgpu", test))]
+pub(crate) fn compression_fingerprint_tag(
+    model_is_compressed: bool,
+    compression: &cera::kv_cache::KvCompression,
+) -> String {
+    if model_is_compressed {
+        compression.cache_tag()
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(any(feature = "wgpu", test))]
 pub(crate) fn validate_webgpu_checkpoint(
     cp: &cera::session::SessionCheckpoint,
     config: &cera::model::ModelConfig,
     state: &cera::kv_cache::InferenceState,
     model_is_compressed: bool,
+    compression: &cera::kv_cache::KvCompression,
 ) -> Result<(), wasm_bindgen::JsError> {
     use wasm_bindgen::JsError;
 
-    let current_fp = cera::kv_cache::model_fingerprint(config, "");
+    let tag = compression_fingerprint_tag(model_is_compressed, compression);
+    let current_fp = cera::kv_cache::model_fingerprint(config, &tag);
     if cp.model_fingerprint != current_fp {
         return Err(JsError::new(&format!(
             "model fingerprint mismatch: checkpoint was created for a different model (expected {current_fp:016x}, got {:016x})",
@@ -2554,6 +2597,9 @@ pub(crate) fn validate_webgpu_checkpoint(
     state
         .validate_snapshot(&cp.kv_state)
         .map_err(|e| JsError::new(&e))?;
+    cp.kv_state
+        .validate_for_model(config)
+        .map_err(|e| JsError::new(&e))?;
 
     Ok(())
 }
@@ -2561,8 +2607,8 @@ pub(crate) fn validate_webgpu_checkpoint(
 #[cfg(feature = "wgpu")]
 mod webgpu {
     use super::{
-        Capabilities, Tokenizer, capabilities_to_js, console_info, console_warn, map_err,
-        validate_webgpu_checkpoint,
+        Capabilities, Tokenizer, capabilities_to_js, compression_fingerprint_tag, console_info,
+        console_warn, effective_compression, map_err, validate_webgpu_checkpoint,
     };
     use cera::model::Model;
     use cera::time::Instant;
@@ -2782,6 +2828,7 @@ mod webgpu {
             model
                 .configure_kv_compression(&compression)
                 .map_err(crate::map_cera_err)?;
+            let compression = effective_compression(model.is_compressed(), compression);
             // Pass the mode even though `GpuLfm2Model` keeps its real KV on the
             // GPU and reads TurboQuant state from its own `tq` cache, never from
             // `InferenceState`. The reason is memory, not correctness:
@@ -2949,6 +2996,7 @@ mod webgpu {
                 model
                     .configure_kv_compression(&compression)
                     .map_err(crate::map_cera_err)?;
+                let compression = effective_compression(model.is_compressed(), compression);
                 let state = cera::kv_cache::InferenceState::from_config_with_compression(
                     model.config(),
                     &compression,
@@ -3707,6 +3755,7 @@ mod webgpu {
         /// CPU one:
         ///
         /// ```js
+        /// // Frame the initial prompt on a fresh or reset session.
         /// const tk = session.tokenizer;
         /// // A real array, not JSON: `applyChatTemplate` type-checks its
         /// // argument and rejects a string with "messages must be an array".
@@ -3719,7 +3768,9 @@ mod webgpu {
         /// if (tk.addBosToken && tk.bosToken != null && ids[0] !== tk.bosToken) {
         ///   ids.unshift(tk.bosToken);
         /// }
-        /// await session.generateTokens(new Uint32Array(ids), 128, onToken);
+        /// await session.generateTokens(
+        ///   new Uint32Array(ids), 128, 0, undefined, undefined, undefined, onToken, undefined,
+        /// );
         /// ```
         ///
         /// The returned handle shares this session's tokenizer rather than
@@ -4485,7 +4536,8 @@ mod webgpu {
                 .snapshot_session_state_async()
                 .await
                 .map_err(map_err)?;
-            let fp = cera::kv_cache::model_fingerprint(self.model.config(), "");
+            let tag = compression_fingerprint_tag(self.model.is_compressed(), &self.compression);
+            let fp = cera::kv_cache::model_fingerprint(self.model.config(), &tag);
             let cp = cera::session::SessionCheckpoint {
                 model_fingerprint: fp,
                 position: self.state.seq_len,
@@ -4518,6 +4570,7 @@ mod webgpu {
                 self.model.config(),
                 &self.state,
                 self.model.is_compressed(),
+                &self.compression,
             )?;
 
             self.state.restore(&cp.kv_state);
@@ -4588,6 +4641,8 @@ mod tests {
         }
 
         fn forward(&self, tokens: &[u32], _: usize, state: &mut InferenceState) -> Vec<f32> {
+            let rows = vec![0.0; tokens.len() * self.config.n_kv_heads * self.config.head_dim];
+            state.append_kv(0, &rows, &rows);
             state.seq_len += tokens.len();
             let mut logits = vec![0.0f32; self.config.vocab_size];
             if (self.token_to_emit as usize) < logits.len() {
@@ -4599,10 +4654,12 @@ mod tests {
         fn try_reset_kv(
             &self,
             state: &mut InferenceState,
-            _: &KvCompression,
-            _: usize,
+            compression: &KvCompression,
+            max_seq_len: usize,
         ) -> Result<(), cera::CeraError> {
-            state.seq_len = 0;
+            let mut config = self.config.clone();
+            config.max_seq_len = config.max_seq_len.min(max_seq_len);
+            *state = InferenceState::from_config_with_compression(&config, compression)?;
             Ok(())
         }
     }
@@ -4812,7 +4869,13 @@ mod tests {
             kv_state: f16_snapshot,
         };
 
-        let res_f16 = validate_webgpu_checkpoint(&f16_checkpoint, &config, &state, false);
+        let res_f16 = validate_webgpu_checkpoint(
+            &f16_checkpoint,
+            &config,
+            &state,
+            false,
+            &KvCompression::None,
+        );
         assert!(res_f16.is_err());
         let err_msg = format!("{:?}", res_f16.unwrap_err());
         assert!(
@@ -4841,12 +4904,46 @@ mod tests {
 
         // When model is configured with TurboQuant compression (model_is_compressed = true)
         // but checkpoint is uncompressed, validation must reject it
-        let res_comp = validate_webgpu_checkpoint(&f32_checkpoint, &config, &state, true);
+        let res_comp = validate_webgpu_checkpoint(
+            &f32_checkpoint,
+            &config,
+            &state,
+            true,
+            &KvCompression::None,
+        );
         assert!(res_comp.is_err());
         let comp_err_msg = format!("{:?}", res_comp.unwrap_err());
         assert!(
             comp_err_msg.contains("compression mode"),
             "Error must mention compression mode mismatch, got: {comp_err_msg}"
         );
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn webgpu_checkpoint_checks_seed_and_resident_row_count() {
+        let mut config = TestModel::new(7).config;
+        config.head_dim = 32;
+        config.hidden_size = 32;
+        let compression = KvCompression::turboquant(1);
+        let state = InferenceState::from_config_with_compression(&config, &compression).unwrap();
+        let mut cp = cera::session::SessionCheckpoint {
+            model_fingerprint: cera::kv_cache::model_fingerprint(&config, &compression.cache_tag()),
+            position: 0,
+            max_seq_len: config.max_seq_len,
+            prefill_tokens: 0,
+            prefill_elapsed_ms: 0,
+            last_logits: None,
+            token_history: Vec::new(),
+            kv_state: state.snapshot().unwrap(),
+        };
+        assert!(validate_webgpu_checkpoint(&cp, &config, &state, true, &compression).is_ok());
+        assert!(
+            validate_webgpu_checkpoint(&cp, &config, &state, true, &KvCompression::turboquant(2))
+                .is_err()
+        );
+        cp.position = 1;
+        cp.kv_state.seq_len = 1;
+        assert!(validate_webgpu_checkpoint(&cp, &config, &state, true, &compression).is_err());
     }
 }

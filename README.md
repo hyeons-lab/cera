@@ -5,7 +5,7 @@ on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
 > [!NOTE]
-> Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`SessionChat` / `ChatSession`), language-native reactive streaming across Swift, Kotlin, Python, and Dart, native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 API includes corrections to chat lifecycle, streaming, checkpoint validation, JSON Schema constraints and audio processing. See the [0.6 API guide](docs/API_0_6.md) for usage and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 ## Why Cera
 
@@ -20,10 +20,10 @@ or in the browser, from a single dependency-free core.
   load through the same session API.
 - **Wake word & speech recognition.** Native Keyword Spotting (KWS), Silero VAD, OpenAI Whisper ASR, and the unified stateful `AudioPipeline` in pure Rust, linked through a single unified binary across mobile and desktop.
 - **Structured output.** Constrain generation to a GBNF grammar, or one flag
-  for guaranteed-valid JSON.
+  for grammar-constrained JSON (check for incomplete output on token limits).
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it
   makes back out: format-aware (LFM2 Pythonic, Hermes/Qwen JSON), with an
-  optional constrained mode that guarantees a well-formed, correctly-typed call.
+  optional grammar constraints on tool-call syntax.
   From the CLI and every binding.
 - **LoRA adapters & embeddings.** Load LoRA adapters at runtime (GGUF or PEFT
   safetensors), hot-swap / unload per session (applied on CPU, Metal, and wgpu,
@@ -32,8 +32,8 @@ or in the browser, from a single dependency-free core.
 
 ## Supported models
 
-Dispatch is on the GGUF `general.architecture` string, so any GGUF matching one
-of these architectures loads:
+Dispatch is on the GGUF `general.architecture` string. Selected supported
+families are listed below; tensor layouts and quantization must also match the loader:
 
 | Architecture | Models | Modalities |
 |--------------|--------|------------|
@@ -49,16 +49,16 @@ of these architectures loads:
 | `mistral3` | **Ministral 3** (Norm YaRN RoPE, attention temperature scaling, Tekken BPE) | text |
 | `bailingmoe3`, `bailingmoe` | **Ling 3.0 Tiny** (hybrid KDA linear, MLA latent attention, and MoE) | text |
 
-No Granite 4.0 model loads today. The 4.0-H hybrids convert to a separate arch
-`granitehybrid`; the non-hybrid ones (`granite-4.0-micro`, `-1b`, `-350m`) do
-convert to `granite`, but write `attention.head_count_kv` as a per-layer array
-that the loader does not yet accept. The 4.1 line above is unaffected.
+CPU loading also supports families such as Gemma 2/4, Olmo 2/3, Granite Hybrid,
+Falcon H1 and Mamba-2. See the [loading dispatch](cera/src/model/mod.rs) for
+architecture aliases and backend admission rules.
 
-Every architecture above runs on **all three compute backends** (CPU, Metal, and
-wgpu), with single-token decode and prompt prefill on each. Prefill uses
-batched-GEMM (each weight read once for the whole prompt) on every backend and
-architecture, including CPU for both LFM2 and the dense transformers, with a
-tiled flash-attention path that kicks in for long prompts.
+Metal and wgpu support `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
+`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`. The listed `qwen35`,
+`mistral3` and `bailingmoe3` families use CPU; requesting an unsupported GPU
+backend explicitly returns an error. Auto selection can fall back to CPU.
+The LFM2 and supported dense-transformer paths use batched-GEMM prefill,
+including on CPU, with tiled flash attention for long prompts where supported.
 
 `lfm2moe`'s routed feed-forward block is the one exception to that
 batched-GEMM sentence, and it is deliberate: each token picks its own 4-of-32
@@ -146,7 +146,7 @@ schema. Cera ships a byte-level GBNF engine (mirroring llama.cpp's) that masks t
 sampler each step so only grammar-valid tokens can be produced.
 
 ```bash
-# Guaranteed-valid JSON (bundled grammar)
+# Constrain generation to JSON (a token limit can still truncate it)
 cera run -m model.gguf -p "List 3 colors as JSON" --json
 
 # Any custom GBNF (inline or @file)
@@ -158,18 +158,29 @@ Supports literals, character classes, alternation, grouping, and repetition
 CLI: in Rust set `GenerateOpts.grammar` to a compiled `Grammar` (`Grammar::parse(gbnf)?`),
 while the Kotlin/Swift FFI (`GenerateOpts.grammar`) and browser/Node WASM
 (`GenerateOpts.setGrammar(gbnf)`) take the GBNF string directly and compile it
-natively, so mobile and web apps get the same guaranteed-valid output.
+natively, so mobile and web apps use the same grammar rules. A token limit or
+cancellation can leave an incomplete value; parse and validate the final output.
 
 ### Native JSON Schema compilation
 
-Cera compiles standard JSON Schemas directly to GBNF grammars without external tooling:
+Cera compiles a subset of JSON Schema directly to GBNF without external tooling:
 
 - **Rust**: `let grammar = Grammar::from_json_schema_str(&schema_json)?;` or `opts = opts.with_json_schema(&schema_json)?;`
-- **Swift / Kotlin / Python**: `try opts.withJsonSchema(schema)` in Swift, `opts.withJsonSchema(schema)` in Kotlin, `opts.with_json_schema(schema)` in Python
+- **Swift**: `let constrainedOpts = try opts.withJsonSchema(schema)`
+- **Kotlin**: `val constrainedOpts = opts.withJsonSchema(schema)`
+- **Python**: `constrained_opts = opts.with_json_schema(schema)`
 - **Dart**: `chat.streamJson(opts, schemaJson)`
-- **Browser / Node WASM**: `opts.setJsonSchema(schema)` or `GenerateOpts.withJsonSchema(opts, schema)`
+- **Browser / Node WASM**: `opts.setJsonSchema(schema)` or `const constrainedOpts = GenerateOpts.withJsonSchema(opts, schema)`
 
-Supports nested objects, arrays, string enums, `$defs`/`definitions`, recursive chained `$ref` resolution, and `allOf` schema composition.
+Pass the returned constrained options to generation. The Swift/Kotlin/Python
+helpers and WASM `withJsonSchema` return copies; WASM `setJsonSchema` updates
+`opts` in place.
+
+Supports nested properties and required keys, bounded arrays, scalar enums,
+local `$defs`/`definitions` and chained `$ref` resolution. `allOf` accepts only
+supported scalar wrappers and compatible object merges. Numeric ranges, string
+patterns and other unimplemented keywords are not enforced. See the
+[supported subset](docs/API_0_6.md#json-schema-constraints) before relying on a schema.
 
 ## Tool calling
 
@@ -188,13 +199,15 @@ cera run -m model.gguf -p "What's the weather in Paris?" \
              "parameters":{"type":"object",
                "properties":{"city":{"type":"string"}},"required":["city"]}}]'
 
-# Force a well-formed, correctly-typed call (grammar-constrained)
+# Constrain tool-call syntax after the model emits a call marker
 cera run -m model.gguf -p "..." --tools @tools.json --constrain-tools
 ```
 
 With `--constrain-tools` a **lazy grammar trigger** keeps generation free until
-the model starts a tool call, then constrains the call to a valid function name,
-valid argument names, and correctly-typed values (JSON-Schema → GBNF). In
+the model starts a tool call, then constrains function/argument names and outer
+value syntax. Its separate tool grammar does not enforce required arguments,
+uniqueness or nested item/property schemas. Prose and truncated calls remain
+possible; parse and validate arguments before executing a tool. In
 `--tools` mode stdout is machine-readable: **only** the JSON array of calls
 (`[]` when the model answered in prose); the assistant reply and timing stream to
 stderr, so `… --tools tools.json | jq` just works.
@@ -208,20 +221,28 @@ README for the API surface.
 
 Cera promotes the high-level **`SessionChat` coordinator** (`cera::session::chat` / `ChatSession` in FFI) to the public API:
 
-- **Transactional state machine**: Transitions explicitly across `Idle` -> `Generating` -> `TurnComplete`, with non-destructive recovery upon `Interrupted` or `Unusable` states.
+- **Explicit lifecycle**: Ingestion moves `Idle` to `PromptReady`; generation reaches `TurnComplete` only on a profile terminal. Token limits, cancellation and nonterminal stops can leave `Interrupted`; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery may restore, reset or mark execution unusable.
 - **Delta-only prompt evaluation**: Continuation turns evaluate only the newly appended user message delta, preserving warm KV cache resident state without repeating full prompt history prefill.
-- **Dynamic template profile discovery**: Detects and applies ChatML, Llama 3, Gemma, and generic Jinja templates (`TemplateFamily`, `ProfileBuilder`).
+- **Validated template profiles**: Discovers framing for ChatML, Llama 3, Gemma and compatible Jinja templates (`TemplateFamily`, `ProfileBuilder`); unsupported continuation profiles are rejected.
 - **First-class tool loop**: Register tool schemas directly on the coordinator via `chat.set_tools(tools)`; tool calls are parsed into `TurnResult.tool_calls` and tool execution outputs are ingested with `chat.ingest_tool_response(...)`.
 
 ```rust
+use cera::{Message, SessionPhase};
+
 let mut chat = session.into_chat().map_err(|(_, err)| err)?;
 chat.ingest(&Message::user("Hello!"))?;
 let result = chat.complete(&opts)?;
 println!("Assistant: {}", result.text);
 
-// Next turn evaluates delta only with warm KV retention:
-chat.ingest(&Message::user("What did I just say?"))?;
-let reply = chat.complete(&opts)?;
+// Continue only after the profile's terminal marker ended the turn.
+if chat.phase() == SessionPhase::TurnComplete {
+    chat.ingest(&Message::user("What did I just say?"))?;
+    let reply = chat.complete(&opts)?;
+    println!("Assistant: {}", reply.text);
+} else {
+    // Start a fresh conversation; alternatively replace the full history.
+    chat.reset()?;
+}
 ```
 
 ## Language-native reactive streaming
@@ -234,16 +255,26 @@ Cera provides native reactive streaming wrappers tailored for each language ecos
 - **Dart**: `Stream<String>` via `chat.stream(opts)` and `chat.streamJson(opts, schema)`.
 - **Rust**: `chat.stream_text(&opts, |chunk| { ... })?` yielding real-time text fragments into a callback closure.
 
-Every stream wrapper guards against sticky cancellation, isolating normal stream completion and errors so sessions remain fully reusable across multi-turn conversations.
+Stream completion does not imply a completed chat turn. Inspect the phase before
+the next user message; reset or replace interrupted conversations. Abandoning an
+active stream requests cancellation. Let that operation finish before reusing
+the handle. See [streaming and cancellation](docs/API_0_6.md#streaming-and-cancellation).
 
 ## Session checkpointing & persistence
 
-Export, persist, and restore live session state across CPU, Metal, and WebGPU:
+CPU Session and Chat support resumable snapshots. Native Metal/wgpu Session
+checkpoint and restore operations reject backend-owned state; browser
+`WebGpuSession` has a separate device snapshot API.
 
-- **Binary serialization**: Fast, compact `SessionCheckpoint` format with magic headers (`CERASCHK` / `CERACHAT`), 64-bit FNV-1a model structural fingerprint validation, and versioned headers.
+- **Binary serialization**: `SessionCheckpoint` / `ChatCheckpoint` formats with magic headers (`CERASCHK` / `CERACHAT`), structural fingerprints and versioned headers. Fingerprints are not cryptographic model identities.
 - **Atomic file operations**: `checkpoint.save_to_file(path)` and `SessionCheckpoint::load_from_file(path)` with atomic writes and clean error recovery.
-- **WebGPU VRAM checkpointing**: Asynchronous GPU buffer staging readbacks and restores without blocking the browser event loop.
+- **Browser WebGPU checkpointing**: Async GPU readback/export and synchronous restore/import into a compatible session.
 - **Continuation state preservation**: Restores live sequence length, KV cache states, and terminal token commitment for seamless multi-turn resumption.
+
+Version 0.6.2 validates row geometry, KV precision and compression identity,
+including TurboQuant seeds. Recreate older f16/TurboQuant snapshots whose
+fingerprints lack compression identity; plain f32 fingerprints are unchanged.
+See [checkpoint compatibility](docs/API_0_6.md#checkpoints-and-compatibility).
 
 ## LoRA adapters & hidden states
 
@@ -307,19 +338,23 @@ context shift is not supported with any TurboQuant mode on any backend.
 
 See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
 
-## FreeToken: Semantic Anchor Caching
+## Prefix cache anchors
 
-Cera implements **FreeToken** ([arXiv:2406.14588](https://arxiv.org/abs/2406.14588), 2024: *FreeToken: Fast and Resource-Efficient KV Cache for Long-Context LLMs*), a semantic-aware caching hierarchy that accelerates multi-turn chat and long-context inference:
+`cera::kv_cache::KvPrefixCache` retains token-prefix snapshots in warm memory and,
+when disk caching is enabled and configured, a cold disk tier. Its `insert_anchor`
+and `find_deepest_semantic_anchor` APIs let callers tag and select matching
+prefix snapshots using caller-supplied boundary metadata. The standard engine
+cache path does not automatically select semantic anchors.
 
-- **Semantic Anchor Extraction**: Identifies key sentence boundaries and high-entropy prompt positions as persistent semantic anchors (`cera::kv_cache::KvPrefixCache`).
-- **Hierarchical Warm & Cold Tiering**: Promotes active conversation prefixes to warm in-memory cache and compresses older history into cold TurboQuant storage, eliminating redundant prefill computation.
-- **FlatBuffers v2 Disk Serialization**: Fast, zero-copy persistence format for saving and restoring warm prefix caches across session lifecycles without full prompt re-evaluations.
+FlatBuffers v2 persistence preserves each snapshot's existing precision,
+including TurboQuant data when already compressed. Callers choose compression
+before capturing snapshots; moving a snapshot to disk does not recompress it.
 
 ## DSpark: Neural Speculative Decoding
 
 Cera includes support for **DSpark** ([arXiv:2407.08608](https://arxiv.org/abs/2407.08608), 2024: *DSpark: High-Throughput Speculative Decoding with Lightweight Drafters*), accelerating inference throughput via parallel multi-token draft verification:
 
-- **Lightweight Sidecar Drafters**: Load compact draft models (`cera::spec::dspark`) that share embedding and GGUF weight backings with the target model without redundant memory mapping.
+- **Lightweight Sidecar Drafters**: Load compact draft models (`cera::model::dspark`) that share embedding and GGUF weight backings with the target model without redundant memory mapping.
 - **Parallel GPU Verification**: Validates draft token sequences in a single forward pass with batched LM-head verification on CPU, Metal, and WebGPU.
 - **Automatic Drafter Discovery**: Bundle loader automatically discovers and attaches paired DSpark sidecar models from LeapBundles and Hugging Face repositories.
 
@@ -472,6 +507,8 @@ let opts = GenerateOpts { max_tokens: 128, ..Default::default() };
 let summary = session.generate(&opts, &mut sink)?; // sink: your ModalitySink
 
 // Or conversational chat coordination (delta-only prefill, live KV retention):
+// Start a new conversation after the raw completion above.
+session.reset()?;
 let mut chat = session.into_chat().map_err(|(_, err)| err)?;
 chat.ingest(&Message::user("What is the capital of France?"))?;
 let reply = chat.complete(&opts)?;
@@ -613,10 +650,11 @@ enough to invent a trend that isn't there.
   too is read once per round.) Every emitted token is the target's own
   argmax (a poor draft costs acceptance rate, never
   correctness), though a near-tie can land differently than a sequential greedy
-  run, since the verifier forwards a different batch shape. Today it engages on
-  the **CPU dense (`llama`-family) path only**, on the plain greedy path with an
-  uncompressed KV cache, and falls back transparently everywhere else. On the
-  CLI it is exposed on `bench` (`--spec`).
+  run, since the verifier forwards a different batch shape. It engages on
+  eligible CPU and native GPU models with all-position logits, plain greedy
+  decoding, uncompressed KV and no audio decoder. See
+  [speculative decoding](cera/README.md#speculative-decoding) for backend and
+  execution limits. The CLI exposes prompt-lookup knobs on `bench` (`--spec`).
 - **Streaming & cancellation**: tokens (and audio frames) arrive through a
   `ModalitySink` as they decode; `Session::cancel()` interrupts long prompts
   responsively via chunked prefill.

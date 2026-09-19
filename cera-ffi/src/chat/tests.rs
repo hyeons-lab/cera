@@ -46,6 +46,8 @@ impl Model for TestModel {
     }
 
     fn forward(&self, tokens: &[u32], _: usize, state: &mut InferenceState) -> Vec<f32> {
+        let rows = vec![0.0; tokens.len() * self.config.n_kv_heads * self.config.head_dim];
+        state.append_kv(0, &rows, &rows);
         state.seq_len += tokens.len();
         let mut logits = vec![0.0f32; self.config.vocab_size];
         if (self.token_to_emit as usize) < logits.len() {
@@ -57,10 +59,12 @@ impl Model for TestModel {
     fn try_reset_kv(
         &self,
         state: &mut InferenceState,
-        _: &KvCompression,
-        _: usize,
+        compression: &KvCompression,
+        max_seq_len: usize,
     ) -> Result<(), cera::CeraError> {
-        state.seq_len = 0;
+        let mut config = self.config.clone();
+        config.max_seq_len = config.max_seq_len.min(max_seq_len);
+        *state = InferenceState::from_config_with_compression(&config, compression)?;
         Ok(())
     }
 }
@@ -89,6 +93,7 @@ fn test_session(n_keep: u32) -> Arc<Session> {
 struct TestSink {
     chunks: std::sync::Mutex<Vec<String>>,
     done: std::sync::Mutex<Option<FinishReason>>,
+    done_count: std::sync::atomic::AtomicUsize,
 }
 
 impl TestSink {
@@ -96,6 +101,7 @@ impl TestSink {
         Self {
             chunks: std::sync::Mutex::new(Vec::new()),
             done: std::sync::Mutex::new(None),
+            done_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -107,8 +113,64 @@ impl ModalitySink for TestSink {
     }
     fn on_audio_frames(&self, _: Vec<f32>, _: u32) {}
     fn on_done(&self, reason: FinishReason) {
+        self.done_count.fetch_add(1, Ordering::Relaxed);
         *self.done.lock().unwrap() = Some(reason);
     }
+}
+
+#[tokio::test]
+async fn invalid_json_stream_notifies_once_for_both_entry_points() {
+    let chat = test_session(0).into_chat().unwrap();
+    let sink = Arc::new(TestSink::new());
+    assert!(
+        chat.generate_streaming_json(GenerateOpts::default(), "{".into(), sink.clone())
+            .is_err()
+    );
+    assert_eq!(sink.done_count.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        *sink.done.lock().unwrap(),
+        Some(FinishReason::Error { .. })
+    ));
+    let sink = Arc::new(TestSink::new());
+    assert!(
+        chat.generate_streaming_async_json(GenerateOpts::default(), "{".into(), sink.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(sink.done_count.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        *sink.done.lock().unwrap(),
+        Some(FinishReason::Error { .. })
+    ));
+}
+
+#[test]
+fn moved_chat_terminal_callback_can_reenter() {
+    struct ReentrantSink(Arc<ChatSession>, std::sync::atomic::AtomicUsize);
+    impl ModalitySink for ReentrantSink {
+        fn on_thought_chunk(&self, _: String) {}
+        fn on_text_chunk(&self, _: String) {}
+        fn on_audio_frames(&self, _: Vec<f32>, _: u32) {}
+        fn on_done(&self, reason: FinishReason) {
+            assert!(matches!(reason, FinishReason::Error { .. }));
+            // phase uses try_lock: this assertion fails promptly if the callback
+            // still holds the mutex, instead of hanging the regression test.
+            assert!(matches!(self.0.phase(), Err(FfiError::Backend { .. })));
+            assert!(self.0.reset().is_err());
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let chat = test_session(0).into_chat().unwrap();
+    let _session = chat.into_session().unwrap();
+    let sink = Arc::new(ReentrantSink(
+        chat.clone(),
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    assert!(
+        chat.generate_streaming(GenerateOpts::default(), sink.clone())
+            .is_err()
+    );
+    assert_eq!(sink.1.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -224,7 +286,23 @@ fn session_into_chat_refusal_preserves_session() {
 #[test]
 fn moved_session_returns_error_on_subsequent_calls() {
     let session = test_session(0);
-    let _chat = session.into_chat().expect("into_chat succeeds");
+    let chat = session.into_chat().expect("into_chat succeeds");
+
+    session.cancel();
+    assert!(!chat.cancel.load(Ordering::Relaxed));
+    chat.cancel();
+    session.clear_cancel();
+    assert!(chat.cancel.load(Ordering::Relaxed));
+    chat.clear_cancel().unwrap();
+    chat.ingest(chat_message_user("still usable".into()))
+        .unwrap();
+    assert_ne!(
+        chat.complete(GenerateOpts::default())
+            .unwrap()
+            .summary
+            .finish_reason,
+        FinishReason::Cancelled
+    );
 
     let err = session.append_text("test".into()).unwrap_err();
     match err {

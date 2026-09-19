@@ -673,7 +673,7 @@ pub struct Session {
     ingest_mutation: Option<recovery::Mutation>,
     last_ingest_recovery: Option<IngestRecovery>,
     // Declared last so other fields drop before a successor acquires live KV.
-    _model_session_lease: Option<ModelSessionLease>,
+    model_session_lease: Option<ModelSessionLease>,
 }
 
 impl Session {
@@ -815,7 +815,7 @@ impl Session {
             usable: true,
             ingest_mutation: None,
             last_ingest_recovery: None,
-            _model_session_lease: model_session_lease,
+            model_session_lease,
         })
     }
 
@@ -1047,13 +1047,24 @@ impl Session {
         chat::core_chat(self)
     }
 
-    /// Calculate structural model fingerprint to verify compatibility upon restore.
+    /// Fingerprint the model and KV compression configuration for checkpoint restore.
     pub fn model_fingerprint(&self) -> u64 {
-        crate::kv_cache::model_fingerprint(self.model.config(), "")
+        crate::kv_cache::model_fingerprint(
+            self.model.config(),
+            &self
+                .config
+                .kv_compression
+                .resolved_for(self.model.config())
+                .cache_tag(),
+        )
     }
 
     /// Capture a resumable checkpoint of the current inference session.
+    ///
+    /// Models with backend-owned state (including native Metal/wgpu) are rejected:
+    /// a host-only snapshot cannot safely represent their live caches.
     pub fn checkpoint(&self) -> Result<checkpoint::SessionCheckpoint, CeraError> {
+        self.check_checkpoint_backend()?;
         if !self.usable {
             return Err(CeraError::Format(
                 "cannot checkpoint session in unusable state".to_string(),
@@ -1078,7 +1089,12 @@ impl Session {
     }
 
     /// Restore a previously captured checkpoint into this session.
+    ///
+    /// Compression configuration, including the TurboQuant seed, must match.
+    /// Compressed and f16 checkpoints created before compression was included in
+    /// the fingerprint must be recreated. Plain f32 fingerprints are unchanged.
     pub fn restore(&mut self, checkpoint: &checkpoint::SessionCheckpoint) -> Result<(), CeraError> {
+        self.check_checkpoint_backend()?;
         let current_fp = self.model_fingerprint();
         if checkpoint.model_fingerprint != current_fp {
             return Err(CeraError::Format(format!(
@@ -1114,7 +1130,20 @@ impl Session {
         self.state
             .validate_snapshot(&checkpoint.kv_state)
             .map_err(CeraError::Format)?;
+        self.model
+            .validate_checkpoint_state(&checkpoint.kv_state)
+            .map_err(CeraError::Format)?;
+        if checkpoint
+            .last_logits
+            .as_ref()
+            .is_some_and(|logits| logits.len() != self.model.config().vocab_size)
+        {
+            return Err(CeraError::Format(
+                "checkpoint logits do not match model vocabulary".into(),
+            ));
+        }
 
+        self.usable = false;
         self.state.restore(&checkpoint.kv_state);
         self.current_pos = checkpoint.position;
         self.position_atomic
@@ -1123,10 +1152,23 @@ impl Session {
         self.last_logits = checkpoint.last_logits.clone();
         self.prefill_tokens = checkpoint.prefill_tokens;
         self.prefill_elapsed = Duration::from_millis(checkpoint.prefill_elapsed_ms);
-        self.usable = true;
         self.ingest_mutation = None;
         self.last_ingest_recovery = None;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.reset();
+        }
         self.cancel.store(false, Ordering::Release);
+        self.usable = true;
+        Ok(())
+    }
+
+    fn check_checkpoint_backend(&self) -> Result<(), CeraError> {
+        if self.model_session_lease.is_some() {
+            return Err(CeraError::Format(
+                "Session checkpoints are not supported for model-owned KV state; use a CPU session"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2533,7 +2575,8 @@ impl Session {
                     && let Some(mask) = grammar_mask.as_ref()
                 {
                     // Mask logits to grammar-allowed tokens (EOS only when complete).
-                    let allowed = mask.apply(state, &mut sample_scratch);
+                    let allowed =
+                        mask.apply_with_stop_tokens(state, &mut sample_scratch, &opts.stop_tokens);
                     if allowed == 0 {
                         finish = FinishReason::GrammarDeadEnd;
                         break;

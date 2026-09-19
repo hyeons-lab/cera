@@ -3,24 +3,20 @@
 `wasm-bindgen` browser / Node bindings for the
 [cera](https://github.com/hyeons-lab/cera) inference engine.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), native JSON Schema compilation, first-class tool calling, and WebGPU session checkpoint persistence. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 API includes chat callback recovery, checkpoint validation and schema corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
-> Status: pre-1.0. Today's surface covers manifest parsing, model
-> loading (CPU-only), engine metadata + capability probes, full
-> tokenizer access (`encode` / `decode` / `applyChatTemplate` /
-> `specialTokenId` / `isSpecialToken`), session lifecycle (`reset`
-> / `cancel` / `clearCancel`), and sync streaming text generation
-> via `Session.generate(opts, cb)`. `Session.appendAudio` is wired
-> as a placeholder symbol; the cera-core method is still a
-> scaffold (always errors); the wasm signature is locked in so JS
-> code stabilizes against the same shape the JVM/Apple bindings
-> expose.
+The CPU API covers explicit model loading, metadata/capability probes,
+tokenization, raw Session generation and the Chat coordinator. `Session.appendAudio`
+resamples/encodes/prefills audio when an audio-capable model and its encoder
+companion have been loaded, for example through `CeraEngine.fromGgufParts`.
+The async browser `WebGpuSession` surface is separate; see
+[GPU acceleration](#gpu-acceleration-experimental-webgpu).
 
 ## Explicit CPU model loading
 
 This checkout exports `ModelSource`, `ModelLoader`, `ModelHandle` and
 `GenerativeModel` alongside the existing engine, browser factories and WebGPU API.
-Version 0.6.1 provides these capabilities alongside `ChatSession` and WebGPU checkpointing. The loader accepts owned
+The loader accepts owned
 GGUF bytes or `ModelParts` containing companion bytes, inference type, chat
 template and complete Text/Audio/Other generation defaults.
 
@@ -80,6 +76,36 @@ for live KV continuation; the example does not establish performance budgets.
 JavaScript method style. `ModelSource.bytes` and `.parts` are the new CPU sources.
 Existing async browser resolution and WebGPU loading use their existing APIs.
 
+## CPU chat lifecycle
+
+`session.intoChat()` transfers the CPU Session into a `ChatSession`.
+`chat.phase` and `chat.position` are properties, not methods. Ingest messages as
+`{role: 'user', content: '...'}` objects, then call `complete(opts)` or
+`generateStreaming(opts, onText)`. Returned ingestion summaries and turn results
+are WASM handles; free them when no longer needed.
+
+The phases are `Idle`, `PromptReady`, `TurnComplete`, `Interrupted`, `RawContext`
+and `Unusable`. Only `TurnComplete` permits the next ordinary user turn. A token
+limit or cancelled call can return successfully with phase `Interrupted`;
+reset or replace messages before adding another turn. `clearCancel()` only clears
+the flag. Zero-token/no-progress calls can preserve `PromptReady`, allowing a
+generation retry without replay. `intoSession()` reclaims execution and leaves
+the old Chat handle moved.
+
+`completeJson(opts, schema)` and `generateStreamingJson(opts, schema, onText)`
+compile the [JSON Schema subset](../docs/API_0_6.md#json-schema-constraints).
+Unimplemented validation keywords are not enforced, and a token limit can leave
+incomplete JSON. Do not re-enter the same Chat handle from a streaming callback,
+including `cancel()`, property reads, reset or disposal: recursive WASM borrowing
+can leave the handle unusable. Ordinary JS values thrown by a Chat callback
+return an error after Rust releases its borrow; inspection/reset remains possible
+after the outer call returns. This guarantee excludes recursive handle access
+and does not apply to every raw Session callback API.
+
+CPU Session and Chat expose `checkpoint()` and `restore(bytes)`. These differ
+from the separate browser `WebGpuSession` API below; native Metal/wgpu Session
+checkpointing is unsupported. See the [checkpoint matrix](../docs/API_0_6.md#checkpoints-and-compatibility).
+
 ## Install
 
 ```sh
@@ -100,12 +126,11 @@ on `main`; three are produced per build:
 npm install /path/to/downloaded/pkg-bundler  # or pkg-web / pkg-nodejs
 ```
 
-> **One npm package, three target shapes:** all three artifacts
-> ship `package.json.name` = `@hyeons-lab/cera-wasm` today. The
-> publish workflow (deferred) will resolve the collision before
-> shipping to the registry; likely by publishing each target as
-> a separate scoped package (`@hyeons-lab/cera-wasm`,
-> `@hyeons-lab/cera-wasm-web`, `@hyeons-lab/cera-wasm-nodejs`).
+> **One npm package, three target shapes:** all three artifacts use
+> `package.json.name` = `@hyeons-lab/cera-wasm`. When its npm job is selected,
+> the [publish workflow](../.github/workflows/publish.yml) publishes only the
+> **bundler** target under that name. Install the `web` and `nodejs` shapes
+> from their CI artifacts; separate npm package names are not configured.
 
 ## Usage
 
@@ -234,8 +259,9 @@ if (tok.eosToken != null) {
 let acc = [];
 const summary = session.generate(opts, (newTokens) => {
     acc.push(...newTokens);
-    process.stdout.write(tok.decode(newTokens));  // streaming text
 });
+// Decode once so a UTF-8 sequence split across batches stays intact.
+console.log(tok.decode(acc));
 
 console.log('\n---');
 console.log('finish:', summary.finishReason);          // "Stop" | "MaxTokens" | ...
@@ -305,14 +331,14 @@ session.appendText(prompt);
 
 const opts = new GenerateOpts();
 opts.maxTokens = 128;
-// Optional: constrain to a valid call (grammar + lazy start-marker trigger).
+// Optional: constrain tool-call syntax (grammar + lazy start-marker trigger).
 // The start marker differs by format; it must be a special token in the model's
 // vocab for the trigger to fire (LFM2's is; Hermes markers usually aren't, so
-// this stays unconstrained there; the model still emits a parseable call).
+// this stays unconstrained there; validate the generated output).
 const startMarker = format === ToolFormat.Hermes ? '<tool_call>' : '<|tool_call_start|>';
 const trigger = tok.specialTokenId(startMarker);
 if (trigger != null) {
-  opts.setGrammar(toolGrammar(tools, format));   // JSON-Schema → GBNF
+  opts.setGrammar(toolGrammar(tools, format));   // separate tool-grammar subset
   opts.grammarTriggerTokens = new Uint32Array([trigger]);
 }
 
@@ -326,8 +352,10 @@ for (const c of calls) console.log(c.name, c.arguments);
 
 `parseToolCalls` returns `[]` (as `"[]"`) when the model answered in prose. With
 the lazy trigger, generation stays unconstrained until the model emits the
-start marker, then the grammar forces a valid function name, valid argument
-names, and correctly-typed values.
+start marker, then the grammar constrains function/argument names and outer value
+syntax. Required arguments, duplicates and nested item/property schemas are not
+validated. A call can still be truncated; parse and validate arguments before
+execution. See the [tool grammar limits](../docs/API_0_6.md#tool-call-constraints).
 
 ### LoRA adapters & hidden states
 
@@ -442,81 +470,29 @@ session.generate(opts, (toks) => out.push(...toks));
 
 ### Cancellation
 
-`session.cancel()` flips an atomic that the decode loop checks at
-every flush boundary; generation exits with `finishReason === "Cancelled"`
-at the next checkpoint.
+CPU `Session.generate()` and `ChatSession.generateStreaming()` are synchronous
+and hold a mutable WASM borrow until they return. Do not call methods or read
+properties on the same handle from their callbacks, including `cancel()`.
+Recursive access raises a borrow error and can leave the handle unusable. Raw
+Session callbacks must also avoid throwing; they do not have Chat's ordinary
+callback-error recovery.
 
-The catch: JS workers (web + `worker_threads`) are single-threaded.
-While `generate()` is blocking, the worker's own message handlers
-**cannot run**; a `postMessage({ kind: 'cancel' })` from the main
-thread queues but doesn't dispatch until `generate` returns. So a
-plain JS flag set by an `onmessage` handler can't be updated
-mid-decode.
+Call CPU cancellation controls between operations. A flag set before generation
+is observed by the next call; `clearCancel()` clears it before a retry. During
+generation, the worker's own message handlers cannot run. Polling a
+`SharedArrayBuffer` in a callback does not make a recursive `session.cancel()`
+safe, and the direct CPU bindings expose no independent cancellation handle.
 
-Two patterns that actually work:
+Set `opts.maxTokens` before generation to bound decode work. If an application
+must stop a blocked CPU worker immediately, terminate the worker and recreate
+its engine/session; termination discards its in-memory execution state. A token
+limit can leave Chat `Interrupted`, so apply the lifecycle rules before a new
+user turn.
 
-**1. Cancel from inside the token callback** based on state the
-callback can observe directly (elapsed time, accumulated content,
-token budget beyond `opts.maxTokens`):
-
-```js
-const startMs = performance.now();
-session.generate(opts, (toks) => {
-    self.postMessage({ kind: 'tokens', toks });
-    if (performance.now() - startMs > 30_000) {
-        session.cancel();  // 30-second budget
-    }
-});
-```
-
-**2. `SharedArrayBuffer` + `Atomics`** for true cross-thread
-signalling. Allocate an `Int32Array` on a `SharedArrayBuffer`,
-poll it from inside the callback with `Atomics.load`, set it from
-the main thread with `Atomics.store`. **Requires cross-origin
-isolation** in browsers (`Cross-Origin-Opener-Policy: same-origin`
-and `Cross-Origin-Embedder-Policy: require-corp` headers); transparent
-on Node `worker_threads`.
-
-```js
-// main thread: only structured-cloneable data crosses the
-// postMessage boundary. wasm-bindgen objects (GenerateOpts,
-// Session, etc.) live inside wasm linear memory and would throw
-// on postMessage; pass plain params and construct the object on
-// the worker side.
-const sab = new SharedArrayBuffer(4);
-const cancelFlag = new Int32Array(sab);
-worker.postMessage({ kind: 'init', cancelFlag });
-worker.postMessage({ kind: 'generate', params: { maxTokens: 64 } });
-// later, to cancel:
-Atomics.store(cancelFlag, 0, 1);
-
-// worker.js: `generate()` is invoked from inside the message
-// handler so `cancelFlag` is guaranteed initialized first; running
-// `generate` at top-level would race with `init` and crash on
-// `Atomics.load(undefined, 0)`. The `cancelFlag` null check guards
-// against a `generate` message arriving before `init` (out-of-order
-// messages).
-let cancelFlag;
-self.onmessage = (ev) => {
-    if (ev.data.kind === 'init') {
-        cancelFlag = ev.data.cancelFlag;
-    } else if (ev.data.kind === 'generate') {
-        const opts = new GenerateOpts();
-        Object.assign(opts, ev.data.params);  // setters fire per field
-        session.generate(opts, (toks) => {
-            self.postMessage({ kind: 'tokens', toks });
-            if (cancelFlag && Atomics.load(cancelFlag, 0) !== 0) {
-                session.cancel();
-            }
-        });
-    }
-};
-```
-
-A pure `postMessage`-flag pattern only works if the cancel arrives
-before `generate` is called (the listener runs during the gap
-between message receipt and the next `generate`). It's unreliable
-for in-flight cancellation; use one of the two patterns above.
+The separate async browser `WebGpuSession` exposes `cancelHandle()`. Obtain that
+handle before starting generation and call its `cancel()` method to signal the
+operation without borrowing the active session. Clear it before reuse and free
+the cancellation handle when it is no longer needed.
 
 ### Resuming after cancel vs starting over
 
@@ -560,12 +536,17 @@ table.
 ## GPU acceleration (experimental WebGPU)
 
 An **experimental** WebGPU-backed session lights up when the crate is
-built with the `wgpu` cargo feature (which pulls in `cera/gpu`). It's a
-prototype (**LFM2 only, greedy decode**) with a surface deliberately
+built with the `wgpu` cargo feature (which pulls in `cera/gpu`). Its API is
 separate from the CPU `Session`: WebGPU can't do blocking GPU readback on
 the JS event loop, so the whole prefill + decode loop is `async`. The
 default builds above are CPU-only; the standard `Session` remains the
 supported path.
+
+The WebGPU loader admits `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
+`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`, subject to supported tensor
+layouts and device limits. Generation supports greedy decoding and stochastic
+sampling. Pass temperature, top-p, top-k and seed before the token callback;
+use `undefined` for a sampling default. A seed is a JavaScript `bigint`.
 
 ```js
 import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
@@ -573,7 +554,7 @@ import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
 // Async constructor: initializes WebGPU (requestAdapter / requestDevice
 // resolve on the event loop), parses the GGUF, and uploads the model to
 // the GPU. `contextSize` defaults to 4096. Throws if WebGPU is
-// unavailable or the bytes aren't a valid LFM2 GGUF.
+// unavailable, the GGUF layout is unsupported, or device initialization fails.
 //
 // The optional third argument requests TurboQuant on the GPU-resident KV
 // cache (~3-bit keys / ~2-bit values). Omit it, or pass null, for
@@ -612,17 +593,25 @@ console.log(session.kvCompression);
 // produced; the full string is also returned. Stateful: the on-GPU KV
 // cache persists across calls, so a second `generate()` continues the
 // same sequence rather than restarting.
-const text = await session.generate('The capital of France is', 32, (piece) => {
+const text = await session.generate('The capital of France is', 32, 0, undefined, undefined, undefined, (piece) => {
     outputEl.textContent += piece;  // stream into the DOM (browser-safe)
 });
 
 // Checkpoint VRAM state: asynchronously snapshot KV and conv buffers to binary bytes.
 const checkpointBytes = await session.checkpoint();
 
-// Restore session state: validate model fingerprint, layer layout, sequence length,
-// precision (f32 or compressed KV; f16 CPU checkpoints are rejected), and TurboQuant mode.
-await session.importCheckpoint(checkpointBytes);
+// Restore synchronously: validate structural fingerprint, row geometry, sequence
+// length, KV precision and compression identity, including the TurboQuant seed.
+// CPU f16 checkpoints are rejected. The fingerprint is not a hash of model weights.
+session.importCheckpoint(checkpointBytes);
 ```
+
+Checkpoint compatibility uses the effective `session.kvCompression` mode after
+fallback. Recreate older TurboQuant snapshots whose fingerprints omitted
+compression identity. CPU f16 snapshots are not importable into WebGPU; plain
+f32 fingerprints are unchanged. Full model/checkpoint parity requires testing
+with the intended model/backend; a WebGPU device/readback smoke test alone does
+not establish it.
 
 ## Building from source
 

@@ -1380,10 +1380,10 @@ impl InferenceState {
                         ));
                     }
                 },
-                (LayerState::Conv { .. }, LayerSnapshot::Conv { buffer }) => {
-                    if !buffer.len().is_multiple_of(4) {
+                (LayerState::Conv { buffer: live, .. }, LayerSnapshot::Conv { buffer }) => {
+                    if buffer.len() != live.len() * 4 {
                         return Err(format!(
-                            "layer {idx}: Conv byte length is not a multiple of 4"
+                            "layer {idx}: Conv byte length does not match state dimensions"
                         ));
                     }
                 }
@@ -1413,15 +1413,20 @@ impl InferenceState {
                     }
                 }
                 (
-                    LayerState::DeltaNet { .. },
+                    LayerState::DeltaNet {
+                        conv_state,
+                        ssm_state,
+                    },
                     LayerSnapshot::DeltaNet {
                         conv_state: snap_conv,
                         ssm_state: snap_ssm,
                     },
                 ) => {
-                    if !snap_conv.len().is_multiple_of(4) || !snap_ssm.len().is_multiple_of(4) {
+                    if snap_conv.len() != conv_state.len() * 4
+                        || snap_ssm.len() != ssm_state.len() * 4
+                    {
                         return Err(format!(
-                            "layer {idx}: DeltaNet byte lengths are not multiples of 4"
+                            "layer {idx}: DeltaNet byte lengths do not match state dimensions"
                         ));
                     }
                 }
@@ -2290,6 +2295,84 @@ pub struct StateSnapshot {
 }
 
 impl StateSnapshot {
+    /// Validate resident attention rows against the model's per-layer dimensions.
+    /// Recurrent shape and precision checks are performed by `InferenceState::validate_snapshot`.
+    pub fn validate_for_model(&self, config: &ModelConfig) -> Result<(), String> {
+        self.validate_for_model_with_head_dims(config, config.head_dim, config.head_dim)
+    }
+
+    /// Validate resident attention rows with explicit per-side head dimensions.
+    /// Used by [`crate::model::Model`] implementations with asymmetric cache
+    /// layouts (see `validate_checkpoint_state`); symmetric models can use
+    /// [`Self::validate_for_model`] instead.
+    pub fn validate_for_model_with_head_dims(
+        &self,
+        config: &ModelConfig,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> Result<(), String> {
+        if self.layers.len() != config.n_layers || self.seq_len > config.max_seq_len {
+            return Err("snapshot layer count or sequence length does not match model".into());
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            let heads = config
+                .kv_heads_per_layer
+                .get(i)
+                .copied()
+                .unwrap_or(config.n_kv_heads);
+            let rows = self
+                .seq_len
+                .checked_mul(heads)
+                .ok_or_else(|| format!("layer {i}: snapshot dimensions overflow"))?;
+            let attention = if let LayerSnapshot::ParallelAttentionMamba2 { snap, .. } = layer {
+                snap.as_ref()
+            } else {
+                layer
+            };
+            match attention {
+                LayerSnapshot::Attention { k_data, v_data }
+                | LayerSnapshot::AttentionF16 { k_data, v_data } => {
+                    let width = if matches!(attention, LayerSnapshot::AttentionF16 { .. }) {
+                        2
+                    } else {
+                        4
+                    };
+                    let byte_len = |dim: usize| {
+                        rows.checked_mul(dim)
+                            .and_then(|elems| elems.checked_mul(width))
+                            .ok_or_else(|| format!("layer {i}: snapshot byte length overflows"))
+                    };
+                    if k_data.len() != byte_len(key_head_dim)?
+                        || v_data.len() != byte_len(value_head_dim)?
+                    {
+                        return Err(format!(
+                            "layer {i}: KV row lengths do not match sequence length and model dimensions"
+                        ));
+                    }
+                }
+                LayerSnapshot::AttentionCompressed { keys, values } => {
+                    let k = crate::turboquant::decode_compressed_keys(keys)
+                        .ok_or_else(|| format!("layer {i}: invalid compressed keys"))?;
+                    let v = crate::turboquant::decode_compressed_values(values)
+                        .ok_or_else(|| format!("layer {i}: invalid compressed values"))?;
+                    if k.seq_len() != self.seq_len
+                        || v.seq_len() != self.seq_len
+                        || k.head_dim != key_head_dim
+                        || v.head_dim != value_head_dim
+                        || k.n_kv_heads != heads
+                        || v.n_kv_heads != heads
+                    {
+                        return Err(format!(
+                            "layer {i}: compressed KV dimensions do not match model"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(layers: Vec<LayerSnapshot>, seq_len: usize) -> Self {
         Self {
             layers,

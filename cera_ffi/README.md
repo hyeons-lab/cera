@@ -3,7 +3,7 @@
 Dart bindings for the [Cera](https://github.com/hyeons-lab/cera) on-device
 inference engine. Runs GGUF language models locally through `dart:ffi`.
 
-> **Note:** Version 0.6.1 introduces consolidated session lifecycle management, transactional multi-turn chat coordination (`ChatSession`), language-native reactive streaming (`Stream<String>`), native JSON Schema compilation, first-class tool calling, session checkpointing, and a unified audio pipeline. See [Releases](https://github.com/hyeons-lab/cera/releases).
+> The 0.6.2 API includes chat lifecycle, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 **Building a Flutter app? Use
 [`cera_ffi_flutter`](https://pub.dev/packages/cera_ffi_flutter) instead.** It
@@ -17,7 +17,7 @@ package declaring `flutter.plugin.platforms` is one `dart pub get` refuses.
 
 Native `ChatSession.recoveryStatus()` and `Session.recoveryStatus()` expose usability
 and the retained recovery report, including typed rewind/reset errors. Read it after
-a failed turn or append call; `Reset` requires context replay and `Unusable` requires
+a failed ingestion or append call; `Reset` requires context replay and `Unusable` requires
 a successful reset or recreation. Legacy `sendMessage` is deprecated in favor of
 `ChatSession` (`session.intoChat()`).
 
@@ -32,11 +32,22 @@ await for (final chunk in chat.stream(opts)) {
   stdout.write(chunk);
 }
 
-// Or constrained by a JSON Schema
+// Start a separate turn from a clean conversation for this JSON example.
+chat.reset();
+chat.ingest(chatMessageUser('Return the answer as JSON.'));
 await for (final chunk in chat.streamJson(opts, schemaJson)) {
   stdout.write(chunk);
 }
 ```
+
+Both calls emit text fragments, not individual tokens. A stream ending normally
+does not guarantee `SessionPhase.turnComplete`: a token limit can leave
+`SessionPhase.interrupted`, while no-progress calls can preserve `promptReady`
+for retry. Check `chat.phase()` before ingesting the next user
+turn; reset or replace messages after interruption. Let an in-flight native
+operation finish before reusing its handle; diagnostic queries can return Busy.
+JSON streaming enforces only the [supported subset](../docs/API_0_6.md#json-schema-constraints),
+and a token limit can still truncate the JSON value.
 
 See the [recovery contract](../docs/internals/API_RESHAPE_RECOVERY.md#native-recovery-status)
 and the [conversational chat example](example/chat.dart).
@@ -53,9 +64,16 @@ CERA_FFI_LIB=/absolute/path/to/libcera_ffi.dylib \
   dart run example/explicit_loading.dart /absolute/path/to/model.gguf "The capital of France is"
 ```
 
-This synchronous path belongs on a worker in UI applications. Version 0.6.1 is published
-on pub.dev; the portable async `Cera` facade retains its existing API. The native loader's
-web stubs do not load models in a browser.
+This synchronous path belongs on a worker in UI applications. Use matching
+bindings and native libraries from this checkout when testing 0.6.2; a local
+version bump does not publish a package. The portable async `Cera` facade retains
+its existing API. The native loader's web stubs do not load models in a browser.
+
+Native CPU Session and Chat provide `exportCheckpoint` / `importCheckpoint` and
+file save/load methods. Native Metal/wgpu checkpoints are rejected; the separate
+browser WebGPU API owns its own device snapshot path. Older f16/TurboQuant
+snapshots need recreation after the compression fingerprint change. See
+[checkpoint compatibility](../docs/API_0_6.md#checkpoints-and-compatibility).
 
 ## Install
 
@@ -173,6 +191,8 @@ For multi-turn conversational chat with delta-only prefill and automatic templat
 use `ChatSession` via `session.intoChat()`:
 
 ```dart
+// Discard the preceding raw completion before starting a new conversation.
+session.reset();
 final chat = session.intoChat();
 chat.ingest(chatMessageUser('Why is the sky blue?'));
 final reply = chat.complete(const GenerateOpts(maxTokens: 128));
@@ -204,27 +224,31 @@ import 'package:cera_ffi/cera_ffi.dart';
 
 void main() {
   final vad = FfiSileroVad.fromFile('/path/to/silero_vad.gguf');
-  final iterator = FfiVadIterator(
-    rate: FfiVadSampleRate.rate16kHz,
-    config: sileroVadDefaultConfig(),
+  final iterator = FfiVadIterator.create(
+    FfiVadSampleRate.rate16kHz,
+    sileroVadDefaultConfig(),
   );
 
   // Process 512-sample (32ms) audio chunks (PCM samples in [-1.0, 1.0])
   final chunk = List<double>.filled(512, 0.0);
   final event = iterator.processChunk(vad, chunk);
-  if (event != null) {
-    print('VAD Event: speech=${event.speech}, start=${event.startSample}, end=${event.endSample}');
+  if (event is FfiVadEventSpeechStart) {
+    print('Speech started at ${event.sample} samples (${event.ms} ms)');
+  } else if (event is FfiVadEventSpeechEnd) {
+    print('Speech segment: ${event.startMs} to ${event.endMs} ms');
   }
 
   // Or extract speech timestamps for an entire audio buffer
   final timestamps = vad.getSpeechTimestamps(
-    audio: chunk,
-    rate: FfiVadSampleRate.rate16kHz,
-    config: sileroVadDefaultConfig(),
+    chunk,
+    FfiVadSampleRate.rate16kHz,
+    sileroVadDefaultConfig(),
   );
   for (final ts in timestamps) {
-    print('Speech segment: ${ts.start}s to ${ts.end}s');
+    print('Speech segment: ${ts.startMs} to ${ts.endMs} ms');
   }
+  iterator.close();
+  vad.close();
 }
 ```
 

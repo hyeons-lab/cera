@@ -163,6 +163,7 @@ bindings:
         --library {{CERA_FFI_DYLIB}} \
         --language python \
         --out-dir cera-ffi/bindings/python
+    python3 scripts/patch-python-bindings.py
     # The root SwiftPM package's `Cera` target needs the wrapper *inside* the
     # target directory (a `.package(url:)` consumer never has the Rust tree), so
     # it holds a committed copy. Syncing it here rather than in a recipe someone

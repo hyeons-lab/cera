@@ -339,11 +339,25 @@ impl GrammarMask {
     /// EOS is allowed iff the grammar is complete; special/control and empty-byte tokens
     /// are always masked. Returns the number of tokens left allowed (0 ⇒ dead end).
     pub fn apply(&self, state: &GrammarState, logits: &mut [f32]) -> usize {
+        self.apply_with_stop_tokens(state, logits, &[])
+    }
+
+    /// Also allow caller-supplied turn terminals once the grammar is complete.
+    /// Keep these per-call so the cached vocabulary mask cannot retain old stops.
+    pub(crate) fn apply_with_stop_tokens(
+        &self,
+        state: &GrammarState,
+        logits: &mut [f32],
+        stop_tokens: &[u32],
+    ) -> usize {
         let n = self.token_bytes.len().min(logits.len());
         let mut allowed = 0usize;
         let complete = state.is_complete();
+        let honor_stops = complete && !stop_tokens.is_empty();
         for (id, logit) in logits.iter_mut().take(n).enumerate() {
-            let ok = if Some(id as u32) == self.eos {
+            let ok = if Some(id as u32) == self.eos
+                || (honor_stops && stop_tokens.contains(&(id as u32)))
+            {
                 complete
             } else if self.special[id] {
                 false
@@ -1002,6 +1016,25 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_json_array_has_small_parse_frontier() {
+        let grammar = super::Grammar::from_json_schema(&serde_json::json!({
+            "type": "array", "items": {"type": "integer"}, "maxItems": 1024
+        }))
+        .unwrap();
+        let mut state = super::GrammarState::new(std::sync::Arc::new(grammar));
+        state.accept(b"[1");
+        assert!(state.stacks.len() < 32, "ambiguous optional array suffixes");
+        for _ in 1..1024 {
+            assert!(state.accepts(b",1"));
+            state.accept(b",1");
+            assert!(state.stacks.len() < 32);
+        }
+        assert!(!state.accepts(b",1"));
+        state.accept(b"]");
+        assert!(state.is_complete());
+    }
+
     use super::*;
 
     fn grammar(src: &str) -> Arc<Grammar> {

@@ -60,24 +60,27 @@ void main(List<String> args) {
             'Generated ${turn1.summary.tokensGenerated} tokens (final position: ${chat.position()})',
           );
           stdout.writeln('Phase after completion: ${chat.phase()}');
-          assert(chat.phase() == SessionPhase.turnComplete);
+          if (chat.phase() == SessionPhase.turnComplete) {
+            // --- Turn 2: Warm Continuation ---
+            // The previous context remains in the KV cache; only new user input is ingested.
+            stdout.writeln('\n--- Turn 2 (Warm Continuation) ---');
+            final turn2User = chatMessageUser('When should it be discarded?');
+            final summary2 = chat.ingest(turn2User);
+            stdout.writeln(
+              'Ingested ${summary2.inputTokens} new tokens (position: ${summary2.positionBefore} -> ${summary2.positionAfter})',
+            );
 
-          // --- Turn 2: Warm Continuation ---
-          // The previous context remains in the KV cache; only new user input is ingested.
-          stdout.writeln('\n--- Turn 2 (Warm Continuation) ---');
-          final turn2User = chatMessageUser('When should it be discarded?');
-          final summary2 = chat.ingest(turn2User);
-          stdout.writeln(
-            'Ingested ${summary2.inputTokens} new tokens (position: ${summary2.positionBefore} -> ${summary2.positionAfter})',
-          );
-
-          final turn2 = chat.complete(opts);
-          stdout.writeln('Assistant: ${turn2.text.trim()}');
-          stdout.writeln(
-            'Generated ${turn2.summary.tokensGenerated} tokens (final position: ${chat.position()})',
-          );
-          stdout.writeln('Phase after completion: ${chat.phase()}');
-          assert(chat.phase() == SessionPhase.turnComplete);
+            final turn2 = chat.complete(opts);
+            stdout.writeln('Assistant: ${turn2.text.trim()}');
+            stdout.writeln(
+              'Generated ${turn2.summary.tokensGenerated} tokens (final position: ${chat.position()})',
+            );
+            stdout.writeln('Phase after completion: ${chat.phase()}');
+          } else {
+            stdout.writeln(
+              'Turn stopped before its terminal marker; reset or replace messages before a new user turn.',
+            );
+          }
 
           // --- Reclaim raw Session ---
           final reclaimedSession = chat.intoSession();

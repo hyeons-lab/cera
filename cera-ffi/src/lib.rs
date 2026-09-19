@@ -1130,9 +1130,10 @@ impl CeraEngine {
     }
 
     /// Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
-    /// model's trained `"Perform ASR."` chat mode. `sample_rate` must match the audio encoder's
-    /// expected rate (resample beforehand if needed). Requires an audio-capable bundle; a text-only
-    /// model returns an [`FfiError`] for unsupported modality.
+    /// model's trained `"Perform ASR."` chat mode. Accepts sample rates from 1000 through
+    /// 192000 Hz and resamples to 16 kHz before encoding. Requires an audio-capable bundle
+    /// with an attached encoder and the required chat template/tokenizer markers; missing
+    /// prerequisites return an [`FfiError`].
     ///
     /// Blocking: runs a full prefill + greedy decode. Foreign async runtimes should wrap the call in
     /// `spawn_blocking` / its equivalent.
@@ -2038,6 +2039,7 @@ impl LoraAdapters {
 #[derive(Debug, uniffi::Object)]
 pub struct Session {
     inner: std::sync::Mutex<Option<cera::Session>>,
+    moved: std::sync::atomic::AtomicBool,
     /// Cloned from the inner session at construction time. Shared
     /// atomic: `position()` / `cancel()` don't need to acquire the
     /// mutex, so they're safe to call from a different thread while
@@ -2106,6 +2108,10 @@ impl Session {
         &self.inner
     }
 
+    pub(crate) fn mark_moved(&self) {
+        self.moved.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub(crate) fn from_core(session: cera::Session) -> Arc<Self> {
         let position = session.position_handle();
         let cancel = session.cancel_handle();
@@ -2113,6 +2119,7 @@ impl Session {
         let hidden_size = u32::try_from(session.hidden_size()).unwrap_or(u32::MAX);
         Arc::new(Self {
             inner: std::sync::Mutex::new(Some(session)),
+            moved: std::sync::atomic::AtomicBool::new(false),
             position,
             cancel,
             capabilities,
@@ -2194,8 +2201,8 @@ impl Session {
     /// surface here as a "no audio encoder attached" `Backend`
     /// error.
     ///
-    /// `sample_rate` must be 16000 — resampling is out of scope.
-    /// Callers should resample externally before passing samples in.
+    /// `sample_rate` must be in 1000..=192000 Hz. The core resamples non-16-kHz
+    /// input to the encoder's 16-kHz rate before encoding.
     ///
     /// **Marshaling cost**: UniFFI maps `Vec<f32>` to `List<Float>`
     /// in Kotlin and `[Float]` in Swift. The Kotlin side boxes each
@@ -2610,8 +2617,13 @@ impl Session {
 
     /// Signal in-flight `generate()` to exit with
     /// `FinishReason::Cancelled` at the next between-token check.
-    /// Safe from any thread. No-op if no `generate()` is running.
+    /// Safe from any thread. The flag remains set even when idle, so subsequent
+    /// prefill/generation observes cancellation until `clear_cancel()` or a
+    /// successful `reset()`. A moved Session handle cannot cancel its new owner.
     pub fn cancel(&self) {
+        if self.moved.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2637,6 +2649,9 @@ impl Session {
     /// Atomic-backed; no mutex acquire, infallible, safe from
     /// any thread (mirrors the shape of [`Self::cancel`]).
     pub fn clear_cancel(&self) {
+        if self.moved.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         self.cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2715,8 +2730,8 @@ impl Session {
 /// on handle-drop — the blocking worker keeps decoding, keeps holding
 /// the session mutex, keeps mutating `Session::state`.
 ///
-/// Without this guard, a foreign-side cancellation (Kotlin coroutine
-/// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`) would
+/// Without this guard, a foreign-side cancellation that drops the Rust future
+/// (such as Kotlin coroutine or Python `asyncio.Task` cancellation) would
 /// silently leak decode work into the background. The caller's next
 /// `generate*` call would block on the still-held mutex or observe
 /// state advanced by the "cancelled" call.
@@ -2820,17 +2835,18 @@ impl Session {
     /// worker so the caller's async context isn't stalled by the
     /// synchronous decode loop.
     ///
-    /// Cancellation: dropping the returned future (Kotlin coroutine
-    /// scope exit, Swift `Task.cancel`, Python `asyncio.Task.cancel`)
-    /// triggers both an abort of the queued `spawn_blocking` task (so
+    /// Cancellation: dropping the returned Rust future triggers both an
+    /// abort of the queued `spawn_blocking` task (so
     /// a not-yet-started decode never runs) and a
     /// [`Session::cancel`] call (so an in-flight decode exits at its
     /// next between-token check with [`FinishReason::Cancelled`]).
-    /// Either path releases the session mutex; subsequent calls see
-    /// a clean session. You can also call [`Session::cancel`]
+    /// Either path eventually releases the session mutex; wait for the worker
+    /// to finish and clear cancellation before retrying. You can also call [`Session::cancel`]
     /// directly from any thread to trigger the same in-flight exit
     /// without dropping the future. See `AsyncCancelGuard` for the
-    /// full rationale.
+    /// full rationale. The generated Swift wrapper does not propagate
+    /// `Task.cancel()` or dropping a Task handle to the Rust future; raw Swift
+    /// callers must explicitly call `session.cancel()` and await completion.
     ///
     /// On error the wrapper performs the same poisoned-mutex handling
     /// as sync [`Session::generate`]. `JoinError` from a panic in the

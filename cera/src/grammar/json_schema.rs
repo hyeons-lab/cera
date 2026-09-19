@@ -2,7 +2,17 @@
 //!
 //! Converts JSON Schema specifications (Draft 7 and 2020-12 subsets) into GBNF
 //! grammars suitable for compilation with [`super::Grammar::parse`]. Constrains
-//! LLM generation to strictly valid JSON matching the schema.
+//! generation to prefixes accepted by the compiled subset. A token limit or
+//! cancellation can still leave incomplete JSON. This is not a general schema
+//! validator: numeric bounds, string length/pattern/format checks and other
+//! unimplemented validation keywords are not enforced.
+//!
+//! Object keys are emitted once in the compiler's fixed map order, including any optional keys.
+//! Array bounds up to 1024 are supported. `allOf` supports a single scalar wrapper
+//! or compatible object property/required merges; other intersections return an error.
+//! `oneOf` compiles as alternatives, without checking exclusive branch matching.
+//! `enum`, `const`, `anyOf` and `oneOf` do not combine sibling type, object or
+//! array constraints; place applicable constraints inside each alternative.
 
 use std::collections::HashMap;
 
@@ -29,6 +39,7 @@ struct SchemaCompiler {
     rule_counter: usize,
     rules: Vec<(String, String)>,
     defs: HashMap<String, Value>,
+    ref_rules: HashMap<String, String>,
 }
 
 impl SchemaCompiler {
@@ -37,6 +48,7 @@ impl SchemaCompiler {
             rule_counter: 0,
             rules: Vec::new(),
             defs: HashMap::new(),
+            ref_rules: HashMap::new(),
         }
     }
 
@@ -44,12 +56,14 @@ impl SchemaCompiler {
         if let Some(obj) = root.as_object() {
             if let Some(Value::Object(defs)) = obj.get("definitions") {
                 for (k, v) in defs {
-                    self.defs.insert(k.clone(), v.clone());
+                    self.defs
+                        .insert(format!("#/definitions/{}", pointer_key(k)), v.clone());
                 }
             }
             if let Some(Value::Object(defs)) = obj.get("$defs") {
                 for (k, v) in defs {
-                    self.defs.insert(k.clone(), v.clone());
+                    self.defs
+                        .insert(format!("#/$defs/{}", pointer_key(k)), v.clone());
                 }
             }
         }
@@ -75,26 +89,70 @@ impl SchemaCompiler {
     }
 
     fn compile_value(&mut self, schema: &Value) -> Result<String> {
+        // Dispatch below implements alternatives, not arbitrary intersections.
+        // Reject competing siblings before a $ref/enum/union can bypass allOf.
+        if schema.get("allOf").is_some() {
+            ensure!(
+                schema.get("allOf").is_some_and(Value::is_array),
+                "allOf must be an array"
+            );
+            ensure!(
+                schema
+                    .as_object()
+                    .is_some_and(|obj| obj.keys().all(|key| matches!(
+                        key.as_str(),
+                        "allOf"
+                            | "type"
+                            | "properties"
+                            | "required"
+                            | "additionalProperties"
+                            | "$defs"
+                            | "definitions"
+                            | "$schema"
+                            | "$id"
+                            | "title"
+                            | "description"
+                            | "default"
+                            | "examples"
+                    ))),
+                "unsupported sibling constraint on allOf"
+            );
+        }
         // Handle $ref
         if let Some(r) = schema.get("$ref").and_then(|v| v.as_str()) {
-            let def_name = r
-                .strip_prefix("#/$defs/")
-                .or_else(|| r.strip_prefix("#/definitions/"))
-                .unwrap_or(r);
-            if let Some(target) = self.defs.get(def_name).cloned() {
-                let rule_name = format!("json-ref-{}", sanitize_identifier(def_name));
-                if !self.rules.iter().any(|(n, _)| n == &rule_name) {
-                    // Placeholder to avoid infinite recursion on circular refs
-                    self.rules.push((rule_name.clone(), String::new()));
-                    let expr = self.compile_value(&target)?;
-                    if let Some(entry) = self.rules.iter_mut().find(|(n, _)| n == &rule_name) {
-                        entry.1 = expr;
-                    }
-                }
-                return Ok(rule_name);
-            } else {
-                bail!("unresolved $ref: {r}");
+            ensure!(
+                schema
+                    .as_object()
+                    .is_some_and(|obj| obj.keys().all(|key| matches!(
+                        key.as_str(),
+                        "$ref"
+                            | "$defs"
+                            | "definitions"
+                            | "$schema"
+                            | "$id"
+                            | "title"
+                            | "description"
+                            | "default"
+                            | "examples"
+                    ))),
+                "$ref with sibling constraints is not supported"
+            );
+            if let Some(rule) = self.ref_rules.get(r) {
+                return Ok(rule.clone());
             }
+            let target = self
+                .defs
+                .get(r)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unresolved $ref: {r}"))?;
+            let rule = self.next_rule_name("json-ref");
+            // Register before descending so recursive references share this rule.
+            self.ref_rules.insert(r.to_owned(), rule.clone());
+            let index = self.rules.len();
+            self.rules.push((rule.clone(), String::new()));
+            let expr = self.compile_value(&target)?;
+            self.rules[index].1 = expr;
+            return Ok(rule);
         }
 
         // Handle enum
@@ -114,6 +172,30 @@ impl SchemaCompiler {
         // Handle anyOf / oneOf
         if let Some(Value::Array(variants)) = schema.get("anyOf").or_else(|| schema.get("oneOf")) {
             ensure!(!variants.is_empty(), "union array must not be empty");
+            // A bare alternation cannot enforce sibling constraints: fail closed
+            // like the allOf/$ref paths above instead of silently dropping them.
+            ensure!(
+                schema.get("anyOf").is_none() || schema.get("oneOf").is_none(),
+                "anyOf and oneOf cannot be combined"
+            );
+            ensure!(
+                schema
+                    .as_object()
+                    .is_some_and(|obj| obj.keys().all(|key| matches!(
+                        key.as_str(),
+                        "anyOf"
+                            | "oneOf"
+                            | "$defs"
+                            | "definitions"
+                            | "$schema"
+                            | "$id"
+                            | "title"
+                            | "description"
+                            | "default"
+                            | "examples"
+                    ))),
+                "anyOf/oneOf with sibling constraints is not supported; place constraints inside each alternative"
+            );
             let mut exprs = Vec::new();
             for v in variants {
                 exprs.push(self.compile_value(v)?);
@@ -138,11 +220,7 @@ impl SchemaCompiler {
                     if depth > MAX_REF_DEPTH {
                         break;
                     }
-                    let def_name = r
-                        .strip_prefix("#/$defs/")
-                        .or_else(|| r.strip_prefix("#/definitions/"))
-                        .unwrap_or(r);
-                    if let Some(t) = self.defs.get(def_name) {
+                    if let Some(t) = self.defs.get(r) {
                         target = t;
                     } else {
                         break;
@@ -155,9 +233,33 @@ impl SchemaCompiler {
                     && target.get("properties").is_none()
                     && target.get("required").is_none()
                 {
+                    ensure!(
+                        schema
+                            .as_object()
+                            .is_some_and(|obj| obj.keys().all(|key| matches!(
+                                key.as_str(),
+                                "allOf"
+                                    | "$defs"
+                                    | "definitions"
+                                    | "$schema"
+                                    | "$id"
+                                    | "title"
+                                    | "description"
+                                    | "default"
+                                    | "examples"
+                            ))),
+                        "scalar allOf with sibling constraints is not supported"
+                    );
                     return self.compile_value(&subschemas[0]);
                 }
             }
+            ensure!(
+                schema.get("type").is_none_or(|t| t == "object"),
+                "allOf intersections with non-object types are not supported"
+            );
+            // Merge the supported object intersection subset. Reject constraints
+            // that flattening would discard instead of broadening the schema.
+            validate_object_intersection(schema, true)?;
             // Merge subschemas and any sibling root properties into a unified object definition
             let mut merged = serde_json::Map::new();
             let mut merged_props = serde_json::Map::new();
@@ -182,9 +284,14 @@ impl SchemaCompiler {
                 let mut depth = 0;
 
                 loop {
+                    validate_object_intersection(current, false)?;
                     if let Some(obj) = current.as_object() {
                         if let Some(Value::Object(p)) = obj.get("properties") {
                             for (k, v) in p {
+                                ensure!(
+                                    merged_props.get(k).is_none_or(|old| old == v),
+                                    "intersecting different schemas for property {k} is not supported"
+                                );
                                 merged_props.insert(k.clone(), v.clone());
                             }
                         }
@@ -207,11 +314,7 @@ impl SchemaCompiler {
                             "exceeded maximum $ref depth ({MAX_REF_DEPTH}) in allOf: possible circular reference"
                         );
                     }
-                    let def_name = r
-                        .strip_prefix("#/$defs/")
-                        .or_else(|| r.strip_prefix("#/definitions/"))
-                        .unwrap_or(r);
-                    if let Some(target) = self.defs.get(def_name) {
+                    if let Some(target) = self.defs.get(r) {
                         current = target;
                     } else {
                         bail!("unresolved $ref in allOf: {r}");
@@ -268,17 +371,48 @@ impl SchemaCompiler {
             "json-value".into()
         };
 
-        let min_items = schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0);
-
-        let expr = if min_items > 0 {
-            format!(
-                "\"[\" json-ws {item_expr} ( json-ws \",\" json-ws {item_expr} )* json-ws \"]\""
-            )
-        } else {
-            format!(
-                "\"[\" json-ws ( {item_expr} ( json-ws \",\" json-ws {item_expr} )* )? json-ws \"]\""
-            )
+        let bound = |name: &str| -> Result<Option<usize>> {
+            schema
+                .get(name)
+                .map(|value| {
+                    let value = value
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("{name} must be a nonnegative integer"))?;
+                    ensure!(value <= 1024, "{name} above 1024 is not supported");
+                    Ok(value as usize)
+                })
+                .transpose()
         };
+        let min = bound("minItems")?.unwrap_or(0);
+        let max = bound("maxItems")?;
+        ensure!(
+            max.is_none_or(|max| min <= max),
+            "minItems exceeds maxItems"
+        );
+        let separator_item = format!(" json-ws \",\" json-ws {item_expr}");
+        let inner = if max == Some(0) {
+            String::new()
+        } else {
+            let mut inner = item_expr.clone();
+            for _ in 1..min {
+                inner.push_str(&separator_item);
+            }
+            match max {
+                Some(max) => {
+                    let extra = max - min.max(1);
+                    if extra > 0 {
+                        inner.push_str(&format!(" ( {separator_item} ){{0,{extra}}}"));
+                    }
+                }
+                None => inner.push_str(&format!(" ( {separator_item} )*")),
+            }
+            if min == 0 {
+                format!("( {inner} )?")
+            } else {
+                inner
+            }
+        };
+        let expr = format!("\"[\" json-ws {inner} json-ws \"]\"");
 
         self.rules.push((rule_name.clone(), expr));
         Ok(rule_name)
@@ -292,61 +426,105 @@ impl SchemaCompiler {
             .and_then(|p| p.as_object())
             .unwrap_or(&empty_props);
 
-        if props.is_empty() {
-            let expr = "\"{\" json-ws ( json-string json-ws \":\" json-ws json-value ( json-ws \",\" json-ws json-string json-ws \":\" json-ws json-value )* )? json-ws \"}\"".into();
-            self.rules.push((rule_name.clone(), expr));
-            return Ok(rule_name);
-        }
-
-        let required_keys: Vec<String> = schema
+        let required = schema
             .get("required")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("required must be an array"))?
+                    .iter()
+                    .map(|key| {
+                        key.as_str()
+                            .ok_or_else(|| anyhow::anyhow!("required keys must be strings"))
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
+            .transpose()?
             .unwrap_or_default();
-
-        let all_required = props.keys().all(|k| required_keys.contains(k));
-
-        if all_required && !props.is_empty() {
-            // Strict ordered representation: every property in declared order
-            let mut prop_seq = Vec::new();
-            for (key, prop_schema) in props {
-                let val_expr = self.compile_value(prop_schema)?;
-                let key_lit = gbnf_quoted_json_string(key);
-                prop_seq.push(format!("{key_lit} json-ws \":\" json-ws {val_expr}"));
-            }
-            let inner = prop_seq.join(" json-ws \",\" json-ws ");
-            let expr = format!("\"{{\" json-ws {inner} json-ws \"}}\"");
+        ensure!(
+            required.iter().all(|key| props.contains_key(*key)),
+            "required keys without a properties schema are not supported"
+        );
+        if props.is_empty() {
+            let expr = if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                "\"{\" json-ws \"}\"".into()
+            } else {
+                "json-object".into()
+            };
             self.rules.push((rule_name.clone(), expr));
             return Ok(rule_name);
         }
 
-        // Permissive / optional properties representation:
-        // Object containing comma-separated key-value pairs matching any of the properties
-        let pair_rule = self.next_rule_name("json-pair");
-        let mut pair_alts = Vec::new();
-        for (key, prop_schema) in props {
-            let val_expr = self.compile_value(prop_schema)?;
-            let key_lit = gbnf_quoted_json_string(key);
-            pair_alts.push(format!("{key_lit} json-ws \":\" json-ws {val_expr}"));
+        // Emit keys once in declaration order. Two suffix states distinguish an
+        // empty prefix from a prefix that needs a comma, preserving required keys
+        // across any combination of omitted optional properties in linear space.
+        let mut first = "\"\"".to_owned();
+        let mut rest = "\"\"".to_owned();
+        for (key, value) in props.iter().rev() {
+            let val = self.compile_value(value)?;
+            let pair = format!(
+                "{} json-ws \":\" json-ws {val}",
+                gbnf_quoted_json_string(key)
+            );
+            let first_name = self.next_rule_name("json-field");
+            let rest_name = self.next_rule_name("json-field");
+            let first_present = format!("{pair} {rest}");
+            let rest_present = format!("json-ws \",\" json-ws {pair} {rest}");
+            let (first_expr, rest_expr) = if required.contains(&key.as_str()) {
+                (first_present, rest_present)
+            } else {
+                (
+                    format!("{first_present} | {first}"),
+                    format!("{rest_present} | {rest}"),
+                )
+            };
+            self.rules.push((first_name.clone(), first_expr));
+            self.rules.push((rest_name.clone(), rest_expr));
+            first = first_name;
+            rest = rest_name;
         }
-        self.rules.push((pair_rule.clone(), pair_alts.join(" | ")));
-
-        let expr = format!(
-            "\"{{\" json-ws ( {pair_rule} ( json-ws \",\" json-ws {pair_rule} )* )? json-ws \"}}\""
-        );
-        self.rules.push((rule_name.clone(), expr));
+        self.rules.push((
+            rule_name.clone(),
+            format!("\"{{\" json-ws {first} json-ws \"}}\""),
+        ));
         Ok(rule_name)
     }
 }
 
-fn sanitize_identifier(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+fn pointer_key(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn validate_object_intersection(schema: &Value, root: bool) -> Result<()> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("allOf requires object schemas"))?;
+    ensure!(
+        schema.get("type").is_none_or(|ty| ty == "object"),
+        "allOf intersections with non-object types are not supported"
+    );
+    for (key, value) in object {
+        ensure!(
+            matches!(
+                key.as_str(),
+                "type"
+                    | "properties"
+                    | "required"
+                    | "$ref"
+                    | "$defs"
+                    | "definitions"
+                    | "$schema"
+                    | "$id"
+                    | "title"
+                    | "description"
+                    | "default"
+                    | "examples"
+            ) || (root && key == "allOf")
+                || (key == "additionalProperties" && value == &Value::Bool(true)),
+            "unsupported constraint in object allOf: {key}"
+        );
+    }
+    Ok(())
 }
 
 fn gbnf_lit(s: &str) -> String {
@@ -499,6 +677,21 @@ mod tests {
         });
         let gbnf = json_schema_to_gbnf(&schema).expect("compiles cleanly");
         Grammar::parse(&gbnf).expect("valid grammar");
+    }
+
+    #[test]
+    fn union_with_sibling_constraints_fails() {
+        // Sibling constraints on a bare alternation would be silently dropped.
+        for schema in [
+            json!({"anyOf": [{"type": "string"}], "properties": {}}),
+            json!({"oneOf": [{"type": "string"}], "type": "string"}),
+            json!({"anyOf": [{"type": "string"}], "oneOf": [{"type": "string"}]}),
+        ] {
+            assert!(json_schema_to_gbnf(&schema).is_err());
+        }
+        // Pure unions with annotation-only siblings still compile.
+        let schema = json!({"title": "u", "anyOf": [{"type": "string"}]});
+        json_schema_to_gbnf(&schema).expect("compiles cleanly");
     }
 
     #[test]

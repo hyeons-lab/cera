@@ -1,9 +1,14 @@
 //! Session checkpointing and binary persistence for inference and chat sessions.
 //!
 //! Provides self-contained serialization and restoration of live KV caches,
-//! recurrent layer states, conversation history, prefill metrics, and coordinator
+//! recurrent layer states, token history, prefill metrics, and coordinator
 //! phases. Checkpoints validate model architectural compatibility using an FNV-1a
-//! fingerprint before modifying any session state.
+//! fingerprint before modifying any session state. This is structural compatibility,
+//! not a cryptographic model identity. Native models with backend-owned state
+//! (including Metal/wgpu) reject Session checkpoint and restore operations; browser
+//! WebGPU implements its own device snapshot path. Compression mode and TurboQuant
+//! seed must match; f16 and compressed snapshots using the older fingerprint need
+//! to be recreated.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -5,6 +5,12 @@ stream in. One code path serves Android, iOS, macOS, Linux, Windows and the
 browser, because it is written against `Cera`, the portable async API, rather
 than against the generated `dart:ffi` bindings.
 
+The controller manages rendered prompt deltas through `Cera`. It recognizes
+ChatML, Llama and Gemma continuation delimiters; an unknown template asks the
+user to start a new chat before changing native state. This is separate from the
+native `ChatSession` coordinator and its phase/ownership API. See the
+[0.6 API guide](../../docs/API_0_6.md) for that distinction and checkpoint limits.
+
 ```bash
 flutter run                # whichever device is attached
 ```

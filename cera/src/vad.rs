@@ -130,7 +130,9 @@ impl VadConfig {
             neg_threshold,
             min_speech_duration_ms: self.min_speech_duration_ms,
             min_silence_duration_ms: self.min_silence_duration_ms,
-            speech_pad_ms: self.speech_pad_ms,
+            // Bound the history-window math that multiplies this (`history_limit`
+            // in the audio pipeline); mirrors the `pre_roll_ms` clamp.
+            speech_pad_ms: self.speech_pad_ms.clamp(0, 5000),
             frame_stride,
         }
     }
@@ -213,6 +215,14 @@ impl VadIterator {
     /// The active frame stride in samples.
     pub fn frame_stride(&self) -> usize {
         self.stride
+    }
+
+    /// Limit a pipeline step to one detector evaluation, including buffered overlap.
+    pub(crate) fn samples_until_window(&self) -> usize {
+        self.rate
+            .window_size()
+            .saturating_sub(self.sample_buffer.len())
+            .max(1)
     }
 
     /// Whether speech is currently active.

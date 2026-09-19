@@ -483,6 +483,19 @@ pub trait Model: Send + Sync {
     /// Get the model configuration.
     fn config(&self) -> &ModelConfig;
 
+    /// Check checkpoint row geometry before restoring caller-owned inference state.
+    ///
+    /// The default uses the configured per-layer head count and attention head
+    /// dimension for both keys and values. Models with asymmetric cache layouts
+    /// must override this check. Precision and recurrent shapes are validated
+    /// separately by `InferenceState::validate_snapshot`.
+    fn validate_checkpoint_state(
+        &self,
+        snapshot: &crate::kv_cache::StateSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate_for_model(self.config())
+    }
+
     /// Does this backend support `n_keep` context shift? Static
     /// capability probe — callers MUST check this before invoking
     /// [`Self::shift_kv`].

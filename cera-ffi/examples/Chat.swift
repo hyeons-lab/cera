@@ -59,7 +59,13 @@ struct ChatExample {
       "Generated \(turn1.summary.tokensGenerated) tokens (final position: \(try chat.position()))"
     )
     print("Phase after completion: \(try chat.phase())")
-    assert(try chat.phase() == .turnComplete)
+    let firstPhase = try chat.phase()
+    guard firstPhase == .turnComplete else {
+      print("Turn stopped before its terminal marker; reset or replace messages before a new user turn.")
+      let reclaimedSession = try chat.intoSession()
+      print("Reclaimed raw session at position \(reclaimedSession.position())")
+      return
+    }
 
     // --- Turn 2: Warm Continuation ---
     // The previous context remains in the KV cache; only new user input is ingested.
@@ -76,8 +82,6 @@ struct ChatExample {
       "Generated \(turn2.summary.tokensGenerated) tokens (final position: \(try chat.position()))"
     )
     print("Phase after completion: \(try chat.phase())")
-    assert(try chat.phase() == .turnComplete)
-
     // --- Reclaim raw Session ---
     let reclaimedSession = try chat.intoSession()
     print("\nReclaimed raw session at position \(reclaimedSession.position())")

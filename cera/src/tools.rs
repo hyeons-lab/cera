@@ -203,11 +203,13 @@ pub fn parse_tool_calls(text: &str, format: ToolFormat) -> Result<Vec<ToolCall>>
 ///
 /// What is enforced: the call structure, the function name (must be a declared
 /// tool), each argument name (must be one of that tool's schema properties), and
-/// each argument's value **type** (string/integer/number/boolean/array/object,
-/// plus `enum` literal sets). Not yet enforced: that *required* arguments are
-/// present, and no-duplicate/ordering constraints — arguments may appear in any
-/// order and any subset. This is a deliberate v1 scope: it guarantees a
-/// well-formed, correctly-typed call without over-constraining the model.
+/// each argument's outer value syntax (string/integer/number/boolean/array/object,
+/// plus scalar `enum` literal sets). Nested array item and object property schemas
+/// are not enforced. Neither are required arguments or no-duplicate/ordering
+/// constraints: arguments may appear in any order and any subset. This compiler
+/// is separate from the general JSON Schema compiler. A token limit can still
+/// truncate output, and lazy triggering permits prose; validate parsed calls
+/// and their arguments before execution.
 ///
 /// For the LFM2 Pythonic format, tool and argument names must be valid Python
 /// identifiers (`[A-Za-z_][A-Za-z0-9_]*`) — that is what the model was trained

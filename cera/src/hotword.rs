@@ -848,6 +848,33 @@ pub struct HotwordIterator {
 }
 
 impl HotwordIterator {
+    pub(crate) fn with_config(self, config: HotwordConfig) -> Self {
+        Self::new(self.detector, self.vad, config)
+    }
+
+    /// Limit a pipeline step so a detection cannot hide an unconsumed suffix.
+    pub(crate) fn samples_until_hop(&self) -> usize {
+        self.hop_samples
+            .saturating_sub(self.current_sample.saturating_sub(self.last_eval_sample))
+            .max(1) as usize
+    }
+
+    /// Contiguous PCM still retained since the most recent reset.
+    pub(crate) fn available_samples(&self) -> usize {
+        self.ring_buffer.count
+    }
+
+    /// Restart contiguous audio after a pipeline speech interval, preserving
+    /// any debounce time that has not elapsed during that interval.
+    pub(crate) fn resume_after_pause(&mut self, skipped_samples: u64) {
+        let remaining_cooldown = self
+            .cooldown_until_sample
+            .saturating_sub(self.current_sample)
+            .saturating_sub(skipped_samples);
+        self.reset();
+        self.cooldown_until_sample = remaining_cooldown;
+    }
+
     /// Create a new streaming `HotwordIterator`.
     pub fn new(detector: HotwordDetector, vad: Option<SileroVad>, config: HotwordConfig) -> Self {
         let config = config.sanitized();
