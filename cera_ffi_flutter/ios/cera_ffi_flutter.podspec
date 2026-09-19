@@ -58,8 +58,8 @@ with a Metal-accelerated backend.
   # platform).
   s.prepare_command = <<-CMD
     set -euo pipefail
-    VERSION="RELEASE_VERSION"
-    EXPECTED_SHA="RELEASE_CHECKSUM"
+    VERSION="0.6.2"
+    EXPECTED_SHA="039888b82e353fc48adfb831e3752d57969c3c41e67cb590f88ac124a692f7c8"
 
     # A locally-built XCFramework always wins. `just apple-xcframework` writes
     # one to target/xcframework-build/; copy it next to this podspec to test an
