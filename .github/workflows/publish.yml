@@ -1077,9 +1077,13 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          PREV=$(gh api "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' \
+          # Paginate: the repo will outgrow one API page. Inject v${VERSION}
+          # explicitly: the tag was just pushed, so API replica lag may omit
+          # it, and out-of-order releases (patch for an older line) must still
+          # resolve the greatest version strictly below it.
+          PREV=$( { gh api --paginate "repos/${{ github.repository }}/tags" --jq '.[].name' || true; echo "v${VERSION}"; } \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V \
+            | sort -u -V \
             | awk -v cur="v${VERSION}" '$0 == cur { exit } { prev = $0 } END { print prev }' \
             || true)
           echo "Previous version tag for v${VERSION}: ${PREV:-<none>}"
