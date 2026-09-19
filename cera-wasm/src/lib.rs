@@ -2363,6 +2363,9 @@ impl ChatSession {
     /// `"stream callback failed"` error with the cancel latch left armed: call
     /// `clearCancel()` before the next turn or it will cancel immediately,
     /// then reset or replace messages if the turn was interrupted.
+    ///
+    /// Do not call back into this handle from `on_token` (including `cancel()`):
+    /// generation holds a mutable borrow and re-entry will panic.
     #[wasm_bindgen(js_name = generateStreaming)]
     pub fn generate_streaming(
         &mut self,
