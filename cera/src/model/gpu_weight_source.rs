@@ -159,17 +159,20 @@ pub trait GpuWeightSource {
 /// `shaders/slang/moe_route.slang`, where it sizes the groupshared probability
 /// scratch. Both backends check it at load so an oversized model is a named
 /// error instead of a groupshared overrun.
+#[allow(dead_code)]
 pub(crate) const MOE_MAX_EXPERTS: u32 = 256;
 
 /// Largest `n_expert_used` the routing kernel can hold, matching `MAX_USED` in
 /// `shaders/slang/moe_route.slang`. The kernel clamps rather than overruns, but
 /// a clamp would silently drop experts, so both backends reject here instead.
+#[allow(dead_code)]
 pub(crate) const MOE_MAX_EXPERT_USED: u32 = 16;
 
 /// One stacked expert projection's validated layout.
 ///
 /// `rows`/`inner` describe a *single* expert's slice; `expert_stride` is the
 /// byte distance to the next one.
+#[allow(dead_code)]
 pub(crate) struct StackedExperts {
     // Read by the wgpu loader only. Metal takes its shapes from the
     // `MetalWeight` it uploads for expert 0 instead, so on a metal-only build
@@ -203,6 +206,7 @@ pub(crate) struct StackedExperts {
 /// `range.start + e * tensor_data_size(&[ne0, ne1], dtype)`, the same product
 /// from the same shape, so evenly stacked is its definition rather than its
 /// finding.
+#[allow(dead_code)]
 pub(crate) fn stacked_expert_layout(
     refs: &[WeightRef],
     layer: usize,

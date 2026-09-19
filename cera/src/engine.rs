@@ -70,10 +70,12 @@ pub enum BackendPreference {
     Gpu,
     /// Native Metal. Requires the `metal` feature + macOS.
     Metal,
+    /// Native CUDA. Requires the `cuda` feature.
+    Cuda,
 }
 
 impl BackendPreference {
-    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`).
+    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`, `"cuda"`).
     /// Returns `Err` on an unknown label.
     pub fn parse_str(s: &str) -> Result<Self, CeraError> {
         match s.to_ascii_lowercase().as_str() {
@@ -81,8 +83,9 @@ impl BackendPreference {
             "cpu" => Ok(Self::Cpu),
             "gpu" | "wgpu" => Ok(Self::Gpu),
             "metal" => Ok(Self::Metal),
+            "cuda" => Ok(Self::Cuda),
             other => Err(CeraError::Backend(format!(
-                "unknown backend preference `{other}` (use auto, cpu, gpu, or metal)"
+                "unknown backend preference `{other}` (use auto, cpu, gpu, metal, or cuda)"
             ))),
         }
     }
@@ -2166,6 +2169,13 @@ fn load_text_model(
         BackendPreference::Metal => Err(CeraError::Backend(
             "Metal backend not available (compile with --features metal on macOS or iOS)".into(),
         )),
+        #[cfg(feature = "cuda")]
+        BackendPreference::Cuda => model::load_model_cuda(gguf, path, cfg.context_size)
+            .map_err(|e| CeraError::Backend(format!("CUDA model load failed: {e}"))),
+        #[cfg(not(feature = "cuda"))]
+        BackendPreference::Cuda => Err(CeraError::Backend(
+            "CUDA backend not available (compile with --features cuda)".into(),
+        )),
     }
 }
 
@@ -2174,6 +2184,23 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
+    // CUDA -> Metal -> wgpu -> CPU.
+    #[cfg(feature = "cuda")]
+    {
+        if crate::backend::cuda::CudaDevice::is_available() {
+            let gguf_for_cuda = gguf.clone();
+            match model::load_model_cuda(gguf_for_cuda, path, context_size) {
+                Ok(m) => {
+                    tracing::debug!("cera::engine: using native CUDA backend (auto)");
+                    return Ok(m);
+                }
+                Err(e) => {
+                    tracing::debug!("cera::engine: CUDA unavailable ({e}); trying next backend");
+                }
+            }
+        }
+    }
+
     // Metal -> wgpu -> CPU. Mirrors the CLI's previous `load_model_auto`.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {

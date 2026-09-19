@@ -155,6 +155,64 @@ pub(crate) mod neon {
     use std::arch::aarch64::*;
     use std::mem::size_of;
 
+    #[cfg(not(cera_nightly))]
+    /// Stable inline assembly fallback for `vdotq_s32` (FEAT_DotProd).
+    #[inline(always)]
+    pub(crate) unsafe fn vdotq_s32(mut r: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        // SAFETY: asm! performs sdot without accessing memory.
+        unsafe {
+            core::arch::asm!(
+                "sdot {r:v}.4s, {a:v}.16b, {b:v}.16b",
+                r = inout(vreg) r,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            );
+        }
+        r
+    }
+
+    #[cfg(not(cera_nightly))]
+    /// Stable inline assembly fallback for `vmmlaq_s32` (FEAT_I8MM).
+    #[inline(always)]
+    pub(crate) unsafe fn vmmlaq_s32(mut r: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        // SAFETY: asm! performs smmla without accessing memory.
+        unsafe {
+            core::arch::asm!(
+                "smmla {r:v}.4s, {a:v}.16b, {b:v}.16b",
+                r = inout(vreg) r,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack),
+            );
+        }
+        r
+    }
+
+    #[cfg(not(cera_nightly))]
+    #[allow(dead_code)]
+    /// Read prefetch hint flag.
+    pub(crate) const _PREFETCH_READ: i32 = 0;
+
+    #[cfg(not(cera_nightly))]
+    #[allow(dead_code)]
+    /// Locality 2 prefetch hint flag.
+    pub(crate) const _PREFETCH_LOCALITY2: i32 = 2;
+
+    #[cfg(not(cera_nightly))]
+    /// Stable inline assembly fallback for memory prefetching.
+    #[inline(always)]
+    pub(crate) unsafe fn _prefetch(ptr: *const i8, _rw: i32, _locality: i32) {
+        // SAFETY: prfm is an advisory prefetch hint.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl2keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, readonly),
+            );
+        }
+    }
+
     // ── Shared GEMM dot-product macros ─────────────────────────────────────
     // Used by both Q4_0 and Q8_0 GEMM kernels to avoid duplicating the
     // Q8_0 input loading + vdotq_s32 + scale accumulation pattern.

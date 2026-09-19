@@ -16,10 +16,10 @@ LeapBundles models locally.
 cargo install cera-cli
 ```
 
-This builds the `cera` binary. For an Apple Metal or wgpu GPU build:
+This builds the `cera` binary. For an Apple Metal, NVIDIA CUDA, or wgpu GPU build:
 
 ```sh
-cargo install cera-cli --features metal   # or gpu
+cargo install cera-cli --features metal   # or: --features cuda, --features gpu
 ```
 
 ## Usage

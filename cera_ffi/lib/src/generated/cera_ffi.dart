@@ -2305,13 +2305,15 @@ class SessionRecoveryStatus {
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
 enum BackendPreference {
-  /// Probe Metal → GPU → CPU at load time.
+  /// Probe CUDA / Metal / GPU / CPU at load time.
   auto,
   cpu,
   /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
   gpu,
   /// Native Metal. Requires the `metal` feature + macOS.
   metal,
+  /// Native CUDA. Requires the `cuda` feature.
+  cuda,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -4469,6 +4471,7 @@ String _encodeBackendPreference(BackendPreference value) {
     BackendPreference.cpu => 'cpu',
     BackendPreference.gpu => 'gpu',
     BackendPreference.metal => 'metal',
+    BackendPreference.cuda => 'cuda',
   };
 }
 
@@ -4478,6 +4481,7 @@ BackendPreference _decodeBackendPreference(String raw) {
     'cpu' => BackendPreference.cpu,
     'gpu' => BackendPreference.gpu,
     'metal' => BackendPreference.metal,
+    'cuda' => BackendPreference.cuda,
     _ => throw StateError('Unknown BackendPreference variant: $raw'),
   };
 }
@@ -7163,6 +7167,7 @@ void _uniffiWriteBackendPreference(BackendPreference value, _UniFfiBinaryWriter 
     BackendPreference.cpu => 2,
     BackendPreference.gpu => 3,
     BackendPreference.metal => 4,
+    BackendPreference.cuda => 5,
   };
   writer.writeI32(tag);
 }
@@ -7184,6 +7189,8 @@ BackendPreference _uniffiReadBackendPreference(_UniFfiBinaryReader reader) {
       return BackendPreference.gpu;
     case 4:
       return BackendPreference.metal;
+    case 5:
+      return BackendPreference.cuda;
     default:
       throw StateError('Unknown BackendPreference variant tag: $tag');
   }

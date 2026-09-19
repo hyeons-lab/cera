@@ -51,6 +51,9 @@ blas = ["cera/blas"]
 # Light up cera's wgpu GPU backend in the built cdylib/staticlib.
 gpu = ["cera/gpu"]
 
+# Light up cera's native CUDA backend in the built cdylib/staticlib.
+cuda = ["cera/cuda"]
+
 # Opt-in feature for the Dart/Flutter bindings (cera_ffi_flutter). The Dart
 # generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
 # extra scaffolding functions that pass args/returns through an FfiBuffer —

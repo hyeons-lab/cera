@@ -8957,7 +8957,7 @@ public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffe
 public enum BackendPreference: Equatable, Hashable {
     
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe CUDA / Metal / GPU / CPU at load time.
      */
     case auto
     case cpu
@@ -8969,6 +8969,10 @@ public enum BackendPreference: Equatable, Hashable {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     case metal
+    /**
+     * Native CUDA. Requires the `cuda` feature.
+     */
+    case cuda
 
 
 
@@ -8998,6 +9002,8 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case 4: return .metal
         
+        case 5: return .cuda
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -9020,6 +9026,10 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case .metal:
             writeInt(&buf, Int32(4))
+        
+        
+        case .cuda:
+            writeInt(&buf, Int32(5))
         
         }
     }

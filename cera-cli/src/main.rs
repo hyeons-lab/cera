@@ -1714,6 +1714,7 @@ fn load_engine_from_spec(
             BackendPreference::Cpu => "CPU",
             BackendPreference::Gpu => "wgpu",
             BackendPreference::Metal => "native Metal",
+            BackendPreference::Cuda => "native CUDA",
         },
         engine.metadata().architecture,
     );

@@ -42,6 +42,7 @@ metal = "0.31"
 objc = "0.2"
 rustfft = "6.4"
 flatbuffers = "25"
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "dynamic-loading", "f16", "cuda-12020", "nvrtc"] }
 tempfile = "3"
 # BLAS bindings for SGEMM on Apple platforms (macOS/iOS). The `accelerate-src` provider
 # dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit).

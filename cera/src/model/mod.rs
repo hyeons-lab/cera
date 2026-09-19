@@ -33,15 +33,20 @@ pub mod gpu_turboquant;
 
 #[cfg(any(
     feature = "gpu",
+    feature = "cuda",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 pub mod gpu_weight_source;
 #[cfg(any(
     feature = "gpu",
+    feature = "cuda",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 pub use gpu_weight_source::{GpuWeightSource, RopeType};
 pub use transformer::WeightRef;
+
+#[cfg(feature = "cuda")]
+pub mod cuda_lfm2;
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_lfm2;
@@ -956,6 +961,39 @@ pub fn load_model_metal(
             context_size,
         )?)),
         other => bail!("unsupported architecture for Metal: {other}"),
+    }
+}
+
+/// Load a model with native CUDA acceleration.
+#[cfg(feature = "cuda")]
+pub fn load_model_cuda(
+    gguf: GgufFile,
+    path: Option<&std::path::Path>,
+    context_size: usize,
+) -> Result<Box<dyn Model>> {
+    let arch = gguf
+        .get_str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string();
+    match arch.as_str() {
+        "lfm2" => Ok(Box::new(cuda_lfm2::CudaLfm2Model::from_gguf(
+            gguf,
+            path,
+            context_size,
+        )?)),
+        "llama" | "qwen3" => Ok(Box::new(cuda_lfm2::CudaLfm2Model::from_llama(
+            gguf,
+            path,
+            context_size,
+        )?)),
+        "lfm2moe" => bail!("lfm2moe architecture is not yet implemented for CUDA backend"),
+        "qwen2" => bail!(
+            "qwen2 architecture requires bias projections which are not yet implemented for CUDA backend"
+        ),
+        "granite" => bail!(
+            "granite architecture requires residual scaling which is not yet implemented for CUDA backend"
+        ),
+        other => bail!("unsupported architecture for CUDA: {other}"),
     }
 }
 #[allow(
