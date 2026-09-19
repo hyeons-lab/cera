@@ -1062,6 +1062,32 @@ jobs:
       # When the SPM leg ran, the tag already exists (pushed above) at the
       # Package.swift-pinned commit, and softprops attaches the release to it
       # rather than re-creating it at the workflow SHA.
+      #
+      # Previous version tag for scoped release notes: the v<version> tags
+      # point at unmerged SPM pin commits, so GitHub's automatic previous-tag
+      # detection falls back to v0.2.2 (last tag on the default branch) and
+      # every release's changelog spans the whole history. Pinning the base to
+      # the previous version tag keeps each release scoped to its own range.
+      # API-driven (no checkout needed): this job only checks out when the SPM
+      # leg ran.
+      - name: Resolve previous version tag
+        id: prev-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Paginate: the repo will outgrow one API page. Inject v${VERSION}
+          # explicitly: the tag was just pushed, so API replica lag may omit
+          # it, and out-of-order releases (patch for an older line) must still
+          # resolve the greatest version strictly below it.
+          PREV=$( { gh api --paginate "repos/${{ github.repository }}/tags" --jq '.[].name' || true; echo "v${VERSION}"; } \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -u -V \
+            | awk -v cur="v${VERSION}" '$0 == cur { exit } { prev = $0 } END { print prev }' \
+            || true)
+          echo "Previous version tag for v${VERSION}: ${PREV:-<none>}"
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
       - name: Create tag and GitHub release
         uses: softprops/action-gh-release@v3
         with:
@@ -1069,6 +1095,7 @@ jobs:
           tag_name: v${{ needs.version.outputs.version }}
           name: v${{ needs.version.outputs.version }}
           generate_release_notes: true
+          previous_tag: ${{ steps.prev-tag.outputs.tag }}
           # Assets are attached per-leg: tolerate absence of optional legs
           # (e.g. cli binaries or web runtime) while SPM is strictly required.
           fail_on_unmatched_files: false
