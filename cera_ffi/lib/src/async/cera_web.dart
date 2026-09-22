@@ -579,6 +579,10 @@ class _WorkerCera implements Cera {
     if (_closed) {
       throw StateError('this Cera engine is closed');
     }
+    // The seed crosses `postMessage` as a JS number, exact only below 2^53,
+    // and the worker rejects anything else: fail fast here with the same
+    // bound. (Literal, not `1 << 53`: bit shifts are 32-bit on Dart web.)
+    checkGenerateSeedRange(seed, 9007199254740991);
     final controller = StreamController<String>();
     // See the native implementation: `onCancel` fires on normal completion as
     // well as on an explicit cancel, and cancelling a finished generation is

@@ -2560,6 +2560,12 @@ impl Model for LlamaModel {
         true
     }
 
+    /// LoRA hooks live in the shared `transformer::forward_*_block` helpers
+    /// this backend decodes through.
+    fn supports_lora(&self) -> bool {
+        true
+    }
+
     fn f16_kv_supported(&self) -> bool {
         true
     }

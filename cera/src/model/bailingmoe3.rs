@@ -1669,6 +1669,14 @@ impl Model for BailingMoe3Model {
         false
     }
 
+    /// No LoRA hooks: the bespoke attention/FFN paths never read `state.lora`
+    /// (the `lora` hits in this file are MLA ranks and `lora_tmp` scratch
+    /// reuse, both unrelated). Restated (not inherited) so whoever adds the
+    /// hooks reads this here.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
     fn supports_all_logits(&self) -> bool {
         false
     }

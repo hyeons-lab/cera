@@ -218,28 +218,80 @@ impl LoraTargetWeights {
             rank_a == rank_b,
             "LoRA rank mismatch between A ({rank_a}) and B ({rank_b})"
         );
-        ensure!(rank_a > 0 && k > 0 && d > 0, "LoRA dims must be non-zero");
+        Self::from_parts(a, b, rank_a, k, d, alpha / rank_a as f32)
+    }
+
+    /// Build factors with an explicit `scale`. [`Self::new`] derives
+    /// `alpha / rank`; composition folds per-adapter scales into `B` instead
+    /// and pins `1.0` here. Same validation either way.
+    fn from_parts(
+        a: Vec<f32>,
+        b: Vec<f32>,
+        rank: usize,
+        k: usize,
+        d: usize,
+        scale: f32,
+    ) -> Result<Self> {
+        Self::check_parts(&a, &b, rank, k, d, scale)?;
+        Ok(Self {
+            a,
+            b,
+            rank,
+            k,
+            d,
+            scale,
+        })
+    }
+
+    /// The one validation predicate for target factors, shared by
+    /// [`Self::from_parts`] (which reports the specific failure) and
+    /// [`is_well_formed`](Self::is_well_formed) so the two cannot drift.
+    fn check_parts(
+        a: &[f32],
+        b: &[f32],
+        rank: usize,
+        k: usize,
+        d: usize,
+        scale: f32,
+    ) -> Result<()> {
+        ensure!(rank > 0 && k > 0 && d > 0, "LoRA dims must be non-zero");
         // Cap the rank so backends can size fixed rank-width scratch (e.g. the
         // Metal `lora_tmp` buffer) without an out-of-bounds risk. Real adapters
         // are rank <= ~64; this bound is generous.
         ensure!(
-            rank_a <= MAX_LORA_RANK,
-            "LoRA rank {rank_a} exceeds the supported maximum ({MAX_LORA_RANK})"
+            rank <= MAX_LORA_RANK,
+            "LoRA rank {rank} exceeds the supported maximum ({MAX_LORA_RANK})"
         );
         // checked_mul so absurd dims from a malformed adapter error rather than
         // wrapping (which could make a wrong size compare equal).
-        let ak = rank_a.checked_mul(k).context("LoRA A dims overflow")?;
-        let dr = d.checked_mul(rank_a).context("LoRA B dims overflow")?;
+        let ak = rank.checked_mul(k).context("LoRA A dims overflow")?;
+        let dr = d.checked_mul(rank).context("LoRA B dims overflow")?;
         ensure!(a.len() == ak, "LoRA A size {} != rank*k {ak}", a.len());
         ensure!(b.len() == dr, "LoRA B size {} != d*rank {dr}", b.len());
-        Ok(Self {
-            a,
-            b,
-            rank: rank_a,
-            k,
-            d,
-            scale: alpha / rank_a as f32,
-        })
+        // A non-finite scale (e.g. an overflowing `lora_alpha as f32` from
+        // `adapter_config.json`) would silently poison every apply with
+        // inf/NaN, so fail closed at load. Composition pins `1.0` here.
+        ensure!(scale.is_finite(), "LoRA scale must be finite, got {scale}");
+        // Same for the factor values themselves: a corrupt file with NaN/inf
+        // weights would otherwise load, compose, and install, then poison
+        // every apply. One linear scan at load; the merge's own B check stays
+        // for products the fold itself overflows.
+        ensure!(
+            a.iter().all(|x| x.is_finite()),
+            "LoRA A factors must be finite"
+        );
+        ensure!(
+            b.iter().all(|x| x.is_finite()),
+            "LoRA B factors must be finite"
+        );
+        Ok(())
+    }
+
+    /// Whether these factors satisfy [`Self::check_parts`]. Used by
+    /// `single_passthrough` so the fast path accepts exactly what the merge
+    /// path would accept unchanged.
+    fn is_well_formed(&self) -> bool {
+        Self::check_parts(&self.a, &self.b, self.rank, self.k, self.d, self.scale).is_ok()
     }
 }
 
@@ -269,6 +321,258 @@ pub struct LoraAdapterWeights {
     pub class_labels: Vec<String>,
     /// Number of token classification classes (0 if not a classifier).
     pub num_classes: usize,
+}
+
+/// Merge every target of one layer of a [`LoraAdapterWeights::compose`] stack.
+fn merge_layer(stacked: &[(Arc<LoraAdapterWeights>, f32)], layer: usize) -> Result<LoraLayer> {
+    let mut slot = LoraLayer::default();
+    for target in LoraTarget::ALL {
+        let delta = merge_target(stacked, layer, target)?;
+        slot.targets[target.index()] = delta;
+    }
+    Ok(slot)
+}
+
+/// Merge one `(layer, target)` of a compose stack: `None` when no entry
+/// touches it, or when every touched part folded to zero (dense and
+/// all-zero expert targets alike), else the rank-concatenated delta.
+fn merge_target(
+    stacked: &[(Arc<LoraAdapterWeights>, f32)],
+    layer: usize,
+    target: LoraTarget,
+) -> Result<Option<TargetDelta>> {
+    // (entry index, delta, runtime scale) for adapters touching this target.
+    // Zero-scale entries are skipped up front: an exact no-op either way,
+    // and skipping keeps `0 · inf` (from a degenerate loaded scale) from
+    // producing NaN columns.
+    let mut dense: Vec<(usize, &LoraTargetWeights, f32)> = Vec::new();
+    let mut experts: Vec<(usize, &[LoraTargetWeights], f32)> = Vec::new();
+    for (i, (a, s)) in stacked.iter().enumerate() {
+        if *s == 0.0 {
+            continue;
+        }
+        let Some(delta) = a
+            .layers
+            .get(layer)
+            .and_then(|l| l.targets[target.index()].as_ref())
+        else {
+            continue;
+        };
+        match delta {
+            TargetDelta::Dense(t) => dense.push((i, t, *s)),
+            TargetDelta::Experts(v) => experts.push((i, v.as_slice(), *s)),
+        }
+    }
+    if dense.is_empty() && experts.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        dense.is_empty() || experts.is_empty(),
+        "layer {layer} target {target:?}: cannot mix dense and per-expert deltas"
+    );
+    if let Some((_, head, _)) = experts.first() {
+        let n_experts = head.len();
+        for &(i, v, _) in &experts {
+            ensure!(
+                v.len() == n_experts,
+                "layer {layer} target {target:?}: entry {i} has {} experts, expected {n_experts}",
+                v.len()
+            );
+        }
+        let merged: Vec<Option<LoraTargetWeights>> = (0..n_experts)
+            .map(|e| {
+                let picked = experts.iter().map(|&(i, v, s)| (i, &v[e], s));
+                merge_parts(picked, layer, target)
+            })
+            .collect::<Result<_>>()?;
+        // Every expert folded to zero: leave the target untouched like the
+        // dense arm, instead of manufacturing all-zero experts. Placeholders
+        // keep a *mixed* list aligned (below), but an all-placeholder target
+        // would still trip `has_moe_deltas` and install-time validation for
+        // a no-op stack.
+        if merged.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        merged
+            .into_iter()
+            .enumerate()
+            .map(|(e, t)| match t {
+                Some(t) => Ok(t),
+                // Every entry folded to zero for this expert, alongside a
+                // live one: an all-zeros rank-1 delta with scale 0 keeps the
+                // expert list aligned while applying (and apply-skipping) as
+                // an exact no-op. Dims come from the first entry's expert
+                // (agreement for a live expert is enforced by the merge; a
+                // wrong guess here fails install-time validation).
+                None => LoraTargetWeights::from_parts(
+                    vec![0.0; head[e].k],
+                    vec![0.0; head[e].d],
+                    1,
+                    head[e].k,
+                    head[e].d,
+                    0.0,
+                ),
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(TargetDelta::Experts)
+            .map(Some)
+    } else {
+        // `experts` is empty and mixing was rejected, so `dense` holds every
+        // live entry. `None` when every entry folded to zero: the target
+        // stays untouched.
+        merge_parts(dense, layer, target).map(|t| t.map(TargetDelta::Dense))
+    }
+}
+
+/// Fold one target's picked parts and merge them into a single delta:
+/// `None` when every part folded to zero (an exact no-op the caller skips).
+/// Shared by the dense arm and each per-expert merge so the two forms
+/// cannot drift on the fold-then-merge chain.
+fn merge_parts<'a>(
+    picked: impl IntoIterator<Item = (usize, &'a LoraTargetWeights, f32)>,
+    layer: usize,
+    target: LoraTarget,
+) -> Result<Option<LoraTargetWeights>> {
+    let parts = fold_parts(picked, layer, target)?;
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    merge_dense(&parts, layer, target).map(Some)
+}
+
+/// Fold runtime scales into `(weights, factor)` parts, rejecting a
+/// non-finite fold (a finite scale times a degenerate loaded scale would
+/// otherwise poison the merged columns with inf/NaN).
+fn fold_parts<'a>(
+    picked: impl IntoIterator<Item = (usize, &'a LoraTargetWeights, f32)>,
+    layer: usize,
+    target: LoraTarget,
+) -> Result<Vec<(&'a LoraTargetWeights, f32)>> {
+    let mut parts = Vec::new();
+    for (i, t, s) in picked {
+        let f = s * t.scale;
+        ensure!(
+            f.is_finite(),
+            "layer {layer} target {target:?}: entry {i} folds to a non-finite factor ({f})"
+        );
+        // A zero fold is an exact no-op, skipped like a zero runtime scale:
+        // merging it would consume merged rank (risking a spurious
+        // MAX_LORA_RANK trip) and pin scale 1.0, defeating apply's zero-skip
+        // and flipping -0.0 to +0.0.
+        if f != 0.0 {
+            parts.push((t, f));
+        }
+    }
+    Ok(parts)
+}
+
+/// Merge one target's `(weights, folded factor)` parts by rank
+/// concatenation: `A` stacks vertically, `B` concatenates horizontally with
+/// each part's factor pre-multiplied, merged `scale = 1.0`. Callers guarantee
+/// `parts` is non-empty and form-consistent; `(k, d)` agreement and the rank
+/// cap are enforced here.
+fn merge_dense(
+    parts: &[(&LoraTargetWeights, f32)],
+    layer: usize,
+    target: LoraTarget,
+) -> Result<LoraTargetWeights> {
+    let (first, rest) = parts.split_first().with_context(|| {
+        format!("layer {layer} target {target:?}: merge_dense called with no parts")
+    })?;
+    let (k, d) = (first.0.k, first.0.d);
+    for (w, _) in rest {
+        ensure!(
+            w.k == k && w.d == d,
+            "layer {layer} target {target:?}: dim mismatch ({}×{}, expected {k}×{d})",
+            w.k,
+            w.d
+        );
+    }
+    let rank = parts.iter().try_fold(0usize, |acc, (w, _)| {
+        acc.checked_add(w.rank)
+            .with_context(|| format!("layer {layer} target {target:?}: LoRA merged rank overflow"))
+    })?;
+    ensure!(
+        rank <= MAX_LORA_RANK,
+        "layer {layer} target {target:?}: merged rank {rank} exceeds the supported maximum ({MAX_LORA_RANK})"
+    );
+    // A is [rank × k] row-major: vertical concat is a plain append.
+    let ak = rank
+        .checked_mul(k)
+        .with_context(|| format!("layer {layer} target {target:?}: LoRA merged A dims overflow"))?;
+    let mut a = Vec::with_capacity(ak);
+    a.extend(parts.iter().flat_map(|(w, _)| w.a.iter().copied()));
+    // B is [d × rank] row-major: each output row concatenates the parts'
+    // factor-scaled rows.
+    let dr = d
+        .checked_mul(rank)
+        .with_context(|| format!("layer {layer} target {target:?}: LoRA merged B dims overflow"))?;
+    let mut b = Vec::with_capacity(dr);
+    if parts.len() == 1 {
+        let (w, f) = parts[0];
+        b.extend(w.b.iter().map(|&x| x * f));
+    } else {
+        for row in 0..d {
+            for &(w, f) in parts {
+                let r = w.rank;
+                let slice = &w.b[row * r..(row + 1) * r];
+                b.extend(slice.iter().map(|&x| x * f));
+            }
+        }
+    }
+    // A factor-scaled product can overflow f32 from finite inputs: fail closed
+    // on a non-finite merged B with a specific error message rather than
+    // installing silent inf/NaN.
+    ensure!(
+        b.iter().all(|x| x.is_finite()),
+        "layer {layer} target {target:?}: merged B holds a non-finite value"
+    );
+    LoraTargetWeights::from_parts(a, b, rank, k, d, 1.0).with_context(|| {
+        format!("layer {layer} target {target:?}: merged target failed validation")
+    })
+}
+
+/// The single live entry of `stacked` when the stack holds exactly one
+/// adapter at unit scale AND that adapter would survive a merge unchanged,
+/// so returning it directly applies bit-identically to attaching it (which
+/// is what the passthrough replaces). `None` otherwise: the caller falls
+/// through to the merge, which reports the exact failure for stacks it must
+/// reject. Note this is deliberately NOT bit-identical to merging in
+/// general: merging folds scale into B (`(B·s)·(A·x)`), while the original
+/// folds it into tmp (`B·((A·x)·s)`), which can differ by 1 ulp.
+fn single_passthrough(
+    stacked: &[(Arc<LoraAdapterWeights>, f32)],
+) -> Option<&Arc<LoraAdapterWeights>> {
+    let mut live = stacked.iter().filter(|(_, s)| *s != 0.0);
+    let (only, s) = live.next()?;
+    if live.next().is_some() {
+        return None;
+    }
+    // The merge strips classifier extras, so a labeled adapter is not
+    // merge-identical. (The validation scan already refused live
+    // classifiers, so `classifier_weight` is `None` here.)
+    if *s != 1.0
+        || only.classifier_bias.is_some()
+        || !only.class_labels.is_empty()
+        || only.num_classes != 0
+    {
+        return None;
+    }
+    // The merge revalidates every target and drops targets whose every
+    // part folds to zero: only pass through when every target is both
+    // well-formed and surviving at unit scale.
+    let survives_and_valid = only.layers.iter().all(|l| {
+        l.targets.iter().flatten().all(|d| match d {
+            TargetDelta::Dense(t) => t.scale != 0.0 && t.is_well_formed(),
+            TargetDelta::Experts(v) => {
+                v.iter().any(|t| t.scale != 0.0) && v.iter().all(|t| t.is_well_formed())
+            }
+        })
+    });
+    if !survives_and_valid {
+        return None;
+    }
+    Some(only)
 }
 
 impl LoraAdapterWeights {
@@ -389,6 +693,91 @@ impl LoraAdapterWeights {
             .iter()
             .map(|l| l.targets.iter().filter(|t| t.is_some()).count())
             .sum()
+    }
+
+    /// Compose a runtime-scaled stack of adapters into one equivalent adapter.
+    ///
+    /// Entry `i` contributes `scale_i · delta_i` per target, merged by rank
+    /// concatenation: `A = [A_1; A_2; …]`, `B = [f_1·B_1, f_2·B_2, …]` with
+    /// each entry's `f_i = scale_i · (alpha_i / rank_i)` folded into its `B`
+    /// columns, and merged `scale = 1.0`. The merged adapter flows through
+    /// every backend's existing single-adapter path (CPU apply hooks and GPU
+    /// upload both fold `scale` into `B`), so composition is exact on all of
+    /// them, including the Granite `residual_mult` fold, which keys off the
+    /// target rather than the adapter. (Folding is an extra multiply per `B`
+    /// element, so a composed adapter can differ from sequential application
+    /// in the last ulp; it is deterministic, just not bit-identical.)
+    ///
+    /// Rules, all validated before anything is built, so a failure leaves no
+    /// partial adapter behind:
+    /// - every `scale` must be finite; entries with zero effective scale
+    ///   (`scale_i == 0`, checked before folding so `0 · inf` can't produce
+    ///   `NaN`) are skipped, an exact no-op that also preserves `-0.0`;
+    /// - classifier adapters cannot stack (heads don't compose), unless
+    ///   skipped as zero-scale entries;
+    /// - adapters sharing a `(layer, target)` must agree on `(k, d)`, on
+    ///   dense-vs-per-expert form, and (for experts) on expert count;
+    /// - the merged rank must fit [`MAX_LORA_RANK`].
+    ///
+    /// A stack holding exactly one live entry at scale `1.0` returns that
+    /// adapter directly (no copy): `1.0` is the exact multiplicative
+    /// identity, so this is bit-identical to attaching the adapter outright.
+    /// Anything else merges as described above, as does a unit-scale entry
+    /// the merge would change (classifier extras stripped, all-zero folds
+    /// dropped) rather than accept unchanged.
+    ///
+    /// An empty stack (or one where every entry is skipped) yields an empty
+    /// generative adapter: well-formed, applies nothing. [`Session`] maps an
+    /// empty list to detach instead of installing that.
+    ///
+    /// [`Session`]: crate::Session
+    pub fn compose(stacked: &[(Arc<LoraAdapterWeights>, f32)]) -> Result<Arc<LoraAdapterWeights>> {
+        // Single pass in entry order: finiteness first per entry (a NaN
+        // scale is never skipped as zero), then the classifier refusal for
+        // live entries. A stack carrying both failure modes reports the
+        // earliest offending entry.
+        for (i, (a, s)) in stacked.iter().enumerate() {
+            ensure!(
+                s.is_finite(),
+                "LoRA stack entry {i}: scale must be finite, got {s}"
+            );
+            ensure!(
+                *s == 0.0 || !a.is_classifier(),
+                "LoRA stack entry {i}: classifier adapters cannot stack"
+            );
+        }
+        if let Some(only) = single_passthrough(stacked) {
+            return Ok(Arc::clone(only));
+        }
+        let n_layers = stacked.iter().map(|(a, _)| a.n_layers()).max().unwrap_or(0);
+        let layers: Vec<LoraLayer> = (0..n_layers)
+            .map(|layer| merge_layer(stacked, layer))
+            .collect::<Result<_>>()?;
+        Ok(Arc::new(LoraAdapterWeights {
+            layers,
+            // Diagnostics only; the merged factors carry scale 1.0 with
+            // per-entry scales folded into B.
+            default_scale: 1.0,
+            classifier_weight: None,
+            classifier_bias: None,
+            class_labels: Vec::new(),
+            num_classes: 0,
+        }))
+    }
+
+    /// Like [`Self::compose`], but `None` for an empty stack (detach / base
+    /// model) instead of an empty generative adapter. Shared by
+    /// [`Session::set_lora_adapters`](crate::Session::set_lora_adapters) and
+    /// the FFI/WASM compose helpers so empty-stack semantics cannot drift
+    /// between boundaries; each maps the shared `None` to its own
+    /// detach/base-model behavior.
+    pub fn compose_opt(
+        stacked: &[(Arc<LoraAdapterWeights>, f32)],
+    ) -> Result<Option<Arc<LoraAdapterWeights>>> {
+        if stacked.is_empty() {
+            return Ok(None);
+        }
+        Self::compose(stacked).map(Some)
     }
 
     /// Verify every target's `(k, d)` matches what `config`'s projections expect,
@@ -2086,6 +2475,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_finite_scale() {
+        // A non-finite scale (e.g. an overflowing `lora_alpha as f32`) must
+        // fail closed at load, not attach and poison every apply with
+        // inf/NaN. All loaders funnel through `from_parts`.
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let err = LoraTargetWeights::from_parts(vec![1.0; 2], vec![1.0; 2], 1, 2, 2, bad)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be finite"), "{err}");
+        }
+        // Same for the factor values: NaN/inf weights fail at load, not at
+        // first apply.
+        for (a, b, who) in [
+            (vec![f32::NAN, 1.0], vec![1.0; 2], "A"),
+            (vec![1.0; 2], vec![1.0, f32::INFINITY], "B"),
+        ] {
+            let err = LoraTargetWeights::from_parts(a, b, 1, 2, 2, 1.0)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{who} factors must be finite")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn peft_classifier_adapter_loads_and_validates() {
         // 3 classes, hidden_size 8: weight [3, 8] = 24 floats = 96 bytes, bias [3] = 3 floats = 12 bytes
         let w_bytes = 24 * 4;
@@ -2175,5 +2593,395 @@ mod tests {
         assert_eq!(adapter.target_count(), 1);
         let t = adapter.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
         assert_eq!((t.rank, t.k, t.d), (2, 4, 3));
+    }
+
+    /// Build a one-target generative adapter with exact factors (bypasses the
+    /// GGUF loaders for full value control).
+    #[allow(clippy::too_many_arguments)]
+    fn direct_adapter(
+        layer: usize,
+        target: LoraTarget,
+        a: Vec<f32>,
+        b: Vec<f32>,
+        rank: usize,
+        k: usize,
+        d: usize,
+        alpha: f32,
+    ) -> Arc<LoraAdapterWeights> {
+        let t = LoraTargetWeights::new(a, rank, k, b, d, rank, alpha).unwrap();
+        let mut layers = Vec::new();
+        layers.resize_with(layer + 1, LoraLayer::default);
+        layers[layer].targets[target.index()] = Some(TargetDelta::Dense(t));
+        Arc::new(LoraAdapterWeights {
+            layers,
+            default_scale: alpha / rank as f32,
+            classifier_weight: None,
+            classifier_bias: None,
+            class_labels: Vec::new(),
+            num_classes: 0,
+        })
+    }
+
+    /// f64 reference for one stacked target: Σᵢ fᵢ·Bᵢ·(Aᵢ·x).
+    fn stacked_reference(parts: &[(&LoraTargetWeights, f64)], x: &[f32]) -> Vec<f64> {
+        let d = parts[0].0.d;
+        let mut y = vec![0.0f64; d];
+        parts.iter().for_each(|(t, f)| {
+            y.iter_mut().enumerate().for_each(|(row, yi)| {
+                let acc: f64 = (0..t.rank)
+                    .map(|r| {
+                        let ax: f64 = (0..t.k)
+                            .map(|c| t.a[r * t.k + c] as f64 * x[c] as f64)
+                            .sum();
+                        t.b[row * t.rank + r] as f64 * ax
+                    })
+                    .sum();
+                *yi += f * acc;
+            });
+        });
+        y
+    }
+
+    #[test]
+    fn compose_stacks_scaled_deltas_by_rank_concatenation() {
+        // Distinct ranks, dims k=4 d=3, distinct values; folded factors are
+        // exactly representable (f1 = 0.5·(4/2) = 1, f2 = 2·(2/1) = 4).
+        let a1 = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1., 2., 3., 4., 5., 6., 7., 8.],
+            vec![0.5, -1., 2., 1.5, -0.5, 3.],
+            2,
+            4,
+            3,
+            4.0,
+        );
+        let a2 = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1., 0., -1., 2.],
+            vec![1., 1., 1.],
+            1,
+            4,
+            3,
+            2.0,
+        );
+        let merged = LoraAdapterWeights::compose(&[(a1.clone(), 0.5), (a2.clone(), 2.0)]).unwrap();
+        let t = merged.get(0, LoraTarget::AttnQ).unwrap();
+        assert_eq!((t.rank, t.k, t.d), (3, 4, 3));
+        assert_eq!(t.scale, 1.0);
+        // A stacks vertically with no arithmetic involved.
+        assert_eq!(t.a, vec![1., 2., 3., 4., 5., 6., 7., 8., 1., 0., -1., 2.]);
+        // B concatenates horizontally with folded factors (exact here).
+        assert_eq!(t.b, vec![0.5, -1., 4., 2., 1.5, 4., -0.5, 3., 4.]);
+        // The merged apply matches the stacked f64 reference.
+        let x = [1., 2., 3., 4.];
+        let expected = stacked_reference(
+            &[
+                (a1.get(0, LoraTarget::AttnQ).unwrap(), 1.0),
+                (a2.get(0, LoraTarget::AttnQ).unwrap(), 4.0),
+            ],
+            &x,
+        );
+        let mut y = vec![0.0f32; 3];
+        apply_decode(t, &x, &mut y, &mut Vec::new());
+        y.iter().zip(expected.iter()).for_each(|(got, want)| {
+            assert!(
+                (*got as f64 - want).abs() < 1e-5,
+                "merged apply {y:?} != stacked reference {expected:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn compose_skips_zero_scale_entries_exactly() {
+        let a1 = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1., 2., 3., 4.],
+            vec![1., 1., 1.],
+            1,
+            4,
+            3,
+            1.0,
+        );
+        let a2 = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![9., 9., 9., 9.],
+            vec![9., 9., 9.],
+            1,
+            4,
+            3,
+            1.0,
+        );
+        let with_zero =
+            LoraAdapterWeights::compose(&[(a1.clone(), 0.0), (a2.clone(), 1.0)]).unwrap();
+        let without = LoraAdapterWeights::compose(&[(a2.clone(), 1.0)]).unwrap();
+        let t = with_zero.get(0, LoraTarget::AttnQ).unwrap();
+        let u = without.get(0, LoraTarget::AttnQ).unwrap();
+        assert_eq!(t.rank, 1, "zero-scale entry must not consume rank");
+        assert_eq!((&t.a, &t.b), (&u.a, &u.b));
+    }
+
+    #[test]
+    fn compose_empty_stack_is_an_empty_generative_adapter() {
+        let merged = LoraAdapterWeights::compose(&[]).unwrap();
+        assert_eq!(merged.n_layers(), 0);
+        assert_eq!(merged.target_count(), 0);
+        assert!(!merged.is_classifier());
+        assert!(!merged.has_moe_deltas());
+    }
+
+    #[test]
+    fn compose_rejects_inconsistent_stacks() {
+        let good = adapter_for(0, LoraTarget::AttnQ, 8, 8, 1);
+        // Non-finite runtime scales.
+        for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert!(
+                LoraAdapterWeights::compose(&[(good.clone(), bad)]).is_err(),
+                "scale {bad} must be rejected"
+            );
+        }
+        // Classifier adapters cannot stack.
+        let cls = LoraAdapterWeights::new_classifier_for_testing(
+            vec![0.0; 2],
+            None,
+            vec!["class".into()],
+        );
+        assert!(
+            LoraAdapterWeights::compose(&[(good.clone(), 1.0), (cls, 1.0)]).is_err(),
+            "classifier in stack must be rejected"
+        );
+        // (k, d) disagreement on a shared target.
+        let other_k = adapter_for(0, LoraTarget::AttnQ, 4, 8, 1);
+        assert!(
+            LoraAdapterWeights::compose(&[(good.clone(), 1.0), (other_k, 1.0)]).is_err(),
+            "k mismatch must be rejected"
+        );
+        // Dense vs per-expert mix on one target.
+        let expert = adapter_for(0, LoraTarget::FfnGateExps, 4, 4, 2);
+        let dense_gate = direct_adapter(
+            0,
+            LoraTarget::FfnGateExps,
+            vec![0.5; 2 * 4],
+            vec![0.5; 4 * 2],
+            2,
+            4,
+            4,
+            2.0,
+        );
+        assert!(
+            LoraAdapterWeights::compose(&[(expert.clone(), 1.0), (dense_gate, 1.0)]).is_err(),
+            "dense/expert mix must be rejected"
+        );
+        // Expert-count disagreement.
+        let three = adapter_for(0, LoraTarget::FfnGateExps, 4, 4, 3);
+        assert!(
+            LoraAdapterWeights::compose(&[(expert, 1.0), (three, 1.0)]).is_err(),
+            "expert-count mismatch must be rejected"
+        );
+        // Merged rank overflow (MAX_LORA_RANK = 512).
+        let big = |v: f32| {
+            direct_adapter(
+                0,
+                LoraTarget::AttnQ,
+                vec![v; 300 * 4],
+                vec![v; 4 * 300],
+                300,
+                4,
+                4,
+                300.0,
+            )
+        };
+        assert!(
+            LoraAdapterWeights::compose(&[(big(0.1), 1.0), (big(0.2), 1.0)]).is_err(),
+            "600-wide merged rank must be rejected"
+        );
+        // Factor-scaled B product overflowing f32 from finite inputs.
+        let huge = direct_adapter(0, LoraTarget::AttnQ, vec![1.0], vec![1e30], 1, 1, 1, 1e10);
+        let err = LoraAdapterWeights::compose(&[(huge, 2.0)])
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-finite"), "{err}");
+    }
+
+    #[test]
+    fn compose_opt_maps_empty_stack_to_none() {
+        // The shared empty-stack mapping behind `Session::set_lora_adapters`
+        // and the FFI/WASM compose helpers: detach / base model, no adapter.
+        assert!(LoraAdapterWeights::compose_opt(&[]).unwrap().is_none());
+        let good = adapter_for(0, LoraTarget::AttnQ, 8, 8, 1);
+        assert!(
+            LoraAdapterWeights::compose_opt(&[(good, 1.0)])
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn compose_skips_zero_fold_parts() {
+        // A zero fold (nonzero runtime scale times a zero loaded scale) is an
+        // exact no-op like a zero runtime scale: the target stays untouched
+        // rather than merging zero columns (which would consume merged rank
+        // and, via the pinned 1.0 scale, defeat apply's -0.0-preserving
+        // zero-skip).
+        let zero_scale = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1.0; 4],
+            vec![2.0; 4],
+            2,
+            2,
+            2,
+            0.0,
+        );
+        let merged = LoraAdapterWeights::compose(&[(zero_scale.clone(), 2.0)]).unwrap();
+        assert!(merged.get(0, LoraTarget::AttnQ).is_none());
+        // Same at unit scale: the passthrough must not bypass the merge's
+        // all-zero drop (it would keep a target the merge deletes).
+        let merged = LoraAdapterWeights::compose(&[(zero_scale, 1.0)]).unwrap();
+        assert!(merged.get(0, LoraTarget::AttnQ).is_none());
+        // Alongside a live entry the zero part contributes no rank.
+        let live = adapter_for(0, LoraTarget::AttnQ, 8, 8, 1);
+        let zero_wide = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1.0; 16],
+            vec![2.0; 16],
+            2,
+            8,
+            8,
+            0.0,
+        );
+        let merged = LoraAdapterWeights::compose(&[(live, 1.0), (zero_wide, 1.0)]).unwrap();
+        // `adapter_for` builds rank 2; unskipped the merge would be rank 4.
+        assert_eq!(merged.get(0, LoraTarget::AttnQ).unwrap().rank, 2);
+    }
+
+    /// One-layer adapter carrying a 2-expert `FfnGateExps` delta with the
+    /// given loaded `alpha` (scale `alpha / rank`).
+    fn expert_adapter(alpha: f32) -> Arc<LoraAdapterWeights> {
+        let experts: Vec<LoraTargetWeights> = (0..2)
+            .map(|_| {
+                LoraTargetWeights::new(vec![1.0; 16], 2, 8, vec![2.0; 32], 16, 2, alpha).unwrap()
+            })
+            .collect();
+        let mut layers = vec![LoraLayer::default()];
+        layers[0].targets[LoraTarget::FfnGateExps.index()] = Some(TargetDelta::Experts(experts));
+        Arc::new(LoraAdapterWeights {
+            layers,
+            default_scale: alpha / 2.0,
+            classifier_weight: None,
+            classifier_bias: None,
+            class_labels: Vec::new(),
+            num_classes: 0,
+        })
+    }
+
+    #[test]
+    fn compose_all_zero_fold_experts_leave_the_target_untouched() {
+        // Expert twin of `compose_skips_zero_fold_parts`: when every expert
+        // folds to zero the target stays untouched instead of manufacturing
+        // all-zero experts, as otherwise the no-op stack still trips
+        // `has_moe_deltas` (refusing install on backends without routed-FFN
+        // hooks) and install-time validation of the guessed dims.
+        let merged = LoraAdapterWeights::compose(&[(expert_adapter(0.0), 2.0)]).unwrap();
+        assert!(merged.layers[0].targets[LoraTarget::FfnGateExps.index()].is_none());
+        assert!(!merged.has_moe_deltas());
+        // Same at unit scale: the passthrough must not bypass the merge's
+        // all-zero drop (it would keep a target the merge deletes, and the
+        // no-op stack would still trip `has_moe_deltas`).
+        let merged = LoraAdapterWeights::compose(&[(expert_adapter(0.0), 1.0)]).unwrap();
+        assert!(merged.layers[0].targets[LoraTarget::FfnGateExps.index()].is_none());
+        assert!(!merged.has_moe_deltas());
+        // Mixed with a live entry the zero parts contribute no rank, and the
+        // target stays live.
+        let merged =
+            LoraAdapterWeights::compose(&[(expert_adapter(0.0), 1.0), (expert_adapter(2.0), 1.0)])
+                .unwrap();
+        assert!(merged.has_moe_deltas());
+        for e in 0..2 {
+            assert_eq!(
+                merged
+                    .get_expert(0, LoraTarget::FfnGateExps, e)
+                    .unwrap()
+                    .rank,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn compose_skips_zero_scale_classifier() {
+        // Zero-scale entries are skipped before target checks, so a
+        // zeroed-out classifier is an exact no-op, not a stack error.
+        let good = adapter_for(0, LoraTarget::AttnQ, 8, 8, 1);
+        let cls = LoraAdapterWeights::new_classifier_for_testing(
+            vec![0.0; 2],
+            None,
+            vec!["class".into()],
+        );
+        let merged = LoraAdapterWeights::compose(&[(good.clone(), 1.0), (cls, 0.0)]).unwrap();
+        let baseline = LoraAdapterWeights::compose(&[(good, 1.0)]).unwrap();
+        let t = merged.get(0, LoraTarget::AttnQ).unwrap();
+        let u = baseline.get(0, LoraTarget::AttnQ).unwrap();
+        assert_eq!((&t.a, &t.b), (&u.a, &u.b));
+        assert!(!merged.is_classifier());
+    }
+
+    #[test]
+    fn compose_single_entry_at_unit_scale_returns_the_adapter() {
+        let a = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![1., 2., 3., 4.],
+            vec![1., 1., 1.],
+            1,
+            4,
+            3,
+            1.0,
+        );
+        // Zero-scale siblings don't disturb the fast path: the result IS the
+        // live adapter (same allocation, not a copy).
+        let zero = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![9., 9., 9., 9.],
+            vec![9., 9., 9.],
+            1,
+            4,
+            3,
+            1.0,
+        );
+        let merged = LoraAdapterWeights::compose(&[(zero, 0.0), (a.clone(), 1.0)]).unwrap();
+        assert!(Arc::ptr_eq(&merged, &a));
+        // A non-unit scale still merges into a fresh copy with folded factors.
+        let scaled = LoraAdapterWeights::compose(&[(a.clone(), 0.5)]).unwrap();
+        assert!(!Arc::ptr_eq(&scaled, &a));
+        let t = scaled.get(0, LoraTarget::AttnQ).unwrap();
+        assert_eq!(t.b, vec![0.5, 0.5, 0.5]);
+        // Labels attached to a generative adapter fall through to the merge,
+        // which strips them like any other stack.
+        let labeled = a.clone().with_class_labels(vec!["x".into()]);
+        let stripped = LoraAdapterWeights::compose(&[(labeled, 1.0)]).unwrap();
+        assert!(stripped.class_labels.is_empty());
+        assert_eq!(stripped.num_classes(), 0);
+    }
+
+    #[test]
+    fn compose_merges_per_expert_deltas_indexwise() {
+        let e1 = adapter_for(0, LoraTarget::FfnGateExps, 4, 4, 2);
+        let e2 = adapter_for(0, LoraTarget::FfnGateExps, 4, 4, 2);
+        let merged = LoraAdapterWeights::compose(&[(e1, 1.0), (e2, 0.5)]).unwrap();
+        assert!(merged.has_moe_deltas());
+        (0..2).for_each(|e| {
+            let t = merged.get_expert(0, LoraTarget::FfnGateExps, e).unwrap();
+            assert_eq!((t.rank, t.k, t.d), (4, 4, 4));
+            assert_eq!(t.scale, 1.0);
+        });
+        // A dense accessor must not see through to expert deltas.
+        assert!(merged.get(0, LoraTarget::FfnGateExps).is_none());
     }
 }

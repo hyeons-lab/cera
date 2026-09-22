@@ -76,6 +76,11 @@ impl Model for StateModel {
     fn config(&self) -> &ModelConfig {
         &self.config
     }
+    // Tests attach adapters to this mock; the forwards never read them, but
+    // install-path tests need the gate open.
+    fn supports_lora(&self) -> bool {
+        true
+    }
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(pos, state.seq_len);
         self.calls.lock().unwrap().push((pos, tokens.to_vec()));

@@ -443,20 +443,17 @@ export class ChatSession {
     [Symbol.dispose](): void;
     /**
      * Flip the cancel atomic, requesting that any in-flight turn exit at its next checkpoint.
+     * Call only between operations; do not re-enter this Chat handle from its callback.
      */
     cancel(): void;
-    /**
-     * Clear pending cancellation without dropping conversation state.
-     */
-    clearCancel(): void;
     /**
      * Export the current chat session checkpoint as binary bytes.
      */
     checkpoint(): Uint8Array;
     /**
-     * Restore a chat session from binary checkpoint bytes.
+     * Clear pending cancellation without dropping conversation state.
      */
-    restore(data: Uint8Array): void;
+    clearCancel(): void;
     /**
      * Execute a turn to completion, returning the assistant response.
      */
@@ -467,6 +464,14 @@ export class ChatSession {
     completeJson(opts: GenerateOpts, schema_json: string): TurnResult;
     /**
      * Stream generated text tokens into a callback, returning the final turn result.
+     *
+     * If the callback throws, generation is cancelled and this returns a
+     * `"stream callback failed"` error with the cancel latch left armed: call
+     * `clearCancel()` before the next turn or it will cancel immediately,
+     * then reset or replace messages if the turn was interrupted.
+     *
+     * Do not call back into this handle from `on_token` (including `cancel()`):
+     * generation holds a mutable borrow and re-entry will panic.
      */
     generateStreaming(opts: GenerateOpts, on_token: Function): TurnResult;
     /**
@@ -503,6 +508,10 @@ export class ChatSession {
      * Drop accumulated turn state and return to SessionPhase::Idle.
      */
     reset(): void;
+    /**
+     * Restore a chat session from binary checkpoint bytes.
+     */
+    restore(data: Uint8Array): void;
     /**
      * Set the tool wire format explicitly.
      */
@@ -619,6 +628,14 @@ export class GenerateOpts {
      */
     repetitionPenalty: number;
     /**
+     * Per-request RNG seed. Setting a seed restarts the sampler's RNG when
+     * the call starts (KV and position are untouched); `undefined` (default)
+     * continues the session's existing RNG stream. Does not change the
+     * session default; `reset()` still rebuilds from the session seed.
+     */
+    get seed(): bigint | undefined;
+    set seed(value: bigint | null | undefined);
+    /**
      * Token IDs that, if produced, end decoding with
      * `finishReason = "Stop"`. Empty by default.
      */
@@ -734,6 +751,41 @@ export class LoraAdapters {
      * Number of `(layer, target)` low-rank deltas the adapter carries.
      */
     targetCount(): number;
+}
+
+/**
+ * A runtime-scaled LoRA stack under construction: push `(adapter, scale)`
+ * entries, then hand the finished stack to `Session.setLoraAdapters` or one
+ * of the per-call `hiddenStates*WithAdapters` overrides. Contributions stack
+ * per target; entry scales must be finite (zero entries are skipped as an
+ * exact no-op when the stack composes).
+ *
+ * A builder instead of a plain `{adapter, scale}[]` array because the
+ * boundary cannot express that: wasm-bindgen generates `JsCast` only for
+ * imported types (never for an exported struct nested in a plain JS
+ * object), and `Vec<T>` arguments only support primitives. Each adapter
+ * therefore crosses as a typed `&LoraAdapters` parameter to `push`, and the
+ * stack itself crosses the same way. Build once, reuse across calls: every
+ * consumer takes `&LoraStack` by reference.
+ */
+export class LoraStack {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * A new, empty stack. An empty stack detaches in `setLoraAdapters` and
+     * selects the base model in the per-call overrides.
+     */
+    constructor();
+    /**
+     * Push one `(adapter, scale)` entry. The scale must be finite as an
+     * `f32` (magnitudes above `f32::MAX` count as infinite); a bad scale
+     * throws and the stack is left unchanged.
+     */
+    push(adapter: LoraAdapters, scale: number): void;
+    /**
+     * Number of entries pushed so far.
+     */
+    readonly length: number;
 }
 
 /**
@@ -894,14 +946,13 @@ export class SamplingDefaults {
  * `generate`, the worker's own `onmessage` handler can't run -
  * incoming `postMessage({kind:'cancel'})` queues but doesn't
  * dispatch until `generate` returns, so a flag set by that
- * handler can't be updated mid-decode. To cancel during a
- * running `generate` call, either call `session.cancel()` from inside
- * the token callback based on state it can observe directly
- * (elapsed time, token budget, accumulated content), or use
- * cross-thread shared memory signalling (`SharedArrayBuffer` +
- * `Atomics`) - see `cera-wasm/README.md` for the full
- * `SharedArrayBuffer` pattern, which requires cross-origin
- * isolation in browsers.
+ * handler can't be updated mid-decode. Do not call `session.cancel()` or
+ * otherwise re-enter this handle from a callback: generation holds a mutable
+ * WASM borrow, and recursive access can leave the handle unusable. A shared
+ * JS flag does not bypass that restriction. Set cancellation between calls,
+ * bound decode work with `maxTokens`, or terminate the worker and recreate its
+ * execution state. The independent cancellation handle on browser WebGPU is
+ * a separate API; see `cera-wasm/README.md`.
  */
 export class Session {
     private constructor();
@@ -980,12 +1031,14 @@ export class Session {
     /**
      * Flip the cancel atomic, requesting that any in-flight
      * `generate` call exit at its next checkpoint with
-     * `finishReason = "Cancelled"`. Safe to call from any thread
-     * (including a Worker that owns this session, though wasm
-     * without SharedArrayBuffer makes cross-thread sharing
-     * unusual).
+     * `finishReason = "Cancelled"`. Call only between operations; a callback
+     * cannot re-enter this handle while generation holds its mutable WASM borrow.
      */
     cancel(): void;
+    /**
+     * Export the current session checkpoint as binary bytes.
+     */
+    checkpoint(): Uint8Array;
     /**
      * Clear the cancel flag without dropping any session state.
      * Use this after observing a cancellation signal; either a
@@ -1010,14 +1063,6 @@ export class Session {
      */
     clearCancel(): void;
     /**
-     * Export the current session checkpoint as binary bytes.
-     */
-    checkpoint(): Uint8Array;
-    /**
-     * Restore an inference session from binary checkpoint bytes.
-     */
-    restore(data: Uint8Array): void;
-    /**
      * Decode tokens until `opts.maxTokens`, a stop token, EOS, or
      * `cancel()` fires. The `onTextTokens` callback is invoked once
      * per flush boundary with a `Uint32Array` of the latest tokens
@@ -1036,15 +1081,20 @@ export class Session {
     hasLora(): boolean;
     /**
      * Model hidden dimension `D`: reshape a `[T*D]` hidden-states buffer into
-     * `[T][D]` with this. Reads a cached field (set at construction), so (unlike
-     * the `&mut self` compute methods) it is safe to call from inside a `generate`
-     * callback without a wasm-bindgen borrow panic.
+     * `[T][D]` with this. Read and cache the dimension before generation. Even
+     * though the field is cached, this exported getter borrows the WASM handle
+     * and must not be called from a `generate` callback.
      */
     hiddenSize(): number;
     /**
      * Tokenize `text` and return its per-token hidden states as a `Float32Array`.
      */
     hiddenStatesForText(text: string): Float32Array;
+    /**
+     * Like `hiddenStatesForText` with the per-call adapter stack of
+     * `hiddenStatesForTokensWithAdapters`.
+     */
+    hiddenStatesForTextWithAdapters(text: string, stack: LoraStack): Float32Array;
     /**
      * Per-token last-layer hidden states (post-final-RMSNorm, the llama.cpp
      * `--pooling none` vector) for `tokens`, as a `Float32Array` of length
@@ -1054,10 +1104,23 @@ export class Session {
      */
     hiddenStatesForTokens(tokens: Uint32Array): Float32Array;
     /**
+     * Like `hiddenStatesForTokens` but with an explicit per-call adapter
+     * stack (see `setLoraAdapters`): entries compose, and an empty
+     * `LoraStack` extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is
+     * untouched. A bad stack throws, never silently.
+     */
+    hiddenStatesForTokensWithAdapters(tokens: Uint32Array, stack: LoraStack): Float32Array;
+    /**
      * Mean-pooled hidden state: a single `Float32Array` of length `hiddenSize`
      * (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
      */
     hiddenStatesMeanPooled(tokens: Uint32Array): Float32Array;
+    /**
+     * Like `hiddenStatesMeanPooled` with the per-call adapter stack of
+     * `hiddenStatesForTokensWithAdapters`.
+     */
+    hiddenStatesMeanPooledWithAdapters(tokens: Uint32Array, stack: LoraStack): Float32Array;
     /**
      * Transfer this session into a conversational `ChatSession`.
      *
@@ -1074,7 +1137,8 @@ export class Session {
      * Drop accumulated state and return the session to a freshly-
      * opened shape. Clears the KV cache, `position`, the last
      * logits, and the cancel flag, then re-seeds the sampler from
-     * the `SessionConfig.seed` originally passed to `newSession`.
+     * the session default (`SessionConfig.seed` as passed to
+     * `newSession`, or the `setSeed` value when one was set).
      *
      * Use this for "clear conversation" UI actions; it skips the
      * per-session setup cost that `engine.newSession(config)`
@@ -1083,11 +1147,11 @@ export class Session {
      * fresh one.
      *
      * Sampler re-seed semantics:
-     * - `SessionConfig.seed = some bigint`: deterministic
+     * - session default = some bigint: deterministic
      *   sessions stay deterministic across `reset()`; the next
      *   `generate` produces the same first token sequence as the
      *   original.
-     * - `SessionConfig.seed = null`: the sampler picks a new
+     * - session default unset: the sampler picks a new
      *   random seed on each `reset()`, so successive
      *   conversations decorrelate.
      *
@@ -1097,6 +1161,10 @@ export class Session {
      */
     reset(): void;
     /**
+     * Restore an inference session from binary checkpoint bytes.
+     */
+    restore(data: Uint8Array): void;
+    /**
      * Set the session-default cap on the longest side of an appended
      * image, in pixels. `null` clears it (no cap).
      *
@@ -1104,6 +1172,23 @@ export class Session {
      * `maxLongSize`. A per-call value always wins.
      */
     setImageMaxLongSize(max_long_size?: number | null): void;
+    /**
+     * Replace the attached adapter set with a runtime-scaled [`LoraStack`]:
+     * contributions stack per target. An empty stack detaches (same as
+     * `removeLora`). A non-empty stack whose entries are all zero-scale
+     * installs a no-op adapter instead, so `hasLora` stays true while
+     * applying nothing. The swap is atomic: a bad stack leaves the
+     * previous set untouched. Like `attachLora`, only tokens processed
+     * after the call are affected.
+     */
+    setLoraAdapters(stack: LoraStack): void;
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (`undefined` re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     */
+    setSeed(seed?: bigint | null): void;
     /**
      * Modality capability flags reported by the model backing
      * this session. Same shape as `CeraEngine.capabilities`;
@@ -1492,6 +1577,10 @@ export class WebGpuSession {
     appendTokens(ids: Uint32Array): void;
     cancel(): void;
     cancelHandle(): WebGpuCancelHandle;
+    /**
+     * Export the current session checkpoint as binary bytes.
+     */
+    checkpoint(): Promise<Uint8Array>;
     clearCancel(): void;
     /**
      * Async constructor: initialize WebGPU (`requestAdapter` /
@@ -1564,6 +1653,10 @@ export class WebGpuSession {
      */
     static createWithParts(bytes: Uint8Array, mmproj: Uint8Array, context_size?: number | null, kv_compression?: TurboQuantConfig | null): Promise<WebGpuSession>;
     /**
+     * Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
+     */
+    exportCheckpoint(): Promise<Uint8Array>;
+    /**
      * Load a published LeapBundle by id and quantization onto the GPU,
      * downloading through `repo` and reusing whatever it already cached.
      *
@@ -1622,31 +1715,32 @@ export class WebGpuSession {
      */
     generateTokens(tokens: Uint32Array, max_tokens: number, temperature: number | null | undefined, top_p: number | null | undefined, top_k: number | null | undefined, seed: bigint | null | undefined, on_token: Function, on_audio?: Function | null): Promise<string>;
     /**
+     * Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
+     */
+    importCheckpoint(data: Uint8Array): void;
+    /**
      * Reset the session in-place, clearing GPU convolution rolling buffers,
-     * resetting sequence counter to zero, and rebuilding fresh CPU state.
+     * resetting sequence counter to zero, rebuilding fresh CPU state,
+     * and dropping the stochastic sampler (the next unseeded call starts
+     * from the session default, or fresh entropy when unset).
      */
     reset(): void;
-    /**
-     * Export the current session checkpoint as binary bytes.
-     */
-    checkpoint(): Promise<Uint8Array>;
-    /**
-     * Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
-     */
-    exportCheckpoint(): Promise<Uint8Array>;
     /**
      * Restore an inference session from binary checkpoint bytes.
      */
     restore(data: Uint8Array): void;
     /**
-     * Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
-     */
-    importCheckpoint(data: Uint8Array): void;
-    /**
      * Set the session-default cap on an appended image's longest side in
      * pixels; `null` clears it. A per-call `maxLongSize` still wins.
      */
     setImageMaxLongSize(max_long_size?: number | null): void;
+    /**
+     * Replace the session-default sampler seed and restart the RNG from
+     * it on the next stochastic call (`undefined` re-seeds from entropy).
+     * KV and position are untouched, so this is safe on a primed
+     * session. Persists across `reset()`, unlike a per-request seed.
+     */
+    setSeed(seed?: bigint | null): void;
     /**
      * Adapter + backend description of the WebGPU device (e.g.
      * `"… (BrowserWebGpu)"`). Useful for confirming the GPU path is live.
@@ -1709,6 +1803,7 @@ export class WebGpuSession {
      * CPU one:
      *
      * ```js
+     * // Frame the initial prompt on a fresh or reset session.
      * const tk = session.tokenizer;
      * // A real array, not JSON: `applyChatTemplate` type-checks its
      * // argument and rejects a string with "messages must be an array".
@@ -1721,7 +1816,9 @@ export class WebGpuSession {
      * if (tk.addBosToken && tk.bosToken != null && ids[0] !== tk.bosToken) {
      *   ids.unshift(tk.bosToken);
      * }
-     * await session.generateTokens(new Uint32Array(ids), 128, onToken);
+     * await session.generateTokens(
+     *   new Uint32Array(ids), 128, 0, undefined, undefined, undefined, onToken, undefined,
+     * );
      * ```
      *
      * The returned handle shares this session's tokenizer rather than
@@ -1823,41 +1920,41 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_bundlerepo_free: (a: number, b: number) => void;
-    readonly bundlerepo_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
-    readonly bundlerepo_cacheSize: (a: number) => any;
-    readonly bundlerepo_clearCache: (a: number) => any;
-    readonly bundlerepo_download: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
-    readonly bundlerepo_isCached: (a: number, b: number, c: number) => any;
-    readonly bundlerepo_new: (a: number, b: number) => [number, number, number];
-    readonly bundlerepo_remove: (a: number, b: number, c: number) => any;
-    readonly bundlerepo_storeDir: (a: number) => [number, number];
-    readonly bundlerepo_text: (a: number, b: number, c: number) => any;
-    readonly listLeapBundles: () => any;
-    readonly persistStorage: () => any;
+    readonly __wbg_ceraengine_free: (a: number, b: number) => void;
+    readonly __wbg_chatsession_free: (a: number, b: number) => void;
+    readonly __wbg_generateopts_free: (a: number, b: number) => void;
+    readonly __wbg_generatesummary_free: (a: number, b: number) => void;
+    readonly __wbg_generationdefaults_free: (a: number, b: number) => void;
     readonly __wbg_generativemodel_free: (a: number, b: number) => void;
-    readonly __wbg_get_loadconfig_backend: (a: number) => [number, number];
+    readonly __wbg_get_loadconfig_backend: (a: number, b: number) => void;
     readonly __wbg_get_loadconfig_context_size: (a: number) => number;
-    readonly __wbg_get_loadconfig_draft_model: (a: number) => [number, number];
+    readonly __wbg_get_loadconfig_draft_model: (a: number, b: number) => void;
     readonly __wbg_get_loadconfig_gpu_depthformer: (a: number) => number;
-    readonly __wbg_get_modelparts_audio_decoder: (a: number) => [number, number];
-    readonly __wbg_get_modelparts_audio_tokenizer: (a: number) => [number, number];
-    readonly __wbg_get_modelparts_chat_template: (a: number) => [number, number];
-    readonly __wbg_get_modelparts_draft_model: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_audio_decoder: (a: number, b: number) => void;
+    readonly __wbg_get_modelparts_audio_tokenizer: (a: number, b: number) => void;
+    readonly __wbg_get_modelparts_chat_template: (a: number, b: number) => void;
+    readonly __wbg_get_modelparts_draft_model: (a: number, b: number) => void;
     readonly __wbg_get_modelparts_generation_defaults: (a: number) => number;
-    readonly __wbg_get_modelparts_inference_type: (a: number) => [number, number];
-    readonly __wbg_get_modelparts_model: (a: number) => [number, number];
-    readonly __wbg_get_modelparts_multimodal_projector: (a: number) => [number, number];
+    readonly __wbg_get_modelparts_inference_type: (a: number, b: number) => void;
+    readonly __wbg_get_modelparts_model: (a: number, b: number) => void;
+    readonly __wbg_get_modelparts_multimodal_projector: (a: number, b: number) => void;
     readonly __wbg_get_samplingdefaults_min_p: (a: number) => number;
     readonly __wbg_get_samplingdefaults_repetition_penalty: (a: number) => number;
     readonly __wbg_get_samplingdefaults_temperature: (a: number) => number;
     readonly __wbg_get_samplingdefaults_top_k: (a: number) => number;
     readonly __wbg_get_samplingdefaults_top_p: (a: number) => number;
+    readonly __wbg_ingestsummary_free: (a: number, b: number) => void;
     readonly __wbg_loadconfig_free: (a: number, b: number) => void;
+    readonly __wbg_loraadapters_free: (a: number, b: number) => void;
+    readonly __wbg_lorastack_free: (a: number, b: number) => void;
+    readonly __wbg_manifest_free: (a: number, b: number) => void;
     readonly __wbg_modelhandle_free: (a: number, b: number) => void;
     readonly __wbg_modelloader_free: (a: number, b: number) => void;
     readonly __wbg_modelparts_free: (a: number, b: number) => void;
     readonly __wbg_modelsource_free: (a: number, b: number) => void;
     readonly __wbg_samplingdefaults_free: (a: number, b: number) => void;
+    readonly __wbg_session_free: (a: number, b: number) => void;
+    readonly __wbg_sessionconfig_free: (a: number, b: number) => void;
     readonly __wbg_set_loadconfig_backend: (a: number, b: number, c: number) => void;
     readonly __wbg_set_loadconfig_context_size: (a: number, b: number) => void;
     readonly __wbg_set_loadconfig_draft_model: (a: number, b: number, c: number) => void;
@@ -1875,110 +1972,72 @@ export interface InitOutput {
     readonly __wbg_set_samplingdefaults_temperature: (a: number, b: number) => void;
     readonly __wbg_set_samplingdefaults_top_k: (a: number, b: number) => void;
     readonly __wbg_set_samplingdefaults_top_p: (a: number, b: number) => void;
-    readonly generativemodel_createSession: (a: number, b: number) => [number, number, number];
-    readonly generativemodel_engine: (a: number) => number;
-    readonly loadconfig_new: (a: number, b: number, c: number) => number;
-    readonly modelhandle_asGenerative: (a: number) => number;
-    readonly modelhandle_kind: (a: number) => [number, number];
-    readonly modelloader_build: (a: number) => [number, number, number];
-    readonly modelloader_buildGenerative: (a: number) => [number, number, number];
-    readonly modelloader_new: (a: number, b: number) => number;
-    readonly modelparts_new: (a: number, b: number) => number;
-    readonly modelsource_bytes: (a: number, b: number) => number;
-    readonly modelsource_parts: (a: number) => number;
-    readonly samplingdefaults_new: () => number;
-    readonly __wbg_webgpucancelhandle_free: (a: number, b: number) => void;
-    readonly __wbg_webgpusession_free: (a: number, b: number) => void;
-    readonly webgpucancelhandle_cancel: (a: number) => void;
-    readonly webgpucancelhandle_clearCancel: (a: number) => void;
-    readonly webgpusession_adapter: (a: number) => [number, number];
-    readonly webgpusession_appendAudio: (a: number, b: number, c: number, d: number) => [number, number];
-    readonly webgpusession_appendImage: (a: number, b: number, c: number, d: number) => any;
-    readonly webgpusession_appendTokens: (a: number, b: number, c: number) => [number, number];
-    readonly webgpusession_audioIn: (a: number) => number;
-    readonly webgpusession_audioOut: (a: number) => number;
-    readonly webgpusession_cancel: (a: number) => void;
-    readonly webgpusession_cancelHandle: (a: number) => number;
-    readonly webgpusession_capabilities: (a: number) => any;
-    readonly webgpusession_clearCancel: (a: number) => void;
-    readonly webgpusession_create: (a: number, b: number, c: number, d: number) => any;
-    readonly webgpusession_createWithParts: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
-    readonly webgpusession_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => any;
-    readonly webgpusession_generate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: any) => any;
-    readonly webgpusession_generateTokens: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: any, k: number) => any;
-    readonly webgpusession_imageIn: (a: number) => number;
-    readonly webgpusession_kvCompression: (a: number) => [number, number];
-    readonly webgpusession_position: (a: number) => number;
-    readonly webgpusession_reset: (a: number) => [number, number];
-    readonly webgpusession_setImageMaxLongSize: (a: number, b: number) => void;
-    readonly webgpusession_tokenizer: (a: number) => number;
-    readonly __wbg_generationdefaults_free: (a: number, b: number) => void;
-    readonly generationdefaults_audio: (a: number, b: number, c: number, d: number) => number;
-    readonly generationdefaults_other: (a: number, b: number) => number;
-    readonly generationdefaults_text: (a: number) => number;
-    readonly generationdefaults_toJson: (a: number) => [number, number, number, number];
-    readonly __wbg_ceraengine_free: (a: number, b: number) => void;
-    readonly __wbg_chatsession_free: (a: number, b: number) => void;
-    readonly __wbg_generateopts_free: (a: number, b: number) => void;
-    readonly __wbg_generatesummary_free: (a: number, b: number) => void;
-    readonly __wbg_ingestsummary_free: (a: number, b: number) => void;
-    readonly __wbg_loraadapters_free: (a: number, b: number) => void;
-    readonly __wbg_manifest_free: (a: number, b: number) => void;
-    readonly __wbg_session_free: (a: number, b: number) => void;
-    readonly __wbg_sessionconfig_free: (a: number, b: number) => void;
     readonly __wbg_tokenizer_free: (a: number, b: number) => void;
     readonly __wbg_turboquantconfig_free: (a: number, b: number) => void;
     readonly __wbg_turnresult_free: (a: number, b: number) => void;
-    readonly ceraVersion: () => [number, number];
+    readonly __wbg_webgpucancelhandle_free: (a: number, b: number) => void;
+    readonly __wbg_webgpusession_free: (a: number, b: number) => void;
+    readonly bundlerepo_bytes: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly bundlerepo_cacheSize: (a: number) => number;
+    readonly bundlerepo_clearCache: (a: number) => number;
+    readonly bundlerepo_download: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly bundlerepo_isCached: (a: number, b: number, c: number) => number;
+    readonly bundlerepo_new: (a: number, b: number, c: number) => void;
+    readonly bundlerepo_remove: (a: number, b: number, c: number) => number;
+    readonly bundlerepo_storeDir: (a: number, b: number) => void;
+    readonly bundlerepo_text: (a: number, b: number, c: number) => number;
+    readonly ceraVersion: (a: number) => void;
     readonly ceraengine_addBosToken: (a: number) => number;
     readonly ceraengine_addEosToken: (a: number) => number;
-    readonly ceraengine_architecture: (a: number) => [number, number];
-    readonly ceraengine_capabilities: (a: number) => any;
+    readonly ceraengine_architecture: (a: number, b: number) => void;
+    readonly ceraengine_capabilities: (a: number) => number;
     readonly ceraengine_contextSize: (a: number) => number;
     readonly ceraengine_defaultGenerateOpts: (a: number) => number;
-    readonly ceraengine_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
-    readonly ceraengine_fromGgufBytes: (a: number, b: number, c: number) => [number, number, number];
-    readonly ceraengine_fromGgufParts: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
-    readonly ceraengine_fromManifestUrl: (a: number, b: number, c: number, d: number, e: number) => any;
+    readonly ceraengine_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => number;
+    readonly ceraengine_fromGgufBytes: (a: number, b: number, c: number, d: number) => void;
+    readonly ceraengine_fromGgufParts: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly ceraengine_fromManifestUrl: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly ceraengine_hasChatTemplate: (a: number) => number;
     readonly ceraengine_maxSeqLen: (a: number) => number;
-    readonly ceraengine_metadata: (a: number) => any;
-    readonly ceraengine_newChatSession: (a: number, b: number) => [number, number, number];
-    readonly ceraengine_newSession: (a: number, b: number) => [number, number, number];
-    readonly ceraengine_quantization: (a: number) => [number, number];
+    readonly ceraengine_metadata: (a: number) => number;
+    readonly ceraengine_newChatSession: (a: number, b: number, c: number) => void;
+    readonly ceraengine_newSession: (a: number, b: number, c: number) => void;
+    readonly ceraengine_quantization: (a: number, b: number) => void;
     readonly ceraengine_tokenizer: (a: number) => number;
     readonly ceraengine_toolCallStartToken: (a: number, b: number) => number;
     readonly ceraengine_toolFormat: (a: number) => number;
-    readonly ceraengine_transcribe: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly ceraengine_transcribe: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly ceraengine_vocabSize: (a: number) => number;
-    readonly chatsession_cancel: (a: number) => [number, number];
-    readonly chatsession_capabilities: (a: number) => [number, number, number];
-    readonly chatsession_clearCancel: (a: number) => [number, number];
-    readonly chatsession_complete: (a: number, b: number) => [number, number, number];
-    readonly chatsession_completeJson: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly chatsession_generateStreaming: (a: number, b: number, c: any) => [number, number, number];
-    readonly chatsession_generateStreamingJson: (a: number, b: number, c: number, d: number, e: any) => [number, number, number];
+    readonly chatsession_cancel: (a: number, b: number) => void;
+    readonly chatsession_capabilities: (a: number, b: number) => void;
+    readonly chatsession_checkpoint: (a: number, b: number) => void;
+    readonly chatsession_clearCancel: (a: number, b: number) => void;
+    readonly chatsession_complete: (a: number, b: number, c: number) => void;
+    readonly chatsession_completeJson: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly chatsession_generateStreaming: (a: number, b: number, c: number, d: number) => void;
+    readonly chatsession_generateStreamingJson: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly chatsession_hiddenSize: (a: number) => number;
-    readonly chatsession_ingest: (a: number, b: any) => [number, number, number];
-    readonly chatsession_ingestMessages: (a: number, b: any) => [number, number, number];
-    readonly chatsession_ingestToolResponse: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
-    readonly chatsession_intoSession: (a: number) => [number, number, number];
-    readonly chatsession_new: (a: number) => [number, number, number];
-    readonly chatsession_phase: (a: number) => [number, number, number, number];
-    readonly chatsession_position: (a: number) => [number, number, number];
-    readonly chatsession_replaceMessages: (a: number, b: any) => [number, number, number];
-    readonly chatsession_reset: (a: number) => [number, number];
-    readonly chatsession_setToolFormat: (a: number, b: number) => [number, number];
-    readonly chatsession_setTools: (a: number, b: number, c: number) => [number, number];
-    readonly chatsession_toolFormat: (a: number) => [number, number, number];
-    readonly chatsession_tools: (a: number) => [number, number, number, number];
-    readonly cpuBackendReport: () => [number, number];
+    readonly chatsession_ingest: (a: number, b: number, c: number) => void;
+    readonly chatsession_ingestMessages: (a: number, b: number, c: number) => void;
+    readonly chatsession_ingestToolResponse: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly chatsession_intoSession: (a: number, b: number) => void;
+    readonly chatsession_new: (a: number, b: number) => void;
+    readonly chatsession_phase: (a: number, b: number) => void;
+    readonly chatsession_position: (a: number, b: number) => void;
+    readonly chatsession_replaceMessages: (a: number, b: number, c: number) => void;
+    readonly chatsession_reset: (a: number, b: number) => void;
+    readonly chatsession_restore: (a: number, b: number, c: number, d: number) => void;
+    readonly chatsession_setToolFormat: (a: number, b: number, c: number) => void;
+    readonly chatsession_setTools: (a: number, b: number, c: number, d: number) => void;
+    readonly chatsession_toolFormat: (a: number, b: number) => void;
+    readonly chatsession_tools: (a: number, b: number) => void;
+    readonly cpuBackendReport: (a: number) => void;
     readonly detectToolFormat: (a: number, b: number) => number;
     readonly generateopts_clearGrammar: (a: number) => void;
     readonly generateopts_clearSpecDecode: (a: number) => void;
     readonly generateopts_flushEveryMs: (a: number) => number;
     readonly generateopts_flushEveryTokens: (a: number) => number;
-    readonly generateopts_grammarTriggerTokens: (a: number) => [number, number];
+    readonly generateopts_grammarTriggerTokens: (a: number, b: number) => void;
     readonly generateopts_hasGrammar: (a: number) => number;
     readonly generateopts_hasSpecDecode: (a: number) => number;
     readonly generateopts_ignoreEos: (a: number) => number;
@@ -1986,8 +2045,9 @@ export interface InitOutput {
     readonly generateopts_minP: (a: number) => number;
     readonly generateopts_new: () => number;
     readonly generateopts_repetitionPenalty: (a: number) => number;
-    readonly generateopts_setGrammar: (a: number, b: number, c: number) => [number, number];
-    readonly generateopts_setJsonSchema: (a: number, b: number, c: number) => [number, number];
+    readonly generateopts_seed: (a: number, b: number) => void;
+    readonly generateopts_setGrammar: (a: number, b: number, c: number, d: number) => void;
+    readonly generateopts_setJsonSchema: (a: number, b: number, c: number, d: number) => void;
     readonly generateopts_setSpecDecode: (a: number, b: number, c: number) => void;
     readonly generateopts_set_flushEveryMs: (a: number, b: number) => void;
     readonly generateopts_set_flushEveryTokens: (a: number, b: number) => void;
@@ -1996,80 +2056,106 @@ export interface InitOutput {
     readonly generateopts_set_maxTokens: (a: number, b: number) => void;
     readonly generateopts_set_minP: (a: number, b: number) => void;
     readonly generateopts_set_repetitionPenalty: (a: number, b: number) => void;
+    readonly generateopts_set_seed: (a: number, b: number, c: bigint) => void;
     readonly generateopts_set_stopTokens: (a: number, b: number, c: number) => void;
     readonly generateopts_set_temperature: (a: number, b: number) => void;
     readonly generateopts_set_topK: (a: number, b: number) => void;
     readonly generateopts_set_topP: (a: number, b: number) => void;
-    readonly generateopts_stopTokens: (a: number) => [number, number];
+    readonly generateopts_stopTokens: (a: number, b: number) => void;
     readonly generateopts_temperature: (a: number) => number;
     readonly generateopts_topK: (a: number) => number;
     readonly generateopts_topP: (a: number) => number;
-    readonly generateopts_withJsonSchema: (a: number, b: number, c: number) => [number, number, number];
+    readonly generateopts_withJsonSchema: (a: number, b: number, c: number, d: number) => void;
     readonly generatesummary_decodeMs: (a: number) => number;
-    readonly generatesummary_finishReason: (a: number) => [number, number];
+    readonly generatesummary_finishReason: (a: number, b: number) => void;
     readonly generatesummary_promptEvalMs: (a: number) => number;
     readonly generatesummary_promptEvalTokens: (a: number) => number;
     readonly generatesummary_tokensGenerated: (a: number) => number;
+    readonly generationdefaults_audio: (a: number, b: number, c: number, d: number) => number;
+    readonly generationdefaults_other: (a: number, b: number) => number;
+    readonly generationdefaults_text: (a: number) => number;
+    readonly generationdefaults_toJson: (a: number, b: number) => void;
+    readonly generativemodel_createSession: (a: number, b: number, c: number) => void;
+    readonly generativemodel_engine: (a: number) => number;
     readonly ingestsummary_inputTokens: (a: number) => number;
     readonly ingestsummary_positionAfter: (a: number) => number;
     readonly ingestsummary_positionBefore: (a: number) => number;
-    readonly jsonSchemaToGrammar: (a: number, b: number) => [number, number, number, number];
-    readonly loraadapters_fromGgufBytes: (a: number, b: number) => [number, number, number];
-    readonly loraadapters_fromSafetensorsBytes: (a: number, b: number, c: number) => [number, number, number];
+    readonly jsonSchemaToGrammar: (a: number, b: number, c: number) => void;
+    readonly listLeapBundles: () => number;
+    readonly loadconfig_new: (a: number, b: number, c: number) => number;
+    readonly loraadapters_fromGgufBytes: (a: number, b: number, c: number) => void;
+    readonly loraadapters_fromSafetensorsBytes: (a: number, b: number, c: number, d: number) => void;
     readonly loraadapters_targetCount: (a: number) => number;
-    readonly manifest_audioDecoderUrl: (a: number) => [number, number];
-    readonly manifest_audioTokenizerUrl: (a: number) => [number, number];
-    readonly manifest_chatTemplate: (a: number) => [number, number];
-    readonly manifest_draftModelUrl: (a: number) => [number, number];
-    readonly manifest_inferenceType: (a: number) => [number, number];
-    readonly manifest_modelUrl: (a: number) => [number, number];
-    readonly manifest_multimodalProjectorUrl: (a: number) => [number, number];
-    readonly manifest_parse: (a: number, b: number) => [number, number, number];
-    readonly manifest_schemaVersion: (a: number) => [number, number];
-    readonly parseToolCalls: (a: number, b: number, c: number) => [number, number, number, number];
-    readonly session_appendAudio: (a: number, b: number, c: number, d: number) => [number, number];
-    readonly session_appendImage: (a: number, b: number, c: number, d: number) => [number, number];
-    readonly session_appendText: (a: number, b: number, c: number) => [number, number];
-    readonly session_appendTokens: (a: number, b: number, c: number) => [number, number];
-    readonly session_attachLora: (a: number, b: number) => [number, number];
+    readonly lorastack_length: (a: number) => number;
+    readonly lorastack_new: () => number;
+    readonly lorastack_push: (a: number, b: number, c: number, d: number) => void;
+    readonly manifest_audioDecoderUrl: (a: number, b: number) => void;
+    readonly manifest_audioTokenizerUrl: (a: number, b: number) => void;
+    readonly manifest_chatTemplate: (a: number, b: number) => void;
+    readonly manifest_draftModelUrl: (a: number, b: number) => void;
+    readonly manifest_inferenceType: (a: number, b: number) => void;
+    readonly manifest_modelUrl: (a: number, b: number) => void;
+    readonly manifest_multimodalProjectorUrl: (a: number, b: number) => void;
+    readonly manifest_parse: (a: number, b: number, c: number) => void;
+    readonly manifest_schemaVersion: (a: number, b: number) => void;
+    readonly modelhandle_asGenerative: (a: number) => number;
+    readonly modelhandle_kind: (a: number, b: number) => void;
+    readonly modelloader_build: (a: number, b: number) => void;
+    readonly modelloader_buildGenerative: (a: number, b: number) => void;
+    readonly modelloader_new: (a: number, b: number) => number;
+    readonly modelparts_new: (a: number, b: number) => number;
+    readonly modelsource_bytes: (a: number, b: number) => number;
+    readonly modelsource_parts: (a: number) => number;
+    readonly parseToolCalls: (a: number, b: number, c: number, d: number) => void;
+    readonly persistStorage: () => number;
+    readonly samplingdefaults_new: () => number;
+    readonly session_appendAudio: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly session_appendImage: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly session_appendText: (a: number, b: number, c: number, d: number) => void;
+    readonly session_appendTokens: (a: number, b: number, c: number, d: number) => void;
+    readonly session_attachLora: (a: number, b: number, c: number) => void;
     readonly session_cancel: (a: number) => void;
-    readonly session_capabilities: (a: number) => any;
+    readonly session_capabilities: (a: number) => number;
+    readonly session_checkpoint: (a: number, b: number) => void;
     readonly session_clearCancel: (a: number) => void;
-    readonly session_generate: (a: number, b: number, c: any, d: number) => [number, number, number];
+    readonly session_generate: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly session_hasLora: (a: number) => number;
     readonly session_hiddenSize: (a: number) => number;
-    readonly session_hiddenStatesForText: (a: number, b: number, c: number) => [number, number, number];
-    readonly session_hiddenStatesForTokens: (a: number, b: number, c: number) => [number, number, number];
-    readonly session_hiddenStatesMeanPooled: (a: number, b: number, c: number) => [number, number, number];
-    readonly session_intoChat: (a: number) => [number, number, number];
+    readonly session_hiddenStatesForText: (a: number, b: number, c: number, d: number) => void;
+    readonly session_hiddenStatesForTextWithAdapters: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly session_hiddenStatesForTokens: (a: number, b: number, c: number, d: number) => void;
+    readonly session_hiddenStatesForTokensWithAdapters: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly session_hiddenStatesMeanPooled: (a: number, b: number, c: number, d: number) => void;
+    readonly session_hiddenStatesMeanPooledWithAdapters: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly session_position: (a: number) => number;
     readonly session_removeLora: (a: number) => void;
-    readonly session_reset: (a: number) => [number, number];
+    readonly session_reset: (a: number, b: number) => void;
+    readonly session_restore: (a: number, b: number, c: number, d: number) => void;
     readonly session_setImageMaxLongSize: (a: number, b: number) => void;
+    readonly session_setLoraAdapters: (a: number, b: number, c: number) => void;
+    readonly session_setSeed: (a: number, b: number, c: number, d: bigint) => void;
     readonly sessionconfig_kvCompression: (a: number) => number;
     readonly sessionconfig_maxSeqLen: (a: number) => number;
     readonly sessionconfig_nKeep: (a: number) => number;
     readonly sessionconfig_new: () => number;
-    readonly sessionconfig_seed: (a: number) => [number, bigint];
     readonly sessionconfig_set_kvCompression: (a: number, b: number) => void;
     readonly sessionconfig_set_maxSeqLen: (a: number, b: number) => void;
     readonly sessionconfig_set_nKeep: (a: number, b: number) => void;
-    readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
     readonly sessionconfig_set_ubatchSize: (a: number, b: number) => void;
     readonly sessionconfig_ubatchSize: (a: number) => number;
     readonly tokenizer_addBosToken: (a: number) => number;
-    readonly tokenizer_applyChatTemplate: (a: number, b: any, c: number) => [number, number, number, number];
-    readonly tokenizer_applyChatTemplateWithTools: (a: number, b: any, c: number, d: number, e: number) => [number, number, number, number];
+    readonly tokenizer_applyChatTemplate: (a: number, b: number, c: number, d: number) => void;
+    readonly tokenizer_applyChatTemplateWithTools: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly tokenizer_bosToken: (a: number) => number;
-    readonly tokenizer_chatTemplate: (a: number) => [number, number];
-    readonly tokenizer_decode: (a: number, b: number, c: number) => [number, number];
-    readonly tokenizer_encode: (a: number, b: number, c: number) => [number, number];
-    readonly tokenizer_encodeSpecial: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly tokenizer_chatTemplate: (a: number, b: number) => void;
+    readonly tokenizer_decode: (a: number, b: number, c: number, d: number) => void;
+    readonly tokenizer_encode: (a: number, b: number, c: number, d: number) => void;
+    readonly tokenizer_encodeSpecial: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly tokenizer_eosToken: (a: number) => number;
     readonly tokenizer_isSpecialToken: (a: number, b: number) => number;
     readonly tokenizer_specialTokenId: (a: number, b: number, c: number) => number;
     readonly tokenizer_vocabSize: (a: number) => number;
-    readonly toolGrammar: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly toolGrammar: (a: number, b: number, c: number, d: number) => void;
     readonly turboquantconfig_keys: (a: number) => number;
     readonly turboquantconfig_new: (a: bigint) => number;
     readonly turboquantconfig_seed: (a: number) => bigint;
@@ -2078,33 +2164,58 @@ export interface InitOutput {
     readonly turboquantconfig_set_values: (a: number, b: number) => void;
     readonly turboquantconfig_values: (a: number) => number;
     readonly turnresult_decodeMs: (a: number) => number;
-    readonly turnresult_finishReason: (a: number) => [number, number];
-    readonly turnresult_promptEvalMs: (a: number) => number;
+    readonly turnresult_finishReason: (a: number, b: number) => void;
     readonly turnresult_promptEvalTokens: (a: number) => number;
     readonly turnresult_summary: (a: number) => number;
-    readonly turnresult_text: (a: number) => [number, number];
-    readonly turnresult_tokens: (a: number) => [number, number];
-    readonly turnresult_tokensGenerated: (a: number) => number;
-    readonly turnresult_toolCalls: (a: number) => [number, number, number];
-    readonly turnresult_toolCallsJson: (a: number) => [number, number, number, number];
+    readonly turnresult_text: (a: number, b: number) => void;
+    readonly turnresult_tokens: (a: number, b: number) => void;
+    readonly turnresult_toolCalls: (a: number, b: number) => void;
+    readonly turnresult_toolCallsJson: (a: number, b: number) => void;
+    readonly webgpucancelhandle_cancel: (a: number) => void;
+    readonly webgpucancelhandle_clearCancel: (a: number) => void;
+    readonly webgpusession_adapter: (a: number, b: number) => void;
+    readonly webgpusession_appendAudio: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly webgpusession_appendImage: (a: number, b: number, c: number, d: number) => number;
+    readonly webgpusession_appendTokens: (a: number, b: number, c: number, d: number) => void;
+    readonly webgpusession_audioIn: (a: number) => number;
+    readonly webgpusession_audioOut: (a: number) => number;
+    readonly webgpusession_cancel: (a: number) => void;
+    readonly webgpusession_cancelHandle: (a: number) => number;
+    readonly webgpusession_capabilities: (a: number) => number;
+    readonly webgpusession_checkpoint: (a: number) => number;
+    readonly webgpusession_clearCancel: (a: number) => void;
+    readonly webgpusession_create: (a: number, b: number, c: number, d: number) => number;
+    readonly webgpusession_createWithParts: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly webgpusession_exportCheckpoint: (a: number) => number;
+    readonly webgpusession_fromBundleId: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+    readonly webgpusession_generate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number) => number;
+    readonly webgpusession_generateTokens: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number, k: number) => number;
+    readonly webgpusession_imageIn: (a: number) => number;
+    readonly webgpusession_importCheckpoint: (a: number, b: number, c: number, d: number) => void;
+    readonly webgpusession_kvCompression: (a: number, b: number) => void;
+    readonly webgpusession_position: (a: number) => number;
+    readonly webgpusession_reset: (a: number, b: number) => void;
+    readonly webgpusession_restore: (a: number, b: number, c: number, d: number) => void;
+    readonly webgpusession_setImageMaxLongSize: (a: number, b: number) => void;
+    readonly webgpusession_setSeed: (a: number, b: number, c: number, d: bigint) => void;
+    readonly webgpusession_tokenizer: (a: number) => number;
     readonly wasm_init: () => void;
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___JsValue__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuDevice__GpuDevice__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__JsOption_wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuError__GpuError___core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__JsOption_wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuAdapter__GpuAdapter___core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wasm_bindgen_c0aede8f3a24923c___sys__Undefined__core_81cd5ad332b340c8___result__Result_____wasm_bindgen_c0aede8f3a24923c___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___js_sys_1fcd217b704f9fe4___Function_fn_wasm_bindgen_c0aede8f3a24923c___JsValue_____wasm_bindgen_c0aede8f3a24923c___sys__Undefined___js_sys_1fcd217b704f9fe4___Function_fn_wasm_bindgen_c0aede8f3a24923c___JsValue_____wasm_bindgen_c0aede8f3a24923c___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuDeviceLostInfo__GpuDeviceLostInfo______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___wgpu_fd25131c06e74ce3___backend__webgpu__webgpu_sys__gen_GpuUncapturedErrorEvent__GpuUncapturedErrorEvent______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_c0aede8f3a24923c___convert__closures_____invoke___bool__true_: (a: number, b: number) => number;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_exn_store: (a: number) => void;
-    readonly __externref_table_alloc: () => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_destroy_closure: (a: number, b: number) => void;
-    readonly __externref_table_dealloc: (a: number) => void;
+    readonly sessionconfig_seed: (a: number, b: number) => void;
+    readonly turnresult_promptEvalMs: (a: number) => number;
+    readonly turnresult_tokensGenerated: (a: number) => number;
+    readonly session_intoChat: (a: number, b: number) => void;
+    readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
+    readonly __wasm_bindgen_func_elem_7660: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6487: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6487_2: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6487_3: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7675: (a: number, b: number, c: number, d: number) => void;
+    readonly __wbindgen_export: (a: number, b: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export3: (a: number) => void;
+    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export5: (a: number, b: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_start: () => void;
 }
 

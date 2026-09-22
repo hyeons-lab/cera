@@ -42,3 +42,20 @@ impl Drop for ModelSessionLease {
         self.active.store(false, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_acquire_is_busy_until_lease_drops() {
+        let gate = ModelSessionGate::default();
+        let lease = gate.try_acquire().expect("first acquire succeeds");
+        assert!(matches!(gate.try_acquire(), Err(CeraError::Busy)));
+        drop(lease);
+        assert!(
+            gate.try_acquire().is_ok(),
+            "dropping the lease releases the gate"
+        );
+    }
+}

@@ -58,8 +58,8 @@ filesystem tree manually" workaround.
 | 14 | `BundleRepo::cache_size` + `clear_cache` for mobile cache mgmt |
 | 15 | Parity harness (`cera-parity` Kotlin/Swift legs + perf gate) |
 | 16+ | Session-API expansion: `Session::append_audio`, `Session::clear_cancel`, `CeraEngine::is_special_token`, `CeraEngine::context_size` resolved getter |
-| 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size` |
-| 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
+| 17+ | Hidden-states extraction: `Session::hidden_states_for_tokens` / `_for_text` (LE-f32 `Data`/`ByteArray`), `hidden_states_mean_pooled` (`[Float]`), `hidden_size`, per-call-adapter `hidden_states_*_with_adapters` overrides |
+| 18+ | LoRA adapters: `LoraAdapters` object (`from_gguf` / `from_safetensors`), `Session::attach_lora` / `set_lora_adapters` / `remove_lora` / `has_lora`, `FfiError::LoraParse`, `FfiError::LoraUnsupportedByBackend` |
 | 19+ | Maven Central (`com.hyeons-lab:cera-ffi-{jvm,android}`) + SwiftPM remote publishing (`.package(url:)` against a prebuilt `CeraFFI.xcframework`); both shipped |
 | 20+ | Native Keyword Spotting (KWS): `FfiHotwordConfig`, `FfiHotwordScore`, `FfiHotwordEvent`, `FfiHotwordDetector`, and `FfiHotwordIterator` (`process_chunk`, `reset`) |
 | 21+ | OpenAI Whisper ASR: `FfiWhisperModel`, `FfiWhisperTranscribeOpts`, `whisper_default_transcribe_opts` with synchronous/asynchronous transcription and cooperative cancellation on Rust future drop |
@@ -69,6 +69,7 @@ filesystem tree manually" workaround.
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
 | 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
+| 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -1160,7 +1161,7 @@ see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifeti
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
 | `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
 | `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
-| `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from `SessionConfig.seed`. Retains GPU context ownership. |
+| `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from the session default (`SessionConfig.seed` as passed to `newSession`, or the `set_seed` value when one was set). Retains GPU context ownership. |
 | `session.capabilities()` | `() -> ModalityCapabilities` | The same flags `engine.capabilities()` reports; exposed on `Session` too so a caller holding only the session handle can probe. |
 
 ### Lifecycle (Kotlin)
@@ -1211,7 +1212,7 @@ without paying `engine.newSession(...)` setup cost again:
 | API | KV cache | `position` | Sampler | When to use |
 |---|---|---|---|---|
 | `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing": keep the conversation context, append more tokens, generate again |
-| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button: start fresh on the same model + tokenizer |
+| `session.reset()` | dropped | reset to 0 | re-seeded from the session default (`cfg.seed`, or the `setSeed` value when one was set) | "clear conversation" UI button: start fresh on the same model + tokenizer |
 
 ```kotlin
 val tokensBefore = session.position().toInt()       // snapshot before the call

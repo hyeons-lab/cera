@@ -758,28 +758,30 @@ const OPS = {
     console.info(
       `[cera:worker] generate: starting generation for "${currentModelLabel}" on "${backendLabel}" (context position: ${currentPos}, maxTokens: ${maxTokens})`,
     );
-    // Seeding is per SESSION in the CPU wasm API, not per generate:
-    // `GenerateOpts` has no seed field and assigning one just creates a dead JS
-    // property. Honoring it therefore means rebuilding the session, which is
-    // only meaningful before anything has been fed. The GPU path takes its seed
-    // as a `generateTokens` argument instead, so it needs none of this.
-    if (req.seed != null && currentPos === 0 && cpu) {
-      const config = new wasm.SessionConfig();
-      config.seed = BigInt(req.seed);
-      if (cpu.ubatchSize != null && cpu.ubatchSize >= 0) {
-        config.ubatchSize = cpu.ubatchSize;
-      }
-      let tq = null;
-      if (cpu.turboQuant && typeof wasm.TurboQuantConfig === 'function') {
-        tq = new wasm.TurboQuantConfig(BigInt(0));
-        config.kvCompression = tq;
-      }
-      try {
-        cpu.session.free();
-        cpu.session = cpu.engine.newSession(config);
-      } finally {
-        config.free();
-        tq?.free();
+    // Per-request seeding: `req.seed` travels on `GenerateOpts.seed` (set
+    // below next to temperature/topP/topK), which restarts the sampler RNG
+    // for this call only without touching the session default at any
+    // position, so no session rebuild is needed. The GPU path takes its
+    // seed as a `generateTokens` argument instead.
+    //
+    // Validated once here for both backends: numbers are exact only below
+    // 2^53 (that is what Dart sends), while bigints survive cloning
+    // exactly, so hand-written hosts may send those for the full u64 range.
+    // Anything else fails here rather than silently seeding the wrong
+    // stream.
+    let seedBigint = null;
+    if (req.seed != null) {
+      if (typeof req.seed === 'bigint') {
+        // Both consumers pass this straight into wasm, where BigInt→i64
+        // wraps mod 2^64 without throwing: bound it here instead.
+        if (req.seed < 0n || req.seed > 0xffffffffffffffffn) {
+          throw new Error('seed bigint must fit in u64');
+        }
+        seedBigint = req.seed;
+      } else if (Number.isSafeInteger(req.seed) && req.seed >= 0) {
+        seedBigint = BigInt(req.seed);
+      } else {
+        throw new Error('seed must be a non-negative safe integer or bigint');
       }
     }
     let ids;
@@ -954,7 +956,7 @@ const OPS = {
         req.temperature ?? null,
         req.topP ?? null,
         req.topK ?? null,
-        req.seed != null ? BigInt(req.seed) : null,
+        seedBigint,
         onToken,
         onAudio,
       );
@@ -971,6 +973,10 @@ const OPS = {
       if (req.temperature != null) opts.temperature = req.temperature;
       if (req.topP != null) opts.topP = req.topP;
       if (req.topK != null) opts.topK = req.topK;
+      // Unconditional: `null` is the declared "continue the stream"
+      // default, so omitting the seed holds by construction even if the
+      // base opts ever carry one.
+      opts.seed = seedBigint;
       if (req.spec != null && typeof opts.setSpecDecode === 'function') {
         const ngram = typeof req.spec.ngram === 'number' ? req.spec.ngram : 2;
         const k = typeof req.spec.k === 'number' ? req.spec.k : 6;
@@ -1071,9 +1077,8 @@ const OPS = {
     }
     if (cpu) {
       // `Session.reset`, not a fresh session. It clears KV, position and token
-      // history and lowers the cancel flag, which is all rebuilding did, while
-      // keeping the session's own config: a rebuild with a default
-      // `SessionConfig` silently discarded a seed the `generate` op installed.
+      // history and lowers the cancel flag, while keeping the session's own
+      // config (per-request `generate` seeds never touch that default).
       cpu.session.reset();
       return null;
     }

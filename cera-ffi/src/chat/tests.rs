@@ -45,6 +45,12 @@ impl Model for TestModel {
         &self.config
     }
 
+    // Tests attach adapters to this mock; the forwards never read them, but
+    // install-path tests need the gate open.
+    fn supports_lora(&self) -> bool {
+        true
+    }
+
     fn forward(&self, tokens: &[u32], _: usize, state: &mut InferenceState) -> Vec<f32> {
         let rows = vec![0.0; tokens.len() * self.config.n_kv_heads * self.config.head_dim];
         state.append_kv(0, &rows, &rows);
@@ -66,6 +72,24 @@ impl Model for TestModel {
         config.max_seq_len = config.max_seq_len.min(max_seq_len);
         *state = InferenceState::from_config_with_compression(&config, compression)?;
         Ok(())
+    }
+
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        // Deterministic ramp, offset when an adapter is staged so tests can
+        // tell the base path from the adapted one.
+        let base = if state.lora.is_some() { 100.0 } else { 0.0 };
+        tokens
+            .iter()
+            .enumerate()
+            .flat_map(|(t, &tok)| {
+                (0..self.config.hidden_size)
+                    .map(move |c| base + (t * 16 + tok as usize * 4 + c) as f32)
+            })
+            .collect()
     }
 }
 
@@ -259,6 +283,237 @@ fn session_into_chat_lifecycle_and_turn_completion() {
     chat.reset().expect("reset should succeed");
     assert_eq!(chat.phase().unwrap(), SessionPhase::Idle);
     assert_eq!(chat.position().unwrap(), 0);
+}
+
+/// Rank-1 AttnQ adapter bytes fitting TestModel (k = d = hidden 4),
+/// written with the public GGUF writer (no metadata needed: alpha
+/// falls back to rank, i.e. scale 1).
+fn test_adapter_file(dir: &std::path::Path) -> String {
+    use cera::convert::writer::{GGML_TYPE_F32, GgufWriter};
+    let mut writer = GgufWriter::new();
+    writer.add_tensor("blk.0.attn_q.weight.lora_a", vec![4, 1], GGML_TYPE_F32, 16);
+    writer.add_tensor("blk.0.attn_q.weight.lora_b", vec![1, 4], GGML_TYPE_F32, 16);
+    let mut bytes = Vec::new();
+    writer.write_header_and_tensor_info(&mut bytes).unwrap();
+    [[1.0f32, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]]
+        .into_iter()
+        .for_each(|factor| {
+            let payload: Vec<u8> = factor.iter().flat_map(|x| x.to_le_bytes()).collect();
+            writer.write_tensor_data(&mut bytes, &payload).unwrap();
+        });
+    let path = dir.join("test-adapter.gguf");
+    std::fs::write(&path, bytes).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn hidden_states_with_adapters_empty_list_uses_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    // Base extraction before anything is attached.
+    let base = session
+        .hidden_states_for_tokens(vec![1, 2])
+        .expect("extract");
+    let bare_pooled = session
+        .hidden_states_mean_pooled(vec![1, 2])
+        .expect("bare pooled");
+
+    session.attach_lora(Arc::clone(&adapters)).expect("attach");
+    // The attached default now adapts (the mock offsets staged output),
+    // while the empty stack still extracts the base model.
+    let adapted = session
+        .hidden_states_for_tokens(vec![1, 2])
+        .expect("adapted");
+    assert_ne!(adapted, base);
+    let with_empty = session
+        .hidden_states_for_tokens_with_adapters(vec![1, 2], vec![])
+        .expect("extract with empty stack");
+    assert_eq!(with_empty, base);
+    // 2 tokens x hidden 4, LE f32 bytes.
+    assert_eq!(with_empty.len(), 2 * 4 * 4);
+    let pooled_empty = session
+        .hidden_states_mean_pooled_with_adapters(vec![1, 2], vec![])
+        .expect("pooled with empty stack");
+    assert_eq!(pooled_empty, bare_pooled);
+    let pooled_over = session
+        .hidden_states_mean_pooled_with_adapters(
+            vec![1, 2],
+            vec![crate::LoraAdapterEntry {
+                adapter: adapters,
+                scale: 1.0,
+            }],
+        )
+        .expect("pooled with non-empty stack");
+    assert_ne!(pooled_over, bare_pooled);
+}
+
+#[test]
+fn set_lora_adapters_empty_list_detaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    let base = session.hidden_states_for_tokens(vec![1, 2]).expect("base");
+    session
+        .set_lora_adapters(vec![crate::LoraAdapterEntry {
+            adapter: adapters,
+            scale: 1.0,
+        }])
+        .expect("install");
+    assert!(session.has_lora().unwrap());
+    assert_ne!(
+        session
+            .hidden_states_for_tokens(vec![1, 2])
+            .expect("adapted"),
+        base
+    );
+    session
+        .set_lora_adapters(vec![])
+        .expect("empty list detaches");
+    assert!(!session.has_lora().unwrap());
+    assert_eq!(
+        session
+            .hidden_states_for_tokens(vec![1, 2])
+            .expect("detached"),
+        base
+    );
+}
+
+#[test]
+fn set_lora_adapters_non_empty_installs_and_bad_scale_is_lora_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    let base = session.hidden_states_for_tokens(vec![1, 2]).expect("base");
+    // A non-empty stack installs (the mock offsets staged output).
+    session
+        .set_lora_adapters(vec![crate::LoraAdapterEntry {
+            adapter: adapters.clone(),
+            scale: 1.0,
+        }])
+        .expect("install");
+    assert!(session.has_lora().unwrap());
+    let adapted = session
+        .hidden_states_for_tokens(vec![1, 2])
+        .expect("adapted");
+    assert_ne!(adapted, base);
+
+    // A non-finite scale fails composition as `LoraParse` (not a backend or
+    // dim error), with the anyhow chain in the detail; and the previous set
+    // survives: install is atomic.
+    let err = session
+        .set_lora_adapters(vec![crate::LoraAdapterEntry {
+            adapter: adapters,
+            scale: f32::NAN,
+        }])
+        .unwrap_err();
+    match err {
+        FfiError::LoraParse { detail } => {
+            assert!(detail.contains("scale must be finite"), "{detail}");
+        }
+        other => panic!("expected LoraParse, got: {other:?}"),
+    }
+    assert!(session.has_lora().unwrap());
+    assert_eq!(
+        session
+            .hidden_states_for_tokens(vec![1, 2])
+            .expect("still adapted"),
+        adapted
+    );
+}
+
+#[test]
+fn hidden_states_with_adapters_non_empty_overrides_for_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    let base = session.hidden_states_for_tokens(vec![1, 2]).expect("base");
+    // A non-empty override adapts one call without attaching anything.
+    let over = session
+        .hidden_states_for_tokens_with_adapters(
+            vec![1, 2],
+            vec![crate::LoraAdapterEntry {
+                adapter: adapters,
+                scale: 1.0,
+            }],
+        )
+        .expect("override");
+    assert_ne!(over, base);
+    assert!(!session.has_lora().unwrap());
+    assert_eq!(
+        session
+            .hidden_states_for_tokens(vec![1, 2])
+            .expect("still base"),
+        base
+    );
+}
+
+#[test]
+fn hidden_states_for_text_with_adapters_overrides_for_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    let base = session
+        .hidden_states_for_text("hello".into())
+        .expect("base text");
+    // A non-empty override adapts one call without attaching anything.
+    let over = session
+        .hidden_states_for_text_with_adapters(
+            "hello".into(),
+            vec![crate::LoraAdapterEntry {
+                adapter: adapters,
+                scale: 1.0,
+            }],
+        )
+        .expect("override text");
+    assert_ne!(over, base);
+    assert!(!session.has_lora().unwrap());
+    assert_eq!(
+        session
+            .hidden_states_for_text("hello".into())
+            .expect("still base"),
+        base
+    );
+}
+
+#[test]
+fn set_seed_persists_across_reset() {
+    // Flat logits (token 99 is out of range) so the stream is pure RNG.
+    let opts = || GenerateOpts {
+        max_tokens: 8,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        ignore_eos: true,
+        ..Default::default()
+    };
+    let run = |seed: u64, advance_first: bool| {
+        let session = test_session_with_token(0, 99);
+        session.append_tokens(vec![0, 1]).expect("prime");
+        session.set_seed(Some(seed)).expect("set seed");
+        if advance_first {
+            // Burn RNG draws before the reset: if `reset` kept the live
+            // stream instead of rebuilding from the session default, this
+            // run would diverge from the un-advanced one.
+            session.generate(opts()).expect("advance");
+            session.reset().expect("reset");
+        } else {
+            session.reset().expect("reset");
+        }
+        session.append_tokens(vec![0, 1]).expect("re-prime");
+        session.generate(opts()).expect("generate").tokens
+    };
+    assert_eq!(run(7, false).len(), 8);
+    assert_eq!(run(7, false), run(7, true));
+    // Non-vacuity: a different session seed diverges.
+    assert_ne!(run(7, false), run(3, false));
 }
 
 #[test]

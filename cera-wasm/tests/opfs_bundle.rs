@@ -52,14 +52,16 @@ fn page_url() -> String {
     }
 }
 
-/// A progress callback that counts its invocations.
-///
-/// Returned as a live `Closure` alongside the counter: dropping the
-/// `Closure` invalidates the function, so the caller has to keep it.
-fn counting_progress() -> (
+/// A progress callback that counts its invocations: a live `Closure`
+/// alongside its counter. Dropping the `Closure` invalidates the function,
+/// so the caller has to keep both (named alias: the inline tuple trips
+/// `clippy::type_complexity`).
+type CountingProgress = (
     Closure<dyn FnMut(JsValue, f64, JsValue)>,
     std::rc::Rc<std::cell::Cell<u32>>,
-) {
+);
+
+fn counting_progress() -> CountingProgress {
     let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let sink = calls.clone();
     let closure = Closure::wrap(Box::new(move |_url: JsValue, _done: f64, _total: JsValue| {

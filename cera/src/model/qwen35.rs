@@ -1136,6 +1136,13 @@ impl Model for Qwen35Model {
         false
     }
 
+    /// No LoRA hooks: the bespoke attention/FFN blocks use raw GEMV and never
+    /// read `state.lora`. Restated (not inherited) so whoever adds the hooks
+    /// reads this here.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
     fn supports_all_logits(&self) -> bool {
         false
     }

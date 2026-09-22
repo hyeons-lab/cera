@@ -9,9 +9,9 @@ uvx --offline ruff check tests/api_contracts
 uvx --offline ruff format --check tests/api_contracts
 ```
 
-The [reviewed baseline](retained_api.json) lists 69 declaration groups in five
+The [reviewed baseline](retained_api.json) lists 71 declaration groups in five
 Rust source files: core engine/repository, native UniFFI and CPU/WebGPU/browser
-WASM. It records 300 methods/functions/constants and 34 records/enums and three callback traits. The
+WASM. It records 338 methods/functions/constants and 35 records/enums and three callback traits. The
 [target retention map](../../docs/internals/API_RESHAPE_TARGET_RETENTION.md)
 explains their supported homes and the selected additive loading signatures.
 This inventory supplements the [generated loading runtime](../api_loading/README.md).
@@ -59,4 +59,4 @@ python3 tests/api_contracts/test_wasm_loading.py /tmp/cera-wasm-node/cera_wasm.d
 
 This checks method/constructor names, return types and complete optional payload
 fields. Ownership, errors and inference still require the executable Node tests.
-The existing 69-surface Rust baseline remains unchanged.
+The retained 71-surface Rust baseline above remains unchanged.

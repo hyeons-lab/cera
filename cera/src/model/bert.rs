@@ -119,6 +119,7 @@ impl BertModel {
             .or_else(|| gguf.get_u32("bert.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
+        ensure!(hidden_size > 0, "{prefix}.embedding_length must be > 0");
 
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
@@ -576,6 +577,13 @@ impl Model for BertModel {
 
     fn supports_hidden_states(&self) -> bool {
         true
+    }
+
+    /// No LoRA hooks: `hidden_states` ignores `state` and `forward` is an
+    /// empty-logits stub, so an adapter would install and adapt nothing.
+    /// Restated (not inherited) so whoever adds the hooks reads this here.
+    fn supports_lora(&self) -> bool {
+        false
     }
 
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {

@@ -208,13 +208,11 @@ KvCompression? _kvCompressionOf(CeraKvCompression compression) =>
       ),
     };
 
-SessionConfig _sessionConfigOf(CeraOptions options, {int? seed}) =>
-    SessionConfig(
-      seed: seed,
-      ubatchSize: options.ubatchSize,
-      gpuDepthformer: options.gpuDepthformer,
-      kvCompression: _kvCompressionOf(options.effectiveKvCompression),
-    );
+SessionConfig _sessionConfigOf(CeraOptions options) => SessionConfig(
+  ubatchSize: options.ubatchSize,
+  gpuDepthformer: options.gpuDepthformer,
+  kvCompression: _kvCompressionOf(options.effectiveKvCompression),
+);
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
@@ -240,8 +238,9 @@ class _NativeCera implements Cera {
 
   Session? _sessionHandle;
 
-  // A failed replacement leaves no closed handle behind. The conversation was
-  // empty before reseeding, so a later operation can safely create a fresh one.
+  // Lazily (re)created: a null slot means no session is open, and the next
+  // operation opens a fresh one. (Per-request `generate` seeds travel on
+  // `GenerateOpts`, never by replacing this handle.)
   Session get _session =>
       _sessionHandle ??= _engine.newSession(_sessionConfigOf(_options));
   bool _closed = false;
@@ -317,29 +316,14 @@ class _NativeCera implements Cera {
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
     _ensureOpen();
+    // Fail fast like web: a negative seed never survives UniFFI lowering
+    // (`writeU64` throws a `RangeError` naming `byteOffset`), so name the
+    // real culprit here, synchronously. (No effective upper bound: Dart VM
+    // `int` tops out at 2^63 - 1, inside the engine's u64.)
+    checkGenerateSeedRange(seed, 0x7FFFFFFFFFFFFFFF);
     // A controller rather than an `async*` body: the tokens arrive on a
     // callback driven by Rust, not from anything this function can await.
     final controller = StreamController<String>();
-    // Built from the session's default options (populated from the bundle
-    // manifest when loaded from a bundle) rather than hardcoded constants,
-    // allowing explicit caller overrides to take precedence.
-    var opts = _session.defaultGenerateOpts().copyWith(
-      maxTokens: maxTokens,
-      // Emit per token. The default buffers 16, which turns a stream into four
-      // lumps for a short reply.
-      flushEveryTokens: 1,
-    );
-    if (temperature != null) opts = opts.copyWith(temperature: temperature);
-    if (topP != null) opts = opts.copyWith(topP: topP);
-    if (topK != null) opts = opts.copyWith(topK: topK);
-    if (spec != null) {
-      opts = opts.copyWith(
-        spec: SpecDecodeConfig(
-          ngram: spec.ngram.clamp(1, 32),
-          k: spec.k.clamp(1, 64),
-        ),
-      );
-    }
 
     // Whether this generation has already produced its terminal event.
     //
@@ -409,17 +393,20 @@ class _NativeCera implements Cera {
         },
       );
       try {
-        // `seed` is per session, not per call, so honoring it means a new
-        // session. That also clears the conversation, so it is only honored on
-        // a fresh engine. Clear the stored handle before releasing it so a
-        // constructor failure leaves a recoverable empty slot.
-        if (seed != null && _session.position() == 0) {
-          // A GPU model permits one live Session, including an empty one.
-          final previous = _sessionHandle;
-          _sessionHandle = null;
-          previous?.close();
-          _sessionHandle = _engine.newSession(
-            _sessionConfigOf(_options, seed: seed),
+        var opts = _session.defaultGenerateOpts().copyWith(
+          maxTokens: maxTokens,
+          flushEveryTokens: 1,
+        );
+        if (temperature != null) opts = opts.copyWith(temperature: temperature);
+        if (topP != null) opts = opts.copyWith(topP: topP);
+        if (topK != null) opts = opts.copyWith(topK: topK);
+        opts = opts.copyWith(seed: seed);
+        if (spec != null) {
+          opts = opts.copyWith(
+            spec: SpecDecodeConfig(
+              ngram: spec.ngram.clamp(1, 32),
+              k: spec.k.clamp(1, 64),
+            ),
           );
         }
         List<int> tokens;
@@ -631,9 +618,8 @@ class _NativeCera implements Cera {
       // instead of this one.
       _ensureOpen();
       // `Session.reset`, not a fresh session. It clears KV, position and token
-      // history and lowers the cancel flag, all of which rebuilding also did,
-      // but it keeps the session's own config: rebuilding with a default
-      // `SessionConfig` silently discarded a seed installed by `generate(seed:)`.
+      // history and lowers the cancel flag, while keeping the session's own
+      // config (per-request `generate` seeds never touch that default).
       _session.reset();
     } finally {
       mine.complete();

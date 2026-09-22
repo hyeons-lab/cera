@@ -489,11 +489,14 @@ abstract interface class Cera {
   /// once per token. Worth knowing if a run is slower than the greedy numbers
   /// suggested; it is not a reason to avoid it.
   ///
-  /// `seed` behaves differently per backend, because the sampler's lifetime
-  /// does. Natively and on the web's CPU backend it is a session-level knob
-  /// applied when the session is created, so it takes effect only on the first
-  /// generation of a session. The web's GPU backend builds its sampler per
-  /// call, so a seed applies to whichever call passes it.
+  /// `seed` is per-request on every backend: it restarts the sampler RNG
+  /// when the call starts (KV and position are untouched, so it is safe
+  /// mid-conversation) without changing the session default. Omitting it
+  /// continues the session's existing RNG stream. Bounds are per platform,
+  /// both smaller than the engine's full u64: `0 <= seed < 2^63` natively
+  /// (Dart's `int` range; negatives throw), `0 <= seed < 2^53` on web (the
+  /// seed crosses `postMessage` as a JS number; out-of-range values throw
+  /// `RangeError`).
   Stream<String> generate(
     String prompt, {
     int maxTokens = 256,
@@ -638,6 +641,20 @@ abstract interface class Cera {
   /// deserves to be told the engine went away. Safe to call twice, and safe to
   /// call after [close].
   Future<void> terminate();
+}
+
+/// Throws [RangeError] unless `seed` is omitted or within `0..=maxSeed`.
+///
+/// Shared by both [Cera.generate] implementations so the documented
+/// per-platform bounds (`0 <= seed < 2^63` native, `0 <= seed < 2^53` web)
+/// are checked one way, naming `seed` rather than whatever the lowering
+/// layer would blame. Declared here, like [CeraWebException], because the
+/// implementations are not exported and a helper in either would be
+/// unreachable from tests.
+void checkGenerateSeedRange(int? seed, int maxSeed) {
+  if (seed != null && (seed < 0 || seed > maxSeed)) {
+    throw RangeError.range(seed, 0, maxSeed, 'seed');
+  }
 }
 
 /// An error raised inside the web worker.

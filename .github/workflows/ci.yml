@@ -59,7 +59,10 @@ jobs:
       - name: Check cera-wasm on host
         run: cargo check -p cera-wasm
       - name: Python unit tests
-        run: python3 tests/test_format_review_comment.py
+        run: |
+          python3 tests/test_format_review_comment.py
+          python3 tests/api_contracts/check.py
+          python3 -m unittest discover -s tests/api_contracts
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
@@ -480,13 +483,27 @@ jobs:
         # fallback and every `gpu`-gated module is invisible to it. Seven
         # undocumented serial fallbacks in `backend/cpu.rs` accumulated in that
         # gap before anyone ran this locally.
-        run: cargo clippy -p cera ${{ matrix.features }} --target wasm32-unknown-unknown -- -D warnings
+        # `--all-targets`: without it clippy lints the lib but skips the test
+        # targets, which is the gap that hid dead `not(wasm32)` helpers in
+        # `audio_pipeline/tests.rs` and the missing `required-features` on the
+        # mmap-loading wgpu parity tests. The `[[test]]` entries in
+        # `cera/Cargo.toml` keep the gpu-only combo compiling by skipping
+        # file-loading tests where `mmap` is off.
+        run: cargo clippy -p cera ${{ matrix.features }} --target wasm32-unknown-unknown --all-targets -- -D warnings
       - name: Lint cera-wasm WebGPU surface
         # Runs once (on the gpu matrix entry): the browser `WebGpuSession`
         # glue in cera-wasm only builds with the `wgpu` feature, which the
         # cera-wasm-pack job doesn't enable.
+        # `--all-targets` matters more here than anywhere else in this file:
+        # cera-wasm is wasm32-only (`#![cfg(target_arch)]`), so the host
+        # `check` job lints an empty crate, and without `--all-targets` this
+        # step lints the lib but skips the integration tests. That combination
+        # left a `type_complexity` warning in `tests/opfs_bundle.rs` (and, just
+        # before it, an uncompilable `dyn_ref` in the lib's own LoRA parsing)
+        # green on every leg. This is the only clippy coverage the wasm
+        # tests get.
         if: matrix.features == '--no-default-features --features gpu'
-        run: cargo clippy -p cera-wasm --features wgpu --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy -p cera-wasm --features wgpu --target wasm32-unknown-unknown --all-targets -- -D warnings
       - name: Lint cera-wasm rustdoc
         # The `doc` job runs rustdoc on the HOST target, and `cera-wasm` is
         # wasm32-only — so nothing there documents this crate, and a broken
@@ -1067,6 +1084,19 @@ jobs:
           unexpected=$(grep -n "not implemented yet" lib/src/generated/cera_ffi.dart || true)
           if [ -n "${unexpected}" ]; then
             echo "::error::Generated bindings contain unexpected runtime stubs:"
+            echo "${unexpected}"
+            exit 1
+          fi
+          # Records holding an object handle get "not fully supported" stubs
+          # for all four serde directions; the patcher synthesizes the write
+          # side (Fix 6, Fix 9) while the read side stays a stub because
+          # nothing lifts records back out of Rust. A leftover encode-side
+          # stub silently breaks every method that passes the record (it took
+          # out all four LoRA stack methods at once), so any hit here fails.
+          # Decode-side stubs are intentional and stay out of this grep.
+          unexpected=$(grep -n "binary encode not fully supported" lib/src/generated/cera_ffi.dart || true)
+          if [ -n "${unexpected}" ]; then
+            echo "::error::Generated bindings contain unpatched record encoders:"
             echo "${unexpected}"
             exit 1
           fi

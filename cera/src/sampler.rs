@@ -99,10 +99,30 @@ impl Sampler {
         self.config = config;
     }
 
+    /// Restart the RNG from `seed` (`None` re-seeds from entropy) and record
+    /// it as the sampler's seed. Touches RNG state only: KV, position, and
+    /// the repetition history are unchanged (generation boundaries clear the
+    /// history separately). Backs per-request seeds (`GenerateOpts::seed`) and
+    /// [`Session::set_seed`](crate::Session::set_seed).
+    pub fn reseed(&mut self, seed: Option<u64>) {
+        self.rng = match seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_entropy(),
+        };
+        self.config.seed = seed;
+    }
+
     /// Clear the repetition-penalty history. Call at the start of each logical
     /// generation so penalties don't leak across independent `generate()` calls.
     pub fn reset_history(&mut self) {
         self.history.clear();
+    }
+
+    /// The seed the RNG was last (re)started from, if any (`None` for a
+    /// sampler that has only ever drawn from entropy). Informational: the
+    /// RNG stream continues across calls that don't reseed.
+    pub fn seed(&self) -> Option<u64> {
+        self.config.seed
     }
 
     /// Sample a token ID from logits. Panics if logits is empty.
@@ -423,5 +443,64 @@ mod tests {
         });
         let mut logits2 = vec![15.0f32, 10.0, 2.0];
         assert_eq!(s_neg.sample(&mut logits2), 0);
+    }
+
+    fn stochastic_stream(seed: Option<u64>, n: usize) -> Vec<u32> {
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed,
+        });
+        (0..n)
+            .map(|_| {
+                // Flat logits: every token is equally likely, so the stream
+                // is pure RNG output.
+                let mut logits = vec![0.0f32; 110];
+                s.sample(&mut logits)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reseed_restarts_the_random_stream() {
+        let mut s = Sampler::new(SamplerConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed: Some(7),
+        });
+        let mut logits = vec![0.0f32; 110];
+        let _ = s.sample(&mut logits);
+        let _ = s.sample(&mut logits);
+        assert_eq!(s.seed(), Some(7));
+        s.reseed(Some(42));
+        assert_eq!(s.seed(), Some(42));
+        // After reseeding, the stream matches a fresh sampler on that seed.
+        let fresh = stochastic_stream(Some(42), 8);
+        let restarted: Vec<u32> = (0..8)
+            .map(|_| {
+                let mut logits = vec![0.0f32; 110];
+                s.sample(&mut logits)
+            })
+            .collect();
+        assert_eq!(restarted, fresh);
+
+        // Reseeding with None clears the seed record and draws from entropy.
+        s.reseed(None);
+        assert_eq!(s.seed(), None);
+    }
+
+    #[test]
+    fn same_seed_reproduces_divergent_seeds_diverge() {
+        let a = stochastic_stream(Some(11), 16);
+        let b = stochastic_stream(Some(11), 16);
+        assert_eq!(a, b, "identical seeds must reproduce");
+        let c = stochastic_stream(Some(12), 16);
+        assert_ne!(a, c, "different seeds must diverge");
     }
 }

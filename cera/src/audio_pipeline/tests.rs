@@ -188,6 +188,11 @@ fn test_audio_pipeline_pending_events_bounded_cap() {
 /// / gap rhythm (LCG-driven, fully deterministic) that the model sustains as
 /// speech across dozens of frames. Frame `i` always yields the same samples,
 /// so multi-chunk tests stay aligned by passing the chunk index.
+///
+/// Gated like its callers: every test driving the real VAD model is
+/// `not(wasm32)` (it loads a GGUF file), so without this the helper is
+/// dead code on wasm32 and trips `-D warnings`.
+#[cfg(not(target_arch = "wasm32"))]
 fn speech_like_frame(frame: usize) -> Vec<f32> {
     const TAU: f32 = 2.0 * std::f32::consts::PI;
 

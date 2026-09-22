@@ -429,3 +429,145 @@ fn cpu_kv_format_sharing_preserves_backend_specific_rules() {
     }
     same_live(&f32_session, &control);
 }
+
+#[test]
+fn set_lora_adapters_stacks_scales_and_swaps_atomically() {
+    [fixture::tiny_dense(), fixture::tiny_hybrid()]
+        .into_iter()
+        .for_each(|bytes| {
+            let model = load(bytes);
+            let adapted_logits =
+                |stack: &[(std::sync::Arc<crate::lora::LoraAdapterWeights>, f32)]| {
+                    let mut s = session(&model, KvCompression::None);
+                    s.set_lora_adapters(stack).unwrap();
+                    s.append_tokens(&[0, 1]).unwrap();
+                    s.last_logits().unwrap().to_vec()
+                };
+            let mut base = session(&model, KvCompression::None);
+            base.append_tokens(&[0, 1]).unwrap();
+            let base_logits = base.last_logits().unwrap().to_vec();
+
+            // A single-entry stack adapts output.
+            let single = adapted_logits(&[(fixture::adapter(32), 1.0)]);
+            distinct(&single, &base_logits);
+            // The same factors twice stack (2x delta), not replace.
+            let stacked =
+                adapted_logits(&[(fixture::adapter(32), 1.0), (fixture::adapter(32), 1.0)]);
+            distinct(&stacked, &single);
+            distinct(&stacked, &base_logits);
+            // A zero-scale entry is skipped: bit-exact base output.
+            let zeroed = adapted_logits(&[(fixture::adapter(32), 0.0)]);
+            assert_eq!(zeroed, base_logits);
+
+            // A bad list fails without disturbing the installed set.
+            let mut s = session(&model, KvCompression::None);
+            s.set_lora_adapters(&[(fixture::adapter(32), 1.0)]).unwrap();
+            s.append_tokens(&[0, 1]).unwrap();
+            let before = s.last_logits().unwrap().to_vec();
+            assert!(matches!(
+                s.set_lora_adapters(&[(fixture::adapter(32), 1.0), (fixture::adapter(16), 1.0)]),
+                Err(CeraError::LoraCompose(_))
+            ));
+            assert!(matches!(
+                s.set_lora_adapters(&[(fixture::adapter(32), f32::NAN)]),
+                Err(CeraError::LoraCompose(_))
+            ));
+            let cls = crate::lora::LoraAdapterWeights::new_classifier_for_testing(
+                vec![0.0; 2],
+                None,
+                vec!["class".into()],
+            );
+            assert!(matches!(
+                s.set_lora_adapters(&[(cls, 1.0)]),
+                Err(CeraError::LoraCompose(_))
+            ));
+            assert!(s.has_lora_adapters());
+            assert_eq!(s.last_logits().unwrap(), before.as_slice());
+
+            // An empty list detaches.
+            s.set_lora_adapters(&[]).unwrap();
+            assert!(!s.has_lora_adapters());
+            s.reset().unwrap();
+            s.append_tokens(&[0, 1]).unwrap();
+            assert_eq!(s.last_logits().unwrap(), base_logits.as_slice());
+        });
+}
+
+#[test]
+fn cpu_sessions_on_one_model_generate_independently() {
+    [fixture::tiny_dense(), fixture::tiny_hybrid()]
+        .into_iter()
+        .for_each(|bytes| {
+            let model = load(bytes);
+            // Interleaved appends on two live sessions sharing one model ...
+            let mut a = session(&model, KvCompression::None);
+            let mut b = session(&model, KvCompression::None);
+            // (Fixture vocab is {0, 1}; the streams differ in order.)
+            a.append_tokens(&[0, 1]).unwrap();
+            b.append_tokens(&[1]).unwrap();
+            a.append_tokens(&[0]).unwrap();
+            let a_logits = a.last_logits().unwrap().to_vec();
+            let b_logits = b.last_logits().unwrap().to_vec();
+            // ... match isolated single-session controls exactly.
+            let mut a_ctl = session(&model, KvCompression::None);
+            a_ctl.append_tokens(&[0, 1, 0]).unwrap();
+            assert_eq!(a_ctl.last_logits().unwrap(), a_logits.as_slice());
+            let mut b_ctl = session(&model, KvCompression::None);
+            b_ctl.append_tokens(&[1]).unwrap();
+            assert_eq!(b_ctl.last_logits().unwrap(), b_logits.as_slice());
+            assert_eq!((a.position(), b.position()), (3, 1));
+        });
+}
+
+#[test]
+fn hidden_states_using_selects_adapter_per_call() {
+    [fixture::tiny_dense(), fixture::tiny_hybrid()]
+        .into_iter()
+        .for_each(|bytes| {
+            let model = load(bytes);
+            let adapter = fixture::adapter(32);
+            let mut bare = session(&model, KvCompression::None);
+            let base = bare.hidden_states_for_tokens(&[0, 1]).unwrap();
+
+            let mut s = session(&model, KvCompression::None);
+            s.attach_lora_adapters(adapter.clone()).unwrap();
+            // Default extraction uses the attached set ...
+            let adapted = s.hidden_states_for_tokens(&[0, 1]).unwrap();
+            distinct(&adapted, &base);
+            // ... an explicit None recovers the base model exactly ...
+            let explicit_base = s.hidden_states_for_tokens_using(&[0, 1], None).unwrap();
+            assert_eq!(explicit_base, base);
+            // ... an explicit adapter matches the attached default ...
+            let explicit_adapter = s
+                .hidden_states_for_tokens_using(&[0, 1], Some(&adapter))
+                .unwrap();
+            assert_eq!(explicit_adapter, adapted);
+            // ... and a composed stack applies per call without installing.
+            let stacked = crate::lora::LoraAdapterWeights::compose(&[
+                (adapter.clone(), 1.0),
+                (adapter.clone(), 1.0),
+            ])
+            .unwrap();
+            let double = s
+                .hidden_states_for_tokens_using(&[0, 1], Some(&stacked))
+                .unwrap();
+            distinct(&double, &adapted);
+            // Mean-pooled and text forms follow the same choice ...
+            let pooled = s.hidden_states_mean_pooled_using(&[0, 1], None).unwrap();
+            let bare_pooled = bare.hidden_states_mean_pooled(&[0, 1]).unwrap();
+            assert_eq!(pooled, bare_pooled);
+            let text = s.hidden_states_for_text_using("hello", None).unwrap();
+            let bare_text = bare.hidden_states_for_text("hello").unwrap();
+            assert_eq!(text, bare_text);
+            // A mismatched override is rejected, not silently misapplied.
+            let bad = fixture::adapter(16);
+            assert!(matches!(
+                s.hidden_states_for_tokens_using(&[0, 1], Some(&bad)),
+                Err(CeraError::LoraDimMismatch(_))
+            ));
+            // ... and none of it disturbs the attached set.
+            assert!(s.has_lora_adapters());
+            let again = s.hidden_states_for_tokens(&[0, 1]).unwrap();
+            assert_eq!(again, adapted);
+        });
+}

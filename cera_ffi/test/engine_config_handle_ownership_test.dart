@@ -1,9 +1,9 @@
 @TestOn('vm')
 library;
 
-import 'dart:io';
-
 import 'package:test/test.dart';
+
+import 'helpers/record_writer_ownership.dart';
 
 /// Guard on who owns the `BundleRepo` handle written into an `EngineConfig`.
 ///
@@ -32,41 +32,11 @@ import 'package:test/test.dart';
 /// repo through `EngineConfig`: `Cera.openBundle` was the first caller.
 void main() {
   test('the EngineConfig record writer clones the BundleRepo handle', () {
-    final source = File('lib/src/generated/cera_ffi.dart').readAsStringSync();
-    final start = source.indexOf('void _uniffiWriteEngineConfig(');
-    expect(
-      start,
-      isNonNegative,
-      reason:
-          '_uniffiWriteEngineConfig is missing from the generated bindings; '
-          'tool/patch_generated_bindings.dart synthesizes it, so it should '
-          'always be there',
-    );
-    final body = source.substring(start, source.indexOf('\n}\n', start));
-
-    expect(
-      body,
-      contains('_bundleRepoClone'),
-      reason:
-          'the handle must be cloned before it is written: Rust lifts this '
-          "field with into_arc and drops the Arc, so lowering the caller's own "
-          'handle leaves the Dart BundleRepo dangling (use-after-free on '
-          'close() or on finalization)',
-    );
-
-    // The clone has to be what reaches the wire. Calling `_bundleRepoClone`
-    // and then writing `BundleRepoFfiCodec.lower(...)` anyway would pass the
-    // check above while still transferring the caller's reference, and would
-    // additionally leak the clone.
-    expect(
-      body,
-      contains('writer.writeU64(clonedHandle)'),
-      reason: 'the CLONED handle must be the one written, not the original',
-    );
-    expect(
-      body,
-      isNot(contains('writer.writeU64(BundleRepoFfiCodec.lower(')),
-      reason: 'writing the raw lowered handle is the bug this test exists for',
+    expectRecordWriterClonesHandle(
+      writerName: '_uniffiWriteEngineConfig',
+      cloneFn: '_bundleRepoClone',
+      rawLower: 'BundleRepoFfiCodec.lower(',
+      handleType: 'BundleRepo',
     );
   });
 }

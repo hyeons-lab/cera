@@ -40,6 +40,53 @@
 
 import 'dart:io';
 
+/// Builds the `calloc<_UniFfiRustCallStatus>()` / try / status-check /
+/// finally preamble shared by the ownership-transfer clones in Fixes 6-9.
+///
+/// `cloneStmt` is the complete clone assignment with its trailing `;`
+/// (embed `\n` plus continuation indent for the split-call form);
+/// `writeStmt` is the in-try write of the cloned handle, present in the
+/// record writers (Fixes 6, 9) and absent at call sites (Fixes 7, 8),
+/// which write the handle after the block instead.
+String cloneSnippet({
+  required String indent,
+  required String cloneStmt,
+  String? writeStmt,
+}) {
+  final out =
+      StringBuffer()
+        ..writeln(
+          '${indent}final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();',
+        )
+        ..writeln('${indent}try {')
+        ..writeln(
+          '$indent  cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;',
+        )
+        ..writeln('$indent  cloneStatusPtr.ref.errorBuf')
+        ..writeln('$indent    ..capacity = 0')
+        ..writeln('$indent    ..len = 0')
+        ..writeln('$indent    ..data = ffi.nullptr;');
+  for (final line in cloneStmt.split('\n')) {
+    out.writeln('$indent  $line');
+  }
+  out
+    ..writeln(
+      '$indent  if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {',
+    )
+    ..writeln(
+      "$indent    throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');",
+    )
+    ..writeln('$indent  }');
+  if (writeStmt != null) {
+    out.writeln('$indent  $writeStmt');
+  }
+  out
+    ..writeln('$indent} finally {')
+    ..writeln('$indent  calloc.free(cloneStatusPtr);')
+    ..writeln('$indent}');
+  return out.toString();
+}
+
 void main(List<String> args) {
   final path = args.isNotEmpty ? args.first : 'lib/src/generated/cera_ffi.dart';
   final file = File(path);
@@ -155,71 +202,34 @@ void main(List<String> args) {
   // already freed and something else may have taken. `BundleRepoFfiCodec.lower`
   // deliberately does NOT clone, which is right for its other uses, so the
   // clone belongs here at the ownership transfer.
-  const writeImpl =
+  const writeHead =
       "void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {\n"
       "  writer.writeU64(value.contextSize);\n"
       "  _uniffiWriteBackendPreference(value.backend, writer);\n"
       "  if (value.bundleRepo == null) {\n"
       "    writer.writeI8(0);\n"
       "  } else {\n"
-      "    writer.writeI8(1);\n"
-      "    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
-      "    try {\n"
-      "      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
-      "      cloneStatusPtr.ref.errorBuf\n"
-      "        ..capacity = 0\n"
-      "        ..len = 0\n"
-      "        ..data = ffi.nullptr;\n"
-      "      final clonedHandle = _bindings()._bundleRepoClone(\n"
-      "          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);\n"
-      "      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
-      "        throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
-      "      }\n"
-      "      writer.writeU64(clonedHandle);\n"
-      "    } finally {\n"
-      "      calloc.free(cloneStatusPtr);\n"
-      "    }\n"
+      "    writer.writeI8(1);\n";
+  final writeClone = cloneSnippet(
+    indent: '    ',
+    cloneStmt:
+        'final clonedHandle = _bindings()._bundleRepoClone(\n'
+        '    BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);',
+    writeStmt: 'writer.writeU64(clonedHandle);',
+  );
+  const writeTail =
       "  }\n"
       "  if (value.draftModel == null) {\n"
       "    writer.writeI8(0);\n"
       "  } else {\n"
       "    writer.writeI8(1);\n"
       "    writer.writeString(value.draftModel!);\n"
-      "  }\n"
-      "  writer.writeBool(value.gpuDepthformer);\n"
-      "}";
-  const oldWriteImpl =
-      "void _uniffiWriteEngineConfig(EngineConfig value, _UniFfiBinaryWriter writer) {\n"
-      "  writer.writeU64(value.contextSize);\n"
-      "  _uniffiWriteBackendPreference(value.backend, writer);\n"
-      "  if (value.bundleRepo == null) {\n"
-      "    writer.writeI8(0);\n"
-      "  } else {\n"
-      "    writer.writeI8(1);\n"
-      "    final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
-      "    try {\n"
-      "      cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
-      "      cloneStatusPtr.ref.errorBuf\n"
-      "        ..capacity = 0\n"
-      "        ..len = 0\n"
-      "        ..data = ffi.nullptr;\n"
-      "      final clonedHandle = _bindings()._bundleRepoClone(\n"
-      "          BundleRepoFfiCodec.lower(value.bundleRepo!), cloneStatusPtr);\n"
-      "      if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
-      "        throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
-      "      }\n"
-      "      writer.writeU64(clonedHandle);\n"
-      "    } finally {\n"
-      "      calloc.free(cloneStatusPtr);\n"
-      "    }\n"
-      "  }\n"
-      "  if (value.draftModel == null) {\n"
-      "    writer.writeI8(0);\n"
-      "  } else {\n"
-      "    writer.writeI8(1);\n"
-      "    writer.writeString(value.draftModel!);\n"
-      "  }\n"
-      "}";
+      "  }\n";
+  final writeImpl =
+      '$writeHead$writeClone$writeTail'
+      '  writer.writeBool(value.gpuDepthformer);\n'
+      '}';
+  final oldWriteImpl = '$writeHead$writeClone$writeTail}';
   if (src.contains(writeStub)) {
     src = src.replaceAll(writeStub, writeImpl);
     applied += 1;
@@ -253,25 +263,12 @@ void main(List<String> args) {
   // causes Rust to drop the caller's only reference on return, invalidating the
   // handle on subsequent chunk calls. Cloning the handle preserves ownership.
   const vadUncloned = '(argBuf + 1).ref.u64 = FfiSileroVadFfiCodec.lower(vad);';
-  const vadCloned =
-      "final int clonedVadHandle;\n"
-      "      {\n"
-      "        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
-      "        try {\n"
-      "          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
-      "          cloneStatusPtr.ref.errorBuf\n"
-      "            ..capacity = 0\n"
-      "            ..len = 0\n"
-      "            ..data = ffi.nullptr;\n"
-      "          clonedVadHandle = _ffiSileroVadClone(FfiSileroVadFfiCodec.lower(vad), cloneStatusPtr);\n"
-      "          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
-      "            throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
-      "          }\n"
-      "        } finally {\n"
-      "          calloc.free(cloneStatusPtr);\n"
-      "        }\n"
-      "      }\n"
-      "      (argBuf + 1).ref.u64 = clonedVadHandle;";
+  final vadCloned =
+      'final int clonedVadHandle;\n'
+      '      {\n'
+      '${cloneSnippet(indent: '        ', cloneStmt: 'clonedVadHandle = _ffiSileroVadClone(FfiSileroVadFfiCodec.lower(vad), cloneStatusPtr);')}'
+      '      }\n'
+      '      (argBuf + 1).ref.u64 = clonedVadHandle;';
   if (src.contains(vadUncloned)) {
     src = src.replaceAll(vadUncloned, vadCloned);
     applied += 1;
@@ -287,31 +284,58 @@ void main(List<String> args) {
   // handle on subsequent calls. Cloning the handle preserves ownership.
   const adaptersUncloned =
       '(argBuf + 1).ref.u64 = LoraAdaptersFfiCodec.lower(adapters);';
-  const adaptersCloned =
-      "final int clonedLoraHandle;\n"
-      "      {\n"
-      "        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();\n"
-      "        try {\n"
-      "          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;\n"
-      "          cloneStatusPtr.ref.errorBuf\n"
-      "            ..capacity = 0\n"
-      "            ..len = 0\n"
-      "            ..data = ffi.nullptr;\n"
-      "          clonedLoraHandle = _loraAdaptersClone(LoraAdaptersFfiCodec.lower(adapters), cloneStatusPtr);\n"
-      "          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {\n"
-      "            throw StateError('UniFFI clone failed with status \${cloneStatusPtr.ref.code}');\n"
-      "          }\n"
-      "        } finally {\n"
-      "          calloc.free(cloneStatusPtr);\n"
-      "        }\n"
-      "      }\n"
-      "      (argBuf + 1).ref.u64 = clonedLoraHandle;";
+  final adaptersCloned =
+      'final int clonedLoraHandle;\n'
+      '      {\n'
+      '${cloneSnippet(indent: '        ', cloneStmt: 'clonedLoraHandle = _loraAdaptersClone(LoraAdaptersFfiCodec.lower(adapters), cloneStatusPtr);')}'
+      '      }\n'
+      '      (argBuf + 1).ref.u64 = clonedLoraHandle;';
   if (src.contains(adaptersUncloned)) {
     src = src.replaceAll(adaptersUncloned, adaptersCloned);
     applied += 1;
     stdout.writeln(
       '  cloned adapters handle in sessionInvokeAttachLora (1 site)',
     );
+  }
+
+  // Fix 9: LoraAdapterEntry record encoding. Same generator gap as Fix 6:
+  // records holding an object handle get throw-stubs, and LoraAdapterEntry
+  // pairs `adapter: LoraAdapters` with `scale: f32`. Synthesized from the
+  // Rust field order (adapter, then scale). The handle is CLONED per entry
+  // for the same ownership reason as Fix 6 and Fix 8: Rust lifts the field
+  // with `into_arc`, so writing the raw handle would hand over the caller's
+  // only strong reference. The read side stays a stub: nothing lifts entries
+  // back out of Rust.
+  const loraEntryWriteStub =
+      "void _uniffiWriteLoraAdapterEntry(LoraAdapterEntry value, _UniFfiBinaryWriter writer) {\n"
+      "  throw UnsupportedError('UniFFI binary encode not fully supported for LoraAdapterEntry');\n"
+      "}";
+  final loraEntryWriteImpl =
+      'void _uniffiWriteLoraAdapterEntry(LoraAdapterEntry value, _UniFfiBinaryWriter writer) {\n'
+      '${cloneSnippet(indent: '  ', cloneStmt: 'final clonedHandle = _bindings()._loraAdaptersClone(\n    LoraAdaptersFfiCodec.lower(value.adapter), cloneStatusPtr);', writeStmt: 'writer.writeU64(clonedHandle);')}'
+      '  writer.writeF32(value.scale);\n'
+      '}';
+  if (src.contains(loraEntryWriteStub)) {
+    src = src.replaceAll(loraEntryWriteStub, loraEntryWriteImpl);
+    applied += 1;
+    stdout.writeln(
+      '  implemented _uniffiWriteLoraAdapterEntry (record with handle field)',
+    );
+  }
+  const loraEntryEncodeStub =
+      "Uint8List _uniffiEncodeLoraAdapterEntry(LoraAdapterEntry value) {\n"
+      "  throw UnsupportedError('UniFFI binary encode not fully supported for LoraAdapterEntry');\n"
+      "}";
+  const loraEntryEncodeImpl =
+      "Uint8List _uniffiEncodeLoraAdapterEntry(LoraAdapterEntry value) {\n"
+      "  final writer = _UniFfiBinaryWriter();\n"
+      "  _uniffiWriteLoraAdapterEntry(value, writer);\n"
+      "  return writer.toBytes();\n"
+      "}";
+  if (src.contains(loraEntryEncodeStub)) {
+    src = src.replaceAll(loraEntryEncodeStub, loraEntryEncodeImpl);
+    applied += 1;
+    stdout.writeln('  implemented _uniffiEncodeLoraAdapterEntry');
   }
 
   if (applied == 0) {
@@ -321,6 +345,15 @@ void main(List<String> args) {
   if (!src.contains('writer.writeBool(value.gpuDepthformer);')) {
     stderr.writeln(
       'patch_generated_bindings error: _uniffiWriteEngineConfig missing gpuDepthformer serialization',
+    );
+    exit(1);
+  }
+
+  if (!src.contains(
+    'LoraAdaptersFfiCodec.lower(value.adapter), cloneStatusPtr',
+  )) {
+    stderr.writeln(
+      'patch_generated_bindings error: _uniffiWriteLoraAdapterEntry missing cloned-handle serialization',
     );
     exit(1);
   }
