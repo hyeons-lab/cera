@@ -13,8 +13,11 @@ pub type DspQueueHandle = *mut c_void;
 pub type DspQueueCallback = extern "C" fn(context: *mut c_void);
 
 pub const DOMAIN_CDSP: i32 = 3;
-pub const FASTRPC_MAP_FD: u32 = 0;
+pub const FASTRPC_MAP_FD: u32 = 2;
+pub const FASTRPC_MAP_FD_DELAYED: u32 = 3;
 pub const DSPQUEUE_TIMEOUT_US: u32 = 1_000_000;
+pub const RPCMEM_HEAP_ID_SYSTEM: i32 = 25;
+pub const RPCMEM_DEFAULT_FLAGS: u32 = 1;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -32,12 +35,12 @@ pub union RemoteArg {
 
 /// Pack scalar descriptors for `remote_handle64_invoke`.
 pub const fn remote_scalars_make(method: u32, in_bufs: u32, out_bufs: u32) -> u32 {
-    ((method & 0x1f) << 24) | ((in_bufs & 0xff) << 16) | ((out_bufs & 0xff) << 8)
+    ((method & 0xff) << 24) | ((in_bufs & 0xff) << 16) | ((out_bufs & 0xff) << 8)
 }
 
 // Function pointer signatures for symbols loaded from libcdsprpc.so
 type RpcmemAllocFn = extern "C" fn(heapid: i32, flags: u32, size: i32) -> *mut c_void;
-type RpcmemAlloc2Fn = extern "C" fn(heapid: i32, flags: u32, size: i32, attr: u32) -> *mut c_void;
+type RpcmemAlloc2Fn = extern "C" fn(heapid: i32, flags: u32, size: usize) -> *mut c_void;
 type RpcmemFreeFn = extern "C" fn(po: *mut c_void);
 type RpcmemToFdFn = extern "C" fn(po: *mut c_void) -> i32;
 
@@ -64,6 +67,7 @@ type DspqueueCreateFn = extern "C" fn(
     resp_queue_size: u32,
     packet_cb: Option<DspQueueCallback>,
     error_cb: Option<DspQueueCallback>,
+    callback_context: *mut c_void,
     queue: *mut DspQueueHandle,
 ) -> i32;
 type DspqueueCloseFn = extern "C" fn(queue: DspQueueHandle) -> i32;
@@ -224,9 +228,9 @@ impl FastRpcDriver {
         }
 
         let ptr = if let Some(alloc2) = self.rpcmem_alloc2 {
-            (alloc2)(0, 1, size as i32, 0)
+            (alloc2)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size)
         } else {
-            (self.rpcmem_alloc)(0, 1, size as i32)
+            (self.rpcmem_alloc)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size as i32)
         };
 
         if ptr.is_null() {
@@ -291,6 +295,29 @@ impl FastRpcDriver {
         }
     }
 
+    /// Enable Qualcomm Unsigned Process Domain (Unsigned PD) for the given domain.
+    pub fn enable_unsigned_pd(&self, domain: u32) -> Result<(), CeraError> {
+        if let Some(control_fn) = self.remote_session_control {
+            #[repr(C)]
+            struct UnsignedModuleControl {
+                domain: u32,
+                enable: u32,
+            }
+            let mut ctrl = UnsignedModuleControl { domain, enable: 1 };
+            let ret = control_fn(
+                2, // DSPRPC_CONTROL_UNSIGNED_MODULE
+                &mut ctrl as *mut _ as *mut c_void,
+                std::mem::size_of::<UnsignedModuleControl>() as u32,
+            );
+            if ret != 0 {
+                return Err(CeraError::Backend(format!(
+                    "remote_session_control(unsigned) failed for domain {domain} (error 0x{ret:08x})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Open a FastRPC handle to a skeleton library (e.g. `file:///libggml-htp-v75.so?domain=3`).
     pub fn open_skel_handle(&self, uri: &str) -> Result<RemoteHandle64, CeraError> {
         let c_uri = CString::new(uri).map_err(|e| CeraError::Backend(e.to_string()))?;
@@ -338,8 +365,16 @@ impl FastRpcDriver {
         resp_size: u32,
     ) -> Result<DspQueueHandle, CeraError> {
         let mut queue: DspQueueHandle = std::ptr::null_mut();
-        let ret =
-            (self.dspqueue_create)(DOMAIN_CDSP, 0, req_size, resp_size, None, None, &mut queue);
+        let ret = (self.dspqueue_create)(
+            DOMAIN_CDSP,
+            0,
+            req_size,
+            resp_size,
+            None,
+            None,
+            std::ptr::null_mut(),
+            &mut queue,
+        );
         if ret != 0 || queue.is_null() {
             Err(CeraError::Backend(format!(
                 "dspqueue_create failed (error 0x{:08x})",

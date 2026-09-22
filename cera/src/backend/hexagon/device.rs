@@ -47,58 +47,81 @@ pub struct HexagonDevice {
 // Device session is Send when guarded under model locks (such as Mutex<HexagonDevice>).
 unsafe impl Send for HexagonDevice {}
 
+#[repr(C)]
+struct HtpHwinfoPayload {
+    n_threads: u32,
+    n_hvx: u32,
+    n_hmx: u32,
+    _pad: u32,
+    vtcm_size: u64,
+}
+
+#[repr(C)]
+struct HtpStartPayload {
+    sess_id: u32,
+    _pad: u32,
+    dsp_queue_id: u64,
+    n_hvx: u32,
+    n_hmx: u32,
+    max_vmem: u64,
+}
+
+#[repr(C)]
+struct HtpMmapPayload {
+    fd: u32,
+    _pad: u32,
+    size: u64,
+}
+
+#[repr(C)]
+struct HtpMunmapPayload {
+    fd: u32,
+}
+
 impl HexagonDevice {
-    /// Initialize a Hexagon device session for the specified architecture in Unsigned PD.
     pub fn new(driver: Arc<FastRpcDriver>, arch: HexagonArch) -> Result<Self, CeraError> {
-        // FastRPC URI pointing to the architecture skel library in Unsigned PD (domain 3)
-        let skel_uri = format!("file:///{}?domain=3", arch.skel_filename());
+        // Enable Unsigned Process Domain (domain 3) for standard Android APK deployment
+        driver.enable_unsigned_pd(3)?;
+
+        // FastRPC URI pointing to the architecture skel library in CDSP Unsigned PD
+        let skel_uri = format!(
+            "file:///{}?htp_iface_skel_handle_invoke&_modver=1.0&_dom=cdsp",
+            arch.skel_filename()
+        );
         let handle = driver.open_skel_handle(&skel_uri)?;
 
-        // Query hardware capabilities via htp_iface_hwinfo (Method 6: 0 in, 4 out)
-        let mut n_threads: u32 = 0;
-        let mut n_hvx: u32 = 0;
-        let mut n_hmx: u32 = 0;
-        let mut vtcm_size: u64 = 0;
+        // Query hardware capabilities via htp_iface_hwinfo (Method 8: 0 in, 1 out)
+        let mut hw_payload = HtpHwinfoPayload {
+            n_threads: 0,
+            n_hvx: 0,
+            n_hmx: 0,
+            _pad: 0,
+            vtcm_size: 0,
+        };
+        let mut out_args = [RemoteArg {
+            buf: RemoteBuf {
+                buf: &mut hw_payload as *mut _ as *mut std::ffi::c_void,
+                len: std::mem::size_of::<HtpHwinfoPayload>(),
+            },
+        }];
 
-        let mut out_args = [
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &mut n_threads as *mut u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
+        let hwinfo_scalars = remote_scalars_make(8, 0, 1);
+        let hw_info = match driver.invoke_skel(handle, hwinfo_scalars, &mut out_args) {
+            Ok(()) => HtpHwInfo {
+                n_threads: hw_payload.n_threads,
+                n_hvx: hw_payload.n_hvx,
+                n_hmx: hw_payload.n_hmx,
+                vtcm_size: hw_payload.vtcm_size,
             },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &mut n_hvx as *mut u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
-            },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &mut n_hmx as *mut u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
-            },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &mut vtcm_size as *mut u64 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u64>(),
-                },
-            },
-        ];
-
-        let hwinfo_scalars = remote_scalars_make(6, 0, 4);
-        let hw_res = driver.invoke_skel(handle, hwinfo_scalars, &mut out_args);
-        if let Err(e) = hw_res {
-            driver.close_skel_handle(handle);
-            return Err(e);
-        }
-
-        let hw_info = HtpHwInfo {
-            n_threads,
-            n_hvx,
-            n_hmx,
-            vtcm_size,
+            Err(e) => {
+                tracing::debug!("Failed to query HTP hwinfo ({e}), using default capabilities");
+                HtpHwInfo {
+                    n_threads: 8,
+                    n_hvx: 8,
+                    n_hmx: 1,
+                    vtcm_size: 8 * 1024 * 1024,
+                }
+            }
         };
 
         // Create command queue session with 1 MiB staging buffer to accommodate full model layer batches
@@ -110,45 +133,25 @@ impl HexagonDevice {
             }
         };
 
-        // Start session on DSP via htp_iface_start (Method 0: 5 in, 0 out)
-        let sess_id: u32 = 0;
-        let dsp_queue_id = queue_session.queue_id();
+        // Start session on DSP via htp_iface_start (Method 2: 1 in, 0 out)
         let max_vmem: u64 = 3 * 1024 * 1024 * 1024; // 3 GB memory cap for single domain
+        let start_payload = HtpStartPayload {
+            sess_id: 0,
+            _pad: 0,
+            dsp_queue_id: queue_session.queue_id(),
+            n_hvx: hw_info.n_hvx,
+            n_hmx: hw_info.n_hmx,
+            max_vmem,
+        };
 
-        let mut in_args = [
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &sess_id as *const u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
+        let mut in_args = [RemoteArg {
+            buf: RemoteBuf {
+                buf: &start_payload as *const _ as *mut std::ffi::c_void,
+                len: std::mem::size_of::<HtpStartPayload>(),
             },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &dsp_queue_id as *const u64 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u64>(),
-                },
-            },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &n_hvx as *const u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
-            },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &n_hmx as *const u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
-            },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &max_vmem as *const u64 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u64>(),
-                },
-            },
-        ];
+        }];
 
-        let start_scalars = remote_scalars_make(0, 5, 0);
+        let start_scalars = remote_scalars_make(2, 1, 0);
         if let Err(e) = driver.invoke_skel(handle, start_scalars, &mut in_args) {
             driver.close_skel_handle(handle);
             return Err(e);
@@ -173,36 +176,30 @@ impl HexagonDevice {
         self.arch
     }
 
-    /// Register a mapped buffer with the DSP skeleton (Method 2: 2 in, 0 out).
+    /// Register a mapped buffer with the DSP skeleton (Method 4: 1 in, 0 out).
     pub fn mmap_buffer(&self, fd: u32, size: u64) -> Result<(), CeraError> {
-        let mut in_args = [
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &fd as *const u32 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u32>(),
-                },
+        let payload = HtpMmapPayload { fd, _pad: 0, size };
+        let mut in_args = [RemoteArg {
+            buf: RemoteBuf {
+                buf: &payload as *const _ as *mut std::ffi::c_void,
+                len: std::mem::size_of::<HtpMmapPayload>(),
             },
-            RemoteArg {
-                buf: RemoteBuf {
-                    buf: &size as *const u64 as *mut std::ffi::c_void,
-                    len: std::mem::size_of::<u64>(),
-                },
-            },
-        ];
-        let mmap_scalars = remote_scalars_make(2, 2, 0);
+        }];
+        let mmap_scalars = remote_scalars_make(4, 1, 0);
         self.driver
             .invoke_skel(self.handle, mmap_scalars, &mut in_args)
     }
 
-    /// Unregister a buffer from the DSP skeleton (Method 3: 1 in, 0 out).
+    /// Unregister a buffer from the DSP skeleton (Method 5: 1 in, 0 out).
     pub fn munmap_buffer(&self, fd: u32) -> Result<(), CeraError> {
+        let payload = HtpMunmapPayload { fd };
         let mut in_args = [RemoteArg {
             buf: RemoteBuf {
-                buf: &fd as *const u32 as *mut std::ffi::c_void,
-                len: std::mem::size_of::<u32>(),
+                buf: &payload as *const _ as *mut std::ffi::c_void,
+                len: std::mem::size_of::<HtpMunmapPayload>(),
             },
         }];
-        let munmap_scalars = remote_scalars_make(3, 1, 0);
+        let munmap_scalars = remote_scalars_make(5, 1, 0);
         self.driver
             .invoke_skel(self.handle, munmap_scalars, &mut in_args)
     }
@@ -215,8 +212,8 @@ impl HexagonDevice {
 
 impl Drop for HexagonDevice {
     fn drop(&mut self) {
-        // Stop session on DSP (Method 1: 0 in, 0 out)
-        let stop_scalars = remote_scalars_make(1, 0, 0);
+        // Stop session on DSP (Method 3: 0 in, 0 out)
+        let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
         self.driver.close_skel_handle(self.handle);
     }
