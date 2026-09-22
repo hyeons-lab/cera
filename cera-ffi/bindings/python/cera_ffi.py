@@ -3136,7 +3136,7 @@ class BackendPreference(enum.Enum):
     
     AUTO = 0
     """
-    Probe Metal → GPU → CPU at load time.
+    Probe Metal / Hexagon / GPU / CPU at load time.
 """
     
     CPU = 1
@@ -3149,6 +3149,11 @@ class BackendPreference(enum.Enum):
     METAL = 3
     """
     Native Metal. Requires the `metal` feature + macOS.
+"""
+    
+    HEXAGON = 4
+    """
+    Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
 """
     
 
@@ -3165,6 +3170,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             return BackendPreference.GPU
         if variant == 4:
             return BackendPreference.METAL
+        if variant == 5:
+            return BackendPreference.HEXAGON
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -3176,6 +3183,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
         if value == BackendPreference.GPU:
             return
         if value == BackendPreference.METAL:
+            return
+        if value == BackendPreference.HEXAGON:
             return
         raise ValueError(value)
 
@@ -3189,6 +3198,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             buf.write_i32(3)
         if value == BackendPreference.METAL:
             buf.write_i32(4)
+        if value == BackendPreference.HEXAGON:
+            buf.write_i32(5)
 
 
 

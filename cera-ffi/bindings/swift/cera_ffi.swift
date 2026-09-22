@@ -9183,7 +9183,7 @@ public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffe
 public enum BackendPreference: Equatable, Hashable {
     
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     case auto
     case cpu
@@ -9195,6 +9195,10 @@ public enum BackendPreference: Equatable, Hashable {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     case metal
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    case hexagon
 
 
 
@@ -9224,6 +9228,8 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case 4: return .metal
         
+        case 5: return .hexagon
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -9246,6 +9252,10 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case .metal:
             writeInt(&buf, Int32(4))
+        
+        
+        case .hexagon:
+            writeInt(&buf, Int32(5))
         
         }
     }

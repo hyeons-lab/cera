@@ -14026,7 +14026,7 @@ public object FfiConverterTypeUserMessage : FfiConverterRustBuffer<UserMessage> 
 
 enum class BackendPreference {
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     AUTO,
     CPU,
@@ -14040,6 +14040,11 @@ enum class BackendPreference {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     METAL,
+
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    HEXAGON,
 
     ;
 

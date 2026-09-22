@@ -999,8 +999,8 @@ pub fn load_model_hexagon(
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
-        | "phi" => Ok(Box::new(hexagon_lfm2::HexagonLfm2Model::from_gguf(
+        "lfm2" | "lfm" | "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5"
+        | "nanbeige" | "phi3" | "phi" => Ok(Box::new(hexagon_lfm2::HexagonLfm2Model::from_gguf(
             gguf,
             path,
             context_size,
