@@ -905,6 +905,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_embedding_length_is_rejected_at_load() {
+        // Twin of the lfm2 loader test: `hidden_size == 0` would size every
+        // buffer at zero; fail at load with a typed error instead. The guard
+        // lives in `from_gguf_with_id` and fires before any tensor load, so
+        // a header-only GGUF suffices.
+        let mut writer = crate::convert::writer::GgufWriter::new();
+        writer.add_string("general.architecture", "bert");
+        writer.add_u32("bert.block_count", 1);
+        writer.add_u32("bert.embedding_length", 0);
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        let gguf = crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap();
+        // (`match`, not `unwrap_err`: `BertModel` has no `Debug` impl.)
+        let err = match BertModel::from_gguf_with_id(gguf, 32, "test".into()) {
+            Ok(_) => panic!("zero embedding_length must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("bert.embedding_length must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn modernbert_alternating_schedule_is_correct() {
         let n_layers = 22;
         let mut sliding_count = 0;

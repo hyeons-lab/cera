@@ -188,6 +188,21 @@ impl LoraTarget {
 }
 
 /// One target's low-rank factors, pre-dequantized to f32 (row-major).
+///
+/// Invariant (adapter-stored factors only): every `LoraTargetWeights`
+/// stored in a [`LoraAdapterWeights`] satisfies `check_parts` (non-zero
+/// dims, rank within cap, exact factor lengths, finite scale and factors).
+/// Loads and placeholders validate through `new` / `from_parts`, and
+/// `merge_dense` enforces every predicate by construction instead of
+/// re-scanning (see its comment); `layers` is private with no `&mut`
+/// accessors and the apply paths only read, so stored factors cannot
+/// leave the satisfying state. The fields stay `pub` for downstream
+/// readers, so nothing prevents a downstream literal (mutation of stored
+/// factors is already impossible: private `layers`, shared-only
+/// accessors, no interior mutability): the merge and passthrough consume
+/// adapter-stored factors only, which is
+/// all this invariant covers, and any new construction or mutation site
+/// must preserve it.
 #[derive(Clone)]
 pub struct LoraTargetWeights {
     /// Down-projection `A`, `[rank × k]` row-major.
@@ -243,9 +258,10 @@ impl LoraTargetWeights {
         })
     }
 
-    /// The one validation predicate for target factors, shared by
-    /// [`Self::from_parts`] (which reports the specific failure) and
-    /// [`is_well_formed`](Self::is_well_formed) so the two cannot drift.
+    /// The one validation predicate for target factors, enforced at every
+    /// construction site: [`Self::from_parts`] for loads and placeholders,
+    /// by-construction argument in `merge_dense` (extend that argument
+    /// alongside any new predicate here).
     fn check_parts(
         a: &[f32],
         b: &[f32],
@@ -285,13 +301,6 @@ impl LoraTargetWeights {
             "LoRA B factors must be finite"
         );
         Ok(())
-    }
-
-    /// Whether these factors satisfy [`Self::check_parts`]. Used by
-    /// `single_passthrough` so the fast path accepts exactly what the merge
-    /// path would accept unchanged.
-    fn is_well_formed(&self) -> bool {
-        Self::check_parts(&self.a, &self.b, self.rank, self.k, self.d, self.scale).is_ok()
     }
 }
 
@@ -527,8 +536,27 @@ fn merge_dense(
         b.iter().all(|x| x.is_finite()),
         "layer {layer} target {target:?}: merged B holds a non-finite value"
     );
-    LoraTargetWeights::from_parts(a, b, rank, k, d, 1.0).with_context(|| {
-        format!("layer {layer} target {target:?}: merged target failed validation")
+    // `a` is a verbatim concat of well-formed rows (no arithmetic) and
+    // `b` was just checked; (k, d) agreement and the rank cap were enforced
+    // above. The O(1) shape conjuncts below are the fail-closed residue of
+    // the `from_parts` validation this direct construction replaces: exact
+    // output lengths and non-zero dims, which no scan re-checks anymore.
+    // (`rank > 0` needs no conjunct: it sums the parts' validated-positive
+    // ranks, and `ak` / `dr` already overflow-checked the products.)
+    ensure!(
+        k > 0 && d > 0 && a.len() == ak && b.len() == dr,
+        "layer {layer} target {target:?}: merged shape mismatch \
+         (a.len()={}, want {ak}; b.len()={}, want {dr}; k={k}, d={d})",
+        a.len(),
+        b.len()
+    );
+    Ok(LoraTargetWeights {
+        a,
+        b,
+        rank,
+        k,
+        d,
+        scale: 1.0,
     })
 }
 
@@ -558,14 +586,16 @@ fn single_passthrough(
     {
         return None;
     }
-    // The merge revalidates every target and drops targets whose every
-    // part folds to zero: only pass through when every target is both
-    // well-formed and surviving at unit scale.
+    // Every target is well-formed by construction (see the struct
+    // invariant), so only the merge's all-zero-fold drop can diverge from
+    // the input: check scale survival, not well-formedness. The finiteness
+    // conjunct is O(targets) fail-closed belt-and-braces for the one
+    // predicate the passthrough itself depends on (`NaN != 0.0` is true).
     let survives_and_valid = only.layers.iter().all(|l| {
         l.targets.iter().flatten().all(|d| match d {
-            TargetDelta::Dense(t) => t.scale != 0.0 && t.is_well_formed(),
+            TargetDelta::Dense(t) => t.scale != 0.0 && t.scale.is_finite(),
             TargetDelta::Experts(v) => {
-                v.iter().any(|t| t.scale != 0.0) && v.iter().all(|t| t.is_well_formed())
+                v.iter().any(|t| t.scale != 0.0) && v.iter().all(|t| t.scale.is_finite())
             }
         })
     });
@@ -2863,8 +2893,15 @@ mod tests {
     /// One-layer adapter carrying a 2-expert `FfnGateExps` delta with the
     /// given loaded `alpha` (scale `alpha / rank`).
     fn expert_adapter(alpha: f32) -> Arc<LoraAdapterWeights> {
-        let experts: Vec<LoraTargetWeights> = (0..2)
-            .map(|_| {
+        expert_adapter_with_alphas(alpha, alpha)
+    }
+
+    /// One-layer adapter carrying a 2-expert `FfnGateExps` delta with
+    /// per-expert loaded alphas, for mixes no uniform-alpha helper can build.
+    fn expert_adapter_with_alphas(alpha0: f32, alpha1: f32) -> Arc<LoraAdapterWeights> {
+        let experts: Vec<LoraTargetWeights> = [alpha0, alpha1]
+            .into_iter()
+            .map(|alpha| {
                 LoraTargetWeights::new(vec![1.0; 16], 2, 8, vec![2.0; 32], 16, 2, alpha).unwrap()
             })
             .collect();
@@ -2872,7 +2909,7 @@ mod tests {
         layers[0].targets[LoraTarget::FfnGateExps.index()] = Some(TargetDelta::Experts(experts));
         Arc::new(LoraAdapterWeights {
             layers,
-            default_scale: alpha / 2.0,
+            default_scale: (alpha0 + alpha1) / 4.0,
             classifier_weight: None,
             classifier_bias: None,
             class_labels: Vec::new(),
@@ -2911,6 +2948,31 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn compose_mixed_zero_and_live_experts_use_placeholders() {
+        // Expert 0 folds to zero while expert 1 stays live: the target keeps
+        // expert-index alignment via a no-op placeholder in slot 0 rather
+        // than dropping the target or shifting expert 1 into slot 0. Scale
+        // 2.0 forces the merge (at unit scale the passthrough would return
+        // the input unchanged, which applies identically).
+        let merged =
+            LoraAdapterWeights::compose(&[(expert_adapter_with_alphas(0.0, 2.0), 2.0)]).unwrap();
+        assert!(merged.has_moe_deltas());
+        let ph = merged.get_expert(0, LoraTarget::FfnGateExps, 0).unwrap();
+        assert_eq!((ph.rank, ph.k, ph.d, ph.scale), (1, 8, 16, 0.0));
+        assert!(
+            ph.a.iter().all(|&x| x == 0.0) && ph.b.iter().all(|&x| x == 0.0),
+            "placeholder must be all zeros"
+        );
+        assert_eq!(
+            merged
+                .get_expert(0, LoraTarget::FfnGateExps, 1)
+                .unwrap()
+                .rank,
+            2
+        );
     }
 
     #[test]

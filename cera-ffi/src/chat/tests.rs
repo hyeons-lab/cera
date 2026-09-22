@@ -382,6 +382,44 @@ fn set_lora_adapters_empty_list_detaches() {
 }
 
 #[test]
+fn set_lora_adapters_all_zero_scale_installs_noop() {
+    // An all-zero non-empty stack is NOT a detach: it installs (staying
+    // attached like any other stack) rather than removing the set, matching
+    // core and Leap semantics. Pinned here because the FFI deliberately
+    // re-implements core's compose-then-install outside the session mutex,
+    // so an FFI-side "simplification" that detaches on empty merges would
+    // otherwise diverge silently. (This mock stages by adapter presence, so
+    // "installed" reads as the adapted output; the true no-op application
+    // itself is pinned at core by byte-equality with base.)
+    let dir = tempfile::tempdir().unwrap();
+    let adapters =
+        crate::LoraAdapters::from_gguf(test_adapter_file(dir.path())).expect("adapter loads");
+    let session = test_session(0);
+    let base = session.hidden_states_for_tokens(vec![1, 2]).expect("base");
+    session
+        .set_lora_adapters(vec![crate::LoraAdapterEntry {
+            adapter: adapters.clone(),
+            scale: 1.0,
+        }])
+        .expect("install");
+    let adapted = session
+        .hidden_states_for_tokens(vec![1, 2])
+        .expect("adapted");
+    assert_ne!(adapted, base);
+    session
+        .set_lora_adapters(vec![crate::LoraAdapterEntry {
+            adapter: adapters,
+            scale: 0.0,
+        }])
+        .expect("install");
+    assert!(session.has_lora().unwrap());
+    assert_eq!(
+        session.hidden_states_for_tokens(vec![1, 2]).expect("noop"),
+        adapted
+    );
+}
+
+#[test]
 fn set_lora_adapters_non_empty_installs_and_bad_scale_is_lora_parse() {
     let dir = tempfile::tempdir().unwrap();
     let adapters =

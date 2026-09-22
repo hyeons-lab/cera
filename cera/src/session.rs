@@ -1032,10 +1032,11 @@ impl Session {
         // silently produce base-model output, so refuse up front (before the
         // dimension check: capability is the more fundamental fact).
         if !self.model.supports_lora() {
-            return Err(CeraError::LoraUnsupportedByBackend(
-                "this backend has no LoRA apply hooks; the adapter would be silently ignored"
-                    .to_string(),
-            ));
+            return Err(CeraError::LoraUnsupportedByBackend(format!(
+                "model architecture '{}' has no LoRA apply hooks, so the adapter would be \
+                 silently ignored; no backend runs it",
+                self.model.config().architecture
+            )));
         }
         adapter
             .validate_dims(self.model.config())
@@ -3345,6 +3346,11 @@ fn mean_pool(flat: Vec<f32>, d: usize) -> Result<Vec<f32>, CeraError> {
             flat.len()
         )));
     }
+    // `tokens` is guaranteed non-empty upstream, so an empty matrix here is a
+    // backend-contract violation, failed closed like the ragged arm above.
+    if flat.is_empty() {
+        return Err(CeraError::Backend("mean_pool: empty hidden states".into()));
+    }
     let t = flat.len() / d;
     let mut pooled = flat;
     if t > 1 {
@@ -3396,6 +3402,13 @@ mod tests {
         ));
         assert!(matches!(
             mean_pool(vec![1., 2., 3.], 2),
+            Err(CeraError::Backend(_))
+        ));
+        // An empty matrix with `D > 0` is the same class of violation
+        // (upstream guarantees non-empty tokens), failed closed rather than
+        // yielding a 0-length "pooled" vector callers would mis-shape.
+        assert!(matches!(
+            mean_pool(Vec::new(), 2),
             Err(CeraError::Backend(_))
         ));
     }
@@ -3817,10 +3830,18 @@ mod tests {
             vec!["class".into()],
         );
         let err = session.attach_lora_adapters(adapter).unwrap_err();
-        assert!(
-            matches!(err, CeraError::LoraUnsupportedByBackend(_)),
-            "expected LoraUnsupportedByBackend, got {err:?}"
-        );
+        match err {
+            CeraError::LoraUnsupportedByBackend(detail) => {
+                // The refusal names the architecture and the recovery (retry
+                // is futile: no backend runs the adapter), so callers can
+                // triage from the string alone.
+                assert!(
+                    detail.contains("'mock'") && detail.contains("no backend runs it"),
+                    "refusal must name the architecture and recovery, got: {detail}"
+                );
+            }
+            other => panic!("expected LoraUnsupportedByBackend, got {other:?}"),
+        }
     }
 
     #[test]

@@ -5212,6 +5212,34 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn generate_opts_seed_roundtrips_and_seeds_generate() {
+        // Accessor roundtrip (the wasm twin of FFI's
+        // `generate_opts_seed_roundtrips_to_cera`).
+        let mut opts = GenerateOpts::new();
+        assert!(opts.seed().is_none());
+        opts.set_seed(Some(99));
+        assert_eq!(opts.seed(), Some(99));
+        // Per-request seed is deterministic through the wasm CPU session.
+        // Flat logits (token 99 is out of range) so the stream is pure RNG.
+        let run = |seed: Option<u64>| {
+            let mut session = create_test_session(99);
+            session.append_tokens(&[0, 1]).expect("prime");
+            let mut opts = GenerateOpts::new();
+            opts.set_max_tokens(8);
+            opts.set_seed(seed);
+            opts.set_temperature(1.0);
+            opts.set_top_p(1.0);
+            opts.set_top_k(0);
+            opts.set_min_p(0.0);
+            opts.set_repetition_penalty(1.0);
+            opts.set_ignore_eos(true);
+            generate_tokens(&mut session, &opts)
+        };
+        assert_eq!(run(Some(99)), run(Some(99)));
+        assert_ne!(run(Some(99)), run(Some(100)));
+    }
+
+    #[wasm_bindgen_test]
     fn chat_session_tool_configuration() {
         let mut session = create_test_session(7);
         let mut chat = session.into_chat().expect("into_chat");
@@ -5358,6 +5386,20 @@ mod tests {
         let expected = reference.sample(&mut flat_logits());
         let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
             .expect("unseeded call continues the restarted stream");
+        assert_eq!(s.sample(&mut flat_logits()), expected);
+        // Greedy with a seed on an EMPTY slot stores the stream (drawing
+        // nothing): a first call that is a seeded greedy still seeds the
+        // session, and the next unseeded stochastic call continues it from
+        // position 0, like CPU.
+        let mut stored = None;
+        let mut seeded_greedy = sampler_cfg(Some(99));
+        seeded_greedy.temperature = 0.0;
+        assert!(super::resolve_call_sampler(&mut stored, seeded_greedy, None).is_none());
+        assert!(stored.is_some());
+        let mut reference = Sampler::new(sampler_cfg(Some(99)));
+        let expected = reference.sample(&mut flat_logits());
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
+            .expect("unseeded call continues the stored stream");
         assert_eq!(s.sample(&mut flat_logits()), expected);
     }
 
