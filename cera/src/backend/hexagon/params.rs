@@ -89,4 +89,29 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_fastdiv_zero_divisor() {
+        let fd = init_fastdiv(0);
+        assert_eq!(fd.mp, 0);
+        assert_eq!(fd.l, 0);
+    }
+
+    #[test]
+    fn test_param_builders() {
+        let rms = build_rms_norm_params(1e-5);
+        assert_eq!(rms[0], (1e-5f32).to_bits() as i32);
+
+        let rope = build_rope_params(42, 128, 0, 4096, 10000.0, 1.0);
+        assert_eq!(rope[0], 42);
+        assert_eq!(rope[1], 128);
+        assert_eq!(rope[2], 0);
+        assert_eq!(rope[3], 4096);
+        assert_eq!(rope[4], (10000.0f32).to_bits() as i32);
+        assert_eq!(rope[5], (1.0f32).to_bits() as i32);
+
+        let mm = build_mul_mat_kernel_params(1, 1, 4);
+        assert_eq!(mm[0], 4);
+        assert!(mm[1] > 0);
+    }
 }

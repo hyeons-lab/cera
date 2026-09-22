@@ -52,6 +52,11 @@ impl HexagonOpBatch {
         bi
     }
 
+    /// Register an RpcmemBuffer with this batch.
+    pub fn add_rpcmem_buffer(&mut self, buf: &RpcmemBuffer, flags: u32) -> u16 {
+        self.add_buffer(buf.base(), buf.size() as u64, flags, buf.fd() as u32)
+    }
+
     /// Register a tensor descriptor with this batch.
     pub fn add_tensor(&mut self, mut tensor: HtpTensor) -> u16 {
         let ti = self.tensors.len() as u16;
@@ -148,14 +153,13 @@ pub struct HexagonQueueSession {
     staging_buf: RpcmemBuffer,
 }
 
-// Queue session operations are safe across threads when guarded by model session locks.
+// Queue session operations are Send across threads when guarded by model session locks.
 unsafe impl Send for HexagonQueueSession {}
-unsafe impl Sync for HexagonQueueSession {}
 
 impl HexagonQueueSession {
     /// Create a new command queue session with an allocated staging descriptor buffer.
     pub fn new(driver: Arc<FastRpcDriver>, staging_size: usize) -> Result<Self, CeraError> {
-        let queue = driver.create_dsp_queue(64 * 1024, 64 * 1024)?;
+        let queue = driver.create_dsp_queue(staging_size as u32, 64 * 1024)?;
         let queue_id = match driver.export_dsp_queue(queue) {
             Ok(id) => id,
             Err(e) => {
@@ -212,21 +216,35 @@ impl HexagonQueueSession {
         let mut rsp = HtpOpBatchRsp::default();
         let mut qbufs = [DspQueueBuffer::default()];
 
-        let rsp_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut rsp as *mut HtpOpBatchRsp as *mut u8,
-                std::mem::size_of::<HtpOpBatchRsp>(),
-            )
-        };
+        // Drain any stale responses from prior timed-out or canceled batches
+        loop {
+            let rsp_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut rsp as *mut HtpOpBatchRsp as *mut u8,
+                    std::mem::size_of::<HtpOpBatchRsp>(),
+                )
+            };
 
-        self.driver
-            .read_dsp_queue(self.queue, &mut qbufs, rsp_bytes)?;
+            self.driver
+                .read_dsp_queue(self.queue, &mut qbufs, rsp_bytes)?;
 
-        if rsp.seq != expected_seq {
-            return Err(CeraError::Backend(format!(
-                "DSP queue sequence mismatch (expected {}, got {})",
-                expected_seq, rsp.seq
-            )));
+            if rsp.seq < expected_seq {
+                tracing::warn!(
+                    stale_seq = rsp.seq,
+                    expected_seq,
+                    "drained stale DSP queue response"
+                );
+                continue;
+            }
+
+            if rsp.seq != expected_seq {
+                return Err(CeraError::Backend(format!(
+                    "DSP queue sequence mismatch (expected {}, got {})",
+                    expected_seq, rsp.seq
+                )));
+            }
+
+            break;
         }
 
         if rsp.status != HtpStatus::Ok as u32 {

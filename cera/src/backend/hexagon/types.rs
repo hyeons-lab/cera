@@ -230,6 +230,16 @@ impl Default for HtpOpDesc {
     }
 }
 
+impl HtpOpDesc {
+    /// Create a new operation descriptor with the specified opcode.
+    pub fn new(opcode: HtpOpCode) -> Self {
+        Self {
+            opcode: opcode as u32,
+            ..Default::default()
+        }
+    }
+}
+
 /// Batch request header sent as message payload to `dspqueue_write`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]

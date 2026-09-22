@@ -19,8 +19,8 @@ pub use rpcmem::RpcmemBuffer;
 pub use sys::FastRpcDriver;
 pub use types::*;
 
-use std::sync::Arc;
 use crate::session::CeraError;
+use std::sync::Arc;
 
 /// Shared Hexagon compute context managing the FastRPC driver and device session.
 pub struct HexagonContext {

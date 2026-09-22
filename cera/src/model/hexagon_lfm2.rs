@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
+    HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext, HexagonDevice,
+    HexagonOpBatch, HtpDataType, HtpOpCode, HtpOpDesc, HtpTensor, RpcmemBuffer,
     build_mul_mat_kernel_params, build_rms_norm_params, build_rope_params, repack_q4_0_tiled,
-    repack_q8_0_tiled, tiled_matrix_size_q4_0, tiled_matrix_size_q8_0, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonOpBatch, HtpDataType, HtpOpCode, HtpOpDesc, HtpTensor,
-    RpcmemBuffer, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT,
+    repack_q8_0_tiled, tiled_matrix_size_q4_0, tiled_matrix_size_q8_0,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError};
@@ -169,8 +169,36 @@ impl HexagonLfm2Model {
         // Initialize FastRPC userspace driver
         let context = HexagonContext::new()?;
 
-        // Default to Hexagon v75 (Snapdragon 8 Gen 3) or v73 (Snapdragon 8 Gen 2)
-        let device = HexagonDevice::new(Arc::clone(context.driver()), HexagonArch::V73)?;
+        // Probe available Hexagon architectures in descending generation order (V81 -> V79 -> V75 -> V73)
+        let mut device_opt = None;
+        let mut last_err = None;
+        for arch in [
+            HexagonArch::V81,
+            HexagonArch::V79,
+            HexagonArch::V75,
+            HexagonArch::V73,
+        ] {
+            match HexagonDevice::new(Arc::clone(context.driver()), arch) {
+                Ok(dev) => {
+                    tracing::info!(arch = ?arch, "initialized Hexagon NPU device");
+                    device_opt = Some(dev);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        let device = match device_opt {
+            Some(d) => d,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    CeraError::Backend(
+                        "no compatible Hexagon skeleton library found (probed V73..V81)".into(),
+                    )
+                }));
+            }
+        };
 
         // Repack token embeddings to CPU f32 table
         let token_embd = gguf
@@ -209,6 +237,12 @@ impl HexagonLfm2Model {
             let raw_data = gguf
                 .tensor_data(name)
                 .map_err(|e| CeraError::Backend(e.to_string()))?;
+            if t.shape.len() < 2 {
+                return Err(CeraError::Backend(format!(
+                    "tensor {name} must have at least 2 dimensions, got {:?}",
+                    t.shape
+                )));
+            }
             let ne0 = t.shape[0];
             let ne1 = t.shape[1];
 
@@ -239,13 +273,14 @@ impl HexagonLfm2Model {
                 .get_tensor(name)
                 .map_err(|e| CeraError::Backend(format!("missing tensor {name}: {e}")))?;
             let f32_vals = t.to_f32_vec();
-            let byte_size = f32_vals.len() * 4;
-            let mut buf = RpcmemBuffer::alloc(Arc::clone(driver), byte_size, true)?;
+            let byte_size = f32_vals.len() * std::mem::size_of::<f32>();
+            let buf = RpcmemBuffer::alloc(Arc::clone(driver), byte_size, true)?;
+            // Copy as bytes to avoid any alignment requirement on raw shared memory pointers
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    f32_vals.as_ptr(),
-                    buf.as_mut_ptr() as *mut f32,
-                    f32_vals.len(),
+                    f32_vals.as_ptr() as *const u8,
+                    buf.as_mut_ptr(),
+                    byte_size,
                 );
             }
             buf.flush_cpu_cache(0, byte_size);
@@ -329,26 +364,38 @@ impl Model for HexagonLfm2Model {
         self.session_gate.try_acquire().map(Some)
     }
 
-    fn forward(&self, tokens: &[u32], pos: usize, _state: &mut InferenceState) -> Vec<f32> {
+    fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         if tokens.is_empty() {
             return Vec::new();
         }
 
         let token = tokens[0] as usize;
-        let hs = self.config.hidden_size;
+        if token >= self.config.vocab_size {
+            tracing::warn!(
+                token,
+                vocab_size = self.config.vocab_size,
+                "token ID exceeds model vocab size; returning zero logits"
+            );
+            return vec![0.0f32; self.config.vocab_size];
+        }
 
-        // Embedding lookup on CPU
+        // Acquire device lock BEFORE writing to shared scratch activation buffer to prevent concurrent races
+        let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
+
+        let hs = self.config.hidden_size;
         let embd_start = token * hs;
         let embd_slice = &self.token_embd[embd_start..embd_start + hs];
 
-        // Copy embedding vector to activation shared buffer
+        // Copy embedding vector to activation shared buffer as raw bytes under the device lock
         unsafe {
-            let act_ptr = self.activation_buf.as_ptr() as *mut f32;
-            std::ptr::copy_nonoverlapping(embd_slice.as_ptr(), act_ptr, hs);
+            std::ptr::copy_nonoverlapping(
+                embd_slice.as_ptr() as *const u8,
+                self.activation_buf.as_mut_ptr(),
+                hs * std::mem::size_of::<f32>(),
+            );
         }
         self.activation_buf.flush_cpu_cache(0, hs * 4);
 
-        let mut device = self.device.lock().unwrap();
         let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let mut batch = HexagonOpBatch::new();
@@ -413,8 +460,7 @@ impl Model for HexagonLfm2Model {
                 nb: [4, (hs * 4) as u32, (hs * 4) as u32, (hs * 4) as u32],
             });
 
-            let mut rms_norm_op = HtpOpDesc::default();
-            rms_norm_op.opcode = HtpOpCode::RmsNorm as u32;
+            let mut rms_norm_op = HtpOpDesc::new(HtpOpCode::RmsNorm);
             rms_norm_op.params = build_rms_norm_params(self.config.rms_norm_eps);
             rms_norm_op.src[0] = act_ti;
             rms_norm_op.src[1] = norm_ti;
@@ -436,7 +482,12 @@ impl Model for HexagonLfm2Model {
                 bi: q_w_bi,
                 ti: 0,
                 ne: [hs as u32, q_dim as u32, 1, 1],
-                nb: [4, (hs * 4) as u32, (hs * q_dim * 4) as u32, (hs * q_dim * 4) as u32],
+                nb: [
+                    4,
+                    (hs * 4) as u32,
+                    (hs * q_dim * 4) as u32,
+                    (hs * q_dim * 4) as u32,
+                ],
             });
 
             let q_out_bi = batch.add_buffer(
@@ -453,11 +504,15 @@ impl Model for HexagonLfm2Model {
                 bi: q_out_bi,
                 ti: 0,
                 ne: [q_dim as u32, 1, 1, 1],
-                nb: [4, (q_dim * 4) as u32, (q_dim * 4) as u32, (q_dim * 4) as u32],
+                nb: [
+                    4,
+                    (q_dim * 4) as u32,
+                    (q_dim * 4) as u32,
+                    (q_dim * 4) as u32,
+                ],
             });
 
-            let mut q_mat_op = HtpOpDesc::default();
-            q_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut q_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             q_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             q_mat_op.src[0] = q_w_ti;
             q_mat_op.src[1] = normed_ti;
@@ -479,7 +534,12 @@ impl Model for HexagonLfm2Model {
                 bi: k_w_bi,
                 ti: 0,
                 ne: [hs as u32, kv_dim as u32, 1, 1],
-                nb: [4, (hs * 4) as u32, (hs * kv_dim * 4) as u32, (hs * kv_dim * 4) as u32],
+                nb: [
+                    4,
+                    (hs * 4) as u32,
+                    (hs * kv_dim * 4) as u32,
+                    (hs * kv_dim * 4) as u32,
+                ],
             });
 
             let k_out_bi = batch.add_buffer(
@@ -496,11 +556,15 @@ impl Model for HexagonLfm2Model {
                 bi: k_out_bi,
                 ti: 0,
                 ne: [kv_dim as u32, 1, 1, 1],
-                nb: [4, (kv_dim * 4) as u32, (kv_dim * 4) as u32, (kv_dim * 4) as u32],
+                nb: [
+                    4,
+                    (kv_dim * 4) as u32,
+                    (kv_dim * 4) as u32,
+                    (kv_dim * 4) as u32,
+                ],
             });
 
-            let mut k_mat_op = HtpOpDesc::default();
-            k_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut k_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             k_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             k_mat_op.src[0] = k_w_ti;
             k_mat_op.src[1] = normed_ti;
@@ -522,7 +586,12 @@ impl Model for HexagonLfm2Model {
                 bi: v_w_bi,
                 ti: 0,
                 ne: [hs as u32, kv_dim as u32, 1, 1],
-                nb: [4, (hs * 4) as u32, (hs * kv_dim * 4) as u32, (hs * kv_dim * 4) as u32],
+                nb: [
+                    4,
+                    (hs * 4) as u32,
+                    (hs * kv_dim * 4) as u32,
+                    (hs * kv_dim * 4) as u32,
+                ],
             });
 
             let v_out_bi = batch.add_buffer(
@@ -539,11 +608,15 @@ impl Model for HexagonLfm2Model {
                 bi: v_out_bi,
                 ti: 0,
                 ne: [kv_dim as u32, 1, 1, 1],
-                nb: [4, (kv_dim * 4) as u32, (kv_dim * 4) as u32, (kv_dim * 4) as u32],
+                nb: [
+                    4,
+                    (kv_dim * 4) as u32,
+                    (kv_dim * 4) as u32,
+                    (kv_dim * 4) as u32,
+                ],
             });
 
-            let mut v_mat_op = HtpOpDesc::default();
-            v_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut v_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             v_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             v_mat_op.src[0] = v_w_ti;
             v_mat_op.src[1] = normed_ti;
@@ -564,15 +637,13 @@ impl Model for HexagonLfm2Model {
                 1.0,
             );
 
-            let mut rope_q_op = HtpOpDesc::default();
-            rope_q_op.opcode = HtpOpCode::Rope as u32;
+            let mut rope_q_op = HtpOpDesc::new(HtpOpCode::Rope);
             rope_q_op.params = rope_params;
             rope_q_op.src[0] = q_out_ti;
             rope_q_op.dst[0] = q_out_ti;
             batch.add_op(rope_q_op);
 
-            let mut rope_k_op = HtpOpDesc::default();
-            rope_k_op.opcode = HtpOpCode::Rope as u32;
+            let mut rope_k_op = HtpOpDesc::new(HtpOpCode::Rope);
             rope_k_op.params = rope_params;
             rope_k_op.src[0] = k_out_ti;
             rope_k_op.dst[0] = k_out_ti;
@@ -654,8 +725,22 @@ impl Model for HexagonLfm2Model {
                 nb: [4, (hs * 4) as u32, (hs * 4) as u32, (hs * 4) as u32],
             });
 
-            let mut attn_op = HtpOpDesc::default();
-            attn_op.opcode = HtpOpCode::FlashAttnExt as u32;
+            // Insert current token K and V projections into KV cache slabs at row index pos
+            let mut set_k_op = HtpOpDesc::new(HtpOpCode::SetRows);
+            set_k_op.params[0] = pos as i32;
+            set_k_op.src[0] = k_out_ti;
+            set_k_op.src[1] = k_cache_ti;
+            set_k_op.dst[0] = k_cache_ti;
+            batch.add_op(set_k_op);
+
+            let mut set_v_op = HtpOpDesc::new(HtpOpCode::SetRows);
+            set_v_op.params[0] = pos as i32;
+            set_v_op.src[0] = v_out_ti;
+            set_v_op.src[1] = v_cache_ti;
+            set_v_op.dst[0] = v_cache_ti;
+            batch.add_op(set_v_op);
+
+            let mut attn_op = HtpOpDesc::new(HtpOpCode::FlashAttnExt);
             attn_op.src[0] = q_out_ti;
             attn_op.src[1] = k_cache_ti;
             attn_op.src[2] = v_cache_ti;
@@ -677,11 +762,15 @@ impl Model for HexagonLfm2Model {
                 bi: attn_proj_bi,
                 ti: 0,
                 ne: [q_dim as u32, hs as u32, 1, 1],
-                nb: [4, (q_dim * 4) as u32, (hs * q_dim * 4) as u32, (hs * q_dim * 4) as u32],
+                nb: [
+                    4,
+                    (q_dim * 4) as u32,
+                    (hs * q_dim * 4) as u32,
+                    (hs * q_dim * 4) as u32,
+                ],
             });
 
-            let mut attn_proj_op = HtpOpDesc::default();
-            attn_proj_op.opcode = HtpOpCode::MulMat as u32;
+            let mut attn_proj_op = HtpOpDesc::new(HtpOpCode::MulMat);
             attn_proj_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             attn_proj_op.src[0] = attn_proj_ti;
             attn_proj_op.src[1] = attn_out_ti;
@@ -689,8 +778,7 @@ impl Model for HexagonLfm2Model {
             batch.add_op(attn_proj_op);
 
             // Residual add: act = act + normed
-            let mut res_add_op = HtpOpDesc::default();
-            res_add_op.opcode = HtpOpCode::Add as u32;
+            let mut res_add_op = HtpOpDesc::new(HtpOpCode::Add);
             res_add_op.src[0] = act_ti;
             res_add_op.src[1] = normed_ti;
             res_add_op.dst[0] = act_ti;
@@ -714,8 +802,7 @@ impl Model for HexagonLfm2Model {
                 nb: [4, (hs * 4) as u32, (hs * 4) as u32, (hs * 4) as u32],
             });
 
-            let mut ffn_norm_op = HtpOpDesc::default();
-            ffn_norm_op.opcode = HtpOpCode::RmsNorm as u32;
+            let mut ffn_norm_op = HtpOpDesc::new(HtpOpCode::RmsNorm);
             ffn_norm_op.params = build_rms_norm_params(self.config.rms_norm_eps);
             ffn_norm_op.src[0] = act_ti;
             ffn_norm_op.src[1] = ffn_norm_ti;
@@ -738,7 +825,12 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_gate_w_bi,
                 ti: 0,
                 ne: [hs as u32, intermediate_size as u32, 1, 1],
-                nb: [4, (hs * 4) as u32, (hs * intermediate_size * 4) as u32, (hs * intermediate_size * 4) as u32],
+                nb: [
+                    4,
+                    (hs * 4) as u32,
+                    (hs * intermediate_size * 4) as u32,
+                    (hs * intermediate_size * 4) as u32,
+                ],
             });
 
             let ffn_gate_out_bi = batch.add_buffer(
@@ -755,11 +847,15 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_gate_out_bi,
                 ti: 0,
                 ne: [intermediate_size as u32, 1, 1, 1],
-                nb: [4, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32],
+                nb: [
+                    4,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                ],
             });
 
-            let mut ffn_gate_mat_op = HtpOpDesc::default();
-            ffn_gate_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut ffn_gate_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             ffn_gate_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             ffn_gate_mat_op.src[0] = ffn_gate_w_ti;
             ffn_gate_mat_op.src[1] = normed_ti;
@@ -781,7 +877,12 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_up_w_bi,
                 ti: 0,
                 ne: [hs as u32, intermediate_size as u32, 1, 1],
-                nb: [4, (hs * 4) as u32, (hs * intermediate_size * 4) as u32, (hs * intermediate_size * 4) as u32],
+                nb: [
+                    4,
+                    (hs * 4) as u32,
+                    (hs * intermediate_size * 4) as u32,
+                    (hs * intermediate_size * 4) as u32,
+                ],
             });
 
             let ffn_up_out_bi = batch.add_buffer(
@@ -798,11 +899,15 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_up_out_bi,
                 ti: 0,
                 ne: [intermediate_size as u32, 1, 1, 1],
-                nb: [4, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32],
+                nb: [
+                    4,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                ],
             });
 
-            let mut ffn_up_mat_op = HtpOpDesc::default();
-            ffn_up_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut ffn_up_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             ffn_up_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             ffn_up_mat_op.src[0] = ffn_up_w_ti;
             ffn_up_mat_op.src[1] = normed_ti;
@@ -824,11 +929,15 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_out_bi,
                 ti: 0,
                 ne: [intermediate_size as u32, 1, 1, 1],
-                nb: [4, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32, (intermediate_size * 4) as u32],
+                nb: [
+                    4,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * 4) as u32,
+                ],
             });
 
-            let mut swiglu_op = HtpOpDesc::default();
-            swiglu_op.opcode = HtpOpCode::GluSwiglu as u32;
+            let mut swiglu_op = HtpOpDesc::new(HtpOpCode::GluSwiglu);
             swiglu_op.src[0] = ffn_gate_out_ti;
             swiglu_op.src[1] = ffn_up_out_ti;
             swiglu_op.dst[0] = ffn_out_ti;
@@ -849,11 +958,15 @@ impl Model for HexagonLfm2Model {
                 bi: ffn_down_w_bi,
                 ti: 0,
                 ne: [intermediate_size as u32, hs as u32, 1, 1],
-                nb: [4, (intermediate_size * 4) as u32, (intermediate_size * hs * 4) as u32, (intermediate_size * hs * 4) as u32],
+                nb: [
+                    4,
+                    (intermediate_size * 4) as u32,
+                    (intermediate_size * hs * 4) as u32,
+                    (intermediate_size * hs * 4) as u32,
+                ],
             });
 
-            let mut ffn_down_mat_op = HtpOpDesc::default();
-            ffn_down_mat_op.opcode = HtpOpCode::MulMat as u32;
+            let mut ffn_down_mat_op = HtpOpDesc::new(HtpOpCode::MulMat);
             ffn_down_mat_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
             ffn_down_mat_op.src[0] = ffn_down_w_ti;
             ffn_down_mat_op.src[1] = ffn_out_ti;
@@ -861,8 +974,7 @@ impl Model for HexagonLfm2Model {
             batch.add_op(ffn_down_mat_op);
 
             // Residual add: act = act + normed
-            let mut res2_add_op = HtpOpDesc::default();
-            res2_add_op.opcode = HtpOpCode::Add as u32;
+            let mut res2_add_op = HtpOpDesc::new(HtpOpCode::Add);
             res2_add_op.src[0] = act_ti;
             res2_add_op.src[1] = normed_ti;
             res2_add_op.dst[0] = act_ti;
@@ -887,8 +999,7 @@ impl Model for HexagonLfm2Model {
             nb: [4, (hs * 4) as u32, (hs * 4) as u32, (hs * 4) as u32],
         });
 
-        let mut out_norm_op = HtpOpDesc::default();
-        out_norm_op.opcode = HtpOpCode::RmsNorm as u32;
+        let mut out_norm_op = HtpOpDesc::new(HtpOpCode::RmsNorm);
         out_norm_op.params = build_rms_norm_params(self.config.rms_norm_eps);
         out_norm_op.src[0] = act_ti;
         out_norm_op.src[1] = out_norm_ti;
@@ -911,7 +1022,12 @@ impl Model for HexagonLfm2Model {
             bi: lm_head_bi,
             ti: 0,
             ne: [hs as u32, vocab_size as u32, 1, 1],
-            nb: [4, (hs * 4) as u32, (hs * vocab_size * 4) as u32, (hs * vocab_size * 4) as u32],
+            nb: [
+                4,
+                (hs * 4) as u32,
+                (hs * vocab_size * 4) as u32,
+                (hs * vocab_size * 4) as u32,
+            ],
         });
 
         let logits_bi = batch.add_buffer(
@@ -928,11 +1044,15 @@ impl Model for HexagonLfm2Model {
             bi: logits_bi,
             ti: 0,
             ne: [vocab_size as u32, 1, 1, 1],
-            nb: [4, (vocab_size * 4) as u32, (vocab_size * 4) as u32, (vocab_size * 4) as u32],
+            nb: [
+                4,
+                (vocab_size * 4) as u32,
+                (vocab_size * 4) as u32,
+                (vocab_size * 4) as u32,
+            ],
         });
 
-        let mut lm_head_op = HtpOpDesc::default();
-        lm_head_op.opcode = HtpOpCode::MulMat as u32;
+        let mut lm_head_op = HtpOpDesc::new(HtpOpCode::MulMat);
         lm_head_op.kernel_params = build_mul_mat_kernel_params(1, 1, n_threads);
         lm_head_op.src[0] = lm_head_ti;
         lm_head_op.src[1] = act_ti;
@@ -951,6 +1071,7 @@ impl Model for HexagonLfm2Model {
         }
 
         self.current_seq_len.store(pos + 1, Ordering::SeqCst);
+        state.seq_len = pos + 1;
 
         // Read back computed logits from shared memory
         self.logits_buf
@@ -969,16 +1090,27 @@ impl Model for HexagonLfm2Model {
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
         state.truncate_to(len);
         self.current_seq_len.store(len, Ordering::SeqCst);
     }
 
-    fn check_kv_rewind(&self, _state: &InferenceState, _len: usize) -> Result<(), KvRewindError> {
-        Ok(())
+    fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
+        let current = self.current_seq_len.load(Ordering::SeqCst);
+        if len > current {
+            return Err(KvRewindError::OutOfBounds {
+                requested: len,
+                current,
+            });
+        }
+        state.check_truncate_to(len)
     }
 
     fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
-        self.truncate_kv(state, len);
+        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_kv_rewind(state, len)?;
+        state.try_truncate_to(len)?;
+        self.current_seq_len.store(len, Ordering::SeqCst);
         Ok(())
     }
 
@@ -988,7 +1120,16 @@ impl Model for HexagonLfm2Model {
         compression: &KvCompression,
         max_seq_len: usize,
     ) -> Result<(), CeraError> {
+        if !matches!(compression, KvCompression::None) {
+            return Err(CeraError::Backend(
+                "TurboQuant KV compression is not supported by the Hexagon backend".into(),
+            ));
+        }
+        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fresh = InferenceState::from_config_capped(&self.config, compression, max_seq_len)?;
+        fresh.lora = state.lora.clone();
         self.current_seq_len.store(0, Ordering::SeqCst);
-        crate::model::reset_cpu_kv(self, state, compression, max_seq_len)
+        *state = fresh;
+        Ok(())
     }
 }

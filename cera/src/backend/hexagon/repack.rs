@@ -16,6 +16,11 @@ pub const HTP_TILE_ROWS: usize = 32;
 pub const HTP_TILE_SIZE_Q4_0: usize = 576; // 512 bytes quants + 64 bytes f16 scales
 pub const HTP_TILE_SIZE_Q8_0: usize = 1088; // 1024 bytes quants + 64 bytes f16 scales
 
+// Both BlockQ4_0 and BlockQ8_0 are #[repr(C, packed)] with alignment 1,
+// allowing zero-copy slice casting from arbitrary byte slices safely.
+const _: () = assert!(std::mem::align_of::<BlockQ4_0>() == 1);
+const _: () = assert!(std::mem::align_of::<BlockQ8_0>() == 1);
+
 #[inline(always)]
 pub const fn round_up_32(val: usize) -> usize {
     (val + 31) & !31
@@ -25,14 +30,18 @@ pub const fn round_up_32(val: usize) -> usize {
 pub fn tiled_matrix_size_q4_0(ne0: usize, ne1: usize) -> usize {
     let n_k_tiles = round_up_32(ne0) / HTP_TILE_COLS;
     let n_col_tiles = round_up_32(ne1) / HTP_TILE_ROWS;
-    n_col_tiles * n_k_tiles * HTP_TILE_SIZE_Q4_0
+    n_col_tiles
+        .saturating_mul(n_k_tiles)
+        .saturating_mul(HTP_TILE_SIZE_Q4_0)
 }
 
 /// Calculate the total buffer size in bytes for a repacked Q8_0 matrix.
 pub fn tiled_matrix_size_q8_0(ne0: usize, ne1: usize) -> usize {
     let n_k_tiles = round_up_32(ne0) / HTP_TILE_COLS;
     let n_col_tiles = round_up_32(ne1) / HTP_TILE_ROWS;
-    n_col_tiles * n_k_tiles * HTP_TILE_SIZE_Q8_0
+    n_col_tiles
+        .saturating_mul(n_k_tiles)
+        .saturating_mul(HTP_TILE_SIZE_Q8_0)
 }
 
 /// Repack a linear GGUF Q4_0 weight matrix into HTP 32x32 tiled layout.
@@ -45,7 +54,7 @@ pub fn repack_q4_0_tiled(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
-    if ne0 % 32 != 0 {
+    if !ne0.is_multiple_of(32) {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: ne0 ({}) must be a multiple of 32",
             ne0
@@ -53,7 +62,22 @@ pub fn repack_q4_0_tiled(
     }
 
     let blocks_per_row = ne0 / 32;
-    let expected_src_len = ne1 * blocks_per_row * std::mem::size_of::<BlockQ4_0>();
+    let total_blocks = match ne1.checked_mul(blocks_per_row) {
+        Some(b) => b,
+        None => {
+            return Err(CeraError::Backend(
+                "repack_q4_0: matrix dimension overflow".into(),
+            ));
+        }
+    };
+    let expected_src_len = match total_blocks.checked_mul(std::mem::size_of::<BlockQ4_0>()) {
+        Some(len) => len,
+        None => {
+            return Err(CeraError::Backend(
+                "repack_q4_0: source buffer size overflow".into(),
+            ));
+        }
+    };
     if src_bytes.len() < expected_src_len {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: source buffer too short (expected {} bytes, got {})",
@@ -89,14 +113,14 @@ pub fn repack_q4_0_tiled(
             let mut tile_quants = [[0u8; 32]; 32];
 
             // Unpack 4-bit quants for up to 32 rows within this tile
-            for row in 0..32 {
+            for (row, quants_row) in tile_quants.iter_mut().enumerate() {
                 let r = ct * 32 + row;
                 if r < ne1 && kt < blocks_per_row {
                     let block = &src_blocks[r * blocks_per_row + kt];
                     // Unpack block: low nibbles for cols 0..15, high nibbles for cols 16..31
                     for i in 0..16 {
-                        tile_quants[row][i] = block.qs[i] & 0x0F;
-                        tile_quants[row][i + 16] = block.qs[i] >> 4;
+                        quants_row[i] = block.qs[i] & 0x0F;
+                        quants_row[i + 16] = block.qs[i] >> 4;
                     }
                 }
             }
@@ -139,7 +163,7 @@ pub fn repack_q8_0_tiled(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
-    if ne0 % 32 != 0 {
+    if !ne0.is_multiple_of(32) {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: ne0 ({}) must be a multiple of 32",
             ne0
@@ -147,7 +171,22 @@ pub fn repack_q8_0_tiled(
     }
 
     let blocks_per_row = ne0 / 32;
-    let expected_src_len = ne1 * blocks_per_row * std::mem::size_of::<BlockQ8_0>();
+    let total_blocks = match ne1.checked_mul(blocks_per_row) {
+        Some(b) => b,
+        None => {
+            return Err(CeraError::Backend(
+                "repack_q8_0: matrix dimension overflow".into(),
+            ));
+        }
+    };
+    let expected_src_len = match total_blocks.checked_mul(std::mem::size_of::<BlockQ8_0>()) {
+        Some(len) => len,
+        None => {
+            return Err(CeraError::Backend(
+                "repack_q8_0: source buffer size overflow".into(),
+            ));
+        }
+    };
     if src_bytes.len() < expected_src_len {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: source buffer too short (expected {} bytes, got {})",
@@ -193,7 +232,7 @@ pub fn repack_q8_0_tiled(
                         (0, 0)
                     };
 
-                    tile_dst[cp * 64 + 2 * row + 0] = q0;
+                    tile_dst[cp * 64 + 2 * row] = q0;
                     tile_dst[cp * 64 + 2 * row + 1] = q1;
                 }
             }
@@ -300,5 +339,27 @@ mod tests {
         // Verify scale for row 7
         let scale_bytes = [dst[1024 + 2 * 7], dst[1024 + 2 * 7 + 1]];
         assert_eq!(u16::from_le_bytes(scale_bytes), 207);
+    }
+
+    #[test]
+    fn test_repack_invalid_dimensions() {
+        let mut dst = vec![0u8; 1024];
+        let err = repack_q4_0_tiled(&[], 31, 32, &mut dst).unwrap_err();
+        assert!(err.to_string().contains("must be a multiple of 32"));
+
+        let err8 = repack_q8_0_tiled(&[], 33, 32, &mut dst).unwrap_err();
+        assert!(err8.to_string().contains("must be a multiple of 32"));
+    }
+
+    #[test]
+    fn test_repack_short_buffer() {
+        let src = vec![0u8; 32 * std::mem::size_of::<BlockQ4_0>()];
+        let mut short_dst = vec![0u8; 10];
+        let err = repack_q4_0_tiled(&src, 32, 32, &mut short_dst).unwrap_err();
+        assert!(err.to_string().contains("destination buffer too short"));
+
+        let mut dst = vec![0u8; HTP_TILE_SIZE_Q4_0];
+        let err_src = repack_q4_0_tiled(&[0u8; 10], 32, 32, &mut dst).unwrap_err();
+        assert!(err_src.to_string().contains("source buffer too short"));
     }
 }

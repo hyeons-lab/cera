@@ -28,6 +28,11 @@ impl RpcmemBuffer {
         size: usize,
         map_to_dsp: bool,
     ) -> Result<Self, CeraError> {
+        if size == 0 {
+            return Err(CeraError::Backend(
+                "rpcmem allocation size must be non-zero".into(),
+            ));
+        }
         let ptr = driver.rpcmem_alloc(size)?;
         let fd = match driver.rpcmem_to_fd(ptr) {
             Ok(fd) => fd,
@@ -71,7 +76,7 @@ impl RpcmemBuffer {
     }
 
     /// Mutable raw pointer to the host memory.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }
 
@@ -92,16 +97,25 @@ impl RpcmemBuffer {
 
     /// Flush CPU cache lines for this buffer to ensure DSP visibility.
     pub fn flush_cpu_cache(&self, offset: usize, length: usize) {
-        let _ = (offset, length);
-        // On modern ARMv8-A platforms with system-level cache coherency,
-        // coherent mappings handle sync automatically. On cached DMA-BUFs,
-        // an explicit memory fence prevents reordering before FastRPC triggers.
+        let end = offset.saturating_add(length).min(self.size);
+        let start = offset.min(end);
+        let len = end - start;
+        if len == 0 {
+            return;
+        }
+        // Memory fence ensures all writes to rpcmem complete before FastRPC invoke.
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Invalidate CPU cache lines to observe updates made by the DSP.
     pub fn invalidate_cpu_cache(&self, offset: usize, length: usize) {
-        let _ = (offset, length);
+        let end = offset.saturating_add(length).min(self.size);
+        let start = offset.min(end);
+        let len = end - start;
+        if len == 0 {
+            return;
+        }
+        // Memory fence ensures subsequent CPU reads observe completed DSP writes.
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 }

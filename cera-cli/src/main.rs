@@ -359,7 +359,7 @@ enum Command {
         #[arg(long, requires = "tools")]
         constrain_tools: bool,
 
-        /// Device to use: cpu, gpu, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -622,7 +622,7 @@ enum Command {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -749,7 +749,7 @@ enum Command {
         #[arg(short, long)]
         prompt: String,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -843,7 +843,7 @@ enum Command {
         #[arg(long)]
         add_bos: bool,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -951,7 +951,7 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 

@@ -49,8 +49,7 @@ type FastrpcMmapFn = extern "C" fn(
     length: usize,
     flags: u32,
 ) -> i32;
-type FastrpcMunmapFn =
-    extern "C" fn(domain: i32, fd: i32, addr: *mut c_void, length: usize) -> i32;
+type FastrpcMunmapFn = extern "C" fn(domain: i32, fd: i32, addr: *mut c_void, length: usize) -> i32;
 
 type RemoteHandle64OpenFn = extern "C" fn(name: *const c_char, ph: *mut RemoteHandle64) -> i32;
 type RemoteHandle64InvokeFn =
@@ -186,9 +185,15 @@ impl FastRpcDriver {
                     fastrpc_munmap: resolve!("fastrpc_munmap", FastrpcMunmapFn),
 
                     remote_handle64_open: resolve!("remote_handle64_open", RemoteHandle64OpenFn),
-                    remote_handle64_invoke: resolve!("remote_handle64_invoke", RemoteHandle64InvokeFn),
+                    remote_handle64_invoke: resolve!(
+                        "remote_handle64_invoke",
+                        RemoteHandle64InvokeFn
+                    ),
                     remote_handle64_close: resolve!("remote_handle64_close", RemoteHandle64CloseFn),
-                    remote_session_control: resolve_opt!("remote_session_control", RemoteSessionControlFn),
+                    remote_session_control: resolve_opt!(
+                        "remote_session_control",
+                        RemoteSessionControlFn
+                    ),
 
                     dspqueue_create: resolve!("dspqueue_create", DspqueueCreateFn),
                     dspqueue_close: resolve!("dspqueue_close", DspqueueCloseFn),
@@ -211,6 +216,13 @@ impl FastRpcDriver {
 
     /// Allocate a shared memory buffer via `rpcmem`.
     pub fn rpcmem_alloc(&self, size: usize) -> Result<*mut u8, CeraError> {
+        if size == 0 || size > i32::MAX as usize {
+            return Err(CeraError::Backend(format!(
+                "invalid rpcmem allocation size: {size} bytes (must be between 1 and {} bytes)",
+                i32::MAX
+            )));
+        }
+
         let ptr = if let Some(alloc2) = self.rpcmem_alloc2 {
             (alloc2)(0, 1, size as i32, 0)
         } else {
@@ -326,15 +338,8 @@ impl FastRpcDriver {
         resp_size: u32,
     ) -> Result<DspQueueHandle, CeraError> {
         let mut queue: DspQueueHandle = std::ptr::null_mut();
-        let ret = (self.dspqueue_create)(
-            DOMAIN_CDSP,
-            0,
-            req_size,
-            resp_size,
-            None,
-            None,
-            &mut queue,
-        );
+        let ret =
+            (self.dspqueue_create)(DOMAIN_CDSP, 0, req_size, resp_size, None, None, &mut queue);
         if ret != 0 || queue.is_null() {
             Err(CeraError::Backend(format!(
                 "dspqueue_create failed (error 0x{:08x})",

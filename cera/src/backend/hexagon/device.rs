@@ -6,9 +6,7 @@
 use std::sync::Arc;
 
 use super::queue::HexagonQueueSession;
-use super::sys::{
-    FastRpcDriver, RemoteArg, RemoteBuf, RemoteHandle64, remote_scalars_make,
-};
+use super::sys::{FastRpcDriver, RemoteArg, RemoteBuf, RemoteHandle64, remote_scalars_make};
 use super::types::*;
 use crate::session::CeraError;
 
@@ -46,9 +44,8 @@ pub struct HexagonDevice {
     queue_session: HexagonQueueSession,
 }
 
-// Device session is Send + Sync when guarded under model locks.
+// Device session is Send when guarded under model locks (such as Mutex<HexagonDevice>).
 unsafe impl Send for HexagonDevice {}
-unsafe impl Sync for HexagonDevice {}
 
 impl HexagonDevice {
     /// Initialize a Hexagon device session for the specified architecture in Unsigned PD.
@@ -104,8 +101,8 @@ impl HexagonDevice {
             vtcm_size,
         };
 
-        // Create command queue session with 64 KiB staging buffer
-        let queue_session = match HexagonQueueSession::new(Arc::clone(&driver), 64 * 1024) {
+        // Create command queue session with 1 MiB staging buffer to accommodate full model layer batches
+        let queue_session = match HexagonQueueSession::new(Arc::clone(&driver), 1024 * 1024) {
             Ok(qs) => qs,
             Err(e) => {
                 driver.close_skel_handle(handle);
@@ -193,7 +190,8 @@ impl HexagonDevice {
             },
         ];
         let mmap_scalars = remote_scalars_make(2, 2, 0);
-        self.driver.invoke_skel(self.handle, mmap_scalars, &mut in_args)
+        self.driver
+            .invoke_skel(self.handle, mmap_scalars, &mut in_args)
     }
 
     /// Unregister a buffer from the DSP skeleton (Method 3: 1 in, 0 out).
@@ -205,7 +203,8 @@ impl HexagonDevice {
             },
         }];
         let munmap_scalars = remote_scalars_make(3, 1, 0);
-        self.driver.invoke_skel(self.handle, munmap_scalars, &mut in_args)
+        self.driver
+            .invoke_skel(self.handle, munmap_scalars, &mut in_args)
     }
 
     /// Mutable reference to the command queue session.
