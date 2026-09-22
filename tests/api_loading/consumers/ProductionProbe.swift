@@ -33,7 +33,7 @@ func productionConsumed(_ loader: loading_native.ModelLoader) {
 }
 
 func runProduction(_ root: URL, bytes: Data) throws -> [String] {
-  for (index, backend) in [BackendPreference.auto, .cpu, .gpu, .metal].enumerated() {
+  for (index, backend) in [BackendPreference.auto, .cpu, .gpu, .metal, .hexagon].enumerated() {
     var encoded: [UInt8] = []
     FfiConverterTypeBackendPreference.write(backend, into: &encoded)
     precondition(encoded == [0, 0, 0, UInt8(index + 1)])
@@ -41,7 +41,7 @@ func runProduction(_ root: URL, bytes: Data) throws -> [String] {
     let decoded = try FfiConverterTypeBackendPreference.read(from: &buffer)
     precondition(decoded == backend && buffer.offset == 4)
   }
-  for tag: Int32 in [0, 5, -1, Int32.max] {
+  for tag: Int32 in [0, 6, -1, Int32.max] {
     var wire = tag.bigEndian
     let data = withUnsafeBytes(of: &wire) { Data($0) }
     var buffer = (data: data, offset: 0)

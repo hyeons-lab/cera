@@ -170,14 +170,26 @@ impl HexagonLfm2Model {
         let context = HexagonContext::new()?;
 
         // Probe available Hexagon architectures in descending generation order (V81 -> V79 -> V75 -> V73)
+        // or prioritize an explicit architecture override via CERA_HEXAGON_ARCH.
+        let arch_override = std::env::var("CERA_HEXAGON_ARCH")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .and_then(HexagonArch::from_u32);
+
+        let probe_archs: Vec<HexagonArch> = if let Some(arch) = arch_override {
+            vec![arch]
+        } else {
+            vec![
+                HexagonArch::V81,
+                HexagonArch::V79,
+                HexagonArch::V75,
+                HexagonArch::V73,
+            ]
+        };
+
         let mut device_opt = None;
-        let mut last_err = None;
-        for arch in [
-            HexagonArch::V81,
-            HexagonArch::V79,
-            HexagonArch::V75,
-            HexagonArch::V73,
-        ] {
+        let mut probed_errors = Vec::new();
+        for arch in probe_archs {
             match HexagonDevice::new(Arc::clone(context.driver()), arch) {
                 Ok(dev) => {
                     tracing::info!(arch = ?arch, "initialized Hexagon NPU device");
@@ -185,18 +197,22 @@ impl HexagonLfm2Model {
                     break;
                 }
                 Err(e) => {
-                    last_err = Some(e);
+                    probed_errors.push(format!("{arch:?}: {e}"));
                 }
             }
         }
         let device = match device_opt {
             Some(d) => d,
             None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    CeraError::Backend(
-                        "no compatible Hexagon skeleton library found (probed V73..V81)".into(),
-                    )
-                }));
+                return Err(CeraError::Backend(format!(
+                    "no compatible Hexagon skeleton library found (probed {}). Errors: {}",
+                    if arch_override.is_some() {
+                        "override"
+                    } else {
+                        "V81, V79, V75, V73"
+                    },
+                    probed_errors.join("; ")
+                )));
             }
         };
 
