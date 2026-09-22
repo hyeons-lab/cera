@@ -1,0 +1,436 @@
+//! Dynamic loading and FFI bindings for Qualcomm FastRPC (`libcdsprpc.so`).
+//!
+//! FastRPC provides userspace communication between the Application Processor (AP)
+//! and the Hexagon Compute DSP (CDSP) over shared DMA memory (`rpcmem`).
+
+use std::ffi::{CString, c_char, c_void};
+use std::sync::Arc;
+
+use crate::session::CeraError;
+
+pub type RemoteHandle64 = u64;
+pub type DspQueueHandle = *mut c_void;
+pub type DspQueueCallback = extern "C" fn(context: *mut c_void);
+
+pub const DOMAIN_CDSP: i32 = 3;
+pub const FASTRPC_MAP_FD: u32 = 0;
+pub const DSPQUEUE_TIMEOUT_US: u32 = 1_000_000;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RemoteBuf {
+    pub buf: *mut c_void,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union RemoteArg {
+    pub buf: RemoteBuf,
+    pub h: u32,
+}
+
+/// Pack scalar descriptors for `remote_handle64_invoke`.
+pub const fn remote_scalars_make(method: u32, in_bufs: u32, out_bufs: u32) -> u32 {
+    ((method & 0x1f) << 24) | ((in_bufs & 0xff) << 16) | ((out_bufs & 0xff) << 8)
+}
+
+// Function pointer signatures for symbols loaded from libcdsprpc.so
+type RpcmemAllocFn = extern "C" fn(heapid: i32, flags: u32, size: i32) -> *mut c_void;
+type RpcmemAlloc2Fn = extern "C" fn(heapid: i32, flags: u32, size: i32, attr: u32) -> *mut c_void;
+type RpcmemFreeFn = extern "C" fn(po: *mut c_void);
+type RpcmemToFdFn = extern "C" fn(po: *mut c_void) -> i32;
+
+type FastrpcMmapFn = extern "C" fn(
+    domain: i32,
+    fd: i32,
+    addr: *mut c_void,
+    offset: i32,
+    length: usize,
+    flags: u32,
+) -> i32;
+type FastrpcMunmapFn =
+    extern "C" fn(domain: i32, fd: i32, addr: *mut c_void, length: usize) -> i32;
+
+type RemoteHandle64OpenFn = extern "C" fn(name: *const c_char, ph: *mut RemoteHandle64) -> i32;
+type RemoteHandle64InvokeFn =
+    extern "C" fn(h: RemoteHandle64, dw_scalars: u32, pra: *mut RemoteArg) -> i32;
+type RemoteHandle64CloseFn = extern "C" fn(h: RemoteHandle64) -> i32;
+type RemoteSessionControlFn = extern "C" fn(req: u32, data: *mut c_void, datalen: u32) -> i32;
+
+type DspqueueCreateFn = extern "C" fn(
+    domain: i32,
+    flags: u32,
+    req_queue_size: u32,
+    resp_queue_size: u32,
+    packet_cb: Option<DspQueueCallback>,
+    error_cb: Option<DspQueueCallback>,
+    queue: *mut DspQueueHandle,
+) -> i32;
+type DspqueueCloseFn = extern "C" fn(queue: DspQueueHandle) -> i32;
+type DspqueueExportFn = extern "C" fn(queue: DspQueueHandle, queue_id: *mut u64) -> i32;
+type DspqueueWriteFn = extern "C" fn(
+    queue: DspQueueHandle,
+    flags: u32,
+    num_buffers: u32,
+    buffers: *const super::types::DspQueueBuffer,
+    msg_len: u32,
+    msg: *const u8,
+    timeout_us: u32,
+) -> i32;
+type DspqueueReadFn = extern "C" fn(
+    queue: DspQueueHandle,
+    flags: *mut u32,
+    max_buffers: u32,
+    num_buffers: *mut u32,
+    buffers: *mut super::types::DspQueueBuffer,
+    max_msg_len: u32,
+    msg_len: *mut u32,
+    msg: *mut u8,
+    timeout_us: u32,
+) -> i32;
+
+/// Dynamically loaded FastRPC library handle and dispatch table.
+pub struct FastRpcDriver {
+    #[cfg(unix)]
+    handle: *mut c_void,
+
+    // Memory allocation
+    rpcmem_alloc: RpcmemAllocFn,
+    rpcmem_alloc2: Option<RpcmemAlloc2Fn>,
+    rpcmem_free: RpcmemFreeFn,
+    rpcmem_to_fd: RpcmemToFdFn,
+
+    // FastRPC mmap
+    fastrpc_mmap: FastrpcMmapFn,
+    fastrpc_munmap: FastrpcMunmapFn,
+
+    // Remote handle
+    remote_handle64_open: RemoteHandle64OpenFn,
+    remote_handle64_invoke: RemoteHandle64InvokeFn,
+    remote_handle64_close: RemoteHandle64CloseFn,
+    #[allow(dead_code)]
+    remote_session_control: Option<RemoteSessionControlFn>,
+
+    // DSP queue
+    dspqueue_create: DspqueueCreateFn,
+    dspqueue_close: DspqueueCloseFn,
+    dspqueue_export: DspqueueExportFn,
+    dspqueue_write: DspqueueWriteFn,
+    dspqueue_read: DspqueueReadFn,
+}
+
+// FastRPC driver dispatch is thread-safe across function invocations.
+unsafe impl Send for FastRpcDriver {}
+unsafe impl Sync for FastRpcDriver {}
+
+impl FastRpcDriver {
+    /// Attempt to dynamically load `libcdsprpc.so` (or system driver on Linux/Android).
+    pub fn load() -> Result<Arc<Self>, CeraError> {
+        #[cfg(unix)]
+        {
+            let lib_names = ["libcdsprpc.so", "libadsprpc.so"];
+            let mut lib_handle = std::ptr::null_mut();
+
+            for name in &lib_names {
+                let c_name = CString::new(*name).unwrap();
+                let h = unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+                if !h.is_null() {
+                    lib_handle = h;
+                    break;
+                }
+            }
+
+            if lib_handle.is_null() {
+                return Err(CeraError::Backend(
+                    "Qualcomm FastRPC driver (libcdsprpc.so) not found on this system".into(),
+                ));
+            }
+
+            unsafe {
+                macro_rules! resolve {
+                    ($name:expr, $type:ty) => {{
+                        let c_sym = CString::new($name).unwrap();
+                        let sym = libc::dlsym(lib_handle, c_sym.as_ptr());
+                        if sym.is_null() {
+                            libc::dlclose(lib_handle);
+                            return Err(CeraError::Backend(format!(
+                                "failed to resolve required FastRPC symbol: {}",
+                                $name
+                            )));
+                        }
+                        std::mem::transmute::<*mut c_void, $type>(sym)
+                    }};
+                }
+
+                macro_rules! resolve_opt {
+                    ($name:expr, $type:ty) => {{
+                        let c_sym = CString::new($name).unwrap();
+                        let sym = libc::dlsym(lib_handle, c_sym.as_ptr());
+                        if sym.is_null() {
+                            None
+                        } else {
+                            Some(std::mem::transmute::<*mut c_void, $type>(sym))
+                        }
+                    }};
+                }
+
+                let driver = Self {
+                    handle: lib_handle,
+                    rpcmem_alloc: resolve!("rpcmem_alloc", RpcmemAllocFn),
+                    rpcmem_alloc2: resolve_opt!("rpcmem_alloc2", RpcmemAlloc2Fn),
+                    rpcmem_free: resolve!("rpcmem_free", RpcmemFreeFn),
+                    rpcmem_to_fd: resolve!("rpcmem_to_fd", RpcmemToFdFn),
+
+                    fastrpc_mmap: resolve!("fastrpc_mmap", FastrpcMmapFn),
+                    fastrpc_munmap: resolve!("fastrpc_munmap", FastrpcMunmapFn),
+
+                    remote_handle64_open: resolve!("remote_handle64_open", RemoteHandle64OpenFn),
+                    remote_handle64_invoke: resolve!("remote_handle64_invoke", RemoteHandle64InvokeFn),
+                    remote_handle64_close: resolve!("remote_handle64_close", RemoteHandle64CloseFn),
+                    remote_session_control: resolve_opt!("remote_session_control", RemoteSessionControlFn),
+
+                    dspqueue_create: resolve!("dspqueue_create", DspqueueCreateFn),
+                    dspqueue_close: resolve!("dspqueue_close", DspqueueCloseFn),
+                    dspqueue_export: resolve!("dspqueue_export", DspqueueExportFn),
+                    dspqueue_write: resolve!("dspqueue_write", DspqueueWriteFn),
+                    dspqueue_read: resolve!("dspqueue_read", DspqueueReadFn),
+                };
+
+                Ok(Arc::new(driver))
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(CeraError::Backend(
+                "Qualcomm Hexagon backend is only supported on Unix/Android targets".into(),
+            ))
+        }
+    }
+
+    /// Allocate a shared memory buffer via `rpcmem`.
+    pub fn rpcmem_alloc(&self, size: usize) -> Result<*mut u8, CeraError> {
+        let ptr = if let Some(alloc2) = self.rpcmem_alloc2 {
+            (alloc2)(0, 1, size as i32, 0)
+        } else {
+            (self.rpcmem_alloc)(0, 1, size as i32)
+        };
+
+        if ptr.is_null() {
+            Err(CeraError::OutOfMemory {
+                requested_bytes: size as u64,
+            })
+        } else {
+            Ok(ptr as *mut u8)
+        }
+    }
+
+    /// Free a shared memory buffer allocated via `rpcmem`.
+    pub fn rpcmem_free(&self, ptr: *mut u8) {
+        if !ptr.is_null() {
+            (self.rpcmem_free)(ptr as *mut c_void);
+        }
+    }
+
+    /// Obtain the underlying DMA file descriptor for an `rpcmem` allocation.
+    pub fn rpcmem_to_fd(&self, ptr: *mut u8) -> Result<i32, CeraError> {
+        let fd = (self.rpcmem_to_fd)(ptr as *mut c_void);
+        if fd < 0 {
+            Err(CeraError::Backend(format!(
+                "rpcmem_to_fd failed for buffer {:p} (error {})",
+                ptr, fd
+            )))
+        } else {
+            Ok(fd)
+        }
+    }
+
+    /// Map a memory buffer into the CDSP virtual memory address space.
+    pub fn fastrpc_mmap(&self, fd: i32, addr: *mut u8, length: usize) -> Result<(), CeraError> {
+        let ret = (self.fastrpc_mmap)(
+            DOMAIN_CDSP,
+            fd,
+            addr as *mut c_void,
+            0,
+            length,
+            FASTRPC_MAP_FD,
+        );
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "fastrpc_mmap failed for fd {} length {} (error {})",
+                fd, length, ret
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Unmap a memory buffer from the CDSP virtual memory address space.
+    pub fn fastrpc_munmap(&self, fd: i32, addr: *mut u8, length: usize) -> Result<(), CeraError> {
+        let ret = (self.fastrpc_munmap)(DOMAIN_CDSP, fd, addr as *mut c_void, length);
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "fastrpc_munmap failed for fd {} length {} (error {})",
+                fd, length, ret
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Open a FastRPC handle to a skeleton library (e.g. `file:///libggml-htp-v75.so?domain=3`).
+    pub fn open_skel_handle(&self, uri: &str) -> Result<RemoteHandle64, CeraError> {
+        let c_uri = CString::new(uri).map_err(|e| CeraError::Backend(e.to_string()))?;
+        let mut handle: RemoteHandle64 = 0;
+        let ret = (self.remote_handle64_open)(c_uri.as_ptr(), &mut handle);
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "remote_handle64_open failed for uri '{}' (error 0x{:08x})",
+                uri, ret
+            )))
+        } else {
+            Ok(handle)
+        }
+    }
+
+    /// Close a FastRPC handle.
+    pub fn close_skel_handle(&self, handle: RemoteHandle64) {
+        if handle != 0 {
+            let _ = (self.remote_handle64_close)(handle);
+        }
+    }
+
+    /// Invoke an IDL method on the skeleton library.
+    pub fn invoke_skel(
+        &self,
+        handle: RemoteHandle64,
+        scalars: u32,
+        args: &mut [RemoteArg],
+    ) -> Result<(), CeraError> {
+        let ret = (self.remote_handle64_invoke)(handle, scalars, args.as_mut_ptr());
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "remote_handle64_invoke failed (error 0x{:08x})",
+                ret
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Create an asynchronous DSP command queue.
+    pub fn create_dsp_queue(
+        &self,
+        req_size: u32,
+        resp_size: u32,
+    ) -> Result<DspQueueHandle, CeraError> {
+        let mut queue: DspQueueHandle = std::ptr::null_mut();
+        let ret = (self.dspqueue_create)(
+            DOMAIN_CDSP,
+            0,
+            req_size,
+            resp_size,
+            None,
+            None,
+            &mut queue,
+        );
+        if ret != 0 || queue.is_null() {
+            Err(CeraError::Backend(format!(
+                "dspqueue_create failed (error 0x{:08x})",
+                ret
+            )))
+        } else {
+            Ok(queue)
+        }
+    }
+
+    /// Export a DSP queue ID for registration with `htp_iface_start`.
+    pub fn export_dsp_queue(&self, queue: DspQueueHandle) -> Result<u64, CeraError> {
+        let mut queue_id: u64 = 0;
+        let ret = (self.dspqueue_export)(queue, &mut queue_id);
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "dspqueue_export failed (error 0x{:08x})",
+                ret
+            )))
+        } else {
+            Ok(queue_id)
+        }
+    }
+
+    /// Close a DSP command queue.
+    pub fn close_dsp_queue(&self, queue: DspQueueHandle) {
+        if !queue.is_null() {
+            let _ = (self.dspqueue_close)(queue);
+        }
+    }
+
+    /// Write a batch payload to the DSP command queue.
+    pub fn write_dsp_queue(
+        &self,
+        queue: DspQueueHandle,
+        buffers: &[super::types::DspQueueBuffer],
+        msg: &[u8],
+    ) -> Result<(), CeraError> {
+        let ret = (self.dspqueue_write)(
+            queue,
+            0,
+            buffers.len() as u32,
+            buffers.as_ptr(),
+            msg.len() as u32,
+            msg.as_ptr(),
+            DSPQUEUE_TIMEOUT_US,
+        );
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "dspqueue_write failed (error 0x{:08x})",
+                ret
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Read a response payload from the DSP command queue.
+    pub fn read_dsp_queue(
+        &self,
+        queue: DspQueueHandle,
+        buffers: &mut [super::types::DspQueueBuffer],
+        msg: &mut [u8],
+    ) -> Result<u32, CeraError> {
+        let mut flags: u32 = 0;
+        let mut n_bufs: u32 = 0;
+        let mut msg_len: u32 = 0;
+        let ret = (self.dspqueue_read)(
+            queue,
+            &mut flags,
+            buffers.len() as u32,
+            &mut n_bufs,
+            buffers.as_mut_ptr(),
+            msg.len() as u32,
+            &mut msg_len,
+            msg.as_mut_ptr(),
+            DSPQUEUE_TIMEOUT_US,
+        );
+        if ret != 0 {
+            Err(CeraError::Backend(format!(
+                "dspqueue_read failed (error 0x{:08x})",
+                ret
+            )))
+        } else {
+            Ok(msg_len)
+        }
+    }
+}
+
+impl Drop for FastRpcDriver {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.handle.is_null() {
+            unsafe {
+                libc::dlclose(self.handle);
+            }
+        }
+    }
+}

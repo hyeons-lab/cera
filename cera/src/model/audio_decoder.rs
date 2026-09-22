@@ -100,7 +100,7 @@ pub fn build_gpu_audio_decoder(
 ) -> Option<Arc<dyn AudioGpu>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu => None,
+        BP::Cpu | BP::Hexagon => None,
         BP::Metal => try_metal_audio_decoder(gguf),
         BP::Gpu => try_wgpu_audio_decoder(gguf),
         BP::Auto => try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf)),

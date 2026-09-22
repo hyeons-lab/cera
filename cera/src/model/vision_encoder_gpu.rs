@@ -1501,7 +1501,7 @@ pub fn build_gpu_vision_encoder(
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu => None,
+        BP::Cpu | BP::Hexagon => None,
         BP::Metal => try_metal_vision_encoder(weights),
         BP::Gpu => try_wgpu_vision_encoder(weights),
         BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),

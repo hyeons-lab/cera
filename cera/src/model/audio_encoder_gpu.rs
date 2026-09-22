@@ -1769,7 +1769,7 @@ pub fn build_gpu_audio_encoder(
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu | BP::Gpu => None,
+        BP::Cpu | BP::Gpu | BP::Hexagon => None,
         BP::Metal | BP::Auto => try_metal_audio_encoder(weights),
     }
 }

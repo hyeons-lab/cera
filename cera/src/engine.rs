@@ -70,10 +70,12 @@ pub enum BackendPreference {
     Gpu,
     /// Native Metal. Requires the `metal` feature + macOS.
     Metal,
+    /// Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+    Hexagon,
 }
 
 impl BackendPreference {
-    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`).
+    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`, `"hexagon"`).
     /// Returns `Err` on an unknown label.
     pub fn parse_str(s: &str) -> Result<Self, CeraError> {
         match s.to_ascii_lowercase().as_str() {
@@ -81,8 +83,9 @@ impl BackendPreference {
             "cpu" => Ok(Self::Cpu),
             "gpu" | "wgpu" => Ok(Self::Gpu),
             "metal" => Ok(Self::Metal),
+            "hexagon" | "npu" | "htp" => Ok(Self::Hexagon),
             other => Err(CeraError::Backend(format!(
-                "unknown backend preference `{other}` (use auto, cpu, gpu, or metal)"
+                "unknown backend preference `{other}` (use auto, cpu, gpu, metal, or hexagon)"
             ))),
         }
     }
@@ -2166,6 +2169,13 @@ fn load_text_model(
         BackendPreference::Metal => Err(CeraError::Backend(
             "Metal backend not available (compile with --features metal on macOS or iOS)".into(),
         )),
+        #[cfg(feature = "hexagon")]
+        BackendPreference::Hexagon => model::load_model_hexagon(gguf, path, cfg.context_size)
+            .map_err(|e| CeraError::Backend(format!("Hexagon model load failed: {e}"))),
+        #[cfg(not(feature = "hexagon"))]
+        BackendPreference::Hexagon => Err(CeraError::Backend(
+            "Hexagon backend not available (compile with --features hexagon)".into(),
+        )),
     }
 }
 
@@ -2174,7 +2184,7 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
-    // Metal -> wgpu -> CPU. Mirrors the CLI's previous `load_model_auto`.
+    // Metal -> Hexagon -> wgpu -> CPU.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
         let gguf_for_metal = gguf.clone();
@@ -2185,6 +2195,20 @@ fn load_text_model_auto(
             }
             Err(e) => {
                 tracing::debug!("cera::engine: Metal unavailable ({e}); trying next backend");
+            }
+        }
+    }
+
+    #[cfg(feature = "hexagon")]
+    {
+        let gguf_for_hex = gguf.clone();
+        match model::load_model_hexagon(gguf_for_hex, path, context_size) {
+            Ok(m) => {
+                tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (auto)");
+                return Ok(m);
+            }
+            Err(e) => {
+                tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
             }
         }
     }

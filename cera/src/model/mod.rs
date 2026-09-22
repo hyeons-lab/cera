@@ -59,6 +59,9 @@ pub mod metal_audio_decoder;
 #[cfg(feature = "gpu")]
 pub mod wgpu_audio_decoder;
 
+#[cfg(feature = "hexagon")]
+pub mod hexagon_lfm2;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail, ensure};
@@ -981,6 +984,28 @@ pub fn load_model_metal(
             context_size,
         )?)),
         other => bail!("unsupported architecture for Metal: {other}"),
+    }
+}
+
+/// Load a model with native Qualcomm Hexagon NPU acceleration.
+#[cfg(feature = "hexagon")]
+pub fn load_model_hexagon(
+    gguf: GgufFile,
+    path: Option<&std::path::Path>,
+    context_size: usize,
+) -> Result<Box<dyn Model>> {
+    let arch = gguf
+        .get_str("general.architecture")
+        .unwrap_or("unknown")
+        .to_string();
+    match arch.as_str() {
+        "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
+        | "phi" => Ok(Box::new(hexagon_lfm2::HexagonLfm2Model::from_gguf(
+            gguf,
+            path,
+            context_size,
+        )?)),
+        other => bail!("unsupported architecture for Hexagon NPU: {other}"),
     }
 }
 #[allow(
