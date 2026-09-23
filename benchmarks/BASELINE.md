@@ -282,6 +282,27 @@ engines but the CPU CoVs (up to 17%) show it. The llama NPU/GPU rows additionall
 depend on an unidentified binary: re-runnable from the staged copy, not from
 source.
 
+**WS2 correction (supersedes the "scaling story" read above).** Same-file,
+same-session, unpinned re-runs on `/data/local/tmp/LFM2-350M-Q4_K_M.gguf`
+(which is **mislabeled: it contains Q4_0 tensors**, verified via
+`cera inspect` — both engines ran Q4_0, so the engine comparison stands and
+only the quant label was wrong): llama pp512 t1=597 / t8=2196 (3.68x),
+cera pp512 t1=376 / t8=1205 (3.21x). The gap is **per-thread throughput
+(1.59x), not scaling** — both engines hit the same ~3.5x device wall. Root
+cause: llama.cpp runs repacked-Q4_0 + `smmla` (i8mm,
+`ggml_gemm_q4_0_8x8_q8_0`); cera's repacked prefill kernel is vdot-only
+(`gemm_q4_0_8x8_q8_0`, `neon,dotprod`). The pinned-prime cells above (cera
+667 vs llama 385) are contaminated by the 1017-3840 MHz prime sweep — a
+lottery, not a lead. Fix spec: `docs/WS2_REPACKED_I8MM_SPEC.md`.
+
+**WS2 implementation (2026-09-23, same file/Q4_0):** smmla repack + kernels
+landed (4 parity tests, i8mm-enforced on device), transposes parallelized,
+flash query-blocked. cera pp512: t1 376→**523** (llama 611, same-session),
+t8 1205→**1724** (llama 2279). Spec acceptance (t1≥550, t8≥2000) not met:
+remaining t1 gap = B-interleave + GEMM-form flash (spec'd follow-ups 1-2);
+remaining t8 gap adds 2D GEMM partitioning (follow-up 3). Decode unaffected
+(cera leads 208.5 vs 182.5 at 6t from WS1).
+
 ## Mac: cera vs llama.cpp on M1 Max
 
 cera `b0ffd7e`, llama.cpp `75ad0b23e` (9770, Homebrew, BLAS + Metal), 15 runs

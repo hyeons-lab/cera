@@ -84,6 +84,16 @@ pub enum Repacked {
         packed: Vec<u8>,
         scales: Vec<f32>,
     },
+    /// Smmla (i8mm) twin of [`Repacked::Q40`]: same shapes
+    /// (`(m/8)*nb*256` packed bytes, `(m/8)*nb*8` f32 scales) but the
+    /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] row-pair × 8-wide
+    /// k-chunk interleave instead of the vdot 4-wide one. Built instead of
+    /// `Q40` when the process tier is `NeonI8mm` — never alongside it, so the
+    /// extra-copy cost is unchanged.
+    Q40Smmla {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+    },
     Q4K {
         packed: Vec<u8>,
         dsc: Vec<f32>,
@@ -110,6 +120,7 @@ impl std::fmt::Debug for RepackedWeight {
         // Never print the buffers — they can be hundreds of MiB.
         let (tag, packed_len) = match &self.kind {
             Repacked::Q40 { packed, .. } => ("Q4_0", packed.len()),
+            Repacked::Q40Smmla { packed, .. } => ("Q4_0+smmla", packed.len()),
             Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
         };
         f.debug_struct("RepackedWeight")
@@ -248,9 +259,22 @@ impl WeightRef {
             let gguf = _gguf;
             let mut kind = None;
             if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
-                let (packed, scales) =
-                    cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
-                kind = Some(Repacked::Q40 { packed, scales });
+                // One repack per process, chosen by the resolved tier: the smmla
+                // interleave on i8mm (1.59x the vdot twin's per-thread prefill),
+                // the vdot one everywhere else. The tier is fixed per process
+                // (env override included), so the repack always matches the
+                // dispatch, and the extra-copy cost never doubles.
+                if crate::backend::cpu_features::cpu_features().tier
+                    == crate::backend::cpu_features::CpuTier::NeonI8mm
+                {
+                    let (packed, scales) =
+                        cpu::repack_q4_0_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q40Smmla { packed, scales });
+                } else {
+                    let (packed, scales) =
+                        cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q40 { packed, scales });
+                }
             }
             #[cfg(target_arch = "x86_64")]
             {
@@ -896,6 +920,11 @@ pub(crate) fn try_repacked_gemm_rowmajor(
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
                 packed, scales, b_scales, b_quants, out, n, m, k,
             ),
+            Repacked::Q40Smmla { packed, scales } => {
+                cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                    packed, scales, b_scales, b_quants, out, n, m, k,
+                )
+            }
             _ => false,
         };
         if ran {
@@ -920,6 +949,8 @@ pub(crate) fn gemm_preq_rowmajor(
     if try_repacked_gemm_rowmajor(wref, b_scales, b_quants, out, n, m, k) {
         return true;
     }
+    // Naive (non-repacked) fallback: standard-layout dispatch into a column
+    // scratch, transposed to `out[n, m]`.
     let mut col_out = vec![0.0f32; m * n];
     if gemm_preq(gguf, wref, b_scales, b_quants, &mut col_out, m, n, k) {
         gemm_out_to_rows(&col_out, m, n, m, out);
@@ -966,6 +997,21 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
         ) = (&g_rp.kind, &u_rp.kind)
         {
             return cpu::gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                gp, gs, up, us, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        if let (
+            Repacked::Q40Smmla {
+                packed: gp,
+                scales: gs,
+            },
+            Repacked::Q40Smmla {
+                packed: up,
+                scales: us,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
+            return cpu::gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
                 gp, gs, up, us, b_scales, b_quants, out, m, n, k,
             );
         }
@@ -1037,6 +1083,9 @@ pub(crate) fn gemm_preq(
             Repacked::Q40 { packed, scales } => cpu::gemm_preq_repacked_q4_0_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             ),
+            Repacked::Q40Smmla { packed, scales } => cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            ),
             #[cfg(target_arch = "x86_64")]
             Repacked::Q4K { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_dispatch(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
@@ -1044,10 +1093,13 @@ pub(crate) fn gemm_preq(
             #[allow(unreachable_patterns)]
             _ => false,
         };
-        if !ran {
-            report_uncomputed_gemm("gemm_preq", wref.dtype, k);
+        if ran {
+            return true;
         }
-        return ran;
+        // Fall through to the standard-layout dispatch below: the repacked
+        // kernels need dotprod (aarch64) / int8 (x86), which a low-tier
+        // override (or ancient hardware) lacks. Returning false here would
+        // leave stale activations in `out` — callers ignore the return.
     }
 
     let ran = cpu::gemm_preq_dispatch(wref.dtype, data, b_scales, b_quants, out, m, n, k);

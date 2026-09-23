@@ -6736,6 +6736,459 @@ pub(crate) mod neon {
         }
     }
 
+    /// Shared 8-row × 4-token smmla tile over the
+    /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] layout: super-row `sr`,
+    /// tokens `j..j+4`, full k. Fills `t[r][c]` with output row `r` (of the
+    /// super-row) at token `j+c`. B is plain columnar from
+    /// [`crate::model::transformer::quantize_rows`] (`bq[j*nb*32+b*32]`,
+    /// `bs[j*nb+b]`).
+    ///
+    /// Each 32-element k-block runs as four 8-wide chunks: the LHS comes from
+    /// one `vld1q_s8` per row pair (the repack stores 2 rows × 8 k-elems
+    /// contiguously); the RHS costs two `vld1_s8` + combine per token pair
+    /// (one 8-wide chunk per token — the load a B-interleaved layout would
+    /// fuse into one `vld1q_s8`, except the packer's scatter/transpose cost
+    /// more than the fused load saved, so B stays columnar). Eight
+    /// `vmmlaq_s32` per chunk cover the 8×4 tile; per-block int32
+    /// accumulators are widened and scale-applied into f32 exactly once per
+    /// block, mirroring the vdot twin's numerics (same summation order per
+    /// output: blocks outer, k-chunks inner).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla_q4_0_tile_8x4(
+        p_ptr: *const i8,
+        s_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb: usize,
+        t: &mut [[f32; 4]; 8],
+    ) {
+        unsafe {
+            let mut facc = [[vdupq_n_f32(0.0); 2]; 4];
+            for b in 0..nb {
+                let mut acc = [[vdupq_n_s32(0); 2]; 4];
+                let w_base = p_ptr.add((sr * nb + b) * 256);
+                for c in 0..4usize {
+                    // Token pairs, hoisted out of the row-pair loop (no `p`
+                    // dependence), so B is loaded once per chunk, not per row.
+                    // Columnar RHS: token `j+r`'s block-`b` chunk `c` is 8
+                    // contiguous bytes; each pair is two `vld1_s8` + combine.
+                    // (Low, high) halves are (even, odd) tokens, matching the
+                    // `[r0·t0, r0·t1, r1·t0, r1·t1]` lane order below.
+                    let t0 = bq_ptr.add((j * nb + b) * 32 + c * 8);
+                    let t1 = bq_ptr.add(((j + 1) * nb + b) * 32 + c * 8);
+                    let t2 = bq_ptr.add(((j + 2) * nb + b) * 32 + c * 8);
+                    let t3 = bq_ptr.add(((j + 3) * nb + b) * 32 + c * 8);
+                    let rhs0 = vcombine_s8(vld1_s8(t0), vld1_s8(t1));
+                    let rhs1 = vcombine_s8(vld1_s8(t2), vld1_s8(t3));
+                    for p in 0..4usize {
+                        let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                        acc[p][0] = vmmlaq_s32(acc[p][0], lhs, rhs0);
+                        acc[p][1] = vmmlaq_s32(acc[p][1], lhs, rhs1);
+                    }
+                }
+
+                // Lanes of acc[p][t] are [r0·t0, r0·t1, r1·t0, r1·t1]; the scale
+                // vector matches lane-wise: [dw0·db0, dw0·db1, dw1·db0, dw1·db1].
+                let s_off = (sr * nb + b) * 8;
+                let d0 = vld1q_f32(s_ptr.add(s_off));
+                let d1 = vld1q_f32(s_ptr.add(s_off + 4));
+                let db0 = *bs_ptr.add(j * nb + b);
+                let db1 = *bs_ptr.add((j + 1) * nb + b);
+                let db2 = *bs_ptr.add((j + 2) * nb + b);
+                let db3 = *bs_ptr.add((j + 3) * nb + b);
+                let dbv0 = vld1q_f32([db0, db1, db0, db1].as_ptr());
+                let dbv1 = vld1q_f32([db2, db3, db2, db3].as_ptr());
+                // Row-pair scale dups: vzip1(d, d) = [d0,d0,d1,d1] and
+                // vzip2(d, d) = [d2,d2,d3,d3] — zip interleaves halves, so zipping
+                // a scale quad with itself dups each lane pair into place.
+                let dw_p0 = vzip1q_f32(d0, d0);
+                facc[0][0] =
+                    vfmaq_f32(facc[0][0], vcvtq_f32_s32(acc[0][0]), vmulq_f32(dw_p0, dbv0));
+                facc[0][1] =
+                    vfmaq_f32(facc[0][1], vcvtq_f32_s32(acc[0][1]), vmulq_f32(dw_p0, dbv1));
+                let dw_p1 = vzip2q_f32(d0, d0);
+                facc[1][0] =
+                    vfmaq_f32(facc[1][0], vcvtq_f32_s32(acc[1][0]), vmulq_f32(dw_p1, dbv0));
+                facc[1][1] =
+                    vfmaq_f32(facc[1][1], vcvtq_f32_s32(acc[1][1]), vmulq_f32(dw_p1, dbv1));
+                let dw_p2 = vzip1q_f32(d1, d1);
+                facc[2][0] =
+                    vfmaq_f32(facc[2][0], vcvtq_f32_s32(acc[2][0]), vmulq_f32(dw_p2, dbv0));
+                facc[2][1] =
+                    vfmaq_f32(facc[2][1], vcvtq_f32_s32(acc[2][1]), vmulq_f32(dw_p2, dbv1));
+                let dw_p3 = vzip2q_f32(d1, d1);
+                facc[3][0] =
+                    vfmaq_f32(facc[3][0], vcvtq_f32_s32(acc[3][0]), vmulq_f32(dw_p3, dbv0));
+                facc[3][1] =
+                    vfmaq_f32(facc[3][1], vcvtq_f32_s32(acc[3][1]), vmulq_f32(dw_p3, dbv1));
+            }
+
+            let mut tmp = [[0.0f32; 4]; 8];
+            for p in 0..4 {
+                vst1q_f32(tmp[p * 2].as_mut_ptr(), facc[p][0]);
+                vst1q_f32(tmp[p * 2 + 1].as_mut_ptr(), facc[p][1]);
+            }
+            // tmp[2p+t] lanes are [r0·t0, r0·t1, r1·t0, r1·t1].
+            for p in 0..4 {
+                for rr in 0..2 {
+                    let r = 2 * p + rr;
+                    t[r][0] = tmp[p * 2][rr * 2];
+                    t[r][1] = tmp[p * 2][rr * 2 + 1];
+                    t[r][2] = tmp[p * 2 + 1][rr * 2];
+                    t[r][3] = tmp[p * 2 + 1][rr * 2 + 1];
+                }
+            }
+        }
+    }
+
+    /// Single-token twin of [`smmla_q4_0_tile_8x4`]: super-row `sr`, token `j`,
+    /// full k into `t[8]`. Runs the token pair `(j, j)` — lanes 1/3 duplicate
+    /// lanes 0/2, so only the even lanes are kept. B is plain columnar.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla_q4_0_tile_8x1(
+        p_ptr: *const i8,
+        s_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb: usize,
+        k: usize,
+        t: &mut [f32; 8],
+    ) {
+        unsafe {
+            let mut facc = [vdupq_n_f32(0.0); 4];
+            for b in 0..nb {
+                let mut acc = [vdupq_n_s32(0); 4];
+                let w_base = p_ptr.add((sr * nb + b) * 256);
+                for c in 0..4usize {
+                    let k_off = b * 32 + c * 8;
+                    let b8 = vld1_s8(bq_ptr.add(j * k + k_off));
+                    let rhs = vcombine_s8(b8, b8);
+                    for p in 0..4usize {
+                        let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                        acc[p] = vmmlaq_s32(acc[p], lhs, rhs);
+                    }
+                }
+
+                let s_off = (sr * nb + b) * 8;
+                let d0 = vld1q_f32(s_ptr.add(s_off));
+                let d1 = vld1q_f32(s_ptr.add(s_off + 4));
+                let db = *bs_ptr.add(j * nb + b);
+                let dbv = vdupq_n_f32(db);
+                let dw_p0 = vzip1q_f32(d0, d0);
+                facc[0] = vfmaq_f32(facc[0], vcvtq_f32_s32(acc[0]), vmulq_f32(dw_p0, dbv));
+                let dw_p1 = vzip2q_f32(d0, d0);
+                facc[1] = vfmaq_f32(facc[1], vcvtq_f32_s32(acc[1]), vmulq_f32(dw_p1, dbv));
+                let dw_p2 = vzip1q_f32(d1, d1);
+                facc[2] = vfmaq_f32(facc[2], vcvtq_f32_s32(acc[2]), vmulq_f32(dw_p2, dbv));
+                let dw_p3 = vzip2q_f32(d1, d1);
+                facc[3] = vfmaq_f32(facc[3], vcvtq_f32_s32(acc[3]), vmulq_f32(dw_p3, dbv));
+            }
+
+            let mut tmp = [[0.0f32; 4]; 4];
+            for p in 0..4 {
+                vst1q_f32(tmp[p].as_mut_ptr(), facc[p]);
+            }
+            for p in 0..4 {
+                t[2 * p] = tmp[p][0];
+                t[2 * p + 1] = tmp[p][2];
+            }
+        }
+    }
+
+    /// Smmla (i8mm) twin of [`gemm_q4_0_8x8_q8_0`]: repacked 8-row Q4_0 × Q8_0
+    /// batched GEMM writing `chunk[8 * n]`, consuming the
+    /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] layout with B quants
+    /// packed by [`crate::model::transformer::quantize_rows`].
+    /// Same output contract as the vdot twin; the per-`smmla` 2×2 dots replace
+    /// its broadcast+`vdotq` inner loop (the 1.59x per-thread prefill gap to
+    /// llama.cpp's `ggml_gemm_q4_0_8x8_q8_0`, which is the same dataflow).
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_0_smmla_8x4_q8_0(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+
+        let p_base = packed.as_ptr() as usize;
+        let s_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+
+        let compute_super_row = move |(sr, chunk): (usize, &mut [f32])| unsafe {
+            let p_ptr = p_base as *const i8;
+            let s_ptr = s_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+
+            let mut j = 0;
+            // Process 4 columns at a time
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q4_0_tile_8x4(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, &mut t);
+
+                // Store output rows: chunk layout is `chunk[r * n + j + t]`
+                for r in 0..8 {
+                    chunk[r * n + j..r * n + j + 4].copy_from_slice(&t[r]);
+                }
+
+                j += 4;
+            }
+
+            // Remainder columns
+            while j < n {
+                let mut t = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut t);
+
+                for r in 0..8 {
+                    chunk[r * n + j] = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            crate::backend::cpu::par_rows_n(out, 8 * n, 1, compute_super_row);
+        } else {
+            out.chunks_mut(8 * n)
+                .enumerate()
+                .for_each(compute_super_row);
+        }
+    }
+
+    /// Smmla (i8mm) twin of [`gemm_q4_0_8x8_q8_0_rowmajor`]: repacked 8-row Q4_0
+    /// × Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout,
+    /// with B quants packed by
+    /// [`crate::model::transformer::quantize_rows`].
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_rowmajor(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+
+        let p_base = packed.as_ptr() as usize;
+        let s_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let p_ptr = p_base as *const i8;
+            let s_ptr = s_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+
+            let mut j = 0;
+            // Process 4 tokens (columns) at a time
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q4_0_tile_8x4(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, &mut t);
+
+                // Write directly to row-major output: out[tok * m + 8*sr + r]
+                let base_row = 8 * sr;
+                for c in 0..4 {
+                    for r in 0..8 {
+                        *out_ptr.add((j + c) * m + base_row + r) = t[r][c];
+                    }
+                }
+
+                j += 4;
+            }
+
+            // Remainder tokens
+            while j < n {
+                let mut t = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut t);
+
+                let base_row = 8 * sr;
+                for r in 0..8 {
+                    *out_ptr.add(j * m + base_row + r) = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            if n == 1 {
+                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
+            } else {
+                let nth = crate::backend::cpu::decode_par_threads().max(1);
+                let chunk = sr_count.div_ceil(nth * 4).max(1);
+                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
+                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+            }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
+    /// Smmla (i8mm) twin of [`gemm_q4_0_gate_up_silu_rowmajor`]: fused Gate +
+    /// Up + SiLU repacked Q4_0 × Q8_0 batched GEMM writing directly into
+    /// `out[n, m]`, with B quants packed by
+    /// [`crate::model::transformer::quantize_rows`].
+    ///
+    /// Computes `out[tok, r] = silu(gate[r] · act[tok]) * (up[r] · act[tok])`
+    /// directly in registers, eliminating intermediate memory allocations,
+    /// store/load rounds, and cache thrashing for `up_mat`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_0_smmla_gate_up_silu_rowmajor(
+        gate_packed: &[u8],
+        gate_scales: &[f32],
+        up_packed: &[u8],
+        up_scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(
+            m % 8,
+            0,
+            "fused smmla Gate+Up GEMM: m must be a multiple of 8"
+        );
+        debug_assert_eq!(
+            k % 32,
+            0,
+            "fused smmla Gate+Up GEMM: k must be divisible by 32"
+        );
+        let nb = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(gate_packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(gate_scales.len(), (m / 8) * nb * 8);
+        debug_assert_eq!(up_packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(up_scales.len(), (m / 8) * nb * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb);
+
+        let gp_base = gate_packed.as_ptr() as usize;
+        let gs_base = gate_scales.as_ptr() as usize;
+        let up_base = up_packed.as_ptr() as usize;
+        let us_base = up_scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let gp_ptr = gp_base as *const i8;
+            let gs_ptr = gs_base as *const f32;
+            let up_ptr = up_base as *const i8;
+            let us_ptr = us_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+
+            let mut j = 0;
+            // Process 4 tokens (columns) at a time
+            while j + 4 <= n {
+                let mut gt = [[0.0f32; 4]; 8];
+                let mut ut = [[0.0f32; 4]; 8];
+                smmla_q4_0_tile_8x4(gp_ptr, gs_ptr, bq_ptr, bs_ptr, sr, j, nb, &mut gt);
+                smmla_q4_0_tile_8x4(up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, &mut ut);
+
+                let base_row = 8 * sr;
+                for c in 0..4 {
+                    let tok_idx = j + c;
+                    for r in 0..8 {
+                        let g_val = gt[r][c];
+                        let u_val = ut[r][c];
+                        let silu_val =
+                            (g_val / (1.0 + crate::backend::cpu::ggml_expf(-g_val))) * u_val;
+                        *out_ptr.add(tok_idx * m + base_row + r) = silu_val;
+                    }
+                }
+
+                j += 4;
+            }
+
+            // Remainder tokens
+            while j < n {
+                let mut gt = [0.0f32; 8];
+                let mut ut = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(gp_ptr, gs_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut gt);
+                smmla_q4_0_tile_8x1(up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut ut);
+
+                let base_row = 8 * sr;
+                for r in 0..8 {
+                    let g_val = gt[r];
+                    let u_val = ut[r];
+                    *out_ptr.add(j * m + base_row + r) =
+                        (g_val / (1.0 + crate::backend::cpu::ggml_expf(-g_val))) * u_val;
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            if n == 1 {
+                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
+            } else {
+                let nth = crate::backend::cpu::decode_par_threads().max(1);
+                let chunk = sr_count.div_ceil(nth * 4).max(1);
+                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
+                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+            }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
     /// Is the K-quant (Q4_K/Q6_K) int8 GEMM usable on this CPU?
     ///
     /// Unlike Q4_0/Q8_0, the K-quant GEMMs have **no baseline-NEON fallback** — they
@@ -8295,6 +8748,350 @@ pub(crate) mod neon {
             let mut out_fb = vec![0.0f32; m * n];
             unsafe { gemm_q4_0_q8_0_neon_base(&a, &b_scales, &b_quants, &mut out_fb, m, n, k) };
             assert_close(&out_dot, &out_fb);
+        }
+
+        fn random_q4_0_prefill_case(
+            st: &mut u64,
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> (Vec<u8>, Vec<f32>, Vec<i8>) {
+            let nb = k / 32;
+            let blocks: Vec<BlockQ4_0> = (0..m * nb)
+                .map(|_| {
+                    let mut qs = [0u8; 16];
+                    for b in qs.iter_mut() {
+                        *b = (lcg(st) * 127.0) as i32 as u8;
+                    }
+                    BlockQ4_0 {
+                        d: crate::quant::f32_to_f16(0.03 + lcg(st).abs() * 0.1),
+                        qs,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg(st)).collect();
+                let (s, q) = quantize_col(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+            (a, b_scales, b_quants)
+        }
+
+        #[test]
+        fn q4_0_rowmajor_repacked_matches_colmajor() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            // The rowmajor 4-column main loop once read activations with a
+            // token-interleaved stride (b*128+g*16) no producer emits, so every
+            // prefill with n >= 4 was wrong while n <= 3 (remainder-only) passed.
+            // Cover remainder-only (1, 3), main-only (4), main+remainder (5),
+            // multi-group (13), and a production-ish (m, k).
+            for (m, n, k) in [
+                (16usize, 1usize, 128usize),
+                (16, 3, 128),
+                (16, 4, 128),
+                (16, 5, 128),
+                (16, 13, 128),
+                (256, 5, 512),
+            ] {
+                let mut st = 0x0bad_f00du64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, b_scales, b_quants) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a, m, k);
+                let mut out_rm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_8x8_q8_0_rowmajor(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_rm,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut out_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut out_cm, m, n, k)
+                };
+                // Row-major out[j*m+i] vs column-major out[i*n+j].
+                let mut out_rm_t = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        out_rm_t[i * n + j] = out_rm[j * m + i];
+                    }
+                }
+                assert_close(&out_rm_t, &out_cm);
+            }
+        }
+
+        #[test]
+        fn q4_0_fused_silu_rowmajor_matches_unfused() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            // Fused twin of the rowmajor GEMM above; carried the same broken
+            // 4-column activation stride. Reference: unfused column-major gate
+            // and up GEMMs plus a scalar SiLU.
+            for (m, n, k) in [(16usize, 4usize, 128usize), (16, 5, 128), (128, 5, 256)] {
+                let mut st = 0xf00d_1eafu64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (g_data, b_scales, b_quants) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let (u_data, _, _) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let (g_packed, g_scales) = crate::backend::cpu::repack_q4_0_8x8(&g_data, m, k);
+                let (u_packed, u_scales) = crate::backend::cpu::repack_q4_0_8x8(&u_data, m, k);
+                let mut out_fused = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_gate_up_silu_rowmajor(
+                        &g_packed,
+                        &g_scales,
+                        &u_packed,
+                        &u_scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_fused,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut g_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_8x8_q8_0(
+                        &g_packed, &g_scales, &b_scales, &b_quants, &mut g_cm, m, n, k,
+                    )
+                };
+                let mut u_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_8x8_q8_0(
+                        &u_packed, &u_scales, &b_scales, &b_quants, &mut u_cm, m, n, k,
+                    )
+                };
+                let mut want = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        let g = g_cm[i * n + j];
+                        let u = u_cm[i * n + j];
+                        want[j * m + i] = (g / (1.0 + (-g).exp())) * u;
+                    }
+                }
+                assert_close(&out_fused, &want);
+            }
+        }
+
+        /// Smmla repack layout: 8 rows × 32 k-elems with sequential nibbles land
+        /// at `[chunk][row-pair][row][elem]` as the kernel's LHS loads expect.
+        /// Scalar (no SIMD), so it runs on every aarch64 host — including the
+        /// M1 dev machines that skip the kernel tests below.
+        #[test]
+        fn smmla_repack_layout_spots() {
+            let (m, k, nb) = (8usize, 32usize, 1usize);
+            let bsz = size_of::<BlockQ4_0>();
+            let mut a = vec![0u8; m * nb * bsz];
+            // Nibble value = (row * 32 + elem) % 16; scale = row as f32.
+            for r in 0..m {
+                let off = r * bsz;
+                let d = crate::quant::f32_to_f16(r as f32);
+                a[off..off + 2].copy_from_slice(&d.to_le_bytes());
+                for e in 0..32 {
+                    let v = ((r * 32 + e) % 16) as u8;
+                    if e < 16 {
+                        a[off + 2 + e] |= v;
+                    } else {
+                        a[off + 2 + e - 16] |= v << 4;
+                    }
+                }
+            }
+            let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+            assert_eq!(packed.len(), 256);
+            assert_eq!(scales.len(), 8);
+            for r in 0..8 {
+                assert_eq!(scales[r], r as f32, "scale row {r}");
+            }
+            for c in 0..4usize {
+                for p in 0..4usize {
+                    for rr in 0..2usize {
+                        for e in 0..8usize {
+                            let row = 2 * p + rr;
+                            let elem = 8 * c + e;
+                            let want = (((row * 32 + elem) % 16) as i8) - 8;
+                            let got = packed[c * 64 + p * 16 + rr * 8 + e] as i8;
+                            assert_eq!(
+                                got, want,
+                                "chunk {c} pair {p} row {rr} elem {e} (W row {row}, k {elem})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Smmla repacked GEMM vs the vdot repacked twin. Same int32 block sums
+        /// (exact arithmetic, no overflow at 32 lanes), same f32 scale-apply
+        /// order — so agreement is near-exact, not merely within tolerance.
+        /// Covers remainder-only (1, 3), main-only (4), main+remainder (5),
+        /// multi-group (13), and a production-ish (m, k).
+        #[test]
+        fn smmla_repacked_matches_vdot_colmajor() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 128usize),
+                (16, 3, 128),
+                (16, 4, 128),
+                (16, 5, 128),
+                (16, 13, 128),
+                (64, 5, 256),
+            ] {
+                let mut st = 0x5aa1_c0deu64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, _, _) = random_q4_0_prefill_case(&mut st, m, n, k);
+                // Same columnar activations feed both kernels.
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let nb = k / 32;
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+                let mut got = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &packed, &scales, &b_scales, &b_quants, &mut got, m, n, k,
+                    )
+                };
+                let (v_packed, v_scales) = crate::backend::cpu::repack_q4_0_8x8(&a, m, k);
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_8x8_q8_0(
+                        &v_packed, &v_scales, &b_scales, &b_quants, &mut want, m, n, k,
+                    )
+                };
+                assert_close(&got, &want);
+            }
+        }
+
+        /// Smmla rowmajor vs smmla colmajor (transposed compare). Mirrors
+        /// `q4_0_rowmajor_repacked_matches_colmajor`, including the n ≥ 4
+        /// main-loop coverage that once caught a broken activation stride.
+        #[test]
+        fn smmla_rowmajor_repacked_matches_colmajor() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 128usize),
+                (16, 3, 128),
+                (16, 4, 128),
+                (16, 5, 128),
+                (16, 13, 128),
+                (256, 5, 512),
+            ] {
+                let mut st = 0x5aa1_04e5u64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, _, _) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let nb = k / 32;
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+                let mut out_rm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0_rowmajor(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_rm,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut out_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_cm,
+                        m,
+                        n,
+                        k,
+                    )
+                };
+                // Row-major out[j*m+i] vs column-major out[i*n+j].
+                let mut out_rm_t = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        out_rm_t[i * n + j] = out_rm[j * m + i];
+                    }
+                }
+                assert_close(&out_rm_t, &out_cm);
+            }
+        }
+
+        /// Smmla fused Gate+Up+SiLU vs unfused smmla gate/up GEMMs plus a scalar
+        /// SiLU. Isolates the fusion; the colmajor test above pins smmla ≈ vdot.
+        #[test]
+        fn smmla_fused_silu_rowmajor_matches_unfused() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [(16usize, 4usize, 128usize), (16, 5, 128), (128, 5, 256)] {
+                let mut st = 0x51f1_1eafu64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (g_data, _, _) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let (u_data, _, _) = random_q4_0_prefill_case(&mut st, m, n, k);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let nb = k / 32;
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+                let (g_packed, g_scales) =
+                    crate::backend::cpu::repack_q4_0_smmla_8x8(&g_data, m, k);
+                let (u_packed, u_scales) =
+                    crate::backend::cpu::repack_q4_0_smmla_8x8(&u_data, m, k);
+                let mut out_fused = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_gate_up_silu_rowmajor(
+                        &g_packed,
+                        &g_scales,
+                        &u_packed,
+                        &u_scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_fused,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut g_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &g_packed, &g_scales, &b_scales, &b_quants, &mut g_cm, m, n, k,
+                    )
+                };
+                let mut u_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &u_packed, &u_scales, &b_scales, &b_quants, &mut u_cm, m, n, k,
+                    )
+                };
+                let mut want = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        let g = g_cm[i * n + j];
+                        let u = u_cm[i * n + j];
+                        want[j * m + i] = (g / (1.0 + (-g).exp())) * u;
+                    }
+                }
+                assert_close(&out_fused, &want);
+            }
         }
 
         #[test]
