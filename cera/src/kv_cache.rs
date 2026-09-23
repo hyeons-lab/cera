@@ -2773,9 +2773,18 @@ impl KvPrefixCache {
     }
 
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
+    /// Whether `insert` would store anything. Backends must check this BEFORE
+    /// building the snapshot: constructing one from GPU state costs a blocking
+    /// readback per layer, and building it just to have `insert` throw it away
+    /// stalls every prefill when the cache is disabled. Keep in sync with the
+    /// early-return in `insert`.
+    pub fn stores_entries(&self) -> bool {
+        !(self.config.max_warm_entries == 0 && self.config.cache_dir.is_none())
+    }
+
     pub fn insert(&mut self, tokens: &[u32], snapshot: StateSnapshot) {
         // Skip if cache is disabled (max_warm_entries == 0 and no disk).
-        if self.config.max_warm_entries == 0 && self.config.cache_dir.is_none() {
+        if !self.stores_entries() {
             return;
         }
         let hash = hash_tokens(tokens);

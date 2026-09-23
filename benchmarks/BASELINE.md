@@ -303,6 +303,57 @@ remaining t1 gap = B-interleave + GEMM-form flash (spec'd follow-ups 1-2);
 remaining t8 gap adds 2D GEMM partitioning (follow-up 3). Decode unaffected
 (cera leads 208.5 vs 182.5 at 6t from WS1).
 
+**WS3 GPU gap work (2026-09-23, same file/model, TEC-cooled).** Two tracks:
+
+*Decode kernels.* `gemv_q4_0_fast` was a 32-thread WGSL kernel with a
+6-barrier shared-memory tree reduction, sustaining ~25 GB/s against ~106
+for dense f16 on the same Adreno 830. llama.cpp's Adreno Q4_0 kernel
+(`mul_mv_q4_0_f32`, OpenCL) uses `sub_group_reduce_add` with no shared
+memory and no barriers. cera now matches that structure: 64-thread
+workgroups with a subgroup reduction (`WaveActiveSum` + one shared-mem
+combine, portable across subgroup sizes 8..64). naga cannot parse WGSL
+`enable subgroups`, so the subgroup kernels ship as SPIR-V passthrough
+twins (`spirv/gemv_q4_0_fast.slang`, `spirv/gemv_q6_k.slang`, entry
+`main`), selected when the backend accepts passthrough; the WGSL twins
+keep the tree for GLES/WebGPU. Q6_K got the same treatment (the LM head
+is Q6_K, 52.5 MB — it was 19% of decode GPU and untouched by the Q4_0
+work). Tried and reverted along the way: NR 8→16 (ffn +15%, register /
+I-cache pressure), divide→reciprocal-mult (nil — the driver folds them),
+64-thread alone (+9% wall, kept). Decode GPU: 7.7→**5.4 ms**
+(ffn 4.1→2.7, lm_head 1.49→1.12, conv 1.05→0.69); burst decode
+110→**142 tok/s** (matrix llama: 134).
+
+*Prefill host.* 128-token prefill was 56 ms GPU vs 117 ms wall. The host
+half was one 257-pass command buffer whose `finish()` cost 33 ms
+(~130 µs/pass, linear from 73 to 257 passes; decode passes cost
+~15 µs — the per-pass rate is encoder-dependent, mechanism still open).
+Fix: record-then-emit (`PrefillCmd`), grouping dispatches between copies
+into shared passes (one per layer segment; wgpu inserts the per-dispatch
+barriers, same guarantee the decode `ffn` span relies on), plus a
+bind-group cache for the 184 stream-GEMM groups. Passes 257→**25**,
+`finish()` 33→**3.4 ms**. Profile mode (`CERA_GPU_PROFILE=1`) keeps
+per-op passes so attribution survives. n=128 prefill 1226→**1693**
+(+38%); n=512 2117→**2250** (+6% — kernel-bound there).
+
+*H2H re-run (today, interleaved, 1 equil + 3×5-run passes, TEC):*
+pp512 cera **2250** vs llama **3310** (**1.47x**, was 1.56x);
+dec128 cera **94.7** vs llama **185** (**1.95x** sustained).
+Two things changed since the matrix besides cera's code: (1) llama tg
+moved 134→185 — the matrix ran uncooled with an 11.1% CoV, so part of
+the old gap was llama throttling, not cera speed; (2) sustained decode
+exposes a CPU-throttle dimension the burst numbers hide: cera host work
+per token slows ~5x at equilibrium (`finish()` 0.6→2.9 ms, `qsubmit`
+0.07→0.33 ms, everything CPU-side) while GPU kernels hold flat at
+5.5 ms — the SoC steals CPU frequency under sustained GPU load, and the
+throttle multiplies host cost. llama's leaner host path suffers less.
+
+*Remaining prefill gap (n=512, 220 ms GPU):* `gemm_stream_q4_0` 148 ms
+(2.5 TFLOP/s vs llama's ~3.3) and `attention_prefill` 46 ms (~70 GFLOP/s
+— already the flash kernel, just slow). Both are kernel-tuning projects,
+not host work; similarly decode needs fusion (41 passes/token) plus
+kernel efficiency to close sustained. Documented as follow-ups, not
+attempted here.
+
 ## Mac: cera vs llama.cpp on M1 Max
 
 cera `b0ffd7e`, llama.cpp `75ad0b23e` (9770, Homebrew, BLAS + Metal), 15 runs

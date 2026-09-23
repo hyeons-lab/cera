@@ -3813,10 +3813,14 @@ fn generated_gemm_wgsl_needs_no_f16() {
     }
 }
 
-/// The generated WGSL must **not** contain subgroup ops: cera never requests
-/// `wgpu::Features::SUBGROUP`, so a wave intrinsic leaking into this target
-/// fails pipeline creation on every device. Text-level because the failure
-/// would otherwise surface as an opaque validation error far from its cause.
+/// The generated WGSL for the kernels listed below must **not** contain
+/// subgroup ops: they are dispatched unconditionally, and a wave intrinsic
+/// leaking into them fails pipeline creation on devices without
+/// `wgpu::Features::SUBGROUP`. Text-level because the failure would otherwise
+/// surface as an opaque validation error far from its cause. (Kernels that
+/// intentionally use subgroups, like `gemv_q4_0_fast`, are selected by the
+/// host only when `GpuContext::has_subgroup` is set, and are NOT in this
+/// list — cera does request SUBGROUP opportunistically.)
 #[cfg(feature = "gpu")]
 #[test]
 fn generated_wgsl_has_no_subgroup_ops() {

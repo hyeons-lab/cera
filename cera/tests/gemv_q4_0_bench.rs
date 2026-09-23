@@ -92,8 +92,38 @@ fn bench_shape(shape: &Shape, iters: u32) {
     q4_padded.extend_from_slice(&[0u8; 8]);
 
     // ── wgpu (WGSL) path ────────────────────────────────────────────────
+    // The WGSL tree twin (production wherever SPIR-V passthrough is
+    // unavailable — this bench only runs on macOS, which never takes
+    // passthrough), plus the handwritten legacy kernel for coverage.
+    // The SPIR-V subgroup twin is pinned by the in-crate dispatch smoke
+    // test, which selects passthrough when the backend accepts it.
     let wgpu_us = match GpuContext::new() {
-        Ok(ctx) => Some(bench_wgpu(&ctx, &q4_padded, &x, shape, iters, &expected)),
+        Ok(ctx) => {
+            use cera::backend::wgpu::shaders;
+            let prod = bench_wgpu(
+                &ctx,
+                &q4_padded,
+                &x,
+                shape,
+                iters,
+                &expected,
+                shaders::GEMV_Q4_0_FAST,
+                "gemv_q4_0_fast",
+                "wgpu",
+            );
+            bench_wgpu(
+                &ctx,
+                &q4_padded,
+                &x,
+                shape,
+                iters,
+                &expected,
+                shaders::GEMV_Q4_0,
+                "gemv_q4_0",
+                "wgpu-legacy",
+            );
+            Some(prod)
+        }
         Err(e) => {
             eprintln!("wgpu unavailable: {e}");
             None
@@ -129,18 +159,19 @@ fn bench_wgpu(
     shape: &Shape,
     iters: u32,
     expected: &[f32],
+    shader: &str,
+    entry: &str,
+    label: &str,
 ) -> f64 {
     let a_buf = ctx.upload_storage(q4_padded, "A_q4");
     let x_buf = ctx.upload_f32(x, "x");
     let y_buf = ctx.create_storage_rw((shape.m as u64) * 4, "y");
-    let params = [shape.m, shape.k];
+    // gemv_q4_0_fast reads params[0] as uint4 — pad to 4 words so the
+    // 16-byte read stays in bounds (z/w unused).
+    let params = [shape.m, shape.k, 0u32, 0u32];
     let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
-    let pipeline = ctx.create_pipeline(
-        cera::backend::wgpu::shaders::GEMV_Q4_0,
-        "gemv_q4_0",
-        "gemv_q4_0",
-    );
+    let pipeline = ctx.create_pipeline(shader, entry, label);
     let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
@@ -164,7 +195,8 @@ fn bench_wgpu(
         ],
     });
 
-    // WGSL shader uses 8 rows/workgroup (not parameterized).
+    // Both Q4_0 kernels use NR=8 rows/workgroup (must match the shader's
+    // `NR` and `gemv_pipeline_rows_label` — see the MUST comment there).
     let groups = shape.m.div_ceil(8);
 
     // Warmup + correctness check.
@@ -179,7 +211,7 @@ fn bench_wgpu(
         ctx.queue.submit(Some(enc.finish()));
     }
     let result = ctx.download_f32(&y_buf, shape.m as usize);
-    check_parity("wgpu", expected, &result);
+    check_parity(label, expected, &result);
 
     // Timed batch — submit all iters, then a single readback to drain.
     let start = std::time::Instant::now();
@@ -364,6 +396,13 @@ fn bench_q4_0_gemv_wgsl_vs_msl() {
             m: 65536,
             k: 1024,
             label: "vocab-head",
+        },
+        // Narrow-k: nb=16 < NQ=32, so half the threads skip the block loop.
+        // Exercises the skip path the 64-thread kernel added (WS3 v2).
+        Shape {
+            m: 512,
+            k: 512,
+            label: "narrow-k512",
         },
     ];
     for s in &shapes {

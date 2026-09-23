@@ -1,45 +1,35 @@
-// slang-entries: gemv_q4_0_fast
+// Fast Q4_0 GEMV: y[m] = dequant(W_q4_0[m, k]) @ x[k]. SPIR-V passthrough
+// twin of `../slang/gemv_q4_0_fast.slang` (same K loop, same NR/NQ — keep
+// them in sync), differing only in the cross-thread reduction: subgroups
+// (`WaveActiveSum` + one shared-mem combine) instead of the 6-barrier tree.
 //
-// Fast Q4_0 Matrix-Vector Multiply (GEMV) in Slang for both Metal and WGSL.
-// Tiled across NR=8 output rows per workgroup with direct register-staged activations.
+// Why a twin instead of one source: naga does not implement WGSL `enable
+// subgroups`, so the subgroup reduction cannot ship through the WGSL path on
+// any backend. The twin compiles straight to SPIR-V (GroupNonUniform is
+// core since Vulkan 1.1) and rides `create_shader_module_passthrough` on
+// Vulkan; every other backend dispatches the WGSL tree. Mirrors llama.cpp's
+// Adreno Q4_0 kernel (mul_mv_q4_0_f32), whose subgroup reduction has no
+// shared memory and no barriers.
 //
-// Reduction is a shared-memory tree (6 barriers): this file must stay naga-
-// parseable, and naga does not implement `enable subgroups` yet, so the
-// subgroup reduction lives in the SPIR-V twin
-// (`spirv/gemv_q4_0_fast.slang`, entry `main`, passthrough on Vulkan). The
-// host dispatches the twin when `supports_spirv_passthrough()`, else this.
-// Both share the K loop below — keep them in sync (same math, same NR/NQ).
-//
-// v2 (WS3): 64 threads/workgroup covering NQ=32 blocks per iteration, mirroring
-// the handwritten Metal kernel's 2-simdgroup shape. The 32-thread v1 left the
-// Adreno latency-bound at ~25 GB/s against ~106 GB/s for dense f16 on the same
-// GPU; doubling the threads doubles the outstanding loads per workgroup.
-// Threads with ix >= nb (only when k < 1024) skip the loop with zero
-// accumulators, so narrow-k projections stay correct.
-//
-// v3 (WS3): NR 8 -> 16 tried and REVERTED. The theory (amortize the 16
-// activation loads over more rows) was sound but ffn REGRESSED 15%
-// (3600 -> 4128 us) while lm_head stayed flat at 1486 us: the doubled
-// [unroll] row loop (~1100 instructions) and/or the 48 live registers +
-// 4 KB shared per workgroup cost more than the saved loads. NR=8 stands.
-//
-// v4 (WS3): subgroup reduction, in the SPIR-V twin only (see above).
-// llama.cpp's Adreno Q4_0 kernel (mul_mv_q4_0_f32, 64 threads x 4 rows,
-// `sub_group_reduce_add`) has no shared memory and no barriers at all; our
-// 6-barrier tree was the structural gap. The twin keeps one barrier and
-// NR*8 shared floats for the cross-subgroup combine.
+// Bindings (same as the twin): 0 = weights (u32 view of Q4_0 blocks),
+// 1 = activations (f32), 2 = dst (f32, read-write), 3 = params (uint4:
+// m, k, unused, unused). NR=8 rows per workgroup, 64 threads, NQ=32
+// blocks per iteration. Dispatch: gemv_row_workgroups(ceil(m / 8)).
 
-[[vk::binding(0)]] StructuredBuffer<uint>    w      : register(t0);
-[[vk::binding(1)]] StructuredBuffer<float>   x      : register(t1);
-[[vk::binding(2)]] RWStructuredBuffer<float> y      : register(u2);
-[[vk::binding(3)]] StructuredBuffer<uint4>   params : register(t3);
+[[vk::binding(0, 0)]] StructuredBuffer<uint>    w;
+[[vk::binding(1, 0)]] StructuredBuffer<float>   x;
+[[vk::binding(2, 0)]] RWStructuredBuffer<float> y;
+[[vk::binding(3, 0)]] StructuredBuffer<uint4>   params;
 
 static const uint NR = 8u;
 static const uint NQ = 32u;
 static const uint WG_SIZE = 64u;
 static const uint BLOCK_BYTES = 18u;
+// Subgroup-combine scratch: one float per subgroup per row. Sized for the
+// smallest plausible subgroup (8 -> 8 subgroups); real hardware is 16..64.
+static const uint MAX_SUBGROUPS = 8u;
 
-groupshared float partials[NR * WG_SIZE];
+groupshared float sg_scratch[NR * MAX_SUBGROUPS];
 
 uint get_wid(uint3 wid) {
     return wid.x + wid.y * 65535u;
@@ -57,7 +47,7 @@ uint q_pair(uint qs_byte) {
 }
 
 // The K loop: each thread accumulates its blocks' partial dots for NR rows
-// into `sumf`. Shared by both entries; only the reduction differs.
+// into `sumf`. Identical to the twin's — only the reduction differs.
 void q4_block_loop(
     uint m,
     uint k,
@@ -99,8 +89,7 @@ void q4_block_loop(
 
         // Reciprocal mults, not divides: the divisors are exact powers of two
         // (1/256, 1/16, 1/4096 are all exactly representable), so the products
-        // are bit-identical to the quotients — while a driver that fails to
-        // fold `x / const` pays ~20-40 cycles per divide, 8x per block.
+        // are bit-identical to the quotients.
         float y0 = a0;
         float y1 = a1 * 0.00390625f;
         float y2 = a2;
@@ -168,7 +157,7 @@ void q4_block_loop(
 
 [shader("compute")]
 [numthreads(WG_SIZE, 1, 1)]
-void gemv_q4_0_fast(
+void main(
     uint3 lid : SV_GroupThreadID,
     uint3 wid : SV_GroupID
 ) {
@@ -183,28 +172,33 @@ void gemv_q4_0_fast(
     float sumf[NR];
     q4_block_loop(m, k, r0, ix, il, sumf);
 
+    // Subgroup reduction: each subgroup sums its lanes' partials with one
+    // wave intrinsic, lane 0 of each subgroup publishes to scratch, and lane
+    // 0 of the workgroup combines (<= MAX_SUBGROUPS values) and writes.
+    // `lane_count` is uniform, so `sgid`/`nsg` are well-defined. One barrier
+    // total, vs six in the WGSL twin's tree.
+    uint lane = WaveGetLaneIndex();
+    uint lane_count = WaveGetLaneCount();
+    uint sgid = tid / lane_count;
     [unroll]
     for (uint r = 0u; r < NR; r++) {
-        partials[r * WG_SIZE + tid] = sumf[r];
+        float s = WaveActiveSum(sumf[r]);
+        if (lane == 0u) {
+            sg_scratch[r * MAX_SUBGROUPS + sgid] = s;
+        }
     }
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            [unroll]
-            for (uint r = 0u; r < NR; r++) {
-                uint idx = r * WG_SIZE + tid;
-                partials[idx] += partials[idx + stride];
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
     if (tid == 0u) {
+        uint nsg = WG_SIZE / lane_count;
         [unroll]
         for (uint r = 0u; r < NR; r++) {
+            float t = 0.0f;
+            for (uint i = 0u; i < nsg; i++) {
+                t += sg_scratch[r * MAX_SUBGROUPS + i];
+            }
             if (r0 + r < m) {
-                y[r0 + r] = partials[r * WG_SIZE];
+                y[r0 + r] = t;
             }
         }
     }

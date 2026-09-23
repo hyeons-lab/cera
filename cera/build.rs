@@ -77,6 +77,10 @@ const SLANG_KERNELS: &[&str] = &[
     "mul_mat_reg_tile_q4_k",
     "mul_mat_reg_tile_q5_k",
     "mul_mat_reg_tile_q6_k",
+    "gemm_stream_q4_0",
+    "transpose_cast_f16",
+    "gemv_q4_0_fast",
+    "gemv_q6_k",
 ];
 
 fn compile_slang_kernels() {

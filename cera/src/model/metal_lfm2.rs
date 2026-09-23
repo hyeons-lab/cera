@@ -4394,10 +4394,7 @@ impl Model for MetalLfm2Model {
                     state.seq_len = use_len;
 
                     let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                    self.prefix_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(tokens, self.snapshot_state_locked());
+                    self.maybe_snapshot_prefix_locked(tokens);
                     return logits;
                 }
             }
@@ -4412,10 +4409,7 @@ impl Model for MetalLfm2Model {
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
         // Only cache base-model KV — an adapted run's KV must never be reused.
         if start_pos == 0 && !lora_active {
-            self.prefix_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(tokens, self.snapshot_state_locked());
+            self.maybe_snapshot_prefix_locked(tokens);
         }
         logits
     }
@@ -4556,6 +4550,18 @@ impl MetalLfm2Model {
     /// cache write step) call this directly to avoid a recursive
     /// `Mutex::lock()` deadlock — `std::sync::Mutex` is not
     /// reentrant.
+    /// Snapshot GPU state into the prefix cache, skipping the snapshot
+    /// entirely when the cache is disabled. Mirrors the wgpu backend: building
+    /// it unconditionally costs a blocking readback per layer just to have
+    /// `insert` throw it away.
+    fn maybe_snapshot_prefix_locked(&self, tokens: &[u32]) {
+        let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.stores_entries() {
+            let snap = self.snapshot_state_locked();
+            cache.insert(tokens, snap);
+        }
+    }
+
     fn snapshot_state_locked(&self) -> crate::kv_cache::StateSnapshot {
         use crate::kv_cache::{LayerSnapshot, StateSnapshot};
         let seq_len = self.state.seq_len.load(Ordering::Relaxed);
