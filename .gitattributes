@@ -10,3 +10,6 @@ cera-parity/legs/swift/Sources/cera_ffiFFI/** linguist-generated=true
 
 # flatbuffers-generated Rust (from the .fbs schema via flatc).
 cera/src/generated/** linguist-generated=true
+
+# Vendored Hexagon DSP skels (prebuilt binaries + upstream license).
+cera/src/backend/hexagon/skels/** linguist-generated=true

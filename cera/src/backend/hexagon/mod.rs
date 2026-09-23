@@ -3,19 +3,23 @@
 //! Provides hardware-accelerated tensor operations on Snapdragon Hexagon Tensor Processors (HTP)
 //! through FastRPC shared memory (`rpcmem`) and asynchronous command queues (`dspqueue`).
 
+pub mod adpf;
 pub mod device;
 pub mod params;
 pub mod queue;
 pub mod repack;
 pub mod rpcmem;
+pub mod skels;
 pub mod sys;
 pub mod types;
 
+pub use adpf::AdpfSession;
 pub use device::{HexagonArch, HexagonDevice};
 pub use params::*;
-pub use queue::{HexagonOpBatch, HexagonQueueSession};
+pub use queue::HexagonQueueSession;
 pub use repack::*;
 pub use rpcmem::RpcmemBuffer;
+pub use skels::{HexagonProbe, embedded_skel, install_skels, probe};
 pub use sys::FastRpcDriver;
 pub use types::*;
 
@@ -35,6 +39,23 @@ impl HexagonContext {
     /// Initialize the Hexagon backend by loading the FastRPC userspace driver.
     pub fn new() -> Result<Arc<Self>, CeraError> {
         let driver = FastRpcDriver::load()?;
+        if std::env::var("CERA_HEXAGON_SPIN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            // Debug knob: park a spinner to hold CPU clocks across DSP-bound
+            // waits (validates governor effects; burns a core — ADPF is the
+            // production answer). Detached: runs until process exit.
+            tracing::warn!("cera-hexagon: CERA_HEXAGON_SPIN=1 parking a keepalive spinner thread");
+            std::thread::Builder::new()
+                .name("cera-hex-spin".into())
+                .spawn(|| {
+                    loop {
+                        std::hint::spin_loop();
+                    }
+                })
+                .map_err(|e| CeraError::Backend(format!("spinner spawn failed: {e}")))?;
+        }
         Ok(Arc::new(Self { driver }))
     }
 

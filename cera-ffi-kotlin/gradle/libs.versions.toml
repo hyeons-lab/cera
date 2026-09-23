@@ -18,4 +18,5 @@ kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-c
 # AGP 9+ has built-in Kotlin, so the android module needs no kotlin-android plugin.
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 android-library = { id = "com.android.library", version.ref = "agp" }
+android-application = { id = "com.android.application" }
 maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }

@@ -400,6 +400,68 @@ impl From<cera::BackendPreference> for BackendPreference {
     }
 }
 
+/// Successful Hexagon NPU probe: the working DSP architecture plus
+/// hardware capabilities. See [`hexagon_probe`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HexagonProbeInfo {
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+    pub arch: String,
+    pub threads: u32,
+    pub hvx_units: u32,
+    pub hmx_units: u32,
+    pub vtcm_bytes: u64,
+}
+
+/// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+/// tries each bundled DSP skel, and returns the first working device's
+/// capabilities (then closes it). Fails when the `hexagon` feature is
+/// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+/// unavailable to this process. Call [`hexagon_install_skels`] first on
+/// Android so the loader can find the skel files.
+#[uniffi::export]
+pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
+    #[cfg(feature = "hexagon")]
+    {
+        let p = cera::backend::hexagon::probe()?;
+        Ok(HexagonProbeInfo {
+            arch: format!("{:?}", p.arch),
+            threads: p.n_threads,
+            hvx_units: p.n_hvx,
+            hmx_units: p.n_hmx,
+            vtcm_bytes: p.vtcm_bytes,
+        })
+    }
+    #[cfg(not(feature = "hexagon"))]
+    {
+        Err(FfiError::Backend {
+            detail: "Hexagon backend not available (built without the hexagon feature)".into(),
+        })
+    }
+}
+
+/// Write the embedded DSP skels into `dir` (created if missing) and
+/// point FastRPC's loader at it. Call once at app startup (before
+/// [`hexagon_probe`] or loading a model with
+/// [`BackendPreference::Hexagon`]), passing a private writable
+/// directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
+/// of skels installed. Re-running is cheap (files are only rewritten
+/// when the size differs).
+#[uniffi::export]
+pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError> {
+    #[cfg(feature = "hexagon")]
+    {
+        let n = cera::backend::hexagon::install_skels(std::path::Path::new(&dir))?;
+        Ok(n as u32)
+    }
+    #[cfg(not(feature = "hexagon"))]
+    {
+        let _ = dir;
+        Err(FfiError::Backend {
+            detail: "Hexagon backend not available (built without the hexagon feature)".into(),
+        })
+    }
+}
+
 /// Per-engine configuration at load time. Mirrors [`cera::EngineConfig`]
 /// with `u64` fields (UniFFI doesn't marshal `usize`).
 #[derive(Debug, Clone, uniffi::Record)]

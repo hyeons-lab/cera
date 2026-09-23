@@ -121,6 +121,15 @@ pub struct FastRpcDriver {
     dspqueue_export: DspqueueExportFn,
     dspqueue_write: DspqueueWriteFn,
     dspqueue_read: DspqueueReadFn,
+
+    /// Non-blocking completion polling (llama's `GGML_HEXAGON_OPPOLL`):
+    /// `dspqueue_read` is issued with timeout 0 and retried on
+    /// `EWOULDBLOCK` instead of sleeping in the kernel. Cuts wakeup
+    /// latency (~35% decode gain at small flush counts) at the cost of a
+    /// spinning host thread during DSP batches. Default on (one busy
+    /// core during active inference is cheaper than CPU inference);
+    /// `CERA_HEXAGON_OPPOLL=0` restores blocking reads.
+    oppoll: bool,
 }
 
 // FastRPC driver dispatch is thread-safe across function invocations.
@@ -132,7 +141,16 @@ impl FastRpcDriver {
     pub fn load() -> Result<Arc<Self>, CeraError> {
         #[cfg(unix)]
         {
-            let lib_names = ["libcdsprpc.so", "libadsprpc.so"];
+            // Absolute vendor paths first: app UIDs can read /vendor/lib64
+            // but the linker namespace hides it from soname search, so
+            // bare `dlopen("libcdsprpc.so")` fails inside APKs while the
+            // absolute path may still resolve.
+            let lib_names = [
+                "/vendor/lib64/libcdsprpc.so",
+                "/vendor/lib64/libadsprpc.so",
+                "libcdsprpc.so",
+                "libadsprpc.so",
+            ];
             let mut lib_handle = std::ptr::null_mut();
 
             for name in &lib_names {
@@ -204,6 +222,9 @@ impl FastRpcDriver {
                     dspqueue_export: resolve!("dspqueue_export", DspqueueExportFn),
                     dspqueue_write: resolve!("dspqueue_write", DspqueueWriteFn),
                     dspqueue_read: resolve!("dspqueue_read", DspqueueReadFn),
+                    oppoll: std::env::var("CERA_HEXAGON_OPPOLL")
+                        .map(|v| v != "0")
+                        .unwrap_or(true),
                 };
 
                 Ok(Arc::new(driver))
@@ -442,24 +463,46 @@ impl FastRpcDriver {
         let mut flags: u32 = 0;
         let mut n_bufs: u32 = 0;
         let mut msg_len: u32 = 0;
-        let ret = (self.dspqueue_read)(
-            queue,
-            &mut flags,
-            buffers.len() as u32,
-            &mut n_bufs,
-            buffers.as_mut_ptr(),
-            msg.len() as u32,
-            &mut msg_len,
-            msg.as_mut_ptr(),
-            DSPQUEUE_TIMEOUT_US,
-        );
-        if ret != 0 {
-            Err(CeraError::Backend(format!(
+        let mut timeouts = 0;
+        // Oppoll: timeout 0 turns the read non-blocking; the retry loop
+        // below spins on EWOULDBLOCK until the response lands.
+        let timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
+        loop {
+            let ret = (self.dspqueue_read)(
+                queue,
+                &mut flags,
+                buffers.len() as u32,
+                &mut n_bufs,
+                buffers.as_mut_ptr(),
+                msg.len() as u32,
+                &mut msg_len,
+                msg.as_mut_ptr(),
+                timeout,
+            );
+            if ret == 0 {
+                return Ok(msg_len);
+            }
+            if ret == 0x204 {
+                // AEE_EINTERRUPTED: retry immediately
+                continue;
+            }
+            if ret == 0x0c
+                || ret == (0x8000_0407u32 as i32)
+                || ret == (0x8000_0408u32 as i32)
+                || ret == 11
+            {
+                // ETIMEDOUT, AEE_EEXPIRED, AEE_EWOULDBLOCK: DSP is still
+                // processing. Oppoll spins unbounded (llama parity);
+                // blocking mode keeps the 30s hang guard.
+                timeouts += 1;
+                if self.oppoll || timeouts < 30 {
+                    continue;
+                }
+            }
+            return Err(CeraError::Backend(format!(
                 "dspqueue_read failed (error 0x{:08x})",
                 ret
-            )))
-        } else {
-            Ok(msg_len)
+            )));
         }
     }
 }

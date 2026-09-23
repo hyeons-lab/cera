@@ -54,7 +54,8 @@ mavenPublishing {
         name.set("cera-ffi (Android)")
         description.set(
             "UniFFI/JNA Kotlin bindings for the cera inference engine: Android AAR with " +
-                "jniLibs for arm64-v8a, armeabi-v7a, x86_64, and x86."
+                "jniLibs for arm64-v8a, armeabi-v7a, x86_64, and x86 " +
+                "(Hexagon NPU backend + DSP skels on the 64-bit ABIs)."
         )
         // Dual-licensed Apache-2.0 OR MIT, matching the Cargo workspace.
         licenses {

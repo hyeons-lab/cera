@@ -852,6 +852,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_detect_tool_format(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_hexagon_install_skels(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_hexagon_probe(): Int
+
     external fun uniffi_cera_ffi_checksum_func_hotword_default_config(): Int
 
     external fun uniffi_cera_ffi_checksum_func_list_leap_bundles(): Int
@@ -2332,6 +2336,13 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        `dir`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_func_hexagon_probe(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_func_hotword_default_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_list_leap_bundles(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
@@ -2615,6 +2626,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 16882) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 10841) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
@@ -13151,6 +13168,57 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
 }
 
 /**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+data class HexagonProbeInfo(
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     */
+    var `arch`: kotlin.String,
+    var `threads`: kotlin.UInt,
+    var `hvxUnits`: kotlin.UInt,
+    var `hmxUnits`: kotlin.UInt,
+    var `vtcmBytes`: kotlin.ULong,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeHexagonProbeInfo : FfiConverterRustBuffer<HexagonProbeInfo> {
+    override fun read(buf: ByteBuffer): HexagonProbeInfo =
+        HexagonProbeInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+
+    override fun allocationSize(value: HexagonProbeInfo) =
+        (
+            FfiConverterString.allocationSize(value.`arch`) +
+                FfiConverterUInt.allocationSize(value.`threads`) +
+                FfiConverterUInt.allocationSize(value.`hvxUnits`) +
+                FfiConverterUInt.allocationSize(value.`hmxUnits`) +
+                FfiConverterULong.allocationSize(value.`vtcmBytes`)
+        )
+
+    override fun write(
+        value: HexagonProbeInfo,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`arch`, buf)
+        FfiConverterUInt.write(value.`threads`, buf)
+        FfiConverterUInt.write(value.`hvxUnits`, buf)
+        FfiConverterUInt.write(value.`hmxUnits`, buf)
+        FfiConverterULong.write(value.`vtcmBytes`, buf)
+    }
+}
+
+/**
  * Recovery diagnostic retained after a failed `send_message` ingestion.
  * The call's original error is still returned separately. Generation failures
  * after successful ingestion do not create this report.
@@ -17780,6 +17848,39 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
     FfiConverterOptionalTypeToolFormat.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format(FfiConverterString.lower(`architecture`), _status)
+        },
+    )
+
+/**
+ * Write the embedded DSP skels into `dir` (created if missing) and
+ * point FastRPC's loader at it. Call once at app startup (before
+ * [`hexagon_probe`] or loading a model with
+ * [`BackendPreference::Hexagon`]), passing a private writable
+ * directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
+ * of skels installed. Re-running is cheap (files are only rewritten
+ * when the size differs).
+ */
+@Throws(FfiException::class)
+fun `hexagonInstallSkels`(`dir`: kotlin.String): kotlin.UInt =
+    FfiConverterUInt.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels(FfiConverterString.lower(`dir`), _status)
+        },
+    )
+
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. Call [`hexagon_install_skels`] first on
+ * Android so the loader can find the skel files.
+ */
+@Throws(FfiException::class)
+fun `hexagonProbe`(): HexagonProbeInfo =
+    FfiConverterTypeHexagonProbeInfo.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe(_status)
         },
     )
 

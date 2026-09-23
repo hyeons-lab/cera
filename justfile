@@ -343,12 +343,28 @@ jvm-libs-host:
 # `ffi-buffer` is not optional here even though Kotlin never uses it: the same
 # AAR backs the Flutter plugin, whose Dart bindings call `uniffi_ffibuffer_*`.
 # See scripts/assert-ffibuffer.sh.
+#
+# `hexagon` (Hexagon NPU backend + embedded DSP skels, ~3.2 MB) ships on the
+# 64-bit ABIs only: no shipping NPU phone is 32-bit, and the Play store has
+# required 64-bit since 2019. The two invocations build into scratch dirs and
+# merge (cargo-ndk owns its `-o` root per invocation). The FFI surface is
+# identical on all ABIs — without the feature, `hexagon_probe()` simply
+# reports unavailable and `BackendPreference::Hexagon` falls back to CPU.
 android-libs:
-    cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
-        --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs
+    rm -rf target/android-libs-64 target/android-libs-32
+    cargo ndk -o target/android-libs-64 \
+        --target arm64-v8a --target x86_64 \
+        build -p cera-ffi --release --features ffi-buffer,hexagon
+    cargo ndk -o target/android-libs-32 \
+        --target armeabi-v7a --target x86 \
         build -p cera-ffi --release --features ffi-buffer
-    scripts/assert-ffibuffer.sh \
-        cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
+    mkdir -p "$out"
+    cp -r target/android-libs-64/* target/android-libs-32/* "$out/"
+    scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
+    ls -la "$out"/*/libcera_ffi.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift

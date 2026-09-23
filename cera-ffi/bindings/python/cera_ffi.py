@@ -499,6 +499,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 16882:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 10841:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979:
@@ -1366,6 +1370,15 @@ _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -2363,6 +2376,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_u
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
@@ -5963,6 +5982,64 @@ class _UniffiFfiConverterTypeGenerateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.text, buf)
         _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
         _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
+
+@dataclass
+class HexagonProbeInfo:
+    """
+    Successful Hexagon NPU probe: the working DSP architecture plus
+    hardware capabilities. See [`hexagon_probe`].
+"""
+    def __init__(self, *, arch:str, threads:int, hvx_units:int, hmx_units:int, vtcm_bytes:int):
+        self.arch = arch
+        self.threads = threads
+        self.hvx_units = hvx_units
+        self.hmx_units = hmx_units
+        self.vtcm_bytes = vtcm_bytes
+        
+        
+
+    
+    def __str__(self):
+        return "HexagonProbeInfo(arch={}, threads={}, hvx_units={}, hmx_units={}, vtcm_bytes={})".format(self.arch, self.threads, self.hvx_units, self.hmx_units, self.vtcm_bytes)
+    def __eq__(self, other):
+        if self.arch != other.arch:
+            return False
+        if self.threads != other.threads:
+            return False
+        if self.hvx_units != other.hvx_units:
+            return False
+        if self.hmx_units != other.hmx_units:
+            return False
+        if self.vtcm_bytes != other.vtcm_bytes:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeHexagonProbeInfo(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return HexagonProbeInfo(
+            arch=_UniffiFfiConverterString.read(buf),
+            threads=_UniffiFfiConverterUInt32.read(buf),
+            hvx_units=_UniffiFfiConverterUInt32.read(buf),
+            hmx_units=_UniffiFfiConverterUInt32.read(buf),
+            vtcm_bytes=_UniffiFfiConverterUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.arch)
+        _UniffiFfiConverterUInt32.check_lower(value.threads)
+        _UniffiFfiConverterUInt32.check_lower(value.hvx_units)
+        _UniffiFfiConverterUInt32.check_lower(value.hmx_units)
+        _UniffiFfiConverterUInt64.check_lower(value.vtcm_bytes)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.arch, buf)
+        _UniffiFfiConverterUInt32.write(value.threads, buf)
+        _UniffiFfiConverterUInt32.write(value.hvx_units, buf)
+        _UniffiFfiConverterUInt32.write(value.hmx_units, buf)
+        _UniffiFfiConverterUInt64.write(value.vtcm_bytes, buf)
 
 
 
@@ -15414,6 +15491,48 @@ def detect_tool_format(architecture: str) -> typing.Optional[ToolFormat]:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def hexagon_install_skels(dir: str) -> int:
+    """
+    Write the embedded DSP skels into `dir` (created if missing) and
+    point FastRPC's loader at it. Call once at app startup (before
+    [`hexagon_probe`] or loading a model with
+    [`BackendPreference::Hexagon`]), passing a private writable
+    directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
+    of skels installed. Re-running is cheap (files are only rewritten
+    when the size differs).
+"""
+    
+    _UniffiFfiConverterString.check_lower(dir)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(dir),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def hexagon_probe() -> HexagonProbeInfo:
+    """
+    Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+    tries each bundled DSP skel, and returns the first working device's
+    capabilities (then closes it). Fails when the `hexagon` feature is
+    off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+    unavailable to this process. Call [`hexagon_install_skels`] first on
+    Android so the loader can find the skel files.
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeHexagonProbeInfo.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def hotword_default_config() -> FfiHotwordConfig:
     """
     Default KWS configuration parameters.
@@ -15611,6 +15730,7 @@ __all__ = [
     "GenerateOpts",
     "GenerateSummary",
     "GenerateOutput",
+    "HexagonProbeInfo",
     "IngestRecovery",
     "IngestSummary",
     "LeapBundleEntry",
@@ -15637,6 +15757,8 @@ __all__ = [
     "chat_message_user_image",
     "cpu_backend_report",
     "detect_tool_format",
+    "hexagon_install_skels",
+    "hexagon_probe",
     "hotword_default_config",
     "json_schema_to_grammar",
     "list_leap_bundles",

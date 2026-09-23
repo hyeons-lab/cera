@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Android benchmark harness: cera (CPU + wgpu/Vulkan) vs llama.cpp, on-device.
+# Android benchmark harness: cera (CPU + wgpu/Vulkan + Hexagon) vs llama.cpp
+# (CPU + OpenCL + HTP), on-device.
 #
 # Companion to scripts/bench_matrix.sh (which is the Mac/desktop equivalent).
 # Emits one CSV row per config plus the raw stdout of every run, because the
@@ -329,7 +330,11 @@ stop_samplers() {
 sample_cera() { # backend label mask
   local backend="$1" mask="$3" key="cera|$2"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
-  local base="cd \"$DEVICE_DIR\" && ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
+  # Hexagon skels live next to the llama libs (same DSP images both engines
+  # use); harmless for cpu/gpu cells, required for hexagon.
+  local skel_dir="/data/local/tmp"
+  [[ -n "$LLAMA_BENCH" ]] && skel_dir="$(dirname "$LLAMA_BENCH")"
+  local base="cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
   local pre dec
   start_samplers "$key"
@@ -360,20 +365,26 @@ llama_cfg() { # threads label mask
   if [[ -n "$3" ]]; then echo "t$1-$2-$3"; else echo "t$1-$2"; fi
 }
 
-sample_llama() { # threads label mask
+sample_llama() { # threads label mask [ngl] [device]
   [[ -n "$LLAMA_BENCH" ]] || return 0
   # Declared separately from the substitution: `local x=$(...)` makes `local`
   # the command whose status is seen, masking a failure inside (SC2155).
   local t="$1" mask="$3" key rt
+  # Explicit -ngl, defaulting to 0: on Snapdragon the build registers OpenCL
+  # and HTP backends, and the -ngl default (-1, auto) would silently offload
+  # the "CPU" cells. On Tensor Pixels no GPU backend registers, so this is a
+  # no-op there.
+  local ngl="${4:-0}" device="${5:-}"
   key="llama.cpp|$(llama_cfg "$1" "$2" "$3")"
   rt=$(dirname "$LLAMA_BENCH")
-  local out pin=""
+  local out pin="" dev_flag=""
+  [[ -n "$device" ]] && dev_flag="--device $device "
   # An empty mask means "unpinned", the symmetric counterpart to cera's default
   # RowPool cell; taskset with no mask is a syntax error, so omit it entirely.
   [[ -n "$mask" ]] && pin="taskset $mask "
   start_samplers "$key"
-  out=$("${ADB[@]}" shell "cd \"$rt\" && LD_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
--m \"$DEVICE_DIR/$MODEL\" -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
+  out=$("${ADB[@]}" shell "cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
+-m \"$DEVICE_DIR/$MODEL\" -t $t ${dev_flag}-ngl $ngl -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   stop_samplers
   printf '%s\n' "$out" >> "$LOG"
   # One `sed -n` per field rather than `grep | sed`, matching `sample_cera`. The
@@ -395,9 +406,12 @@ build_cells() {
   CERA_PRIME="pin-prime-$PRIME_MASK"
   CERA_MID="pin-mid-$MID_MASK"
   CERA_GPU="wgpu-vulkan"
+  CERA_HEXAGON="hexagon"
   LLAMA_PRIME=$(llama_cfg 1 prime "$PRIME_MASK")
   LLAMA_MID=$(llama_cfg "$N_MID" mid "$MID_MASK")
   LLAMA_BIG=$(llama_cfg "$N_BIG" big "$BIG_MASK")
+  LLAMA_HTP=$(llama_cfg "$N_ALL" htp0 "")
+  LLAMA_OCL=$(llama_cfg "$N_ALL" opencl "")
   # Unpinned, every core. Without this cell the matrix has no counterpart to
   # cera's default RowPool, which is also unpinned across every core, so a
   # best-vs-best prefill comparison silently pits cera on N cores against llama
@@ -405,8 +419,9 @@ build_cells() {
   LLAMA_ALL=$(llama_cfg "$N_ALL" all "")
   CELLS=(
     "cera|$CERA_DEFAULT" "cera|$CERA_PRIME" "cera|$CERA_MID" "cera|$CERA_GPU"
+    "cera|$CERA_HEXAGON"
     "llama.cpp|$LLAMA_PRIME" "llama.cpp|$LLAMA_MID" "llama.cpp|$LLAMA_BIG"
-    "llama.cpp|$LLAMA_ALL"
+    "llama.cpp|$LLAMA_ALL" "llama.cpp|$LLAMA_HTP" "llama.cpp|$LLAMA_OCL"
   )
 }
 
@@ -420,6 +435,9 @@ one_pass() {
   sample_llama "$N_BIG" big "$BIG_MASK"
   sample_cera gpu "$CERA_GPU" ""
   sample_llama "$N_ALL" all ""
+  sample_cera hexagon "$CERA_HEXAGON" ""
+  sample_llama "$N_ALL" htp0 "" 99 HTP0
+  sample_llama "$N_ALL" opencl "" 99 GPUOpenCL
 }
 
 detect_topology

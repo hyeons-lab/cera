@@ -1,165 +1,55 @@
-//! Batch assembly and command queue execution for Hexagon HTP.
+//! Asynchronous DSP command queue session for Qualcomm Hexagon NPU.
 //!
-//! Operations are batched on the host into a single contiguous shared memory
-//! descriptor buffer (`[htp_buf_desc][htp_tensor][htp_op_desc]`) and dispatched
-//! asynchronously to the DSP via `dspqueue_write`.
+//! Batches operations into `htp_opbatch_req` descriptors and dispatches
+//! to the DSP hardware via FastRPC `dspqueue`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::rpcmem::RpcmemBuffer;
-use super::sys::{DspQueueHandle, FastRpcDriver};
-use super::types::*;
+use super::sys::FastRpcDriver;
+use super::types::{
+    DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER, DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT, DspQueueBuffer,
+    HtpBufDesc, HtpOpBatchReq, HtpOpBatchRsp, HtpOpDesc, HtpProfDesc, HtpStatus, HtpTensor,
+};
 use crate::session::CeraError;
 
-/// An execution batch containing mapped buffers, tensor descriptors, and operations.
-pub struct HexagonOpBatch {
-    bufs: Vec<HtpBufDesc>,
-    tensors: Vec<HtpTensor>,
-    ops: Vec<HtpOpDesc>,
-}
+/// Staging buffer size for batch queue serialization (4 MB).
+const STAGING_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-impl Default for HexagonOpBatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HexagonOpBatch {
-    pub fn new() -> Self {
-        Self {
-            bufs: Vec::with_capacity(8),
-            tensors: Vec::with_capacity(64),
-            ops: Vec::with_capacity(32),
-        }
-    }
-
-    /// Clear all recorded operations and descriptors for reuse.
-    pub fn reset(&mut self) {
-        self.bufs.clear();
-        self.tensors.clear();
-        self.ops.clear();
-    }
-
-    /// Register a shared memory buffer with this batch.
-    pub fn add_buffer(&mut self, base: u64, size: u64, flags: u32, fd: u32) -> u16 {
-        let bi = self.bufs.len() as u16;
-        self.bufs.push(HtpBufDesc {
-            base,
-            size,
-            flags,
-            fd,
-        });
-        bi
-    }
-
-    /// Register an RpcmemBuffer with this batch.
-    pub fn add_rpcmem_buffer(&mut self, buf: &RpcmemBuffer, flags: u32) -> u16 {
-        self.add_buffer(buf.base(), buf.size() as u64, flags, buf.fd() as u32)
-    }
-
-    /// Register a tensor descriptor with this batch.
-    pub fn add_tensor(&mut self, mut tensor: HtpTensor) -> u16 {
-        let ti = self.tensors.len() as u16;
-        tensor.ti = ti;
-        self.tensors.push(tensor);
-        ti
-    }
-
-    /// Register an operation to be executed on the DSP.
-    pub fn add_op(&mut self, op: HtpOpDesc) {
-        self.ops.push(op);
-    }
-
-    /// Calculate the byte size needed to serialize this batch descriptor buffer.
-    pub fn serialized_size(&self) -> usize {
-        let b_size = std::mem::size_of::<HtpBufDesc>() * self.bufs.len();
-        let t_size = std::mem::size_of::<HtpTensor>() * self.tensors.len();
-        let o_size = std::mem::size_of::<HtpOpDesc>() * self.ops.len();
-        b_size + t_size + o_size
-    }
-
-    /// Pack batch descriptors into a destination byte buffer.
-    pub fn serialize_into(
-        &self,
-        seq: u64,
-        req: &mut HtpOpBatchReq,
-        dst: &mut [u8],
-    ) -> Result<usize, CeraError> {
-        let required_size = self.serialized_size();
-        if dst.len() < required_size {
-            return Err(CeraError::Backend(format!(
-                "queue buffer too small (needed {} bytes, available {})",
-                required_size,
-                dst.len()
-            )));
-        }
-
-        req.seq = seq;
-        req.flags = 0;
-        req.n_bufs = self.bufs.len() as u32;
-        req.n_tensors = self.tensors.len() as u32;
-        req.n_ops = self.ops.len() as u32;
-
-        let mut offset = 0;
-
-        // Copy buffer descriptors
-        let b_bytes = self.bufs.len() * std::mem::size_of::<HtpBufDesc>();
-        if b_bytes > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.bufs.as_ptr() as *const u8,
-                    dst.as_mut_ptr().add(offset),
-                    b_bytes,
-                );
-            }
-            offset += b_bytes;
-        }
-
-        // Copy tensor descriptors
-        let t_bytes = self.tensors.len() * std::mem::size_of::<HtpTensor>();
-        if t_bytes > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.tensors.as_ptr() as *const u8,
-                    dst.as_mut_ptr().add(offset),
-                    t_bytes,
-                );
-            }
-            offset += t_bytes;
-        }
-
-        // Copy op descriptors
-        let o_bytes = self.ops.len() * std::mem::size_of::<HtpOpDesc>();
-        if o_bytes > 0 {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.ops.as_ptr() as *const u8,
-                    dst.as_mut_ptr().add(offset),
-                    o_bytes,
-                );
-            }
-            offset += o_bytes;
-        }
-
-        Ok(offset)
-    }
-}
-
-/// An active DSP command queue session managing async request and response dispatch.
+/// An active DSP command queue session managing batched request and response dispatch.
 pub struct HexagonQueueSession {
     driver: Arc<FastRpcDriver>,
-    queue: DspQueueHandle,
+    queue: crate::backend::hexagon::sys::DspQueueHandle,
     queue_id: u64,
     staging_buf: RpcmemBuffer,
+    bufs: Vec<HtpBufDesc>,
+    buf_map: HashMap<i32, u16>,
+    tens: Vec<HtpTensor>,
+    ops: Vec<HtpOpDesc>,
+    /// Auto-flush once this many ops are queued (`None` = unbounded).
+    /// Small-M prefill chunks cap this (see `SMALL_M_MAX_OPS_PER_FLUSH`):
+    /// large single-flush batches compute nondeterministically there.
+    max_ops_per_flush: Option<usize>,
+    seq: u64,
+    /// Aggregate DSP microseconds per opcode across flushes (profiling only).
+    prof: HashMap<u32, (u64, u64)>,
+    prof_host_us: u64,
+    prof_dsp_us: u64,
+    prof_flushes: u64,
+    /// DSP worker threads from `htp_iface_hwinfo` (llama's `sess->n_threads`).
+    /// kparams thread counts derive from this; the default is llama's
+    /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
+    dsp_threads: u32,
 }
 
 // Queue session operations are Send across threads when guarded by model session locks.
 unsafe impl Send for HexagonQueueSession {}
 
 impl HexagonQueueSession {
-    /// Create a new command queue session with an allocated staging descriptor buffer.
-    pub fn new(driver: Arc<FastRpcDriver>, staging_size: usize) -> Result<Self, CeraError> {
-        let queue = driver.create_dsp_queue(staging_size as u32, 64 * 1024)?;
+    /// Create a new command queue session.
+    pub fn new(driver: Arc<FastRpcDriver>) -> Result<Self, CeraError> {
+        let queue = driver.create_dsp_queue(128 * 1024, 64 * 1024)?;
         let queue_id = match driver.export_dsp_queue(queue) {
             Ok(id) => id,
             Err(e) => {
@@ -168,7 +58,8 @@ impl HexagonQueueSession {
             }
         };
 
-        let staging_buf = match RpcmemBuffer::alloc(Arc::clone(&driver), staging_size, true) {
+        let staging_buf = match RpcmemBuffer::alloc(Arc::clone(&driver), STAGING_BUFFER_SIZE, true)
+        {
             Ok(buf) => buf,
             Err(e) => {
                 driver.close_dsp_queue(queue);
@@ -181,7 +72,30 @@ impl HexagonQueueSession {
             queue,
             queue_id,
             staging_buf,
+            bufs: Vec::with_capacity(32),
+            buf_map: HashMap::new(),
+            tens: Vec::with_capacity(256),
+            ops: Vec::with_capacity(128),
+            max_ops_per_flush: None,
+            seq: 1,
+            prof: HashMap::new(),
+            prof_host_us: 0,
+            prof_dsp_us: 0,
+            prof_flushes: 0,
+            dsp_threads: 8,
         })
+    }
+
+    /// DSP worker threads for kparams (from `htp_iface_hwinfo`).
+    pub fn dsp_threads(&self) -> u32 {
+        self.dsp_threads.max(1)
+    }
+
+    /// Record the `htp_iface_hwinfo` thread count (0 keeps the default).
+    pub fn set_dsp_threads(&mut self, n: u32) {
+        if n > 0 {
+            self.dsp_threads = n;
+        }
     }
 
     /// Underlying exported DSP queue identifier for registration with `htp_iface_start`.
@@ -189,128 +103,359 @@ impl HexagonQueueSession {
         self.queue_id
     }
 
-    /// Submit a batch of operations to the DSP for asynchronous execution.
-    pub fn submit(&mut self, batch: &HexagonOpBatch, seq: u64) -> Result<(), CeraError> {
-        let mut req = HtpOpBatchReq::default();
-        let payload_len = batch.serialize_into(seq, &mut req, self.staging_buf.as_mut_slice())?;
-        self.staging_buf.flush_cpu_cache(0, payload_len);
+    /// Cap ops per flush (`None` restores unbounded batching). While set,
+    /// `enqueue_op` flushes automatically once the cap is reached.
+    pub fn set_max_ops_per_flush(&mut self, max: Option<usize>) {
+        self.max_ops_per_flush = max.filter(|&m| m >= 1);
+    }
 
-        let qbuf = DspQueueBuffer {
-            ptr: self.staging_buf.as_mut_ptr(),
-            size: payload_len as u32,
+    /// Register a buffer in the batch, returning its index.
+    pub fn add_buffer(&mut self, buf: &RpcmemBuffer) -> u16 {
+        let fd = buf.fd();
+        if let Some(&idx) = self.buf_map.get(&fd) {
+            return idx;
+        }
+        let idx = self.bufs.len() as u16;
+        self.bufs.push(HtpBufDesc {
+            base: buf.as_ptr() as u64,
+            size: buf.size() as u64,
             flags: 0,
+            fd: fd as u32,
+        });
+        self.buf_map.insert(fd, idx);
+        idx
+    }
+
+    /// Register a tensor in the batch, returning its index.
+    // One arg per HtpTensor field; a builder would just move the arity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_tensor(
+        &mut self,
+        buf: &RpcmemBuffer,
+        offset: usize,
+        size: usize,
+        flags: u32,
+        dtype: u32,
+        ne: [u32; 4],
+        nb: [u32; 4],
+    ) -> u16 {
+        let bi = self.add_buffer(buf);
+        let ti = self.tens.len() as u16;
+        self.tens.push(HtpTensor {
+            data: offset as u64,
+            size: size as u32,
+            flags,
+            dtype,
+            bi,
+            ti,
+            ne,
+            nb,
+        });
+        ti
+    }
+
+    /// Enqueue an operation into the current batch.
+    pub fn enqueue_op(
+        &mut self,
+        opcode: u32,
+        src: &[u16],
+        dst: &[u16],
+        params: [i32; 16],
+        kernel_params: [i32; 32],
+    ) {
+        let mut op = HtpOpDesc {
+            opcode,
+            flags: 0,
+            params,
+            kernel_params,
+            src: [0xffff; 10],
+            dst: [0xffff; 4],
+            pad: [0; 2],
+        };
+        for (i, &s) in src.iter().enumerate().take(10) {
+            op.src[i] = s;
+        }
+        for (i, &d) in dst.iter().enumerate().take(4) {
+            op.dst[i] = d;
+        }
+        self.ops.push(op);
+        if self.max_ops_per_flush.is_some_and(|m| self.ops.len() >= m)
+            && let Err(e) = self.flush()
+        {
+            panic!(
+                "HTP capped flush failed (cap={:?}): {e}",
+                self.max_ops_per_flush
+            );
+        }
+        if std::env::var_os("CERA_HEXAGON_STEP").is_some() {
+            eprintln!("[cera-hexagon] step op opcode={opcode}");
+            if let Err(e) = self.flush() {
+                eprintln!("[cera-hexagon] step op opcode={opcode} failed: {e}");
+                panic!("HTP step failed on opcode {opcode}: {e}");
+            }
+        }
+    }
+
+    /// Flush all queued operations in a single atomic batch execution.
+    pub fn flush(&mut self) -> Result<(), CeraError> {
+        if self.ops.is_empty() {
+            return Ok(());
+        }
+
+        if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
+            eprintln!(
+                "[cera-hexagon] flush: bufs.len={} tens.len={} ops.len={}",
+                self.bufs.len(),
+                self.tens.len(),
+                self.ops.len()
+            );
+            for (i, b) in self.bufs.iter().enumerate() {
+                eprintln!(
+                    "  buf[{}]: fd={} size={} (0x{:x}) base=0x{:x}",
+                    i, b.fd, b.size, b.size, b.base
+                );
+            }
+            for (i, t) in self.tens.iter().enumerate() {
+                eprintln!(
+                    "  ten[{}]: bi={} data=0x{:x} size={} dtype={} flags={} ne={:?} nb={:?}",
+                    i, t.bi, t.data, t.size, t.dtype, t.flags, t.ne, t.nb
+                );
+            }
+            for (i, o) in self.ops.iter().enumerate() {
+                eprintln!(
+                    "  op[{}]: opcode={} src={:?} dst={:?} params={:?}",
+                    i,
+                    o.opcode,
+                    o.src
+                        .iter()
+                        .cloned()
+                        .filter(|&s| s != 0xffff)
+                        .collect::<Vec<_>>(),
+                    o.dst
+                        .iter()
+                        .cloned()
+                        .filter(|&d| d != 0xffff)
+                        .collect::<Vec<_>>(),
+                    o.params,
+                );
+                eprintln!("    kparams={:?}", o.kernel_params);
+            }
+        }
+
+        let bufs_bytes = self.bufs.len() * std::mem::size_of::<HtpBufDesc>();
+        let tens_bytes = self.tens.len() * std::mem::size_of::<HtpTensor>();
+        let ops_bytes = self.ops.len() * std::mem::size_of::<HtpOpDesc>();
+        let prof_bytes = self.ops.len() * std::mem::size_of::<HtpProfDesc>();
+        let total_bytes = bufs_bytes + tens_bytes + ops_bytes + prof_bytes;
+
+        if total_bytes > self.staging_buf.size() {
+            return Err(CeraError::Backend(format!(
+                "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
+                self.staging_buf.size()
+            )));
+        }
+
+        unsafe {
+            let base = self.staging_buf.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(self.bufs.as_ptr() as *const u8, base, bufs_bytes);
+            std::ptr::copy_nonoverlapping(
+                self.tens.as_ptr() as *const u8,
+                base.add(bufs_bytes),
+                tens_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.ops.as_ptr() as *const u8,
+                base.add(bufs_bytes + tens_bytes),
+                ops_bytes,
+            );
+            std::ptr::write_bytes(base.add(bufs_bytes + tens_bytes + ops_bytes), 0, prof_bytes);
+        }
+
+        self.staging_buf.flush_cpu_cache(0, total_bytes);
+
+        let dbuf = DspQueueBuffer {
+            fd: self.staging_buf.fd() as u32,
+            size: total_bytes as u32,
+            offset: 0,
+            flags: DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT,
+            ptr: self.staging_buf.as_mut_ptr() as *mut std::ffi::c_void,
+        };
+
+        let req = HtpOpBatchReq {
+            seq: self.seq,
+            n_bufs: self.bufs.len() as u32,
+            n_tensors: self.tens.len() as u32,
+            n_ops: self.ops.len() as u32,
+            n_traces: 0,
         };
 
         let req_bytes = unsafe {
             std::slice::from_raw_parts(
-                &req as *const HtpOpBatchReq as *const u8,
+                &req as *const _ as *const u8,
                 std::mem::size_of::<HtpOpBatchReq>(),
             )
         };
 
-        self.driver.write_dsp_queue(self.queue, &[qbuf], req_bytes)
-    }
+        let n_ops = self.ops.len();
+        let host_start = std::time::Instant::now();
+        let write_res = self.driver.write_dsp_queue(self.queue, &[dbuf], req_bytes);
 
-    /// Poll for batch completion and verify execution status.
-    pub fn wait_completion(&mut self, expected_seq: u64) -> Result<HtpOpBatchRsp, CeraError> {
         let mut rsp = HtpOpBatchRsp::default();
-        let mut qbufs = [DspQueueBuffer::default()];
+        let mut resp_bufs = [DspQueueBuffer::default(); 1];
+        let rsp_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut rsp as *mut _ as *mut u8,
+                std::mem::size_of::<HtpOpBatchRsp>(),
+            )
+        };
 
-        // Drain any stale responses from prior timed-out or canceled batches
-        loop {
-            let rsp_bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    &mut rsp as *mut HtpOpBatchRsp as *mut u8,
-                    std::mem::size_of::<HtpOpBatchRsp>(),
-                )
-            };
-
+        let read_res = if write_res.is_ok() {
             self.driver
-                .read_dsp_queue(self.queue, &mut qbufs, rsp_bytes)?;
+                .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
+        } else {
+            Ok(0)
+        };
 
-            if rsp.seq < expected_seq {
-                tracing::warn!(
-                    stale_seq = rsp.seq,
-                    expected_seq,
-                    "drained stale DSP queue response"
-                );
-                continue;
-            }
+        self.staging_buf.invalidate_cpu_cache(0, total_bytes);
 
-            if rsp.seq != expected_seq {
-                return Err(CeraError::Backend(format!(
-                    "DSP queue sequence mismatch (expected {}, got {})",
-                    expected_seq, rsp.seq
-                )));
-            }
+        self.bufs.clear();
+        self.buf_map.clear();
+        self.tens.clear();
+        self.ops.clear();
+        self.seq += 1;
 
-            break;
-        }
+        write_res?;
+        read_res?;
 
         if rsp.status != HtpStatus::Ok as u32 {
             return Err(CeraError::Backend(format!(
-                "DSP execution failed with status code {}",
-                rsp.status
+                "HTP batch seq {} failed with status {}",
+                rsp.seq, rsp.status
             )));
         }
 
-        Ok(rsp)
+        if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() {
+            self.record_profile(
+                n_ops,
+                rsp.usecs,
+                rsp.cycles_stop.saturating_sub(rsp.cycles_start),
+                host_start.elapsed(),
+                bufs_bytes + tens_bytes + ops_bytes,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Aggregate DSP-side per-op timing from the profile descriptors the
+    /// firmware wrote into staging, and log a one-line batch summary.
+    fn record_profile(
+        &mut self,
+        n_ops: usize,
+        batch_usecs: u32,
+        batch_cycles: u64,
+        host_elapsed: std::time::Duration,
+        prof_offset: usize,
+    ) {
+        let prof_size = std::mem::size_of::<HtpProfDesc>();
+        let mut dsp_total: u64 = 0;
+        let per_op = std::env::var_os("CERA_HEXAGON_PROFILE_OPS").is_some();
+        for i in 0..n_ops {
+            let desc = unsafe {
+                (self.staging_buf.as_ptr().add(prof_offset + i * prof_size) as *const HtpProfDesc)
+                    .read_unaligned()
+            };
+            let e = self.prof.entry(desc.opcode).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += desc.usecs as u64;
+            dsp_total += desc.usecs as u64;
+            if per_op {
+                eprintln!(
+                    "[cera-hexagon] profile-op: seq={} idx={} op={} {} usec={}",
+                    self.seq,
+                    i,
+                    desc.opcode,
+                    htp_opcode_name(desc.opcode),
+                    desc.usecs,
+                );
+            }
+        }
+        self.prof_flushes += 1;
+        self.prof_host_us += host_elapsed.as_micros() as u64;
+        self.prof_dsp_us += batch_usecs as u64;
+        let mhz = if batch_usecs > 0 {
+            batch_cycles as f64 / batch_usecs as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[cera-hexagon] profile: seq={} ops={} dsp_op_us={} dsp_batch_us={} host_us={} mhz={:.1}",
+            self.seq,
+            n_ops,
+            dsp_total,
+            batch_usecs,
+            host_elapsed.as_micros(),
+            mhz,
+        );
     }
 }
 
 impl Drop for HexagonQueueSession {
     fn drop(&mut self) {
+        let _ = self.flush();
+        if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() && self.prof_flushes > 0 {
+            let rtt = self.prof_host_us.saturating_sub(self.prof_dsp_us) / self.prof_flushes;
+            eprintln!(
+                "[cera-hexagon] profile: {} flushes, host_total={}us dsp_total={}us mean_rtt={}us",
+                self.prof_flushes, self.prof_host_us, self.prof_dsp_us, rtt
+            );
+            // Per-op descs are zero unless the DSP profiler was enabled
+            // (`HexagonDevice` enables it under `CERA_HEXAGON_PROFILE`); the
+            // batch totals above stay valid either way.
+            if self.prof.values().any(|&(_, us)| us > 0) {
+                let mut rows: Vec<(u32, (u64, u64))> =
+                    self.prof.iter().map(|(&k, &v)| (k, v)).collect();
+                rows.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+                eprintln!(
+                    "[cera-hexagon] profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
+                    "op", "name", "count", "total_us", "mean_us"
+                );
+                for (op, (count, us)) in rows {
+                    eprintln!(
+                        "[cera-hexagon] profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
+                        op,
+                        htp_opcode_name(op),
+                        count,
+                        us,
+                        us / count.max(1)
+                    );
+                }
+            }
+        }
         self.driver.close_dsp_queue(self.queue);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_batch_serialization() {
-        let mut batch = HexagonOpBatch::new();
-
-        let bi0 = batch.add_buffer(0x1000, 4096, 0, 7);
-        let bi1 = batch.add_buffer(0x2000, 8192, 0, 8);
-        assert_eq!(bi0, 0);
-        assert_eq!(bi1, 1);
-
-        let ti0 = batch.add_tensor(HtpTensor {
-            data: 0,
-            size: 1024,
-            flags: 0,
-            dtype: HtpDataType::F32 as u32,
-            bi: bi0,
-            ti: 0,
-            ne: [256, 1, 1, 1],
-            nb: [4, 1024, 1024, 1024],
-        });
-        assert_eq!(ti0, 0);
-
-        let mut op = HtpOpDesc::default();
-        op.opcode = HtpOpCode::RmsNorm as u32;
-        op.src[0] = ti0;
-        op.dst[0] = ti0;
-        batch.add_op(op);
-
-        let expected_size = 2 * std::mem::size_of::<HtpBufDesc>()
-            + std::mem::size_of::<HtpTensor>()
-            + std::mem::size_of::<HtpOpDesc>();
-        assert_eq!(batch.serialized_size(), expected_size);
-
-        let mut req = HtpOpBatchReq::default();
-        let mut buffer = vec![0u8; expected_size];
-        let written = batch.serialize_into(42, &mut req, &mut buffer).unwrap();
-        assert_eq!(written, expected_size);
-        assert_eq!(req.seq, 42);
-        assert_eq!(req.n_bufs, 2);
-        assert_eq!(req.n_tensors, 1);
-        assert_eq!(req.n_ops, 1);
-
-        // Fail when buffer is too small
-        let mut short_buf = vec![0u8; expected_size - 1];
-        assert!(batch.serialize_into(43, &mut req, &mut short_buf).is_err());
+/// Short opcode names for profile tables. Discriminants are firmware-ABI
+/// pinned (see `HtpOpCode`); unknown ids print numerically via the `op` column.
+fn htp_opcode_name(opcode: u32) -> &'static str {
+    match opcode {
+        0 => "Mul",
+        1 => "Add",
+        4 => "MulMat",
+        6 => "MulMatNx",
+        8 => "MulMatAdd",
+        9 => "RmsNorm",
+        10 => "RmsNormMul",
+        21 => "GluSwiglu",
+        27 => "Rope",
+        28 => "FlashAttnExt",
+        29 => "SetRows",
+        30 => "GetRows",
+        31 => "Scale",
+        32 => "Cpy",
+        39 => "SsmConv",
+        50 => "Concat",
+        _ => "unknown",
     }
 }

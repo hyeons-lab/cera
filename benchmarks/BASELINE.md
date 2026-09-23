@@ -14,6 +14,7 @@ decode are always measured as separate runs (see the traps).
 
 | section | measured at | device |
 |---|---|---|
+| Snapdragon NPU/GPU/CPU head-to-head | `e615ba8b` + uncommitted (hexagon wrap-up) | Galaxy S25 Ultra |
 | Android decode at equilibrium | `b0ffd7e` (incl. #342) | Pixel 10 Pro Fold |
 | Mac cera vs llama.cpp | `b0ffd7e` (incl. #342) | M1 Max |
 | GPU I/O counters | mixed, see the † note in that section | Mac / Adreno |
@@ -217,6 +218,69 @@ Best-vs-best decode is also not established: cera pin-mid 43.0 against llama t4
 
 Nothing here is comparable to the Fold section: different SoC and a different
 llama.cpp build (`992871d3c`/8764 here, `f12cc6d0f`/9371 there).
+
+## Android: Galaxy S25 Ultra (Snapdragon 8 Elite)
+
+2 prime Oryon (cpu6-7, mask `c0`) + 6 perf Oryon (cpu0-5, mask `3f`).
+Adreno 830 (llama `--device GPUOpenCL`), Hexagon HTP v79 (both engines load
+`libggml-htp-v79.so` from `ADSP_LIBRARY_PATH`).
+
+cera `e615ba8b` + uncommitted hexagon wrap-up diff, `cargo ndk` release with
+`--features gpu,hexagon`. llama.cpp build **unidentified** (`build: unknown
+(0)`); the binary is still staged at `/data/local/tmp/llama-bench`, which per
+the rule at the top of this file is what makes the llama rows re-runnable if
+not reproducible from source.
+
+Model `LFM2-VL-450M-Q4_0.gguf`, text-only prompts (both engines run the ~354M
+text backbone; llama reports it as "lfm2 350M"). Protocol: `--prompt 512
+--decode 128`, 2 equilibrium warm-up passes discarded, 5 measured passes x 5
+in-process runs, engines interleaved, CPU cells pinned, battery 80% -> 77% on
+USB. cera decode starts from a 128-token prompt while llama `tg` starts from an
+empty context (documented harness asymmetry, disfavours cera by a few percent).
+
+| Engine | Config | Prefill | CoV | Decode | CoV |
+|---|---|---|---|---|---|
+| cera | hexagon (HTP v79) | 8685 | 1.8% | 124.6 | 4.2% |
+| llama.cpp | t8 htp0, ngl 99 | 8103 | 0.5% | 158.2 | 7.6% |
+| cera | wgpu-vulkan (Adreno 830) | 2117 | 1.0% | 78.1 | 0.5% |
+| llama.cpp | t8 GPUOpenCL, ngl 99 | 3307 | 0.6% | 134.4 | 11.1% |
+| cera | pin mid (cpu0-5) | 918 | 6.0% | 92.4 | 1.6% |
+| llama.cpp | t6 mid (cpu0-5) | 860 | 7.1% | 182.5 | 3.5% |
+| cera | pin prime (mask c0) | 667 | 8.6% | 66.1 | 5.2% |
+| llama.cpp | t1 prime (mask c0) | 385 | 12.3% | 83.3 | 6.7% |
+| cera | default RowPool (unpinned) | 679 | 15.0% | 66.2 | 7.8% |
+| llama.cpp | t8 big (cpu0-7) | 1642 | 17.1% | 232.0 | 7.3% |
+| llama.cpp | t8 all (unpinned) | 1413 | 13.7% | 257.1 | 4.0% |
+
+Read:
+
+- **NPU prefill is the one cell cera wins: 8685 vs 8103 (1.07x).** Both CoVs
+  are tight (1.8%/0.5%), so the 7% gap is likely real, but it is narrow and it
+  is the only cera lead in the matrix.
+- **NPU decode goes to llama: 158.2 vs 124.6 (1.27x).** Gap well outside the
+  7.6%/4.2% CoVs.
+- **GPU is llama's by a distance: 1.56x prefill, 1.72x decode.** Forcing
+  `--device GPUOpenCL` matters: `auto`+ngl99 benched at 4381 pp128, near the
+  CPU number, instead of the forced-GPU 2831. The harness now forces the
+  device; the auto-selected target was never identified.
+- **CPU decode is llama's by ~2x at matched cores** (182.5 vs 92.4 on the 6
+  perf cores, 1.6% / 3.5% CoV) and 2.78x best-vs-best (257.1 vs 92.4). Same
+  direction as the Mac gap (1.75-1.97x), larger here.
+- **CPU prefill is a scaling story, not a kernel story.** Single-threaded,
+  cera leads 1.73x (667 vs 385); at 6 threads the lead is 1.07x and inside the
+  combined noise; at 8 threads llama leads 1.79x (1642 vs cera's 6-thread 918
+  -- cera has no 8-thread cell because its default RowPool declines the prime
+  cores and benches 679). cera prefill is flat across 1->6 threads (667 ->
+  918) where llama climbs 385 -> 1642 from 1 to 8. The next CPU task is pool
+  scaling on this SoC, not kernels.
+
+Caveats. The BIG-cluster temperature sensor read empty on this device
+(`soc_big` NA in every row), so equilibrium rests on the warm-up protocol and
+the single-digit CoVs rather than on a temperature trace. The prime-core clock
+swept 1017-3840 MHz across the run; interleaving spreads that drift across
+engines but the CPU CoVs (up to 17%) show it. The llama NPU/GPU rows additionally
+depend on an unidentified binary: re-runnable from the staged copy, not from
+source.
 
 ## Mac: cera vs llama.cpp on M1 Max
 
@@ -606,7 +670,7 @@ already merges the adjacent 8-byte loads.
 ## Reproduce
 
 ```bash
-# Android (build first: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu)
+# Android (build first: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu,hexagon)
 scripts/bench_android.sh --model LFM2.5-350M-Q4_K_M.gguf --serial <adb-serial> \
   --llama-bench /data/local/tmp/.../llama-bench --decode-prompt 128 \
   --passes 5 --equil-warm 2

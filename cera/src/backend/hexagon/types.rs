@@ -1,10 +1,11 @@
-//! C ABI types, opcodes, and descriptors for the Hexagon Tensor Processor (HTP).
+//! Qualcomm Hexagon Tensor Processor (HTP) type definitions and C-ABI layouts.
 //!
-//! These structures and constants precisely match upstream `ggml-hexagon`
-//! (`htp-ops.h`, `htp-tensor.h`, and `htp/main.c`) to maintain binary compatibility
-//! with the compiled DSP skel libraries (`libggml-htp-v*.so`).
+//! Provides ABI-compatible memory structures matching `libggml-htp`
+//! on Snapdragon Compute DSPs.
 
-/// Status codes returned by the DSP runtime.
+use std::ffi::c_void;
+
+/// Execution status returned by the HTP runtime.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HtpStatus {
@@ -35,8 +36,10 @@ pub enum HtpDataType {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
-    Q4_1 = 3,
     Q8_0 = 8,
+    // K-quants share the Q4_1/Q6_K tiled wire layouts (`HTP_TYPE_Q4_K=12`,
+    // `HTP_TYPE_Q6_K=14`). There is no Q5_K wire type; Q5_K weights are
+    // requanted to Q8_0 on the host at load.
     Q4K = 12,
     Q6K = 14,
     Iq4Nl = 20,
@@ -44,19 +47,8 @@ pub enum HtpDataType {
     I64 = 27,
     Mxfp4 = 39,
 
-    // Internal tiled formats produced by host-side repacking
-    Q4_0Tiled = 200,
-    Q4_1Tiled = 201,
-    Q8_0Tiled = 202,
-    Mxfp4Tiled = 203,
-
     Invalid = 0xFFFF_FFFF,
 }
-
-/// Tiling constants for repacked quant formats.
-pub const QK_Q4_0_TILED: usize = 256; // 32x32 Q4_0 tiled layout
-pub const QK_Q8_0_TILED: usize = 128; // 32x32 Q8_0 tiled layout
-pub const QK_MXFP4_TILED: usize = 256; // 32x32 MXFP4 tiled layout
 
 /// Operation codes dispatched to the DSP execution queue.
 #[repr(u32)]
@@ -114,184 +106,166 @@ pub enum HtpOpCode {
     Norm = 49,
     Concat = 50,
     Clamp = 51,
-    LeakyRelu = 52,
-    Im2col = 53,
-    Fence = 54,
-    Allreduce = 55,
-    AllreduceAdd = 56,
-    GluSwigluClamp = 57,
-    MdevGroup = 58,
-    Roll = 59,
 
     Invalid = 0xFFFF_FFFF,
 }
 
-pub const HTP_OP_MAX_DIMS: usize = 4;
-pub const HTP_OP_MAX_INPUTS: usize = 10;
-pub const HTP_OP_MAX_OUTPUTS: usize = 4;
-pub const HTP_OP_MAX_PARAMS: usize = 16;
-pub const HTP_OP_MAX_KERN_PARAMS: usize = 32;
-pub const HTP_OP_MAX_BUFS: usize = 16;
-pub const HTP_OP_MAX_TENSORS: usize = 8192;
+/// Compute (non-weight) tensor: flags 0, so the DSP tracks its dirty ranges
+/// and keeps intra-batch producer/consumer edges coherent. Upstream defines
+/// no COMPUTE bit; bit 0 is WEIGHT (read-only, skipped by dirty tracking).
+pub const HTP_TENSOR_COMPUTE: u32 = 0;
+/// Tensor holds read-only model weight data (skipped by dirty tracking).
+pub const HTP_TENSOR_WEIGHT: u32 = 1;
+/// Tensor is in repacked tiled format.
+pub const HTP_TENSOR_REPACK: u32 = 2;
+/// Tensor is a synchronization fence (explicitly managed).
+pub const HTP_TENSOR_FENCE: u32 = 4;
+pub const HTP_TENSOR_DIRTY: u32 = 2;
 
-/// Flags for tensor descriptors.
-pub const HTP_TENSOR_WEIGHT: u32 = 1 << 0; // Tensor buffer holds static model weight data
-pub const HTP_TENSOR_REPACK: u32 = 1 << 1; // Tensor is in repacked tiled format
-pub const HTP_TENSOR_FENCE: u32 = 1 << 2; // Tensor is synchronization fence
+pub const HTP_MAX_DIMS: usize = 4;
+pub const HTP_MAX_OP_PARAMS: usize = 16;
+pub const HTP_MAX_PACKET_BUFFERS: usize = 8;
 
-/// Flags for buffer descriptors.
-pub const HTP_BUF_EXTENDED: u32 = 1 << 0;
-
-/// Tensor descriptor sent over FastRPC queue.
+/// Buffer in FastRPC batch descriptor.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct HtpTensor {
-    /// Buffer offset in messages, and data pointer on the NPU.
-    pub data: u64,
-    /// Data size in bytes.
-    pub size: u32,
-    /// Tensor flags (`HTP_TENSOR_*`).
-    pub flags: u32,
-    /// Data type (`HtpDataType`).
-    pub dtype: u32,
-    /// Buffer index within the batch buffer list.
-    pub bi: u16,
-    /// Tensor index within the batch tensor list.
-    pub ti: u16,
-    /// Number of elements per dimension (up to 4D).
-    pub ne: [u32; HTP_OP_MAX_DIMS],
-    /// Stride in bytes per dimension.
-    pub nb: [u32; HTP_OP_MAX_DIMS],
-}
-
-impl Default for HtpTensor {
-    fn default() -> Self {
-        Self {
-            data: 0,
-            size: 0,
-            flags: 0,
-            dtype: HtpDataType::Invalid as u32,
-            bi: 0,
-            ti: 0,
-            ne: [0; HTP_OP_MAX_DIMS],
-            nb: [0; HTP_OP_MAX_DIMS],
-        }
-    }
-}
-
-/// Buffer descriptor describing mapped memory segments.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HtpBufDesc {
-    /// Base address of the memory mapping.
     pub base: u64,
-    /// Total size in bytes.
     pub size: u64,
-    /// Buffer flags (`HTP_BUF_*`).
     pub flags: u32,
-    /// Shared memory file descriptor.
     pub fd: u32,
 }
 
-/// Op flags.
-pub const HTP_OPFLAGS_STUB: u32 = 1 << 0;
+/// Tensor descriptor in FastRPC batch descriptor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HtpTensor {
+    pub data: u64,
+    pub size: u32,
+    pub flags: u32,
+    pub dtype: u32,
+    pub bi: u16,
+    pub ti: u16,
+    pub ne: [u32; 4],
+    pub nb: [u32; 4],
+}
 
-/// Operation descriptor encoding a single node dispatch.
+/// Operation descriptor in FastRPC batch descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HtpOpDesc {
-    /// Opcode (`HtpOpCode`).
     pub opcode: u32,
-    /// Op flags (`HTP_OPFLAGS_*`).
     pub flags: u32,
-    /// General operation parameters (e.g. epsilon for RMS norm).
-    pub params: [i32; HTP_OP_MAX_PARAMS],
-    /// Precomputed kernel parameters (e.g. FastDiv factors, head strides).
-    pub kernel_params: [i32; HTP_OP_MAX_KERN_PARAMS],
-    /// Input tensor indices referencing the batch tensor table.
-    pub src: [u16; HTP_OP_MAX_INPUTS],
-    /// Output tensor indices referencing the batch tensor table.
-    pub dst: [u16; HTP_OP_MAX_OUTPUTS],
-    /// Alignment padding to 64 bits.
+    pub params: [i32; 16],
+    pub kernel_params: [i32; 32],
+    pub src: [u16; 10],
+    pub dst: [u16; 4],
     pub pad: [u16; 2],
 }
 
 impl Default for HtpOpDesc {
     fn default() -> Self {
         Self {
-            opcode: HtpOpCode::Invalid as u32,
+            opcode: 0,
             flags: 0,
-            params: [0; HTP_OP_MAX_PARAMS],
-            kernel_params: [0; HTP_OP_MAX_KERN_PARAMS],
-            src: [0xFFFF; HTP_OP_MAX_INPUTS],
-            dst: [0xFFFF; HTP_OP_MAX_OUTPUTS],
+            params: [0; 16],
+            kernel_params: [0; 32],
+            src: [0xffff; 10],
+            dst: [0xffff; 4],
             pad: [0; 2],
         }
     }
 }
 
-impl HtpOpDesc {
-    /// Create a new operation descriptor with the specified opcode.
-    pub fn new(opcode: HtpOpCode) -> Self {
-        Self {
-            opcode: opcode as u32,
-            ..Default::default()
-        }
-    }
-}
-
-/// Batch request header sent as message payload to `dspqueue_write`.
+/// Profile descriptor written by the DSP into the shared batch staging buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HtpOpBatchReq {
-    /// Monotonic sequence counter.
-    pub seq: u64,
-    /// Batch request flags.
-    pub flags: u32,
-    /// Number of buffer descriptors packed in queue buffer.
-    pub n_bufs: u32,
-    /// Number of tensor descriptors packed in queue buffer.
-    pub n_tensors: u32,
-    /// Number of op descriptors packed in queue buffer.
-    pub n_ops: u32,
+pub struct HtpProfDesc {
+    pub opcode: u32,
+    pub usecs: u32,
+    pub cycles_start: u32,
+    pub cycles_stop: u32,
+    pub pmu: [u32; 8],
 }
 
-/// Batch response header read from `dspqueue_read`.
+/// Batch request sent to the DSP over FastRPC queue.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HtpOpBatchReq {
+    pub seq: u64,
+    pub n_bufs: u32,
+    pub n_tensors: u32,
+    pub n_ops: u32,
+    pub n_traces: u32,
+}
+
+/// Batch response returned by the DSP over FastRPC queue.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HtpOpBatchRsp {
-    /// Monotonic sequence counter matching request.
     pub seq: u64,
-    /// Completion status (`HtpStatus`).
+    pub cycles_start: u64,
+    pub cycles_stop: u64,
     pub status: u32,
-    /// Performance cycles elapsed on DSP.
-    pub perf_cycles: u32,
+    pub n_bufs: u32,
+    pub n_tensors: u32,
+    pub n_ops: u32,
+    pub usecs: u32,
+    pub n_traces: [u32; 11],
 }
 
-/// Buffer handle used with `dspqueue_write` and `dspqueue_read`.
+/// Buffer flag constants.
+pub const DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER: u32 = 16;
+pub const DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT: u32 = 128;
+
+pub const DSPQBUF_TYPE_CONSTANT: u32 = 0;
+pub const DSPQBUF_TYPE_HOST_WRITE_DSP_READ: u32 =
+    DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
+pub const DSPQBUF_TYPE_DSP_WRITE_HOST_READ: u32 = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER;
+
+/// Buffer descriptor passed to `dspqueue_write` and `dspqueue_read`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DspQueueBuffer {
-    pub ptr: *mut u8,
+    pub fd: u32,
     pub size: u32,
+    pub offset: u32,
     pub flags: u32,
+    pub ptr: *mut c_void,
 }
 
 impl Default for DspQueueBuffer {
     fn default() -> Self {
         Self {
-            ptr: std::ptr::null_mut(),
+            fd: 0,
             size: 0,
+            offset: 0,
             flags: 0,
+            ptr: std::ptr::null_mut(),
         }
     }
 }
 
-/// Hardware information returned by `htp_iface_hwinfo`.
+/// Hardware information returned by DSP probe.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HtpHwInfo {
     pub n_threads: u32,
     pub n_hvx: u32,
     pub n_hmx: u32,
     pub vtcm_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_htp_abi_sizes() {
+        assert_eq!(std::mem::size_of::<HtpBufDesc>(), 24);
+        assert_eq!(std::mem::size_of::<HtpTensor>(), 56);
+        assert_eq!(std::mem::size_of::<HtpOpDesc>(), 232);
+        assert_eq!(std::mem::size_of::<HtpOpBatchReq>(), 24);
+        assert_eq!(std::mem::size_of::<HtpOpBatchRsp>(), 88);
+        assert_eq!(std::mem::size_of::<DspQueueBuffer>(), 24);
+    }
 }

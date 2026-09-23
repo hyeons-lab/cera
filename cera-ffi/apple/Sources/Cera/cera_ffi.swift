@@ -7843,6 +7843,82 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
 
 
 /**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+public struct HexagonProbeInfo: Equatable, Hashable {
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     */
+    public var arch: String
+    public var threads: UInt32
+    public var hvxUnits: UInt32
+    public var hmxUnits: UInt32
+    public var vtcmBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+         */arch: String, threads: UInt32, hvxUnits: UInt32, hmxUnits: UInt32, vtcmBytes: UInt64) {
+        self.arch = arch
+        self.threads = threads
+        self.hvxUnits = hvxUnits
+        self.hmxUnits = hmxUnits
+        self.vtcmBytes = vtcmBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension HexagonProbeInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHexagonProbeInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HexagonProbeInfo {
+        return
+            try HexagonProbeInfo(
+                arch: FfiConverterString.read(from: &buf), 
+                threads: FfiConverterUInt32.read(from: &buf), 
+                hvxUnits: FfiConverterUInt32.read(from: &buf), 
+                hmxUnits: FfiConverterUInt32.read(from: &buf), 
+                vtcmBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HexagonProbeInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.arch, into: &buf)
+        FfiConverterUInt32.write(value.threads, into: &buf)
+        FfiConverterUInt32.write(value.hvxUnits, into: &buf)
+        FfiConverterUInt32.write(value.hmxUnits, into: &buf)
+        FfiConverterUInt64.write(value.vtcmBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lift(_ buf: RustBuffer) throws -> HexagonProbeInfo {
+    return try FfiConverterTypeHexagonProbeInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lower(_ value: HexagonProbeInfo) -> RustBuffer {
+    return FfiConverterTypeHexagonProbeInfo.lower(value)
+}
+
+
+/**
  * Recovery diagnostic retained after a failed `send_message` ingestion.
  * The call's original error is still returned separately. Generation failures
  * after successful ingestion do not create this report.
@@ -12300,6 +12376,36 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 })
 }
 /**
+ * Write the embedded DSP skels into `dir` (created if missing) and
+ * point FastRPC's loader at it. Call once at app startup (before
+ * [`hexagon_probe`] or loading a model with
+ * [`BackendPreference::Hexagon`]), passing a private writable
+ * directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
+ * of skels installed. Re-running is cheap (files are only rewritten
+ * when the size differs).
+ */
+public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        FfiConverterString.lower(dir),$0
+    )
+})
+}
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. Call [`hexagon_install_skels`] first on
+ * Android so the loader can find the skel files.
+ */
+public func hexagonProbe()throws  -> HexagonProbeInfo  {
+    return try  FfiConverterTypeHexagonProbeInfo_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_probe($0
+    )
+})
+}
+/**
  * Default KWS configuration parameters.
  */
 public func hotwordDefaultConfig() -> FfiHotwordConfig  {
@@ -12512,6 +12618,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 16882) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 10841) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {

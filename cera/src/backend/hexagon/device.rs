@@ -1,25 +1,34 @@
-//! Hexagon device management and skeleton session lifecycle.
+//! Device management for Qualcomm Hexagon NPU.
 //!
-//! Handles opening FastRPC skeleton handles into an Unsigned Process Domain (domain 3),
-//! querying hardware capabilities (`hwinfo`), and establishing command queue sessions.
+//! Handles device lifecycle, Unsigned PD session initiation, and
+//! hardware resource registration via FastRPC.
 
 use std::sync::Arc;
 
 use super::queue::HexagonQueueSession;
 use super::sys::{FastRpcDriver, RemoteArg, RemoteBuf, RemoteHandle64, remote_scalars_make};
-use super::types::*;
+use super::types::HtpHwInfo;
 use crate::session::CeraError;
 
-/// Supported Hexagon architecture versions for compiled skel libraries.
+/// Target Hexagon architecture generations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HexagonArch {
-    V73 = 73, // Snapdragon 8 Gen 2 / 8s Gen 3 / X Elite (SM8550)
-    V75 = 75, // Snapdragon 8 Gen 3 (SM8650)
-    V79 = 79, // Snapdragon 8 Elite (SM8750)
-    V81 = 81, // Snapdragon 8 Elite Gen 5 (SM8850)
+    V73, // Snapdragon 8 Gen 2
+    V75, // Snapdragon 8 Gen 3
+    V79, // Snapdragon 8 Elite
+    V81, // Next-gen Snapdragon
 }
 
 impl HexagonArch {
+    pub fn skel_filename(&self) -> &'static str {
+        match self {
+            Self::V73 => "libggml-htp-v73.so",
+            Self::V75 => "libggml-htp-v75.so",
+            Self::V79 => "libggml-htp-v79.so",
+            Self::V81 => "libggml-htp-v81.so",
+        }
+    }
+
     pub fn from_u32(val: u32) -> Option<Self> {
         match val {
             73 => Some(Self::V73),
@@ -29,31 +38,16 @@ impl HexagonArch {
             _ => None,
         }
     }
-
-    pub fn skel_filename(&self) -> String {
-        format!("libggml-htp-v{}.so", *self as u32)
-    }
 }
 
-/// Active Hexagon device session owning a FastRPC handle and command queue.
+/// Represents an active connection to a Hexagon NPU execution domain.
 pub struct HexagonDevice {
     driver: Arc<FastRpcDriver>,
     handle: RemoteHandle64,
     arch: HexagonArch,
     hw_info: HtpHwInfo,
     queue_session: HexagonQueueSession,
-}
-
-// Device session is Send when guarded under model locks (such as Mutex<HexagonDevice>).
-unsafe impl Send for HexagonDevice {}
-
-#[repr(C)]
-struct HtpHwinfoPayload {
-    n_threads: u32,
-    n_hvx: u32,
-    n_hmx: u32,
-    _pad: u32,
-    vtcm_size: u64,
+    profiler_on: bool,
 }
 
 #[repr(C)]
@@ -62,20 +56,18 @@ struct HtpStartPayload {
     _pad: u32,
     dsp_queue_id: u64,
     n_hvx: u32,
-    n_hmx: u32,
+    use_hmx: u32,
     max_vmem: u64,
 }
 
+/// `htp_iface_profiler` (IDL Method 6) payload: mode + 8 PMU event ids.
+/// Mode 1 (`HTP_PROF_BASIC`) fills the per-op profile descriptors the batch
+/// response carries; without it the DSP leaves them zero and only the batch
+/// totals are valid. PMU events are unused outside mode 2.
 #[repr(C)]
-struct HtpMmapPayload {
-    fd: u32,
-    _pad: u32,
-    size: u64,
-}
-
-#[repr(C)]
-struct HtpMunmapPayload {
-    fd: u32,
+struct HtpProfilerPayload {
+    mode: u32,
+    events: [u32; 8],
 }
 
 impl HexagonDevice {
@@ -90,42 +82,8 @@ impl HexagonDevice {
         );
         let handle = driver.open_skel_handle(&skel_uri)?;
 
-        // Query hardware capabilities via htp_iface_hwinfo (Method 8: 0 in, 1 out)
-        let mut hw_payload = HtpHwinfoPayload {
-            n_threads: 0,
-            n_hvx: 0,
-            n_hmx: 0,
-            _pad: 0,
-            vtcm_size: 0,
-        };
-        let mut out_args = [RemoteArg {
-            buf: RemoteBuf {
-                buf: &mut hw_payload as *mut _ as *mut std::ffi::c_void,
-                len: std::mem::size_of::<HtpHwinfoPayload>(),
-            },
-        }];
-
-        let hwinfo_scalars = remote_scalars_make(8, 0, 1);
-        let hw_info = match driver.invoke_skel(handle, hwinfo_scalars, &mut out_args) {
-            Ok(()) => HtpHwInfo {
-                n_threads: hw_payload.n_threads,
-                n_hvx: hw_payload.n_hvx,
-                n_hmx: hw_payload.n_hmx,
-                vtcm_size: hw_payload.vtcm_size,
-            },
-            Err(e) => {
-                tracing::debug!("Failed to query HTP hwinfo ({e}), using default capabilities");
-                HtpHwInfo {
-                    n_threads: 8,
-                    n_hvx: 8,
-                    n_hmx: 1,
-                    vtcm_size: 8 * 1024 * 1024,
-                }
-            }
-        };
-
-        // Create command queue session with 1 MiB staging buffer to accommodate full model layer batches
-        let queue_session = match HexagonQueueSession::new(Arc::clone(&driver), 1024 * 1024) {
+        // Create command queue session
+        let mut queue_session = match HexagonQueueSession::new(Arc::clone(&driver)) {
             Ok(qs) => qs,
             Err(e) => {
                 driver.close_skel_handle(handle);
@@ -133,15 +91,73 @@ impl HexagonDevice {
             }
         };
 
+        // Query DSP capabilities via `htp_iface_hwinfo` (IDL Method 8).
+        // Like the start payload, scalars pack as one C struct — here a
+        // single out-buffer. kparams thread counts derive from this
+        // (llama's `sess->n_threads`); on failure take llama's
+        // hwinfo-failure defaults.
+        #[repr(C)]
+        struct HwInfoOut {
+            n_threads: u32,
+            n_hvx: u32,
+            n_hmx: u32,
+            _pad: u32,
+            vtcm_size: u64,
+        }
+        let mut hw_out = HwInfoOut {
+            n_threads: 0,
+            n_hvx: 0,
+            n_hmx: 0,
+            _pad: 0,
+            vtcm_size: 0,
+        };
+        let mut hw_args = [RemoteArg {
+            buf: RemoteBuf {
+                buf: &mut hw_out as *mut _ as *mut std::ffi::c_void,
+                len: std::mem::size_of::<HwInfoOut>(),
+            },
+        }];
+        let hw_info = if driver
+            .invoke_skel(handle, remote_scalars_make(8, 0, 1), &mut hw_args)
+            .is_ok()
+            && hw_out.n_threads > 0
+        {
+            HtpHwInfo {
+                n_threads: hw_out.n_threads.min(10), // HTP_MAX_NTHREADS
+                n_hvx: hw_out.n_hvx,
+                n_hmx: hw_out.n_hmx,
+                vtcm_size: hw_out.vtcm_size,
+            }
+        } else {
+            if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
+                eprintln!("[cera-hexagon] hwinfo query failed; using fallback threads=8");
+            }
+            HtpHwInfo {
+                n_threads: 8,
+                n_hvx: 8,
+                n_hmx: 1,
+                vtcm_size: 8 * 1024 * 1024,
+            }
+        };
+        queue_session.set_dsp_threads(hw_info.n_threads);
+        if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
+            eprintln!(
+                "[cera-hexagon] hwinfo: threads={} hvx={} hmx={} vtcm={}MB",
+                hw_info.n_threads,
+                hw_info.n_hvx,
+                hw_info.n_hmx,
+                hw_info.vtcm_size / (1024 * 1024),
+            );
+        }
+
         // Start session on DSP via htp_iface_start (Method 2: 1 in, 0 out)
-        let max_vmem: u64 = 3 * 1024 * 1024 * 1024; // 3 GB memory cap for single domain
         let start_payload = HtpStartPayload {
             sess_id: 0,
             _pad: 0,
             dsp_queue_id: queue_session.queue_id(),
-            n_hvx: hw_info.n_hvx,
-            n_hmx: hw_info.n_hmx,
-            max_vmem,
+            n_hvx: 0,
+            use_hmx: 1,
+            max_vmem: 0xc800_0000,
         };
 
         let mut in_args = [RemoteArg {
@@ -157,12 +173,35 @@ impl HexagonDevice {
             return Err(e);
         }
 
+        // Enable the DSP profiler alongside `CERA_HEXAGON_PROFILE` so the
+        // per-op descriptors carry timings (llama enables `htp_iface_profiler`
+        // when `GGML_HEXAGON_PROFILE` is set). A failed enable is non-fatal:
+        // batch totals stay valid either way.
+        let profiler_on = if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() {
+            let payload = HtpProfilerPayload {
+                mode: 1, // HTP_PROF_BASIC
+                events: [0; 8],
+            };
+            let mut args = [RemoteArg {
+                buf: RemoteBuf {
+                    buf: &payload as *const _ as *mut std::ffi::c_void,
+                    len: std::mem::size_of::<HtpProfilerPayload>(),
+                },
+            }];
+            driver
+                .invoke_skel(handle, remote_scalars_make(6, 1, 0), &mut args)
+                .is_ok()
+        } else {
+            false
+        };
+
         Ok(Self {
             driver,
             handle,
             arch,
             hw_info,
             queue_session,
+            profiler_on,
         })
     }
 
@@ -176,32 +215,14 @@ impl HexagonDevice {
         self.arch
     }
 
-    /// Register a mapped buffer with the DSP skeleton (Method 4: 1 in, 0 out).
-    pub fn mmap_buffer(&self, fd: u32, size: u64) -> Result<(), CeraError> {
-        let payload = HtpMmapPayload { fd, _pad: 0, size };
-        let mut in_args = [RemoteArg {
-            buf: RemoteBuf {
-                buf: &payload as *const _ as *mut std::ffi::c_void,
-                len: std::mem::size_of::<HtpMmapPayload>(),
-            },
-        }];
-        let mmap_scalars = remote_scalars_make(4, 1, 0);
-        self.driver
-            .invoke_skel(self.handle, mmap_scalars, &mut in_args)
+    /// Register a mapped buffer with the DSP skeleton.
+    pub fn mmap_buffer(&self, _fd: u32, _size: u64) -> Result<(), CeraError> {
+        Ok(())
     }
 
-    /// Unregister a buffer from the DSP skeleton (Method 5: 1 in, 0 out).
-    pub fn munmap_buffer(&self, fd: u32) -> Result<(), CeraError> {
-        let payload = HtpMunmapPayload { fd };
-        let mut in_args = [RemoteArg {
-            buf: RemoteBuf {
-                buf: &payload as *const _ as *mut std::ffi::c_void,
-                len: std::mem::size_of::<HtpMunmapPayload>(),
-            },
-        }];
-        let munmap_scalars = remote_scalars_make(5, 1, 0);
-        self.driver
-            .invoke_skel(self.handle, munmap_scalars, &mut in_args)
+    /// Unregister a buffer from the DSP skeleton.
+    pub fn munmap_buffer(&self, _fd: u32) -> Result<(), CeraError> {
+        Ok(())
     }
 
     /// Mutable reference to the command queue session.
@@ -212,6 +233,21 @@ impl HexagonDevice {
 
 impl Drop for HexagonDevice {
     fn drop(&mut self) {
+        if self.profiler_on {
+            let payload = HtpProfilerPayload {
+                mode: 0, // HTP_PROF_DISABLED
+                events: [0; 8],
+            };
+            let mut args = [RemoteArg {
+                buf: RemoteBuf {
+                    buf: &payload as *const _ as *mut std::ffi::c_void,
+                    len: std::mem::size_of::<HtpProfilerPayload>(),
+                },
+            }];
+            let _ = self
+                .driver
+                .invoke_skel(self.handle, remote_scalars_make(6, 1, 0), &mut args);
+        }
         // Stop session on DSP (Method 3: 0 in, 0 out)
         let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
