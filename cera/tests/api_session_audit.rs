@@ -731,6 +731,32 @@ fn greedy_call_honors_per_request_seed_for_later_calls() {
 }
 
 #[test]
+fn greedy_draws_nothing_from_the_rng_stream() {
+    // Greedy decode must not consume randomness: the same reseed followed
+    // by a stochastic continuation yields byte-identical streams whether
+    // or not a greedy call runs in between. Flat logits make the
+    // continuation pure RNG output, so any draw inside the greedy path
+    // would shift it. (Position differs between the runs; FlatModel
+    // ignores position.)
+    let run = |with_greedy: bool| {
+        let tok = tokenizer(false);
+        let mut s = flat_session(tok, None);
+        s.append_tokens(&[0, 1]).unwrap();
+        s.set_seed(Some(7));
+        if with_greedy {
+            let mut greedy_sink = Collect(Vec::new());
+            s.generate(&greedy_opts(None), &mut greedy_sink).unwrap();
+            // Greedy clears `last_logits`, so chaining needs a re-prime.
+            s.append_tokens(&[0]).unwrap();
+        }
+        let mut sink = Collect(Vec::new());
+        s.generate(&stochastic_opts(None), &mut sink).unwrap();
+        sink.0
+    };
+    assert_eq!(run(true), run(false));
+}
+
+#[test]
 fn set_seed_persists_across_reset() {
     // `set_seed` replaces the session default (unlike a per-request seed),
     // so after `reset` the sampler rebuilds from it: identical to a fresh

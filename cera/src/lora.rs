@@ -2838,6 +2838,41 @@ mod tests {
     }
 
     #[test]
+    fn compose_enforces_max_rank_at_the_boundary() {
+        // Exactly MAX_LORA_RANK merges fine; one more is refused with a
+        // `LoraCompose` chain naming the over-wide rank. (Non-unit scale
+        // on the single entry forces the merge: at 1.0 the passthrough
+        // would return the input without consulting the cap.)
+        let max = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![0.1; 512 * 4],
+            vec![0.1; 4 * 512],
+            512,
+            4,
+            4,
+            512.0,
+        );
+        let one = direct_adapter(
+            0,
+            LoraTarget::AttnQ,
+            vec![0.2; 4],
+            vec![0.2; 4],
+            1,
+            4,
+            4,
+            1.0,
+        );
+        let merged = LoraAdapterWeights::compose(&[(max.clone(), 2.0)]).unwrap();
+        assert_eq!(merged.get(0, LoraTarget::AttnQ).unwrap().rank, 512);
+        let err = LoraAdapterWeights::compose(&[(max, 1.0), (one, 1.0)])
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merged rank 513 exceeds"), "{err}");
+    }
+
+    #[test]
     fn compose_opt_maps_empty_stack_to_none() {
         // The shared empty-stack mapping behind `Session::set_lora_adapters`
         // and the FFI/WASM compose helpers: detach / base model, no adapter.
