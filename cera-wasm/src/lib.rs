@@ -1073,6 +1073,72 @@ fn read_string_field(
         .ok_or_else(|| JsError::new(&format!("messages[{index}].{field_name} must be a string")))
 }
 
+/// Compose a finished [`LoraStack`] for a per-call extraction override:
+/// `None` (base model) for an empty stack, else the merged adapter. The
+/// empty-stack mapping lives in
+/// [`cera::lora::LoraAdapterWeights::compose_opt`]; this only maps the
+/// error.
+fn compose_lora_override(
+    stack: &LoraStack,
+) -> Result<Option<std::sync::Arc<cera::lora::LoraAdapterWeights>>, JsError> {
+    if let Some(cached) = stack.cached.borrow().as_ref() {
+        return Ok(cached.clone());
+    }
+    let composed = cera::lora::LoraAdapterWeights::compose_opt(&stack.entries)
+        // Route through `CeraError::LoraCompose` so the thrown message is
+        // byte-identical to the session-level `setLoraAdapters` failure for
+        // the same bad stack.
+        .map_err(|e| map_cera_err(cera::CeraError::LoraCompose(format!("{e:#}"))))?;
+    *stack.cached.borrow_mut() = Some(composed.clone());
+    Ok(composed)
+}
+
+/// Resolve the stochastic sampler for one GPU `generateTokens` call against
+/// the session-persisted one: a presented seed replaces it (fresh stream,
+/// like the CPU per-request seed); an unseeded call reuses it, applying this
+/// call's knobs without touching the RNG, so omitting the seed continues the
+/// session stream exactly like the CPU session. The first stochastic call
+/// with no per-request seed starts from `default_seed` (fresh entropy when
+/// unset). Greedy calls resolve to `None` (they draw nothing) but still
+/// honor a presented seed: it restarts the stored stream for a later
+/// stochastic call. One function (rather than inline in `generate_ids`) so
+/// the stream-continuation contract is unit-testable without a GPU.
+#[cfg(any(feature = "wgpu", test))]
+fn resolve_call_sampler(
+    stored: &mut Option<cera::sampler::Sampler>,
+    mut cfg: cera::sampler::SamplerConfig,
+    default_seed: Option<u64>,
+) -> Option<&mut cera::sampler::Sampler> {
+    if cfg.temperature <= 0.0 || cfg.top_k == 1 {
+        if let Some(seed) = cfg.seed {
+            if let Some(existing) = stored.as_mut() {
+                existing.reseed(Some(seed));
+            } else {
+                *stored = Some(cera::sampler::Sampler::new(cfg));
+            }
+        }
+        return None;
+    }
+    if stored.is_none() {
+        if cfg.seed.is_none() {
+            // First stochastic call with no per-request seed: start from
+            // the session default (fresh entropy when unset). A presented
+            // seed always wins and never touches the default.
+            cfg.seed = default_seed;
+        }
+        *stored = Some(cera::sampler::Sampler::new(cfg));
+        return stored.as_mut();
+    }
+    let existing = stored.as_mut().unwrap();
+    if let Some(seed) = cfg.seed {
+        existing.reseed(Some(seed));
+    }
+    cfg.seed = existing.seed();
+    existing.set_config(cfg);
+    existing.reset_history();
+    Some(existing)
+}
+
 /// Parse a single JS `ChatMessage` object into the cera chat coordinator `Message` type.
 /// Supports optional multimodal content (`imageBytes`, `audioPcm`, `audioSampleRate`).
 fn parse_chat_message(
@@ -1430,6 +1496,19 @@ impl GenerateOpts {
         self.inner.max_tokens = v;
     }
 
+    /// Per-request RNG seed. Setting a seed restarts the sampler's RNG when
+    /// the call starts (KV and position are untouched); `undefined` (default)
+    /// continues the session's existing RNG stream. Does not change the
+    /// session default; `reset()` still rebuilds from the session seed.
+    #[wasm_bindgen(getter)]
+    pub fn seed(&self) -> Option<u64> {
+        self.inner.seed
+    }
+    #[wasm_bindgen(setter)]
+    pub fn set_seed(&mut self, v: Option<u64>) {
+        self.inner.seed = v;
+    }
+
     #[wasm_bindgen(getter)]
     pub fn temperature(&self) -> f32 {
         self.inner.temperature
@@ -1695,6 +1774,59 @@ impl LoraAdapters {
     }
 }
 
+/// A runtime-scaled LoRA stack under construction: push `(adapter, scale)`
+/// entries, then hand the finished stack to `Session.setLoraAdapters` or one
+/// of the per-call `hiddenStates*WithAdapters` overrides. Contributions stack
+/// per target; entry scales must be finite (zero entries are skipped as an
+/// exact no-op when the stack composes).
+///
+/// A builder instead of a plain `{adapter, scale}[]` array because the
+/// boundary cannot express that: wasm-bindgen generates `JsCast` only for
+/// imported types (never for an exported struct nested in a plain JS
+/// object), and `Vec<T>` arguments only support primitives. Each adapter
+/// therefore crosses as a typed `&LoraAdapters` parameter to `push`, and the
+/// stack itself crosses the same way. Build once, reuse across calls: every
+/// consumer takes `&LoraStack` by reference.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct LoraStack {
+    entries: Vec<(std::sync::Arc<cera::lora::LoraAdapterWeights>, f32)>,
+    cached: std::cell::RefCell<Option<Option<std::sync::Arc<cera::lora::LoraAdapterWeights>>>>,
+}
+
+#[wasm_bindgen]
+impl LoraStack {
+    /// A new, empty stack. An empty stack detaches in `setLoraAdapters` and
+    /// selects the base model in the per-call overrides.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> LoraStack {
+        LoraStack::default()
+    }
+
+    /// Push one `(adapter, scale)` entry. The scale must be finite as an
+    /// `f32` (magnitudes above `f32::MAX` count as infinite); a bad scale
+    /// throws and the stack is left unchanged.
+    pub fn push(&mut self, adapter: &LoraAdapters, scale: f64) -> Result<(), JsError> {
+        // Cast first: magnitudes above `f32::MAX` saturate to infinity, and
+        // the caller deserves this scale-specific message rather than core's.
+        let scale_f32 = scale as f32;
+        if !scale_f32.is_finite() {
+            return Err(JsError::new(&format!(
+                "LoraStack.push: scale must be finite, got {scale}"
+            )));
+        }
+        self.cached.borrow_mut().take();
+        self.entries.push((adapter.inner.clone(), scale_f32));
+        Ok(())
+    }
+
+    /// Number of entries pushed so far.
+    #[wasm_bindgen(getter)]
+    pub fn length(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Stateful generation handle. Built via `CeraEngine.newSession(config)`.
 ///
 /// JS callers seed the conversation by calling `appendText` /
@@ -1821,6 +1953,57 @@ impl Session {
         Ok(js_sys::Float32Array::from(pooled.as_slice()))
     }
 
+    /// Like `hiddenStatesForTokens` but with an explicit per-call adapter
+    /// stack (see `setLoraAdapters`): entries compose, and an empty
+    /// `LoraStack` extracts from the base model even when the session has
+    /// adapters attached. Nothing is installed; the session set is
+    /// untouched. A bad stack throws, never silently.
+    #[wasm_bindgen(js_name = hiddenStatesForTokensWithAdapters)]
+    pub fn hidden_states_for_tokens_with_adapters(
+        &mut self,
+        tokens: &[u32],
+        stack: &LoraStack,
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let adapter = compose_lora_override(stack)?;
+        let hs = self
+            .session_mut()?
+            .hidden_states_for_tokens_using(tokens, adapter.as_ref())
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Like `hiddenStatesForText` with the per-call adapter stack of
+    /// `hiddenStatesForTokensWithAdapters`.
+    #[wasm_bindgen(js_name = hiddenStatesForTextWithAdapters)]
+    pub fn hidden_states_for_text_with_adapters(
+        &mut self,
+        text: &str,
+        stack: &LoraStack,
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let adapter = compose_lora_override(stack)?;
+        let hs = self
+            .session_mut()?
+            .hidden_states_for_text_using(text, adapter.as_ref())
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(hs.as_slice()))
+    }
+
+    /// Like `hiddenStatesMeanPooled` with the per-call adapter stack of
+    /// `hiddenStatesForTokensWithAdapters`.
+    #[wasm_bindgen(js_name = hiddenStatesMeanPooledWithAdapters)]
+    pub fn hidden_states_mean_pooled_with_adapters(
+        &mut self,
+        tokens: &[u32],
+        stack: &LoraStack,
+    ) -> Result<js_sys::Float32Array, JsError> {
+        let adapter = compose_lora_override(stack)?;
+        let pooled = self
+            .session_mut()?
+            .hidden_states_mean_pooled_using(tokens, adapter.as_ref())
+            .map_err(map_cera_err)?;
+        Ok(js_sys::Float32Array::from(pooled.as_slice()))
+    }
+
     /// Attach a [`LoraAdapters`] to this session. Applied to every subsequent
     /// forward pass (generation and hidden-states extraction) until
     /// removed or replaced (hot-swap), and preserved across `reset()`. Throws if
@@ -1831,6 +2014,26 @@ impl Session {
         self.session_mut()?
             .attach_lora_adapters(adapters.inner.clone())
             .map_err(map_cera_err)
+    }
+
+    /// Replace the attached adapter set with a runtime-scaled [`LoraStack`]:
+    /// contributions stack per target. An empty stack detaches (same as
+    /// `removeLora`). A non-empty stack whose entries are all zero-scale
+    /// installs a no-op adapter instead, so `hasLora` stays true while
+    /// applying nothing. The swap is atomic: a bad stack leaves the
+    /// previous set untouched. Like `attachLora`, only tokens processed
+    /// after the call are affected.
+    #[wasm_bindgen(js_name = setLoraAdapters)]
+    pub fn set_lora_adapters(&mut self, stack: &LoraStack) -> Result<(), JsError> {
+        let adapter = compose_lora_override(stack)?;
+        let session = self.session_mut()?;
+        match adapter {
+            Some(arc) => session.attach_lora_adapters(arc).map_err(map_cera_err),
+            None => {
+                session.remove_lora_adapters();
+                Ok(())
+            }
+        }
     }
 
     /// Remove any attached LoRA adapter, returning to base-model inference.
@@ -1986,7 +2189,8 @@ impl Session {
     /// Drop accumulated state and return the session to a freshly-
     /// opened shape. Clears the KV cache, `position`, the last
     /// logits, and the cancel flag, then re-seeds the sampler from
-    /// the `SessionConfig.seed` originally passed to `newSession`.
+    /// the session default (`SessionConfig.seed` as passed to
+    /// `newSession`, or the `setSeed` value when one was set).
     ///
     /// Use this for "clear conversation" UI actions; it skips the
     /// per-session setup cost that `engine.newSession(config)`
@@ -1995,11 +2199,11 @@ impl Session {
     /// fresh one.
     ///
     /// Sampler re-seed semantics:
-    /// - `SessionConfig.seed = some bigint`: deterministic
+    /// - session default = some bigint: deterministic
     ///   sessions stay deterministic across `reset()`; the next
     ///   `generate` produces the same first token sequence as the
     ///   original.
-    /// - `SessionConfig.seed = null`: the sampler picks a new
+    /// - session default unset: the sampler picks a new
     ///   random seed on each `reset()`, so successive
     ///   conversations decorrelate.
     ///
@@ -2009,6 +2213,16 @@ impl Session {
     #[wasm_bindgen]
     pub fn reset(&mut self) -> Result<(), JsError> {
         self.session_mut()?.reset().map_err(map_cera_err)?;
+        Ok(())
+    }
+
+    /// Replace the session-default sampler seed and restart the RNG from it
+    /// immediately (`undefined` re-seeds from entropy). KV and position are
+    /// untouched, so this is safe on a primed session. Persists across
+    /// `reset()`, unlike a per-request `GenerateOpts.seed`.
+    #[wasm_bindgen(js_name = setSeed)]
+    pub fn set_seed(&mut self, seed: Option<u64>) -> Result<(), JsError> {
+        self.session_mut()?.set_seed(seed);
         Ok(())
     }
 
@@ -2666,6 +2880,17 @@ mod webgpu {
         /// Generation defaults from the bundle manifest.
         generation_defaults: Option<cera::manifest::GenerationDefaults>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        /// Persistent stochastic sampler. A presented seed replaces it (fresh
+        /// stream); an unseeded call reuses it, so omitting the seed
+        /// continues the session RNG stream exactly like the CPU session.
+        /// `None` until the first stochastic call; greedy calls never create
+        /// it, and `reset()` drops it.
+        sampler: Option<cera::sampler::Sampler>,
+        /// Session-default sampler seed, set by `setSeed`. The first
+        /// stochastic call with no per-request seed starts from it (fresh
+        /// entropy when unset), and `reset()` restores that behavior by
+        /// dropping the stored sampler.
+        default_seed: Option<u64>,
     }
 
     #[wasm_bindgen]
@@ -2707,8 +2932,21 @@ mod webgpu {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
+        /// Replace the session-default sampler seed and restart the RNG from
+        /// it on the next stochastic call (`undefined` re-seeds from entropy).
+        /// KV and position are untouched, so this is safe on a primed
+        /// session. Persists across `reset()`, unlike a per-request seed.
+        #[wasm_bindgen(js_name = setSeed)]
+        pub fn set_seed(&mut self, seed: Option<u64>) -> Result<(), JsError> {
+            self.default_seed = seed;
+            self.sampler = None;
+            Ok(())
+        }
+
         /// Reset the session in-place, clearing GPU convolution rolling buffers,
-        /// resetting sequence counter to zero, and rebuilding fresh CPU state.
+        /// resetting sequence counter to zero, rebuilding fresh CPU state,
+        /// and dropping the stochastic sampler (the next unseeded call starts
+        /// from the session default, or fresh entropy when unset).
         #[wasm_bindgen]
         pub fn reset(&mut self) -> Result<(), JsError> {
             let mut fresh = cera::kv_cache::InferenceState::from_config_with_compression(
@@ -2727,6 +2965,7 @@ mod webgpu {
             self.cancel
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             self.state = fresh;
+            self.sampler = None;
             Ok(())
         }
         /// Async constructor: initialize WebGPU (`requestAdapter` /
@@ -2880,6 +3119,8 @@ mod webgpu {
                 model_label: "custom GGUF".to_string(),
                 generation_defaults: None,
                 cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                sampler: None,
+                default_seed: None,
             })
         }
 
@@ -3024,6 +3265,8 @@ mod webgpu {
                     model_label: format!("{bundle_id} ({quant})"),
                     generation_defaults: Some(manifest.generation_defaults.clone()),
                     cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    sampler: None,
+                    default_seed: None,
                 };
 
                 if let Some(rel) = manifest
@@ -3940,8 +4183,8 @@ mod webgpu {
                 repetition_penalty: def_rep_pen.unwrap_or(defaults.repetition_penalty),
                 seed,
             };
-            let mut sampler =
-                (cfg.temperature > 0.0 && cfg.top_k != 1).then(|| cera::sampler::Sampler::new(cfg));
+            let default_seed = self.default_seed;
+            let mut sampler = crate::resolve_call_sampler(&mut self.sampler, cfg, default_seed);
 
             let mut next = match sampler.as_mut() {
                 Some(s) => {
@@ -4600,7 +4843,10 @@ mod tests {
     use cera::kv_cache::{InferenceState, KvCompression};
     use cera::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
     use cera::tokenizer::BpeTokenizer;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
+    use wasm_bindgen::closure::Closure;
     use wasm_bindgen_test::wasm_bindgen_test;
 
     struct TestModel {
@@ -4643,6 +4889,12 @@ mod tests {
             &self.config
         }
 
+        // Tests attach adapters to this mock; the forwards never read them, but
+        // install-path tests need the gate open.
+        fn supports_lora(&self) -> bool {
+            true
+        }
+
         fn forward(&self, tokens: &[u32], _: usize, state: &mut InferenceState) -> Vec<f32> {
             let rows = vec![0.0; tokens.len() * self.config.n_kv_heads * self.config.head_dim];
             state.append_kv(0, &rows, &rows);
@@ -4664,6 +4916,25 @@ mod tests {
             config.max_seq_len = config.max_seq_len.min(max_seq_len);
             *state = InferenceState::from_config_with_compression(&config, compression)?;
             Ok(())
+        }
+
+        fn supports_hidden_states(&self) -> bool {
+            true
+        }
+
+        fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+            // Deterministic ramp, offset when an adapter is staged so tests
+            // can tell the base path from the adapted one (same arrangement
+            // as the cera-ffi mock).
+            let base = if state.lora.is_some() { 100.0 } else { 0.0 };
+            tokens
+                .iter()
+                .enumerate()
+                .flat_map(|(t, &tok)| {
+                    (0..self.config.hidden_size)
+                        .map(move |c| base + (t * 16 + tok as usize * 4 + c) as f32)
+                })
+                .collect()
         }
     }
 
@@ -4769,6 +5040,205 @@ mod tests {
         assert_eq!(msg.content.len(), 2);
     }
 
+    fn js_error_message(err: JsError) -> String {
+        let value: JsValue = err.into();
+        value
+            .dyn_into::<js_sys::Error>()
+            .expect("JsError is a JS Error")
+            .message()
+            .as_string()
+            .unwrap_or_default()
+    }
+
+    fn empty_test_adapter() -> LoraAdapters {
+        let inner = cera::lora::LoraAdapterWeights::compose(&[]).expect("empty stack");
+        LoraAdapters { inner }
+    }
+
+    #[wasm_bindgen_test]
+    fn lora_stack_push_validates_scale() {
+        let adapters = empty_test_adapter();
+        let mut stack = LoraStack::new();
+        assert_eq!(stack.length(), 0);
+
+        // NaN names the exact message; 1e300 is finite as f64 but infinite
+        // as f32, so it must fail the same check rather than reaching core.
+        let err = stack.push(&adapters, f64::NAN).unwrap_err();
+        assert_eq!(
+            js_error_message(err),
+            "LoraStack.push: scale must be finite, got NaN"
+        );
+        assert_eq!(stack.length(), 0);
+        let err = stack.push(&adapters, 1e300).unwrap_err();
+        assert!(js_error_message(err).starts_with("LoraStack.push: scale must be finite"));
+        assert_eq!(stack.length(), 0);
+
+        stack.push(&adapters, 0.5).expect("finite scale");
+        assert_eq!(stack.length(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn lora_stack_set_and_override_roundtrip() {
+        let adapters = empty_test_adapter();
+        let mut session = create_test_session(7);
+        let tokens = [1u32, 2, 3];
+        // Baseline BEFORE install: the mock shifts every channel by 100
+        // whenever any adapter is staged, so adapted output differs.
+        let pre = session
+            .hidden_states_for_tokens(&tokens)
+            .expect("pre-install base");
+        // An empty adapter composes to a no-op, but the stack itself is
+        // non-empty, so the session installs it (same as core: only an
+        // empty stack detaches) and the mock sees an adapter in effect.
+        let mut stack = LoraStack::new();
+        stack.push(&adapters, 1.0).expect("push");
+        session.set_lora_adapters(&stack).expect("set stack");
+        assert!(session.has_lora());
+        let adapted = session.hidden_states_for_tokens(&tokens).expect("adapted");
+        assert_ne!(adapted.to_vec(), pre.to_vec());
+
+        // An empty stack extracts from the base model even with adapters
+        // attached: byte-identical to the pre-install baseline. (Compared
+        // against `pre`, not the post-install call: the installed no-op
+        // entry keeps the adapted path visibly distinct.)
+        let empty = LoraStack::new();
+        let over = session
+            .hidden_states_for_tokens_with_adapters(&tokens, &empty)
+            .expect("override");
+        assert_eq!(over.to_vec(), pre.to_vec());
+
+        // And an empty stack detaches again.
+        session.set_lora_adapters(&empty).expect("detach");
+        assert!(!session.has_lora());
+        let post_detach = session
+            .hidden_states_for_tokens(&tokens)
+            .expect("post-detach base");
+        assert_eq!(post_detach.to_vec(), pre.to_vec());
+    }
+
+    #[wasm_bindgen_test]
+    fn hidden_states_with_adapters_non_empty_overrides_for_one_call() {
+        let adapters = empty_test_adapter();
+        let mut session = create_test_session(7);
+        let tokens = [1u32, 2, 3];
+        let base = session.hidden_states_for_tokens(&tokens).expect("base");
+        // A non-empty override adapts one call (the mock offsets staged
+        // output) without attaching anything.
+        let mut stack = LoraStack::new();
+        stack.push(&adapters, 1.0).expect("push");
+        let over = session
+            .hidden_states_for_tokens_with_adapters(&tokens, &stack)
+            .expect("override");
+        assert_ne!(over.to_vec(), base.to_vec());
+        assert!(!session.has_lora());
+        assert_eq!(
+            session
+                .hidden_states_for_tokens(&tokens)
+                .expect("still base")
+                .to_vec(),
+            base.to_vec()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn hidden_states_text_and_pooled_with_adapters_exercise_all_entry_points() {
+        let adapters = empty_test_adapter();
+        let mut session = create_test_session(7);
+        let tokens = [1u32, 2, 3];
+        let base_text = session
+            .hidden_states_for_text("test prompt")
+            .expect("base text");
+        let base_pooled = session
+            .hidden_states_mean_pooled(&tokens)
+            .expect("base pooled");
+
+        let mut stack = LoraStack::new();
+        stack.push(&adapters, 1.0).expect("push");
+
+        let text_out = session
+            .hidden_states_for_text_with_adapters("test prompt", &stack)
+            .expect("text with adapters");
+        assert_ne!(text_out.to_vec(), base_text.to_vec());
+
+        let pooled_out = session
+            .hidden_states_mean_pooled_with_adapters(&tokens, &stack)
+            .expect("pooled with adapters");
+        assert_ne!(pooled_out.to_vec(), base_pooled.to_vec());
+    }
+
+    /// Collect `Session::generate` output through the real JS-callback sink.
+    fn generate_tokens(session: &mut Session, opts: &GenerateOpts) -> Vec<u32> {
+        let out = Rc::new(RefCell::new(Vec::<u32>::new()));
+        let sink = out.clone();
+        let cb = Closure::wrap(Box::new(move |arr: JsValue| {
+            let a: js_sys::Uint32Array = arr.unchecked_into();
+            sink.borrow_mut().extend(a.to_vec());
+        }) as Box<dyn FnMut(JsValue)>);
+        let f: &js_sys::Function = cb.as_ref().unchecked_ref();
+        let summary = session.generate(opts, f, None).expect("generate");
+        assert_eq!(summary.tokens_generated(), out.borrow().len() as u32);
+        out.borrow().clone()
+    }
+
+    #[wasm_bindgen_test]
+    fn set_seed_persists_across_reset() {
+        // Flat logits (token 99 is out of range) so the stream is pure RNG.
+        fn run(seed: u64, advance_first: bool) -> Vec<u32> {
+            let mut session = create_test_session(99);
+            session.append_tokens(&[0, 1]).expect("prime");
+            session.set_seed(Some(seed)).expect("set seed");
+            let mut opts = GenerateOpts::new();
+            opts.set_max_tokens(8);
+            opts.set_temperature(1.0);
+            opts.set_top_p(1.0);
+            opts.set_top_k(0);
+            opts.set_min_p(0.0);
+            opts.set_repetition_penalty(1.0);
+            opts.set_ignore_eos(true);
+            if advance_first {
+                // Burn RNG draws before the reset: if `reset` kept the live
+                // stream instead of rebuilding from the session default, this
+                // run would diverge from the un-advanced one.
+                generate_tokens(&mut session, &opts);
+            }
+            session.reset().expect("reset");
+            session.append_tokens(&[0, 1]).expect("re-prime");
+            generate_tokens(&mut session, &opts)
+        }
+        assert_eq!(run(7, false).len(), 8);
+        assert_eq!(run(7, false), run(7, true));
+        // Non-vacuity: a different session seed diverges.
+        assert_ne!(run(7, false), run(3, false));
+    }
+
+    #[wasm_bindgen_test]
+    fn generate_opts_seed_roundtrips_and_seeds_generate() {
+        // Accessor roundtrip (the wasm twin of FFI's
+        // `generate_opts_seed_roundtrips_to_cera`).
+        let mut opts = GenerateOpts::new();
+        assert!(opts.seed().is_none());
+        opts.set_seed(Some(99));
+        assert_eq!(opts.seed(), Some(99));
+        // Per-request seed is deterministic through the wasm CPU session.
+        // Flat logits (token 99 is out of range) so the stream is pure RNG.
+        let run = |seed: Option<u64>| {
+            let mut session = create_test_session(99);
+            session.append_tokens(&[0, 1]).expect("prime");
+            let mut opts = GenerateOpts::new();
+            opts.set_max_tokens(8);
+            opts.set_seed(seed);
+            opts.set_temperature(1.0);
+            opts.set_top_p(1.0);
+            opts.set_top_k(0);
+            opts.set_min_p(0.0);
+            opts.set_repetition_penalty(1.0);
+            opts.set_ignore_eos(true);
+            generate_tokens(&mut session, &opts)
+        };
+        assert_eq!(run(Some(99)), run(Some(99)));
+        assert_ne!(run(Some(99)), run(Some(100)));
+    }
+
     #[wasm_bindgen_test]
     fn chat_session_tool_configuration() {
         let mut session = create_test_session(7);
@@ -4844,6 +5314,123 @@ mod tests {
             let err = session2.restore(&data);
             assert!(err.is_err(), "mismatched fingerprint must be rejected");
         }
+    }
+
+    fn sampler_cfg(seed: Option<u64>) -> cera::sampler::SamplerConfig {
+        cera::sampler::SamplerConfig {
+            temperature: 1.0,
+            top_k: 16,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            seed,
+        }
+    }
+
+    fn flat_logits() -> Vec<f32> {
+        vec![0.5f32; 16]
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn call_sampler_continues_stream_without_seed() {
+        use cera::sampler::Sampler;
+        // Reference stream: two draws from a seed-42 sampler.
+        let mut reference = Sampler::new(sampler_cfg(Some(42)));
+        let first = reference.sample(&mut flat_logits());
+        let second = reference.sample(&mut flat_logits());
+        // Helper: a seeded call starts the stream, an unseeded call
+        // continues it (no fresh entropy), a fresh seed restarts it.
+        let mut stored = None;
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(Some(42)), None)
+            .expect("stochastic call resolves");
+        assert_eq!(s.sample(&mut flat_logits()), first);
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
+            .expect("unseeded call continues the stream");
+        assert_eq!(s.sample(&mut flat_logits()), second);
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(Some(42)), None)
+            .expect("reseed resolves");
+        assert_eq!(s.sample(&mut flat_logits()), first);
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn call_sampler_greedy_consumes_nothing() {
+        use cera::sampler::Sampler;
+        let mut stored = None;
+        // Greedy on an empty slot resolves None and stores nothing.
+        let mut greedy = sampler_cfg(None);
+        greedy.temperature = 0.0;
+        assert!(super::resolve_call_sampler(&mut stored, greedy, None).is_none());
+        assert!(stored.is_none());
+        // Greedy between stochastic calls disturbs neither the stored
+        // sampler nor the stream position.
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(Some(7)), None)
+            .expect("seeded call resolves");
+        s.sample(&mut flat_logits());
+        let mut greedy = sampler_cfg(None);
+        greedy.temperature = 0.0;
+        assert!(super::resolve_call_sampler(&mut stored, greedy, None).is_none());
+        let mut reference = Sampler::new(sampler_cfg(Some(7)));
+        reference.sample(&mut flat_logits());
+        let expected = reference.sample(&mut flat_logits());
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
+            .expect("unseeded call continues the stream");
+        assert_eq!(s.sample(&mut flat_logits()), expected);
+        // Greedy with a seed draws nothing but restarts the stored stream:
+        // the next stochastic call continues from stream 99, like CPU.
+        let mut seeded_greedy = sampler_cfg(Some(99));
+        seeded_greedy.temperature = 0.0;
+        assert!(super::resolve_call_sampler(&mut stored, seeded_greedy, None).is_none());
+        let mut reference = Sampler::new(sampler_cfg(Some(99)));
+        let expected = reference.sample(&mut flat_logits());
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
+            .expect("unseeded call continues the restarted stream");
+        assert_eq!(s.sample(&mut flat_logits()), expected);
+        // Greedy with a seed on an EMPTY slot stores the stream (drawing
+        // nothing): a first call that is a seeded greedy still seeds the
+        // session, and the next unseeded stochastic call continues it from
+        // position 0, like CPU.
+        let mut stored = None;
+        let mut seeded_greedy = sampler_cfg(Some(99));
+        seeded_greedy.temperature = 0.0;
+        assert!(super::resolve_call_sampler(&mut stored, seeded_greedy, None).is_none());
+        assert!(stored.is_some());
+        let mut reference = Sampler::new(sampler_cfg(Some(99)));
+        let expected = reference.sample(&mut flat_logits());
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), None)
+            .expect("unseeded call continues the stored stream");
+        assert_eq!(s.sample(&mut flat_logits()), expected);
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn call_sampler_first_call_uses_session_default() {
+        use cera::sampler::Sampler;
+        // First unseeded call starts from the session default.
+        let mut stored = None;
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), Some(11))
+            .expect("first call resolves");
+        let mut reference = Sampler::new(sampler_cfg(Some(11)));
+        assert_eq!(
+            s.sample(&mut flat_logits()),
+            reference.sample(&mut flat_logits())
+        );
+        // A presented seed wins over the default and restarts the stream.
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(Some(22)), Some(11))
+            .expect("seeded call resolves");
+        let mut reference = Sampler::new(sampler_cfg(Some(22)));
+        assert_eq!(
+            s.sample(&mut flat_logits()),
+            reference.sample(&mut flat_logits())
+        );
+        // ...and the stream then continues past the restart.
+        let s = super::resolve_call_sampler(&mut stored, sampler_cfg(None), Some(11))
+            .expect("unseeded call continues");
+        assert_eq!(
+            s.sample(&mut flat_logits()),
+            reference.sample(&mut flat_logits())
+        );
     }
 
     #[test]

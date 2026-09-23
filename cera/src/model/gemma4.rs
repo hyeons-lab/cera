@@ -1927,6 +1927,13 @@ impl Model for Gemma4Model {
         true
     }
 
+    /// No LoRA hooks: `forward_single_token` never reads `state.lora` (the
+    /// `lora` hits in this file are `lora_tmp` scratch reuse). Restated (not
+    /// inherited) so whoever adds the hooks reads this here.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
     fn forward_prefill_logits_all(
         &self,
         tokens: &[u32],

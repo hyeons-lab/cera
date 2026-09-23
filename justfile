@@ -103,6 +103,8 @@ profile-cpu MODEL *ARGS:
 # Run python unit tests
 python-test:
     python3 tests/test_format_review_comment.py
+    python3 tests/api_contracts/check.py
+    python3 -m unittest discover -s tests/api_contracts
 
 # Run all CI checks locally (mirrors GitHub Actions)
 ci: fmt clippy test python-test
@@ -199,9 +201,9 @@ vendor-generator:
 # `cera_ffi/lib/src/generated/cera_ffi_web.dart`. See that directory's README.
 # It runs against the ffi-buffer cdylib, then
 # `tool/patch_generated_bindings.dart` (deterministic + idempotent) fixes symbol
-# names, native-lib resolution, and the EngineConfig record encoder. The patched
-# result analyzes clean and round-trips real inference, including async +
-# streaming. See V2.17.
+# names, native-lib resolution, and the record encoders the generator stubs
+# (EngineConfig, LoraAdapterEntry). The patched result analyzes clean and
+# round-trips real inference, including async + streaming. See V2.17.
 #
 # `cargo run --manifest-path` is used over a hardcoded target/ binary path so it
 # stays portable (handles the Windows `.exe` suffix automatically).

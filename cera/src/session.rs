@@ -36,7 +36,9 @@ pub use recovery::{IngestRecovery, RecoveryOutcome};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Per-session configuration. Set at construction; immutable thereafter.
+/// Per-session configuration. Set at construction; immutable thereafter except
+/// for `seed`, which [`Session::set_seed`] replaces (so `reset()` re-seeds
+/// from the live default, not necessarily the construction value).
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Cap on total tokens held in KV. `None` → model's default `max_seq_len`.
@@ -96,6 +98,15 @@ impl Default for SpecDecode {
 #[derive(Debug, Clone)]
 pub struct GenerateOpts {
     pub max_tokens: u32,
+    /// Per-request RNG seed. `Some` restarts the sampler's RNG from this
+    /// seed when the call starts (KV, position, and repetition state are
+    /// untouched; only the random stream restarts); `None` continues the
+    /// session's existing RNG stream. Greedy calls honor it too (no
+    /// sampling happens there, but the seed selects the stream a later
+    /// stochastic call continues). A per-request seed does not change the
+    /// session default: [`Session::reset`] still rebuilds the sampler from
+    /// [`SessionConfig::seed`].
+    pub seed: Option<u64>,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -150,6 +161,7 @@ impl Default for GenerateOpts {
     fn default() -> Self {
         Self {
             max_tokens: 256,
+            seed: None,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
@@ -411,11 +423,20 @@ pub enum CeraError {
     ///
     /// Distinct from [`CeraError::LoraDimMismatch`] because the remedy is
     /// different and a caller can act on it: nothing about the adapter or the
-    /// model needs changing, only the backend it runs on. Today the one case is
-    /// a routed feed-forward delta (the router or the per-expert factors) on a
-    /// GPU backend, which the CPU backend applies.
+    /// model needs changing, only the backend it runs on. Two cases: a routed
+    /// feed-forward delta (the router or the per-expert factors) on a GPU
+    /// backend, which the CPU backend applies; and a backend with no LoRA
+    /// hooks at all (bert, qwen35, gemma4, bailingmoe3), where no backend
+    /// runs the adapter and retrying elsewhere is futile.
     #[error("LoRA adapter not supported by this backend: {0}")]
     LoraUnsupportedByBackend(String),
+    /// A [`Session::set_lora_adapters`] stack is inconsistent with itself
+    /// (non-finite scale, dimension/expert-count disagreement between
+    /// entries, merged rank overflow, or a classifier in the stack).
+    /// Distinct from [`CeraError::LoraDimMismatch`]: the entries may each
+    /// fit the model. The list itself doesn't compose.
+    #[error("LoRA adapter stack is inconsistent: {0}")]
+    LoraCompose(String),
     #[error("backend: {0}")]
     Backend(String),
     #[error("out of memory: could not allocate {requested_bytes} bytes")]
@@ -604,8 +625,8 @@ pub struct Session {
     capabilities: ModalityCapabilities,
     /// Default generation options for this session.
     default_opts: GenerateOpts,
-    /// Retained for `reset()` (rebuild state + sampler) and
-    /// `sync_sampler_from_opts` (read back the seed).
+    /// Retained for `reset()`, which rebuilds state plus the sampler from
+    /// the session-default seed.
     config: SessionConfig,
     /// Audio encoder weights, if attached. None for text-only
     /// sessions; populated via [`Self::attach_audio_encoder`] before
@@ -689,6 +710,8 @@ impl Session {
     /// Returns [`CeraError::Busy`] if the model's live GPU state belongs to an
     /// existing session. Drop that session or load a separate model to proceed.
     /// CPU models with caller-owned state permit multiple live sessions.
+    /// A gated model therefore keeps at most one session warm: every
+    /// additional live session needs its own model instance.
     pub fn new(
         model: Arc<dyn Model>,
         tokenizer: Arc<BpeTokenizer>,
@@ -944,22 +967,91 @@ impl Session {
         &mut self,
         adapters: Arc<crate::lora::LoraAdapterWeights>,
     ) -> Result<(), CeraError> {
-        adapters
+        self.install_lora(adapters)
+    }
+
+    /// Replace the attached adapter set with a runtime-scaled stack, Leap
+    /// `setLoraAdapters` semantics: entry `i` contributes `scale_i` times its
+    /// delta, and contributions stack per target. An empty list detaches
+    /// (same as [`Self::remove_lora_adapters`]). A non-empty stack whose
+    /// entries are all zero-scale installs a no-op adapter instead, so
+    /// [`Self::has_lora_adapters`] stays true while applying nothing.
+    ///
+    /// The stack is composed into one equivalent adapter up front (see
+    /// [`crate::lora::LoraAdapterWeights::compose`]), so every backend keeps
+    /// its existing single-adapter path (including the GPU upload and the
+    /// routed-FFN refusal below).
+    ///
+    /// Atomic: composition, dimension validation, and the backend check all
+    /// run before anything is swapped, so a bad list leaves the previous set
+    /// untouched. A stack that fits the model but carries
+    /// mixture-of-experts deltas is refused with
+    /// [`CeraError::LoraUnsupportedByBackend`] on backends without
+    /// routed-FFN hooks, as in [`Self::attach_lora_adapters`]. Like
+    /// [`Self::attach_lora_adapters`], only tokens processed after the call
+    /// are affected.
+    pub fn set_lora_adapters(
+        &mut self,
+        adapters: &[(Arc<crate::lora::LoraAdapterWeights>, f32)],
+    ) -> Result<(), CeraError> {
+        match crate::lora::LoraAdapterWeights::compose_opt(adapters)
+            .map_err(|e| CeraError::LoraCompose(format!("{e:#}")))?
+        {
+            None => {
+                self.remove_lora_adapters();
+                Ok(())
+            }
+            Some(merged) => self.install_lora(merged),
+        }
+    }
+
+    /// Validate `adapter` against the model and backend, then install it as
+    /// the session's adapter set. Shared by [`Self::attach_lora_adapters`]
+    /// and [`Self::set_lora_adapters`] so the two can't drift on guards.
+    fn install_lora(
+        &mut self,
+        adapter: Arc<crate::lora::LoraAdapterWeights>,
+    ) -> Result<(), CeraError> {
+        self.check_lora_usable(&adapter)?;
+        self.lora = Some(adapter);
+        self.state.lora = self.lora.clone();
+        Ok(())
+    }
+
+    /// Reject an adapter that doesn't fit this model or backend: the
+    /// backend-capability gate, dimension validation, and the routed-FFN
+    /// gate. Shared by installation and by per-call extraction overrides,
+    /// which bypass installation but must not bypass its guards (an
+    /// unvalidated adapter would mis-`zip` in the apply hooks and silently
+    /// corrupt output).
+    fn check_lora_usable(
+        &self,
+        adapter: &crate::lora::LoraAdapterWeights,
+    ) -> Result<(), CeraError> {
+        // Backends without any LoRA hooks would install the adapter and then
+        // silently produce base-model output, so refuse up front (before the
+        // dimension check: capability is the more fundamental fact).
+        if !self.model.supports_lora() {
+            return Err(CeraError::LoraUnsupportedByBackend(format!(
+                "model architecture '{}' has no LoRA apply hooks, so the adapter would be \
+                 silently ignored; no backend runs it",
+                self.model.config().architecture
+            )));
+        }
+        adapter
             .validate_dims(self.model.config())
             .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
         // Routed-FFN deltas have no hook on the GPU backends. Both the router
         // and the per-expert factors would upload without complaint and then
         // never be applied, which is an adapter that quietly does part of its
         // job, so refuse the whole thing here.
-        if adapters.has_moe_deltas() && !self.model.supports_moe_lora() {
+        if adapter.has_moe_deltas() && !self.model.supports_moe_lora() {
             return Err(CeraError::LoraUnsupportedByBackend(
                 "the adapter carries mixture-of-experts deltas (router and/or per-expert \
                  factors) and this backend has no routed-FFN hooks; the CPU backend applies them"
                     .to_string(),
             ));
         }
-        self.lora = Some(adapters);
-        self.state.lora = self.lora.clone();
         Ok(())
     }
 
@@ -972,6 +1064,17 @@ impl Session {
     /// Whether a LoRA adapter is currently attached.
     pub fn has_lora_adapters(&self) -> bool {
         self.lora.is_some()
+    }
+
+    /// Replace the session-default sampler seed and restart the RNG from it
+    /// immediately (`None` re-seeds from entropy). KV, position, and the
+    /// repetition history are untouched (only the random stream restarts),
+    /// so this is safe to call on a primed session. Unlike a per-request
+    /// [`GenerateOpts::seed`], this persists: [`Self::reset`] rebuilds the
+    /// sampler from the seed set here.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.config.seed = seed;
+        self.sampler.reseed(seed);
     }
 
     /// Set the session-default cap on the longest side of an appended
@@ -1263,7 +1366,33 @@ impl Session {
     /// [`CeraError::UnsupportedModality`] if the backend doesn't implement
     /// hidden-state extraction (probe via [`Model::supports_hidden_states`]);
     /// [`CeraError::InvalidToken`] if any id is `>= vocab_size`.
+    ///
+    /// For a per-call adapter choice instead of the session-attached set,
+    /// see [`Self::hidden_states_for_tokens_using`].
     pub fn hidden_states_for_tokens(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
+        let lora = self.lora.clone();
+        self.hidden_states_for_tokens_inner(tokens, lora)
+    }
+
+    /// Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+    /// adapter choice: `Some` extracts through that adapter (a single
+    /// adapter or a [`crate::lora::LoraAdapterWeights::compose`]d stack),
+    /// `None` extracts from the base model even when the session has
+    /// adapters attached. The choice applies to this call only; session
+    /// state (KV, position, RNG, attached set) is untouched either way.
+    pub fn hidden_states_for_tokens_using(
+        &mut self,
+        tokens: &[u32],
+        adapter: Option<&Arc<crate::lora::LoraAdapterWeights>>,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.hidden_states_for_tokens_inner(tokens, adapter.cloned())
+    }
+
+    fn hidden_states_for_tokens_inner(
+        &mut self,
+        tokens: &[u32],
+        lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
+    ) -> Result<Vec<f32>, CeraError> {
         self.ensure_usable()?;
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
@@ -1273,6 +1402,12 @@ impl Session {
         let model = Arc::clone(&self.model);
         if !model.supports_hidden_states() {
             return Err(CeraError::UnsupportedModality);
+        }
+        // Per-call overrides bypass installation, so they must not bypass
+        // its guards. (The session-attached set already passed at install;
+        // re-checking it here is a cheap walk that keeps one guard point.)
+        if let Some(adapter) = &lora {
+            self.check_lora_usable(adapter)?;
         }
         // Validate token ids BEFORE dispatch: the model embedding paths
         // `assert!(id < vocab_size)`, and that panic would unwind through the
@@ -1311,7 +1446,8 @@ impl Session {
             self.hs_scratch_cap = n;
         }
         // The slot is always `Some` after the rebuild block (rebuild covers the
-        // `is_none()` case), so this unwrap never fires.
+        // `is_none()` case), so the `None` arm is a defensive error, not a
+        // reachable path.
         let state = match self.hs_scratch.as_mut() {
             Some(s) => s,
             None => {
@@ -1323,10 +1459,22 @@ impl Session {
         if !rebuild {
             state.clear_for_reuse();
         }
-        // Reflect the attached adapter in the extraction (the coordination point:
-        // the CPU per-token path applies it via the decode hooks).
-        state.lora = self.lora.clone();
-        Ok(model.hidden_states(tokens, state))
+        // Run the extraction under the chosen adapter (the coordination point:
+        // the CPU per-token path applies it via the decode hooks). `None`
+        // extracts from the base model even when the session has adapters
+        // attached; the session's own set is untouched either way.
+        //
+        // Swap the per-call choice in for the call, then swap the previous
+        // slot value back: the slot is never read between calls (every call
+        // sets it first), but without the restore a large one-shot adapter
+        // would stay pinned in session memory until the next extraction
+        // call. Restoring the old value instead of cloning the attached set
+        // keeps this at one clone per call (the `lora` argument itself). No
+        // fallible step sits between the swap and the restore.
+        let prev = std::mem::replace(&mut state.lora, lora);
+        let out = model.hidden_states(tokens, state);
+        state.lora = prev;
+        Ok(out)
     }
 
     /// Like [`Self::hidden_states_for_tokens`] but **mean-pools** over tokens,
@@ -1334,28 +1482,45 @@ impl Session {
     /// path (their head consumes the mean-pooled hidden state) and avoids
     /// shipping the full `[T*D]` matrix across an FFI/WASM boundary.
     pub fn hidden_states_mean_pooled(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CeraError> {
-        self.ensure_usable()?;
         let d = self.hidden_size();
         let flat = self.hidden_states_for_tokens(tokens)?;
-        let t = flat.len() / d;
-        debug_assert_eq!(t * d, flat.len(), "hidden states not a multiple of D");
-        let mut pooled = vec![0.0f32; d];
-        for row in flat.chunks_exact(d) {
-            crate::backend::cpu::add_inplace(&mut pooled, row);
-        }
-        if t > 0 {
-            let inv = 1.0 / t as f32;
-            pooled.iter_mut().for_each(|p| *p *= inv);
-        }
-        Ok(pooled)
+        mean_pool(flat, d)
+    }
+
+    /// Like [`Self::hidden_states_mean_pooled`] but with an explicit per-call
+    /// adapter choice (see [`Self::hidden_states_for_tokens_using`]): `Some`
+    /// extracts through that adapter, `None` extracts from the base model
+    /// even when the session has adapters attached.
+    pub fn hidden_states_mean_pooled_using(
+        &mut self,
+        tokens: &[u32],
+        adapter: Option<&Arc<crate::lora::LoraAdapterWeights>>,
+    ) -> Result<Vec<f32>, CeraError> {
+        // No outer `ensure_usable`: `hidden_states_for_tokens_using` checks
+        // first, and `hidden_size` cannot fail.
+        let d = self.hidden_size();
+        let flat = self.hidden_states_for_tokens_using(tokens, adapter)?;
+        mean_pool(flat, d)
     }
 
     /// Tokenize `text` and return its per-token hidden states. Convenience over
     /// [`Self::hidden_states_for_tokens`] (Swift `hiddenStates(for:)`).
     pub fn hidden_states_for_text(&mut self, text: &str) -> Result<Vec<f32>, CeraError> {
-        self.ensure_usable()?;
         let tokens = self.tokenizer.encode(text);
         self.hidden_states_for_tokens(&tokens)
+    }
+
+    /// Like [`Self::hidden_states_for_text`] but with an explicit per-call
+    /// adapter choice (see [`Self::hidden_states_for_tokens_using`]).
+    pub fn hidden_states_for_text_using(
+        &mut self,
+        text: &str,
+        adapter: Option<&Arc<crate::lora::LoraAdapterWeights>>,
+    ) -> Result<Vec<f32>, CeraError> {
+        // No outer `ensure_usable`: `hidden_states_for_tokens_using` checks
+        // first, and tokenizing cannot fail.
+        let tokens = self.tokenizer.encode(text);
+        self.hidden_states_for_tokens_using(&tokens, adapter)
     }
 
     /// Tokenize text and append. Convenience over `append_tokens`.
@@ -2390,6 +2555,12 @@ impl Session {
                 return Err(CeraError::EmptyInput);
             }
         };
+        // Per-request reseed runs here, past the no-op early exits above
+        // (which promise zero side effects) and ahead of every decode path
+        // below: plain greedy and speculative greedy skip the sampler sync
+        // (no sampling happens there), but the seed still selects the stream
+        // a later stochastic call continues.
+        self.reseed_from_opts(opts);
         tracing::info!(
             "[cera:session] generate starting: current_pos={}, max_seq_len={}, audio_vocoder_attached={}",
             self.current_pos,
@@ -2495,7 +2666,8 @@ impl Session {
         let grammar_for_rearm = opts.grammar.clone();
 
         // Stochastic-only state. Allocating the scratch buffer and syncing
-        // the sampler are skipped in greedy mode where neither is touched.
+        // the sampler are skipped in greedy mode where neither is touched
+        // (the per-request reseed already ran at entry for every mode).
         let mut sample_scratch: Vec<f32> = if greedy {
             Vec::new()
         } else {
@@ -3117,16 +3289,27 @@ impl Session {
         })
     }
 
+    /// Restart the RNG from a per-request [`GenerateOpts::seed`], if any.
+    /// Split out of [`Self::sync_sampler_from_opts`] (which the greedy
+    /// paths skip) so every decode honors the seed. KV and position are
+    /// untouched; only the random stream restarts. Without a seed the
+    /// session's RNG stream continues across calls.
+    fn reseed_from_opts(&mut self, opts: &GenerateOpts) {
+        if let Some(seed) = opts.seed {
+            self.sampler.reseed(Some(seed));
+        }
+    }
+
     fn sync_sampler_from_opts(&mut self, opts: &GenerateOpts) {
-        // `Sampler::new` rebuilds the RNG from the seed; for per-call opts
-        // updates within the same session we just replace the config.
+        // The per-request reseed already ran at `generate_inner` entry for
+        // every mode; this sync covers the stochastic-only sampler state.
         let cfg = SamplerConfig {
             temperature: opts.temperature,
             top_k: opts.top_k as usize,
             top_p: opts.top_p,
             min_p: opts.min_p,
             repetition_penalty: opts.repetition_penalty,
-            seed: self.config.seed,
+            seed: self.sampler.seed(),
         };
         self.sampler.set_config(cfg);
         // Repetition penalty references tokens emitted this call only — start
@@ -3137,6 +3320,51 @@ impl Session {
         // penalty active the chained calls see a smaller history window each.
         self.sampler.reset_history();
     }
+}
+
+/// Mean-pool a flattened row-major `[T * D]` hidden-state matrix into one
+/// `[D]` vector. Shared by [`Session::hidden_states_mean_pooled`] and its
+/// per-call-adapter sibling so the two cannot drift.
+fn mean_pool(flat: Vec<f32>, d: usize) -> Result<Vec<f32>, CeraError> {
+    // `d` is the model's hidden_size, which every shipped loader rejects at
+    // zero, but both the division and `chunks_exact` below panic on zero,
+    // so don't rely on the transitive guarantee (`Model` is a public trait).
+    // A `[0]`-wide pool over no data is correctly empty; a `[0]`-wide pool
+    // over data is a backend-contract violation, failed closed like the
+    // ragged arm below.
+    if d == 0 {
+        if flat.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(CeraError::Backend(
+            "mean_pool: non-empty hidden states with D == 0".into(),
+        ));
+    }
+    if !flat.len().is_multiple_of(d) {
+        return Err(CeraError::Backend(format!(
+            "mean_pool: hidden states len ({}) is not a multiple of D ({d})",
+            flat.len()
+        )));
+    }
+    // `tokens` is guaranteed non-empty upstream, so an empty matrix here is a
+    // backend-contract violation, failed closed like the ragged arm above.
+    if flat.is_empty() {
+        return Err(CeraError::Backend("mean_pool: empty hidden states".into()));
+    }
+    let t = flat.len() / d;
+    let mut pooled = flat;
+    if t > 1 {
+        let (acc, rest) = pooled.split_at_mut(d);
+        for row in rest.chunks_exact(d) {
+            crate::backend::cpu::add_inplace(acc, row);
+        }
+        let inv = 1.0 / t as f32;
+        for p in acc.iter_mut() {
+            *p *= inv;
+        }
+        pooled.truncate(d);
+    }
+    Ok(pooled)
 }
 
 impl std::fmt::Debug for Session {
@@ -3157,6 +3385,33 @@ impl std::fmt::Debug for Session {
 mod tests {
     use super::*;
     use crate::manifest::InferenceType;
+
+    #[test]
+    fn mean_pool_averages_rows_and_tolerates_zero_width() {
+        assert_eq!(mean_pool(vec![1., 2., 3., 4.], 2).unwrap(), vec![2., 3.]);
+        // A `[0]`-wide pool over no data is empty, not a division-by-zero
+        // panic: all shipped loaders reject `hidden_size == 0`, but `Model`
+        // is a public trait and this helper must not trust the transitive
+        // guarantee.
+        assert!(mean_pool(Vec::new(), 0).unwrap().is_empty());
+        // Data with `D == 0` is a backend-contract violation, failed closed
+        // like a ragged tail: a typed error, not silently dropped rows.
+        assert!(matches!(
+            mean_pool(vec![1., 2., 3.], 0),
+            Err(CeraError::Backend(_))
+        ));
+        assert!(matches!(
+            mean_pool(vec![1., 2., 3.], 2),
+            Err(CeraError::Backend(_))
+        ));
+        // An empty matrix with `D > 0` is the same class of violation
+        // (upstream guarantees non-empty tokens), failed closed rather than
+        // yielding a 0-length "pooled" vector callers would mis-shape.
+        assert!(matches!(
+            mean_pool(Vec::new(), 2),
+            Err(CeraError::Backend(_))
+        ));
+    }
 
     #[test]
     fn capabilities_from_inference_type_covers_every_variant() {
@@ -3530,6 +3785,62 @@ mod tests {
                 assert_eq!(vocab_size, 100);
             }
             other => panic!("expected InvalidToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_lora_adapters_refused_without_backend_hooks() {
+        // MockTestModel inherits the default `supports_lora() == false` (like
+        // bert/qwen35/gemma4/bailingmoe3): install must refuse rather than
+        // silently produce base-model output. The gate fires before the
+        // adapter is even inspected, so any adapter trips it.
+        let config = crate::model::ModelConfig {
+            architecture: "mock".into(),
+            n_layers: 0,
+            hidden_size: 0,
+            intermediate_size: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: 100,
+            max_seq_len: 1024,
+            rope_theta: 0.0,
+            rms_norm_eps: 0.0,
+            block_types: Vec::new(),
+            conv_kernel_size: None,
+            ssm: None,
+            kv_heads_per_layer: Vec::new(),
+            scalars: crate::model::ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let model = Arc::new(MockTestModel { config });
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let mut session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+        let adapter = crate::lora::LoraAdapterWeights::new_classifier_for_testing(
+            vec![0.0; 2],
+            None,
+            vec!["class".into()],
+        );
+        let err = session.attach_lora_adapters(adapter).unwrap_err();
+        match err {
+            CeraError::LoraUnsupportedByBackend(detail) => {
+                // The refusal names the architecture and the recovery (retry
+                // is futile: no backend runs the adapter), so callers can
+                // triage from the string alone.
+                assert!(
+                    detail.contains("'mock'") && detail.contains("no backend runs it"),
+                    "refusal must name the architecture and recovery, got: {detail}"
+                );
+            }
+            other => panic!("expected LoraUnsupportedByBackend, got {other:?}"),
         }
     }
 

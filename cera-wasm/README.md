@@ -383,6 +383,31 @@ const perToken = session.hiddenStatesForTokens(tokens); // Float32Array, tokens.
 adapters.free();  // frees the JS handle; the attached copy stays live in the session
 ```
 
+To stack several adapters with per-adapter runtime scales, build a
+`LoraStack` and install it with `setLoraAdapters` (contributions stack per
+target; the swap is atomic, so a bad stack leaves the previous set
+untouched). An empty stack detaches, the same as `removeLora()`:
+
+```js
+import { LoraStack } from '@hyeons-lab/cera-wasm';
+
+const stack = new LoraStack();
+stack.push(styleAdapters, 0.8);
+stack.push(taskAdapters, 1.0);
+session.setLoraAdapters(stack);
+// ...when done with the stack itself (the session holds its own copy):
+stack.free();
+```
+
+For a one-shot extraction through a different stack without touching the
+session set, pass the stack to a per-call override instead (an empty stack
+extracts from the base model even when the session has adapters attached):
+
+```js
+const pooled = session.hiddenStatesMeanPooledWithAdapters(tokens, stack);
+// ...or hiddenStatesForTokensWithAdapters / hiddenStatesForTextWithAdapters
+```
+
 ### Reproducibility (seeded sampler)
 
 Pass a `SessionConfig` with a fixed `seed` to `newSession` so the
@@ -440,6 +465,18 @@ opts.temperature = 1.0;  // non-greedy so the seed actually matters
 const out = [];
 session.generate(opts, (toks) => out.push(...toks));
 // `out` is identical for any session built with the same seed + prompt + opts.
+```
+
+Two finer-grained knobs sit on top of the session seed. `opts.seed` is a
+per-request override: it restarts the sampler RNG when that one call starts
+(KV and position are untouched, so it is safe mid-conversation) without
+changing the session default. `session.setSeed(seed)` replaces the
+persistent default instead (and restarts the RNG immediately), surviving
+`reset()`; pass `undefined` to re-seed from entropy:
+
+```js
+opts.seed = 7n;          // this call only; default `undefined` continues the stream
+session.setSeed(1234n);  // new default from here on, reset()-proof
 ```
 
 > **Worker note:** `Session.generate` is **synchronous** and blocks
@@ -504,7 +541,7 @@ without paying `engine.newSession(config)` setup cost again:
 | API | KV cache | `position` | Sampler | When to use |
 |---|---|---|---|---|
 | `session.clearCancel()` | preserved | preserved | preserved | "interrupted but continuing": keep the conversation context, append more tokens, generate again |
-| `session.reset()` | dropped | reset to 0 | re-seeded from `cfg.seed` | "clear conversation" UI button: start fresh |
+| `session.reset()` | dropped | reset to 0 | re-seeded from the session default (the `setSeed` value when one was set, else `cfg.seed`) | "clear conversation" UI button: start fresh |
 
 `clearCancel()` takes `&self`, `reset()` takes `&mut self`;
 remember `reset()` must be invoked outside any in-flight `generate`

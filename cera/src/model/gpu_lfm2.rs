@@ -7638,6 +7638,12 @@ impl Model for GpuLfm2Model {
         false
     }
 
+    /// Dense-target hooks via `resolve_lora` (routed-FFN targets excluded, as
+    /// above).
+    fn supports_lora(&self) -> bool {
+        true
+    }
+
     fn turboquant_supported(&self) -> bool {
         // Gated on `head_dim`: the compressed kernels need a power-of-two
         // `head_dim` that is <= 128 and a multiple of 32. Reporting the real

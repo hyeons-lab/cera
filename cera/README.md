@@ -486,10 +486,12 @@ Load a LoRA adapter, a llama.cpp GGUF (from `convert_lora_to_gguf`) or a PEFT
 `.safetensors`, and attach it to a `Session`. The delta is applied at inference
 time (`y += scale·B·(A·x)`), **never merged into the weights**, so the base model
 stays quantized and adapters hot-swap / unload per request. Runs on CPU, Metal,
-and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach. The
-one gap is `lfm2moe`'s routed-FFN targets (the router and the per-expert
-projections), which apply on CPU only; on a GPU backend such an adapter is
-refused with `CeraError::LoraUnsupportedByBackend` rather than half-applied.
+and wgpu (batched-GEMM prefill + decode) and is dimension-checked at attach.
+Two backend gaps refuse loudly with `CeraError::LoraUnsupportedByBackend`
+rather than silently ignoring the adapter: `lfm2moe`'s routed-FFN targets (the
+router and the per-expert projections), which apply on CPU only; and the
+bert, qwen35, gemma4, and bailingmoe3 backends, which have no LoRA hooks at
+all (any adapter is refused on those).
 
 ```rust
 use cera::lora::LoraAdapterWeights;
@@ -511,7 +513,7 @@ let pooled = session.hidden_states_mean_pooled(&tokens)?; // [hidden_size]
 ```
 
 Both are also exposed over the FFI (`LoraAdapters` / `attachLora` /
-`hiddenStatesMeanPooled`) and WASM bindings.
+`setLoraAdapters` / `hiddenStatesMeanPooled`) and WASM bindings.
 
 ## Feature flags
 

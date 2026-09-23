@@ -339,6 +339,7 @@ impl Lfm2Model {
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
+        ensure!(hidden_size > 0, "{prefix}.embedding_length must be > 0");
         let intermediate_size = if let Some(info) = gguf.tensors.get("blk.0.ffn_gate.weight") {
             if info.shape.len() > 1 {
                 info.shape[1]
@@ -4213,6 +4214,11 @@ impl Model for Lfm2Model {
         true
     }
 
+    /// Dense-target LoRA hooks in the attention, FFN, and gated-conv blocks.
+    fn supports_lora(&self) -> bool {
+        true
+    }
+
     fn f16_kv_supported(&self) -> bool {
         true
     }
@@ -5059,5 +5065,30 @@ mod moe_routing_tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].0, 0);
         assert_eq!(selected[1].0, 1);
+    }
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use super::Lfm2Model;
+    use crate::gguf::GgufFile;
+
+    #[test]
+    fn zero_embedding_length_is_rejected_at_load() {
+        // `hidden_size == 0` would divide by zero in mean-pooling and size
+        // every buffer at zero; fail at load with a typed error instead.
+        let mut writer = crate::convert::writer::GgufWriter::new();
+        writer.add_string("general.architecture", "lfm2");
+        writer.add_u32("lfm2.block_count", 1);
+        writer.add_u32("lfm2.embedding_length", 0);
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        let gguf = GgufFile::from_bytes(bytes.into()).unwrap();
+        let err = Lfm2Model::parse_config(&gguf, 32).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lfm2.embedding_length must be > 0"),
+            "unexpected error: {err}"
+        );
     }
 }

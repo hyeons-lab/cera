@@ -235,8 +235,12 @@ pub enum FfiError {
     InvalidToken { id: u32, vocab_size: u32 },
 
     /// A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
-    /// [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
-    /// attach time (wrong dimensions). `detail` carries the diagnostic.
+    /// [`LoraAdapters::from_safetensors`]), was incompatible with the model at
+    /// attach time (wrong dimensions), or a [`Session::set_lora_adapters`]
+    /// stack was inconsistent with itself (non-finite scale, classifier entry,
+    /// rank overflow, entry disagreement). All three are caller bugs needing
+    /// the same handling, so they share one variant; `detail` carries the
+    /// diagnostic.
     #[error("lora: {detail}")]
     LoraParse { detail: String },
 
@@ -268,9 +272,11 @@ pub enum FfiError {
     /// Separate from [`FfiError::LoraParse`] because the two need different
     /// handling on the foreign side: `LoraParse` means the adapter or the model
     /// pairing is wrong, while this one means only the backend is, so a caller
-    /// can retry on CPU instead of surfacing "bad adapter" to a user. Today the
-    /// case is a routed feed-forward (mixture-of-experts) delta on a GPU
-    /// backend.
+    /// can retry on CPU instead of surfacing "bad adapter" to a user. Two
+    /// cases: a routed feed-forward (mixture-of-experts) delta on a GPU
+    /// backend (CPU applies it, so retrying there works), and a backend with
+    /// no LoRA hooks at all (bert, qwen35, gemma4, bailingmoe3), where no
+    /// backend runs the adapter and retrying elsewhere is futile.
     ///
     /// **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
     /// enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
@@ -338,6 +344,7 @@ impl From<&cera::CeraError> for FfiError {
                 requested: requested.clone(),
             },
             cera::CeraError::LoraDimMismatch(s) => FfiError::LoraParse { detail: s.clone() },
+            cera::CeraError::LoraCompose(s) => FfiError::LoraParse { detail: s.clone() },
             cera::CeraError::LoraUnsupportedByBackend(s) => {
                 FfiError::LoraUnsupportedByBackend { detail: s.clone() }
             }
@@ -1512,6 +1519,12 @@ impl From<SpecDecodeConfig> for cera::SpecDecode {
 pub struct GenerateOpts {
     #[uniffi(default = 256)]
     pub max_tokens: u32,
+    /// Per-request RNG seed. A value restarts the sampler's RNG when the call
+    /// starts (KV and position are untouched); omitted (default) continues
+    /// the session's existing RNG stream. Does not change the session
+    /// default; `reset()` still rebuilds from the session seed.
+    #[uniffi(default = None)]
+    pub seed: Option<u64>,
     #[uniffi(default = 0.7)]
     pub temperature: f32,
     #[uniffi(default = 0.9)]
@@ -1563,6 +1576,7 @@ impl From<&cera::GenerateOpts> for GenerateOpts {
     fn from(core: &cera::GenerateOpts) -> Self {
         Self {
             max_tokens: core.max_tokens,
+            seed: core.seed,
             temperature: core.temperature,
             top_p: core.top_p,
             top_k: core.top_k,
@@ -1610,6 +1624,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
         };
         Ok(cera::GenerateOpts {
             max_tokens: o.max_tokens,
+            seed: o.seed,
             temperature: o.temperature,
             top_p: o.top_p,
             top_k: o.top_k,
@@ -1983,12 +1998,26 @@ impl cera::ModalitySink for ForeignSinkAdapter {
 // ---------------------------------------------------------------------------
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
-/// [`Session::attach_lora`]. Load it once and share the handle across sessions —
+/// [`Session::attach_lora`]. Load it once and share the handle across sessions:
 /// it's reference-counted internally, so attaching to multiple sessions doesn't
 /// re-parse or re-allocate the factors.
 #[derive(uniffi::Object)]
 pub struct LoraAdapters {
     inner: Arc<cera::lora::LoraAdapterWeights>,
+}
+
+/// One entry of a [`Session::set_lora_adapters`] stack: the adapter plus its
+/// runtime scale. Contributions stack per target; the scale must be finite
+/// (zero entries are skipped as an exact no-op). Finite alone is not enough
+/// across the FFI: the value crosses as an `f32`, so magnitudes above
+/// `f32::MAX` never reach Rust: out-of-range scales fail at the binding
+/// boundary (Python raises `OverflowError` while lowering; the other
+/// bindings saturate to ±inf and fail as `LoraParse`). No `Debug`: the
+/// handle has none to forward.
+#[derive(Clone, uniffi::Record)]
+pub struct LoraAdapterEntry {
+    pub adapter: Arc<LoraAdapters>,
+    pub scale: f32,
 }
 
 #[uniffi::export]
@@ -2018,7 +2047,7 @@ impl LoraAdapters {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Number of `(layer, target)` low-rank deltas the adapter carries — for
+    /// Number of `(layer, target)` low-rank deltas the adapter carries, for
     /// diagnostics / logging.
     pub fn target_count(&self) -> u32 {
         self.inner.target_count() as u32
@@ -2126,6 +2155,25 @@ impl Session {
             hidden_size,
         })
     }
+}
+
+/// Compose an FFI adapter stack: `None` (detach / base model) for an empty
+/// list, else the merged adapter. Compose failures surface as
+/// [`FfiError::LoraParse`]. Shared by [`Session::set_lora_adapters`] and the
+/// per-call extraction overrides so the error mapping cannot drift between
+/// them; the empty-stack mapping itself lives in
+/// [`cera::lora::LoraAdapterWeights::compose_opt`]. Takes no lock: callers
+/// compose first, then install under the session mutex.
+fn compose_stack(
+    entries: Vec<LoraAdapterEntry>,
+) -> Result<Option<Arc<cera::lora::LoraAdapterWeights>>, FfiError> {
+    let stack = entries
+        .into_iter()
+        .map(|e| (e.adapter.inner.clone(), e.scale))
+        .collect::<Vec<_>>();
+    cera::lora::LoraAdapterWeights::compose_opt(&stack).map_err(|e| FfiError::LoraParse {
+        detail: format!("{e:#}"),
+    })
 }
 
 /// Flatten `f32`s into a little-endian byte buffer (`4 * len` bytes) so the wire
@@ -2279,22 +2327,100 @@ impl Session {
         Ok(self.lock_inner()?.hidden_states_mean_pooled(&tokens)?)
     }
 
+    /// Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+    /// adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+    /// an empty list extracts from the base model even when the session has
+    /// adapters attached. Nothing is installed; the session set is untouched.
+    /// An inconsistent or mismatched stack fails with
+    /// [`FfiError::LoraParse`], never silently (a stack that fits but
+    /// carries mixture-of-experts deltas fails instead with
+    /// [`FfiError::LoraUnsupportedByBackend`] on backends without
+    /// routed-FFN hooks).
+    pub fn hidden_states_for_tokens_with_adapters(
+        &self,
+        tokens: Vec<u32>,
+        adapters: Vec<LoraAdapterEntry>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let adapter = compose_stack(adapters)?;
+        let hs = self
+            .lock_inner()?
+            .hidden_states_for_tokens_using(&tokens, adapter.as_ref())?;
+        Ok(f32_vec_to_le_bytes(&hs))
+    }
+
+    /// Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+    /// of [`Self::hidden_states_for_tokens_with_adapters`].
+    pub fn hidden_states_for_text_with_adapters(
+        &self,
+        text: String,
+        adapters: Vec<LoraAdapterEntry>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let adapter = compose_stack(adapters)?;
+        let hs = self
+            .lock_inner()?
+            .hidden_states_for_text_using(&text, adapter.as_ref())?;
+        Ok(f32_vec_to_le_bytes(&hs))
+    }
+
+    /// Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+    /// stack of [`Self::hidden_states_for_tokens_with_adapters`].
+    pub fn hidden_states_mean_pooled_with_adapters(
+        &self,
+        tokens: Vec<u32>,
+        adapters: Vec<LoraAdapterEntry>,
+    ) -> Result<Vec<f32>, FfiError> {
+        let adapter = compose_stack(adapters)?;
+        Ok(self
+            .lock_inner()?
+            .hidden_states_mean_pooled_using(&tokens, adapter.as_ref())?)
+    }
+
     /// Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-    /// Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-    /// call). It's applied to every subsequent forward pass — generation **and**
-    /// hidden-states extraction — until removed or replaced (hot-swap), and is
-    /// preserved across [`Self::reset`]. Only affects tokens processed after the
-    /// call (doesn't retroactively re-adapt cached KV).
+    /// Swift/Kotlin). It's applied to every subsequent forward pass
+    /// (generation and hidden-states extraction) until removed or replaced
+    /// (hot-swap), and is preserved across [`Self::reset`]. Only affects
+    /// tokens processed after the call (doesn't retroactively re-adapt
+    /// cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
     ///
     /// Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
     /// means the adapter's dimensions don't match the loaded model, so the
     /// adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
     /// means it fits but this backend has no hook for something it adapts, so
-    /// the same adapter works on another backend (today: a mixture-of-experts
-    /// adapter needs the CPU backend).
+    /// the same adapter usually works on another backend (a mixture-of-experts
+    /// adapter needs the CPU backend), except on a backend with no LoRA hooks
+    /// at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
     pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError> {
         self.lock_inner()?
             .attach_lora_adapters(adapters.inner.clone())?;
+        Ok(())
+    }
+
+    /// Replace the attached adapter set with a runtime-scaled stack: entry
+    /// `i` contributes `scale` times its delta, stacking per target. An
+    /// empty list detaches (same as [`Self::remove_lora`]). A non-empty
+    /// stack whose entries are all zero-scale installs a no-op adapter
+    /// instead, so [`Self::has_lora`] stays true while applying nothing.
+    /// The swap is atomic: a bad list leaves the previous set untouched.
+    /// Like [`Self::attach_lora`], only tokens processed after the call are
+    /// affected.
+    ///
+    /// [`FfiError::LoraParse`] here covers both dimension mismatches and an
+    /// inconsistent stack (non-finite scale, dimension/expert-count
+    /// disagreement between entries, rank overflow, or a classifier in the
+    /// stack); the detail names the problem. Like [`Self::attach_lora`], a
+    /// stack that fits but carries mixture-of-experts deltas is refused
+    /// separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+    /// without routed-FFN hooks (retry on CPU).
+    pub fn set_lora_adapters(&self, adapters: Vec<LoraAdapterEntry>) -> Result<(), FfiError> {
+        // Compose outside the session mutex: merging copies every weight and
+        // can take tens of milliseconds at high rank, during which no other
+        // session call could run. `compose_stack` takes no lock and maps a
+        // bad stack to the same `FfiError::LoraParse` detail the in-lock
+        // core call produced, so validation-before-install is unchanged.
+        match compose_stack(adapters)? {
+            None => self.lock_inner()?.remove_lora_adapters(),
+            Some(merged) => self.lock_inner()?.attach_lora_adapters(merged)?,
+        }
         Ok(())
     }
 
@@ -2426,13 +2552,13 @@ impl Session {
     /// continues.
     ///
     /// **Callback reentrancy: deadlock hazard.** The session mutex is
-    /// held for the entire call, and sink callbacks run while that
-    /// lock is held. Calling back into methods that also take the
-    /// mutex ([`Session::append_text`], [`Session::append_tokens`],
-    /// [`Session::generate`], [`Session::generate_streaming`],
-    /// [`Session::reset`]) from inside a sink method will deadlock.
-    /// [`Session::cancel`] and [`Session::position`] are atomic-backed
-    /// and safe to call from the sink or from any other thread.
+    /// held while per-chunk/frame sink callbacks run: calling any other
+    /// [`Session`] method from inside one will deadlock, except the
+    /// lock-free ones ([`Session::position`] and [`Session::cancel`],
+    /// atomics with [`Session::clear_cancel`] likewise safe, plus the
+    /// cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+    /// The terminal `on_done` fires after the mutex is released and may
+    /// call any method.
     ///
     /// Cancellation: call [`Session::cancel`] from any thread (or from
     /// inside a sink callback on this thread) to terminate the loop at
@@ -2667,6 +2793,15 @@ impl Session {
         Ok(())
     }
 
+    /// Replace the session-default sampler seed and restart the RNG from it
+    /// immediately (omitted re-seeds from entropy). KV and position are
+    /// untouched, so this is safe on a primed session. Persists across
+    /// `reset()`, unlike a per-request `GenerateOpts.seed`.
+    pub fn set_seed(&self, seed: Option<u64>) -> Result<(), FfiError> {
+        self.lock_inner()?.set_seed(seed);
+        Ok(())
+    }
+
     /// Save current inference session checkpoint to a file.
     pub fn save_checkpoint(&self, path: String) -> Result<(), FfiError> {
         self.lock_inner()?.save_checkpoint(path)?;
@@ -2876,14 +3011,15 @@ impl Session {
     /// the caller's async runtime stays responsive.
     ///
     /// Sink callbacks run on the blocking worker thread that's
-    /// executing the decode — **not** on the caller's async thread.
+    /// executing the decode, **not** on the caller's async thread.
     /// The reentrancy hazard documented on
-    /// [`Session::generate_streaming`] still applies: sink callbacks
-    /// that call back into `append_text` / `generate*` / `reset` from
-    /// inside the session will deadlock on the session mutex.
-    /// [`Session::cancel`] and [`Session::position`] remain atomic-
-    /// backed and safe to invoke from any thread (including from
-    /// inside a callback).
+    /// [`Session::generate_streaming`] still applies: per-chunk/frame
+    /// sink callbacks that call back into any other [`Session`] method
+    /// will deadlock on the session mutex, except the lock-free
+    /// [`Session::position`], [`Session::cancel`],
+    /// [`Session::clear_cancel`], [`Session::capabilities`], and
+    /// [`Session::hidden_size`]. The terminal `on_done` fires after
+    /// the mutex is released and may call any method.
     ///
     /// Cancellation: dropping the returned future fires the same
     /// abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -3978,6 +4114,21 @@ mod tests {
         assert!(core.bundle_repo.is_none());
     }
 
+    #[test]
+    fn generate_opts_seed_roundtrips_to_cera() {
+        // Default is None (continue the session RNG stream).
+        assert!(GenerateOpts::default().seed.is_none());
+        // Per-request seed survives the FFI → core conversion both ways.
+        let ffi = GenerateOpts {
+            seed: Some(99),
+            ..Default::default()
+        };
+        let core = cera::GenerateOpts::try_from(ffi).unwrap();
+        assert_eq!(core.seed, Some(99));
+        let back = GenerateOpts::from(&core);
+        assert_eq!(back.seed, Some(99));
+    }
+
     /// `ChatMessage` round-trips its `role` + `content` fields
     /// through the cera-core conversion. `From<ChatMessage> for
     /// cera::tokenizer::ChatMessage` is a trivial field-copy; this
@@ -4244,6 +4395,22 @@ mod tests {
             other => panic!("expected Backend, got: {other:?}"),
         }
 
+        match FfiError::from(cera::CeraError::LoraCompose("inconsistent stack".into())) {
+            FfiError::LoraParse { detail } => {
+                assert_eq!(detail, "inconsistent stack");
+            }
+            other => panic!("expected LoraParse, got: {other:?}"),
+        }
+
+        match FfiError::from(cera::CeraError::LoraUnsupportedByBackend(
+            "no routed-FFN hooks".into(),
+        )) {
+            FfiError::LoraUnsupportedByBackend { detail } => {
+                assert_eq!(detail, "no routed-FFN hooks");
+            }
+            other => panic!("expected LoraUnsupportedByBackend, got: {other:?}"),
+        }
+
         // Io flattens the OS error to a string.
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let io_str = io_err.to_string();
@@ -4268,11 +4435,12 @@ mod tests {
     /// side had dropped the `"backend: "` and `"io: "` label prefixes.
     #[test]
     fn ffi_error_display_matches_cera_error_for_every_shared_variant() {
-        // One deliberate exclusion: `CeraError::LoraDimMismatch` maps to
-        // `FfiError::LoraParse`, whose Display is the wider "lora: {detail}"
-        // because it also covers adapter *load* failures that have no
-        // `CeraError` counterpart. Every other shared variant is paired below,
-        // and a new one belongs here rather than being quietly left out.
+        // Two deliberate exclusions: `CeraError::LoraDimMismatch` and
+        // `CeraError::LoraCompose` both map to `FfiError::LoraParse`, whose
+        // Display is the wider "lora: {detail}" because it also covers
+        // adapter *load* failures that have no `CeraError` counterpart.
+        // Every other shared variant is paired below, and a new one belongs
+        // here rather than being quietly left out.
 
         // Prep the Io pair outside the vec since io::Error isn't
         // `Clone`: we need to consume one into `CeraError::Io` and

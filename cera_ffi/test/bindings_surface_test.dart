@@ -24,10 +24,12 @@ import 'package:test/test.dart';
 /// Referencing the symbols means the package stops compiling if they vanish.
 void main() {
   test('GenerateOpts carries every field the Rust record declares', () {
-    // 13 fields as of cera-ffi/src/lib.rs (including spec). `grammarTriggerTokens`,
-    // `flushEveryTokens`, and `flushEveryMs` are the three that went missing.
+    // 14 fields as of cera-ffi/src/lib.rs (including spec and seed).
+    // `grammarTriggerTokens`, `flushEveryTokens`, and `flushEveryMs` are the
+    // three that went missing.
     const opts = GenerateOpts(
       maxTokens: 1,
+      seed: 7,
       temperature: 0.0,
       topP: 1.0,
       topK: 0,
@@ -43,6 +45,7 @@ void main() {
     );
 
     expect(opts.maxTokens, 1);
+    expect(opts.seed, 7);
     expect(opts.grammarTriggerTokens, isEmpty);
     expect(opts.flushEveryTokens, 0);
     expect(opts.flushEveryMs, 0);
@@ -404,6 +407,17 @@ void Function(Session) get _sessionSurfaceGuard => (Session session) {
   // `Vec<u8>` argument alongside an optional-primitive argument.
   session.appendImage(Uint8List(0), null);
   session.setImageMaxLongSize(null);
+  session.setLoraAdapters(const <LoraAdapterEntry>[]);
+  session.setSeed(null);
+  session.hiddenStatesForTokensWithAdapters(
+    const <int>[],
+    const <LoraAdapterEntry>[],
+  );
+  session.hiddenStatesForTextWithAdapters('', const <LoraAdapterEntry>[]);
+  session.hiddenStatesMeanPooledWithAdapters(
+    const <int>[],
+    const <LoraAdapterEntry>[],
+  );
 };
 
 /// And for `BundleRepo`, whose `storeDir` is a plain string return and so was

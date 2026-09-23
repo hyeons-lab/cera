@@ -739,7 +739,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137:
+    if lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -773,7 +773,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 3335:
+    if lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_cancel() != 44519:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -789,9 +789,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 4050:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 13931:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -799,9 +799,15 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -826,6 +832,10 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_set_seed() != 54035:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -2205,18 +2215,39 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2287,6 +2318,18 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size.argtypes = 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_set_lora_adapters.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_set_lora_adapters.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed.restype = None
 _UniffiLib.ffi_cera_ffi_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_cera_ffi_uniffi_contract_version.restype = ctypes.c_uint32
@@ -2770,12 +2813,21 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_size.restype = ctypes.
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
@@ -2812,6 +2864,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.restyp
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.restype = ctypes.c_uint16
 
 _uniffi_check_contract_api_version(_UniffiLib)
 # _uniffi_check_api_checksums(_UniffiLib)
@@ -4010,8 +4068,12 @@ class FfiError:  # type: ignore
     class LoraParse(_UniffiTempFfiError):
         """
         A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
-        [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
-        attach time (wrong dimensions). `detail` carries the diagnostic.
+        [`LoraAdapters::from_safetensors`]), was incompatible with the model at
+        attach time (wrong dimensions), or a [`Session::set_lora_adapters`]
+        stack was inconsistent with itself (non-finite scale, classifier entry,
+        rank overflow, entry disagreement). All three are caller bugs needing
+        the same handling, so they share one variant; `detail` carries the
+        diagnostic.
 """
         
         def __init__(self, detail):
@@ -4069,9 +4131,11 @@ class FfiError:  # type: ignore
         Separate from [`FfiError::LoraParse`] because the two need different
         handling on the foreign side: `LoraParse` means the adapter or the model
         pairing is wrong, while this one means only the backend is, so a caller
-        can retry on CPU instead of surfacing "bad adapter" to a user. Today the
-        case is a routed feed-forward (mixture-of-experts) delta on a GPU
-        backend.
+        can retry on CPU instead of surfacing "bad adapter" to a user. Two
+        cases: a routed feed-forward (mixture-of-experts) delta on a GPU
+        backend (CPU applies it, so retrying there works), and a backend with
+        no LoRA hooks at all (bert, qwen35, gemma4, bailingmoe3), where no
+        backend runs the adapter and retrying elsewhere is futile.
 
         **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
         enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
@@ -5271,6 +5335,31 @@ class _UniffiFfiConverterTypeFfiSpeechTimestamp(_UniffiConverterRustBuffer):
         _UniffiFfiConverterFloat32.write(value.start_ms, buf)
         _UniffiFfiConverterFloat32.write(value.end_ms, buf)
 
+class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt64.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt64.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt64.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterSequenceUInt32(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -5373,8 +5462,12 @@ class GenerateOpts:
     in a follow-up PR. Including them in the record now keeps the FFI
     surface stable across that transition.
 """
-    def __init__(self, *, max_tokens:int = 256, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT):
+    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT):
         self.max_tokens = max_tokens
+        if seed is _DEFAULT:
+            self.seed = None
+        else:
+            self.seed = seed
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -5404,9 +5497,11 @@ class GenerateOpts:
 
     
     def __str__(self):
-        return "GenerateOpts(max_tokens={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={})".format(self.max_tokens, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec)
+        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec)
     def __eq__(self, other):
         if self.max_tokens != other.max_tokens:
+            return False
+        if self.seed != other.seed:
             return False
         if self.temperature != other.temperature:
             return False
@@ -5439,6 +5534,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
     def read(buf):
         return GenerateOpts(
             max_tokens=_UniffiFfiConverterUInt32.read(buf),
+            seed=_UniffiFfiConverterOptionalUInt64.read(buf),
             temperature=_UniffiFfiConverterFloat32.read(buf),
             top_p=_UniffiFfiConverterFloat32.read(buf),
             top_k=_UniffiFfiConverterUInt32.read(buf),
@@ -5456,6 +5552,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterUInt32.check_lower(value.max_tokens)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.seed)
         _UniffiFfiConverterFloat32.check_lower(value.temperature)
         _UniffiFfiConverterFloat32.check_lower(value.top_p)
         _UniffiFfiConverterUInt32.check_lower(value.top_k)
@@ -5472,6 +5569,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterUInt32.write(value.max_tokens, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.seed, buf)
         _UniffiFfiConverterFloat32.write(value.temperature, buf)
         _UniffiFfiConverterFloat32.write(value.top_p, buf)
         _UniffiFfiConverterUInt32.write(value.top_k, buf)
@@ -6450,6 +6548,187 @@ class _UniffiFfiConverterTypeLeapBundleEntry(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.write(value.quants, buf)
 
 
+class LoraAdaptersProtocol(typing.Protocol):
+    """
+    A loaded LoRA adapter, ready to attach to a [`Session`] via
+    [`Session::attach_lora`]. Load it once and share the handle across sessions:
+    it's reference-counted internally, so attaching to multiple sessions doesn't
+    re-parse or re-allocate the factors.
+"""
+    
+    def target_count(self, ) -> int:
+        """
+        Number of `(layer, target)` low-rank deltas the adapter carries, for
+        diagnostics / logging.
+"""
+        raise NotImplementedError
+
+class LoraAdapters(LoraAdaptersProtocol):
+    """
+    A loaded LoRA adapter, ready to attach to a [`Session`] via
+    [`Session::attach_lora`]. Load it once and share the handle across sessions:
+    it's reference-counted internally, so attaching to multiple sessions doesn't
+    re-parse or re-allocate the factors.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def from_gguf(cls, path: str) -> LoraAdapters:
+        """
+        Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
+        a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
+        metadata (missing ⇒ scale = 1).
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_safetensors(cls, path: str,alpha: typing.Optional[float]) -> LoraAdapters:
+        """
+        Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
+        in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
+        scale = 1, i.e. `alpha == rank`).
+"""
+        
+        _UniffiFfiConverterString.check_lower(path)
+
+        _UniffiFfiConverterOptionalFloat32.check_lower(alpha)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(path),
+            _UniffiFfiConverterOptionalFloat32.lower(alpha),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def target_count(self, ) -> int:
+        """
+        Number of `(layer, target)` low-rank deltas the adapter carries, for
+        diagnostics / logging.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeLoraAdapters:
+    @staticmethod
+    def lift(value: int) -> LoraAdapters:
+        return LoraAdapters._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: LoraAdapters):
+        if not isinstance(value, LoraAdapters):
+            raise TypeError("Expected LoraAdapters instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: LoraAdapters) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> LoraAdapters:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: LoraAdapters, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+@dataclass
+class LoraAdapterEntry:
+    """
+    One entry of a [`Session::set_lora_adapters`] stack: the adapter plus its
+    runtime scale. Contributions stack per target; the scale must be finite
+    (zero entries are skipped as an exact no-op). Finite alone is not enough
+    across the FFI: the value crosses as an `f32`, so magnitudes above
+    `f32::MAX` never reach Rust: out-of-range scales fail at the binding
+    boundary (Python raises `OverflowError` while lowering; the other
+    bindings saturate to ±inf and fail as `LoraParse`). No `Debug`: the
+    handle has none to forward.
+"""
+    def __init__(self, *, adapter:LoraAdapters, scale:float):
+        self.adapter = adapter
+        self.scale = scale
+        
+        
+
+    
+    def __str__(self):
+        return "LoraAdapterEntry(adapter={}, scale={})".format(self.adapter, self.scale)
+    def __eq__(self, other):
+        if self.adapter != other.adapter:
+            return False
+        if self.scale != other.scale:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeLoraAdapterEntry(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return LoraAdapterEntry(
+            adapter=_UniffiFfiConverterTypeLoraAdapters.read(buf),
+            scale=_UniffiFfiConverterFloat32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeLoraAdapters.check_lower(value.adapter)
+        _UniffiFfiConverterFloat32.check_lower(value.scale)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeLoraAdapters.write(value.adapter, buf)
+        _UniffiFfiConverterFloat32.write(value.scale, buf)
+
+
 
 
 
@@ -7422,31 +7701,6 @@ class _UniffiFfiConverterOptionalTypeKvCompression(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiFfiConverterTypeKvCompression.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt64.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt64.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt64.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
@@ -9448,140 +9702,28 @@ class _UniffiFfiConverterSequenceTypeMessage(_UniffiConverterRustBuffer):
             _UniffiFfiConverterTypeMessage.read(buf) for i in range(count)
         ]
 
-
-class LoraAdaptersProtocol(typing.Protocol):
-    """
-    A loaded LoRA adapter, ready to attach to a [`Session`] via
-    [`Session::attach_lora`]. Load it once and share the handle across sessions —
-    it's reference-counted internally, so attaching to multiple sessions doesn't
-    re-parse or re-allocate the factors.
-"""
-    
-    def target_count(self, ) -> int:
-        """
-        Number of `(layer, target)` low-rank deltas the adapter carries — for
-        diagnostics / logging.
-"""
-        raise NotImplementedError
-
-class LoraAdapters(LoraAdaptersProtocol):
-    """
-    A loaded LoRA adapter, ready to attach to a [`Session`] via
-    [`Session::attach_lora`]. Load it once and share the handle across sessions —
-    it's reference-counted internally, so attaching to multiple sessions doesn't
-    re-parse or re-allocate the factors.
-"""
-    
-    _handle: ctypes.c_uint64
+class _UniffiFfiConverterSequenceTypeLoraAdapterEntry(_UniffiConverterRustBuffer):
     @classmethod
-    def from_gguf(cls, path: str) -> LoraAdapters:
-        """
-        Load a llama.cpp-format GGUF adapter (`convert_lora_to_gguf` output) from
-        a local path. `alpha` is read from the adapter's `adapter.lora.alpha`
-        metadata (missing ⇒ scale = 1).
-"""
-        
-        _UniffiFfiConverterString.check_lower(path)
-        _uniffi_lowered_args = (
-            _UniffiFfiConverterString.lower(path),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
-        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf,
-            *_uniffi_lowered_args,
-        )
-        return cls._uniffi_make_instance(_uniffi_ffi_result)
-    @classmethod
-    def from_safetensors(cls, path: str,alpha: typing.Optional[float]) -> LoraAdapters:
-        """
-        Load a PEFT `.safetensors` adapter from a local path. PEFT stores `alpha`
-        in a sibling `adapter_config.json`, so pass it explicitly here (`None` ⇒
-        scale = 1, i.e. `alpha == rank`).
-"""
-        
-        _UniffiFfiConverterString.check_lower(path)
-
-        _UniffiFfiConverterOptionalFloat32.check_lower(alpha)
-        _uniffi_lowered_args = (
-            _UniffiFfiConverterString.lower(path),
-            _UniffiFfiConverterOptionalFloat32.lower(alpha),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterTypeLoraAdapters.lift
-        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors,
-            *_uniffi_lowered_args,
-        )
-        return cls._uniffi_make_instance(_uniffi_ffi_result)
-    
-    def __init__(self, *args, **kwargs):
-        raise ValueError("This class has no default constructor")
-
-    def __del__(self):
-        # In case of partial initialization of instances.
-        handle = getattr(self, "_handle", None)
-        if handle is not None:
-            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters, handle)
-
-    def _uniffi_clone_handle(self):
-        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters, self._handle)
-
-    # Used by alternative constructors or any methods which return this type.
-    @classmethod
-    def _uniffi_make_instance(cls, handle):
-        # Lightly yucky way to bypass the usual __init__ logic
-        # and just create a new instance with the required handle.
-        inst = cls.__new__(cls)
-        inst._handle = handle
-        return inst
-    def target_count(self, ) -> int:
-        """
-        Number of `(layer, target)` low-rank deltas the adapter carries — for
-        diagnostics / logging.
-"""
-        _uniffi_lowered_args = (
-            self._uniffi_clone_handle(),
-        )
-        _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
-        _uniffi_error_converter = None
-        _uniffi_ffi_result = _uniffi_rust_call_with_error(
-            _uniffi_error_converter,
-            _UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count,
-            *_uniffi_lowered_args,
-        )
-        return _uniffi_lift_return(_uniffi_ffi_result)
-
-
-
-
-
-class _UniffiFfiConverterTypeLoraAdapters:
-    @staticmethod
-    def lift(value: int) -> LoraAdapters:
-        return LoraAdapters._uniffi_make_instance(value)
-
-    @staticmethod
-    def check_lower(value: LoraAdapters):
-        if not isinstance(value, LoraAdapters):
-            raise TypeError("Expected LoraAdapters instance, {} found".format(type(value).__name__))
-
-    @staticmethod
-    def lower(value: LoraAdapters) -> ctypes.c_uint64:
-        return value._uniffi_clone_handle()
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeLoraAdapterEntry.check_lower(item)
 
     @classmethod
-    def read(cls, buf: _UniffiRustBuffer) -> LoraAdapters:
-        ptr = buf.read_u64()
-        if ptr == 0:
-            raise InternalError("Raw handle value was null")
-        return cls.lift(ptr)
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeLoraAdapterEntry.write(item, buf)
 
     @classmethod
-    def write(cls, value: LoraAdapters, buf: _UniffiRustBuffer):
-        buf.write_u64(cls.lower(value))
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeLoraAdapterEntry.read(buf) for i in range(count)
+        ]
 
 
 class SessionProtocol(typing.Protocol):
@@ -9710,18 +9852,19 @@ class SessionProtocol(typing.Protocol):
     def attach_lora(self, adapters: LoraAdapters) -> None:
         """
         Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-        Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-        call). It's applied to every subsequent forward pass — generation **and**
-        hidden-states extraction — until removed or replaced (hot-swap), and is
-        preserved across [`Self::reset`]. Only affects tokens processed after the
-        call (doesn't retroactively re-adapt cached KV).
+        Swift/Kotlin). It's applied to every subsequent forward pass
+        (generation and hidden-states extraction) until removed or replaced
+        (hot-swap), and is preserved across [`Self::reset`]. Only affects
+        tokens processed after the call (doesn't retroactively re-adapt
+        cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
 
         Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
         means the adapter's dimensions don't match the loaded model, so the
         adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
         means it fits but this backend has no hook for something it adapts, so
-        the same adapter works on another backend (today: a mixture-of-experts
-        adapter needs the CPU backend).
+        the same adapter usually works on another backend (a mixture-of-experts
+        adapter needs the CPU backend), except on a backend with no LoRA hooks
+        at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
 """
         raise NotImplementedError
     def cancel(self, ) -> None:
@@ -9820,13 +9963,13 @@ class SessionProtocol(typing.Protocol):
         continues.
 
         **Callback reentrancy: deadlock hazard.** The session mutex is
-        held for the entire call, and sink callbacks run while that
-        lock is held. Calling back into methods that also take the
-        mutex ([`Session::append_text`], [`Session::append_tokens`],
-        [`Session::generate`], [`Session::generate_streaming`],
-        [`Session::reset`]) from inside a sink method will deadlock.
-        [`Session::cancel`] and [`Session::position`] are atomic-backed
-        and safe to call from the sink or from any other thread.
+        held while per-chunk/frame sink callbacks run: calling any other
+        [`Session`] method from inside one will deadlock, except the
+        lock-free ones ([`Session::position`] and [`Session::cancel`],
+        atomics with [`Session::clear_cancel`] likewise safe, plus the
+        cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+        The terminal `on_done` fires after the mutex is released and may
+        call any method.
 
         Cancellation: call [`Session::cancel`] from any thread (or from
         inside a sink callback on this thread) to terminate the loop at
@@ -9850,14 +9993,15 @@ class SessionProtocol(typing.Protocol):
         the caller's async runtime stays responsive.
 
         Sink callbacks run on the blocking worker thread that's
-        executing the decode — **not** on the caller's async thread.
+        executing the decode, **not** on the caller's async thread.
         The reentrancy hazard documented on
-        [`Session::generate_streaming`] still applies: sink callbacks
-        that call back into `append_text` / `generate*` / `reset` from
-        inside the session will deadlock on the session mutex.
-        [`Session::cancel`] and [`Session::position`] remain atomic-
-        backed and safe to invoke from any thread (including from
-        inside a callback).
+        [`Session::generate_streaming`] still applies: per-chunk/frame
+        sink callbacks that call back into any other [`Session`] method
+        will deadlock on the session mutex, except the lock-free
+        [`Session::position`], [`Session::cancel`],
+        [`Session::clear_cancel`], [`Session::capabilities`], and
+        [`Session::hidden_size`]. The terminal `on_done` fires after
+        the mutex is released and may call any method.
 
         Cancellation: dropping the returned future fires the same
         abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -9889,6 +10033,12 @@ class SessionProtocol(typing.Protocol):
         (Swift `hiddenStatesForText(text:)`). Returns the same LE-f32 byte layout.
 """
         raise NotImplementedError
+    def hidden_states_for_text_with_adapters(self, text: str,adapters: typing.List[LoraAdapterEntry]) -> bytes:
+        """
+        Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+        of [`Self::hidden_states_for_tokens_with_adapters`].
+"""
+        raise NotImplementedError
     def hidden_states_for_tokens(self, tokens: typing.List[int]) -> bytes:
         """
         Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
@@ -9911,11 +10061,30 @@ class SessionProtocol(typing.Protocol):
         `>= vocab_size`.
 """
         raise NotImplementedError
+    def hidden_states_for_tokens_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> bytes:
+        """
+        Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+        adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+        an empty list extracts from the base model even when the session has
+        adapters attached. Nothing is installed; the session set is untouched.
+        An inconsistent or mismatched stack fails with
+        [`FfiError::LoraParse`], never silently (a stack that fits but
+        carries mixture-of-experts deltas fails instead with
+        [`FfiError::LoraUnsupportedByBackend`] on backends without
+        routed-FFN hooks).
+"""
+        raise NotImplementedError
     def hidden_states_mean_pooled(self, tokens: typing.List[int]) -> typing.List[float]:
         """
         Mean-pooled hidden state — a single `[hidden_size]` vector (the common
         classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
         `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
+"""
+        raise NotImplementedError
+    def hidden_states_mean_pooled_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> typing.List[float]:
+        """
+        Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+        stack of [`Self::hidden_states_for_tokens_with_adapters`].
 """
         raise NotImplementedError
     def import_checkpoint(self, data: bytes) -> None:
@@ -10014,6 +10183,34 @@ class SessionProtocol(typing.Protocol):
         image-encode budget once. See [`Self::append_image`] for the cap
         semantics (shrinks the encoded target, never upscales, takes
         precedence over the model's minimum-resolution floor).
+"""
+        raise NotImplementedError
+    def set_lora_adapters(self, adapters: typing.List[LoraAdapterEntry]) -> None:
+        """
+        Replace the attached adapter set with a runtime-scaled stack: entry
+        `i` contributes `scale` times its delta, stacking per target. An
+        empty list detaches (same as [`Self::remove_lora`]). A non-empty
+        stack whose entries are all zero-scale installs a no-op adapter
+        instead, so [`Self::has_lora`] stays true while applying nothing.
+        The swap is atomic: a bad list leaves the previous set untouched.
+        Like [`Self::attach_lora`], only tokens processed after the call are
+        affected.
+
+        [`FfiError::LoraParse`] here covers both dimension mismatches and an
+        inconsistent stack (non-finite scale, dimension/expert-count
+        disagreement between entries, rank overflow, or a classifier in the
+        stack); the detail names the problem. Like [`Self::attach_lora`], a
+        stack that fits but carries mixture-of-experts deltas is refused
+        separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+        without routed-FFN hooks (retry on CPU).
+"""
+        raise NotImplementedError
+    def set_seed(self, seed: typing.Optional[int]) -> None:
+        """
+        Replace the session-default sampler seed and restart the RNG from it
+        immediately (omitted re-seeds from entropy). KV and position are
+        untouched, so this is safe on a primed session. Persists across
+        `reset()`, unlike a per-request `GenerateOpts.seed`.
 """
         raise NotImplementedError
 
@@ -10223,18 +10420,19 @@ class Session(SessionProtocol):
     def attach_lora(self, adapters: LoraAdapters) -> None:
         """
         Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-        Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-        call). It's applied to every subsequent forward pass — generation **and**
-        hidden-states extraction — until removed or replaced (hot-swap), and is
-        preserved across [`Self::reset`]. Only affects tokens processed after the
-        call (doesn't retroactively re-adapt cached KV).
+        Swift/Kotlin). It's applied to every subsequent forward pass
+        (generation and hidden-states extraction) until removed or replaced
+        (hot-swap), and is preserved across [`Self::reset`]. Only affects
+        tokens processed after the call (doesn't retroactively re-adapt
+        cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
 
         Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
         means the adapter's dimensions don't match the loaded model, so the
         adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
         means it fits but this backend has no hook for something it adapts, so
-        the same adapter works on another backend (today: a mixture-of-experts
-        adapter needs the CPU backend).
+        the same adapter usually works on another backend (a mixture-of-experts
+        adapter needs the CPU backend), except on a backend with no LoRA hooks
+        at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
 """
         
         _UniffiFfiConverterTypeLoraAdapters.check_lower(adapters)
@@ -10424,13 +10622,13 @@ class Session(SessionProtocol):
         continues.
 
         **Callback reentrancy: deadlock hazard.** The session mutex is
-        held for the entire call, and sink callbacks run while that
-        lock is held. Calling back into methods that also take the
-        mutex ([`Session::append_text`], [`Session::append_tokens`],
-        [`Session::generate`], [`Session::generate_streaming`],
-        [`Session::reset`]) from inside a sink method will deadlock.
-        [`Session::cancel`] and [`Session::position`] are atomic-backed
-        and safe to call from the sink or from any other thread.
+        held while per-chunk/frame sink callbacks run: calling any other
+        [`Session`] method from inside one will deadlock, except the
+        lock-free ones ([`Session::position`] and [`Session::cancel`],
+        atomics with [`Session::clear_cancel`] likewise safe, plus the
+        cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+        The terminal `on_done` fires after the mutex is released and may
+        call any method.
 
         Cancellation: call [`Session::cancel`] from any thread (or from
         inside a sink callback on this thread) to terminate the loop at
@@ -10470,14 +10668,15 @@ class Session(SessionProtocol):
         the caller's async runtime stays responsive.
 
         Sink callbacks run on the blocking worker thread that's
-        executing the decode — **not** on the caller's async thread.
+        executing the decode, **not** on the caller's async thread.
         The reentrancy hazard documented on
-        [`Session::generate_streaming`] still applies: sink callbacks
-        that call back into `append_text` / `generate*` / `reset` from
-        inside the session will deadlock on the session mutex.
-        [`Session::cancel`] and [`Session::position`] remain atomic-
-        backed and safe to invoke from any thread (including from
-        inside a callback).
+        [`Session::generate_streaming`] still applies: per-chunk/frame
+        sink callbacks that call back into any other [`Session`] method
+        will deadlock on the session mutex, except the lock-free
+        [`Session::position`], [`Session::cancel`],
+        [`Session::clear_cancel`], [`Session::capabilities`], and
+        [`Session::hidden_size`]. The terminal `on_done` fires after
+        the mutex is released and may call any method.
 
         Cancellation: dropping the returned future fires the same
         abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -10560,6 +10759,28 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def hidden_states_for_text_with_adapters(self, text: str,adapters: typing.List[LoraAdapterEntry]) -> bytes:
+        """
+        Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+        of [`Self::hidden_states_for_tokens_with_adapters`].
+"""
+        
+        _UniffiFfiConverterString.check_lower(text)
+
+        _UniffiFfiConverterSequenceTypeLoraAdapterEntry.check_lower(adapters)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(text),
+            _UniffiFfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def hidden_states_for_tokens(self, tokens: typing.List[int]) -> bytes:
         """
         Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
@@ -10595,6 +10816,35 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def hidden_states_for_tokens_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> bytes:
+        """
+        Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+        adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+        an empty list extracts from the base model even when the session has
+        adapters attached. Nothing is installed; the session set is untouched.
+        An inconsistent or mismatched stack fails with
+        [`FfiError::LoraParse`], never silently (a stack that fits but
+        carries mixture-of-experts deltas fails instead with
+        [`FfiError::LoraUnsupportedByBackend`] on backends without
+        routed-FFN hooks).
+"""
+        
+        _UniffiFfiConverterSequenceUInt32.check_lower(tokens)
+
+        _UniffiFfiConverterSequenceTypeLoraAdapterEntry.check_lower(adapters)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceUInt32.lower(tokens),
+            _UniffiFfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def hidden_states_mean_pooled(self, tokens: typing.List[int]) -> typing.List[float]:
         """
         Mean-pooled hidden state — a single `[hidden_size]` vector (the common
@@ -10612,6 +10862,28 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def hidden_states_mean_pooled_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> typing.List[float]:
+        """
+        Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+        stack of [`Self::hidden_states_for_tokens_with_adapters`].
+"""
+        
+        _UniffiFfiConverterSequenceUInt32.check_lower(tokens)
+
+        _UniffiFfiConverterSequenceTypeLoraAdapterEntry.check_lower(adapters)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceUInt32.lower(tokens),
+            _UniffiFfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceFloat32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10860,6 +11132,60 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_lora_adapters(self, adapters: typing.List[LoraAdapterEntry]) -> None:
+        """
+        Replace the attached adapter set with a runtime-scaled stack: entry
+        `i` contributes `scale` times its delta, stacking per target. An
+        empty list detaches (same as [`Self::remove_lora`]). A non-empty
+        stack whose entries are all zero-scale installs a no-op adapter
+        instead, so [`Self::has_lora`] stays true while applying nothing.
+        The swap is atomic: a bad list leaves the previous set untouched.
+        Like [`Self::attach_lora`], only tokens processed after the call are
+        affected.
+
+        [`FfiError::LoraParse`] here covers both dimension mismatches and an
+        inconsistent stack (non-finite scale, dimension/expert-count
+        disagreement between entries, rank overflow, or a classifier in the
+        stack); the detail names the problem. Like [`Self::attach_lora`], a
+        stack that fits but carries mixture-of-experts deltas is refused
+        separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+        without routed-FFN hooks (retry on CPU).
+"""
+        
+        _UniffiFfiConverterSequenceTypeLoraAdapterEntry.check_lower(adapters)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_set_lora_adapters,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_seed(self, seed: typing.Optional[int]) -> None:
+        """
+        Replace the session-default sampler seed and restart the RNG from it
+        immediately (omitted re-seeds from entropy). KV and position are
+        untouched, so this is safe on a primed session. Persists across
+        `reset()`, unlike a per-request `GenerateOpts.seed`.
+"""
+        
+        _UniffiFfiConverterOptionalUInt64.check_lower(seed)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterOptionalUInt64.lower(seed),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -15277,6 +15603,7 @@ __all__ = [
     "IngestRecovery",
     "IngestSummary",
     "LeapBundleEntry",
+    "LoraAdapterEntry",
     "Message",
     "ModalityCapabilities",
     "ModelFiles",
@@ -15309,10 +15636,10 @@ __all__ = [
     "whisper_default_transcribe_opts",
     "BundleRepo",
     "BundleRepoProtocol",
-    "ModalitySinkImpl",
-    "ModalitySink",
     "LoraAdapters",
     "LoraAdaptersProtocol",
+    "ModalitySinkImpl",
+    "ModalitySink",
     "Session",
     "SessionProtocol",
     "ChatSession",

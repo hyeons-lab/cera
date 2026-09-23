@@ -1002,6 +1002,12 @@ impl Model for HybridModel {
         false
     }
 
+    /// LoRA hooks live in the shared `transformer::forward_*_block` helpers
+    /// this backend decodes through.
+    fn supports_lora(&self) -> bool {
+        true
+    }
+
     fn supports_all_logits(&self) -> bool {
         false
     }

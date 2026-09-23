@@ -119,6 +119,7 @@ impl BertModel {
             .or_else(|| gguf.get_u32("bert.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
             as usize;
+        ensure!(hidden_size > 0, "{prefix}.embedding_length must be > 0");
 
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
@@ -578,6 +579,13 @@ impl Model for BertModel {
         true
     }
 
+    /// No LoRA hooks: `hidden_states` ignores `state` and `forward` is an
+    /// empty-logits stub, so an adapter would install and adapt nothing.
+    /// Restated (not inherited) so whoever adds the hooks reads this here.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
     fn hidden_states(&self, tokens: &[u32], _state: &mut InferenceState) -> Vec<f32> {
         let n_tokens = if self.config.max_seq_len > 0 && tokens.len() > self.config.max_seq_len {
             tracing::warn!(
@@ -895,6 +903,31 @@ impl Model for BertModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_embedding_length_is_rejected_at_load() {
+        // Twin of the lfm2 loader test: `hidden_size == 0` would size every
+        // buffer at zero; fail at load with a typed error instead. The guard
+        // lives in `from_gguf_with_id` and fires before any tensor load, so
+        // a header-only GGUF suffices.
+        let mut writer = crate::convert::writer::GgufWriter::new();
+        writer.add_string("general.architecture", "bert");
+        writer.add_u32("bert.block_count", 1);
+        writer.add_u32("bert.embedding_length", 0);
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        let gguf = crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap();
+        // (`match`, not `unwrap_err`: `BertModel` has no `Debug` impl.)
+        let err = match BertModel::from_gguf_with_id(gguf, 32, "test".into()) {
+            Ok(_) => panic!("zero embedding_length must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("bert.embedding_length must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn modernbert_alternating_schedule_is_correct() {

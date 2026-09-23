@@ -1022,9 +1022,15 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_text(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_import_checkpoint(): Int
 
@@ -1047,6 +1053,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_send_message_streaming(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_set_image_max_long_size(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_set_lora_adapters(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_set_seed(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
 
@@ -1866,15 +1876,36 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        `adapters`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(
         `ptr`: Long,
         `tokens`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters(
+        `ptr`: Long,
+        `tokens`: RustBuffer.ByValue,
+        `adapters`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
         `ptr`: Long,
         `tokens`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters(
+        `ptr`: Long,
+        `tokens`: RustBuffer.ByValue,
+        `adapters`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -1940,6 +1971,18 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
         `ptr`: Long,
         `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_set_lora_adapters(
+        `ptr`: Long,
+        `adapters`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_set_seed(
+        `ptr`: Long,
+        `seed`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -2760,7 +2803,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
+    if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
@@ -2790,7 +2833,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 3335) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 44519) {
@@ -2814,10 +2857,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 4050) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
@@ -2829,10 +2872,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
@@ -2866,6 +2918,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_seed() != 54035) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
@@ -9056,13 +9114,13 @@ public object FfiConverterTypeGenerativeModel : FfiConverter<GenerativeModel, Lo
 
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
- * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions:
  * it's reference-counted internally, so attaching to multiple sessions doesn't
  * re-parse or re-allocate the factors.
  */
 public interface LoraAdaptersInterface {
     /**
-     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * Number of `(layer, target)` low-rank deltas the adapter carries, for
      * diagnostics / logging.
      */
     fun `targetCount`(): kotlin.UInt
@@ -9072,7 +9130,7 @@ public interface LoraAdaptersInterface {
 
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
- * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions:
  * it's reference-counted internally, so attaching to multiple sessions doesn't
  * re-parse or re-allocate the factors.
  */
@@ -9176,7 +9234,7 @@ open class LoraAdapters :
     }
 
     /**
-     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * Number of `(layer, target)` low-rank deltas the adapter carries, for
      * diagnostics / logging.
      */
     override fun `targetCount`(): kotlin.UInt =
@@ -10783,18 +10841,19 @@ public interface SessionInterface {
 
     /**
      * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-     * call). It's applied to every subsequent forward pass — generation **and**
-     * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Only affects tokens processed after the
-     * call (doesn't retroactively re-adapt cached KV).
+     * Swift/Kotlin). It's applied to every subsequent forward pass
+     * (generation and hidden-states extraction) until removed or replaced
+     * (hot-swap), and is preserved across [`Self::reset`]. Only affects
+     * tokens processed after the call (doesn't retroactively re-adapt
+     * cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
      *
      * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
      * means the adapter's dimensions don't match the loaded model, so the
      * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
      * means it fits but this backend has no hook for something it adapts, so
-     * the same adapter works on another backend (today: a mixture-of-experts
-     * adapter needs the CPU backend).
+     * the same adapter usually works on another backend (a mixture-of-experts
+     * adapter needs the CPU backend), except on a backend with no LoRA hooks
+     * at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
      */
     fun `attachLora`(`adapters`: LoraAdapters)
 
@@ -10893,13 +10952,13 @@ public interface SessionInterface {
      * continues.
      *
      * **Callback reentrancy: deadlock hazard.** The session mutex is
-     * held for the entire call, and sink callbacks run while that
-     * lock is held. Calling back into methods that also take the
-     * mutex ([`Session::append_text`], [`Session::append_tokens`],
-     * [`Session::generate`], [`Session::generate_streaming`],
-     * [`Session::reset`]) from inside a sink method will deadlock.
-     * [`Session::cancel`] and [`Session::position`] are atomic-backed
-     * and safe to call from the sink or from any other thread.
+     * held while per-chunk/frame sink callbacks run: calling any other
+     * [`Session`] method from inside one will deadlock, except the
+     * lock-free ones ([`Session::position`] and [`Session::cancel`],
+     * atomics with [`Session::clear_cancel`] likewise safe, plus the
+     * cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+     * The terminal `on_done` fires after the mutex is released and may
+     * call any method.
      *
      * Cancellation: call [`Session::cancel`] from any thread (or from
      * inside a sink callback on this thread) to terminate the loop at
@@ -10926,14 +10985,15 @@ public interface SessionInterface {
      * the caller's async runtime stays responsive.
      *
      * Sink callbacks run on the blocking worker thread that's
-     * executing the decode — **not** on the caller's async thread.
+     * executing the decode, **not** on the caller's async thread.
      * The reentrancy hazard documented on
-     * [`Session::generate_streaming`] still applies: sink callbacks
-     * that call back into `append_text` / `generate*` / `reset` from
-     * inside the session will deadlock on the session mutex.
-     * [`Session::cancel`] and [`Session::position`] remain atomic-
-     * backed and safe to invoke from any thread (including from
-     * inside a callback).
+     * [`Session::generate_streaming`] still applies: per-chunk/frame
+     * sink callbacks that call back into any other [`Session`] method
+     * will deadlock on the session mutex, except the lock-free
+     * [`Session::position`], [`Session::cancel`],
+     * [`Session::clear_cancel`], [`Session::capabilities`], and
+     * [`Session::hidden_size`]. The terminal `on_done` fires after
+     * the mutex is released and may call any method.
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -10970,6 +11030,15 @@ public interface SessionInterface {
     fun `hiddenStatesForText`(`text`: kotlin.String): kotlin.ByteArray
 
     /**
+     * Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+     * of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    fun `hiddenStatesForTextWithAdapters`(
+        `text`: kotlin.String,
+        `adapters`: List<LoraAdapterEntry>,
+    ): kotlin.ByteArray
+
+    /**
      * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
      * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
      * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
@@ -10992,11 +11061,36 @@ public interface SessionInterface {
     fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray
 
     /**
+     * Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+     * adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+     * an empty list extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is untouched.
+     * An inconsistent or mismatched stack fails with
+     * [`FfiError::LoraParse`], never silently (a stack that fits but
+     * carries mixture-of-experts deltas fails instead with
+     * [`FfiError::LoraUnsupportedByBackend`] on backends without
+     * routed-FFN hooks).
+     */
+    fun `hiddenStatesForTokensWithAdapters`(
+        `tokens`: List<kotlin.UInt>,
+        `adapters`: List<LoraAdapterEntry>,
+    ): kotlin.ByteArray
+
+    /**
      * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
      * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
      * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
      */
     fun `hiddenStatesMeanPooled`(`tokens`: List<kotlin.UInt>): List<kotlin.Float>
+
+    /**
+     * Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+     * stack of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    fun `hiddenStatesMeanPooledWithAdapters`(
+        `tokens`: List<kotlin.UInt>,
+        `adapters`: List<LoraAdapterEntry>,
+    ): List<kotlin.Float>
 
     /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
@@ -11089,6 +11183,34 @@ public interface SessionInterface {
      * precedence over the model's minimum-resolution floor).
      */
     fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
+
+    /**
+     * Replace the attached adapter set with a runtime-scaled stack: entry
+     * `i` contributes `scale` times its delta, stacking per target. An
+     * empty list detaches (same as [`Self::remove_lora`]). A non-empty
+     * stack whose entries are all zero-scale installs a no-op adapter
+     * instead, so [`Self::has_lora`] stays true while applying nothing.
+     * The swap is atomic: a bad list leaves the previous set untouched.
+     * Like [`Self::attach_lora`], only tokens processed after the call are
+     * affected.
+     *
+     * [`FfiError::LoraParse`] here covers both dimension mismatches and an
+     * inconsistent stack (non-finite scale, dimension/expert-count
+     * disagreement between entries, rank overflow, or a classifier in the
+     * stack); the detail names the problem. Like [`Self::attach_lora`], a
+     * stack that fits but carries mixture-of-experts deltas is refused
+     * separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+     * without routed-FFN hooks (retry on CPU).
+     */
+    fun `setLoraAdapters`(`adapters`: List<LoraAdapterEntry>)
+
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (omitted re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     */
+    fun `setSeed`(`seed`: kotlin.ULong?)
 
     /**
      * Observe recovery after a failed whole-message call without changing KV,
@@ -11374,18 +11496,19 @@ open class Session :
 
     /**
      * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-     * call). It's applied to every subsequent forward pass — generation **and**
-     * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Only affects tokens processed after the
-     * call (doesn't retroactively re-adapt cached KV).
+     * Swift/Kotlin). It's applied to every subsequent forward pass
+     * (generation and hidden-states extraction) until removed or replaced
+     * (hot-swap), and is preserved across [`Self::reset`]. Only affects
+     * tokens processed after the call (doesn't retroactively re-adapt
+     * cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
      *
      * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
      * means the adapter's dimensions don't match the loaded model, so the
      * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
      * means it fits but this backend has no hook for something it adapts, so
-     * the same adapter works on another backend (today: a mixture-of-experts
-     * adapter needs the CPU backend).
+     * the same adapter usually works on another backend (a mixture-of-experts
+     * adapter needs the CPU backend), except on a backend with no LoRA hooks
+     * at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
      */
     @Throws(FfiException::class)
     override fun `attachLora`(`adapters`: LoraAdapters) =
@@ -11571,13 +11694,13 @@ open class Session :
      * continues.
      *
      * **Callback reentrancy: deadlock hazard.** The session mutex is
-     * held for the entire call, and sink callbacks run while that
-     * lock is held. Calling back into methods that also take the
-     * mutex ([`Session::append_text`], [`Session::append_tokens`],
-     * [`Session::generate`], [`Session::generate_streaming`],
-     * [`Session::reset`]) from inside a sink method will deadlock.
-     * [`Session::cancel`] and [`Session::position`] are atomic-backed
-     * and safe to call from the sink or from any other thread.
+     * held while per-chunk/frame sink callbacks run: calling any other
+     * [`Session`] method from inside one will deadlock, except the
+     * lock-free ones ([`Session::position`] and [`Session::cancel`],
+     * atomics with [`Session::clear_cancel`] likewise safe, plus the
+     * cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+     * The terminal `on_done` fires after the mutex is released and may
+     * call any method.
      *
      * Cancellation: call [`Session::cancel`] from any thread (or from
      * inside a sink callback on this thread) to terminate the loop at
@@ -11617,14 +11740,15 @@ open class Session :
      * the caller's async runtime stays responsive.
      *
      * Sink callbacks run on the blocking worker thread that's
-     * executing the decode — **not** on the caller's async thread.
+     * executing the decode, **not** on the caller's async thread.
      * The reentrancy hazard documented on
-     * [`Session::generate_streaming`] still applies: sink callbacks
-     * that call back into `append_text` / `generate*` / `reset` from
-     * inside the session will deadlock on the session mutex.
-     * [`Session::cancel`] and [`Session::position`] remain atomic-
-     * backed and safe to invoke from any thread (including from
-     * inside a callback).
+     * [`Session::generate_streaming`] still applies: per-chunk/frame
+     * sink callbacks that call back into any other [`Session`] method
+     * will deadlock on the session mutex, except the lock-free
+     * [`Session::position`], [`Session::cancel`],
+     * [`Session::clear_cancel`], [`Session::capabilities`], and
+     * [`Session::hidden_size`]. The terminal `on_done` fires after
+     * the mutex is released and may call any method.
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -11712,6 +11836,28 @@ open class Session :
         )
 
     /**
+     * Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+     * of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesForTextWithAdapters`(
+        `text`: kotlin.String,
+        `adapters`: List<LoraAdapterEntry>,
+    ): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        FfiConverterSequenceTypeLoraAdapterEntry.lower(`adapters`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
      * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
      * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
@@ -11746,6 +11892,35 @@ open class Session :
         )
 
     /**
+     * Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+     * adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+     * an empty list extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is untouched.
+     * An inconsistent or mismatched stack fails with
+     * [`FfiError::LoraParse`], never silently (a stack that fits but
+     * carries mixture-of-experts deltas fails instead with
+     * [`FfiError::LoraUnsupportedByBackend`] on backends without
+     * routed-FFN hooks).
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesForTokensWithAdapters`(
+        `tokens`: List<kotlin.UInt>,
+        `adapters`: List<LoraAdapterEntry>,
+    ): kotlin.ByteArray =
+        FfiConverterByteArray.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters(
+                        it,
+                        FfiConverterSequenceUInt.lower(`tokens`),
+                        FfiConverterSequenceTypeLoraAdapterEntry.lower(`adapters`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
      * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
      * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
@@ -11758,6 +11933,28 @@ open class Session :
                     UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
                         it,
                         FfiConverterSequenceUInt.lower(`tokens`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+     * stack of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    @Throws(FfiException::class)
+    override fun `hiddenStatesMeanPooledWithAdapters`(
+        `tokens`: List<kotlin.UInt>,
+        `adapters`: List<LoraAdapterEntry>,
+    ): List<kotlin.Float> =
+        FfiConverterSequenceFloat.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters(
+                        it,
+                        FfiConverterSequenceUInt.lower(`tokens`),
+                        FfiConverterSequenceTypeLoraAdapterEntry.lower(`adapters`),
                         _status,
                     )
                 }
@@ -11967,6 +12164,54 @@ open class Session :
                 UniffiLib.uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
                     it,
                     FfiConverterOptionalUInt.lower(`maxLongSize`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Replace the attached adapter set with a runtime-scaled stack: entry
+     * `i` contributes `scale` times its delta, stacking per target. An
+     * empty list detaches (same as [`Self::remove_lora`]). A non-empty
+     * stack whose entries are all zero-scale installs a no-op adapter
+     * instead, so [`Self::has_lora`] stays true while applying nothing.
+     * The swap is atomic: a bad list leaves the previous set untouched.
+     * Like [`Self::attach_lora`], only tokens processed after the call are
+     * affected.
+     *
+     * [`FfiError::LoraParse`] here covers both dimension mismatches and an
+     * inconsistent stack (non-finite scale, dimension/expert-count
+     * disagreement between entries, rank overflow, or a classifier in the
+     * stack); the detail names the problem. Like [`Self::attach_lora`], a
+     * stack that fits but carries mixture-of-experts deltas is refused
+     * separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+     * without routed-FFN hooks (retry on CPU).
+     */
+    @Throws(FfiException::class)
+    override fun `setLoraAdapters`(`adapters`: List<LoraAdapterEntry>) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_set_lora_adapters(
+                    it,
+                    FfiConverterSequenceTypeLoraAdapterEntry.lower(`adapters`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (omitted re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     */
+    @Throws(FfiException::class)
+    override fun `setSeed`(`seed`: kotlin.ULong?) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed(
+                    it,
+                    FfiConverterOptionalULong.lower(`seed`),
                     _status,
                 )
             }
@@ -12677,6 +12922,13 @@ public object FfiConverterTypeFfiWhisperTranscribeOpts : FfiConverterRustBuffer<
  */
 data class GenerateOpts(
     var `maxTokens`: kotlin.UInt = 256u,
+    /**
+     * Per-request RNG seed. A value restarts the sampler's RNG when the call
+     * starts (KV and position are untouched); omitted (default) continues
+     * the session's existing RNG stream. Does not change the session
+     * default; `reset()` still rebuilds from the session seed.
+     */
+    var `seed`: kotlin.ULong? = null,
     var `temperature`: kotlin.Float = 0.7f,
     var `topP`: kotlin.Float = 0.9f,
     var `topK`: kotlin.UInt = 40u,
@@ -12739,6 +12991,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
     override fun read(buf: ByteBuffer): GenerateOpts =
         GenerateOpts(
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalULong.read(buf),
             FfiConverterFloat.read(buf),
             FfiConverterFloat.read(buf),
             FfiConverterUInt.read(buf),
@@ -12756,6 +13009,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
     override fun allocationSize(value: GenerateOpts) =
         (
             FfiConverterUInt.allocationSize(value.`maxTokens`) +
+                FfiConverterOptionalULong.allocationSize(value.`seed`) +
                 FfiConverterFloat.allocationSize(value.`temperature`) +
                 FfiConverterFloat.allocationSize(value.`topP`) +
                 FfiConverterUInt.allocationSize(value.`topK`) +
@@ -12775,6 +13029,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         buf: ByteBuffer,
     ) {
         FfiConverterUInt.write(value.`maxTokens`, buf)
+        FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterFloat.write(value.`temperature`, buf)
         FfiConverterFloat.write(value.`topP`, buf)
         FfiConverterUInt.write(value.`topK`, buf)
@@ -13022,6 +13277,56 @@ public object FfiConverterTypeLeapBundleEntry : FfiConverterRustBuffer<LeapBundl
     ) {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterSequenceString.write(value.`quants`, buf)
+    }
+}
+
+/**
+ * One entry of a [`Session::set_lora_adapters`] stack: the adapter plus its
+ * runtime scale. Contributions stack per target; the scale must be finite
+ * (zero entries are skipped as an exact no-op). Finite alone is not enough
+ * across the FFI: the value crosses as an `f32`, so magnitudes above
+ * `f32::MAX` never reach Rust: out-of-range scales fail at the binding
+ * boundary (Python raises `OverflowError` while lowering; the other
+ * bindings saturate to ±inf and fail as `LoraParse`). No `Debug`: the
+ * handle has none to forward.
+ */
+data class LoraAdapterEntry(
+    var `adapter`: LoraAdapters,
+    var `scale`: kotlin.Float,
+) : Disposable {
+    @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
+    override fun destroy() {
+        Disposable.destroy(
+            this.`adapter`,
+            this.`scale`,
+        )
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLoraAdapterEntry : FfiConverterRustBuffer<LoraAdapterEntry> {
+    override fun read(buf: ByteBuffer): LoraAdapterEntry =
+        LoraAdapterEntry(
+            FfiConverterTypeLoraAdapters.read(buf),
+            FfiConverterFloat.read(buf),
+        )
+
+    override fun allocationSize(value: LoraAdapterEntry) =
+        (
+            FfiConverterTypeLoraAdapters.allocationSize(value.`adapter`) +
+                FfiConverterFloat.allocationSize(value.`scale`)
+        )
+
+    override fun write(
+        value: LoraAdapterEntry,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterTypeLoraAdapters.write(value.`adapter`, buf)
+        FfiConverterFloat.write(value.`scale`, buf)
     }
 }
 
@@ -14216,8 +14521,12 @@ sealed class FfiException : kotlin.Exception() {
 
     /**
      * A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
-     * [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
-     * attach time (wrong dimensions). `detail` carries the diagnostic.
+     * [`LoraAdapters::from_safetensors`]), was incompatible with the model at
+     * attach time (wrong dimensions), or a [`Session::set_lora_adapters`]
+     * stack was inconsistent with itself (non-finite scale, classifier entry,
+     * rank overflow, entry disagreement). All three are caller bugs needing
+     * the same handling, so they share one variant; `detail` carries the
+     * diagnostic.
      */
     class LoraParse(
         val `detail`: kotlin.String,
@@ -14262,9 +14571,11 @@ sealed class FfiException : kotlin.Exception() {
      * Separate from [`FfiError::LoraParse`] because the two need different
      * handling on the foreign side: `LoraParse` means the adapter or the model
      * pairing is wrong, while this one means only the backend is, so a caller
-     * can retry on CPU instead of surfacing "bad adapter" to a user. Today the
-     * case is a routed feed-forward (mixture-of-experts) delta on a GPU
-     * backend.
+     * can retry on CPU instead of surfacing "bad adapter" to a user. Two
+     * cases: a routed feed-forward (mixture-of-experts) delta on a GPU
+     * backend (CPU applies it, so retrying there works), and a backend with
+     * no LoRA hooks at all (bert, qwen35, gemma4, bailingmoe3), where no
+     * backend runs the adapter and retrying elsewhere is futile.
      *
      * **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
      * enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
@@ -17245,6 +17556,34 @@ public object FfiConverterSequenceTypeLeapBundleEntry : FfiConverterRustBuffer<L
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeLeapBundleEntry.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeLoraAdapterEntry : FfiConverterRustBuffer<List<LoraAdapterEntry>> {
+    override fun read(buf: ByteBuffer): List<LoraAdapterEntry> {
+        val len = buf.getInt()
+        return List<LoraAdapterEntry>(len) {
+            FfiConverterTypeLoraAdapterEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<LoraAdapterEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeLoraAdapterEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<LoraAdapterEntry>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeLoraAdapterEntry.write(it, buf)
         }
     }
 }

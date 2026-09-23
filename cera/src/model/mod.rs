@@ -724,6 +724,25 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether this backend reads `state.lora` and applies the delta in its
+    /// forward passes (generation and hidden-states extraction alike).
+    ///
+    /// Defaults to `false`, which is the direction that fails loudly:
+    /// `Session::attach_lora_adapters` refuses the adapter outright rather
+    /// than admitting one the backend has no hooks for and silently
+    /// producing base-model output. A backend that forgets to override this
+    /// rejects an adapter it could have run, which a user sees immediately;
+    /// the opposite default would silently ignore the adapter.
+    ///
+    /// Backends with the hooks (llama, hybrid, lfm2, and the LFM2 GPU
+    /// backends) return `true`. Backends without them (bert, qwen35,
+    /// gemma4, bailingmoe3) restate `false` at their own definitions rather
+    /// than inheriting this one, so whoever adds the hooks reads the reason
+    /// where the work is.
+    fn supports_lora(&self) -> bool {
+        false
+    }
+
     /// Whether this model/backend supports TurboQuant KV cache compression.
     /// Used by the CLI to decide whether to request compression or fall back to
     /// the backend's uncompressed KV (f32 on CPU and wgpu, f16 on native

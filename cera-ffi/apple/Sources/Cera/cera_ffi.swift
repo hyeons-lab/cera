@@ -4174,14 +4174,14 @@ public func FfiConverterTypeGenerativeModel_lower(_ value: GenerativeModel) -> U
 
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
- * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions:
  * it's reference-counted internally, so attaching to multiple sessions doesn't
  * re-parse or re-allocate the factors.
  */
 public protocol LoraAdaptersProtocol: AnyObject, Sendable {
     
     /**
-     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * Number of `(layer, target)` low-rank deltas the adapter carries, for
      * diagnostics / logging.
      */
     func targetCount()  -> UInt32
@@ -4189,7 +4189,7 @@ public protocol LoraAdaptersProtocol: AnyObject, Sendable {
 }
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via
- * [`Session::attach_lora`]. Load it once and share the handle across sessions —
+ * [`Session::attach_lora`]. Load it once and share the handle across sessions:
  * it's reference-counted internally, so attaching to multiple sessions doesn't
  * re-parse or re-allocate the factors.
  */
@@ -4274,7 +4274,7 @@ public static func fromSafetensors(path: String, alpha: Float?)throws  -> LoraAd
 
     
     /**
-     * Number of `(layer, target)` low-rank deltas the adapter carries — for
+     * Number of `(layer, target)` low-rank deltas the adapter carries, for
      * diagnostics / logging.
      */
 open func targetCount() -> UInt32  {
@@ -5295,18 +5295,19 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-     * call). It's applied to every subsequent forward pass — generation **and**
-     * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Only affects tokens processed after the
-     * call (doesn't retroactively re-adapt cached KV).
+     * Swift/Kotlin). It's applied to every subsequent forward pass
+     * (generation and hidden-states extraction) until removed or replaced
+     * (hot-swap), and is preserved across [`Self::reset`]. Only affects
+     * tokens processed after the call (doesn't retroactively re-adapt
+     * cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
      *
      * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
      * means the adapter's dimensions don't match the loaded model, so the
      * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
      * means it fits but this backend has no hook for something it adapts, so
-     * the same adapter works on another backend (today: a mixture-of-experts
-     * adapter needs the CPU backend).
+     * the same adapter usually works on another backend (a mixture-of-experts
+     * adapter needs the CPU backend), except on a backend with no LoRA hooks
+     * at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
      */
     func attachLora(adapters: LoraAdapters) throws 
     
@@ -5405,13 +5406,13 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * continues.
      *
      * **Callback reentrancy: deadlock hazard.** The session mutex is
-     * held for the entire call, and sink callbacks run while that
-     * lock is held. Calling back into methods that also take the
-     * mutex ([`Session::append_text`], [`Session::append_tokens`],
-     * [`Session::generate`], [`Session::generate_streaming`],
-     * [`Session::reset`]) from inside a sink method will deadlock.
-     * [`Session::cancel`] and [`Session::position`] are atomic-backed
-     * and safe to call from the sink or from any other thread.
+     * held while per-chunk/frame sink callbacks run: calling any other
+     * [`Session`] method from inside one will deadlock, except the
+     * lock-free ones ([`Session::position`] and [`Session::cancel`],
+     * atomics with [`Session::clear_cancel`] likewise safe, plus the
+     * cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+     * The terminal `on_done` fires after the mutex is released and may
+     * call any method.
      *
      * Cancellation: call [`Session::cancel`] from any thread (or from
      * inside a sink callback on this thread) to terminate the loop at
@@ -5435,14 +5436,15 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * the caller's async runtime stays responsive.
      *
      * Sink callbacks run on the blocking worker thread that's
-     * executing the decode — **not** on the caller's async thread.
+     * executing the decode, **not** on the caller's async thread.
      * The reentrancy hazard documented on
-     * [`Session::generate_streaming`] still applies: sink callbacks
-     * that call back into `append_text` / `generate*` / `reset` from
-     * inside the session will deadlock on the session mutex.
-     * [`Session::cancel`] and [`Session::position`] remain atomic-
-     * backed and safe to invoke from any thread (including from
-     * inside a callback).
+     * [`Session::generate_streaming`] still applies: per-chunk/frame
+     * sink callbacks that call back into any other [`Session`] method
+     * will deadlock on the session mutex, except the lock-free
+     * [`Session::position`], [`Session::cancel`],
+     * [`Session::clear_cancel`], [`Session::capabilities`], and
+     * [`Session::hidden_size`]. The terminal `on_done` fires after
+     * the mutex is released and may call any method.
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -5476,6 +5478,12 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesForText(text: String) throws  -> Data
     
     /**
+     * Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+     * of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEntry]) throws  -> Data
+    
+    /**
      * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
      * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
      * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
@@ -5498,11 +5506,30 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesForTokens(tokens: [UInt32]) throws  -> Data
     
     /**
+     * Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+     * adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+     * an empty list extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is untouched.
+     * An inconsistent or mismatched stack fails with
+     * [`FfiError::LoraParse`], never silently (a stack that fits but
+     * carries mixture-of-experts deltas fails instead with
+     * [`FfiError::LoraUnsupportedByBackend`] on backends without
+     * routed-FFN hooks).
+     */
+    func hiddenStatesForTokensWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry]) throws  -> Data
+    
+    /**
      * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
      * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
      * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
      */
     func hiddenStatesMeanPooled(tokens: [UInt32]) throws  -> [Float]
+    
+    /**
+     * Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+     * stack of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+    func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry]) throws  -> [Float]
     
     /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
@@ -5588,6 +5615,34 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * precedence over the model's minimum-resolution floor).
      */
     func setImageMaxLongSize(maxLongSize: UInt32?) throws 
+    
+    /**
+     * Replace the attached adapter set with a runtime-scaled stack: entry
+     * `i` contributes `scale` times its delta, stacking per target. An
+     * empty list detaches (same as [`Self::remove_lora`]). A non-empty
+     * stack whose entries are all zero-scale installs a no-op adapter
+     * instead, so [`Self::has_lora`] stays true while applying nothing.
+     * The swap is atomic: a bad list leaves the previous set untouched.
+     * Like [`Self::attach_lora`], only tokens processed after the call are
+     * affected.
+     *
+     * [`FfiError::LoraParse`] here covers both dimension mismatches and an
+     * inconsistent stack (non-finite scale, dimension/expert-count
+     * disagreement between entries, rank overflow, or a classifier in the
+     * stack); the detail names the problem. Like [`Self::attach_lora`], a
+     * stack that fits but carries mixture-of-experts deltas is refused
+     * separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+     * without routed-FFN hooks (retry on CPU).
+     */
+    func setLoraAdapters(adapters: [LoraAdapterEntry]) throws 
+    
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (omitted re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     */
+    func setSeed(seed: UInt64?) throws 
     
     /**
      * Observe recovery after a failed whole-message call without changing KV,
@@ -5805,18 +5860,19 @@ open func appendTokens(tokens: [UInt32])throws   {try rustCallWithError(FfiConve
     
     /**
      * Attach a [`LoraAdapters`] to this session (generated as `attachLora` in
-     * Swift/Kotlin — this is the engine's equivalent of a `setLoraAdapters`
-     * call). It's applied to every subsequent forward pass — generation **and**
-     * hidden-states extraction — until removed or replaced (hot-swap), and is
-     * preserved across [`Self::reset`]. Only affects tokens processed after the
-     * call (doesn't retroactively re-adapt cached KV).
+     * Swift/Kotlin). It's applied to every subsequent forward pass
+     * (generation and hidden-states extraction) until removed or replaced
+     * (hot-swap), and is preserved across [`Self::reset`]. Only affects
+     * tokens processed after the call (doesn't retroactively re-adapt
+     * cached KV). For a runtime-scaled stack, use [`Self::set_lora_adapters`].
      *
      * Two distinct failures, worth catching separately: [`FfiError::LoraParse`]
      * means the adapter's dimensions don't match the loaded model, so the
      * adapter or the pairing is wrong; [`FfiError::LoraUnsupportedByBackend`]
      * means it fits but this backend has no hook for something it adapts, so
-     * the same adapter works on another backend (today: a mixture-of-experts
-     * adapter needs the CPU backend).
+     * the same adapter usually works on another backend (a mixture-of-experts
+     * adapter needs the CPU backend), except on a backend with no LoRA hooks
+     * at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
      */
 open func attachLora(adapters: LoraAdapters)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_attach_lora(
@@ -5971,13 +6027,13 @@ open func generateAsync(opts: GenerateOpts)async throws  -> GenerateOutput  {
      * continues.
      *
      * **Callback reentrancy: deadlock hazard.** The session mutex is
-     * held for the entire call, and sink callbacks run while that
-     * lock is held. Calling back into methods that also take the
-     * mutex ([`Session::append_text`], [`Session::append_tokens`],
-     * [`Session::generate`], [`Session::generate_streaming`],
-     * [`Session::reset`]) from inside a sink method will deadlock.
-     * [`Session::cancel`] and [`Session::position`] are atomic-backed
-     * and safe to call from the sink or from any other thread.
+     * held while per-chunk/frame sink callbacks run: calling any other
+     * [`Session`] method from inside one will deadlock, except the
+     * lock-free ones ([`Session::position`] and [`Session::cancel`],
+     * atomics with [`Session::clear_cancel`] likewise safe, plus the
+     * cached reads [`Session::capabilities`] and [`Session::hidden_size`]).
+     * The terminal `on_done` fires after the mutex is released and may
+     * call any method.
      *
      * Cancellation: call [`Session::cancel`] from any thread (or from
      * inside a sink callback on this thread) to terminate the loop at
@@ -6009,14 +6065,15 @@ open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> Ge
      * the caller's async runtime stays responsive.
      *
      * Sink callbacks run on the blocking worker thread that's
-     * executing the decode — **not** on the caller's async thread.
+     * executing the decode, **not** on the caller's async thread.
      * The reentrancy hazard documented on
-     * [`Session::generate_streaming`] still applies: sink callbacks
-     * that call back into `append_text` / `generate*` / `reset` from
-     * inside the session will deadlock on the session mutex.
-     * [`Session::cancel`] and [`Session::position`] remain atomic-
-     * backed and safe to invoke from any thread (including from
-     * inside a callback).
+     * [`Session::generate_streaming`] still applies: per-chunk/frame
+     * sink callbacks that call back into any other [`Session`] method
+     * will deadlock on the session mutex, except the lock-free
+     * [`Session::position`], [`Session::cancel`],
+     * [`Session::clear_cancel`], [`Session::capabilities`], and
+     * [`Session::hidden_size`]. The terminal `on_done` fires after
+     * the mutex is released and may call any method.
      *
      * Cancellation: dropping the returned future fires the same
      * abort + [`Session::cancel`] pair as [`Session::generate_async`]
@@ -6084,6 +6141,20 @@ open func hiddenStatesForText(text: String)throws  -> Data  {
 }
     
     /**
+     * Like [`Self::hidden_states_for_text`] with the per-call adapter stack
+     * of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+open func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEntry])throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+    )
+})
+}
+    
+    /**
      * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
      * `--pooling none` / `llama_get_embeddings_ith` vector) for `tokens`,
      * returned as **little-endian f32 bytes**: `n_tokens * hidden_size * 4`
@@ -6113,6 +6184,27 @@ open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
 }
     
     /**
+     * Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
+     * adapter stack: entries compose (see [`Self::set_lora_adapters`]) and
+     * an empty list extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is untouched.
+     * An inconsistent or mismatched stack fails with
+     * [`FfiError::LoraParse`], never silently (a stack that fits but
+     * carries mixture-of-experts deltas fails instead with
+     * [`FfiError::LoraUnsupportedByBackend`] on backends without
+     * routed-FFN hooks).
+     */
+open func hiddenStatesForTokensWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry])throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(tokens),
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+    )
+})
+}
+    
+    /**
      * Mean-pooled hidden state — a single `[hidden_size]` vector (the common
      * classifier path: pool in Rust, ship `D` floats not `T*D`). Returned as
      * `[Float]` / `List<Float>`; only `D` elements, so boxing is negligible.
@@ -6122,6 +6214,20 @@ open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
     uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),$0
+    )
+})
+}
+    
+    /**
+     * Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
+     * stack of [`Self::hidden_states_for_tokens_with_adapters`].
+     */
+open func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry])throws  -> [Float]  {
+    return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(tokens),
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
     )
 })
 }
@@ -6276,6 +6382,46 @@ open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithErr
     uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
             self.uniffiCloneHandle(),
         FfiConverterOptionUInt32.lower(maxLongSize),$0
+    )
+}
+}
+    
+    /**
+     * Replace the attached adapter set with a runtime-scaled stack: entry
+     * `i` contributes `scale` times its delta, stacking per target. An
+     * empty list detaches (same as [`Self::remove_lora`]). A non-empty
+     * stack whose entries are all zero-scale installs a no-op adapter
+     * instead, so [`Self::has_lora`] stays true while applying nothing.
+     * The swap is atomic: a bad list leaves the previous set untouched.
+     * Like [`Self::attach_lora`], only tokens processed after the call are
+     * affected.
+     *
+     * [`FfiError::LoraParse`] here covers both dimension mismatches and an
+     * inconsistent stack (non-finite scale, dimension/expert-count
+     * disagreement between entries, rank overflow, or a classifier in the
+     * stack); the detail names the problem. Like [`Self::attach_lora`], a
+     * stack that fits but carries mixture-of-experts deltas is refused
+     * separately with [`FfiError::LoraUnsupportedByBackend`] on backends
+     * without routed-FFN hooks (retry on CPU).
+     */
+open func setLoraAdapters(adapters: [LoraAdapterEntry])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_set_lora_adapters(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+    )
+}
+}
+    
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (omitted re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     */
+open func setSeed(seed: UInt64?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_set_seed(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt64.lower(seed),$0
     )
 }
 }
@@ -7351,6 +7497,13 @@ public func FfiConverterTypeFfiWhisperTranscribeOpts_lower(_ value: FfiWhisperTr
  */
 public struct GenerateOpts: Equatable, Hashable {
     public var maxTokens: UInt32
+    /**
+     * Per-request RNG seed. A value restarts the sampler's RNG when the call
+     * starts (KV and position are untouched); omitted (default) continues
+     * the session's existing RNG stream. Does not change the session
+     * default; `reset()` still rebuilds from the session seed.
+     */
+    public var seed: UInt64?
     public var temperature: Float
     public var topP: Float
     public var topK: UInt32
@@ -7405,7 +7558,13 @@ public struct GenerateOpts: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(maxTokens: UInt32 = UInt32(256), temperature: Float = Float(0.7), topP: Float = Float(0.9), topK: UInt32 = UInt32(40), 
+    public init(maxTokens: UInt32 = UInt32(256), 
+        /**
+         * Per-request RNG seed. A value restarts the sampler's RNG when the call
+         * starts (KV and position are untouched); omitted (default) continues
+         * the session's existing RNG stream. Does not change the session
+         * default; `reset()` still rebuilds from the session seed.
+         */seed: UInt64? = nil, temperature: Float = Float(0.7), topP: Float = Float(0.9), topK: UInt32 = UInt32(40), 
         /**
          * Min-p (relative) nucleus cutoff: drop tokens below `min_p * p_max`. `0.0`
          * disables it. Honored in the stochastic path.
@@ -7446,6 +7605,7 @@ public struct GenerateOpts: Equatable, Hashable {
          * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
          */spec: SpecDecodeConfig? = nil) {
         self.maxTokens = maxTokens
+        self.seed = seed
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -7477,6 +7637,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         return
             try GenerateOpts(
                 maxTokens: FfiConverterUInt32.read(from: &buf), 
+                seed: FfiConverterOptionUInt64.read(from: &buf), 
                 temperature: FfiConverterFloat.read(from: &buf), 
                 topP: FfiConverterFloat.read(from: &buf), 
                 topK: FfiConverterUInt32.read(from: &buf), 
@@ -7494,6 +7655,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
 
     public static func write(_ value: GenerateOpts, into buf: inout [UInt8]) {
         FfiConverterUInt32.write(value.maxTokens, into: &buf)
+        FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterFloat.write(value.temperature, into: &buf)
         FfiConverterFloat.write(value.topP, into: &buf)
         FfiConverterUInt32.write(value.topK, into: &buf)
@@ -7882,6 +8044,70 @@ public func FfiConverterTypeLeapBundleEntry_lift(_ buf: RustBuffer) throws -> Le
 #endif
 public func FfiConverterTypeLeapBundleEntry_lower(_ value: LeapBundleEntry) -> RustBuffer {
     return FfiConverterTypeLeapBundleEntry.lower(value)
+}
+
+
+/**
+ * One entry of a [`Session::set_lora_adapters`] stack: the adapter plus its
+ * runtime scale. Contributions stack per target; the scale must be finite
+ * (zero entries are skipped as an exact no-op). Finite alone is not enough
+ * across the FFI: the value crosses as an `f32`, so magnitudes above
+ * `f32::MAX` never reach Rust: out-of-range scales fail at the binding
+ * boundary (Python raises `OverflowError` while lowering; the other
+ * bindings saturate to ±inf and fail as `LoraParse`). No `Debug`: the
+ * handle has none to forward.
+ */
+public struct LoraAdapterEntry {
+    public var adapter: LoraAdapters
+    public var scale: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(adapter: LoraAdapters, scale: Float) {
+        self.adapter = adapter
+        self.scale = scale
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LoraAdapterEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoraAdapterEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoraAdapterEntry {
+        return
+            try LoraAdapterEntry(
+                adapter: FfiConverterTypeLoraAdapters.read(from: &buf), 
+                scale: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LoraAdapterEntry, into buf: inout [UInt8]) {
+        FfiConverterTypeLoraAdapters.write(value.adapter, into: &buf)
+        FfiConverterFloat.write(value.scale, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoraAdapterEntry_lift(_ buf: RustBuffer) throws -> LoraAdapterEntry {
+    return try FfiConverterTypeLoraAdapterEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoraAdapterEntry_lower(_ value: LoraAdapterEntry) -> RustBuffer {
+    return FfiConverterTypeLoraAdapterEntry.lower(value)
 }
 
 
@@ -9429,8 +9655,12 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
     )
     /**
      * A LoRA adapter failed to load ([`LoraAdapters::from_gguf`] /
-     * [`LoraAdapters::from_safetensors`]) or was incompatible with the model at
-     * attach time (wrong dimensions). `detail` carries the diagnostic.
+     * [`LoraAdapters::from_safetensors`]), was incompatible with the model at
+     * attach time (wrong dimensions), or a [`Session::set_lora_adapters`]
+     * stack was inconsistent with itself (non-finite scale, classifier entry,
+     * rank overflow, entry disagreement). All three are caller bugs needing
+     * the same handling, so they share one variant; `detail` carries the
+     * diagnostic.
      */
     case LoraParse(detail: String
     )
@@ -9459,9 +9689,11 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
      * Separate from [`FfiError::LoraParse`] because the two need different
      * handling on the foreign side: `LoraParse` means the adapter or the model
      * pairing is wrong, while this one means only the backend is, so a caller
-     * can retry on CPU instead of surfacing "bad adapter" to a user. Today the
-     * case is a routed feed-forward (mixture-of-experts) delta on a GPU
-     * backend.
+     * can retry on CPU instead of surfacing "bad adapter" to a user. Two
+     * cases: a routed feed-forward (mixture-of-experts) delta on a GPU
+     * backend (CPU applies it, so retrying there works), and a backend with
+     * no LoRA hooks at all (bert, qwen35, gemma4, bailingmoe3), where no
+     * backend runs the adapter and retrying elsewhere is futile.
      *
      * **Appended, not grouped next to `LoraParse`.** UniFFI serializes this
      * enum by ordinal, and the committed Kotlin/Swift/Dart bindings decode it
@@ -11827,6 +12059,31 @@ fileprivate struct FfiConverterSequenceTypeLeapBundleEntry: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeLoraAdapterEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [LoraAdapterEntry]
+
+    public static func write(_ value: [LoraAdapterEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLoraAdapterEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LoraAdapterEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LoraAdapterEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLoraAdapterEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeMessage: FfiConverterRustBuffer {
     typealias SwiftType = [Message]
 
@@ -12433,7 +12690,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 23137) {
+    if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
@@ -12463,7 +12720,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_attach_lora() != 3335) {
+    if (uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_cancel() != 44519) {
@@ -12487,10 +12744,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_generate_async() != 4050) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 27550) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 12198) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
@@ -12502,10 +12759,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
@@ -12539,6 +12805,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_set_seed() != 54035) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {

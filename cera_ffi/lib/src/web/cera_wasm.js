@@ -201,14 +201,14 @@ export class BundleRepo {
 if (Symbol.dispose) BundleRepo.prototype[Symbol.dispose] = BundleRepo.prototype.free;
 
 /**
- * Loaded inference engine — wraps `cera::CeraEngine` with sync access
+ * Loaded inference engine - wraps `cera::CeraEngine` with sync access
  * to model metadata and the tokenizer.
  *
  * JS callers fetch the GGUF (e.g. via `fetch().arrayBuffer()`), pass
  * the bytes to `CeraEngine.fromGgufBytes`, and use the returned
  * handle to read model info or pull a `Tokenizer`. Session-based
  * inference (`generate`, streaming) is intentionally not exposed yet
- * — that shape needs an async/streaming design that lives in a
+ * - that shape needs an async/streaming design that lives in a
  * follow-up PR.
  *
  * **Memory:** the loaded GGUF stays resident in wasm linear memory
@@ -238,7 +238,7 @@ export class CeraEngine {
      * `true` when the GGUF declares `tokenizer.ggml.add_bos_token`.
      * Callers that hand-build a token sequence from `Tokenizer.encode`
      * should prepend `Tokenizer.bosToken` when this is `true` (and
-     * the model has a BOS) — cera's encoder returns the raw tokens
+     * the model has a BOS) - cera's encoder returns the raw tokens
      * without that prefix.
      * @returns {boolean}
      */
@@ -299,7 +299,7 @@ export class CeraEngine {
     /**
      * Requested context-window size (KV cache cap) the engine was
      * configured with. Mirrors what `fromGgufBytes(bytes,
-     * contextSize)` resolved to — i.e. the value of `contextSize`
+     * contextSize)` resolved to - i.e. the value of `contextSize`
      * you passed in, or `4096` if you omitted it. Unlike
      * `cera-ffi`'s `EngineConfig::try_from`, the wasm load path
      * has no `0` → `maxSeqLen` translation: a `contextSize` of `0`
@@ -310,7 +310,7 @@ export class CeraEngine {
      * per-session ceiling. cera core clamps the model's
      * `maxSeqLen` at load time to `min(contextSize,
      * gguf_max_seq_len)`, so `engine.maxSeqLen` is already the
-     * effective ceiling — `contextSize` is informational ("what
+     * effective ceiling - `contextSize` is informational ("what
      * cap did I load with?") rather than a value to `Math.min`
      * against `maxSeqLen` at call sites.
      * @returns {number}
@@ -366,7 +366,7 @@ export class CeraEngine {
      * to 4096 if omitted; the actual KV-cache cap is the smaller of
      * the requested size and the model's own `max_seq_len`.
      *
-     * The backend is forced to CPU — wasm has no native GPU/Metal
+     * The backend is forced to CPU - wasm has no native GPU/Metal
      * backend. Throws on parse failure, unsupported quantization,
      * or unrecognized architecture.
      * @param {Uint8Array} bytes
@@ -477,7 +477,7 @@ export class CeraEngine {
     }
     /**
      * Maximum sequence length the model was trained for. Independent
-     * of the engine's `contextSize` config — that one is the KV
+     * of the engine's `contextSize` config - that one is the KV
      * cache cap, this is the model's positional encoding ceiling.
      * @returns {number}
      */
@@ -495,8 +495,29 @@ export class CeraEngine {
         return takeObject(ret);
     }
     /**
+     * Create a new conversational `ChatSession` backed by this engine.
+     * @param {SessionConfig} config
+     * @returns {ChatSession}
+     */
+    newChatSession(config) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(config, SessionConfig);
+            wasm.ceraengine_newChatSession(retptr, this.__wbg_ptr, config.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return ChatSession.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Construct a new `Session` for this engine. The `config`
-     * freezes per-session knobs — sampler `seed`, `nKeep`
+     * freezes per-session knobs - sampler `seed`, `nKeep`
      * pinned-prefix size, `ubatchSize` chunked-prefill batch,
      * `maxSeqLen` KV cap. For the cera defaults
      * (`maxSeqLen = null` → engine's effective cap, i.e.
@@ -504,7 +525,7 @@ export class CeraEngine {
      * `seed = null`, `ubatchSize = 512`), pass a freshly-
      * constructed `new SessionConfig()`.
      *
-     * `config` is **borrowed**, not consumed — JS callers can
+     * `config` is **borrowed**, not consumed - JS callers can
      * reuse the same `SessionConfig` across multiple `newSession`
      * calls. Inner state is cloned per-session at the boundary.
      * This mirrors how `Session.generate` borrows `GenerateOpts`.
@@ -559,7 +580,7 @@ export class CeraEngine {
     /**
      * Returns a `Tokenizer` handle bound to this engine's vocab.
      * Each call allocates a fresh JS object but the underlying
-     * tokenizer state is shared via `Arc` — cheap to call, JS
+     * tokenizer state is shared via `Arc` - cheap to call, JS
      * callers can cache the result if they prefer one handle.
      * @returns {Tokenizer}
      */
@@ -647,6 +668,509 @@ export class CeraEngine {
 if (Symbol.dispose) CeraEngine.prototype[Symbol.dispose] = CeraEngine.prototype.free;
 
 /**
+ * Stateful conversational chat coordinator.
+ *
+ * Wraps an underlying inference session, maintaining chat template framing,
+ * turn delimiter invariants, multimodal ingestion, tool calling, and
+ * conversational state transitions.
+ */
+export class ChatSession {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ChatSession.prototype);
+        obj.__wbg_ptr = ptr;
+        ChatSessionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ChatSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_chatsession_free(ptr, 0);
+    }
+    /**
+     * Flip the cancel atomic, requesting that any in-flight turn exit at its next checkpoint.
+     * Call only between operations; do not re-enter this Chat handle from its callback.
+     */
+    cancel() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_cancel(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Modality capability flags reported by the model backing this session.
+     * @returns {Capabilities}
+     */
+    get capabilities() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_capabilities(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Export the current chat session checkpoint as binary bytes.
+     * @returns {Uint8Array}
+     */
+    checkpoint() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_checkpoint(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Clear pending cancellation without dropping conversation state.
+     */
+    clearCancel() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_clearCancel(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Execute a turn to completion, returning the assistant response.
+     * @param {GenerateOpts} opts
+     * @returns {TurnResult}
+     */
+    complete(opts) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(opts, GenerateOpts);
+            wasm.chatsession_complete(retptr, this.__wbg_ptr, opts.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return TurnResult.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Execute a turn constrained by a JSON Schema string, returning the assistant response.
+     * @param {GenerateOpts} opts
+     * @param {string} schema_json
+     * @returns {TurnResult}
+     */
+    completeJson(opts, schema_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(opts, GenerateOpts);
+            const ptr0 = passStringToWasm0(schema_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.chatsession_completeJson(retptr, this.__wbg_ptr, opts.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return TurnResult.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Stream generated text tokens into a callback, returning the final turn result.
+     *
+     * If the callback throws, generation is cancelled and this returns a
+     * `"stream callback failed"` error with the cancel latch left armed: call
+     * `clearCancel()` before the next turn or it will cancel immediately,
+     * then reset or replace messages if the turn was interrupted.
+     *
+     * Do not call back into this handle from `on_token` (including `cancel()`):
+     * generation holds a mutable borrow and re-entry will panic.
+     * @param {GenerateOpts} opts
+     * @param {Function} on_token
+     * @returns {TurnResult}
+     */
+    generateStreaming(opts, on_token) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(opts, GenerateOpts);
+            wasm.chatsession_generateStreaming(retptr, this.__wbg_ptr, opts.__wbg_ptr, addBorrowedObject(on_token));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return TurnResult.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            heap[stack_pointer++] = undefined;
+        }
+    }
+    /**
+     * Stream generated text constrained by a JSON Schema string into a callback.
+     * @param {GenerateOpts} opts
+     * @param {string} schema_json
+     * @param {Function} on_token
+     * @returns {TurnResult}
+     */
+    generateStreamingJson(opts, schema_json, on_token) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(opts, GenerateOpts);
+            const ptr0 = passStringToWasm0(schema_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.chatsession_generateStreamingJson(retptr, this.__wbg_ptr, opts.__wbg_ptr, ptr0, len0, addBorrowedObject(on_token));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return TurnResult.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            heap[stack_pointer++] = undefined;
+        }
+    }
+    /**
+     * Model hidden dimension D.
+     * @returns {number}
+     */
+    get hiddenSize() {
+        const ret = wasm.chatsession_hiddenSize(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Ingest a single message into the chat context.
+     * @param {any} message
+     * @returns {IngestSummary}
+     */
+    ingest(message) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_ingest(retptr, this.__wbg_ptr, addBorrowedObject(message));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return IngestSummary.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            heap[stack_pointer++] = undefined;
+        }
+    }
+    /**
+     * Ingest a batch of messages into the chat context.
+     * @param {ChatMessage[]} messages
+     * @returns {IngestSummary}
+     */
+    ingestMessages(messages) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_ingestMessages(retptr, this.__wbg_ptr, addHeapObject(messages));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return IngestSummary.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Ingest a tool execution response back into the conversation.
+     * @param {string} tool_name
+     * @param {string} content
+     * @returns {IngestSummary}
+     */
+    ingestToolResponse(tool_name, content) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(tool_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(content, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.chatsession_ingestToolResponse(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return IngestSummary.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Reclaim ownership of the underlying Session.
+     * @returns {Session}
+     */
+    intoSession() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_intoSession(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return Session.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Construct a ChatSession from an existing Session, taking ownership of its state.
+     *
+     * If validation or template discovery fails, the session remains intact and usable.
+     * @param {Session} session
+     */
+    constructor(session) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(session, Session);
+            wasm.chatsession_new(retptr, session.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            this.__wbg_ptr = r0 >>> 0;
+            ChatSessionFinalization.register(this, this.__wbg_ptr, this);
+            return this;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Current session lifecycle phase ("Idle", "PromptReady", "TurnComplete", "Interrupted", "RawContext", "Unusable").
+     * @returns {string}
+     */
+    get phase() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_phase(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Current token position in the execution context.
+     * @returns {number}
+     */
+    get position() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_position(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return r0 >>> 0;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Replace conversation history by rewinding or re-prefilling the context.
+     * @param {ChatMessage[]} messages
+     * @returns {IngestSummary}
+     */
+    replaceMessages(messages) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_replaceMessages(retptr, this.__wbg_ptr, addHeapObject(messages));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return IngestSummary.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Drop accumulated turn state and return to SessionPhase::Idle.
+     */
+    reset() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_reset(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Restore a chat session from binary checkpoint bytes.
+     * @param {Uint8Array} data
+     */
+    restore(data) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.chatsession_restore(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Set the tool wire format explicitly.
+     * @param {ToolFormat} format
+     */
+    setToolFormat(format) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_setToolFormat(retptr, this.__wbg_ptr, format);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Register tools for function calling via a JSON array string.
+     * @param {string} tools_json
+     */
+    setTools(tools_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(tools_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.chatsession_setTools(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Active tool wire format.
+     * @returns {ToolFormat}
+     */
+    get toolFormat() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_toolFormat(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return r0;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Currently registered tools for function calling as a JSON string.
+     * @returns {string}
+     */
+    get tools() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.chatsession_tools(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) ChatSession.prototype[Symbol.dispose] = ChatSession.prototype.free;
+
+/**
  * Per-call generation options. Constructed via `new GenerateOpts()`
  * in JS (returns the cera defaults: `maxTokens=256`,
  * `temperature=0.7`, `topP=0.9`, `topK=40`, no stop tokens, flush
@@ -678,6 +1202,12 @@ export class GenerateOpts {
      */
     clearGrammar() {
         wasm.generateopts_clearGrammar(this.__wbg_ptr);
+    }
+    /**
+     * Clear speculative decoding, returning to standard non-speculative decoding.
+     */
+    clearSpecDecode() {
+        wasm.generateopts_clearSpecDecode(this.__wbg_ptr);
     }
     /**
      * @returns {number}
@@ -724,6 +1254,14 @@ export class GenerateOpts {
         return ret !== 0;
     }
     /**
+     * Whether speculative decoding is currently configured.
+     * @returns {boolean}
+     */
+    get hasSpecDecode() {
+        const ret = wasm.generateopts_hasSpecDecode(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
      * Ignore end-of-generation: EOS and `stopTokens` are not honored, so
      * decode always runs to `maxTokens`. For benchmark loops that must
      * cover an exact token count. `false` by default.
@@ -765,6 +1303,24 @@ export class GenerateOpts {
         return ret;
     }
     /**
+     * Per-request RNG seed. Setting a seed restarts the sampler's RNG when
+     * the call starts (KV and position are untouched); `undefined` (default)
+     * continues the session's existing RNG stream. Does not change the
+     * session default; `reset()` still rebuilds from the session seed.
+     * @returns {bigint | undefined}
+     */
+    get seed() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.generateopts_seed(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r2 = getDataViewMemory0().getBigInt64(retptr + 8 * 1, true);
+            return r0 === 0 ? undefined : BigInt.asUintN(64, r2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Constrain decoding to a GBNF grammar (source text, e.g. a JSON grammar).
      * Each step masks the logits so only tokens the grammar accepts are
      * sampled. Throws a `JsError` if the grammar fails to compile; replaces any
@@ -786,6 +1342,37 @@ export class GenerateOpts {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
         }
+    }
+    /**
+     * Constrain output to conform to a JSON Schema definition string.
+     * Compiles the schema to GBNF and sets the grammar on this options instance.
+     * @param {string} schema_json
+     */
+    setJsonSchema(schema_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(schema_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.generateopts_setJsonSchema(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Configure speculative decoding with prompt-lookup drafting.
+     *
+     * `ngram` specifies the lookup context length (clamped to 1..=32).
+     * `k` specifies the number of candidate draft tokens proposed per step (clamped to 1..=64).
+     * @param {number} ngram
+     * @param {number} k
+     */
+    setSpecDecode(ngram, k) {
+        wasm.generateopts_setSpecDecode(this.__wbg_ptr, ngram, k);
     }
     /**
      * @param {number} v
@@ -830,6 +1417,12 @@ export class GenerateOpts {
      */
     set repetitionPenalty(v) {
         wasm.generateopts_set_repetitionPenalty(this.__wbg_ptr, v);
+    }
+    /**
+     * @param {bigint | null} [v]
+     */
+    set seed(v) {
+        wasm.generateopts_set_seed(this.__wbg_ptr, !isLikeNone(v), isLikeNone(v) ? BigInt(0) : v);
     }
     /**
      * @param {Uint32Array} v
@@ -896,6 +1489,30 @@ export class GenerateOpts {
         const ret = wasm.generateopts_topP(this.__wbg_ptr);
         return ret;
     }
+    /**
+     * Helper creating a new `GenerateOpts` cloned from `opts` with JSON Schema constraint applied.
+     * @param {GenerateOpts} opts
+     * @param {string} schema_json
+     * @returns {GenerateOpts}
+     */
+    static withJsonSchema(opts, schema_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(opts, GenerateOpts);
+            const ptr0 = passStringToWasm0(schema_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.generateopts_withJsonSchema(retptr, opts.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return GenerateOpts.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
 }
 if (Symbol.dispose) GenerateOpts.prototype[Symbol.dispose] = GenerateOpts.prototype.free;
 
@@ -929,7 +1546,7 @@ export class GenerateSummary {
     }
     /**
      * Why decode ended. One of `"MaxTokens"`, `"Stop"`,
-     * `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` —
+     * `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` -
      * the `Error(...)` form preserves the inner string verbatim
      * (no surrounding quotes), so JS callers can log it directly.
      * @returns {string}
@@ -974,9 +1591,300 @@ export class GenerateSummary {
 }
 if (Symbol.dispose) GenerateSummary.prototype[Symbol.dispose] = GenerateSummary.prototype.free;
 
+export class GenerationDefaults {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(GenerationDefaults.prototype);
+        obj.__wbg_ptr = ptr;
+        GenerationDefaultsFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        GenerationDefaultsFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_generationdefaults_free(ptr, 0);
+    }
+    /**
+     * @param {SamplingDefaults} sampling
+     * @param {number | null} [number_of_decoding_threads]
+     * @param {number | null} [audio_temperature]
+     * @param {number | null} [audio_top_k]
+     * @returns {GenerationDefaults}
+     */
+    static audio(sampling, number_of_decoding_threads, audio_temperature, audio_top_k) {
+        _assertClass(sampling, SamplingDefaults);
+        var ptr0 = sampling.__destroy_into_raw();
+        const ret = wasm.generationdefaults_audio(ptr0, isLikeNone(number_of_decoding_threads) ? 0x100000001 : (number_of_decoding_threads) >>> 0, isLikeNone(audio_temperature) ? 0x100000001 : Math.fround(audio_temperature), isLikeNone(audio_top_k) ? 0x100000001 : (audio_top_k) >>> 0);
+        return GenerationDefaults.__wrap(ret);
+    }
+    /**
+     * @param {string} raw_json
+     * @returns {GenerationDefaults}
+     */
+    static other(raw_json) {
+        const ptr0 = passStringToWasm0(raw_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.generationdefaults_other(ptr0, len0);
+        return GenerationDefaults.__wrap(ret);
+    }
+    /**
+     * @param {SamplingDefaults} sampling
+     * @returns {GenerationDefaults}
+     */
+    static text(sampling) {
+        _assertClass(sampling, SamplingDefaults);
+        var ptr0 = sampling.__destroy_into_raw();
+        const ret = wasm.generationdefaults_text(ptr0);
+        return GenerationDefaults.__wrap(ret);
+    }
+    /**
+     * @returns {string}
+     */
+    toJson() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.generationdefaults_toJson(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) GenerationDefaults.prototype[Symbol.dispose] = GenerationDefaults.prototype.free;
+
+/**
+ * A loaded generative engine with shared weights and independent CPU sessions.
+ */
+export class GenerativeModel {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(GenerativeModel.prototype);
+        obj.__wbg_ptr = ptr;
+        GenerativeModelFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        GenerativeModelFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_generativemodel_free(ptr, 0);
+    }
+    /**
+     * Create a production Session that can outlive all loading and engine handles.
+     * @param {SessionConfig} config
+     * @returns {Session}
+     */
+    createSession(config) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(config, SessionConfig);
+            wasm.generativemodel_createSession(retptr, this.__wbg_ptr, config.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return Session.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Share the already loaded engine, including its tokenizer and cache.
+     * @returns {CeraEngine}
+     */
+    engine() {
+        const ret = wasm.generativemodel_engine(this.__wbg_ptr);
+        return CeraEngine.__wrap(ret);
+    }
+}
+if (Symbol.dispose) GenerativeModel.prototype[Symbol.dispose] = GenerativeModel.prototype.free;
+
+/**
+ * Summary of a successful message ingestion.
+ */
+export class IngestSummary {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(IngestSummary.prototype);
+        obj.__wbg_ptr = ptr;
+        IngestSummaryFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        IngestSummaryFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_ingestsummary_free(ptr, 0);
+    }
+    /**
+     * Number of tokens encoded and appended to the context.
+     * @returns {number}
+     */
+    get inputTokens() {
+        const ret = wasm.ingestsummary_inputTokens(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * KV position after ingestion.
+     * @returns {number}
+     */
+    get positionAfter() {
+        const ret = wasm.ingestsummary_positionAfter(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * KV position before ingestion.
+     * @returns {number}
+     */
+    get positionBefore() {
+        const ret = wasm.ingestsummary_positionBefore(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) IngestSummary.prototype[Symbol.dispose] = IngestSummary.prototype.free;
+
+/**
+ * CPU loading options. A zero context uses the core engine's existing semantics.
+ */
+export class LoadConfig {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        LoadConfigFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_loadconfig_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    get backend() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_loadconfig_backend(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    get context_size() {
+        const ret = wasm.__wbg_get_loadconfig_context_size(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {string | undefined}
+     */
+    get draft_model() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_loadconfig_draft_model(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {boolean}
+     */
+    get gpu_depthformer() {
+        const ret = wasm.__wbg_get_loadconfig_gpu_depthformer(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @param {number} context_size
+     * @param {string} backend
+     */
+    constructor(context_size, backend) {
+        const ptr0 = passStringToWasm0(backend, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.loadconfig_new(context_size, ptr0, len0);
+        this.__wbg_ptr = ret >>> 0;
+        LoadConfigFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {string} arg0
+     */
+    set backend(arg0) {
+        const ptr0 = passStringToWasm0(arg0, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_loadconfig_backend(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {number} arg0
+     */
+    set context_size(arg0) {
+        wasm.__wbg_set_loadconfig_context_size(this.__wbg_ptr, arg0);
+    }
+    /**
+     * @param {string | null} [arg0]
+     */
+    set draft_model(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passStringToWasm0(arg0, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_loadconfig_draft_model(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {boolean} arg0
+     */
+    set gpu_depthformer(arg0) {
+        wasm.__wbg_set_loadconfig_gpu_depthformer(this.__wbg_ptr, arg0);
+    }
+}
+if (Symbol.dispose) LoadConfig.prototype[Symbol.dispose] = LoadConfig.prototype.free;
+
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via `attachLora`.
- * Load it once (from bytes — the browser has no filesystem) and reuse the
+ * Load it once (from bytes - the browser has no filesystem) and reuse the
  * handle across sessions; the factors are reference-counted internally.
  */
 export class LoraAdapters {
@@ -1057,13 +1965,81 @@ export class LoraAdapters {
 if (Symbol.dispose) LoraAdapters.prototype[Symbol.dispose] = LoraAdapters.prototype.free;
 
 /**
+ * A runtime-scaled LoRA stack under construction: push `(adapter, scale)`
+ * entries, then hand the finished stack to `Session.setLoraAdapters` or one
+ * of the per-call `hiddenStates*WithAdapters` overrides. Contributions stack
+ * per target; entry scales must be finite (zero entries are skipped as an
+ * exact no-op when the stack composes).
+ *
+ * A builder instead of a plain `{adapter, scale}[]` array because the
+ * boundary cannot express that: wasm-bindgen generates `JsCast` only for
+ * imported types (never for an exported struct nested in a plain JS
+ * object), and `Vec<T>` arguments only support primitives. Each adapter
+ * therefore crosses as a typed `&LoraAdapters` parameter to `push`, and the
+ * stack itself crosses the same way. Build once, reuse across calls: every
+ * consumer takes `&LoraStack` by reference.
+ */
+export class LoraStack {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        LoraStackFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_lorastack_free(ptr, 0);
+    }
+    /**
+     * Number of entries pushed so far.
+     * @returns {number}
+     */
+    get length() {
+        const ret = wasm.lorastack_length(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * A new, empty stack. An empty stack detaches in `setLoraAdapters` and
+     * selects the base model in the per-call overrides.
+     */
+    constructor() {
+        const ret = wasm.lorastack_new();
+        this.__wbg_ptr = ret >>> 0;
+        LoraStackFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Push one `(adapter, scale)` entry. The scale must be finite as an
+     * `f32` (magnitudes above `f32::MAX` count as infinite); a bad scale
+     * throws and the stack is left unchanged.
+     * @param {LoraAdapters} adapter
+     * @param {number} scale
+     */
+    push(adapter, scale) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(adapter, LoraAdapters);
+            wasm.lorastack_push(retptr, this.__wbg_ptr, adapter.__wbg_ptr, scale);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) LoraStack.prototype[Symbol.dispose] = LoraStack.prototype.free;
+
+/**
  * Parsed view of a LeapBundles `*.json` manifest.
  *
  * JS callers fetch the manifest bytes (e.g. via `fetch().arrayBuffer()`)
  * and pass them to `Manifest.parse`. The wrapper exposes the typed
  * fields cera already understands; the raw `serde_json::Value`
  * retained on the inner `cera::manifest::Manifest` is intentionally
- * **not** exposed here — JS callers can re-parse the JSON themselves
+ * **not** exposed here - JS callers can re-parse the JSON themselves
  * for forward-compat fields, and we don't want to commit to a
  * `serde-wasm-bindgen` round-trip on every getter.
  */
@@ -1148,9 +2124,29 @@ export class Manifest {
         }
     }
     /**
+     * URL of the companion DSpark draft model GGUF for speculative decoding.
+     * @returns {string | undefined}
+     */
+    get draftModelUrl() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.manifest_draftModelUrl(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Raw `inference_type` string (e.g. `llama.cpp/text-to-text`).
      * Round-trips through cera's enum, so unknown variants come back
-     * as their original string — no information loss.
+     * as their original string - no information loss.
      * @returns {string}
      */
     get inferenceType() {
@@ -1190,26 +2186,6 @@ export class Manifest {
         }
     }
     /**
-     * URL of the companion DSpark draft model GGUF for speculative decoding.
-     * @returns {string | undefined}
-     */
-    get draftModelUrl() {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.manifest_draftModelUrl(retptr, this.__wbg_ptr);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            let v1;
-            if (r0 !== 0) {
-                v1 = getStringFromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export4(r0, r1 * 1, 1);
-            }
-            return v1;
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
      * URL of the multimodal projector GGUF if the manifest declares
      * one (VL / audio models). `undefined` for plain text models.
      * @returns {string | undefined}
@@ -1231,70 +2207,10 @@ export class Manifest {
         }
     }
     /**
-     * URL of the audio-decoder GGUF for audio-out models.
-     * @returns {string | undefined}
-     */
-    get audioDecoderUrl() {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.manifest_audioDecoderUrl(retptr, this.__wbg_ptr);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            let v1;
-            if (r0 !== 0) {
-                v1 = getStringFromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export4(r0, r1 * 1, 1);
-            }
-            return v1;
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
-     * URL of the audio-tokenizer checkpoint.
-     * @returns {string | undefined}
-     */
-    get audioTokenizerUrl() {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.manifest_audioTokenizerUrl(retptr, this.__wbg_ptr);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            let v1;
-            if (r0 !== 0) {
-                v1 = getStringFromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export4(r0, r1 * 1, 1);
-            }
-            return v1;
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
-     * Jinja chat template override from the manifest.
-     * @returns {string | undefined}
-     */
-    get chatTemplate() {
-        try {
-            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            wasm.manifest_chatTemplate(retptr, this.__wbg_ptr);
-            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
-            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
-            let v1;
-            if (r0 !== 0) {
-                v1 = getStringFromWasm0(r0, r1).slice();
-                wasm.__wbindgen_export4(r0, r1 * 1, 1);
-            }
-            return v1;
-        } finally {
-            wasm.__wbindgen_add_to_stack_pointer(16);
-        }
-    }
-    /**
      * Parse a JSON manifest from raw bytes. Throws a `JsError` on
      * malformed JSON or when required fields are missing or wrongly
      * typed (e.g. no `load_time_parameters.model`). Unknown
-     * `inference_type` values are **not** an error — they round-trip
+     * `inference_type` values are **not** an error - they round-trip
      * through `cera::manifest::InferenceType::Unknown(String)` and
      * surface verbatim via the `inferenceType` getter, so JS callers
      * can decide how to react instead of catching here.
@@ -1341,6 +2257,486 @@ export class Manifest {
 if (Symbol.dispose) Manifest.prototype[Symbol.dispose] = Manifest.prototype.free;
 
 /**
+ * Dynamic loaded model; its typed accessor shares ownership.
+ */
+export class ModelHandle {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ModelHandle.prototype);
+        obj.__wbg_ptr = ptr;
+        ModelHandleFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ModelHandleFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_modelhandle_free(ptr, 0);
+    }
+    /**
+     * @returns {GenerativeModel | undefined}
+     */
+    asGenerative() {
+        const ret = wasm.modelhandle_asGenerative(this.__wbg_ptr);
+        return ret === 0 ? undefined : GenerativeModel.__wrap(ret);
+    }
+    /**
+     * @returns {string}
+     */
+    kind() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.modelhandle_kind(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) ModelHandle.prototype[Symbol.dispose] = ModelHandle.prototype.free;
+
+/**
+ * Single-use synchronous loader. Both build methods consume the source even on failure.
+ */
+export class ModelLoader {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ModelLoaderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_modelloader_free(ptr, 0);
+    }
+    /**
+     * @returns {ModelHandle}
+     */
+    build() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.modelloader_build(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return ModelHandle.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {GenerativeModel}
+     */
+    buildGenerative() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.modelloader_buildGenerative(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return GenerativeModel.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @param {ModelSource} source
+     * @param {LoadConfig} config
+     */
+    constructor(source, config) {
+        _assertClass(source, ModelSource);
+        var ptr0 = source.__destroy_into_raw();
+        _assertClass(config, LoadConfig);
+        var ptr1 = config.__destroy_into_raw();
+        const ret = wasm.modelloader_new(ptr0, ptr1);
+        this.__wbg_ptr = ret >>> 0;
+        ModelLoaderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+}
+if (Symbol.dispose) ModelLoader.prototype[Symbol.dispose] = ModelLoader.prototype.free;
+
+/**
+ * Multi-component model parts for WASM loading.
+ *
+ * Constructed from JavaScript and passed by value into `ModelSource::parts`.
+ * Property getters use `getter_with_clone` to conform to the TypeScript binding
+ * contract in `tests/api_contracts/wasm_loading.json`; JS consumers should avoid
+ * reading `.model` directly to prevent cloning the byte buffer into JS memory.
+ */
+export class ModelParts {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ModelPartsFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_modelparts_free(ptr, 0);
+    }
+    /**
+     * @returns {Uint8Array | undefined}
+     */
+    get audio_decoder() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_audio_decoder(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {Uint8Array | undefined}
+     */
+    get audio_tokenizer() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_audio_tokenizer(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {string | undefined}
+     */
+    get chat_template() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_chat_template(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {Uint8Array | undefined}
+     */
+    get draft_model() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_draft_model(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {GenerationDefaults | undefined}
+     */
+    get generation_defaults() {
+        const ret = wasm.__wbg_get_modelparts_generation_defaults(this.__wbg_ptr);
+        return ret === 0 ? undefined : GenerationDefaults.__wrap(ret);
+    }
+    /**
+     * @returns {string | undefined}
+     */
+    get inference_type() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_inference_type(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get model() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_model(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v1 = getArrayU8FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @returns {Uint8Array | undefined}
+     */
+    get multimodal_projector() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.__wbg_get_modelparts_multimodal_projector(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * @param {Uint8Array} model
+     */
+    constructor(model) {
+        const ptr0 = passArray8ToWasm0(model, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.modelparts_new(ptr0, len0);
+        this.__wbg_ptr = ret >>> 0;
+        ModelPartsFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {Uint8Array | null} [arg0]
+     */
+    set audio_decoder(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passArray8ToWasm0(arg0, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_audio_decoder(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {Uint8Array | null} [arg0]
+     */
+    set audio_tokenizer(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passArray8ToWasm0(arg0, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_audio_tokenizer(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {string | null} [arg0]
+     */
+    set chat_template(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passStringToWasm0(arg0, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_chat_template(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {Uint8Array | null} [arg0]
+     */
+    set draft_model(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passArray8ToWasm0(arg0, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_draft_model(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {GenerationDefaults | null} [arg0]
+     */
+    set generation_defaults(arg0) {
+        let ptr0 = 0;
+        if (!isLikeNone(arg0)) {
+            _assertClass(arg0, GenerationDefaults);
+            ptr0 = arg0.__destroy_into_raw();
+        }
+        wasm.__wbg_set_modelparts_generation_defaults(this.__wbg_ptr, ptr0);
+    }
+    /**
+     * @param {string | null} [arg0]
+     */
+    set inference_type(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passStringToWasm0(arg0, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_inference_type(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {Uint8Array} arg0
+     */
+    set model(arg0) {
+        const ptr0 = passArray8ToWasm0(arg0, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_model(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @param {Uint8Array | null} [arg0]
+     */
+    set multimodal_projector(arg0) {
+        var ptr0 = isLikeNone(arg0) ? 0 : passArray8ToWasm0(arg0, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        wasm.__wbg_set_modelparts_multimodal_projector(this.__wbg_ptr, ptr0, len0);
+    }
+}
+if (Symbol.dispose) ModelParts.prototype[Symbol.dispose] = ModelParts.prototype.free;
+
+export class ModelSource {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ModelSource.prototype);
+        obj.__wbg_ptr = ptr;
+        ModelSourceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ModelSourceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_modelsource_free(ptr, 0);
+    }
+    /**
+     * @param {Uint8Array} bytes
+     * @returns {ModelSource}
+     */
+    static bytes(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.modelsource_bytes(ptr0, len0);
+        return ModelSource.__wrap(ret);
+    }
+    /**
+     * @param {ModelParts} parts
+     * @returns {ModelSource}
+     */
+    static parts(parts) {
+        _assertClass(parts, ModelParts);
+        var ptr0 = parts.__destroy_into_raw();
+        const ret = wasm.modelsource_parts(ptr0);
+        return ModelSource.__wrap(ret);
+    }
+}
+if (Symbol.dispose) ModelSource.prototype[Symbol.dispose] = ModelSource.prototype.free;
+
+export class SamplingDefaults {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        SamplingDefaultsFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_samplingdefaults_free(ptr, 0);
+    }
+    /**
+     * @returns {number | undefined}
+     */
+    get min_p() {
+        const ret = wasm.__wbg_get_samplingdefaults_min_p(this.__wbg_ptr);
+        return ret === 0x100000001 ? undefined : ret;
+    }
+    /**
+     * @returns {number | undefined}
+     */
+    get repetition_penalty() {
+        const ret = wasm.__wbg_get_samplingdefaults_repetition_penalty(this.__wbg_ptr);
+        return ret === 0x100000001 ? undefined : ret;
+    }
+    /**
+     * @returns {number | undefined}
+     */
+    get temperature() {
+        const ret = wasm.__wbg_get_samplingdefaults_temperature(this.__wbg_ptr);
+        return ret === 0x100000001 ? undefined : ret;
+    }
+    /**
+     * @returns {number | undefined}
+     */
+    get top_k() {
+        const ret = wasm.__wbg_get_samplingdefaults_top_k(this.__wbg_ptr);
+        return ret === 0x100000001 ? undefined : ret;
+    }
+    /**
+     * @returns {number | undefined}
+     */
+    get top_p() {
+        const ret = wasm.__wbg_get_samplingdefaults_top_p(this.__wbg_ptr);
+        return ret === 0x100000001 ? undefined : ret;
+    }
+    constructor() {
+        const ret = wasm.samplingdefaults_new();
+        this.__wbg_ptr = ret >>> 0;
+        SamplingDefaultsFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {number | null} [arg0]
+     */
+    set min_p(arg0) {
+        wasm.__wbg_set_samplingdefaults_min_p(this.__wbg_ptr, isLikeNone(arg0) ? 0x100000001 : Math.fround(arg0));
+    }
+    /**
+     * @param {number | null} [arg0]
+     */
+    set repetition_penalty(arg0) {
+        wasm.__wbg_set_samplingdefaults_repetition_penalty(this.__wbg_ptr, isLikeNone(arg0) ? 0x100000001 : Math.fround(arg0));
+    }
+    /**
+     * @param {number | null} [arg0]
+     */
+    set temperature(arg0) {
+        wasm.__wbg_set_samplingdefaults_temperature(this.__wbg_ptr, isLikeNone(arg0) ? 0x100000001 : Math.fround(arg0));
+    }
+    /**
+     * @param {number | null} [arg0]
+     */
+    set top_k(arg0) {
+        wasm.__wbg_set_samplingdefaults_top_k(this.__wbg_ptr, isLikeNone(arg0) ? 0x100000001 : (arg0) >>> 0);
+    }
+    /**
+     * @param {number | null} [arg0]
+     */
+    set top_p(arg0) {
+        wasm.__wbg_set_samplingdefaults_top_p(this.__wbg_ptr, isLikeNone(arg0) ? 0x100000001 : Math.fround(arg0));
+    }
+}
+if (Symbol.dispose) SamplingDefaults.prototype[Symbol.dispose] = SamplingDefaults.prototype.free;
+
+/**
  * Stateful generation handle. Built via `CeraEngine.newSession(config)`.
  *
  * JS callers seed the conversation by calling `appendText` /
@@ -1351,7 +2747,7 @@ if (Symbol.dispose) Manifest.prototype[Symbol.dispose] = Manifest.prototype.free
  *
  * **Worker note:** `generate` is synchronous and will block the
  * thread it runs on for the duration of decode (potentially
- * seconds). On the browser main thread that freezes the page —
+ * seconds). On the browser main thread that freezes the page -
  * always call from a Web Worker. On Node it also blocks the JS
  * event loop (libuv's background I/O thread pool keeps running,
  * but JS callbacks queue): use `worker_threads` for server
@@ -1359,17 +2755,16 @@ if (Symbol.dispose) Manifest.prototype[Symbol.dispose] = Manifest.prototype.free
  * one-off scripts are fine to run sync.
  *
  * **Cancellation:** since the worker thread is blocked inside
- * `generate`, the worker's own `onmessage` handler can't run —
+ * `generate`, the worker's own `onmessage` handler can't run -
  * incoming `postMessage({kind:'cancel'})` queues but doesn't
  * dispatch until `generate` returns, so a flag set by that
- * handler can't be updated mid-decode. To cancel during a
- * running `generate` call, either call `session.cancel()` from inside
- * the token callback based on state it can observe directly
- * (elapsed time, token budget, accumulated content), or use
- * cross-thread shared memory signalling (`SharedArrayBuffer` +
- * `Atomics`) — see `cera-wasm/README.md` for the full
- * `SharedArrayBuffer` pattern, which requires cross-origin
- * isolation in browsers.
+ * handler can't be updated mid-decode. Do not call `session.cancel()` or
+ * otherwise re-enter this handle from a callback: generation holds a mutable
+ * WASM borrow, and recursive access can leave the handle unusable. A shared
+ * JS flag does not bypass that restriction. Set cancellation between calls,
+ * bound decode work with `maxTokens`, or terminate the worker and recreate its
+ * execution state. The independent cancellation handle on browser WebGPU is
+ * a separate API; see `cera-wasm/README.md`.
  */
 export class Session {
     static __wrap(ptr) {
@@ -1396,8 +2791,8 @@ export class Session {
      * Non-16kHz inputs are automatically linearly resampled to 16 kHz.
      * `samples` arrives as `Float32Array` on the JS side. The
      * wasm-bindgen boundary copies the typed-array contents into
-     * wasm linear memory once — there's no per-element boxing
-     * (contrast with Kotlin's `List<Float>` 4× memory overhead
+     * wasm linear memory once; there's no per-element boxing
+     * (contrast with Kotlin's `List<Float>` 4x memory overhead
      * flagged in PR #78). The `&[f32]` Rust signature matches
      * `appendTokens(&[u32])` and avoids the per-call `Vec`
      * allocation that an owned parameter would require.
@@ -1405,7 +2800,7 @@ export class Session {
      * Errors today are thrown as JS `Error`s; the message string
      * is the underlying `cera::CeraError::Display` text (same as
      * `appendText` / `appendTokens` produce):
-     * - `"empty input"` if `samples.length === 0` — fast-fail at
+     * - `"empty input"` if `samples.length === 0`: fast-fail at
      *   the wasm boundary, parity with `appendText` /
      *   `appendTokens` empty-input rejection.
      * - `"modality not supported by this model"` when
@@ -1515,7 +2910,7 @@ export class Session {
     }
     /**
      * Attach a [`LoraAdapters`] to this session. Applied to every subsequent
-     * forward pass — generation **and** hidden-states extraction — until
+     * forward pass (generation and hidden-states extraction) until
      * removed or replaced (hot-swap), and preserved across `reset()`. Throws if
      * the adapter's dimensions don't match the loaded model. Only affects tokens
      * processed after the call (doesn't retroactively re-adapt cached KV).
@@ -1538,17 +2933,15 @@ export class Session {
     /**
      * Flip the cancel atomic, requesting that any in-flight
      * `generate` call exit at its next checkpoint with
-     * `finishReason = "Cancelled"`. Safe to call from any thread
-     * (including a Worker that owns this session — though wasm
-     * without SharedArrayBuffer makes cross-thread sharing
-     * unusual).
+     * `finishReason = "Cancelled"`. Call only between operations; a callback
+     * cannot re-enter this handle while generation holds its mutable WASM borrow.
      */
     cancel() {
         wasm.session_cancel(this.__wbg_ptr);
     }
     /**
      * Modality capability flags reported by the model backing
-     * this session. Same shape as `CeraEngine.capabilities` —
+     * this session. Same shape as `CeraEngine.capabilities`;
      * see that getter for the `Capabilities` field documentation
      * and the synthetic-text caveat that applies to all
      * `fromGgufBytes`-loaded models today.
@@ -1559,13 +2952,32 @@ export class Session {
         return takeObject(ret);
     }
     /**
+     * Export the current session checkpoint as binary bytes.
+     * @returns {Uint8Array}
+     */
+    checkpoint() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.session_checkpoint(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Clear the cancel flag without dropping any session state.
-     * Use this after observing a cancellation signal — either a
+     * Use this after observing a cancellation signal; either a
      * thrown cancellation error from `appendText` / `appendTokens`
      * (mid-prefill cancellation surfaces as a thrown error) or
      * `summary.finishReason === "Cancelled"` on the value
      * returned from `generate` (cancellation during decode is
-     * reported via the finish reason, not a thrown error) — when
+     * reported via the finish reason, not a thrown error), when
      * you want to resume work on the same session without losing
      * the accumulated KV cache.
      *
@@ -1577,18 +2989,8 @@ export class Session {
      *   re-seeds the sampler. Use for "clear conversation"
      *   flows.
      *
-     * **Call sequencing:** invoke this *after* `generate` /
-     * `appendText` / `appendTokens` has returned. Even though
-     * the underlying cera method takes `&self`, wasm-bindgen's
-     * JS-side borrow check on the `Session` wrapper rejects any
-     * method call (including this `&self` one) while another
-     * method is still borrowing the same handle — calling
-     * `session.clearCancel()` from inside a `generate` token
-     * callback would throw "recursive use of an object". The
-     * `&self` Rust shape matters in the native binding
-     * (`cera-ffi`) where there's no JS-side borrow check; in
-     * wasm it just means there's no `&mut self` cost on the cera
-     * core side.
+     * Call sequencing: invoke this after `generate` /
+     * `appendText` / `appendTokens` has returned.
      */
     clearCancel() {
         wasm.session_clearCancel(this.__wbg_ptr);
@@ -1597,7 +2999,7 @@ export class Session {
      * Decode tokens until `opts.maxTokens`, a stop token, EOS, or
      * `cancel()` fires. The `onTextTokens` callback is invoked once
      * per flush boundary with a `Uint32Array` of the latest tokens
-     * (*not* the cumulative buffer — concatenate yourself if you
+     * (not the cumulative buffer: concatenate yourself if you
      * want the full sequence).
      *
      * Returns the `GenerateSummary` once decode finishes. Throws
@@ -1635,10 +3037,10 @@ export class Session {
         return ret !== 0;
     }
     /**
-     * Model hidden dimension `D` — reshape a `[T*D]` hidden-states buffer into
-     * `[T][D]` with this. Reads a cached field (set at construction), so — unlike
-     * the `&mut self` compute methods — it's safe to call from inside a `generate`
-     * callback without a wasm-bindgen borrow panic.
+     * Model hidden dimension `D`: reshape a `[T*D]` hidden-states buffer into
+     * `[T][D]` with this. Read and cache the dimension before generation. Even
+     * though the field is cached, this exported getter borrows the WASM handle
+     * and must not be called from a `generate` callback.
      * @returns {number}
      */
     hiddenSize() {
@@ -1668,11 +3070,36 @@ export class Session {
         }
     }
     /**
-     * Per-token last-layer hidden states (post-final-RMSNorm — the llama.cpp
+     * Like `hiddenStatesForText` with the per-call adapter stack of
+     * `hiddenStatesForTokensWithAdapters`.
+     * @param {string} text
+     * @param {LoraStack} stack
+     * @returns {Float32Array}
+     */
+    hiddenStatesForTextWithAdapters(text, stack) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(text, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            _assertClass(stack, LoraStack);
+            wasm.session_hiddenStatesForTextWithAdapters(retptr, this.__wbg_ptr, ptr0, len0, stack.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Per-token last-layer hidden states (post-final-RMSNorm, the llama.cpp
      * `--pooling none` vector) for `tokens`, as a `Float32Array` of length
      * `tokens.length * hiddenSize` (row-major; token `t` channel `c` at
      * `t*hiddenSize + c`). The wasm boundary copies the buffer into the JS heap
-     * once. Side-effect-free — does not disturb the generation KV.
+     * once. Side-effect-free, does not disturb the generation KV.
      * @param {Uint32Array} tokens
      * @returns {Float32Array}
      */
@@ -1694,7 +3121,35 @@ export class Session {
         }
     }
     /**
-     * Mean-pooled hidden state — a single `Float32Array` of length `hiddenSize`
+     * Like `hiddenStatesForTokens` but with an explicit per-call adapter
+     * stack (see `setLoraAdapters`): entries compose, and an empty
+     * `LoraStack` extracts from the base model even when the session has
+     * adapters attached. Nothing is installed; the session set is
+     * untouched. A bad stack throws, never silently.
+     * @param {Uint32Array} tokens
+     * @param {LoraStack} stack
+     * @returns {Float32Array}
+     */
+    hiddenStatesForTokensWithAdapters(tokens, stack) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray32ToWasm0(tokens, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            _assertClass(stack, LoraStack);
+            wasm.session_hiddenStatesForTokensWithAdapters(retptr, this.__wbg_ptr, ptr0, len0, stack.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Mean-pooled hidden state: a single `Float32Array` of length `hiddenSize`
      * (the common classifier path: pool in Rust, ship `D` floats not `T*D`).
      * @param {Uint32Array} tokens
      * @returns {Float32Array}
@@ -1717,6 +3172,54 @@ export class Session {
         }
     }
     /**
+     * Like `hiddenStatesMeanPooled` with the per-call adapter stack of
+     * `hiddenStatesForTokensWithAdapters`.
+     * @param {Uint32Array} tokens
+     * @param {LoraStack} stack
+     * @returns {Float32Array}
+     */
+    hiddenStatesMeanPooledWithAdapters(tokens, stack) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray32ToWasm0(tokens, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            _assertClass(stack, LoraStack);
+            wasm.session_hiddenStatesMeanPooledWithAdapters(retptr, this.__wbg_ptr, ptr0, len0, stack.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Transfer this session into a conversational `ChatSession`.
+     *
+     * The session must be backed by a model with a supported chat profile
+     * (e.g. ChatML, Llama 3, Gemma). If discovery fails, this session retains
+     * its inner handle and throws an error.
+     * @returns {ChatSession}
+     */
+    intoChat() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.session_intoChat(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return ChatSession.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Current KV cache position (number of tokens currently held).
      * @returns {number}
      */
@@ -1734,42 +3237,51 @@ export class Session {
      * Drop accumulated state and return the session to a freshly-
      * opened shape. Clears the KV cache, `position`, the last
      * logits, and the cancel flag, then re-seeds the sampler from
-     * the `SessionConfig.seed` originally passed to `newSession`.
+     * the session default (`SessionConfig.seed` as passed to
+     * `newSession`, or the `setSeed` value when one was set).
      *
-     * Use this for "clear conversation" UI actions — it skips the
+     * Use this for "clear conversation" UI actions; it skips the
      * per-session setup cost that `engine.newSession(config)`
      * would pay (model + tokenizer Arc clones, sampler ctor),
      * while still leaving the session indistinguishable from a
      * fresh one.
      *
      * Sampler re-seed semantics:
-     * - `SessionConfig.seed = some bigint` — deterministic
+     * - session default = some bigint: deterministic
      *   sessions stay deterministic across `reset()`; the next
      *   `generate` produces the same first token sequence as the
      *   original.
-     * - `SessionConfig.seed = null` — the sampler picks a new
+     * - session default unset: the sampler picks a new
      *   random seed on each `reset()`, so successive
      *   conversations decorrelate.
      *
      * Engine-level disk prefix cache (when configured on
-     * `CeraEngine`) is not touched — those entries are
+     * `CeraEngine`) is not touched; those entries are
      * engine-scoped, not session-scoped.
-     *
-     * **Threading:** unlike `cancel()` (which only flips an
-     * atomic and is safe to call concurrently with anything),
-     * `reset()` takes `&mut self` and rebuilds non-atomic
-     * internal state (KV cache, sampler). Must be called on
-     * the owning thread, with no in-flight `generate` /
-     * `appendText` / `appendTokens` running. The wasm-bindgen
-     * borrow check enforces this within a single Worker; if
-     * you share a `Session` across Workers via
-     * `SharedArrayBuffer`-style schemes, it's on you to
-     * serialize calls.
      */
     reset() {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
             wasm.session_reset(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Restore an inference session from binary checkpoint bytes.
+     * @param {Uint8Array} data
+     */
+    restore(data) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.session_restore(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             if (r1) {
@@ -1789,6 +3301,50 @@ export class Session {
      */
     setImageMaxLongSize(max_long_size) {
         wasm.session_setImageMaxLongSize(this.__wbg_ptr, isLikeNone(max_long_size) ? 0x100000001 : (max_long_size) >>> 0);
+    }
+    /**
+     * Replace the attached adapter set with a runtime-scaled [`LoraStack`]:
+     * contributions stack per target. An empty stack detaches (same as
+     * `removeLora`). A non-empty stack whose entries are all zero-scale
+     * installs a no-op adapter instead, so `hasLora` stays true while
+     * applying nothing. The swap is atomic: a bad stack leaves the
+     * previous set untouched. Like `attachLora`, only tokens processed
+     * after the call are affected.
+     * @param {LoraStack} stack
+     */
+    setLoraAdapters(stack) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            _assertClass(stack, LoraStack);
+            wasm.session_setLoraAdapters(retptr, this.__wbg_ptr, stack.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Replace the session-default sampler seed and restart the RNG from it
+     * immediately (`undefined` re-seeds from entropy). KV and position are
+     * untouched, so this is safe on a primed session. Persists across
+     * `reset()`, unlike a per-request `GenerateOpts.seed`.
+     * @param {bigint | null} [seed]
+     */
+    setSeed(seed) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.session_setSeed(retptr, this.__wbg_ptr, !isLikeNone(seed), isLikeNone(seed) ? BigInt(0) : seed);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
     }
 }
 if (Symbol.dispose) Session.prototype[Symbol.dispose] = Session.prototype.free;
@@ -1816,9 +3372,9 @@ export class SessionConfig {
     }
     /**
      * KV cache compression configuration. `null` (default) stores
-     * keys and values as f32 — best fidelity, biggest memory
+     * keys and values as f32 - best fidelity, biggest memory
      * footprint. Set to a `TurboQuantConfig` to **request**
-     * TurboQuant compression — keys to ~3 bits/elem, values to
+     * TurboQuant compression - keys to ~3 bits/elem, values to
      * ~2 bits/elem (plus a norm word per vector); the same `seed`
      * reproduces the same per-layer Hadamard rotations
      * deterministically.
@@ -1828,14 +3384,14 @@ export class SessionConfig {
      *   attention `head_dim` is a power of two (a constraint of
      *   the Hadamard rotation). If it isn't, cera logs a warning
      *   and falls back to the uncompressed f32 path even with
-     *   this set — there's no JS-visible error, just no
+     *   this set - there's no JS-visible error, just no
      *   compression.
      * - `nKeep` (context-shift) is incompatible with TurboQuant.
      *   Setting both gets a warning at session creation and the
      *   `nKeep` value is ignored on KV overflow (the cache
      *   overflows hard instead of shifting). Pick one.
      * - This config drives the CPU session. `WebGpuSession` takes
-     *   no `SessionConfig` — it accepts its own `kvCompression`
+     *   no `SessionConfig` - it accepts its own `kvCompression`
      *   argument on `create` instead, and its `kvCompression`
      *   getter reports the mode that actually took effect. Its
      *   `head_dim` constraint is stricter than the CPU's: a power
@@ -1845,8 +3401,8 @@ export class SessionConfig {
      *
      * Setting this consumes the JS-side `TurboQuantConfig`
      * handle (wasm-bindgen's `Option<T>` parameter shape). Read
-     * back via the getter — which returns a fresh handle that's
-     * a snapshot, not a live link — if you need to inspect the
+     * back via the getter - which returns a fresh handle that's
+     * a snapshot, not a live link - if you need to inspect the
      * current config without affecting it.
      *
      * Assign a fresh config per session. Reusing an already-
@@ -1854,7 +3410,7 @@ export class SessionConfig {
      * wasm-bindgen lowers it to pointer 0, which arrives as
      * `None`, so the second session silently gets uncompressed
      * KV. (A `--dev` build does throw "Attempt to use a moved
-     * value" — so this is a bug that only appears in release.)
+     * value" - so this is a bug that only appears in release.)
      * @returns {TurboQuantConfig | undefined}
      */
     get kvCompression() {
@@ -1863,7 +3419,7 @@ export class SessionConfig {
     }
     /**
      * Cap on total tokens held in KV. `null` (the common case)
-     * defers to the engine's effective max — i.e.
+     * defers to the engine's effective max - i.e.
      * `min(engine.contextSize, model.maxSeqLen)`. Set to a
      * smaller value here to further lower the cap; values larger
      * than the engine's effective max are still capped at it.
@@ -1874,7 +3430,7 @@ export class SessionConfig {
         return ret === 0x100000001 ? undefined : ret;
     }
     /**
-     * Number of leading tokens pinned in KV across context shifts —
+     * Number of leading tokens pinned in KV across context shifts -
      * a system prompt or persistent prefix that should survive
      * when the cache fills. `0` (default) disables the pin.
      * @returns {number}
@@ -1891,7 +3447,7 @@ export class SessionConfig {
     }
     /**
      * Deterministic sampler seed. `null` (default) uses a fresh
-     * random seed per session — set this to make a session's
+     * random seed per session - set this to make a session's
      * outputs reproducible across runs (useful for testing /
      * demos / regression checks).
      * @returns {bigint | undefined}
@@ -1963,7 +3519,7 @@ if (Symbol.dispose) SessionConfig.prototype[Symbol.dispose] = SessionConfig.prot
  *
  * Round-trip note: `decode(encode(text))` is **not** guaranteed to
  * be byte-identical to `text` for inputs containing tokens that
- * don't survive BPE merge replay (rare in practice — BOS/EOS,
+ * don't survive BPE merge replay (rare in practice - BOS/EOS,
  * some byte-level edge cases). When you need exact reproduction,
  * keep the original string around.
  */
@@ -2091,7 +3647,7 @@ export class Tokenizer {
     /**
      * Raw embedded Jinja chat template from the GGUF metadata, if
      * any. Most callers should use [`Self::apply_chat_template`]
-     * (`applyChatTemplate` in JS) instead — this getter is for
+     * (`applyChatTemplate` in JS) instead - this getter is for
      * inspection or for callers who want to render with a
      * different Jinja runtime.
      * @returns {string | undefined}
@@ -2114,7 +3670,7 @@ export class Tokenizer {
     }
     /**
      * Detokenize back to a UTF-8 string. Lossy for tokens whose
-     * byte sequences don't decode to valid UTF-8 — those are
+     * byte sequences don't decode to valid UTF-8 - those are
      * replaced with U+FFFD per `String::from_utf8_lossy`.
      * @param {Uint32Array} tokens
      * @returns {string}
@@ -2139,7 +3695,7 @@ export class Tokenizer {
     }
     /**
      * Tokenize a UTF-8 string. Returns the token IDs as a
-     * `Uint32Array`. No BOS/EOS prefix — callers that want them
+     * `Uint32Array`. No BOS/EOS prefix - callers that want them
      * should prepend `bosToken` / append `eosToken` manually, or use
      * `encodeSpecial`.
      * @param {string} text
@@ -2161,7 +3717,7 @@ export class Tokenizer {
         }
     }
     /**
-     * Encode with optional special markers — the analog of llama.cpp's
+     * Encode with optional special markers - the analog of llama.cpp's
      * `llama_tokenize(..., add_special)`. When `addSpecial` is true, BOS is
      * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
      * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
@@ -2197,9 +3753,9 @@ export class Tokenizer {
      * `true` when `id` is registered as a control or user-defined
      * special token in the model's GGUF metadata
      * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
-     * output filtering — e.g. dropping `<|im_end|>` from a
+     * output filtering - e.g. dropping `<|im_end|>` from a
      * `Session.generate` token-callback batch before joining the
-     * IDs into UI-rendered text — and for token-class
+     * IDs into UI-rendered text - and for token-class
      * classification in analysis tools.
      *
      * Out-of-range IDs (>= vocab size) and regular vocab tokens
@@ -2284,7 +3840,7 @@ export const ToolFormat = Object.freeze({
  * - **Values**: 2-bit PolarQuant only (2 bits/elem + a packed
  *   norm word per vector).
  *
- * `seed` drives the per-layer randomized Hadamard rotations —
+ * `seed` drives the per-layer randomized Hadamard rotations -
  * the same seed produces the same rotations deterministically,
  * so a seeded session with TurboQuant on stays bitwise-
  * reproducible across runs.
@@ -2367,6 +3923,174 @@ export class TurboQuantConfig {
     }
 }
 if (Symbol.dispose) TurboQuantConfig.prototype[Symbol.dispose] = TurboQuantConfig.prototype.free;
+
+/**
+ * Result of a completed chat turn.
+ */
+export class TurnResult {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(TurnResult.prototype);
+        obj.__wbg_ptr = ptr;
+        TurnResultFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        TurnResultFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_turnresult_free(ptr, 0);
+    }
+    /**
+     * Decode wall-clock duration in milliseconds.
+     * @returns {number}
+     */
+    get decodeMs() {
+        const ret = wasm.turnresult_decodeMs(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Logical condition that ended generation (e.g. "Stop", "MaxTokens", "Cancelled").
+     * @returns {string}
+     */
+    get finishReason() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.turnresult_finishReason(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Prompt ingestion wall-clock duration in milliseconds.
+     * @returns {number}
+     */
+    get promptEvalMs() {
+        const ret = wasm.turnresult_promptEvalMs(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Tokens processed during prompt ingestion for this turn.
+     * @returns {number}
+     */
+    get promptEvalTokens() {
+        const ret = wasm.turnresult_promptEvalTokens(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Generation summary metrics.
+     * @returns {GenerateSummary}
+     */
+    get summary() {
+        const ret = wasm.turnresult_summary(this.__wbg_ptr);
+        return GenerateSummary.__wrap(ret);
+    }
+    /**
+     * Decoded assistant response text.
+     * @returns {string}
+     */
+    get text() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.turnresult_text(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Token identifiers emitted during the turn.
+     * @returns {Uint32Array}
+     */
+    get tokens() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.turnresult_tokens(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var v1 = getArrayU32FromWasm0(r0, r1).slice();
+            wasm.__wbindgen_export4(r0, r1 * 4, 4);
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Number of tokens generated during decode.
+     * @returns {number}
+     */
+    get tokensGenerated() {
+        const ret = wasm.turnresult_tokensGenerated(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Parsed tool calls emitted by the model during the turn, as a JS array of ToolCall objects.
+     * @returns {any}
+     */
+    get toolCalls() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.turnresult_toolCalls(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Parsed tool calls encoded as a JSON string.
+     * @returns {string}
+     */
+    get toolCallsJson() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.turnresult_toolCallsJson(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) TurnResult.prototype[Symbol.dispose] = TurnResult.prototype.free;
 
 export class WebGpuCancelHandle {
     static __wrap(ptr) {
@@ -2541,6 +4265,14 @@ export class WebGpuSession {
         const ret = wasm.webgpusession_capabilities(this.__wbg_ptr);
         return takeObject(ret);
     }
+    /**
+     * Export the current session checkpoint as binary bytes.
+     * @returns {Promise<Uint8Array>}
+     */
+    checkpoint() {
+        const ret = wasm.webgpusession_checkpoint(this.__wbg_ptr);
+        return takeObject(ret);
+    }
     clearCancel() {
         wasm.webgpusession_clearCancel(this.__wbg_ptr);
     }
@@ -2549,7 +4281,7 @@ export class WebGpuSession {
      * `requestDevice` resolve on the JS event loop), parse the in-memory
      * GGUF, upload the model to the GPU, and build a fresh inference
      * state. `contextSize` defaults to 4096. Throws if WebGPU is
-     * unavailable, the bytes aren't a valid LFM2 GGUF, or the device
+     * unavailable, the bytes aren't a valid GGUF, or the device
      * rejects the model.
      *
      * `kvCompression` is optional and defaults to `null` (uncompressed f32
@@ -2559,7 +4291,7 @@ export class WebGpuSession {
      * (token, KV head) vector, so against f32's 32 bits the KV slabs shrink
      * ~10.7x rather than the ~12.8x the bit rates alone suggest. Concretely,
      * for LFM2-1.2B (6 attention layers, 8 KV heads x head_dim 64) that is
-     * 24 KiB per token down to 2.25 KiB — at a 16K context, 384 MiB
+     * 24 KiB per token down to 2.25 KiB: at a 16K context, 384 MiB
      * (~403 MB) of GPU-side KV becomes 36 MiB (~38 MB).
      *
      * Both trailing parameters are optional, so to request compression while
@@ -2582,8 +4314,8 @@ export class WebGpuSession {
      * Setting this **consumes** the JS-side `TurboQuantConfig` handle
      * (wasm-bindgen's by-value `Option<T>` parameter shape), exactly like
      * the `SessionConfig.kvCompression` setter. Build a fresh config per
-     * session: reusing one across two `create` calls — two sessions, or a
-     * retry after a failed load — does **not** throw in a release build.
+     * session: reusing one across two `create` calls - two sessions, or a
+     * retry after a failed load - does **not** throw in a release build.
      * wasm-bindgen lowers an already-moved handle to pointer 0, which
      * arrives in Rust as `None`, so the second session silently runs
      * uncompressed. That makes handle reuse a third silent-downgrade cause
@@ -2597,7 +4329,7 @@ export class WebGpuSession {
      * keys *and* values together. Anything else falls back to uncompressed
      * KV. The engine records that as a `tracing::warn!`, and `cera-wasm`
      * installs no tracing subscriber, so **nothing reaches the browser
-     * console** — read the `kvCompression` getter to see what took effect.
+     * console** - read the `kvCompression` getter to see what took effect.
      * @param {Uint8Array} bytes
      * @param {number | null} [context_size]
      * @param {TurboQuantConfig | null} [kv_compression]
@@ -2646,6 +4378,14 @@ export class WebGpuSession {
         return takeObject(ret);
     }
     /**
+     * Export the current session checkpoint as binary bytes. Alias for `checkpoint()`.
+     * @returns {Promise<Uint8Array>}
+     */
+    exportCheckpoint() {
+        const ret = wasm.webgpusession_exportCheckpoint(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
      * Load a published LeapBundle by id and quantization onto the GPU,
      * downloading through `repo` and reusing whatever it already cached.
      *
@@ -2664,10 +4404,10 @@ export class WebGpuSession {
      * on a single JS `ArrayBuffer` that loading through `create` runs into,
      * and costs one copy of the model rather than two.
      *
-     * Throws for every reason `create` does, plus a bundle the GPU path
-     * cannot serve: it is LFM2-only. A caller wanting a fallback should catch
-     * and retry through `CeraEngine.fromBundleId`, which is what
-     * `cera_worker.js` does for `backend: 'auto'`.
+     * Throws for every reason `create` does, plus bundle download/manifest errors.
+     * A caller wanting a fallback should catch and retry through
+     * `CeraEngine.fromBundleId`, which is what `cera_worker.js` does for
+     * `backend: 'auto'`.
      * @param {BundleRepo} repo
      * @param {string} bundle_id
      * @param {string} quant
@@ -2760,10 +4500,29 @@ export class WebGpuSession {
         return ret !== 0;
     }
     /**
+     * Restore an inference session from binary checkpoint bytes. Alias for `restore()`.
+     * @param {Uint8Array} data
+     */
+    importCheckpoint(data) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webgpusession_importCheckpoint(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * The KV-cache mode this session actually resolved to:
      * `"turboquant(seed=N)"` or `"uncompressed"`.
      *
-     * Read this after `create` to confirm a TurboQuant request was honored —
+     * Read this after `create` to confirm a TurboQuant request was honored -
      * a downgrade is silent in the browser, so this is the only JS-visible
      * signal that compression is off. See `create` for what causes one.
      * @returns {string}
@@ -2799,12 +4558,70 @@ export class WebGpuSession {
         return ret >>> 0;
     }
     /**
+     * Reset the session in-place, clearing GPU convolution rolling buffers,
+     * resetting sequence counter to zero, rebuilding fresh CPU state,
+     * and dropping the stochastic sampler (the next unseeded call starts
+     * from the session default, or fresh entropy when unset).
+     */
+    reset() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.webgpusession_reset(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Restore an inference session from binary checkpoint bytes.
+     * @param {Uint8Array} data
+     */
+    restore(data) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.webgpusession_restore(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Set the session-default cap on an appended image's longest side in
      * pixels; `null` clears it. A per-call `maxLongSize` still wins.
      * @param {number | null} [max_long_size]
      */
     setImageMaxLongSize(max_long_size) {
         wasm.webgpusession_setImageMaxLongSize(this.__wbg_ptr, isLikeNone(max_long_size) ? 0x100000001 : (max_long_size) >>> 0);
+    }
+    /**
+     * Replace the session-default sampler seed and restart the RNG from
+     * it on the next stochastic call (`undefined` re-seeds from entropy).
+     * KV and position are untouched, so this is safe on a primed
+     * session. Persists across `reset()`, unlike a per-request seed.
+     * @param {bigint | null} [seed]
+     */
+    setSeed(seed) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.webgpusession_setSeed(retptr, this.__wbg_ptr, !isLikeNone(seed), isLikeNone(seed) ? BigInt(0) : seed);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
     }
     /**
      * The tokenizer this session's GGUF declares, for callers that need to
@@ -2823,6 +4640,7 @@ export class WebGpuSession {
      * CPU one:
      *
      * ```js
+     * // Frame the initial prompt on a fresh or reset session.
      * const tk = session.tokenizer;
      * // A real array, not JSON: `applyChatTemplate` type-checks its
      * // argument and rejects a string with "messages must be an array".
@@ -2835,7 +4653,9 @@ export class WebGpuSession {
      * if (tk.addBosToken && tk.bosToken != null && ids[0] !== tk.bosToken) {
      *   ids.unshift(tk.bosToken);
      * }
-     * await session.generateTokens(new Uint32Array(ids), 128, onToken);
+     * await session.generateTokens(
+     *   new Uint32Array(ids), 128, 0, undefined, undefined, undefined, onToken, undefined,
+     * );
      * ```
      *
      * The returned handle shares this session's tokenizer rather than
@@ -2852,7 +4672,7 @@ if (Symbol.dispose) WebGpuSession.prototype[Symbol.dispose] = WebGpuSession.prot
 /**
  * Returns the version of the `cera` core library this binding wraps.
  *
- * Note this is **`cera`'s** version, not `cera-wasm`'s — JS callers
+ * Note this is **`cera`'s** version, not `cera-wasm`'s - JS callers
  * usually want to know what core lib is driving the engine, since
  * the wrapper crate version may evolve independently.
  * @returns {string}
@@ -2919,6 +4739,41 @@ export function detectToolFormat(architecture) {
 }
 
 /**
+ * Compile a JSON Schema definition string into a GBNF grammar string.
+ *
+ * Converts Draft 7 / 2020-12 JSON Schema definitions into valid GBNF
+ * grammars for structured output generation.
+ * @param {string} schema_json
+ * @returns {string}
+ */
+export function jsonSchemaToGrammar(schema_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passStringToWasm0(schema_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.jsonSchemaToGrammar(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export4(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
  * Bundles published on `LiquidAI/LeapBundles`, as
  * `[{ name, quants: [...] }]`.
  *
@@ -2935,7 +4790,7 @@ export function listLeapBundles() {
 
 /**
  * Parse tool calls out of generated model text. Returns a JSON string
- * encoding an array of `ToolCall` (`[{name, arguments}]`) — `JSON.parse` it.
+ * encoding an array of `ToolCall` (`[{name, arguments}]`) - `JSON.parse` it.
  * An empty array means the reply had no tool call.
  * @param {string} text
  * @param {ToolFormat} format
@@ -3085,6 +4940,12 @@ function __wbg_get_imports() {
             const ret = getObject(arg0) === undefined;
             return ret;
         },
+        __wbg___wbindgen_number_get_7579aab02a8a620c: function(arg0, arg1) {
+            const obj = getObject(arg1);
+            const ret = typeof(obj) === 'number' ? obj : undefined;
+            getDataViewMemory0().setFloat64(arg0 + 8 * 1, isLikeNone(ret) ? 0 : ret, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, !isLikeNone(ret), true);
+        },
         __wbg___wbindgen_rethrow_828b2014a519945b: function(arg0) {
             throw takeObject(arg0);
         },
@@ -3228,11 +5089,11 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).features;
             return addHeapObject(ret);
         },
-        __wbg_fetch_91b1c8546f912bb4: function(arg0, arg1) {
+        __wbg_fetch_4868003253aa368d: function(arg0, arg1) {
             const ret = fetch(getStringFromWasm0(arg0, arg1));
             return addHeapObject(ret);
         },
-        __wbg_fetch_983438a4305dc694: function(arg0, arg1, arg2) {
+        __wbg_fetch_6f454a71954917bc: function(arg0, arg1, arg2) {
             const ret = fetch(getStringFromWasm0(arg0, arg1), getObject(arg2));
             return addHeapObject(ret);
         },
@@ -3320,6 +5181,26 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).info;
             return addHeapObject(ret);
         },
+        __wbg_instanceof_Float32Array_462df6f004aa518b: function(arg0) {
+            let result;
+            try {
+                result = getObject(arg0) instanceof Float32Array;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Uint8Array_4b8da683deb25d72: function(arg0) {
+            let result;
+            try {
+                result = getObject(arg0) instanceof Uint8Array;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_isArray_db61795ad004c139: function(arg0) {
             const ret = Array.isArray(getObject(arg0));
             return ret;
@@ -3344,6 +5225,10 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbg_length_6e821edde497a532: function(arg0) {
+            const ret = getObject(arg0).length;
+            return ret;
+        },
+        __wbg_length_fd4646b401926788: function(arg0) {
             const ret = getObject(arg0).length;
             return ret;
         },
@@ -3507,6 +5392,10 @@ function __wbg_get_imports() {
             const ret = new OffscreenCanvas(arg0 >>> 0, arg1 >>> 0);
             return addHeapObject(ret);
         }, arguments); },
+        __wbg_new_e3b04b4d53d1b593: function(arg0, arg1) {
+            const ret = new Error(getStringFromWasm0(arg0, arg1));
+            return addHeapObject(ret);
+        },
         __wbg_new_f3c9df4f38f3f798: function() {
             const ret = new Array();
             return addHeapObject(ret);
@@ -3530,7 +5419,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_6878(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_7675(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -3577,6 +5466,10 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).onSubmittedWorkDone();
             return addHeapObject(ret);
         },
+        __wbg_parse_545d11396395fbbd: function() { return handleError(function (arg0, arg1) {
+            const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
+            return addHeapObject(ret);
+        }, arguments); },
         __wbg_performance_3fcf6e32a7e1ed0a: function(arg0) {
             const ret = getObject(arg0).performance;
             return addHeapObject(ret);
@@ -3595,6 +5488,9 @@ function __wbg_get_imports() {
         },
         __wbg_prototypesetcall_3e05eb9545565046: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), getObject(arg2));
+        },
+        __wbg_prototypesetcall_66c8e1fb820946be: function(arg0, arg1, arg2) {
+            Float32Array.prototype.set.call(getArrayF32FromWasm0(arg0, arg1), getObject(arg2));
         },
         __wbg_push_6bdbc990be5ac37b: function(arg0, arg1) {
             const ret = getObject(arg0).push(getObject(arg1));
@@ -3661,6 +5557,9 @@ function __wbg_get_imports() {
         },
         __wbg_setPipeline_d73f019e98c76d2d: function(arg0, arg1) {
             getObject(arg0).setPipeline(getObject(arg1));
+        },
+        __wbg_set_16a9c1a07b3d38ec: function(arg0, arg1, arg2) {
+            getObject(arg0).set(getArrayU8FromWasm0(arg1, arg2));
         },
         __wbg_set_62f340d5d135b4db: function(arg0, arg1, arg2) {
             getObject(arg0).set(getObject(arg1), arg2 >>> 0);
@@ -3933,7 +5832,7 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).then(getObject(arg1));
             return addHeapObject(ret);
         },
-        __wbg_timeout_b4c95f843b772fc9: function(arg0) {
+        __wbg_timeout_20b3872e8c69172f: function(arg0) {
             const ret = AbortSignal.timeout(arg0 >>> 0);
             return addHeapObject(ret);
         },
@@ -3973,23 +5872,23 @@ function __wbg_get_imports() {
             return addHeapObject(ret);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2669, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6863);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 2883, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_7660);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 2631, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_5690);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("GPUDevice")], shim_idx: 2845, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6487);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 2631, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_5690_2);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("any")], shim_idx: 2845, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6487_2);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 2631, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_5690_3);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("undefined")], shim_idx: 2845, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_6487_3);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000005: function(arg0) {
@@ -4021,10 +5920,10 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_6863(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_7660(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_6863(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_7660(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -4035,10 +5934,10 @@ function __wasm_bindgen_func_elem_6863(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_5690(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_6487(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_5690(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_6487(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -4049,10 +5948,10 @@ function __wasm_bindgen_func_elem_5690(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_5690_2(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_6487_2(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_5690_2(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_6487_2(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -4063,10 +5962,10 @@ function __wasm_bindgen_func_elem_5690_2(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_5690_3(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_6487_3(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_5690_3(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_6487_3(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -4077,8 +5976,8 @@ function __wasm_bindgen_func_elem_5690_3(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_6878(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_6878(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_7675(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_7675(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 
@@ -4116,18 +6015,51 @@ const BundleRepoFinalization = (typeof FinalizationRegistry === 'undefined')
 const CeraEngineFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_ceraengine_free(ptr >>> 0, 1));
+const ChatSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_chatsession_free(ptr >>> 0, 1));
 const GenerateOptsFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_generateopts_free(ptr >>> 0, 1));
 const GenerateSummaryFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_generatesummary_free(ptr >>> 0, 1));
+const GenerationDefaultsFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_generationdefaults_free(ptr >>> 0, 1));
+const GenerativeModelFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_generativemodel_free(ptr >>> 0, 1));
+const IngestSummaryFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_ingestsummary_free(ptr >>> 0, 1));
+const LoadConfigFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_loadconfig_free(ptr >>> 0, 1));
 const LoraAdaptersFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_loraadapters_free(ptr >>> 0, 1));
+const LoraStackFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_lorastack_free(ptr >>> 0, 1));
 const ManifestFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_manifest_free(ptr >>> 0, 1));
+const ModelHandleFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_modelhandle_free(ptr >>> 0, 1));
+const ModelLoaderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_modelloader_free(ptr >>> 0, 1));
+const ModelPartsFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_modelparts_free(ptr >>> 0, 1));
+const ModelSourceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_modelsource_free(ptr >>> 0, 1));
+const SamplingDefaultsFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_samplingdefaults_free(ptr >>> 0, 1));
 const SessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_session_free(ptr >>> 0, 1));
@@ -4140,6 +6072,9 @@ const TokenizerFinalization = (typeof FinalizationRegistry === 'undefined')
 const TurboQuantConfigFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_turboquantconfig_free(ptr >>> 0, 1));
+const TurnResultFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_turnresult_free(ptr >>> 0, 1));
 const WebGpuCancelHandleFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_webgpucancelhandle_free(ptr >>> 0, 1));

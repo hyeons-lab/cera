@@ -169,6 +169,9 @@ mod settings {
 fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
     cera::GenerateOpts {
         max_tokens,
+        // Greedy decoding never samples, so the RNG stream is untouched on
+        // both sides; None pins that rather than seeding pointlessly.
+        seed: None,
         temperature: settings::TEMPERATURE,
         top_p: settings::TOP_P,
         top_k: settings::TOP_K,
@@ -196,6 +199,7 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
 fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
     cera_ffi::GenerateOpts {
         max_tokens,
+        seed: None,
         temperature: settings::TEMPERATURE,
         top_p: settings::TOP_P,
         top_k: settings::TOP_K,
