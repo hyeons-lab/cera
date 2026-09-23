@@ -6339,7 +6339,7 @@ final class FfiWhisperModelFfiCodec {
 }
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
-/// [`Session::attach_lora`]. Load it once and share the handle across sessions —
+/// [`Session::attach_lora`]. Load it once and share the handle across sessions:
 /// it's reference-counted internally, so attaching to multiple sessions doesn't
 /// re-parse or re-allocate the factors.
 final class LoraAdapters {
@@ -6359,7 +6359,7 @@ final class LoraAdapters {
   /// scale = 1, i.e. `alpha == rank`).
   static LoraAdapters fromSafetensors(String path, double? alpha) => _unsupportedOnWeb('LoraAdapters.fromSafetensors');
 
-  /// Number of `(layer, target)` low-rank deltas the adapter carries — for
+  /// Number of `(layer, target)` low-rank deltas the adapter carries, for
   /// diagnostics / logging.
   int targetCount() => _unsupportedOnWeb('LoraAdapters.targetCount');
 }

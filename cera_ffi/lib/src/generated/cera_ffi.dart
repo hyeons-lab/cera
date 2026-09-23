@@ -9111,8 +9111,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count != 23137) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: expected 23137, got $_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count');
+    if (_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count != 55901) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: expected 55901, got $_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk;
     try {
@@ -29458,7 +29458,7 @@ final class _LoraAdaptersFinalizerToken {
 }
 
 /// A loaded LoRA adapter, ready to attach to a [`Session`] via
-/// [`Session::attach_lora`]. Load it once and share the handle across sessions —
+/// [`Session::attach_lora`]. Load it once and share the handle across sessions:
 /// it's reference-counted internally, so attaching to multiple sessions doesn't
 /// re-parse or re-allocate the factors.
 final class LoraAdapters {
@@ -29505,7 +29505,7 @@ final class LoraAdapters {
     return _bindings().loraAdaptersCreateFromSafetensors(path, alpha);
   }
 
-  /// Number of `(layer, target)` low-rank deltas the adapter carries — for
+  /// Number of `(layer, target)` low-rank deltas the adapter carries, for
   /// diagnostics / logging.
   int targetCount() {
     _ensureOpen();
