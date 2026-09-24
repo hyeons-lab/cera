@@ -6545,18 +6545,26 @@ pub(crate) mod neon {
                     let mut acc3_1 = vdupq_n_s32(0);
 
                     let pbase = (sr * nb + b) * 256;
-                    let bq_blk = bq_ptr.add(j * k + b * 128);
                     for g in 0..8usize {
                         let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
                         let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
 
-                        let act_4x4 = vld1q_s8(bq_blk.add(g * 16));
-                        let act_s32 = vreinterpretq_s32_s8(act_4x4);
+                        // Activations are row-major [n, k]: each column's block
+                        // lives in its own row (compare the remainder path and
+                        // the column-major kernel, which address identically).
+                        let a4_0 =
+                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
+                        let a4_1 = (bq_ptr.add((j + 1) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
+                        let a4_2 = (bq_ptr.add((j + 2) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
+                        let a4_3 = (bq_ptr.add((j + 3) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
 
-                        let act0 = vreinterpretq_s8_s32(vdupq_laneq_s32::<0>(act_s32));
-                        let act1 = vreinterpretq_s8_s32(vdupq_laneq_s32::<1>(act_s32));
-                        let act2 = vreinterpretq_s8_s32(vdupq_laneq_s32::<2>(act_s32));
-                        let act3 = vreinterpretq_s8_s32(vdupq_laneq_s32::<3>(act_s32));
+                        let act0 = vreinterpretq_s8_s32(vdupq_n_s32(a4_0));
+                        let act1 = vreinterpretq_s8_s32(vdupq_n_s32(a4_1));
+                        let act2 = vreinterpretq_s8_s32(vdupq_n_s32(a4_2));
+                        let act3 = vreinterpretq_s8_s32(vdupq_n_s32(a4_3));
 
                         acc0_0 = vdotq_s32(acc0_0, w0, act0);
                         acc0_1 = vdotq_s32(acc0_1, w1, act0);
@@ -6789,15 +6797,23 @@ pub(crate) mod neon {
                     let mut uacc3_1 = vdupq_n_s32(0);
 
                     let pbase = (sr * nb + b) * 256;
-                    let bq_blk = bq_ptr.add(j * k + b * 128);
                     for g in 0..8usize {
-                        let act_4x4 = vld1q_s8(bq_blk.add(g * 16));
-                        let act_s32 = vreinterpretq_s32_s8(act_4x4);
+                        // Activations are row-major [n, k]: each column's block
+                        // lives in its own row (compare the remainder path,
+                        // which addresses identically).
+                        let a4_0 =
+                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
+                        let a4_1 = (bq_ptr.add((j + 1) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
+                        let a4_2 = (bq_ptr.add((j + 2) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
+                        let a4_3 = (bq_ptr.add((j + 3) * k + b * 32 + g * 4) as *const i32)
+                            .read_unaligned();
 
-                        let act0 = vreinterpretq_s8_s32(vdupq_laneq_s32::<0>(act_s32));
-                        let act1 = vreinterpretq_s8_s32(vdupq_laneq_s32::<1>(act_s32));
-                        let act2 = vreinterpretq_s8_s32(vdupq_laneq_s32::<2>(act_s32));
-                        let act3 = vreinterpretq_s8_s32(vdupq_laneq_s32::<3>(act_s32));
+                        let act0 = vreinterpretq_s8_s32(vdupq_n_s32(a4_0));
+                        let act1 = vreinterpretq_s8_s32(vdupq_n_s32(a4_1));
+                        let act2 = vreinterpretq_s8_s32(vdupq_n_s32(a4_2));
+                        let act3 = vreinterpretq_s8_s32(vdupq_n_s32(a4_3));
 
                         let gw0 = vld1q_s8(gp_ptr.add(pbase + g * 32));
                         let gw1 = vld1q_s8(gp_ptr.add(pbase + g * 32 + 16));
@@ -14618,6 +14634,146 @@ mod tests {
                     gemv_out[i]
                 );
             }
+        }
+    }
+
+    /// Repacked Q4_0 row-major GEMM vs a dequantize-then-dot reference (f64
+    /// accumulation): dequantize the weights, dot against the dequantized
+    /// activations. `n = 7` covers the 4-column main loop (cols 0..4) plus the
+    /// scalar remainder (cols 4..7); `m = 16` is two super-rows.
+    ///
+    /// Regression test: the main loop once read activations at `b * 128`
+    /// (an interleaved-column layout nothing produces) instead of row-major
+    /// `b * 32`, silently corrupting every main-path column while the
+    /// remainder stayed correct — every no-BLAS aarch64 prefill with `n >= 4`
+    /// decoded garbage.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_8x8_q8_0_rowmajor_matches_reference() {
+        if !require_simd_or_skip(
+            "dotprod",
+            std::arch::is_aarch64_feature_detected!("dotprod"),
+        ) {
+            return;
+        }
+        let m = 16;
+        let k = 256;
+        let n = 7;
+        let nb = k / 32;
+        let weights: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let a_bytes = build_q4_0_matrix(&weights, m, k);
+        let inputs: Vec<Vec<f32>> = (0..n)
+            .map(|j| {
+                (0..k)
+                    .map(|i| ((i * 13 + j * 7 + 5) % 23) as f32 * 0.2 - 2.3)
+                    .collect()
+            })
+            .collect();
+        let (b_scales, b_quants) = quantize_input_columns(&inputs, k);
+
+        let mut wdeq = vec![0.0f32; m * k];
+        crate::quant::dequantize_q4_0_matrix(&a_bytes, m, k, &mut wdeq);
+        // Row-major want[n, m].
+        let mut want = vec![0.0f32; n * m];
+        for j in 0..n {
+            for i in 0..m {
+                let mut acc = 0.0f64;
+                for e in 0..k {
+                    let xa = b_scales[j * nb + e / 32] * b_quants[j * k + e] as f32;
+                    acc += (wdeq[i * k + e] * xa) as f64;
+                }
+                want[j * m + i] = acc as f32;
+            }
+        }
+
+        let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a_bytes, m, k);
+        let mut got = vec![0.0f32; n * m];
+        unsafe {
+            neon::gemm_q4_0_8x8_q8_0_rowmajor(
+                &packed, &scales, &b_scales, &b_quants, &mut got, n, m, k,
+            );
+        }
+        for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                "q4_0_8x8_rowmajor [{},{}]: {g} vs reference {w}",
+                idx / m,
+                idx % m,
+            );
+        }
+    }
+
+    /// Fused repacked Q4_0 gate+up SiLU row-major GEMM vs the same
+    /// dequantize-then-dot reference plus `silu(gate) * up`. Same `n = 7`
+    /// main-loop/remainder coverage and the same regression: this kernel
+    /// shared the `b * 128` activation misread.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_gate_up_silu_rowmajor_matches_reference() {
+        if !require_simd_or_skip(
+            "dotprod",
+            std::arch::is_aarch64_feature_detected!("dotprod"),
+        ) {
+            return;
+        }
+        let m = 16;
+        let k = 256;
+        let n = 7;
+        let nb = k / 32;
+        let gate_w: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
+            .collect();
+        let up_w: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 11 + 7) % 31) as f32 * 0.1 - 1.5)
+            .collect();
+        let gate_bytes = build_q4_0_matrix(&gate_w, m, k);
+        let up_bytes = build_q4_0_matrix(&up_w, m, k);
+        let inputs: Vec<Vec<f32>> = (0..n)
+            .map(|j| {
+                (0..k)
+                    .map(|i| ((i * 13 + j * 7 + 5) % 23) as f32 * 0.2 - 2.3)
+                    .collect()
+            })
+            .collect();
+        let (b_scales, b_quants) = quantize_input_columns(&inputs, k);
+
+        let mut gate_deq = vec![0.0f32; m * k];
+        let mut up_deq = vec![0.0f32; m * k];
+        crate::quant::dequantize_q4_0_matrix(&gate_bytes, m, k, &mut gate_deq);
+        crate::quant::dequantize_q4_0_matrix(&up_bytes, m, k, &mut up_deq);
+        let mut want = vec![0.0f32; n * m];
+        for j in 0..n {
+            for i in 0..m {
+                let (mut acc_g, mut acc_u) = (0.0f64, 0.0f64);
+                for e in 0..k {
+                    let xa = b_scales[j * nb + e / 32] * b_quants[j * k + e] as f32;
+                    acc_g += (gate_deq[i * k + e] * xa) as f64;
+                    acc_u += (up_deq[i * k + e] * xa) as f64;
+                }
+                let silu = acc_g / (1.0 + (-acc_g).exp());
+                want[j * m + i] = (silu * acc_u) as f32;
+            }
+        }
+
+        let (gp, gs) = crate::backend::cpu::repack_q4_0_8x8(&gate_bytes, m, k);
+        let (up, us) = crate::backend::cpu::repack_q4_0_8x8(&up_bytes, m, k);
+        let mut got = vec![0.0f32; n * m];
+        unsafe {
+            neon::gemm_q4_0_gate_up_silu_rowmajor(
+                &gp, &gs, &up, &us, &b_scales, &b_quants, &mut got, n, m, k,
+            );
+        }
+        // Looser than the plain kernel: the kernel's SiLU uses the fast
+        // `ggml_expf` approximation while the reference uses exact `exp`.
+        for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-3 * w.abs().max(1.0),
+                "gate_up_silu_rowmajor [{},{}]: {g} vs reference {w}",
+                idx / m,
+                idx % m,
+            );
         }
     }
 
