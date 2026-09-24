@@ -789,6 +789,10 @@ pub(crate) mod neon {
     ///   For each group `g \in 0..8`:
     ///     `[t0_g, t1_g, t2_g, t3_g]` (16 contiguous bytes)
     /// Total per 4 tokens per block: 8 groups * 16 bytes = 128 bytes.
+    ///
+    /// Obsolete: no kernel consumes this layout anymore (the repacked row-major
+    /// kernels read standard row-major `b_quants` directly), and this function
+    /// has no callers. Kept only to document the historical format.
     #[allow(dead_code, clippy::too_many_arguments)]
     #[target_feature(enable = "neon")]
     pub unsafe fn quantize_f32_to_q8_0_interleaved4_neon(
@@ -6699,10 +6703,11 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                let nth = crate::backend::cpu::decode_par_threads().max(1);
-                let chunk = sr_count.div_ceil(nth * 4).max(1);
-                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+                crate::backend::cpu::par_range_prefill(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
@@ -7007,10 +7012,11 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                let nth = crate::backend::cpu::decode_par_threads().max(1);
-                let chunk = sr_count.div_ceil(nth * 4).max(1);
-                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+                crate::backend::cpu::par_range_prefill(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
