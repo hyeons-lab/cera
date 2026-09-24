@@ -6284,6 +6284,11 @@ pub(crate) mod neon {
     }
 
     /// Repacked 8x4 Q4_0 × Q8_0 batched GEMM writing to `chunk[8 * n]`.
+    ///
+    /// Activations are row-major: `b_quants` is `[n, k]` (token `j`, block `b`,
+    /// group `g` at `j * k + b * 32 + g * 4`) and `b_scales` is `[n, nb]` (at
+    /// `j * nb + b`). Every main and remainder loop in this kernel family
+    /// addresses them identically; columns are never interleaved.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
@@ -6350,19 +6355,10 @@ pub(crate) mod neon {
                         let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
                         let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
 
-                        let a4_0 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let a4_1 = (bq_ptr.add((j + 1) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_2 = (bq_ptr.add((j + 2) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_3 = (bq_ptr.add((j + 3) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-
-                        let act0 = vreinterpretq_s8_s32(vdupq_n_s32(a4_0));
-                        let act1 = vreinterpretq_s8_s32(vdupq_n_s32(a4_1));
-                        let act2 = vreinterpretq_s8_s32(vdupq_n_s32(a4_2));
-                        let act3 = vreinterpretq_s8_s32(vdupq_n_s32(a4_3));
+                        let act0 = load_act_4(bq_ptr, j, k, b, g);
+                        let act1 = load_act_4(bq_ptr, j + 1, k, b, g);
+                        let act2 = load_act_4(bq_ptr, j + 2, k, b, g);
+                        let act3 = load_act_4(bq_ptr, j + 3, k, b, g);
 
                         acc0_0 = vdotq_s32(acc0_0, w0, act0);
                         acc0_1 = vdotq_s32(acc0_1, w1, act0);
@@ -6440,9 +6436,7 @@ pub(crate) mod neon {
                         let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
                         let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
 
-                        let a4 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let act = vreinterpretq_s8_s32(vdupq_n_s32(a4));
+                        let act = load_act_4(bq_ptr, j, k, b, g);
 
                         acc0 = vdotq_s32(acc0, w0, act);
                         acc1 = vdotq_s32(acc1, w1, act);
@@ -6480,7 +6474,39 @@ pub(crate) mod neon {
         }
     }
 
+    /// Load one column's 4 activation bytes for block `b`, group `g` from
+    /// row-major `bq[n, k]` and broadcast them to all four i32 lanes.
+    ///
+    /// Canonical spelling for the repacked-Q4_0 family: all three kernels'
+    /// main loops and remainders call this.
+    #[inline]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn load_act_4(bq: *const i8, tok: usize, k: usize, b: usize, g: usize) -> int8x16_t {
+        // SAFETY: `tok < n` comes from the caller's loop guards (`j + 4 <= n`
+        // covering `tok` in `j..j + 4`, `j < n` in the remainders), `b < nb`
+        // from `for b in 0..nb` and `g < 8` from `for g in 0..8`, so the 4-byte
+        // read at `tok * k + b * 32 + g * 4` stays inside row-major `bq[n, k]`
+        // provided the kernel precondition `b_quants.len() >= n * k` holds.
+        // Release-mode callers get it from their dispatcher's
+        // `activation/output buffers wrong` assert (one per Q4_0 dispatcher:
+        // `gemm_preq_repacked_q4_0_dispatch`,
+        // `gemm_preq_repacked_q4_0_rowmajor_dispatch`,
+        // `gemm_preq_repacked_q4_0_gate_up_silu_dispatch`); direct kernel
+        // callers (the reference tests) establish it by fixture construction,
+        // since the kernels' `debug_assert_eq!(b_quants.len(), n * k)` compile out.
+        unsafe {
+            let a4 = (bq.add(tok * k + b * 32 + g * 4) as *const i32).read_unaligned();
+            vreinterpretq_s8_s32(vdupq_n_s32(a4))
+        }
+    }
+
     /// Repacked 8x4 Q4_0 × Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout.
+    ///
+    /// Activations are row-major too: `b_quants` is `[n, k]` (token `j`,
+    /// block `b`, group `g` at `j * k + b * 32 + g * 4`) and `b_scales` is
+    /// `[n, nb]` (at `j * nb + b`). Every main and remainder loop in this
+    /// kernel family addresses them identically; columns are never
+    /// interleaved.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
@@ -6549,22 +6575,10 @@ pub(crate) mod neon {
                         let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
                         let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
 
-                        // Activations are row-major [n, k]: each column's block
-                        // lives in its own row (compare the remainder path and
-                        // the column-major kernel, which address identically).
-                        let a4_0 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let a4_1 = (bq_ptr.add((j + 1) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_2 = (bq_ptr.add((j + 2) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_3 = (bq_ptr.add((j + 3) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-
-                        let act0 = vreinterpretq_s8_s32(vdupq_n_s32(a4_0));
-                        let act1 = vreinterpretq_s8_s32(vdupq_n_s32(a4_1));
-                        let act2 = vreinterpretq_s8_s32(vdupq_n_s32(a4_2));
-                        let act3 = vreinterpretq_s8_s32(vdupq_n_s32(a4_3));
+                        let act0 = load_act_4(bq_ptr, j, k, b, g);
+                        let act1 = load_act_4(bq_ptr, j + 1, k, b, g);
+                        let act2 = load_act_4(bq_ptr, j + 2, k, b, g);
+                        let act3 = load_act_4(bq_ptr, j + 3, k, b, g);
 
                         acc0_0 = vdotq_s32(acc0_0, w0, act0);
                         acc0_1 = vdotq_s32(acc0_1, w1, act0);
@@ -6647,9 +6661,7 @@ pub(crate) mod neon {
                         let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
                         let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
 
-                        let a4 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let act = vreinterpretq_s8_s32(vdupq_n_s32(a4));
+                        let act = load_act_4(bq_ptr, j, k, b, g);
 
                         acc0 = vdotq_s32(acc0, w0, act);
                         acc1 = vdotq_s32(acc1, w1, act);
@@ -6701,6 +6713,11 @@ pub(crate) mod neon {
     ///
     /// Computes `out[tok, r] = silu(gate[r] · act[tok]) * (up[r] · act[tok])` directly in registers,
     /// eliminating intermediate memory allocations, store/load rounds, and cache thrashing for `up_mat`.
+    ///
+    /// Activations are row-major: `b_quants` is `[n, k]` (token `j`, block `b`,
+    /// group `g` at `j * k + b * 32 + g * 4`) and `b_scales` is `[n, nb]` (at
+    /// `j * nb + b`). Every main and remainder loop in this kernel family
+    /// addresses them identically; columns are never interleaved.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
@@ -6798,22 +6815,10 @@ pub(crate) mod neon {
 
                     let pbase = (sr * nb + b) * 256;
                     for g in 0..8usize {
-                        // Activations are row-major [n, k]: each column's block
-                        // lives in its own row (compare the remainder path,
-                        // which addresses identically).
-                        let a4_0 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let a4_1 = (bq_ptr.add((j + 1) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_2 = (bq_ptr.add((j + 2) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-                        let a4_3 = (bq_ptr.add((j + 3) * k + b * 32 + g * 4) as *const i32)
-                            .read_unaligned();
-
-                        let act0 = vreinterpretq_s8_s32(vdupq_n_s32(a4_0));
-                        let act1 = vreinterpretq_s8_s32(vdupq_n_s32(a4_1));
-                        let act2 = vreinterpretq_s8_s32(vdupq_n_s32(a4_2));
-                        let act3 = vreinterpretq_s8_s32(vdupq_n_s32(a4_3));
+                        let act0 = load_act_4(bq_ptr, j, k, b, g);
+                        let act1 = load_act_4(bq_ptr, j + 1, k, b, g);
+                        let act2 = load_act_4(bq_ptr, j + 2, k, b, g);
+                        let act3 = load_act_4(bq_ptr, j + 3, k, b, g);
 
                         let gw0 = vld1q_s8(gp_ptr.add(pbase + g * 32));
                         let gw1 = vld1q_s8(gp_ptr.add(pbase + g * 32 + 16));
@@ -6937,9 +6942,7 @@ pub(crate) mod neon {
                         options(nostack, preserves_flags)
                     );
                     for g in 0..8usize {
-                        let a4 =
-                            (bq_ptr.add(j * k + b * 32 + g * 4) as *const i32).read_unaligned();
-                        let act = vreinterpretq_s8_s32(vdupq_n_s32(a4));
+                        let act = load_act_4(bq_ptr, j, k, b, g);
 
                         let gw0 = vld1q_s8(gp_ptr.add(pbase + g * 32));
                         let gw1 = vld1q_s8(gp_ptr.add(pbase + g * 32 + 16));
@@ -10051,6 +10054,13 @@ macro_rules! int8_gemm_kernels {
         // `gemm_preq_repacked_q4_0_dispatch` is `cfg(not(blas))`, so a non-test
         // `--features blas` lib build has no caller (the tests still do). Same
         // pattern the other `blas`-dead kernels here carry.
+        ///
+        /// Repacked 8-row-interleave Q4_0 x Q8_0 batched GEMM (x86 instantiation).
+        ///
+        /// Activations are row-major: `b_quants` is `[n, k]` (column `col`,
+        /// block `b`, group `g` at `col * k + b * 32 + g * 4`) and `b_scales`
+        /// is `[n, nb]` (at `col * nb + b`): the same layout the NEON
+        /// repacked-Q4_0 family documents; columns are never interleaved.
         #[cfg_attr(feature = "blas", allow(dead_code))]
         #[allow(clippy::too_many_arguments)]
         #[target_feature(enable = $feat)]
@@ -10195,6 +10205,12 @@ macro_rules! int8_gemm_kernels {
         ///
         /// `allow(dead_code)` under `blas`: the sole caller
         /// `gemm_preq_repacked_q4_k_dispatch` is `cfg(not(blas))`.
+        ///
+        /// Activations are row-major: `b_quants` is `[n, k]` (column `col`,
+        /// 32-block `block`, group `g` at `col * k + block * 32 + g * 4`) and
+        /// `b_scales` is `[n, nb32]` (at `col * nb32 + block`): the same layout
+        /// the NEON repacked-Q4_0 family and the Q4_0 instantiation above
+        /// document; columns are never interleaved.
         #[cfg_attr(feature = "blas", allow(dead_code))]
         #[allow(clippy::too_many_arguments)]
         #[target_feature(enable = $feat)]
@@ -14637,33 +14653,27 @@ mod tests {
         }
     }
 
-    /// Repacked Q4_0 row-major GEMM vs a dequantize-then-dot reference (f64
-    /// accumulation): dequantize the weights, dot against the dequantized
-    /// activations. `n = 7` covers the 4-column main loop (cols 0..4) plus the
-    /// scalar remainder (cols 4..7); `m = 16` is two super-rows.
-    ///
-    /// Regression test: the main loop once read activations at `b * 128`
-    /// (an interleaved-column layout nothing produces) instead of row-major
-    /// `b * 32`, silently corrupting every main-path column while the
-    /// remainder stayed correct — every no-BLAS aarch64 prefill with `n >= 4`
-    /// decoded garbage.
-    #[test]
+    /// Shape matrix shared by the three repacked-Q4_0 `*_matches_reference`
+    /// tests, so a new leg covers all three kernels or none.
     #[cfg(target_arch = "aarch64")]
-    fn test_gemm_q4_0_8x8_q8_0_rowmajor_matches_reference() {
-        if !require_simd_or_skip(
-            "dotprod",
-            std::arch::is_aarch64_feature_detected!("dotprod"),
-        ) {
-            return;
-        }
-        let m = 16;
-        let k = 256;
-        let n = 7;
-        let nb = k / 32;
+    const Q4_0_REFERENCE_SHAPES: [(usize, usize, usize); 4] =
+        [(8, 32, 1), (8, 64, 3), (8, 64, 4), (16, 256, 7)];
+
+    /// Pseudo-random Q4_0 weight bytes shared by the three
+    /// `*_matches_reference` tests (the fused test's gate matrix too; its up
+    /// matrix uses a distinct formula inline).
+    #[cfg(target_arch = "aarch64")]
+    fn q4_0_reference_weight_bytes(m: usize, k: usize) -> Vec<u8> {
         let weights: Vec<f32> = (0..m * k)
             .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
             .collect();
-        let a_bytes = build_q4_0_matrix(&weights, m, k);
+        build_q4_0_matrix(&weights, m, k)
+    }
+
+    /// Pseudo-random Q8_0 activations shared by the three
+    /// `*_matches_reference` tests, as `(b_scales, b_quants)`.
+    #[cfg(target_arch = "aarch64")]
+    fn q4_0_reference_activations(n: usize, k: usize) -> (Vec<f32>, Vec<i8>) {
         let inputs: Vec<Vec<f32>> = (0..n)
             .map(|j| {
                 (0..k)
@@ -14671,7 +14681,100 @@ mod tests {
                     .collect()
             })
             .collect();
-        let (b_scales, b_quants) = quantize_input_columns(&inputs, k);
+        quantize_input_columns(&inputs, k)
+    }
+
+    /// Repacked Q4_0 column-major GEMM vs a dequantize-then-dot reference
+    /// (f64 accumulation), column-major `want[m, n]`. Same shape matrix as
+    /// the row-major twins; pins the sibling whose addressing the row-major
+    /// fix was verified against, so all three kernels sharing `load_act_4`
+    /// are covered.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_8x8_q8_0_matches_reference() {
+        if !require_simd_or_skip(
+            "dotprod",
+            crate::backend::cpu_features::cpu_features().dotprod,
+        ) {
+            return;
+        }
+        for (m, k, n) in Q4_0_REFERENCE_SHAPES {
+            assert_colmajor_matches_reference(m, k, n);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn assert_colmajor_matches_reference(m: usize, k: usize, n: usize) {
+        let nb = k / 32;
+        let a_bytes = q4_0_reference_weight_bytes(m, k);
+        let (b_scales, b_quants) = q4_0_reference_activations(n, k);
+
+        let mut wdeq = vec![0.0f32; m * k];
+        crate::quant::dequantize_q4_0_matrix(&a_bytes, m, k, &mut wdeq);
+        // Column-major want[m, n].
+        let mut want = vec![0.0f32; m * n];
+        for j in 0..n {
+            for i in 0..m {
+                let mut acc = 0.0f64;
+                for e in 0..k {
+                    let xa = b_scales[j * nb + e / 32] * b_quants[j * k + e] as f32;
+                    acc += (wdeq[i * k + e] * xa) as f64;
+                }
+                want[i * n + j] = acc as f32;
+            }
+        }
+
+        let (packed, scales) = crate::backend::cpu::repack_q4_0_8x8(&a_bytes, m, k);
+        let mut got = vec![0.0f32; m * n];
+        unsafe {
+            neon::gemm_q4_0_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut got, m, n, k);
+        }
+        for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                "q4_0_8x8 [{m}x{k}x{n}][{},{}]: {g} vs reference {w}",
+                idx / n,
+                idx % n,
+            );
+        }
+    }
+
+    /// Repacked Q4_0 row-major GEMM vs a dequantize-then-dot reference (f64
+    /// accumulation): dequantize the weights, dot against the dequantized
+    /// activations.
+    ///
+    /// Regression test: the main loop once read activations at `b * 128`
+    /// (an interleaved-column layout nothing produces) instead of row-major
+    /// `b * 32`, silently corrupting every main-path column while the
+    /// remainder stayed correct; every no-BLAS aarch64 prefill with `n >= 4`
+    /// decoded garbage.
+    ///
+    /// Shapes cover every dispatch/loop leg: serial super-row + remainder-only
+    /// `(8, 32, 1)` and `(8, 64, 3)`, main-loop-only `(8, 64, 4)`, parallel
+    /// main+remainder `(16, 256, 7)`. Only shapes reaching the 4-column main
+    /// loop (`n >= 4`) pin the regression: the pre-fix loop differed in the
+    /// block, group, and token strides alike (`b * 128`, `g * 16`, `t * 4`),
+    /// so every main-loop read was suspect, while the `n < 4` legs never enter
+    /// it and pin only dispatch legs that were never buggy.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_gemm_q4_0_8x8_q8_0_rowmajor_matches_reference() {
+        if !require_simd_or_skip(
+            "dotprod",
+            crate::backend::cpu_features::cpu_features().dotprod,
+        ) {
+            return;
+        }
+        for (m, k, n) in Q4_0_REFERENCE_SHAPES {
+            assert_plain_rowmajor_matches_reference(m, k, n);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn assert_plain_rowmajor_matches_reference(m: usize, k: usize, n: usize) {
+        let nb = k / 32;
+        let a_bytes = q4_0_reference_weight_bytes(m, k);
+        let (b_scales, b_quants) = q4_0_reference_activations(n, k);
 
         let mut wdeq = vec![0.0f32; m * k];
         crate::quant::dequantize_q4_0_matrix(&a_bytes, m, k, &mut wdeq);
@@ -14698,7 +14801,7 @@ mod tests {
         for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
             assert!(
                 (g - w).abs() <= 1e-5 * w.abs().max(1.0),
-                "q4_0_8x8_rowmajor [{},{}]: {g} vs reference {w}",
+                "q4_0_8x8_rowmajor [{m}x{k}x{n}][{},{}]: {g} vs reference {w}",
                 idx / m,
                 idx % m,
             );
@@ -14706,38 +14809,32 @@ mod tests {
     }
 
     /// Fused repacked Q4_0 gate+up SiLU row-major GEMM vs the same
-    /// dequantize-then-dot reference plus `silu(gate) * up`. Same `n = 7`
-    /// main-loop/remainder coverage and the same regression: this kernel
+    /// dequantize-then-dot reference plus `silu(gate) * up`. Same shape
+    /// matrix and the same regression as the plain kernel: this kernel
     /// shared the `b * 128` activation misread.
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_gemm_q4_0_gate_up_silu_rowmajor_matches_reference() {
         if !require_simd_or_skip(
             "dotprod",
-            std::arch::is_aarch64_feature_detected!("dotprod"),
+            crate::backend::cpu_features::cpu_features().dotprod,
         ) {
             return;
         }
-        let m = 16;
-        let k = 256;
-        let n = 7;
+        for (m, k, n) in Q4_0_REFERENCE_SHAPES {
+            assert_fused_rowmajor_matches_reference(m, k, n);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn assert_fused_rowmajor_matches_reference(m: usize, k: usize, n: usize) {
         let nb = k / 32;
-        let gate_w: Vec<f32> = (0..m * k)
-            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.1 - 1.4)
-            .collect();
+        let gate_bytes = q4_0_reference_weight_bytes(m, k);
         let up_w: Vec<f32> = (0..m * k)
             .map(|i| ((i * 11 + 7) % 31) as f32 * 0.1 - 1.5)
             .collect();
-        let gate_bytes = build_q4_0_matrix(&gate_w, m, k);
         let up_bytes = build_q4_0_matrix(&up_w, m, k);
-        let inputs: Vec<Vec<f32>> = (0..n)
-            .map(|j| {
-                (0..k)
-                    .map(|i| ((i * 13 + j * 7 + 5) % 23) as f32 * 0.2 - 2.3)
-                    .collect()
-            })
-            .collect();
-        let (b_scales, b_quants) = quantize_input_columns(&inputs, k);
+        let (b_scales, b_quants) = q4_0_reference_activations(n, k);
 
         let mut gate_deq = vec![0.0f32; m * k];
         let mut up_deq = vec![0.0f32; m * k];
@@ -14770,7 +14867,7 @@ mod tests {
         for (idx, (g, w)) in got.iter().zip(&want).enumerate() {
             assert!(
                 (g - w).abs() <= 1e-3 * w.abs().max(1.0),
-                "gate_up_silu_rowmajor [{},{}]: {g} vs reference {w}",
+                "gate_up_silu_rowmajor [{m}x{k}x{n}][{},{}]: {g} vs reference {w}",
                 idx / m,
                 idx % m,
             );

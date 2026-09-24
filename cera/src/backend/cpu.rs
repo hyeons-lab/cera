@@ -7896,6 +7896,295 @@ mod tests {
         }
     }
 
+    /// Well-formed repacked-dispatcher args shared by the plain and fused
+    /// guard modules: m = 8, n = 1, k = 32, as
+    /// `(packed, scales, b_scales, b_quants, out)`. Packed sizing satisfies
+    /// both arches (256 B/block on aarch64, 128 on x86); one constructor so a
+    /// sizing change cannot desync the two modules' fixtures.
+    #[allow(clippy::type_complexity)]
+    fn repacked_guard_base_args() -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>) {
+        (
+            vec![0u8; 256],
+            vec![0.0f32; 8],
+            vec![0.0f32; 1],
+            vec![0i8; 32],
+            vec![0.0f32; 8],
+        )
+    }
+
+    /// The repacked plain row-major dispatcher's release-mode guards must fire.
+    ///
+    /// Same rationale as `gemm_preq_guards`: these `assert!`s are the only
+    /// release-mode enforcement of the kernels' preconditions (the kernels'
+    /// `debug_assert!`s compile out), and the golden tests all use valid
+    /// buffers, so a weakened guard would pass the suite and surface only
+    /// as silent OOB reads/writes in release. One test per guard leg, with
+    /// partner values satisfying every other assert so each kills exactly
+    /// its leg. Gated exactly like the dispatcher itself.
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+    mod gemm_preq_repacked_plain_guards {
+        use super::*;
+
+        /// Well-formed plain-dispatcher args: the shared base fixture.
+        #[allow(clippy::type_complexity)]
+        fn plain_args() -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<i8>, Vec<f32>) {
+            repacked_guard_base_args()
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn plain_over_long_out_is_rejected() {
+            let (packed, scales, bs, bq, mut out) = plain_args();
+            out.push(0.0);
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn plain_short_out_is_rejected() {
+            let (packed, scales, bs, bq, mut out) = plain_args();
+            out.pop();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "repacked weights too small")]
+        fn plain_short_packed_is_rejected() {
+            let (mut packed, scales, bs, bq, mut out) = plain_args();
+            packed.truncate(64);
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "need k%32==0 and m%8==0")]
+        fn plain_misaligned_m_is_rejected() {
+            let (packed, scales, bs, bq, mut out) = plain_args();
+            // Partners pass every other assert: out == m*n == 7 satisfies the
+            // buffer gate, and the weights gate needs (7/8)*nb*256 == 0 packed
+            // bytes, so only the `m % 8` conjunct can fire.
+            out.pop();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 7, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "need k%32==0 and m%8==0")]
+        fn plain_misaligned_k_is_rejected() {
+            // Partners pass every other assert (nb = k / 32 = 1): only the
+            // `k % 32` conjunct can fire.
+            let (packed, scales, _, _, mut out) = plain_args();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed,
+                &scales,
+                &[0.0f32; 1],
+                &[0i8; 48],
+                &mut out,
+                1,
+                8,
+                48,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "repacked weights too small")]
+        fn plain_short_scales_is_rejected() {
+            let (packed, mut scales, bs, bq, mut out) = plain_args();
+            scales.truncate(4);
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn plain_short_bquants_is_rejected() {
+            let (packed, scales, bs, mut bq, mut out) = plain_args();
+            bq.truncate(16);
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn plain_short_bscales_is_rejected() {
+            let (packed, scales, mut bs, bq, mut out) = plain_args();
+            bs.clear();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+
+        #[test]
+        fn plain_well_formed_call_is_accepted() {
+            let (packed, scales, bs, bq, mut out) = plain_args();
+            gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                &packed, &scales, &bs, &bq, &mut out, 1, 8, 32,
+            );
+        }
+    }
+
+    /// The repacked fused gate-up-SiLU dispatcher's release-mode guards must
+    /// fire. Same per-leg rationale as the plain module above. Deliberately
+    /// ungated (except the aarch64-only asserts): unlike the plain
+    /// dispatcher, the fused one exists on every build including `has_blas`,
+    /// so gating this module would compile the fused guards out of the
+    /// macOS CI leg that unifies `blas`.
+    mod gemm_preq_repacked_fused_guards {
+        use super::*;
+
+        /// Well-formed fused-dispatcher args: the shared base fixture with
+        /// the packed/scales pair duplicated for gate and up.
+        #[allow(clippy::type_complexity)]
+        fn fused_args() -> (
+            Vec<u8>,
+            Vec<f32>,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<i8>,
+            Vec<f32>,
+        ) {
+            let (packed, scales, bs, bq, out) = repacked_guard_base_args();
+            (packed.clone(), scales.clone(), packed, scales, bs, bq, out)
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn fused_over_long_out_is_rejected() {
+            let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            out.push(0.0);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn fused_short_out_is_rejected() {
+            let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            out.pop();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "gate packed bytes mismatch")]
+        fn fused_short_gate_packed_is_rejected() {
+            let (mut gp, gs, up, us, bs, bq, mut out) = fused_args();
+            gp.truncate(128);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "up scales mismatch")]
+        fn fused_short_up_scales_is_rejected() {
+            let (gp, gs, up, mut us, bs, bq, mut out) = fused_args();
+            us.truncate(4);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "must be %8")]
+        fn fused_misaligned_m_is_rejected() {
+            let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            // Partners pass every other assert: m = 9 keeps sr_count == 1 so
+            // the 256/8 packed/scales fixtures satisfy the `assert_eq!`s, and
+            // out == m*n == 9 satisfies the buffer gate, so only the `m % 8`
+            // conjunct can fire.
+            out.push(0.0);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 9, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "up packed bytes mismatch")]
+        fn fused_short_up_packed_is_rejected() {
+            let (gp, gs, mut up, us, bs, bq, mut out) = fused_args();
+            up.truncate(128);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "gate scales mismatch")]
+        fn fused_short_gate_scales_is_rejected() {
+            let (gp, mut gs, up, us, bs, bq, mut out) = fused_args();
+            gs.truncate(4);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn fused_short_bquants_is_rejected() {
+            let (gp, gs, up, us, bs, mut bq, mut out) = fused_args();
+            bq.truncate(16);
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "activation/output buffers wrong")]
+        fn fused_short_bscales_is_rejected() {
+            let (gp, gs, up, us, mut bs, bq, mut out) = fused_args();
+            bs.clear();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        #[should_panic(expected = "must be %32")]
+        fn fused_misaligned_k_is_rejected() {
+            // Partners pass every other assert (nb = k / 32 = 1): only the
+            // `k % 32` conjunct can fire.
+            let (gp, gs, up, us, _, _, mut out) = fused_args();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp,
+                &gs,
+                &up,
+                &us,
+                &[0.0f32; 1],
+                &[0i8; 48],
+                &mut out,
+                8,
+                1,
+                48,
+            );
+        }
+
+        #[test]
+        fn fused_well_formed_call_is_accepted() {
+            let (gp, gs, up, us, bs, bq, mut out) = fused_args();
+            gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
+                &gp, &gs, &up, &us, &bs, &bq, &mut out, 8, 1, 32,
+            );
+        }
+    }
+
     /// The repacked-Q4_0 dispatch must agree with the standard-layout dispatch
     /// for the same weight — one level above the kernel equivalence test in
     /// `simd.rs`. This drives the *plumbing*: `repack_q4_0_8x8` →
