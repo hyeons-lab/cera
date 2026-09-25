@@ -6,7 +6,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <application>
+    <!-- Both entries below merge into consuming apps (manifest merger):
+         an app's own values win on conflict.
+         - extractNativeLibs: the DSP skels in jniLibs must be real files at
+           install time (the FastRPC loader opens them by path), not
+           unextracted entries inside the APK.
+         - uses-native-library: grants the app linker namespace access to
+           the vendor FastRPC client (on the vendor public list).
+           required=false so devices without it still install; the NPU
+           probe then reports unavailable and callers fall back. -->
+    <application android:extractNativeLibs="true">
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
         <service
             android:name="com.hyeonslab.cera.android.download.CeraDownloadService"
             android:exported="false"

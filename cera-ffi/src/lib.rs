@@ -412,24 +412,32 @@ pub struct HexagonProbeInfo {
     pub vtcm_bytes: u64,
 }
 
+/// Map a core probe result onto the FFI record. Factored out of
+/// [`hexagon_probe`] so the wire mapping (especially `arch`) is testable
+/// without FastRPC hardware.
+#[cfg(feature = "hexagon")]
+fn probe_info_from(p: &cera::backend::hexagon::HexagonProbe) -> HexagonProbeInfo {
+    HexagonProbeInfo {
+        arch: p.arch.short_name().to_string(),
+        threads: p.n_threads,
+        hvx_units: p.n_hvx,
+        hmx_units: p.n_hmx,
+        vtcm_bytes: p.vtcm_bytes,
+    }
+}
+
 /// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
 /// tries each bundled DSP skel, and returns the first working device's
 /// capabilities (then closes it). Fails when the `hexagon` feature is
 /// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
-/// unavailable to this process. Call [`hexagon_install_skels`] first on
-/// Android so the loader can find the skel files.
+/// unavailable to this process. On Android, call the AAR's
+/// `HexagonNpu.setup` first so the loader can find the skel files
+/// (JVM/desktop flows use [`hexagon_install_skels`] instead).
 #[uniffi::export]
 pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
     #[cfg(feature = "hexagon")]
     {
-        let p = cera::backend::hexagon::probe()?;
-        Ok(HexagonProbeInfo {
-            arch: format!("{:?}", p.arch),
-            threads: p.n_threads,
-            hvx_units: p.n_hvx,
-            hmx_units: p.n_hmx,
-            vtcm_bytes: p.vtcm_bytes,
-        })
+        Ok(probe_info_from(&cera::backend::hexagon::probe()?))
     }
     #[cfg(not(feature = "hexagon"))]
     {
@@ -440,12 +448,15 @@ pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
 }
 
 /// Write the embedded DSP skels into `dir` (created if missing) and
-/// point FastRPC's loader at it. Call once at app startup (before
-/// [`hexagon_probe`] or loading a model with
-/// [`BackendPreference::Hexagon`]), passing a private writable
-/// directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
-/// of skels installed. Re-running is cheap (files are only rewritten
-/// when the size differs).
+/// point FastRPC's loader at it. For JVM/desktop/shell flows where the
+/// caller stages a private writable directory; Android apps instead use
+/// the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+/// (which points the loader at `nativeLibraryDir`), so this call is not
+/// needed there. Call once at startup, before [`hexagon_probe`] or
+/// loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// number of skels written (0 when all were already present and fresh).
+/// Re-running is cheap and idempotent (files are only rewritten when
+/// their bytes differ, and the loader path is not duplicated).
 #[uniffi::export]
 pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError> {
     #[cfg(feature = "hexagon")]
@@ -4157,6 +4168,43 @@ impl PiiClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the FFI `arch` wire strings end to end: the literals plus the
+    /// field mapping in `probe_info_from` (a hardcoded `arch` or swapped
+    /// field fails here). NOTE: a revert to `format!("{:?}", …)` passes
+    /// this test (derived `Debug` of these unit variants is value-equal to
+    /// `short_name()`), so the mapping line itself is guarded by review,
+    /// not by this assertion. Constructing `HexagonProbe` directly needs
+    /// no FastRPC hardware (all fields are pub).
+    #[cfg(feature = "hexagon")]
+    #[test]
+    fn probe_arch_wire_names_pinned() {
+        use cera::backend::hexagon::{HexagonArch, HexagonProbe};
+        for (arch, want) in [
+            (HexagonArch::V73, "V73"),
+            (HexagonArch::V75, "V75"),
+            (HexagonArch::V79, "V79"),
+            (HexagonArch::V81, "V81"),
+        ] {
+            let info = probe_info_from(&HexagonProbe {
+                arch,
+                n_threads: 4,
+                n_hvx: 2,
+                n_hmx: 1,
+                vtcm_bytes: 1024,
+            });
+            assert_eq!(info.arch, want);
+            assert_eq!(
+                (
+                    info.threads,
+                    info.hvx_units,
+                    info.hmx_units,
+                    info.vtcm_bytes
+                ),
+                (4, 2, 1, 1024)
+            );
+        }
+    }
 
     #[test]
     fn version_is_non_empty() {

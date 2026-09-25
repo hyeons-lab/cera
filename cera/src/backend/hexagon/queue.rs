@@ -109,13 +109,39 @@ impl HexagonQueueSession {
         self.max_ops_per_flush = max.filter(|&m| m >= 1);
     }
 
+    /// Next free DSP-visible index for a registry. The DSP reads `u16`
+    /// indices, and `0xffff` is the wire absent-operand marker (unused
+    /// src/dst slots are padded with it), so a batch past 65534 entries is
+    /// an error, never a silently aliasing truncation.
+    fn batch_index(len: usize, what: &str) -> Result<u16, CeraError> {
+        if len >= 0xffff {
+            return Err(CeraError::Backend(format!(
+                "HTP batch exceeds 65534 {what} ({len})"
+            )));
+        }
+        Ok(len as u16)
+    }
+
+    /// Drop the pending batch. Used when registration fails: the batch is
+    /// uncompletable (its owning dispatch already failed) and retaining it
+    /// would wedge the session, since every later registration fails the
+    /// same way. No `seq` advance: nothing was attempted, so the
+    /// stale-drain accounting is unaffected.
+    fn drop_pending_batch(&mut self) {
+        self.bufs.clear();
+        self.buf_map.clear();
+        self.tens.clear();
+        self.ops.clear();
+    }
+
     /// Register a buffer in the batch, returning its index.
-    pub fn add_buffer(&mut self, buf: &RpcmemBuffer) -> u16 {
+    pub fn add_buffer(&mut self, buf: &RpcmemBuffer) -> Result<u16, CeraError> {
         let fd = buf.fd();
         if let Some(&idx) = self.buf_map.get(&fd) {
-            return idx;
+            return Ok(idx);
         }
-        let idx = self.bufs.len() as u16;
+        let idx = Self::batch_index(self.bufs.len(), "buffers")
+            .inspect_err(|_| self.drop_pending_batch())?;
         self.bufs.push(HtpBufDesc {
             base: buf.as_ptr() as u64,
             size: buf.size() as u64,
@@ -123,7 +149,7 @@ impl HexagonQueueSession {
             fd: fd as u32,
         });
         self.buf_map.insert(fd, idx);
-        idx
+        Ok(idx)
     }
 
     /// Register a tensor in the batch, returning its index.
@@ -138,9 +164,10 @@ impl HexagonQueueSession {
         dtype: u32,
         ne: [u32; 4],
         nb: [u32; 4],
-    ) -> u16 {
-        let bi = self.add_buffer(buf);
-        let ti = self.tens.len() as u16;
+    ) -> Result<u16, CeraError> {
+        let bi = self.add_buffer(buf)?;
+        let ti = Self::batch_index(self.tens.len(), "tensors")
+            .inspect_err(|_| self.drop_pending_batch())?;
         self.tens.push(HtpTensor {
             data: offset as u64,
             size: size as u32,
@@ -151,10 +178,13 @@ impl HexagonQueueSession {
             ne,
             nb,
         });
-        ti
+        Ok(ti)
     }
 
-    /// Enqueue an operation into the current batch.
+    /// Enqueue an operation into the current batch. Returns the capped
+    /// auto-flush (or step-mode flush) error instead of panicking: the cap is
+    /// set on production prefill/decode paths, and a panic at the UniFFI
+    /// boundary aborts the host process.
     pub fn enqueue_op(
         &mut self,
         opcode: u32,
@@ -162,7 +192,7 @@ impl HexagonQueueSession {
         dst: &[u16],
         params: [i32; 16],
         kernel_params: [i32; 32],
-    ) {
+    ) -> Result<(), CeraError> {
         let mut op = HtpOpDesc {
             opcode,
             flags: 0,
@@ -179,21 +209,21 @@ impl HexagonQueueSession {
             op.dst[i] = d;
         }
         self.ops.push(op);
-        if self.max_ops_per_flush.is_some_and(|m| self.ops.len() >= m)
-            && let Err(e) = self.flush()
-        {
-            panic!(
-                "HTP capped flush failed (cap={:?}): {e}",
-                self.max_ops_per_flush
-            );
+        if self.max_ops_per_flush.is_some_and(|m| self.ops.len() >= m) {
+            self.flush().map_err(|e| {
+                CeraError::Backend(format!(
+                    "HTP capped flush failed (cap={:?}): {e}",
+                    self.max_ops_per_flush
+                ))
+            })?;
         }
         if std::env::var_os("CERA_HEXAGON_STEP").is_some() {
             eprintln!("[cera-hexagon] step op opcode={opcode}");
-            if let Err(e) = self.flush() {
-                eprintln!("[cera-hexagon] step op opcode={opcode} failed: {e}");
-                panic!("HTP step failed on opcode {opcode}: {e}");
-            }
+            self.flush().map_err(|e| {
+                CeraError::Backend(format!("HTP step failed on opcode {opcode}: {e}"))
+            })?;
         }
+        Ok(())
     }
 
     /// Flush all queued operations in a single atomic batch execution.
@@ -302,22 +332,61 @@ impl HexagonQueueSession {
 
         let mut rsp = HtpOpBatchRsp::default();
         let mut resp_bufs = [DspQueueBuffer::default(); 1];
-        let rsp_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut rsp as *mut _ as *mut u8,
-                std::mem::size_of::<HtpOpBatchRsp>(),
-            )
-        };
 
-        let read_res = if write_res.is_ok() {
-            self.driver
-                .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
-        } else {
-            Ok(0)
-        };
+        // Drain stale responses from prior timed-out batches, then require
+        // the response for THIS batch. In blocking mode a 30s timeout
+        // returns Err while the DSP may still complete the batch later; its
+        // response then sits in the queue, and without the drain the next
+        // flush would consume it as its own, permanently desyncing status
+        // attribution by one batch.
+        let mut read_res: Result<(), CeraError> = Ok(());
+        if write_res.is_ok() {
+            loop {
+                let rsp_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        &mut rsp as *mut _ as *mut u8,
+                        std::mem::size_of::<HtpOpBatchRsp>(),
+                    )
+                };
+                match self
+                    .driver
+                    .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
+                {
+                    Err(e) => {
+                        read_res = Err(e);
+                        break;
+                    }
+                    Ok(_) => {
+                        if rsp.seq < self.seq {
+                            tracing::warn!(
+                                stale_seq = rsp.seq,
+                                expected_seq = self.seq,
+                                "drained stale DSP queue response"
+                            );
+                            continue;
+                        }
+                        if rsp.seq != self.seq {
+                            read_res = Err(CeraError::Backend(format!(
+                                "DSP queue sequence mismatch (expected {}, got {})",
+                                self.seq, rsp.seq
+                            )));
+                            break;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         self.staging_buf.invalidate_cpu_cache(0, total_bytes);
 
+        // Attempts are single-shot: drop the batch and advance `seq` whether
+        // this attempt succeeded or failed. Nothing ever retries (every
+        // flush-error path aborts its forward), while the session outlives
+        // the forward — retaining a failed batch would piggyback stale ops
+        // onto the next forward's flush. And the drain above is correct only
+        // if `seq` advances strictly per attempt: reusing a timed-out
+        // batch's `seq` would accept its late response as the new batch's.
         self.bufs.clear();
         self.buf_map.clear();
         self.tens.clear();
@@ -457,5 +526,24 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
         39 => "SsmConv",
         50 => "Concat",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DSP reads `u16` indices and `0xffff` is the absent-operand
+    /// marker, so the top usable index is 65534 and one past it is `Err`,
+    /// never a silently aliasing truncation or marker collision.
+    #[test]
+    fn batch_index_boundary() {
+        assert_eq!(HexagonQueueSession::batch_index(0, "buffers").unwrap(), 0);
+        assert_eq!(
+            HexagonQueueSession::batch_index(65534, "buffers").unwrap(),
+            65534
+        );
+        assert!(HexagonQueueSession::batch_index(65535, "buffers").is_err());
+        assert!(HexagonQueueSession::batch_index(usize::MAX, "tensors").is_err());
     }
 }

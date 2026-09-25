@@ -50,6 +50,17 @@ jobs:
         # clippy skips those compile targets, so lints living in test modules
         # (e.g. `needless_update`, `items_after_test_module`) slip through CI.
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (hexagon feature)
+        # Non-default feature, so the line above never compiles it: without
+        # this leg the Hexagon backend's lints rot while CI stays green.
+        run: cargo clippy -p cera --features hexagon --all-targets -- -D warnings
+      - name: Clippy (gpu feature)
+        # Same gap for the wgpu backend's feature-gated modules and tests.
+        run: cargo clippy -p cera --features gpu --all-targets -- -D warnings
+      - name: Clippy (cera-ffi hexagon feature)
+        # The FFI hexagon_probe/install_skels bodies are cfg'd on cera-ffi's
+        # own `hexagon` feature; neither leg above compiles them.
+        run: cargo clippy -p cera-ffi --features hexagon --all-targets -- -D warnings
       # Host-side compilation checks without default features. Because workspace
       # checks unify features across all crates, `cargo check --workspace` never
       # verifies `cera` with `default-features = false`. Checking `cera-wasm` on
@@ -115,6 +126,18 @@ jobs:
           # consult the variable and setting it would assert nothing.
           CERA_REQUIRE_SIMD: ${{ matrix.os == 'ubuntu-latest' && 'avx2' || '' }}
         run: cargo test --workspace --no-fail-fast
+      # The `hexagon` backend is a non-default feature with host-runnable unit
+      # tests (param goldens, repack layout, ADPF degrade, ABI sizes): without
+      # this leg they pass locally and rot, since the default-feature run
+      # above filters them out. No device needed; safe on both OS legs.
+      - name: Hexagon host-side unit tests
+        run: cargo test -p cera --features hexagon --lib --no-fail-fast
+      # The FFI `arch` wire-string pin (`probe_arch_wire_names_pinned`) lives
+      # in cera-ffi behind its own non-default `hexagon` feature: the clippy
+      # leg above proves it compiles, but only this proves it passes. Host-
+      # runnable (no FastRPC hardware); safe on both OS legs.
+      - name: Hexagon FFI unit tests
+        run: cargo test -p cera-ffi --features hexagon --lib --no-fail-fast
 
   # x86_64 with the default-on `avx512` crate feature OFF.
   #

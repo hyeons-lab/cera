@@ -37,24 +37,56 @@ fn ceil32(x: usize) -> usize {
     x.next_multiple_of(32)
 }
 
+/// Tiled byte size with overflow-checked arithmetic: hostile GGUF dims must
+/// produce `Err`, not a debug panic or a wrapped release size. (Unreachable
+/// via `GgufFile::open`, which validates dims with checked math at load;
+/// this is pub-API robustness.)
+fn checked_tiled_size(ne0: usize, ne1: usize, tile: usize, what: &str) -> Result<usize, CeraError> {
+    let n_col = ne1
+        .checked_next_multiple_of(32)
+        .ok_or_else(|| CeraError::Backend(format!("{what}: dim {ne1} overflows")))?
+        / 32;
+    let n_k = ne0
+        .checked_next_multiple_of(32)
+        .ok_or_else(|| CeraError::Backend(format!("{what}: dim {ne0} overflows")))?
+        / 32;
+    n_col
+        .checked_mul(n_k)
+        .and_then(|n| n.checked_mul(tile))
+        .ok_or_else(|| CeraError::Backend(format!("{what}: dims {ne0}x{ne1} overflow usize")))
+}
+
+/// Source-byte count with overflow-checked arithmetic (same contract as
+/// [`checked_tiled_size`]).
+fn checked_src_bytes(
+    rows: usize,
+    per_row: usize,
+    block: usize,
+    what: &str,
+) -> Result<usize, CeraError> {
+    rows.checked_mul(per_row)
+        .and_then(|n| n.checked_mul(block))
+        .ok_or_else(|| CeraError::Backend(format!("{what}: source size overflows usize")))
+}
+
 /// Calculate the total buffer size in bytes for a repacked Q4_0 matrix.
-pub fn repacked_matrix_size_q4_0(ne0: usize, ne1: usize) -> usize {
-    (ceil32(ne1) / 32) * (ceil32(ne0) / 32) * TILE_SIZE_Q4_0
+pub fn repacked_matrix_size_q4_0(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
+    checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_0, "repacked_matrix_size_q4_0")
 }
 
 /// Calculate the total buffer size in bytes for a repacked Q8_0 matrix.
-pub fn repacked_matrix_size_q8_0(ne0: usize, ne1: usize) -> usize {
-    (ceil32(ne1) / 32) * (ceil32(ne0) / 32) * TILE_SIZE_Q8_0
+pub fn repacked_matrix_size_q8_0(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
+    checked_tiled_size(ne0, ne1, TILE_SIZE_Q8_0, "repacked_matrix_size_q8_0")
 }
 
 /// Calculate the total buffer size in bytes for a repacked Q4_K matrix.
-pub fn repacked_matrix_size_q4_k(ne0: usize, ne1: usize) -> usize {
-    (ceil32(ne1) / 32) * (ceil32(ne0) / 32) * TILE_SIZE_Q4_K
+pub fn repacked_matrix_size_q4_k(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
+    checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_K, "repacked_matrix_size_q4_k")
 }
 
 /// Calculate the total buffer size in bytes for a repacked Q6_K matrix.
-pub fn repacked_matrix_size_q6_k(ne0: usize, ne1: usize) -> usize {
-    (ceil32(ne1) / 32) * (ceil32(ne0) / 32) * TILE_SIZE_Q6_K
+pub fn repacked_matrix_size_q6_k(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
+    checked_tiled_size(ne0, ne1, TILE_SIZE_Q6_K, "repacked_matrix_size_q6_k")
 }
 
 /// Repack a linear GGUF Q8_0 weight matrix into HTP 32x32 tiled layout.
@@ -71,7 +103,7 @@ pub fn repack_q8_0(
 ) -> Result<(), CeraError> {
     let blocks_per_row = ne0.div_ceil(32);
     let block_size = std::mem::size_of::<BlockQ8_0>();
-    let total_src_bytes = ne1 * blocks_per_row * block_size;
+    let total_src_bytes = checked_src_bytes(ne1, blocks_per_row, block_size, "repack_q8_0")?;
     if src_bytes.len() < total_src_bytes {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: source buffer too short (expected {} bytes, got {})",
@@ -80,9 +112,12 @@ pub fn repack_q8_0(
         )));
     }
 
+    // Checked first: a hostile dim must be `Err` before the `ceil32`
+    // calls below (which would panic on overflow), and the surviving
+    // plain-arithmetic uses are then provably in-range.
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q8_0, "repack_q8_0")?;
     let n_col_tiles = ceil32(ne1) / 32;
     let n_k_tiles = ceil32(ne0) / 32;
-    let matrix_size = n_col_tiles * n_k_tiles * TILE_SIZE_Q8_0;
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: destination buffer too short (expected {} bytes, got {})",
@@ -136,7 +171,7 @@ pub fn repack_q4_0(
 ) -> Result<(), CeraError> {
     let blocks_per_row = ne0.div_ceil(32);
     let block_size = std::mem::size_of::<BlockQ4_0>();
-    let total_src_bytes = ne1 * blocks_per_row * block_size;
+    let total_src_bytes = checked_src_bytes(ne1, blocks_per_row, block_size, "repack_q4_0")?;
     if src_bytes.len() < total_src_bytes {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: source buffer too short (expected {} bytes, got {})",
@@ -145,9 +180,12 @@ pub fn repack_q4_0(
         )));
     }
 
+    // Checked first: a hostile dim must be `Err` before the `ceil32`
+    // calls below (which would panic on overflow), and the surviving
+    // plain-arithmetic uses are then provably in-range.
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_0, "repack_q4_0")?;
     let n_col_tiles = ceil32(ne1) / 32;
     let n_k_tiles = ceil32(ne0) / 32;
-    let matrix_size = n_col_tiles * n_k_tiles * TILE_SIZE_Q4_0;
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: destination buffer too short (expected {} bytes, got {})",
@@ -211,7 +249,7 @@ pub fn repack_q4_k(
     }
     let sb_per_row = ne0 / 256;
     let block_size = std::mem::size_of::<BlockQ4KM>();
-    let total_src_bytes = ne1 * sb_per_row * block_size;
+    let total_src_bytes = checked_src_bytes(ne1, sb_per_row, block_size, "repack_q4_k")?;
     if src_bytes.len() < total_src_bytes {
         return Err(CeraError::Backend(format!(
             "repack_q4_k: source buffer too short (expected {} bytes, got {})",
@@ -220,9 +258,11 @@ pub fn repack_q4_k(
         )));
     }
 
-    let n_col_tiles = ceil32(ne1) / 32;
+    // Checked first: a hostile dim must be `Err` before the `ceil32`
+    // calls below (which would panic on overflow), and the surviving
+    // plain-arithmetic uses are then provably in-range.
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_K, "repack_q4_k")?;
     let n_k_tiles = ceil32(ne0) / 32;
-    let matrix_size = n_col_tiles * n_k_tiles * TILE_SIZE_Q4_K;
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q4_k: destination buffer too short (expected {} bytes, got {})",
@@ -303,7 +343,7 @@ pub fn repack_q6_k(
     }
     let sb_per_row = ne0 / 256;
     let block_size = std::mem::size_of::<BlockQ6K>();
-    let total_src_bytes = ne1 * sb_per_row * block_size;
+    let total_src_bytes = checked_src_bytes(ne1, sb_per_row, block_size, "repack_q6_k")?;
     if src_bytes.len() < total_src_bytes {
         return Err(CeraError::Backend(format!(
             "repack_q6_k: source buffer too short (expected {} bytes, got {})",
@@ -312,9 +352,11 @@ pub fn repack_q6_k(
         )));
     }
 
-    let n_col_tiles = ceil32(ne1) / 32;
+    // Checked first: a hostile dim must be `Err` before the `ceil32`
+    // calls below (which would panic on overflow), and the surviving
+    // plain-arithmetic uses are then provably in-range.
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q6_K, "repack_q6_k")?;
     let n_k_tiles = ceil32(ne0) / 32;
-    let matrix_size = n_col_tiles * n_k_tiles * TILE_SIZE_Q6_K;
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q6_k: destination buffer too short (expected {} bytes, got {})",
@@ -387,6 +429,16 @@ pub fn requant_q5_k_to_q8_0(
     ne0: usize,
     ne1: usize,
 ) -> Result<Vec<u8>, CeraError> {
+    // Reject degenerate dims fail-closed: without this, `(0, N)` passes
+    // the `% 256` gate below and burns an O(N) no-op loop to produce an
+    // empty vec, and small zero dims flow through the downstream repack
+    // as a silent no-op `Ok` (only hostile-scale dims trip its checked
+    // math), leaving zero weights in place with no signal.
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "requant_q5_k_to_q8_0: degenerate dims ({ne0}, {ne1})"
+        )));
+    }
     if !ne0.is_multiple_of(256) {
         return Err(CeraError::Backend(format!(
             "requant_q5_k_to_q8_0: K dim {ne0} is not a multiple of 256"
@@ -394,7 +446,7 @@ pub fn requant_q5_k_to_q8_0(
     }
     let sb_per_row = ne0 / 256;
     let block_size = std::mem::size_of::<BlockQ5K>();
-    let total_src_bytes = ne1 * sb_per_row * block_size;
+    let total_src_bytes = checked_src_bytes(ne1, sb_per_row, block_size, "requant_q5_k_to_q8_0")?;
     if src_bytes.len() < total_src_bytes {
         return Err(CeraError::Backend(format!(
             "requant_q5_k_to_q8_0: source buffer too short (expected {} bytes, got {})",
@@ -402,7 +454,13 @@ pub fn requant_q5_k_to_q8_0(
             src_bytes.len()
         )));
     }
-    let mut out = vec![0u8; ne1 * (ne0 / 32) * std::mem::size_of::<BlockQ8_0>()];
+    let out_len = checked_src_bytes(
+        ne1,
+        ne0 / 32,
+        std::mem::size_of::<BlockQ8_0>(),
+        "requant_q5_k_to_q8_0",
+    )?;
+    let mut out = vec![0u8; out_len];
     for r in 0..ne1 {
         for sb in 0..sb_per_row {
             let blk_off = (r * sb_per_row + sb) * block_size;
@@ -435,11 +493,11 @@ mod tests {
 
     #[test]
     fn test_repack_q8_0_sizes() {
-        assert_eq!(repacked_matrix_size_q8_0(1024, 32), 32 * 1088);
-        assert_eq!(repacked_matrix_size_q8_0(1000, 20), 1 * 32 * 1088);
+        assert_eq!(repacked_matrix_size_q8_0(1024, 32).unwrap(), 32 * 1088);
+        assert_eq!(repacked_matrix_size_q8_0(1000, 20).unwrap(), 32 * 1088);
 
         let (ne0, ne1) = (64, 32);
-        let size = repacked_matrix_size_q8_0(ne0, ne1);
+        let size = repacked_matrix_size_q8_0(ne0, ne1).unwrap();
         let src = vec![0u8; ne1 * (ne0 / 32) * 34];
         let mut dst = vec![0xccu8; size];
         assert!(repack_q8_0(&src, ne0, ne1, &mut dst).is_ok());
@@ -447,10 +505,10 @@ mod tests {
 
     #[test]
     fn test_repack_q4_0_sizes() {
-        assert_eq!(repacked_matrix_size_q4_0(256, 4), 1 * 8 * 576);
+        assert_eq!(repacked_matrix_size_q4_0(256, 4).unwrap(), 8 * 576);
 
         let (ne0, ne1) = (64, 32);
-        let size = repacked_matrix_size_q4_0(ne0, ne1);
+        let size = repacked_matrix_size_q4_0(ne0, ne1).unwrap();
         let src = vec![0u8; ne1 * (ne0 / 32) * 18];
         let mut dst = vec![0xccu8; size];
         assert!(repack_q4_0(&src, ne0, ne1, &mut dst).is_ok());
@@ -485,11 +543,14 @@ mod tests {
 
     #[test]
     fn test_repack_q4_k_sizes() {
-        assert_eq!(repacked_matrix_size_q4_k(256, 32), 1 * 8 * 640);
-        assert_eq!(repacked_matrix_size_q4_k(1024, 4608), 144 * 32 * 640);
+        assert_eq!(repacked_matrix_size_q4_k(256, 32).unwrap(), 8 * 640);
+        assert_eq!(
+            repacked_matrix_size_q4_k(1024, 4608).unwrap(),
+            144 * 32 * 640
+        );
 
         let (ne0, ne1) = (256, 4);
-        let size = repacked_matrix_size_q4_k(ne0, ne1);
+        let size = repacked_matrix_size_q4_k(ne0, ne1).unwrap();
         let src = vec![0u8; ne1 * (ne0 / 256) * 144];
         let mut dst = vec![0xccu8; size];
         assert!(repack_q4_k(&src, ne0, ne1, &mut dst).is_ok());
@@ -505,11 +566,14 @@ mod tests {
 
     #[test]
     fn test_repack_q6_k_sizes() {
-        assert_eq!(repacked_matrix_size_q6_k(256, 32), 1 * 8 * 896);
-        assert_eq!(repacked_matrix_size_q6_k(1024, 1024), 32 * 32 * 896);
+        assert_eq!(repacked_matrix_size_q6_k(256, 32).unwrap(), 8 * 896);
+        assert_eq!(
+            repacked_matrix_size_q6_k(1024, 1024).unwrap(),
+            32 * 32 * 896
+        );
 
         let (ne0, ne1) = (256, 4);
-        let size = repacked_matrix_size_q6_k(ne0, ne1);
+        let size = repacked_matrix_size_q6_k(ne0, ne1).unwrap();
         let src = vec![0u8; ne1 * (ne0 / 256) * 210];
         let mut dst = vec![0xccu8; size];
         assert!(repack_q6_k(&src, ne0, ne1, &mut dst).is_ok());
@@ -644,5 +708,43 @@ mod tests {
             assert_eq!(dst[512 + row * 2], row as u8);
             assert_eq!(dst[512 + row * 2 + 1], 0);
         }
+    }
+
+    /// Hostile dims must be `Err`, never a debug panic or a wrapped size.
+    #[test]
+    fn huge_dims_are_err_not_panic() {
+        let huge = usize::MAX / 2;
+        for f in [
+            repacked_matrix_size_q4_0,
+            repacked_matrix_size_q8_0,
+            repacked_matrix_size_q4_k,
+            repacked_matrix_size_q6_k,
+        ] {
+            assert!(f(huge, huge).is_err());
+            assert!(f(usize::MAX, 32).is_err());
+        }
+        // Source-size math likewise: short buffer would otherwise wrap the
+        // expectation below `src.len()` and read out of bounds.
+        let empty: &[u8] = &[];
+        let mut dst = vec![0u8; 64];
+        assert!(repack_q8_0(empty, huge, huge, &mut dst).is_err());
+        assert!(repack_q4_0(empty, huge, huge, &mut dst).is_err());
+        // Zero in one dim defeats the src-size check (0 times anything is 0)
+        // and used to reach the unchecked `ceil32` tile math and panic.
+        for (ne0, ne1) in [(0, usize::MAX), (usize::MAX, 0)] {
+            assert!(repack_q8_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_q4_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_q4_k(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_q6_k(empty, ne0, ne1, &mut dst).is_err());
+        }
+        // Requant shares the checked-src-size contract (`ne0 = 256` keeps
+        // `sb_per_row = 1`, so the overflow trips checked math rather than
+        // the `% 256` gate) and the degenerate-dims rejection. Each zero
+        // leg uses a `% 256`-passing partner dim so it pins the guard leg
+        // alone, not the guard-or-gate disjunction.
+        assert!(requant_q5_k_to_q8_0(empty, 256, huge).is_err());
+        assert!(requant_q5_k_to_q8_0(empty, 256, usize::MAX).is_err());
+        assert!(requant_q5_k_to_q8_0(empty, 0, 256).is_err());
+        assert!(requant_q5_k_to_q8_0(empty, 256, 0).is_err());
     }
 }

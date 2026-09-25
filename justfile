@@ -349,7 +349,15 @@ jvm-libs-host:
 # required 64-bit since 2019. The two invocations build into scratch dirs and
 # merge (cargo-ndk owns its `-o` root per invocation). The FFI surface is
 # identical on all ABIs — without the feature, `hexagon_probe()` simply
-# reports unavailable and `BackendPreference::Hexagon` falls back to CPU.
+# reports unavailable, only `Auto` falls back to CPU, and explicit
+# `BackendPreference::Hexagon` reports `Backend/Hexagon backend not available`.
+#
+# The DSP skels are ALSO staged as standalone `jniLibs/arm64-v8a/lib*.so`
+# files (same bytes the Rust code embeds): at install they extract to the
+# app's `nativeLibraryDir`, where the FastRPC loader opens them by path
+# (see `HexagonNpu.setup`). arm64-v8a only: x86_64 Android has no Hexagon
+# DSP, and 32-bit ABIs build without the feature. Filenames must match
+# `HexagonArch::skel_filename` exactly.
 android-libs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -363,8 +371,12 @@ android-libs:
         build -p cera-ffi --release --features ffi-buffer
     mkdir -p "$out"
     cp -r target/android-libs-64/* target/android-libs-32/* "$out/"
+    for arch in v73 v75 v79 v81; do
+        cp "cera/src/backend/hexagon/skels/libggml-htp-$arch.so" "$out/arm64-v8a/"
+    done
+    [ "$(ls "$out"/arm64-v8a/libggml-htp-v*.so | wc -l | tr -d ' ')" = "4" ]
     scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
-    ls -la "$out"/*/libcera_ffi.so
+    ls -la "$out"/*/libcera_ffi.so "$out"/arm64-v8a/libggml-htp-v*.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift

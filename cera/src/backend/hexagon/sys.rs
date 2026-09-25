@@ -141,15 +141,18 @@ impl FastRpcDriver {
     pub fn load() -> Result<Arc<Self>, CeraError> {
         #[cfg(unix)]
         {
-            // Absolute vendor paths first: app UIDs can read /vendor/lib64
-            // but the linker namespace hides it from soname search, so
-            // bare `dlopen("libcdsprpc.so")` fails inside APKs while the
-            // absolute path may still resolve.
+            // Soname first: inside an APK the app linker namespace resolves
+            // `libcdsprpc.so` once the manifest declares it (see the AAR
+            // manifest's `<uses-native-library>` entry; the lib is on the
+            // vendor public list). Absolute vendor paths stay blocked by
+            // that same namespace, so they are only a fallback for
+            // shell/CLI contexts outside APKs. Every miss is non-fatal:
+            // the loop keeps trying until one `dlopen` succeeds.
             let lib_names = [
-                "/vendor/lib64/libcdsprpc.so",
-                "/vendor/lib64/libadsprpc.so",
                 "libcdsprpc.so",
                 "libadsprpc.so",
+                "/vendor/lib64/libcdsprpc.so",
+                "/vendor/lib64/libadsprpc.so",
             ];
             let mut lib_handle = std::ptr::null_mut();
 
@@ -466,8 +469,24 @@ impl FastRpcDriver {
         let mut timeouts = 0;
         // Oppoll: timeout 0 turns the read non-blocking; the retry loop
         // below spins on EWOULDBLOCK until the response lands.
-        let timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
+        let mut timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
+        // Oppoll hang guard: the same 30s budget blocking mode gets from
+        // its per-read timeouts. Without it a wedged DSP pins this thread
+        // at 100% forever, teardown included (`Drop` flushes through this
+        // loop). (llama.cpp spins unbounded here; the deadline is where
+        // cera deliberately differs.) Checked at the top of every iteration
+        // so no retry arm (including AEE_EINTERRUPTED) can bypass it; lazy
+        // so blocking mode pays no clock read for a budget it never uses.
+        let deadline = self
+            .oppoll
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+        let mut spins: u64 = 0;
         loop {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Err(CeraError::Backend(format!(
+                    "dspqueue_read: no DSP response after 30s ({spins} spins)"
+                )));
+            }
             let ret = (self.dspqueue_read)(
                 queue,
                 &mut flags,
@@ -492,10 +511,19 @@ impl FastRpcDriver {
                 || ret == 11
             {
                 // ETIMEDOUT, AEE_EEXPIRED, AEE_EWOULDBLOCK: DSP is still
-                // processing. Oppoll spins unbounded (llama parity);
-                // blocking mode keeps the 30s hang guard.
+                // processing.
+                if self.oppoll {
+                    spins += 1;
+                    if spins > 10_000 {
+                        // Slow batch: stop burning a core and block for the
+                        // response like blocking mode does.
+                        timeout = DSPQUEUE_TIMEOUT_US;
+                    }
+                    // Expiry is checked at the top of the next iteration.
+                    continue;
+                }
                 timeouts += 1;
-                if self.oppoll || timeouts < 30 {
+                if timeouts < 30 {
                     continue;
                 }
             }

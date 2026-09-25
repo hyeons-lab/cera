@@ -12377,12 +12377,15 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 }
 /**
  * Write the embedded DSP skels into `dir` (created if missing) and
- * point FastRPC's loader at it. Call once at app startup (before
- * [`hexagon_probe`] or loading a model with
- * [`BackendPreference::Hexagon`]), passing a private writable
- * directory (e.g. Android `filesDir/hexagon-skels`). Returns the number
- * of skels installed. Re-running is cheap (files are only rewritten
- * when the size differs).
+ * point FastRPC's loader at it. For JVM/desktop/shell flows where the
+ * caller stages a private writable directory; Android apps instead use
+ * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+ * (which points the loader at `nativeLibraryDir`), so this call is not
+ * needed there. Call once at startup, before [`hexagon_probe`] or
+ * loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * number of skels written (0 when all were already present and fresh).
+ * Re-running is cheap and idempotent (files are only rewritten when
+ * their bytes differ, and the loader path is not duplicated).
  */
 public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -12396,8 +12399,9 @@ public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
  * tries each bundled DSP skel, and returns the first working device's
  * capabilities (then closes it). Fails when the `hexagon` feature is
  * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
- * unavailable to this process. Call [`hexagon_install_skels`] first on
- * Android so the loader can find the skel files.
+ * unavailable to this process. On Android, call the AAR's
+ * `HexagonNpu.setup` first so the loader can find the skel files
+ * (JVM/desktop flows use [`hexagon_install_skels`] instead).
  */
 public func hexagonProbe()throws  -> HexagonProbeInfo  {
     return try  FfiConverterTypeHexagonProbeInfo_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -12620,10 +12624,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 16882) {
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 18871) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 10841) {
+    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {

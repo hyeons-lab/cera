@@ -19,7 +19,7 @@ pub use params::*;
 pub use queue::HexagonQueueSession;
 pub use repack::*;
 pub use rpcmem::RpcmemBuffer;
-pub use skels::{HexagonProbe, embedded_skel, install_skels, probe};
+pub use skels::{HexagonProbe, PROBE_ARCHS, embedded_skel, install_skels, probe};
 pub use sys::FastRpcDriver;
 pub use types::*;
 
@@ -45,16 +45,30 @@ impl HexagonContext {
         {
             // Debug knob: park a spinner to hold CPU clocks across DSP-bound
             // waits (validates governor effects; burns a core — ADPF is the
-            // production answer). Detached: runs until process exit.
-            tracing::warn!("cera-hexagon: CERA_HEXAGON_SPIN=1 parking a keepalive spinner thread");
-            std::thread::Builder::new()
-                .name("cera-hex-spin".into())
-                .spawn(|| {
-                    loop {
-                        std::hint::spin_loop();
-                    }
+            // production answer). Detached: runs until process exit. `OnceLock`:
+            // without it every model reload parks another thread and the
+            // knob skews the runs it was meant to stabilize; the stored
+            // `Result` keeps a spawn failure visible to every caller instead
+            // of only the first.
+            static SPIN_RESULT: std::sync::OnceLock<Result<(), CeraError>> =
+                std::sync::OnceLock::new();
+            SPIN_RESULT
+                .get_or_init(|| {
+                    tracing::warn!(
+                        "cera-hexagon: CERA_HEXAGON_SPIN=1 parking a keepalive spinner thread"
+                    );
+                    std::thread::Builder::new()
+                        .name("cera-hex-spin".into())
+                        .spawn(|| {
+                            loop {
+                                std::hint::spin_loop();
+                            }
+                        })
+                        .map(|_| ())
+                        .map_err(|e| CeraError::Backend(format!("spinner spawn failed: {e}")))
                 })
-                .map_err(|e| CeraError::Backend(format!("spinner spawn failed: {e}")))?;
+                .as_ref()
+                .map_err(|e| CeraError::Backend(e.to_string()))?;
         }
         Ok(Arc::new(Self { driver }))
     }

@@ -29,6 +29,18 @@ impl HexagonArch {
         }
     }
 
+    /// Cross-language wire name (`HexagonProbeInfo.arch`): a pinned literal,
+    /// not `Debug`, so a variant rename cannot silently change what mobile
+    /// clients match on.
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::V73 => "V73",
+            Self::V75 => "V75",
+            Self::V79 => "V79",
+            Self::V81 => "V81",
+        }
+    }
+
     pub fn from_u32(val: u32) -> Option<Self> {
         match val {
             73 => Some(Self::V73),
@@ -252,5 +264,39 @@ impl Drop for HexagonDevice {
         let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
         self.driver.close_skel_handle(self.handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The FFI `arch` wire strings are pinned literals: mobile clients
+    /// match on them, so any rename must be a deliberate breaking change.
+    /// A new variant fails here twice (exhaustive match, list length) until
+    /// its wire string is deliberately pinned.
+    #[test]
+    fn arch_short_names_pinned() {
+        for arch in super::super::skels::PROBE_ARCHS {
+            let expected = match arch {
+                HexagonArch::V73 => "V73",
+                HexagonArch::V75 => "V75",
+                HexagonArch::V79 => "V79",
+                HexagonArch::V81 => "V81",
+            };
+            assert_eq!(arch.short_name(), expected);
+        }
+        assert_eq!(super::super::skels::PROBE_ARCHS.len(), 4);
+        // Membership + order: order decides the winning DSP on multi-arch
+        // devices and the install set, so a dup or reorder must fail loudly.
+        assert_eq!(
+            super::super::skels::PROBE_ARCHS,
+            [
+                HexagonArch::V79,
+                HexagonArch::V75,
+                HexagonArch::V73,
+                HexagonArch::V81
+            ]
+        );
     }
 }

@@ -1233,10 +1233,11 @@ mod tests {
         let q8 = HtpDataType::Q8_0;
         let q4 = HtpDataType::Q4_0;
         // (wtype, k, n, m) -> (m_chunk, n_chunk, act_threads, vtcm).
-        let cases: [(
+        type HmxCase = (
             (HtpDataType, usize, usize, usize),
             (usize, usize, usize, usize),
-        ); 15] = [
+        );
+        let cases: [HmxCase; 15] = [
             ((q8, 1024, 4608, 5), (32, 2528, 4, 8318976)),
             ((q8, 1024, 4608, 8), (32, 2528, 4, 8318976)),
             ((q8, 1024, 4608, 13), (32, 2528, 4, 8318976)),
@@ -1351,7 +1352,7 @@ mod tests {
         let kp = build_hmx_fa_kernel_params(64, 16, 8, 32, 602, scale, 4, 8 << 20)
             .expect("m=32 kv=602 fits");
         assert_eq!(kp[0] & 0xff, 2); // HMX
-        assert_eq!(kp[1], (32 | (192 << 16)) as i32); // Br | Bc << 16
+        assert_eq!(kp[1], 32 | (192 << 16)); // Br | Bc << 16
         assert_eq!(kp[2] & 0xffff, 4); // n_kv_blocks = ceil(602/192)
         assert_eq!((kp[2] >> 16) & 0xffff, 2); // G
         assert_eq!(kp[3], scale.to_bits() as i32);

@@ -20,6 +20,15 @@ android {
         }
     }
 
+    // Same flag as the manifest's extractNativeLibs (kept in both places:
+    // the DSL is authoritative for the app build, the manifest documents
+    // and merges). The DSP skels must be extracted files at install time.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     lint {
         abortOnError = false
     }

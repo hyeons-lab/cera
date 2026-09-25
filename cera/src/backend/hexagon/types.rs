@@ -120,7 +120,6 @@ pub const HTP_TENSOR_WEIGHT: u32 = 1;
 pub const HTP_TENSOR_REPACK: u32 = 2;
 /// Tensor is a synchronization fence (explicitly managed).
 pub const HTP_TENSOR_FENCE: u32 = 4;
-pub const HTP_TENSOR_DIRTY: u32 = 2;
 
 pub const HTP_MAX_DIMS: usize = 4;
 pub const HTP_MAX_OP_PARAMS: usize = 16;

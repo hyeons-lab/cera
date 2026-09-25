@@ -8,7 +8,7 @@ runs on, and what blocks the rest.
 | artifact | NPU content | notes |
 |---|---|---|
 | `cera` (crates.io) | `hexagon` feature (off by default) + 4 embedded DSP skels (~3.2 MB) | `cargo package` includes `src/backend/hexagon/skels/` (no `package.include` filter) |
-| `cera-ffi-android` AAR | hexagon on arm64-v8a + x86_64; lean on 32-bit | FFI surface identical everywhere; `hexagon_probe()` reports unavailable where off |
+| `cera-ffi-android` AAR | hexagon on arm64-v8a + x86_64; lean on 32-bit; 4 skels in `jniLibs/arm64-v8a` | FFI surface identical everywhere; `hexagon_probe()` reports unavailable where off |
 | AAR `assets/NOTICE` | MIT attribution for the embedded skels | required: MIT covers binaries too |
 | `cera-ffi-jvm` / xcframework / npm / crates | unchanged (no hexagon) | host platforms have no DSP |
 
@@ -20,11 +20,11 @@ Recipes: `just android-libs` (split 64/32 build), `just bindings`
 ## App integration (Kotlin)
 
 ```kotlin
+import com.hyeonslab.cera.android.HexagonNpu
 import uniffi.cera_ffi.*
-import java.io.File
 
-// Once at startup, before loading a model:
-hexagonInstallSkels(File(filesDir, "hexagon-skels").absolutePath)
+// Once at startup, on the main thread, before loading a model:
+HexagonNpu.setup(context) // verifies extracted skels, sets ADSP_LIBRARY_PATH
 
 // Gate NPU use on a live probe (fast: one driver open + hwinfo):
 val backend = try {
@@ -36,12 +36,33 @@ val backend = try {
 }
 ```
 
-`hexagonInstallSkels` writes the four embedded skels (only when the size
-differs) and prepends the dir to `ADSP_LIBRARY_PATH`, which FastRPC's
-loader honors (verified: skel in a non-CWD dir + env var → inference
-works). The `probe-app` module is a runnable reference + the on-device
-gate: `./gradlew :probe-app:installDebug`, launch, `adb logcat -s
-CeraProbe`.
+Three packaging requirements make the stock tier work (all verified on
+a retail S25 Ultra, SELinux enforcing, via a normally installed APK):
+
+1. **Manifest**: `<uses-native-library android:name="libcdsprpc.so"
+   android:required="false"/>` inside `<application>` — grants the app
+   linker namespace access to the vendor FastRPC client (on the vendor
+   public list). The AAR manifest carries this and it merges into
+   consumers automatically; `required=false` so devices without the lib
+   still install (the probe then reports unavailable).
+2. **Extracted skels**: the AAR ships the four skels in
+   `jniLibs/arm64-v8a/`; they must be real files at install time (the
+   FastRPC loader opens them by path), so the APK needs
+   `android:extractNativeLibs="true"` (also in the AAR manifest, merged
+   into consumers). arm64-v8a only — x86_64 Android has no Hexagon DSP.
+3. **`ADSP_LIBRARY_PATH`**: `HexagonNpu.setup` points the loader at
+   `nativeLibraryDir` plus the vendor fallback paths, set once before
+   the first FastRPC call. It fails fast with an actionable message
+   when the skels are missing (wrong packaging) or the ABI ships none.
+
+`hexagonInstallSkels` (write embedded skels into a caller-staged dir)
+remains for JVM/desktop/shell flows; Android apps use the AAR path
+above instead. The `probe-app` module is a runnable reference + the
+on-device gate: `./gradlew :probe-app:installDebug`, launch from the
+launcher, `adb logcat -s CeraProbe`. It also reports the access route
+(`direct` vs `hal-fallback`, see below), since DSP policy varies per
+OEM/SoC/firmware — that route string is the datum to record when
+validating a new device.
 
 ## Device support matrix
 
@@ -71,41 +92,63 @@ skel exists) and stays on CPU/GPU fallback. Non-Snapdragon devices:
 |---|---|---|
 | adb shell / dev tools / benchmarks | ✅ yes | all NPU validation runs as `shell` |
 | system / priv-app / OEM preload / rooted / eng builds | ✅ expected | same UID class as shell-or-better; probe app reports the exact failure if not |
-| stock third-party APK (Play install) | ❌ **blocked by Android** | measured, see below |
+| stock third-party APK (Play install) | ✅ yes, with the packaging above | installed-APK probe on S25U (SM8750, Android 16): unsigned PD up, inference running |
 
-Why stock APKs are blocked (all verified on a retail S25 Ultra,
-SELinux enforcing):
+How the stock tier works: the app cannot open `/dev/fastrpc-cdsp`
+itself, but `libcdsprpc.so` falls back to Qualcomm's DSP service,
+which opens the node and passes the fd back over binder; the session
+then creates an unsigned user PD as usual. No cera code is involved in
+the fallback — it is Qualcomm's own `open_device_node` logic — but it
+rests on three device grants, all present on the S25 Ultra:
 
-1. `dlopen("libcdsprpc.so")` fails: linker namespaces hide
-   `/vendor/lib64` from apps (soname **and** absolute path both fail;
-   the probe app reports `FastRPC driver not found`).
-2. `/dev/fastrpc-cdsp` can't even be opened `O_RDONLY` as an app UID
-   (`run-as` test → `Permission denied`), so a bundled FastRPC client
-   over the kernel node is dead too. (The shell path works over an
-   `O_RDONLY` fd + ioctl — DAC other-read suffices there.)
-3. No DSP/NPU HAL service exists to proxy through (`lshal` empty).
+- `allow appdomain vendor_qdsp_device (chr_file (ioctl read))`: apps
+  may ioctl an already-open DSP fd (not `open` it).
+- `vendor_hal_dspmanager_client` includes `untrusted_app` (and
+  `untrusted_app_25..32`, `isolated_compute_app`, ...): apps may find
+  and call `vendor.qti.hardware.dsp.IDspService/default`. Note the
+  grant lives in system_ext/product policy, not vendor — grep every
+  partition's `.cil` before judging a new device.
+- `libcdsprpc.so` is on the vendor public list
+  (`/vendor/etc/public.libraries.txt`), so the manifest entry above
+  makes it loadable.
 
-This is uniform AOSP behavior (it is also why QNN-from-app needs OEM
-cooperation on some devices), not a Samsung quirk. Consequences:
+Logcat markers of the working path: `open thru HAL` followed by
+`Created user PD ... Unsigned:Y`, with no `avc: denied` lines.
 
-- The sanctioned app path to phone NPUs is NNAPI/QNN graph APIs, not
-  FastRPC — a different backend (months, not days).
-- Niches that keep our FastRPC path viable in apps: OEM/system
-  integration, MDM-managed fleets, and a Shizuku-style shell-UID proxy
-  (shell *can* open the node `O_RDONLY`; unverified end-to-end).
-- NPU Manager (Android 17+) arbitrates buffers/admission but does not
-  grant compute access — it does not unlock this tier either.
+Earlier "blocked" verdicts were false negatives from three
+measurement errors (recorded here so they are not repeated):
+
+1. Judging app access from `run-as`: `runas_app` is NOT a DSP-HAL
+   client while `untrusted_app` IS, so a `run-as` denial proves
+   nothing about Play apps. Only a real installed APK counts — never
+   `run-as`, never `service check` from a shell domain.
+2. Missing `<uses-native-library>`: without it the soname `dlopen`
+   fails; with it, it resolves. (Absolute `/vendor/lib64` paths stay
+   blocked by the linker namespace either way; the driver tries the
+   soname first and treats absolute-path misses as non-fatal.)
+3. `lshal` shows no DSP service — but `IDspService` is AIDL and `lshal`
+   lists HIDL only; `service list` shows it.
+
+Caveats that still hold: raw FastRPC device opens remain blocked for
+apps (only the HAL route works); DSP policy varies per OEM/SoC/firmware
+(the probe-app route string is how a new device is checked); NPU
+Manager (Android 17+) arbitrates buffers/admission but grants no access
+and is not needed for it.
 
 ## Verification gates (run before calling an NPU release done)
 
 1. `just android-libs` green; arm64/x86_64 `.so` contain
    `libggml-htp-v*` strings, 32-bit don't; all four pass
-   `assert-ffibuffer.sh`.
-2. AAR unzips with `jni/<4 abis>/libcera_ffi.so` + `assets/NOTICE`
-   (byte-identical MIT block to `skels/LICENSE`).
-3. `probe-app` on a privileged tier reports `OK arch=V..` (documents
-   the tier it ran in); on a stock APK it must report the clean
-   `FastRPC driver not found` failure (no crash).
+   `assert-ffibuffer.sh`; `jniLibs/arm64-v8a` holds the 4 skels.
+2. AAR unzips with `jni/<4 abis>/libcera_ffi.so` +
+   `jni/arm64-v8a/libggml-htp-v*.so` (4 files; AGP strips their
+   symtabs, loadable sections intact) + `assets/NOTICE`
+   (byte-identical MIT block to `skels/LICENSE`); AAR manifest
+   carries `extractNativeLibs` + `uses-native-library`.
+3. `probe-app`, installed normally and launched from the launcher
+   (never via `run-as`), reports `OK route=hal-fallback arch=V..`
+   on a granting device; where the grant is absent it must fail
+   cleanly (no crash). Record the route string per device.
 4. Existing on-device determinism matrix still green (logits m=1..8
    x5, greedy md5 2x2x6, 256-token pair) — any skel/host change can
    silently re-phase the DSP race.
@@ -118,12 +161,10 @@ cooperation on some devices), not a Samsung quirk. Consequences:
 - One-time confirm of the Hexagon SDK EULA redistribution clause
   (flagged in `skels/SOURCE.md`).
 - v75/v73 on-device smoke (same code path as v79; want one boot each).
-- If a stock-APK story is ever required: LiteRT + Qualcomm AI Engine
-  Direct delegate, via a GGUF→TFLite converter (reviewed 2026-09: LFM2's
-  shortconv blocks are GEMV-dominated and delegatable; the converter +
-  requant validation is the project, not the delegate wiring). Raw NNAPI
-  is a poor fit for an LLM engine; raw QNN duplicates what the delegate
-  already ships on Maven.
+- OEM/SoC validation matrix: stock-APK probe route (`direct` vs
+  `hal-fallback` vs clean failure) on one device per major OEM skin,
+  since the DSP-service grant lives in per-OEM system_ext/product
+  policy — the S25U result must not be assumed universal.
 
 ## Head-to-head
 

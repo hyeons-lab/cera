@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- This app declares no NPU manifest entries of its own: the AAR
+         merges `extractNativeLibs="true"` + `<uses-native-library
+         android:name="libcdsprpc.so" android:required="false"/>` (see
+         cera-ffi-android's manifest), exactly as for any third-party
+         consumer. Skels must be extracted files and the vendor FastRPC
+         client visible to the linker, or the NPU stays unreachable. -->
     <application
         android:label="Cera NPU Probe"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">

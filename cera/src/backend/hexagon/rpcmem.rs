@@ -17,7 +17,11 @@ pub struct RpcmemBuffer {
     mapped: bool,
 }
 
-// Memory allocated through rpcmem is accessible across threads.
+// SAFETY (Send + Sync): the allocation is DSP-visible from any thread, but
+// host-side soundness requires external serialization: every `as_slice` /
+// `as_mut_ptr` use must hold `HexagonLfm2Model.device`'s `MutexGuard`, and
+// `&RpcmemBuffer` must never escape that critical section. Concurrent
+// `Model::forward` calls are safe only because they serialize on that lock.
 unsafe impl Send for RpcmemBuffer {}
 unsafe impl Sync for RpcmemBuffer {}
 
