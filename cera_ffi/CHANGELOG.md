@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3
+
+- Add LoRA composition, per-request seeds, and extraction overrides to the session API.
+- Bundle the native engine fix for repacked-Q4_0 row-major prefill addressing on ARM64.
+- Align package and native artifact versions at 0.6.3.
+
 ## 0.6.2
 
 - Fix chat stopping, streamed UTF-8, moved-handle cancellation and terminal callbacks.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.3
+
+- Include the session additions (LoRA composition, per-request seeds, extraction overrides) and the ARM64 prefill correctness fix from `cera_ffi` 0.6.3.
+- Align platform manifests and the dependency on `cera_ffi` at 0.6.3.
+
 ## 0.6.2
 
 - Include the core chat, checkpoint, schema and audio corrections from `cera_ffi` 0.6.2.
