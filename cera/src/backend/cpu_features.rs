@@ -631,7 +631,7 @@ pub fn detect_topology() -> CoreTopology {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(topo) = detect_topology_sysfs() {
-        return apply_thread_override(topo, forced, pinning_on);
+        return apply_thread_override(clamp_to_cpu_allowance(topo), forced, pinning_on);
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -671,6 +671,64 @@ pub fn detect_topology() -> CoreTopology {
         forced,
         pinning_on,
     )
+}
+
+/// Cap a detected topology's pool width at the CPUs this process may actually
+/// run on. `available_parallelism` honors cpuset/cgroup affinity on Linux, so
+/// it sees the restriction the sysfs detector (which reads host-wide files)
+/// cannot: an Android app without a visible Activity sits in the `foreground`
+/// cpuset (no prime cluster), and a container sees its quota the same way.
+///
+/// Without this, the natural path sizes the pools for silicon the process can
+/// never touch, which is the same cliff [`apply_thread_override`] clamps the
+/// `CERA_THREADS` knob against: measured on a Snapdragon 8 Elite (8 detected,
+/// 6 usable), width 8 decoded at 14 tok/s against 171 at width 6 — the surplus
+/// workers do not oversubscribe gracefully. The gate is unconditional on
+/// `CERA_PIN`: the collapse reproduces unpinned, so the override's pinning
+/// exemption does not apply here.
+///
+/// Runs *before* the `CERA_THREADS` override so the knob keeps its documented
+/// meaning (an explicit width, clamped only to pinnable cores): a deliberate
+/// oversubscription sweep can still ask for more, but the default never does.
+// `allow`, not `expect`: only the sysfs detector calls it, so it is dead in a
+// normal non-Linux build but live in a test build (see below).
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    allow(
+        dead_code,
+        reason = "only the sysfs detector calls it; tested on all hosts"
+    )
+)]
+fn clamp_to_cpu_allowance(topo: CoreTopology) -> CoreTopology {
+    let allowed = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(usize::MAX);
+    clamp_perf_count(topo, allowed)
+}
+
+/// Pure half of [`clamp_to_cpu_allowance`]: cap `perf_core_count` at `allowed`
+/// CPUs. `pin_cores`/`core_weights` are intentionally left alone: the clamp
+/// reproduces the measured-good shape (width at the usable count, fastest-first
+/// pins with the out-of-reach entries failing closed at spawn), and filtering
+/// the pin set to the affinity mask is a separate follow-up.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    allow(
+        dead_code,
+        reason = "only the sysfs detector calls it; tested on all hosts"
+    )
+)]
+fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
+    let allowed = allowed.max(1);
+    if topo.perf_core_count > allowed {
+        tracing::warn!(
+            "cera: detected {} performance cores but this process may only run on {allowed}; \
+             clamping pool width to {allowed} (more workers than usable cores falls off a cliff)",
+            topo.perf_core_count,
+        );
+        topo.perf_core_count = allowed;
+    }
+    topo
 }
 
 /// Apply a `CERA_THREADS` override to a detected topology: set the thread count
@@ -999,6 +1057,50 @@ mod tests {
         let narrow = apply_thread_override(big_little, Some(3), true);
         assert_eq!(narrow.fast_cores, 3);
         assert!(narrow.fast_cores <= narrow.pin_cores.len());
+    }
+
+    /// A process allowance smaller than the detected silicon caps the pool width:
+    /// an 8-perf-core part in a 6-CPU cpuset runs 6 workers, not 8 (measured
+    /// 171 vs 14 tok/s on a Snapdragon 8 Elite). Pins/weights/fast stay put —
+    /// the clamp reproduces the measured-good shape, it does not re-place it.
+    #[test]
+    fn affinity_clamp_caps_width_leaves_pins() {
+        let detected = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: vec![6, 7, 0, 1, 2, 3, 4, 5],
+            fast_cores: 8,
+            core_weights: vec![WEIGHT_FULL; 8],
+        };
+        let clamped = clamp_perf_count(detected, 6);
+        assert_eq!(clamped.perf_core_count, 6);
+        assert_eq!(clamped.pin_cores, vec![6, 7, 0, 1, 2, 3, 4, 5]);
+        assert_eq!(clamped.core_weights, vec![WEIGHT_FULL; 8]);
+        assert_eq!(clamped.fast_cores, 8);
+    }
+
+    /// An allowance at or above the detected count is a no-op.
+    #[test]
+    fn affinity_clamp_is_noop_when_allowed_covers_detected() {
+        let detected = CoreTopology {
+            perf_core_count: 6,
+            pin_cores: vec![5, 4, 3, 2, 1, 0],
+            fast_cores: 6,
+            core_weights: vec![WEIGHT_FULL; 6],
+        };
+        assert_eq!(clamp_perf_count(detected.clone(), 6), detected);
+        assert_eq!(clamp_perf_count(detected.clone(), 64), detected);
+    }
+
+    /// A degenerate allowance still yields one worker, never zero.
+    #[test]
+    fn affinity_clamp_floors_at_one() {
+        let detected = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: vec![6, 7, 0, 1, 2, 3, 4, 5],
+            fast_cores: 8,
+            core_weights: vec![WEIGHT_FULL; 8],
+        };
+        assert_eq!(clamp_perf_count(detected, 0).perf_core_count, 1);
     }
 
     /// Asking for more workers than there are pinnable cores is the
