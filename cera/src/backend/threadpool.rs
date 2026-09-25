@@ -634,92 +634,50 @@ pub(crate) fn pinning_enabled() -> bool {
     !super::cpu_features::pinning_disabled()
 }
 
+/// A global pool plus the allowance it was sized for. Pools are rebuilt, not
+/// mutated, when the allowance changes: dispatches in flight hold their own
+/// `Arc` and finish on the old width, while new dispatches take the new one.
+/// `None` until first use so the decode pool stays lazy (its width needs the
+/// loaded model's shape; see [`RowPool::decode`]).
+struct PoolSlot {
+    pool: Arc<RowPool>,
+    allowance: usize,
+}
+
+static PREFILL_SLOT: Mutex<Option<PoolSlot>> = Mutex::new(None);
+static DECODE_SLOT: Mutex<Option<PoolSlot>> = Mutex::new(None);
+
 impl RowPool {
-    /// Full-width pool for compute-bound batched work — prefill GEMM
+    /// Full-width pool for compute-bound batched work: prefill GEMM
     /// ([`super::cpu::par_rows_n`]). Width comes from
     /// `super::calibrate::prefill_thread_count`: the performance cores, since
     /// batched matmul is compute-bound and scales with threads, but *not* the
     /// efficiency cores, which measured as a large net loss. Overridable with
     /// `CERA_PREFILL_THREADS=<n>` up to every pinnable core. Lazily built so
     /// `CeraEngine` consumers get it without calling
-    /// [`super::cpu::configure_thread_pool`].
-    pub fn prefill() -> &'static RowPool {
-        static POOL: OnceLock<RowPool> = OnceLock::new();
-        POOL.get_or_init(|| {
-            let topo = super::cpu_features::core_topology();
-            let n = super::calibrate::prefill_thread_count(topo);
-            // Active-sized barrier: prefill GEMMs vary widely in size, and a
-            // small one is better run on the few cores its work can fill than
-            // dragged across the whole pool's barrier (see `Shared::active_barrier`).
-            //
-            // **Pinning is dropped once the pool outgrows the fast cores.**
-            // 1:1 pinning nails a worker to a specific efficiency core and
-            // leaves it there; the scheduler cannot move it even when it is the
-            // straggler every other worker is waiting on at the barrier. Below
-            // that width every worker lands on a fast core and pinning is a
-            // clear win, so the policy flips rather than being abandoned.
-            //
-            // Measured on a Pixel 10 Pro Fold (Tensor G5, 6 fast + 2 A520),
-            // 350M-Q4_K_M at 512 prompt tokens, 5 interleaved rounds each,
-            // thermally and load gated, prefill tok/s:
-            //
-            // | width | pinned | unpinned |
-            // |-------|-------:|---------:|
-            // | default (6, fits the fast cores) | **211** | 189 |
-            // | `CERA_THREADS=8` (reaches the A520s) | 148 | **203** |
-            //
-            // Non-overlapping in both directions. That is a 1.43x cost to
-            // widening, cut to 1.04x, against llama.cpp's own 1.06x.
-            //
-            // Decode keeps pinning at every width; see [`RowPool::decode`].
-            let widened = !prefill_should_pin(topo.fast_cores, n);
-            let (cores, weights, spread) = if widened {
-                // Weights go with the pins: `core_weights[i]` describes the core
-                // worker `i` was placed on, and once nothing is placed it
-                // describes nothing (the same reasoning as `pinned_core_weights`
-                // under `CERA_PIN=0`).
-                // Empty pins, but a non-empty *mask*: the workers must be
-                // confined to the usable core set explicitly rather than
-                // inheriting the caller's single-core mask. See `worker_loop`.
-                (&[][..], &[][..], pinned_cores())
-            } else {
-                (pinned_cores(), pinned_core_weights(), &[][..])
-            };
-            RowPool::build(n, cores, weights, spread, true)
-        })
+    /// [`super::cpu::configure_thread_pool`], and rebuilt by
+    /// `resize_pools_for_cpuset` when the cpuset moves. The returned `Arc`
+    /// keeps a superseded pool alive until in-flight dispatches finish, so a
+    /// resize never strands a dispatcher.
+    pub fn prefill() -> Arc<RowPool> {
+        get_or_build_pool(&PREFILL_SLOT, build_prefill)
     }
 
-    /// Narrow pool for per-token work — decode GEMV
+    /// Narrow pool for per-token work: decode GEMV
     /// ([`super::cpu::par_rows`]). Width comes from
     /// `super::calibrate::decode_thread_count`, which sizes it from the loaded
     /// model's `DecodeShape` (bytes per pool dispatch) on a homogeneous host,
-    /// and on heterogeneous big.LITTLE keeps the full big-core set — decode's
+    /// and on heterogeneous big.LITTLE keeps the full big-core set, decode's
     /// measured optimum there. Overridable with `CERA_DECODE_THREADS=<n>`.
     ///
-    /// **Whoever touches this `OnceLock` first freezes the width for the
-    /// process.** That is why `super::cpu::configure_thread_pool` deliberately
-    /// does not warm it: it runs before any model is loaded, so warming it
-    /// there would pin the pool to the model-less fallback and silently disable
-    /// shape-based sizing. Keep it lazy.
-    pub fn decode() -> &'static RowPool {
-        static POOL: OnceLock<RowPool> = OnceLock::new();
-        POOL.get_or_init(|| {
-            let topo = super::cpu_features::core_topology();
-            let n = super::calibrate::decode_thread_count(topo);
-            // Full barrier: decode wants every worker hot across its tiny-GEMV /
-            // huge-vocab-GEMV mix (see `Shared::active_barrier`).
-            //
-            // **Unlike prefill, decode pins at every width.** The two want
-            // opposite policies and it is worth being explicit about why: decode
-            // is a per-token full barrier over tiny dispatches, where keeping
-            // each worker resident on its own core matters more than letting the
-            // scheduler move it. Same device and model as the table on
-            // [`RowPool::prefill`], decode tok/s: 95.2 pinned against 83.1
-            // unpinned at the default width, and 81.0 against 67.8 at
-            // `CERA_THREADS=8`. Pinned wins at both, so there is no width at
-            // which relaxing it would pay.
-            RowPool::build(n, pinned_cores(), pinned_core_weights(), &[], false)
-        })
+    /// **Whoever touches this pool first sizes it.** That is why
+    /// `super::cpu::configure_thread_pool` deliberately does not warm it: it
+    /// runs before any model is loaded, so warming it there would size the
+    /// pool to the model-less fallback and silently disable shape-based
+    /// sizing (a later cpuset resize would only heal that if the allowance
+    /// also changed). Keep it lazy.
+    pub fn decode() -> Arc<RowPool> {
+        get_or_build_pool(&DECODE_SLOT, build_decode)
     }
 
     /// Build a pool with `num_threads` total workers, pinning worker `i` to
@@ -742,9 +700,10 @@ impl RowPool {
     /// chunk by `core_weights[i]` (see [`Shared::worker_weights`]). Empty, or
     /// shorter than the pool, leaves the uncovered workers on the full chunk.
     ///
-    /// `pin_cores` is taken as already policy-filtered: callers outside the
-    /// tests pass [`pinned_cores`], which is where `CERA_PIN` is honoured, and
-    /// the matching [`pinned_core_weights`] for the weights.
+    /// `pin_cores` is taken as already policy-filtered: callers pass
+    /// [`pin_cores_in`]/[`pin_weights_in`] over their sized topo, which is
+    /// where `CERA_PIN` is honoured; [`pinned_cores`] is the cached-topology
+    /// shorthand.
     fn build(
         num_threads: usize,
         pin_cores: &[usize],
@@ -805,8 +764,16 @@ impl RowPool {
                 .spawn(move || worker_loop(shared, id, pin, spread_mask, spin_limit))
             {
                 Ok(handle) => workers.push(handle),
-                // Couldn't spawn — cap the pool at what we have.
-                Err(_) => break,
+                // Couldn't spawn: cap the pool at what we have, loudly. The
+                // slot records the requested allowance either way, so a
+                // silent shortfall would read as tracked-but-narrow forever.
+                Err(e) => {
+                    tracing::warn!(
+                        "cera: worker spawn failed ({e}); capping pool at {} of {num_threads} workers",
+                        1 + workers.len(),
+                    );
+                    break;
+                }
             }
         }
 
@@ -832,6 +799,306 @@ impl RowPool {
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
+}
+
+/// Fetch the pool in `slot`, building it on first use: size from a fresh
+/// probe, never from a cached width (the cpuset may have moved between
+/// topology detection and now). Built under the slot lock (like the old
+/// `OnceLock`) so concurrent first touches serialize instead of building
+/// twice. Shared by both accessors so the allowance bookkeeping cannot drift
+/// between them.
+fn get_or_build_pool(
+    slot: &Mutex<Option<PoolSlot>>,
+    build: fn(&super::cpu_features::CoreTopology) -> RowPool,
+) -> Arc<RowPool> {
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(built) = guard.as_ref() {
+        return Arc::clone(&built.pool);
+    }
+    let allowed = super::cpu_features::cpu_allowance();
+    let topo = sized_topo_for_pools(allowed);
+    let pool = Arc::new(build(&topo));
+    let out = Arc::clone(&pool);
+    *guard = Some(PoolSlot {
+        pool,
+        allowance: allowed,
+    });
+    out
+}
+
+/// Build the prefill pool for `topo`: width from
+/// `super::calibrate::prefill_thread_count`, pins from `topo`, spread mask
+/// from the cached usable set. The spread stays cache-sourced because it
+/// needs `&'static` for the worker threads. Membership drift is benign: the
+/// kernel constrains the mask to the live cpuset, and a fully disjoint mask
+/// fails the call, whose result is ignored (the thread keeps its inherited
+/// mask).
+fn build_prefill(topo: &super::cpu_features::CoreTopology) -> RowPool {
+    let n = super::calibrate::prefill_thread_count(topo);
+    // Active-sized barrier: prefill GEMMs vary widely in size, and a
+    // small one is better run on the few cores its work can fill than
+    // dragged across the whole pool's barrier (see `Shared::active_barrier`).
+    //
+    // **Pinning is dropped once the pool outgrows the fast cores.**
+    // 1:1 pinning nails a worker to a specific efficiency core and
+    // leaves it there; the scheduler cannot move it even when it is the
+    // straggler every other worker is waiting on at the barrier. Below
+    // that width every worker lands on a fast core and pinning is a
+    // clear win, so the policy flips rather than being abandoned.
+    //
+    // Measured on a Pixel 10 Pro Fold (Tensor G5, 6 fast + 2 A520),
+    // 350M-Q4_K_M at 512 prompt tokens, 5 interleaved rounds each,
+    // thermally and load gated, prefill tok/s:
+    //
+    // | width | pinned | unpinned |
+    // |-------|-------:|---------:|
+    // | default (6, fits the fast cores) | **211** | 189 |
+    // | `CERA_THREADS=8` (reaches the A520s) | 148 | **203** |
+    //
+    // Non-overlapping in both directions. That is a 1.43x cost to
+    // widening, cut to 1.04x, against llama.cpp's own 1.06x.
+    //
+    // Decode keeps pinning at every width; see [`build_decode`].
+    let widened = !prefill_should_pin(topo.fast_cores, n);
+    let (cores, weights, spread) = if widened {
+        // Weights go with the pins: `core_weights[i]` describes the core
+        // worker `i` was placed on, and once nothing is placed it
+        // describes nothing (the same reasoning as `pin_weights_in`
+        // under `CERA_PIN=0`).
+        // Empty pins, but a non-empty *mask*: the workers must be
+        // confined to the usable core set explicitly rather than
+        // inheriting the caller's single-core mask. See `worker_loop`.
+        (&[][..], &[][..], pinned_cores())
+    } else {
+        (pin_cores_in(topo), pin_weights_in(topo), &[][..])
+    };
+    RowPool::build(n, cores, weights, spread, true)
+}
+
+/// Build the decode pool for `topo`: width from
+/// `super::calibrate::decode_thread_count`, pins from `topo`. Unlike
+/// prefill, decode pins at every width (measurement below); full barrier,
+/// every worker hot across the tiny-GEMV / huge-vocab-GEMV mix.
+fn build_decode(topo: &super::cpu_features::CoreTopology) -> RowPool {
+    let n = super::calibrate::decode_thread_count(topo);
+    // Full barrier: decode wants every worker hot across its tiny-GEMV /
+    // huge-vocab-GEMV mix (see `Shared::active_barrier`).
+    //
+    // **Unlike prefill, decode pins at every width.** The two want
+    // opposite policies and it is worth being explicit about why: decode
+    // is a per-token full barrier over tiny dispatches, where keeping
+    // each worker resident on its own core matters more than letting the
+    // scheduler move it. Same device and model as the table on
+    // [`build_prefill`], decode tok/s: 95.2 pinned against 83.1
+    // unpinned at the default width, and 81.0 against 67.8 at
+    // `CERA_THREADS=8`. Pinned wins at both, so there is no width at
+    // which relaxing it would pay.
+    RowPool::build(n, pin_cores_in(topo), pin_weights_in(topo), &[], false)
+}
+
+/// Topology sized for pool construction: the cached RAW detection with policy
+/// (allowance clamp, env overrides) applied fresh. Pool builds (initial and
+/// resize) always go through here rather than trusting a cached width, so a
+/// cpuset move between topology detection and first use cannot stick the
+/// pools, and widening restores width (re-clamping an already-clamped topo
+/// could only narrow). The raw input is load-bearing and pinned only by
+/// review: re-applying policy to an already-shaped cache is a fixed point at
+/// a fixed allowance, so no test distinguishes this call site reading the raw
+/// static from the policy static without a startup-narrowed cpuset, which
+/// tests cannot arrange deterministically. Pins, weights, and the fast-core
+/// set come from the raw detection, which is host-wide (sysfs is not re-read,
+/// so CPU hotplug still needs a restart).
+fn sized_topo_for_pools(allowed: usize) -> super::cpu_features::CoreTopology {
+    let topo = super::cpu_features::core_topology_raw().clone();
+    super::cpu_features::apply_pool_policy(topo, allowed)
+}
+
+/// `try_lock` a pool's dispatch lock: `WouldBlock` means a dispatch is in
+/// flight (the caller falls back to serial, or defers the rebuild); poisoned
+/// proceeds (the last holder unwound, so nothing is in flight).
+fn idle_guard(pool: &RowPool) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match pool.dispatch_lock.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// What one pool slot needs at a resize boundary: already tracking (or
+/// unbuilt, which first use sizes fresh), holding a pool that must be
+/// rebuilt, or mid-first-use-build. The third state exists so a deferred
+/// slot is logged as deferred, never misread as tracking.
+enum PoolNeed {
+    Tracking,
+    Rebuild(Arc<RowPool>),
+    Deferred,
+}
+
+impl PoolNeed {
+    fn rebuild_pool(self) -> Option<Arc<RowPool>> {
+        match self {
+            PoolNeed::Rebuild(pool) => Some(pool),
+            PoolNeed::Tracking | PoolNeed::Deferred => None,
+        }
+    }
+
+    fn is_deferred(&self) -> bool {
+        matches!(self, PoolNeed::Deferred)
+    }
+}
+
+/// Slot snapshot for the resize gate. `try_lock`, poison-tolerant: a slot
+/// mid-first-use-build reports [`PoolNeed::Deferred`] rather than stalling
+/// this boundary, keeping the resize path non-blocking end to end.
+fn pool_resize_need(slot: &Mutex<Option<PoolSlot>>, name: &str, allowed: usize) -> PoolNeed {
+    let guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            tracing::debug!(
+                "cera: {name} pool slot mid-build; resize to {allowed} deferred to next boundary"
+            );
+            return PoolNeed::Deferred;
+        }
+    };
+    match guard.as_ref() {
+        Some(s) if s.allowance != allowed => PoolNeed::Rebuild(Arc::clone(&s.pool)),
+        _ => PoolNeed::Tracking,
+    }
+}
+
+/// Rebuild the pools that are not tracking `allowed`, skipping unbuilt ones
+/// (first use sizes them fresh, which keeps decode lazy until its model's
+/// shape is registered). Gated on idleness BEFORE anything is built, so a
+/// refused gate costs no spawn. Each pool gates independently: a mid-dispatch
+/// pool defers to the next boundary while an idle one still swaps, so a
+/// persistently busy pool cannot pin the other at a departed width. Never
+/// blocks a dispatcher. A poisoned dispatch lock proceeds like the dispatch
+/// path does (the last dispatcher unwound, so nothing is in flight, and the
+/// swap heals the poison with a fresh lock). Returns true when it swapped at
+/// least one pool.
+///
+/// Locking: the need snapshot is `try_lock` per slot (an accessor holds a
+/// slot lock only for an `Arc` clone, except during first-use builds, which
+/// report [`PoolNeed::Deferred`], logged distinctly from the tracking
+/// no-op); everything after that is `try_lock` in fixed prefill-then-decode
+/// order, so there is no lock-order cycle (accessors never hold a slot guard
+/// while taking a dispatch lock) and concurrent rebuilders serialize on the
+/// dispatch guards. A cpuset move between the probe and the swap just leaves
+/// the stored allowance stale, and the next boundary re-resizes. Every early
+/// `false` logs at debug with its leg and target allowance so a stuck width
+/// stays diagnosable.
+fn rebuild_pools_for_allowance(allowed: usize) -> bool {
+    let prefill_need = pool_resize_need(&PREFILL_SLOT, "prefill", allowed);
+    let decode_need = pool_resize_need(&DECODE_SLOT, "decode", allowed);
+    let deferred = prefill_need.is_deferred() || decode_need.is_deferred();
+    let old_prefill = prefill_need.rebuild_pool();
+    let old_decode = decode_need.rebuild_pool();
+    if old_prefill.is_none() && old_decode.is_none() {
+        // A deferred slot already logged at the snapshot site; only the
+        // all-tracking case is a no-op.
+        if !deferred {
+            tracing::debug!("cera: pools already track allowance {allowed}; resize no-op");
+        }
+        return false;
+    }
+    // Gate each pool on idleness before building: a refused gate must not
+    // cost a spawn. Fixed order, never blocking; guards held through the
+    // swap. A busy pool defers to the next boundary while an idle one still
+    // swaps.
+    let _prefill_guard = old_prefill.as_ref().and_then(|p| idle_guard(p));
+    let _decode_guard = old_decode.as_ref().and_then(|p| idle_guard(p));
+    let rebuild_prefill = old_prefill.is_some() && _prefill_guard.is_some();
+    let rebuild_decode = old_decode.is_some() && _decode_guard.is_some();
+    if old_prefill.is_some() && !rebuild_prefill {
+        tracing::debug!(
+            "cera: prefill pool mid-dispatch; resize to {allowed} deferred to next boundary"
+        );
+    }
+    if old_decode.is_some() && !rebuild_decode {
+        tracing::debug!(
+            "cera: decode pool mid-dispatch; resize to {allowed} deferred to next boundary"
+        );
+    }
+    if !rebuild_prefill && !rebuild_decode {
+        return false;
+    }
+    // Build replacements while gated: concurrent dispatches from other
+    // sessions fall back to serial for one build (~ms, only on real
+    // transitions) instead of piling onto the old width.
+    let topo = sized_topo_for_pools(allowed);
+    let new_prefill = rebuild_prefill.then(|| build_prefill(&topo));
+    let new_decode = rebuild_decode.then(|| build_decode(&topo));
+    // Swap each rebuilt pool under its slot try-lock, fixed order, with no
+    // early return between: a contended slot defers only its own pool (see
+    // `pool_swap_helper_defers_only_contended_slot`), so a first-use build
+    // on one slot never strands a ready swap on the other.
+    let mut rebuilt = false;
+    if let Some(new) = new_prefill {
+        rebuilt |= swap_rebuilt_pool(&PREFILL_SLOT, "prefill", new, allowed);
+    }
+    if let Some(new) = new_decode {
+        rebuilt |= swap_rebuilt_pool(&DECODE_SLOT, "decode", new, allowed);
+    }
+    rebuilt
+}
+
+/// Swap one rebuilt pool into its slot. Returns whether it swapped; a
+/// contended slot logs and defers this pool to the next boundary (the other
+/// pool still swaps). Poisoned proceeds (the last accessor unwound, so
+/// nothing is mid-build).
+fn swap_rebuilt_pool(
+    slot: &Mutex<Option<PoolSlot>>,
+    name: &str,
+    new: RowPool,
+    allowed: usize,
+) -> bool {
+    let mut guard = match slot.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            tracing::debug!(
+                "cera: {name} pool slot contended; resize to {allowed} deferred to next boundary"
+            );
+            return false;
+        }
+    };
+    let Some(entry) = guard.as_mut() else {
+        tracing::debug!(
+            "cera: {name} pool slot unbuilt at swap; resize to {allowed} deferred to next boundary"
+        );
+        return false;
+    };
+    tracing::info!(
+        "cera: cpuset allowance is now {allowed}; rebuilding {name} pool {} -> {} workers",
+        entry.pool.num_threads(),
+        new.num_threads(),
+    );
+    *entry = PoolSlot {
+        pool: Arc::new(new),
+        allowance: allowed,
+    };
+    true
+}
+
+/// Rebuild both pools when the process CPU allowance changed since they were
+/// sized (cpuset/cgroup migration, e.g. Android background to foreground),
+/// so performance is never stuck at a departed cpuset's width. Cheap no-op
+/// when unchanged: one affinity syscall plus two integer compares. On change
+/// it rebuilds only idle pools; a mid-dispatch pool defers to the next
+/// boundary instead of blocking it. Returns true when it swapped at least
+/// one pool.
+///
+/// Called at generation boundaries (append/generate entry, each decode
+/// token, each prefill chunk): between dispatches, never within one.
+/// In-flight dispatches hold their own `Arc` and finish on the old width.
+///
+/// Scope is RowPool widths only. The rayon global pool (vision
+/// preprocessing) is build-once and has no public resize API; hardware
+/// topology (pins, weights, fast set) is host-wide and reuses the frozen
+/// detection, so only the allowance-tracked width moves.
+pub(crate) fn resize_pools_for_cpuset() -> bool {
+    rebuild_pools_for_allowance(super::cpu_features::cpu_allowance())
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1074,11 +1341,7 @@ impl RowPool {
         // guard below leaves the pool state consistent even on unwind.
         let wanted_fanout = active > 1;
         let guard = if wanted_fanout {
-            match self.dispatch_lock.try_lock() {
-                Ok(g) => Some(g),
-                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
-                Err(std::sync::TryLockError::WouldBlock) => None,
-            }
+            idle_guard(self)
         } else {
             None
         };
@@ -1478,16 +1741,24 @@ pub(crate) fn pin_current_thread_to_core(_core: usize) -> bool {
 }
 
 /// Every core this crate is willing to pin a worker to, fastest-first, or
-/// nothing at all when `CERA_PIN` is off. The single place that decision is
-/// made; `RowPool::build` takes its core list already filtered through here.
+/// nothing at all when `CERA_PIN` is off. Cached-topology shorthand over
+/// [`pin_cores_in`]; `RowPool::build` takes its core list already filtered
+/// through here.
 ///
 /// This is the *full* usable set, efficiency cores included, because a widened
 /// pool needs a distinct core for every worker (see `CoreTopology::pin_cores`
 /// for the 35x measurement behind that). A caller that wants only the fast
 /// cores wants [`perf_pinned_cores`] instead.
 pub(crate) fn pinned_cores() -> &'static [usize] {
+    pin_cores_in(super::cpu_features::core_topology())
+}
+
+/// [`pinned_cores`] for an explicit topology: pool (re)builds pass their
+/// freshly-sized topo so pins track it. The single place the `CERA_PIN`
+/// decision is made.
+fn pin_cores_in(topo: &super::cpu_features::CoreTopology) -> &[usize] {
     if pinning_enabled() {
-        &super::cpu_features::core_topology().pin_cores
+        &topo.pin_cores
     } else {
         &[]
     }
@@ -1502,9 +1773,18 @@ pub(crate) fn pinned_cores() -> &'static [usize] {
 /// and sizing its chunk from that would be a guess dressed as a measurement.
 /// Returning nothing puts every worker back on the uniform chunk, which is the
 /// right behaviour when placement is unknown.
+///
+/// Test-only: pool builds take weights from their sized topo (see
+/// [`pin_weights_in`]).
+#[cfg(test)]
 pub(crate) fn pinned_core_weights() -> &'static [u32] {
+    pin_weights_in(super::cpu_features::core_topology())
+}
+
+/// [`pinned_core_weights`] for an explicit topology; see [`pin_cores_in`].
+fn pin_weights_in(topo: &super::cpu_features::CoreTopology) -> &[u32] {
     if pinning_enabled() {
-        &super::cpu_features::core_topology().core_weights
+        &topo.core_weights
     } else {
         &[]
     }
@@ -1572,6 +1852,354 @@ pub(crate) fn set_current_thread_affinity(_cores: &[usize]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the resize tests: they all mutate the global pools, so
+    /// interleaved rebuilds would race each other's width assertions. Other
+    /// tests only dispatch (correct at any width) and run concurrently.
+    static RESIZE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drive both pools to tracking `allowed`, retrying past concurrent-test
+    /// dispatches that legitimately refuse an attempt. Callers ensure the
+    /// pools are built first (unbuilt slots are skipped, never staged).
+    /// Returns whether both pools landed there (false only under sustained
+    /// contention); the panicking wrapper below is for test bodies, this one
+    /// for `Drop`, which must not panic.
+    ///
+    /// Deadline-bounded, not count-bounded: a refused attempt costs
+    /// microseconds (the gate runs before any build), so a fixed iteration
+    /// count could all land inside one concurrent multi-millisecond dispatch.
+    fn try_stage_allowance(allowed: usize) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            rebuild_pools_for_allowance(allowed);
+            let tracking = [&PREFILL_SLOT, &DECODE_SLOT].iter().all(|slot| {
+                slot.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .is_some_and(|s| s.allowance == allowed)
+            });
+            if tracking {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn stage_allowance(allowed: usize) {
+        assert!(
+            try_stage_allowance(allowed),
+            "staging allowance {allowed} never landed"
+        );
+    }
+
+    /// Restores the ambient allowance on exit, including on panic, so later
+    /// tests inherit normally-sized pools. Best-effort retry: a single shot
+    /// can lose to a concurrent test dispatch; correctness never depends on
+    /// width.
+    struct RestoreAmbient(usize);
+    impl Drop for RestoreAmbient {
+        fn drop(&mut self) {
+            try_stage_allowance(self.0);
+        }
+    }
+
+    /// Expected `(prefill, decode)` widths for an allowance, through the same
+    /// sizing path the rebuild uses (frozen detection, fresh clamp, current
+    /// env).
+    fn expect_widths(allowed: usize) -> (usize, usize) {
+        let topo = sized_topo_for_pools(allowed);
+        (
+            crate::backend::calibrate::prefill_thread_count(&topo),
+            crate::backend::calibrate::decode_thread_count(&topo),
+        )
+    }
+
+    fn live_widths() -> (usize, usize) {
+        (
+            RowPool::prefill().num_threads(),
+            RowPool::decode().num_threads(),
+        )
+    }
+
+    /// Stage `allowed` and verify the exact widths, folding the pins into a
+    /// deadline loop: session/engine tests drive ambient resizes concurrently
+    /// in this binary (outside the serial lock), so a bare assert after
+    /// staging can catch a slipped-in ambient width and flake.
+    fn stage_and_verify(allowed: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            stage_allowance(allowed);
+            if live_widths() == expect_widths(allowed) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "widths never settled at allowance {allowed}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Resize tracks an explicit allowance: narrowing rebuilds both pools to
+    /// the calibrate-predicted widths for that allowance, widening restores
+    /// them, and the landing rebuild reports true. Uses the
+    /// explicit-allowance seam so the test is deterministic (no cpuset
+    /// mutation); restores the ambient allowance on exit, including on panic,
+    /// so later tests inherit normally-sized pools.
+    ///
+    /// Degenerate-host caveat: on a 1-CPU runner the narrow leg equals the
+    /// wide leg, so only the exact-width assertions (not the change itself)
+    /// carry weight there.
+    #[test]
+    fn pool_resize_tracks_explicit_allowance() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        if ambient == usize::MAX {
+            eprintln!("skip: process allowance unknown, cannot stage a change");
+            return;
+        }
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::prefill();
+        let _ = RowPool::decode();
+        // Widen first so the narrow leg below proves a change even on hosts
+        // whose ambient allowance is already small.
+        stage_and_verify(usize::MAX);
+        // The landing rebuild reports true (retried past concurrent
+        // dispatches, like the staging above; deadline-bounded for the same
+        // reason).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut landed = false;
+        loop {
+            if rebuild_pools_for_allowance(1) {
+                landed = true;
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(landed);
+        // Per-pool gating means the landing rebuild may have swapped only
+        // the idle pool; converge the other before asserting widths.
+        stage_and_verify(1);
+        stage_and_verify(ambient);
+    }
+
+    /// A mid-dispatch pool defers resize while the idle pool still swaps:
+    /// with the decode dispatch lock held, rebuild swaps prefill, reports
+    /// true, and leaves the decode width untouched. Holds the lock directly
+    /// (same module); `std` mutexes are non-reentrant so the rebuild's
+    /// `try_lock` deterministically fails on this thread. The lock is
+    /// acquire-then-verified (`Arc::ptr_eq` against the live slot): a
+    /// concurrent ambient resize slipping between fetch and lock would
+    /// otherwise hand this test a stale pool's guard while its own rebuild
+    /// swaps the live pool. Width pins fold into the landing loop (a
+    /// concurrent resize can slip between a true report and the width read);
+    /// deadline-bounded like the staging above. Restores ambient on exit.
+    #[test]
+    fn pool_resize_skips_when_busy() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        // Declared before `_held` so drop order releases the lock first,
+        // then re-stages.
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::decode();
+        let _ = RowPool::prefill();
+        // Stage a tracked allowance that differs from the rebuild target so
+        // the busy gate (not the no-op leg) is what refuses decode below.
+        stage_allowance(usize::MAX);
+        let expect_pre = expect_widths(1).0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Pin the CURRENT decode pool for the whole attempt: fetch, lock,
+        // verify the slot still holds it, then drive the landing loop with
+        // both alive (the guard borrows the pool, so the loop lives in this
+        // scope). A concurrent ambient resize between fetch and lock hands
+        // us a stale guard, in which case retry.
+        let mut saw_true = false;
+        let landed = 'pin: loop {
+            let decode = RowPool::decode();
+            let _held = decode
+                .dispatch_lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !Arc::ptr_eq(&decode, &RowPool::decode()) {
+                drop(_held);
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "decode pool never stable enough to pin"
+                );
+                std::thread::yield_now();
+                continue 'pin;
+            }
+            let w_dec = decode.num_threads();
+            loop {
+                if rebuild_pools_for_allowance(1) {
+                    saw_true = true;
+                }
+                // Break only on an observed swap plus the full post-state:
+                // prefill swapped, decode untouched. The widths alone
+                // cannot gate the break: under a width-dominating override
+                // (`CERA_THREADS`) they match before any swap is reported.
+                if saw_true
+                    && RowPool::prefill().num_threads() == expect_pre
+                    && RowPool::decode().num_threads() == w_dec
+                {
+                    break 'pin true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break 'pin false;
+                }
+                std::thread::yield_now();
+            }
+        };
+        assert!(saw_true, "rebuild never reported a swap");
+        assert!(landed, "prefill never swapped while decode was held");
+    }
+
+    /// Need-stage deferral is per-pool: with the prefill slot lock held
+    /// (mid-build), a rebuild needing both pools still swaps decode and
+    /// reports true. Holds the slot directly (same module). Prefill cannot
+    /// have swapped (every swap path takes the held slot lock), so only the
+    /// decode width is asserted; concurrent ambient resizes cannot touch
+    /// prefill either, for the same reason. (This pins the need snapshot,
+    /// not the swap: the held slot reports `Deferred` before any swap runs.
+    /// The swap helper's own contract is pinned below.)
+    #[test]
+    fn pool_resize_deferred_slot_does_not_block_other_pool() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::decode();
+        let _ = RowPool::prefill();
+        stage_allowance(usize::MAX);
+        let expect_dec = expect_widths(1).1;
+        let _slot_held = PREFILL_SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_true = false;
+        let mut landed = false;
+        loop {
+            if rebuild_pools_for_allowance(1) {
+                saw_true = true;
+            }
+            // Gate the break on an observed swap, not the width alone:
+            // under a width-dominating override (`CERA_THREADS`) the width
+            // matches before any swap is reported.
+            if saw_true && RowPool::decode().num_threads() == expect_dec {
+                landed = true;
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            saw_true,
+            "rebuild never reported a swap with prefill slot held"
+        );
+        assert!(landed, "decode never swapped with prefill slot held");
+    }
+
+    /// The swap helper refuses a contended slot and swaps a free one. Direct
+    /// pin of the per-pool swap contract: rebuild calls it once per pool
+    /// with no early return between, so contention defers only its own pool
+    /// (that wiring is structural, verified by read). The decode leg loops:
+    /// a concurrent accessor's brief slot hold can refuse one attempt, and
+    /// a concurrent ambient resize can slip between the swap and the width
+    /// read.
+    #[test]
+    fn pool_swap_helper_defers_only_contended_slot() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::decode();
+        let _ = RowPool::prefill();
+        stage_allowance(usize::MAX);
+        let expect_dec = expect_widths(1).1;
+        let _slot_held = PREFILL_SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let topo = sized_topo_for_pools(1);
+            // Prefill deterministically refuses: we hold its slot.
+            assert!(!swap_rebuilt_pool(
+                &PREFILL_SLOT,
+                "prefill",
+                build_prefill(&topo),
+                1
+            ));
+            if swap_rebuilt_pool(&DECODE_SLOT, "decode", build_decode(&topo), 1)
+                && RowPool::decode().num_threads() == expect_dec
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "decode swap never landed with prefill slot held"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A poisoned dispatch lock (a dispatcher panicked) must not wedge
+    /// resize: the gate proceeds through poison, the swap heals the slot
+    /// with a fresh lock, and the new pool dispatches. Staging ambient
+    /// first makes concurrent ambient resizes no-ops, so nothing swaps
+    /// between the poison and the rebuild gating it: that is what makes
+    /// the heal deterministic rather than racy.
+    #[test]
+    fn pool_resize_heals_poisoned_dispatch_lock() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::prefill();
+        let _ = RowPool::decode();
+        stage_allowance(ambient);
+        let pool = RowPool::prefill();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = pool.dispatch_lock.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("intentional poison probe");
+        }));
+        assert!(outcome.is_err(), "poison probe did not panic");
+        assert!(pool.dispatch_lock.is_poisoned());
+        // Poison is not business: the gate proceeds through it...
+        assert!(idle_guard(&pool).is_some());
+        // ...and the rebuild heals the slot with a fresh lock.
+        stage_and_verify(1);
+        assert!(!RowPool::prefill().dispatch_lock.is_poisoned());
+        // The healed pool dispatches correctly.
+        let mut y = vec![0.0f32; 64];
+        RowPool::prefill().dispatch_rows(&mut y, 1, 1, |row, slice| {
+            slice[0] = row as f32;
+        });
+        for (row, &v) in y.iter().enumerate() {
+            assert_eq!(v, row as f32);
+        }
+    }
+
+    /// With pools tracking the ambient allowance, the probed entry is a
+    /// no-op: no rebuild, same widths.
+    #[test]
+    fn pool_resize_noop_when_allowance_unchanged() {
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        let _ = RowPool::prefill();
+        let _ = RowPool::decode();
+        stage_allowance(ambient);
+        let before = (
+            RowPool::prefill().num_threads(),
+            RowPool::decode().num_threads(),
+        );
+        assert!(!resize_pools_for_cpuset());
+        let after = (
+            RowPool::prefill().num_threads(),
+            RowPool::decode().num_threads(),
+        );
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn dispatch_matches_serial_across_shapes_and_threads() {
@@ -1806,7 +2434,7 @@ mod tests {
         // width: the policy is decided on the *requested* width while
         // `num_threads()` reports the width actually achieved, and a spawn
         // failure can move one without the other.
-        let pools: Vec<&RowPool> = [RowPool::prefill(), RowPool::decode()]
+        let pools: Vec<Arc<RowPool>> = [RowPool::prefill(), RowPool::decode()]
             .into_iter()
             .filter(|p| p.workers_pinned || pinned_core_weights().is_empty())
             .collect();
@@ -1843,9 +2471,9 @@ mod tests {
     /// the default width and a 27% loss once the pool reaches the E-cores, so a
     /// policy that got the threshold wrong would regress one of the two.
     ///
-    /// Asserts the predicate rather than the built pool, because `prefill()` is
-    /// a process-wide `OnceLock` whose width is fixed by whoever touches it
-    /// first and cannot be varied within a test run.
+    /// Asserts the predicate rather than the built pool, because `prefill()`
+    /// width follows the live cpuset allowance and cannot be set directly
+    /// within a test run.
     #[test]
     fn prefill_drops_pinning_only_once_wider_than_the_fast_cores() {
         // Drives the production predicate, so a change to it fails this test.

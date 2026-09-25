@@ -225,13 +225,13 @@ pub fn configure_thread_pool() -> usize {
     //
     // The **decode** pool is deliberately not warmed here. Its width depends on
     // the loaded model's `DecodeShape` (see `backend::calibrate`), and this
-    // runs from `main()` before any model exists — warming it here would freeze
-    // the pool at the model-less fallback width and silently disable
-    // shape-based sizing. It builds on the first decode GEMV instead, which is
-    // after `load_model` has registered the shape. That defers its worker spawn
-    // into the first token rather than startup — unmeasured, but it is one
-    // thread spawn per worker, once per process, against a decode that already
-    // takes milliseconds per token.
+    // runs from `main()` before any model exists: warming it here would size
+    // the pool to the model-less fallback and silently disable shape-based
+    // sizing until a cpuset resize. It builds on the first decode GEMV instead,
+    // which is after `load_model` has registered the shape. That defers its
+    // worker spawn into the first token rather than startup (unmeasured, but
+    // it is one thread spawn per worker, per pool build, against a decode that
+    // already takes milliseconds per token).
     super::threadpool::RowPool::prefill().num_threads()
 }
 
@@ -665,7 +665,7 @@ pub fn par_rows_n_chunked(
 /// duplicated body.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn par_rows_n_chunked_on(
-    pool: &'static super::threadpool::RowPool,
+    pool: std::sync::Arc<super::threadpool::RowPool>,
     y: &mut [f32],
     n: usize,
     min_rows: usize,
