@@ -135,6 +135,15 @@ pub fn build_mel_filterbank(n_mel: usize, n_fft: usize, sample_rate: usize) -> V
 /// span: it is crate-internal, and an intra-doc link to it fails
 /// `rustdoc::private_intra_doc_links` on this public item).
 pub fn build_hann_window(length: usize) -> Vec<f32> {
+    if length <= 1 {
+        // Same degenerate contract as `build_symmetric_hann_window`
+        // (plain code span: it is crate-internal, and an intra-doc
+        // link to it fails `rustdoc::private_intra_doc_links` on this
+        // public item). A single tap is the neutral window, matching
+        // numpy and torch; the raw periodic formula would yield 0.0,
+        // which zeroes the signal it windows.
+        return vec![1.0; length];
+    }
     hann_window_with_divisor(length, length as f64)
 }
 
@@ -603,7 +612,7 @@ mod tests {
         let (mel, _) = log_mel_spectrogram(&pcm, n_mel);
         // Old formula: -9.687714 (delta 0.17 vs tol 1e-2).
         assert!(
-            (mel[0] - -9.857828).abs() < 1e-2,
+            (mel[0] - (-9.857828)).abs() < 1e-2,
             "mel[0] = {} (expected ~= -9.858)",
             mel[0]
         );
@@ -621,6 +630,15 @@ mod tests {
     fn symmetric_hann_window_degenerate_lengths() {
         assert!(build_symmetric_hann_window(0).is_empty());
         assert_eq!(build_symmetric_hann_window(1), vec![1.0]);
+    }
+
+    /// The periodic builder shares the symmetric builder's degenerate
+    /// contract: empty stays empty and a single tap is the neutral
+    /// window, not the raw formula's 0.0.
+    #[test]
+    fn hann_window_degenerate_lengths() {
+        assert!(build_hann_window(0).is_empty());
+        assert_eq!(build_hann_window(1), vec![1.0]);
     }
 
     /// Empty input returns an empty vec without panicking.

@@ -842,7 +842,7 @@ fn xl_attention_strided_path_parity() {
     );
 }
 
-// ── Tests 7-11: the log-mel front-end ───────────────────────────────────────
+// ── Tests 7-12: the log-mel front-end ───────────────────────────────────────
 //
 // Unlike everything above, this half is not an exact port: the CPU FFTs with
 // rustfft and accumulates the power spectrum, the filterbank dot product and the
@@ -1062,6 +1062,52 @@ fn mel_frontend_parity() {
         );
         assert_parity(&label, &want, &got, 0.9999999, 1e-3, 1e-3);
     }
+}
+
+/// Constant PCM pins the GPU kernel's eps placement, where broadband parity
+/// cannot.
+///
+/// `mel_frontend_parity` compares GPU against CPU on a broadband signal, where
+/// per-bin variances are O(1) and `1/(sqrt(var)+eps)` vs `1/sqrt(var+eps)`
+/// differ by ~1e-5 relative: both formulas pass that gate. Constant PCM drives
+/// the variance toward zero, where the two formulas separate by ~0.17 absolute
+/// on `mel[0]` (the CPU golden `per_feature_norm_eps_is_after_sqrt` pins the
+/// same separation on the CPU side). A GPU kernel regressed to the inside-sqrt
+/// form would miss the live CPU reference by that 0.17 here. Measured
+/// GPU-vs-CPU max abs diff on this input is 2.6e-5, so the 1e-3 budgets below
+/// sit ~40x above the noise and ~17x below the regression signal.
+#[test]
+fn mel_frontend_constant_pcm_pins_eps_placement() {
+    use cera::model::audio_encoder_gpu::{
+        AudioEncoderGpuOps, GpuMelFrontend, log_mel_spectrogram_gpu,
+    };
+
+    let Some(ctx) = common::metal_context() else {
+        return;
+    };
+    let ops = MetalAudioOps::new(ctx).expect("build Metal audio ops");
+    // Same shape as the CPU golden, so the live reference is the pinned one.
+    let n_mel = 80;
+    let fe = GpuMelFrontend::build(&ops, n_mel).expect("build mel front-end");
+
+    let pcm = vec![0.1f32; 16000];
+    let (want, n_frames) = log_mel_spectrogram(&pcm, n_mel);
+    assert!(n_frames > 0, "constant signal produced no mel frames");
+
+    let (mel_buf, gpu_frames) = log_mel_spectrogram_gpu(&ops, &fe, &pcm)
+        .expect("front-end should run")
+        .expect("front-end should produce frames");
+    assert_eq!(gpu_frames, n_frames, "frame count disagrees");
+    let got = ops.download(&mel_buf, n_frames * n_mel);
+
+    let label = "log-mel constant pcm";
+    let l2 = rel_l2(&want, &got);
+    eprintln!("{label}: rel-L2 vs CPU front-end {l2:.3e}");
+    assert!(
+        l2 <= 1e-4,
+        "{label}: rel-L2 {l2:.3e} vs the CPU front-end, over 1e-4"
+    );
+    assert_parity(label, &want, &got, 0.9999999, 1e-3, 1e-3);
 }
 
 /// A chunk with only one live frame normalizes to all zeros, on both paths.
