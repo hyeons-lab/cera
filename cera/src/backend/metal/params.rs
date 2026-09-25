@@ -750,7 +750,8 @@ impl MetalParams for MelProjectParams {}
 ///
 /// Not shared with [`MelProjectParams`] despite the identical width: the third
 /// field means "frames the statistics are taken over" here and "FFT bins" there,
-/// and `eps_bits` is the variance floor rather than the log floor. One mirror for
+/// and `eps_bits` is the post-sqrt norm offset (`NORM_VAR_EPS`) rather than
+/// the log floor. One mirror for
 /// both would make a field added for one kernel silently reinterpret the other's
 /// upload.
 #[repr(C)]

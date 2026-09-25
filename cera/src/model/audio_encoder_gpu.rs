@@ -416,7 +416,8 @@ pub trait AudioEncoderGpuOps {
 /// by the STFT geometry and the filterbank by `n_mel_bins`. Rebuilding them per
 /// utterance would cost more host work than the front-end saves.
 pub struct GpuMelFrontend<O: AudioEncoderGpuOps> {
-    /// Periodic Hann window centered in an `N_FFT`-wide buffer.
+    /// Symmetric Hann window (`torch.hann_window(periodic=False)` form)
+    /// centered in an `N_FFT`-wide buffer.
     hann: O::Buf,
     /// `[N_FFT, 2]` cos/sin of `-2π·m/N_FFT`, indexed by `(k·n) mod N_FFT`.
     twiddle: O::Buf,

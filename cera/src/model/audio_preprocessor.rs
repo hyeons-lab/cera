@@ -1,10 +1,11 @@
 //! LFM2A audio preprocessor — PCM samples → log-mel spectrogram.
 //!
 //! Mirrors the C++ reference's `mtmd_audio_preprocessor_conformer`
-//! pipeline: center-pad → pre-emphasis → per-frame (Hann-window
-//! → FFT → power → mel filterbank → natural log) → per-feature
-//! normalization. Output is `[n_frames × n_mel_bins]` row-major
-//! (time-major outer, freq inner) — the natural input layout for
+//! pipeline at its NeMo-parity revision: center-pad → pre-emphasis
+//! → per-frame (Hann-window → FFT → power → mel filterbank →
+//! natural log) → per-feature normalization. Output is
+//! `[n_frames × n_mel_bins]` row-major (time-major outer, freq
+//! inner), the natural input layout for
 //! `audio_encoder::conv_stem_forward`.
 //!
 //! Design notes:
@@ -12,15 +13,17 @@
 //!   Slaney area normalization. Matches librosa defaults and the
 //!   C++ reference exactly. Differs from the HTK formula
 //!   (`2595 * log10(1 + f / 700)`).
-//! - **Hann window** is `WINDOW_LEN = 400` samples (periodic),
-//!   centered inside an `N_FFT = 512`-sized buffer (zero-padded
-//!   56 samples on each side).
+//! - **Hann window** is `WINDOW_LEN = 400` samples, symmetric as
+//!   in `torch.hann_window(periodic=False)`, centered inside an
+//!   `N_FFT = 512`-sized buffer (zero-padded 56 samples on each
+//!   side). NeMo (which LFM2.5-Audio trained against) uses the
+//!   symmetric form, not the periodic one.
 //! - **Center padding** by `N_FFT / 2 = 256` zeros on both
 //!   sides (Whisper / librosa `center=True` mode).
 //! - **Pre-emphasis** runs over the inner (un-padded) region only.
 //! - **Per-feature norm** uses the unbiased variance estimator
-//!   (denominator `effective_n_len - 1`) and an `eps = 1e-5`
-//!   floor before the sqrt — matches the C++ ref exactly.
+//!   (denominator `effective_n_len - 1`) with `eps = 1e-5` added
+//!   after the sqrt (`sqrt(var) + eps`), matching NeMo.
 //! - **f64 accumulation** for the per-feature mean/var sums and
 //!   the mel-filterbank dot products, matching the project's
 //!   numerical-precision convention.
@@ -126,18 +129,58 @@ pub fn build_mel_filterbank(n_mel: usize, n_fft: usize, sample_rate: usize) -> V
 
 /// Build a periodic Hann window of `length` samples. "Periodic"
 /// matches librosa / Whisper / the C++ reference (cos divisor is
-/// `length`, not `length - 1` as in the symmetric form).
+/// `length`, not `length - 1` as in the symmetric form). Only the
+/// Whisper path uses this; the LFM2A path needs the NeMo
+/// (symmetric) form in `build_symmetric_hann_window` (plain code
+/// span: it is crate-internal, and an intra-doc link to it fails
+/// `rustdoc::private_intra_doc_links` on this public item).
 pub fn build_hann_window(length: usize) -> Vec<f32> {
+    if length <= 1 {
+        // Same degenerate contract as `build_symmetric_hann_window`
+        // (plain code span: it is crate-internal, and an intra-doc
+        // link to it fails `rustdoc::private_intra_doc_links` on this
+        // public item). A single tap is the neutral window, matching
+        // numpy and torch; the raw periodic formula would yield 0.0,
+        // which zeroes the signal it windows.
+        return vec![1.0; length];
+    }
+    hann_window_with_divisor(length, length as f64)
+}
+
+/// Build a symmetric Hann window of `length` samples, as in
+/// `torch.hann_window(..., periodic=False)` (cos divisor is
+/// `length - 1`, so both endpoints are zero). This is the NeMo
+/// form the LFM2A preprocessor needs; the periodic form stays in
+/// [`build_hann_window`] for the Whisper path.
+///
+/// Crate-internal: the only consumer is [`build_padded_hann_window`]
+/// in this module. Widen to `pub` only if an external crate needs
+/// the raw symmetric window (widening is non-breaking; narrowing a
+/// `pub` item later would not be).
+pub(crate) fn build_symmetric_hann_window(length: usize) -> Vec<f32> {
+    if length <= 1 {
+        // Degenerate lengths never occur in practice (`WINDOW_LEN`
+        // is 400); return a neutral window rather than dividing
+        // by zero.
+        return vec![1.0; length];
+    }
+    hann_window_with_divisor(length, (length - 1) as f64)
+}
+
+/// Shared Hann tap computation behind [`build_hann_window`] (periodic
+/// divisor `length`) and [`build_symmetric_hann_window`] (symmetric
+/// divisor `length - 1`). One core so a precision or endpoint fix can
+/// never land on one form and silently miss the other.
+fn hann_window_with_divisor(length: usize, divisor: f64) -> Vec<f32> {
     let mut w = Vec::with_capacity(length);
-    let denom = length as f64;
     for i in 0..length {
-        let v = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / denom).cos());
+        let v = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / divisor).cos());
         w.push(v as f32);
     }
     w
 }
 
-/// The Hann window as the STFT actually applies it: `WINDOW_LEN` periodic Hann
+/// The Hann window as the STFT actually applies it: `WINDOW_LEN` symmetric Hann
 /// samples centered inside an `N_FFT`-wide buffer, zero on both flanks.
 ///
 /// Split out of [`log_mel_spectrogram`] so the GPU front-end
@@ -146,7 +189,7 @@ pub fn build_hann_window(length: usize) -> Vec<f32> {
 /// placed at 0 instead of `(N_FFT - WINDOW_LEN) / 2` still produces a plausible
 /// spectrogram, shifted in phase.
 pub fn build_padded_hann_window() -> Vec<f32> {
-    let raw = build_hann_window(WINDOW_LEN);
+    let raw = build_symmetric_hann_window(WINDOW_LEN);
     let lo = (N_FFT - WINDOW_LEN) / 2;
     let mut padded = vec![0.0f32; N_FFT];
     padded[lo..lo + WINDOW_LEN].copy_from_slice(&raw);
@@ -332,7 +375,7 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
                 var_sum += d * d;
             }
             let var = var_sum / (effective_n_len - 1) as f64; // unbiased
-            let inv_std = 1.0 / (var + NORM_VAR_EPS).sqrt();
+            let inv_std = 1.0 / (var.sqrt() + NORM_VAR_EPS);
             for v in row[..effective_n_len].iter_mut() {
                 *v = ((*v as f64 - mean) * inv_std) as f32;
             }
@@ -376,13 +419,18 @@ mod tests {
         assert!((w[3] - w[5]).abs() < 1e-6);
     }
 
-    /// Sanity: the LFM2A Hann window is 400 samples and peaks at
-    /// index 200.
+    /// Sanity: the LFM2A Hann window is 400 symmetric samples peaking
+    /// between indices 199 and 200, with both endpoints at zero (the
+    /// periodic form instead peaks exactly at index 200 with a
+    /// nonzero last tap).
     #[test]
     fn hann_window_lfm2a_dims() {
-        let w = build_hann_window(WINDOW_LEN);
+        let w = build_symmetric_hann_window(WINDOW_LEN);
         assert_eq!(w.len(), 400);
-        assert!((w[200] - 1.0).abs() < 1e-6);
+        assert!((w[0] - 0.0).abs() < 1e-6, "w[0] = {}", w[0]);
+        assert!((w[399] - 0.0).abs() < 1e-6, "w[399] = {}", w[399]);
+        assert!((w[199] - w[200]).abs() < 1e-6);
+        assert!((w[199] - 1.0).abs() < 1e-4, "w[199] = {}", w[199]);
     }
 
     /// Mel filterbank: shape and per-row positivity.
@@ -483,29 +531,36 @@ mod tests {
 
     /// The padded window must sit centered in the FFT buffer, not at index 0.
     ///
-    /// Checked as a property of the result (peak at `N_FFT / 2`, both flanks
-    /// zero) rather than by re-slicing it against `build_hann_window`, which
-    /// would only restate the construction. The GPU front-end uploads this
-    /// verbatim, and a window at the wrong offset shifts every frame's phase
-    /// while still producing a plausible spectrogram.
+    /// Checked as a property of the result (peak pair straddling `N_FFT / 2`,
+    /// both flanks zero) rather than by re-slicing it against the window
+    /// builder, which would only restate the construction. The GPU front-end
+    /// uploads this verbatim, and a window at the wrong offset shifts every
+    /// frame's phase while still producing a plausible spectrogram.
     #[test]
     fn padded_hann_window_is_centered() {
         let w = build_padded_hann_window();
         assert_eq!(w.len(), N_FFT);
         let lo = (N_FFT - WINDOW_LEN) / 2;
+        // Symmetric window: the peak straddles N_FFT/2 - 1 and N_FFT/2.
         assert!(
-            (w[N_FFT / 2] - 1.0).abs() < 1e-6,
+            (w[N_FFT / 2] - 1.0).abs() < 1e-4,
             "peak should land at N_FFT/2, got {}",
             w[N_FFT / 2]
         );
+        assert!((w[N_FFT / 2 - 1] - w[N_FFT / 2]).abs() < 1e-6);
         assert!(w[..lo].iter().all(|&v| v == 0.0), "low flank is not zero");
         assert!(
             w[lo + WINDOW_LEN..].iter().all(|&v| v == 0.0),
             "high flank is not zero"
         );
-        // The window itself must be strictly inside those flanks, or "centered"
-        // would also be satisfied by an all-zero buffer.
-        assert!(w[lo + 1..lo + WINDOW_LEN].iter().all(|&v| v > 0.0));
+        // The window interior must be strictly positive, or "centered"
+        // would also be satisfied by an all-zero buffer. Both raw
+        // endpoints are zero in the symmetric form, so they are
+        // excluded on both sides.
+        assert!(
+            w[lo + 1..lo + WINDOW_LEN - 1].iter().all(|&v| v > 0.0),
+            "window interior is not strictly positive"
+        );
     }
 
     /// `effective_n_len` must name exactly the frames the normalization keeps.
@@ -542,6 +597,48 @@ mod tests {
             "the last live frame ({}) is entirely zero",
             eff - 1
         );
+    }
+
+    /// Per-feature norm places eps AFTER the sqrt (`1/(sqrt(var)+eps)`,
+    /// NeMo), not inside it (`1/sqrt(var+eps)`). The CPU↔GPU parity
+    /// suites move every implementation in lockstep, so they cannot pin
+    /// the placement; this golden can. Constant PCM separates the two
+    /// most widely measured (old-formula values in comments, verified
+    /// by running this test against the reverted formula).
+    #[test]
+    fn per_feature_norm_eps_is_after_sqrt() {
+        let n_mel = 80;
+        let pcm = vec![0.1f32; 16000];
+        let (mel, _) = log_mel_spectrogram(&pcm, n_mel);
+        // Old formula: -9.687714 (delta 0.17 vs tol 1e-2).
+        assert!(
+            (mel[0] - (-9.857828)).abs() < 1e-2,
+            "mel[0] = {} (expected ~= -9.858)",
+            mel[0]
+        );
+        // Old formula: 0.097881 (delta 0.0017 vs tol 1e-4).
+        assert!(
+            (mel[400] - 0.099599).abs() < 1e-4,
+            "mel[400] = {} (expected ~= 0.0996)",
+            mel[400]
+        );
+    }
+
+    /// Degenerate window lengths: empty stays empty, a single tap is
+    /// the neutral window, and neither divides by zero.
+    #[test]
+    fn symmetric_hann_window_degenerate_lengths() {
+        assert!(build_symmetric_hann_window(0).is_empty());
+        assert_eq!(build_symmetric_hann_window(1), vec![1.0]);
+    }
+
+    /// The periodic builder shares the symmetric builder's degenerate
+    /// contract: empty stays empty and a single tap is the neutral
+    /// window, not the raw formula's 0.0.
+    #[test]
+    fn hann_window_degenerate_lengths() {
+        assert!(build_hann_window(0).is_empty());
+        assert_eq!(build_hann_window(1), vec![1.0]);
     }
 
     /// Empty input returns an empty vec without panicking.
