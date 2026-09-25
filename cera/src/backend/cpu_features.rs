@@ -674,8 +674,8 @@ pub fn detect_topology() -> CoreTopology {
 }
 
 /// Cap a detected topology's pool width at the CPUs this process may actually
-/// run on. `available_parallelism` honors cpuset/cgroup affinity on Linux, so
-/// it sees the restriction the sysfs detector (which reads host-wide files)
+/// run on. The allowance probe honors cpuset/cgroup affinity on Linux, so it
+/// sees the restriction the sysfs detector (which reads host-wide files)
 /// cannot: an Android app without a visible Activity sits in the `foreground`
 /// cpuset (no prime cluster), and a container sees its quota the same way.
 ///
@@ -700,17 +700,55 @@ pub fn detect_topology() -> CoreTopology {
     )
 )]
 fn clamp_to_cpu_allowance(topo: CoreTopology) -> CoreTopology {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let allowed = process_cpu_allowance()
+        .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
+        .unwrap_or(usize::MAX);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let allowed = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(usize::MAX);
     clamp_perf_count(topo, allowed)
 }
 
+/// CPUs the process may run on, read from the process leader's affinity mask.
+///
+/// `available_parallelism` reports the *calling thread's* mask, and this
+/// topology is cached process-wide in a `OnceLock`: had the first caller been
+/// a thread an embedder pinned to one core (audio callback, platform worker),
+/// the width would freeze at that thread's mask for the process lifetime. The
+/// leader (TGID) is effectively never pinned, so its mask is the process
+/// allowance. `None` when the probe itself fails, in which case the caller
+/// falls back to `available_parallelism`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_cpu_allowance() -> Option<usize> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        libc::sched_getaffinity(
+            libc::getpid(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &mut set,
+        )
+    };
+    if ok != 0 {
+        return None;
+    }
+    let mut count = 0;
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
 /// Pure half of [`clamp_to_cpu_allowance`]: cap `perf_core_count` at `allowed`
 /// CPUs. `pin_cores`/`core_weights` are intentionally left alone: the clamp
-/// reproduces the measured-good shape (width at the usable count, fastest-first
-/// pins with the out-of-reach entries failing closed at spawn), and filtering
-/// the pin set to the affinity mask is a separate follow-up.
+/// reproduces the measured-good shape (width at the usable count), with
+/// out-of-reach pins failing open to unpinned execution (a refused
+/// `sched_setaffinity` leaves the thread on its inherited mask; see
+/// `RowPool::build`). Filtering the pin set down to the affinity mask so every
+/// worker lands pinned is a separate follow-up.
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
     allow(
@@ -721,9 +759,12 @@ fn clamp_to_cpu_allowance(topo: CoreTopology) -> CoreTopology {
 fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
     let allowed = allowed.max(1);
     if topo.perf_core_count > allowed {
-        tracing::warn!(
+        // `debug`, not `warn`: running inside a cpuset or container quota is
+        // normal deployment, not a user misconfiguration (warns here are
+        // reserved for explicit `CERA_*` overrides that overshoot hardware).
+        tracing::debug!(
             "cera: detected {} performance cores but this process may only run on {allowed}; \
-             clamping pool width to {allowed} (more workers than usable cores falls off a cliff)",
+             clamping pool width to {allowed}",
             topo.perf_core_count,
         );
         topo.perf_core_count = allowed;
@@ -1101,6 +1142,26 @@ mod tests {
             core_weights: vec![WEIGHT_FULL; 8],
         };
         assert_eq!(clamp_perf_count(detected, 0).perf_core_count, 1);
+    }
+
+    /// End to end through the real allowance probe: an absurd detected width
+    /// comes back within the process allowance (and never zero). Skipped under
+    /// Miri, which cannot execute the raw `sched_getaffinity` probe.
+    #[cfg(not(miri))]
+    #[test]
+    fn cpu_allowance_clamp_smoke() {
+        let detected = CoreTopology {
+            perf_core_count: 128,
+            pin_cores: (0..128).collect(),
+            fast_cores: 128,
+            core_weights: vec![WEIGHT_FULL; 128],
+        };
+        let clamped = clamp_to_cpu_allowance(detected);
+        let allowance = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(usize::MAX);
+        assert!(clamped.perf_core_count >= 1);
+        assert!(clamped.perf_core_count <= allowance.min(128));
     }
 
     /// Asking for more workers than there are pinnable cores is the
