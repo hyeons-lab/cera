@@ -51,6 +51,14 @@ PASSES=5
 # here from 93% down to 14% before this was noticed.
 MIN_BATTERY=30
 FORCE=no
+# OOM containment prefix for every on-device shell: adb-shell children
+# inherit oom_score_adj -1000 (unkillable), so a cell that exhausts memory
+# deadlock-panics the phone instead of dying (measured: GPU bench rebooted
+# an S25U three times). Mark the remote shell normally-killable first; both
+# engines inherit it. Best-effort (`;`, never `&&`) so a hardening failure
+# can never skip the cell itself. Single-quoted: `$$` is the REMOTE shell's
+# pid, expanded on-device, not this script's.
+OOM_GUARD='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -334,14 +342,7 @@ sample_cera() { # backend label mask
   # use); harmless for cpu/gpu cells, required for hexagon.
   local skel_dir="/data/local/tmp"
   [[ -n "$LLAMA_BENCH" ]] && skel_dir="$(dirname "$LLAMA_BENCH")"
-  # OOM containment: adb-shell children inherit oom_score_adj -1000
-  # (unkillable), so a cell that exhausts memory deadlock-panics the phone
-  # instead of dying (measured: cera GPU on 2.6B rebooted an S25U three
-  # times). Mark the remote shell normally-killable first; both engines
-  # inherit it. Best-effort (`;`, never `&&`) so a hardening failure can
-  # never skip the cell itself.
-  local oom_guard='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
-  local base="${oom_guard}cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
+  local base="${OOM_GUARD}cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
   # Thermal pacing: 2.6B vulkan decode loses the Adreno context when a run
   # starts hot (intra-run headroom past ~0.85 after a long soak) while the
@@ -350,6 +351,14 @@ sample_cera() { # backend label mask
   # start in the green regime. Targeted at cera GPU (llama OpenCL never
   # tripped); set only for runs that need it.
   local cooldown="${CERA_BENCH_COOLDOWN_SECS:-0}"
+  # Fail LOUD on garbage: `[[ $cooldown -gt 0 ]]` below is silently false
+  # for non-numeric input, fail-opening a guard against Adreno context loss.
+  # Exits the whole matrix — a silently unguarded run would report numbers
+  # from the red regime as if they were green-regime measurements.
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || {
+    echo "error: non-numeric CERA_BENCH_COOLDOWN_SECS=$cooldown (want seconds)" >&2
+    exit 1
+  }
   local pre dec
   start_samplers "$key"
   if [[ "$backend" == "gpu" && "$cooldown" -gt 0 ]]; then sleep "$cooldown"; fi
@@ -399,10 +408,7 @@ sample_llama() { # threads label mask [ngl] [device]
   # RowPool cell; taskset with no mask is a syntax error, so omit it entirely.
   [[ -n "$mask" ]] && pin="taskset $mask "
   start_samplers "$key"
-  # Same OOM containment as sample_cera (see above): a runaway cell must
-  # die as SIGKILL, never panic the shared phone.
-  local oom_guard='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
-  out=$("${ADB[@]}" shell "${oom_guard}cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
+  out=$("${ADB[@]}" shell "${OOM_GUARD}cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
 -m \"$DEVICE_DIR/$MODEL\" -t $t ${dev_flag}-ngl $ngl -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   stop_samplers
   printf '%s\n' "$out" >> "$LOG"

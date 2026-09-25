@@ -69,11 +69,40 @@ jobs:
         run: cargo check -p cera --no-default-features --all-targets
       - name: Check cera-wasm on host
         run: cargo check -p cera-wasm
+      # `cera-cli`'s gpu-gated code (bench harnesses, `--shapes` parsing) is
+      # compiled out by default, so default CI neither compiles nor tests it.
+      # Pure unit tests, no GPU needed.
+      - name: Test cera-cli (gpu feature)
+        run: cargo test -p cera-cli --features gpu
       - name: Python unit tests
         run: |
           python3 tests/test_format_review_comment.py
           python3 tests/api_contracts/check.py
           python3 -m unittest discover -s tests/api_contracts
+      - name: Shell syntax check (bench script)
+        # `bench_android.sh` only runs against hardware; a syntax slip would
+        # otherwise surface on-device instead of on the PR.
+        run: bash -n scripts/bench_android.sh
+      - name: Hexagon skel list pin
+        # The DSP skel filename set lives in three hand-synced places (the
+        # embedded skel dir, `HexagonArch::skel_filename`, Kotlin
+        # `HexagonNpu.skelFiles`): adding an arch to one and forgetting the
+        # others ships an AAR whose setup fails on new hardware, misdiagnosed
+        # as no-NPU. The sets must agree exactly.
+        run: |
+          skel_pat='libggml-htp-v[0-9]*\.so'
+          skels=$(ls cera/src/backend/hexagon/skels/libggml-htp-v*.so | xargs -n1 basename | sort)
+          rust=$(grep -o "$skel_pat" cera/src/backend/hexagon/device.rs | sort -u)
+          kt=$(grep -o "$skel_pat" cera-ffi-kotlin/cera-ffi-android/src/main/kotlin/com/hyeonslab/cera/android/HexagonNpu.kt | sort -u)
+          if [ -n "$skels" ] && [ "$skels" = "$rust" ] && [ "$skels" = "$kt" ]; then
+            echo "skel lists agree: $(echo "$skels" | tr '\n' ' ')"
+          else
+            echo "::error::Hexagon skel filename lists diverged (dir vs Rust vs Kotlin):"
+            echo "--- skels/ ---"; echo "$skels"
+            echo "--- device.rs ---"; echo "$rust"
+            echo "--- HexagonNpu.kt ---"; echo "$kt"
+            exit 1
+          fi
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build
@@ -125,6 +154,11 @@ jobs:
           # the `avx2_int8` module is cfg'd out entirely, so nothing would ever
           # consult the variable and setting it would assert nothing.
           CERA_REQUIRE_SIMD: ${{ matrix.os == 'ubuntu-latest' && 'avx2' || '' }}
+          # Same fail-closed shape for the CPU repack gate: without this, an
+          # int8-detection regression degrades `repackless_dispatch_warns_once`
+          # to a silent skip. Safe on ubuntu (AVX2 runners repack) and moot on
+          # macOS (the aarch64 gate is shape-only and always runs).
+          CERA_REQUIRE_CPU_REPACK: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
         run: cargo test --workspace --no-fail-fast
       # The `hexagon` backend is a non-default feature with host-runnable unit
       # tests (param goldens, repack layout, ADPF degrade, ABI sizes): without
@@ -269,24 +303,36 @@ jobs:
           # The MSL half is never compiled on this runner, so a stale
           # `<name>.metal` would only surface on the Metal leg (or a user's
           # device) with no indication that the committed file, not the .slang,
-          # was at fault. Entry points are the kernel's own function names, not
-          # `main`: default to the basename, or read a `// slang-entries: a b c`
-          # header (same parse as build.rs and `just slang`) for kernels whose
-          # entry name differs (gelu) or that expose several (elementwise).
+          # was at fault. Header parsing (entries, targets, fail-fast, the
+          # target allowlist) comes from scripts/slang-headers.sh, shared with
+          # `just slang`; build.rs is the canonical Rust copy.
           dir=cera/src/backend/shaders/slang
           for f in "$dir"/*.slang; do
             name=$(basename "$f" .slang)
-            entries=$(sed -n 's|^[[:space:]]*//[[:space:]]*slang-entries:[[:space:]]*||p' "$f")
-            [ -z "$entries" ] && entries="$name"
+            entries=$(./scripts/slang-headers.sh entries "$f")
             entry_args=()
             for e in $entries; do entry_args+=(-entry "$e"); done
-            for target in wgsl metal; do
+            targets=$(./scripts/slang-headers.sh targets "$f")
+            for target in $targets; do
               "$slangc" "$f" -target "$target" -O3 "${entry_args[@]}" -stage compute \
                 -o "$RUNNER_TEMP/$name.$target"
               if cmp -s "$RUNNER_TEMP/$name.$target" "$dir/$name.$target"; then
                 echo "ok: $name.$target matches slangc $SLANG_VER"
               else
                 echo "::error file=$dir/$name.$target::committed $name.$target differs from slangc ${SLANG_VER} output; regenerate with slangc ${SLANG_VER} ('just slang') and commit it."
+                rc=1
+              fi
+            done
+            # A committed twin outside the declared targets is never compared
+            # above, yet build.rs copies committed output when slangc is
+            # missing — so an undeclared twin would ship unchecked. Fail on it.
+            for twin in wgsl metal; do
+              declared=0
+              for target in $targets; do
+                if [ "$target" = "$twin" ]; then declared=1; fi
+              done
+              if [ "$declared" = 0 ] && [ -e "$dir/$name.$twin" ]; then
+                echo "::error file=$dir/$name.$twin::committed $name.$twin is not declared by $f's slang-targets; delete the twin or declare '$twin'."
                 rc=1
               fi
             done
@@ -344,6 +390,7 @@ jobs:
             --test gpu_lfm2_prefill_dispatch \
             --test gpu_lfm2_decode_passes \
             --test gpu_lfm2_greedy_submits \
+            --test gpu_lfm2_prefill_pass_split \
             -- --nocapture
       # The GEMM microbenchmark carries `required-features = ["gpu"]`, so the
       # `check` job's `cargo clippy --all-targets` (no features) skips it and
@@ -986,7 +1033,7 @@ jobs:
           retention-days: 30
 
   ffi-bindings-drift:
-    # Verifies the committed Kotlin + Swift bindings under
+    # Verifies the committed Kotlin + Swift + Python bindings under
     # cera-ffi/bindings/, and the SwiftPM wrapper copy under
     # cera-ffi/apple/Sources/Cera/, stay in sync with the Rust
     # `#[uniffi::*]` surface. Regenerates via `uniffi-bindgen` (the in-repo
@@ -1049,6 +1096,51 @@ jobs:
         # the local and CI definitions cannot disagree again.
         run: just bindings-check
 
+  kotlin-unit-tests:
+    # Runs the junit suite for the Android helper (`mergeAdspPaths`, the
+    # `ADSP_LIBRARY_PATH` merge `HexagonNpu.setup` performs). Plain JVM
+    # tests (no device, no emulator), but the module still compiles against
+    # the Android SDK, so the job installs the compileSdk platform. Without
+    # this leg the tests only run on machines with the SDK.
+    name: Kotlin Unit Tests
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install compileSdk platform + build-tools
+        # Pinned to what `cera-ffi-kotlin/gradle/libs.versions.toml` declares
+        # (compileSdk 36; build-tools track the SDK major). The unit-test
+        # tasks never invoke aapt2/aidl — only android.jar is read — but AGP
+        # still requires build-tools present at configuration.
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          yes | sdkmanager --licenses > /dev/null
+      - name: Run Android unit tests
+        working-directory: cera-ffi-kotlin
+        run: ./gradlew --no-daemon :cera-ffi-android:testDebugUnitTest
+      - name: Assert unit-test count
+        # Gradle exits 0 with zero discovered test classes, so a source-set
+        # or AGP-convention regression would silently unrun the suite. Same
+        # exhaustive-check discipline as the metal leg's COUNT assertion.
+        working-directory: cera-ffi-kotlin
+        run: |
+          set -euo pipefail
+          files=(cera-ffi-android/build/test-results/testDebugUnitTest/TEST-*.xml)
+          if [ ! -f "${files[0]}" ]; then
+            echo "::error::no Kotlin test-result XML found; suite did not run?" >&2
+            exit 1
+          fi
+          count=$(grep -ho 'tests="[0-9]*"' "${files[@]}" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
+          if [ "$count" -ne 7 ]; then
+            echo "::error::expected 7 Kotlin unit tests, found $count (did a test get dropped or renamed? Update the count in this job)." >&2
+            exit 1
+          fi
   dart-bindings-drift:
     # Same idea as ffi-bindings-drift, for the committed Dart bindings under
     # cera_ffi/lib/src/generated/.

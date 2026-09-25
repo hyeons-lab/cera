@@ -273,6 +273,177 @@ pub struct MoeConfig {
     pub is_moe_layer: Vec<bool>,
 }
 
+/// Session-ubatch loop with fail-closed accounting: the one home for the
+/// `forward_prefill_chunked` loop policy (`ubatch == 0` meaning one chunk,
+/// cancel checked between chunks, always at least one chunk). `forward` is
+/// the fallible per-chunk forward returning `(consumed, logits)`; a short
+/// chunk stops the count at the KV prefix that exists instead of counting
+/// every chunk unconditionally (which would advance the session over KV
+/// that was never written). The trait default below adapts its infallible
+/// `forward_prefill` as an always-full forward; the Hexagon override passes
+/// its scratch-chunk runner.
+pub(crate) fn run_chunked_prefill(
+    tokens: &[u32],
+    start_pos: usize,
+    ubatch: usize,
+    cancel: &AtomicBool,
+    mut forward: impl FnMut(&[u32], usize) -> (usize, Option<Vec<f32>>),
+) -> (usize, Option<Vec<f32>>) {
+    // `ubatch == 0` → one chunk covering everything (no chunking).
+    // Otherwise keep the caller-supplied size.
+    let ubatch = if ubatch == 0 {
+        tokens.len().max(1)
+    } else {
+        ubatch
+    };
+    let mut consumed = 0usize;
+    let mut last_logits: Option<Vec<f32>> = None;
+    for chunk in tokens.chunks(ubatch) {
+        // Resize CPU pools between chunks (a no-op unless the cpuset
+        // moved): a long token prefill must not run fully stale. Gated
+        // exactly like `backend::threadpool`, which exists only where
+        // the `RowPool` does.
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        crate::backend::threadpool::resize_pools_for_cpuset();
+        let (n, logits) = forward(chunk, start_pos + consumed);
+        consumed += n;
+        last_logits = logits.or(last_logits);
+        if n < chunk.len() {
+            // Backend fault mid-prefill: stop here so the session's
+            // `current_pos` advance matches the KV prefix that exists (the
+            // session maps short-without-cancel `consumed` to a `Backend`
+            // fault and forces re-append/reset rather than decoding over a
+            // hole; short-with-cancel stays `Cancelled`).
+            break;
+        }
+        // Check *after* each chunk so we always make progress on at
+        // least one ubatch — avoids the "cancel-before-start leaves
+        // the session wedged with no position advance" corner.
+        if cancel.load(Ordering::Relaxed) && consumed < tokens.len() {
+            break;
+        }
+    }
+    (consumed, last_logits)
+}
+
+/// First-wins record into a sticky decode-fault slot: an operation that
+/// fails more than once per take keeps the root-cause fault, not the
+/// last one. Shared by the NPU/wgpu/Metal backends (each `eprintln`s
+/// unconditionally so the full failure order stays in logs); pinned by
+/// `sticky_slot_keeps_first_fault` below.
+pub(crate) fn record_first_fault(
+    slot: &std::sync::Mutex<Option<crate::CeraError>>,
+    err: crate::CeraError,
+) {
+    let mut guard = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
+/// Take half of [`record_first_fault`]: drain a sticky decode-fault slot,
+/// recovering through a poisoned lock (a panicked recorder must not wedge
+/// the drain). Symmetric twin so record/take stay one shape at all three
+/// backend drains.
+pub(crate) fn take_fault(
+    slot: &std::sync::Mutex<Option<crate::CeraError>>,
+) -> Option<crate::CeraError> {
+    slot.lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_first_fault, run_chunked_prefill};
+    use crate::CeraError;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn sticky_slot_keeps_first_fault() {
+        let slot = Mutex::new(None);
+        record_first_fault(&slot, CeraError::Backend("root cause".into()));
+        record_first_fault(&slot, CeraError::Backend("downstream symptom".into()));
+        let taken = slot.lock().unwrap().take();
+        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "root cause"));
+        // Drained: a later fault records fresh.
+        record_first_fault(&slot, CeraError::Backend("next".into()));
+        let taken = slot.lock().unwrap().take();
+        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "next"));
+    }
+
+    #[test]
+    fn chunked_prefill_stops_consumed_at_failed_ubatch() {
+        // Three session-ubatch chunks; the scripted forward fails the middle
+        // one after consuming 5 of its 10 tokens (a partial scratch-chunk
+        // run). `consumed` must cover exactly the KV that exists: the full
+        // first chunk plus the 5-token partial prefix, never the failed
+        // suffix the session would otherwise advance over.
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(false);
+        let mut ran: Vec<(usize, usize)> = Vec::new();
+        let (consumed, logits) = run_chunked_prefill(&tokens, 40, 10, &cancel, |chunk, pos| {
+            ran.push((chunk.len(), pos));
+            match ran.len() {
+                1 => (chunk.len(), Some(vec![1.0f32; 4])),
+                2 => (5, Some(vec![2.0f32; 4])),
+                _ => panic!("third chunk ran after the short second chunk"),
+            }
+        });
+        assert_eq!(consumed, 15);
+        assert_eq!(logits, Some(vec![2.0f32; 4]));
+        assert_eq!(ran, vec![(10, 40), (10, 50)]);
+    }
+
+    #[test]
+    fn chunked_prefill_cancel_and_ubatch_zero_match_default() {
+        // Cancel fires between chunks (after at least one ran); `ubatch == 0`
+        // runs the whole input as one chunk. Both mirror the default
+        // `forward_prefill_chunked` exactly.
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(true);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |chunk, _| {
+            ran += 1;
+            (chunk.len(), Some(vec![ran as f32; 2]))
+        });
+        assert_eq!((consumed, ran), (10, 1));
+        assert_eq!(logits, Some(vec![1.0f32; 2]));
+
+        let cancel = AtomicBool::new(false);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 7, 0, &cancel, |chunk, pos| {
+            ran += 1;
+            assert_eq!((chunk.len(), pos), (30, 7));
+            (chunk.len(), Some(vec![9.0f32; 2]))
+        });
+        assert_eq!((consumed, ran), (30, 1));
+        assert_eq!(logits, Some(vec![9.0f32; 2]));
+
+        // Empty input: `(0, None)`, runner never invoked.
+        let (consumed, logits) = run_chunked_prefill(&[], 0, 10, &cancel, |_, _| {
+            panic!("forward invoked for empty tokens")
+        });
+        assert_eq!((consumed, logits), (0, None));
+    }
+
+    #[test]
+    fn chunked_prefill_first_chunk_fault_yields_zero_none() {
+        // Backend fault before anything completes: `(0, None)` without
+        // invoking later chunks, and `logits.or(last_logits)` stays `None`
+        // (no stale logits for the session to stash).
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(false);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |_, _| {
+            ran += 1;
+            (0, None)
+        });
+        assert_eq!((consumed, logits, ran), (0, None, 1));
+    }
+}
+
 /// Trait for loaded models that can run forward passes.
 ///
 /// `Send + Sync` is required so `std::sync::Arc<dyn Model>` is itself
@@ -304,6 +475,28 @@ pub trait Model: Send + Sync {
 
     /// Run a forward pass for a single token and return logits over the vocabulary.
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32>;
+
+    /// Take a recorded decode failure, if the last decode-side `forward`
+    /// failed. The decode surface returns bare logits (no error channel),
+    /// so a backend that fails a decode returns its zero-logits fallback
+    /// *and* records the error here; the session takes it after every
+    /// decode forward and fails the generation instead of sampling the
+    /// zeros as token 0. Sticky until taken (a faulted backend must not
+    /// fail open on retry); the session discards any stale error at each
+    /// entry point, so only the current call's failures surface.
+    /// Recording is first-wins: an operation that fails more than once
+    /// per take keeps the root-cause fault, not the last one.
+    /// Default: never poisoned. Backends that can fail (NPU/wgpu/Metal)
+    /// override with interior mutability. The slot lives on the shared
+    /// model, so an overriding backend must also override `acquire_session`
+    /// to gate to one live [`crate::Session`] per model instance at a time
+    /// ([`ModelSessionGate`] returns `CeraError::Busy` otherwise); then a
+    /// take is always attributable to the session that just drove the
+    /// forward. (Backends on the defaults stay shareable: their slot is
+    /// never filled.)
+    fn take_decode_error(&self) -> Option<crate::CeraError> {
+        None
+    }
 
     /// Batched forward pass for prefill: process all prompt tokens at once.
     /// Implementations may use GEMM for linear projections. Returns logits for the LAST token only.
@@ -434,18 +627,28 @@ pub trait Model: Send + Sync {
         ))
     }
 
-    /// Cancelable chunked prefill. Splits `tokens` into `ubatch`-sized slices,
-    /// calls [`Self::forward_prefill`] per chunk, and polls `cancel` between
-    /// chunks so long prompts can be interrupted without blocking the
-    /// caller for the full monolithic duration.
+    /// Cancelable chunked prefill. The default splits `tokens` into
+    /// `ubatch`-sized slices, calls [`Self::forward_prefill`] per chunk,
+    /// and polls `cancel` between chunks so long prompts can be
+    /// interrupted without blocking the caller for the full monolithic
+    /// duration. Overrides may chunk differently (cf. Hexagon's
+    /// scratch-capacity runner) but honor the same return contract below.
     ///
     /// Returns `(tokens_processed, last_logits)`:
     /// - `tokens_processed <= tokens.len()`; when cancel fires, equals the
     ///   number of tokens that made it into KV before the flag was
-    ///   observed (granularity: one ubatch).
-    /// - `last_logits` holds the logits from the final processed chunk —
-    ///   `Some` whenever any chunk ran. `None` only for the empty-input
-    ///   edge case (`tokens.is_empty()`).
+    ///   observed (granularity: one ubatch). Overrides with a fallible
+    ///   chunk runner (cf. the Hexagon override) likewise stop the count
+    ///   at the KV prefix that exists; the default impl, which cannot see
+    ///   faults through the bare-logits `forward_prefill`, counts every
+    ///   chunk unconditionally and relies on the session's post-loop
+    ///   [`Self::take_decode_error`] drain to surface out-of-band faults
+    ///   (the wgpu/Metal shape: sticky slot, no short count).
+    /// - `last_logits` holds the logits from the final processed chunk:
+    ///   `Some` whenever any chunk ran. `None` when no chunk produced
+    ///   logits: the empty-input edge case (`tokens.is_empty()`), or (in
+    ///   an override with a fallible chunk runner) a backend failure
+    ///   before the first chunk completed.
     ///
     /// Default impl is correctness-preserving; backend-specific overrides
     /// are free to batch across chunks (none do in v1 — Phase 1.4's
@@ -460,33 +663,11 @@ pub trait Model: Send + Sync {
         ubatch: usize,
         cancel: &AtomicBool,
     ) -> (usize, Option<Vec<f32>>) {
-        // `ubatch == 0` → one chunk covering everything (no chunking).
-        // Otherwise keep the caller-supplied size.
-        let ubatch = if ubatch == 0 {
-            tokens.len().max(1)
-        } else {
-            ubatch
-        };
-        let mut consumed = 0usize;
-        let mut last_logits: Option<Vec<f32>> = None;
-        for chunk in tokens.chunks(ubatch) {
-            // Resize CPU pools between chunks (a no-op unless the cpuset
-            // moved): a long token prefill must not run fully stale. Gated
-            // exactly like `backend::threadpool`, which exists only where
-            // the `RowPool` does.
-            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-            crate::backend::threadpool::resize_pools_for_cpuset();
-            let logits = self.forward_prefill(chunk, start_pos + consumed, state);
-            consumed += chunk.len();
-            last_logits = Some(logits);
-            // Check *after* each chunk so we always make progress on at
-            // least one ubatch — avoids the "cancel-before-start leaves
-            // the session wedged with no position advance" corner.
-            if cancel.load(Ordering::Relaxed) && consumed < tokens.len() {
-                break;
-            }
-        }
-        (consumed, last_logits)
+        // The bare-logits `forward_prefill` cannot fail observably, so adapt
+        // it as an always-full forward over the shared loop.
+        run_chunked_prefill(tokens, start_pos, ubatch, cancel, |chunk, pos| {
+            (chunk.len(), Some(self.forward_prefill(chunk, pos, state)))
+        })
     }
 
     /// Get the model configuration.

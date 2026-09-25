@@ -9,7 +9,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::cpu::RopeType;
@@ -27,7 +27,7 @@ use crate::backend::hexagon::{
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvRewindError};
 use crate::model::session_gate::{ModelSessionGate, ModelSessionLease};
-use crate::model::{BlockType, Model, ModelConfig};
+use crate::model::{BlockType, Model, ModelConfig, record_first_fault, take_fault};
 use crate::session::CeraError;
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +291,11 @@ pub struct HexagonLfm2Model {
     use_hmx: bool,
     vtcm_budget: usize,
     current_seq_len: AtomicUsize,
+    /// Last decode failure, recorded by `forward` for
+    /// [`Model::take_decode_error`]: the trait's decode surface has no
+    /// error channel, so without this the session would sample the
+    /// zero-logits fallback as token 0 and keep generating.
+    decode_error: Mutex<Option<CeraError>>,
 }
 
 unsafe impl Send for HexagonLfm2Model {}
@@ -985,6 +990,7 @@ impl HexagonLfm2Model {
             use_hmx,
             vtcm_budget,
             current_seq_len: AtomicUsize::new(0),
+            decode_error: Mutex::new(None),
         })
     }
 }
@@ -3317,17 +3323,30 @@ impl HexagonLfm2Model {
         Ok(logits_slice.to_vec())
     }
 
+    /// Run one prefill chunk, or `None` when the chunk failed. A failed
+    /// chunk aborts the whole prefill (see `forward_prefill`): continuing
+    /// would write later chunks' KV slots over the failed chunk's hole,
+    /// leaving a KV-timeline gap behind plausible-looking logits. The
+    /// `eprintln!` pairs the structured log because no `tracing`
+    /// subscriber exists on the shipping NPU platforms (Android/iOS).
     fn forward_prefill_chunk(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut InferenceState,
-    ) -> Vec<f32> {
-        self.try_forward_prefill_chunk(tokens, start_pos, state)
-            .unwrap_or_else(|e| {
+    ) -> Option<Vec<f32>> {
+        match self.try_forward_prefill_chunk(tokens, start_pos, state) {
+            Ok(logits) => Some(logits),
+            Err(e) => {
                 tracing::error!("Hexagon NPU prefill chunk failed: {e}");
-                vec![0.0f32; self.config.vocab_size]
-            })
+                eprintln!("[cera-hexagon] prefill chunk failed, aborting prefill: {e}");
+                // Record first-wins for `take_decode_error` (same slot as
+                // `forward`): the session drain then surfaces the DSP root
+                // cause instead of its generic short-prefill message.
+                record_first_fault(&self.decode_error, e);
+                None
+            }
+        }
     }
 
     fn try_forward(
@@ -4177,6 +4196,63 @@ impl HexagonLfm2Model {
     }
 }
 
+/// Run prefill in scratch-capacity chunks, aborting at the first failed
+/// chunk. Returns `(consumed, last_logits)`: `consumed` is the prefix
+/// length actually written to KV (the whole input on success), and
+/// `last_logits` is `Some` iff at least one chunk succeeded. Later chunks
+/// must not run past a failure — they would append their KV over the
+/// failed chunk's missing rows. The caller decides the failure signal:
+/// [`Model::forward_prefill`] maps a short run to zeros (its signature has
+/// no error channel), while the [`Model::forward_prefill_chunked`]
+/// override below reports the short `consumed` so the session advances
+/// `current_pos` exactly over the KV that exists instead of over the
+/// failed suffix. Split out of `Model::forward_prefill` so the abort
+/// policy is host-testable without a DSP session.
+fn run_scratch_chunks(
+    tokens: &[u32],
+    start_pos: usize,
+    state: &mut InferenceState,
+    mut runner: impl FnMut(&[u32], usize, &mut InferenceState) -> Option<Vec<f32>>,
+) -> (usize, Option<Vec<f32>>) {
+    if tokens.is_empty() {
+        return (0, None);
+    }
+    // Chunk to scratch capacity.
+    let mut consumed = 0usize;
+    let mut logits = None;
+    for (chunk_idx, chunk) in tokens.chunks(PREFILL_MAX_ROWS).enumerate() {
+        match runner(chunk, start_pos + chunk_idx * PREFILL_MAX_ROWS, state) {
+            Some(logits_out) => {
+                consumed += chunk.len();
+                logits = Some(logits_out);
+            }
+            None => break,
+        }
+    }
+    (consumed, logits)
+}
+
+/// Map a [`run_scratch_chunks`] result to the bare logits
+/// `Model::forward_prefill` returns. No error channel here (the trait
+/// returns bare logits), so a short run maps to zeros — the abort site
+/// already logged the cause on stderr, which is the loud half of the
+/// signal; the zeros keep a direct caller from sampling stale last-good
+/// logits over a KV hole. A full run returns the last chunk's logits
+/// (zeros only when no chunk ran, i.e. empty input). Pure so the caller
+/// side of the abort policy is unit-testable.
+fn prefill_tail_logits(
+    consumed: usize,
+    total: usize,
+    logits: Option<Vec<f32>>,
+    vocab_size: usize,
+) -> Vec<f32> {
+    if consumed == total {
+        logits.unwrap_or_else(|| vec![0.0f32; vocab_size])
+    } else {
+        vec![0.0f32; vocab_size]
+    }
+}
+
 impl Model for HexagonLfm2Model {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -4187,10 +4263,27 @@ impl Model for HexagonLfm2Model {
     }
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        self.try_forward(tokens, pos, state).unwrap_or_else(|e| {
-            tracing::error!("Hexagon NPU decode failed: {e}");
-            vec![0.0f32; self.config.vocab_size]
-        })
+        match self.try_forward(tokens, pos, state) {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::error!("Hexagon NPU decode failed: {e}");
+                // No `tracing` subscriber on the shipping NPU platforms; without
+                // this the failure is zero logits with zero record.
+                eprintln!("[cera-hexagon] decode failed, returning zero logits: {e}");
+                // Record for `take_decode_error`: the session fails the
+                // generation on this instead of sampling the zeros below
+                // as token 0. Sticky until taken (see the trait docs).
+                // First fault wins: a multi-chunk prefill can fail more
+                // than once per take, and the surfaced error should name
+                // the root cause (the `eprintln` above keeps full order).
+                record_first_fault(&self.decode_error, e);
+                vec![0.0f32; self.config.vocab_size]
+            }
+        }
+    }
+
+    fn take_decode_error(&self) -> Option<CeraError> {
+        take_fault(&self.decode_error)
     }
 
     fn forward_prefill(
@@ -4199,17 +4292,30 @@ impl Model for HexagonLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
-        if tokens.is_empty() {
-            return vec![0.0f32; self.config.vocab_size];
-        }
-        // Chunk to scratch capacity; sequential chunks append KV in order and
-        // the final chunk's last-position logits are the prompt's logits.
-        let mut logits = Vec::new();
-        for (chunk_idx, chunk) in tokens.chunks(PREFILL_MAX_ROWS).enumerate() {
-            logits =
-                self.forward_prefill_chunk(chunk, start_pos + chunk_idx * PREFILL_MAX_ROWS, state);
-        }
-        logits
+        // The session path below recovers exact accounting through
+        // `forward_prefill_chunked`.
+        let (consumed, logits) =
+            run_scratch_chunks(tokens, start_pos, state, |chunk, pos, state| {
+                self.forward_prefill_chunk(chunk, pos, state)
+            });
+        prefill_tail_logits(consumed, tokens.len(), logits, self.config.vocab_size)
+    }
+
+    fn forward_prefill_chunked(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+        ubatch: usize,
+        cancel: &AtomicBool,
+    ) -> (usize, Option<Vec<f32>>) {
+        // The shared loop (`model::run_chunked_prefill`): the fallible
+        // per-chunk forward is a scratch-capacity `run_scratch_chunks` call.
+        super::run_chunked_prefill(tokens, start_pos, ubatch, cancel, |chunk, pos| {
+            run_scratch_chunks(chunk, pos, state, |c, p, s| {
+                self.forward_prefill_chunk(c, p, s)
+            })
+        })
     }
 
     fn supports_all_logits(&self) -> bool {
@@ -4266,5 +4372,104 @@ impl Model for HexagonLfm2Model {
         self.current_seq_len.store(0, Ordering::SeqCst);
         *state = fresh;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::*;
+    use crate::model::{ModelConfig, ScalarMultipliers};
+
+    fn tiny_config() -> ModelConfig {
+        ModelConfig {
+            architecture: "lfm2".into(),
+            n_layers: 1,
+            hidden_size: 8,
+            intermediate_size: 16,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 4,
+            vocab_size: 32,
+            max_seq_len: 2048,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+            block_types: vec![BlockType::Attention],
+            conv_kernel_size: None,
+            ssm: None,
+            kv_heads_per_layer: vec![2],
+            scalars: ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_chunk_aborts_and_skips_later_chunks() {
+        let config = tiny_config();
+        let mut state = InferenceState::from_config(&config).unwrap();
+        // Three chunks; the scripted runner fails chunk 2.
+        let tokens: Vec<u32> = (0..PREFILL_MAX_ROWS * 2 + 7)
+            .map(|i| (i % 31 + 1) as u32)
+            .collect();
+        let mut ran: Vec<(usize, usize)> = Vec::new();
+        let (consumed, logits) =
+            run_scratch_chunks(&tokens, 0, &mut state, |chunk, pos, _state| {
+                ran.push((chunk.len(), pos));
+                if ran.len() == 2 {
+                    return None;
+                }
+                Some(vec![1.0f32; config.vocab_size])
+            });
+        // `consumed` stops at the failed chunk (the session advances over
+        // exactly this prefix); the last good logits survive for direct
+        // callers that can use them.
+        assert_eq!(consumed, PREFILL_MAX_ROWS);
+        assert_eq!(logits, Some(vec![1.0f32; config.vocab_size]));
+        assert_eq!(ran.len(), 2, "chunk 3 ran after chunk 2 failed: {ran:?}");
+        assert_eq!(ran[0], (PREFILL_MAX_ROWS, 0));
+        assert_eq!(ran[1], (PREFILL_MAX_ROWS, PREFILL_MAX_ROWS));
+    }
+
+    #[test]
+    fn all_chunks_ok_returns_last_logits() {
+        let config = tiny_config();
+        let mut state = InferenceState::from_config(&config).unwrap();
+        let tokens: Vec<u32> = (0..PREFILL_MAX_ROWS + 3)
+            .map(|i| (i % 31 + 1) as u32)
+            .collect();
+        let (consumed, logits) =
+            run_scratch_chunks(&tokens, 0, &mut state, |_chunk, pos, _state| {
+                Some(vec![pos as f32; config.vocab_size])
+            });
+        // Final chunk's logits win; positions advance per chunk.
+        assert_eq!(consumed, tokens.len());
+        assert_eq!(
+            logits,
+            Some(vec![PREFILL_MAX_ROWS as f32; config.vocab_size])
+        );
+        // Empty prompt: `(0, None)` without invoking the runner.
+        let (consumed, logits) = run_scratch_chunks(&[], 0, &mut state, |_, _, _| {
+            panic!("runner invoked for empty tokens")
+        });
+        assert_eq!((consumed, logits), (0, None));
+    }
+
+    #[test]
+    fn prefill_tail_logits_maps_short_run_to_zeros() {
+        // Short run → zeros even when a last-good chunk exists: returning
+        // the stale logits would sample over a KV hole. Deleting the `else`
+        // leg must fail this test.
+        assert_eq!(
+            prefill_tail_logits(5, 30, Some(vec![1.0f32; 4]), 4),
+            vec![0.0f32; 4]
+        );
+        // Full run → the last chunk's logits untouched.
+        assert_eq!(
+            prefill_tail_logits(30, 30, Some(vec![2.0f32; 4]), 4),
+            vec![2.0f32; 4]
+        );
+        // Empty input → zeros (no chunk ran, so `None`).
+        assert_eq!(prefill_tail_logits(0, 0, None, 4), vec![0.0f32; 4]);
     }
 }

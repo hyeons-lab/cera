@@ -1062,6 +1062,75 @@ class GenerateSummary {
   int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, totalDurationMs, decodeTokPerSec, promptEvalTokPerSec, finishReason);
 }
 
+/// Successful Hexagon NPU probe: the working DSP architecture plus
+/// hardware capabilities. See [`hexagon_probe`].
+class HexagonProbeInfo {
+  const HexagonProbeInfo({
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+    required this.arch,
+    required this.threads,
+    required this.hvxUnits,
+    required this.hmxUnits,
+    required this.vtcmBytes,
+  });
+
+  /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+  final String arch;
+  final int threads;
+  final int hvxUnits;
+  final int hmxUnits;
+  final int vtcmBytes;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'arch': this.arch,
+      'threads': this.threads,
+      'hvxUnits': this.hvxUnits,
+      'hmxUnits': this.hmxUnits,
+      'vtcmBytes': this.vtcmBytes,
+    };
+  }
+
+  factory HexagonProbeInfo.fromJson(Map<String, dynamic> json) {
+    return HexagonProbeInfo(
+      arch: json['arch'] as String,
+      threads: (json['threads'] as num).toInt(),
+      hvxUnits: (json['hvxUnits'] as num).toInt(),
+      hmxUnits: (json['hmxUnits'] as num).toInt(),
+      vtcmBytes: (json['vtcmBytes'] as num).toInt(),
+    );
+  }
+
+  HexagonProbeInfo copyWith({
+    String? arch,
+    int? threads,
+    int? hvxUnits,
+    int? hmxUnits,
+    int? vtcmBytes,
+  }) {
+    return HexagonProbeInfo(
+      arch: arch ?? this.arch,
+      threads: threads ?? this.threads,
+      hvxUnits: hvxUnits ?? this.hvxUnits,
+      hmxUnits: hmxUnits ?? this.hmxUnits,
+      vtcmBytes: vtcmBytes ?? this.vtcmBytes,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'HexagonProbeInfo(arch: $arch, threads: $threads, hvxUnits: $hvxUnits, hmxUnits: $hmxUnits, vtcmBytes: $vtcmBytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is HexagonProbeInfo && arch == other.arch && threads == other.threads && hvxUnits == other.hvxUnits && hmxUnits == other.hmxUnits && vtcmBytes == other.vtcmBytes;
+
+  @override
+  int get hashCode => Object.hash(arch, threads, hvxUnits, hmxUnits, vtcmBytes);
+}
+
 /// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
 /// model directory plus every per-quant manifest inside it. Feed
 /// `name` and one element of `quants` straight to
@@ -6491,8 +6560,9 @@ final class Session {
   /// includes both "manifest didn't list a mmproj" (no warn
   /// logged) and "mmproj listed but failed to open/parse"
   /// (warn logged at `CeraEngine::from_path`).
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendAudio(List<double> samples, int sampleRate) => _unsupportedOnWeb('Session.appendAudio');
 
   /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the
@@ -6543,8 +6613,9 @@ final class Session {
   /// - `Backend(...)` for image decode failure, missing vision
   /// encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
   /// mismatch.
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendImage(Uint8List bytes, int? maxLongSize) => _unsupportedOnWeb('Session.appendImage');
 
   /// Append raw text to the context, running a prefill over just
@@ -6734,7 +6805,7 @@ final class Session {
   ///
   /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
   /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
-  /// `>= vocab_size`.
+  /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
   Uint8List hiddenStatesForTokens(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesForTokens');
 
   /// Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
@@ -7129,6 +7200,31 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
+
+/// Write the embedded DSP skels into `dir` (created if missing) and
+/// point FastRPC's loader at it. For JVM/desktop/shell flows where the
+/// caller stages a private writable directory; Android apps instead use
+/// the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+/// (which points the loader at `nativeLibraryDir`), so this call is not
+/// needed there. Do not combine the two in one process unless merging
+/// both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+/// flow per app. Call once at startup, before [`hexagon_probe`] or
+/// loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// number of skels written (0 when all were already present and fresh).
+/// Re-running is cheap and idempotent (files are only rewritten when
+/// their bytes differ, and the loader path is not duplicated). A `dir`
+/// containing `;` is rejected: it would silently split into two loader
+/// search entries.
+int hexagonInstallSkels(String dir) => _unsupportedOnWeb('hexagonInstallSkels');
+
+/// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+/// tries each bundled DSP skel, and returns the first working device's
+/// capabilities (then closes it). Fails when the `hexagon` feature is
+/// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+/// unavailable to this process. On Android, call the AAR's
+/// `HexagonNpu.setup` first so the loader can find the skel files
+/// (JVM/desktop flows use [`hexagon_install_skels`] instead).
+HexagonProbeInfo hexagonProbe() => _unsupportedOnWeb('hexagonProbe');
 
 /// Default KWS configuration parameters.
 FfiHotwordConfig hotwordDefaultConfig() => _unsupportedOnWeb('hotwordDefaultConfig');

@@ -315,6 +315,251 @@ fn repack_q4_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
     (q, d)
 }
 
+/// Salt for synthetic *weight* vectors: every microbench and stream-kernel
+/// test quantizes the same weights, so their inputs (and any input bug)
+/// stay identical.
+const SYNTH_SALT_WEIGHTS: u32 = 0x5EED;
+/// Salt for synthetic *input* vectors (`x` / `B`): distinct from the
+/// weights salt so inputs and weights are never accidentally correlated.
+const SYNTH_SALT_INPUTS: u32 = 0xB0B;
+
+/// Deterministic synthetic vector for bench/test fixtures: hash noise in
+/// `[-1, 1)`, shared by the Q4_0 microbenches and the stream-kernel tests
+/// so their inputs (and any input bug) stay identical.
+fn synth_q4_0_vec(n: usize, salt: u32) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(salt);
+            ((x >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+/// Row-major f32 to Q4_0 blocks (18 bytes per 32 elems), GGUF layout:
+/// f16 scale + 16 bytes, byte i holding w[i] (low nibble) / w[i+16].
+fn quantize_q4_0_synth(weights: &[f32], m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 32, 0);
+    let nb = k / 32;
+    let mut out = Vec::with_capacity(m * nb * 18);
+    for row in 0..m {
+        for b in 0..nb {
+            let start = row * k + b * 32;
+            let block = &weights[start..start + 32];
+            let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = if amax == 0.0 { 1.0 } else { amax / 7.0 };
+            out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+            let id = 1.0 / d;
+            for qi in 0..16 {
+                let lo = ((block[qi] * id + 8.5) as i32).clamp(0, 15) as u8;
+                let hi = ((block[16 + qi] * id + 8.5) as i32).clamp(0, 15) as u8;
+                out.push(lo | (hi << 4));
+            }
+        }
+    }
+    out
+}
+
+/// CPU reference: Q4_0 GEMV (`y = Wx`, `W` row-major `m x k`).
+fn cpu_gemv_q4_0_ref(raw: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f32> {
+    let nb = k / 32;
+    let mut y = vec![0.0f32; m];
+    let mut row_f32 = vec![0.0f32; k];
+    for (r, y_r) in y.iter_mut().enumerate() {
+        crate::quant::dequantize_q4_0_row(&raw[r * nb * 18..(r + 1) * nb * 18], &mut row_f32);
+        *y_r = row_f32.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+    }
+    y
+}
+
+/// CPU reference: Q4_0 GEMM (`Y = WB`, `W` row-major `m x k`, `B`
+/// row-major `n x k`) into packed `[n][m]` (`y[c * m + r]`), matching the
+/// stream kernels' output layout.
+fn cpu_gemm_q4_0_ref(raw: &[u8], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let nb = k / 32;
+    let mut y = vec![0.0f32; n * m];
+    let mut row_f32 = vec![0.0f32; k];
+    for r in 0..m {
+        crate::quant::dequantize_q4_0_row(&raw[r * nb * 18..(r + 1) * nb * 18], &mut row_f32);
+        for c in 0..n {
+            let mut acc = 0.0f32;
+            for t in 0..k {
+                acc += row_f32[t] * b[c * k + t];
+            }
+            y[c * m + r] = acc;
+        }
+    }
+    y
+}
+
+/// Largest accepted `--spv` file. Shipped kernels are kilobytes; anything
+/// past this is a mistyped path (a model file, a log), not a shader.
+const SPV_MAX_BYTES: usize = 64 << 20;
+
+/// SPIR-V magic word (`0x07230203`, little-endian on disk).
+const SPV_MAGIC: u32 = 0x0723_0203;
+
+/// Pure size leg of [`check_spv_bytes`]: word alignment + the cap. Split
+/// out so the exact cap boundary is pinnable without a 64 MiB vec.
+fn check_spv_size(len: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        len.is_multiple_of(4),
+        "SPIR-V size {len} is not a multiple of 4"
+    );
+    anyhow::ensure!(
+        len <= SPV_MAX_BYTES,
+        "SPIR-V size {len} exceeds the {SPV_MAX_BYTES}-byte cap"
+    );
+    Ok(())
+}
+
+/// Validate raw `--spv` bytes before they reach the driver: word alignment,
+/// the size cap, and the 5-word SPIR-V header shape (magic, a 1.x version,
+/// a nonzero id bound, zero schema). Pure (no GPU needed) so a mistyped
+/// path fails with a message naming the file instead of risking device
+/// loss on attacker-influenced bytes (e.g. a shared CI artifact dir).
+///
+/// Header-shape only, not full module validity: magic + version + bound +
+/// schema prove the file *starts like* a module, not that the driver will
+/// accept it. (SPIR-V has no header-declared total length to cross-check
+/// against the file size — the 5 words are all there is.)
+fn check_spv_bytes(path: &str, bytes: &[u8]) -> anyhow::Result<Vec<u32>> {
+    check_spv_size(bytes.len()).map_err(|e| anyhow::anyhow!("{path}: {e:#}"))?;
+    let words: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    anyhow::ensure!(
+        words.first() == Some(&SPV_MAGIC),
+        "{path}: bad SPIR-V magic (expected 0x07230203)"
+    );
+    anyhow::ensure!(
+        words.len() >= 5,
+        "{path}: SPIR-V too short for the 5-word header ({} words)",
+        words.len()
+    );
+    anyhow::ensure!(
+        words[1] >> 16 == 1,
+        "{path}: bad SPIR-V version 0x{:08x} (want 1.x)",
+        words[1]
+    );
+    // words[2] is the generator id: any value (including 0) is legal.
+    anyhow::ensure!(
+        words[3] >= 1,
+        "{path}: bad SPIR-V id bound {} (must be >= 1)",
+        words[3]
+    );
+    anyhow::ensure!(
+        words[4] == 0,
+        "{path}: bad SPIR-V schema {} (reserved, must be 0)",
+        words[4]
+    );
+    Ok(words)
+}
+
+/// Load one experimental `--spv` variant against a baseline pipeline's
+/// bind-group layout.
+fn load_spv_variant(
+    ctx: &GpuContext,
+    base_pipe: &wgpu::ComputePipeline,
+    path: &str,
+) -> anyhow::Result<(String, wgpu::ComputePipeline)> {
+    use anyhow::Context;
+    use std::io::Read;
+    // Bounded read: `take` caps the allocation at one byte past the cap, so
+    // a mistyped path (a multi-GB model file, a log) fails on the size check
+    // below instead of OOMing first — with no metadata/read TOCTOU.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("reading experimental SPIR-V {path}"))?
+        .take(SPV_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading experimental SPIR-V {path}"))?;
+    let words = check_spv_bytes(path, &bytes)?;
+    let layout = base_pipe.get_bind_group_layout(0);
+    let pipe_layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bench_variant_layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+    // SAFETY: `check_spv_bytes` above established word alignment, the size
+    // cap, and the 5-word header shape (magic, 1.x version, nonzero id
+    // bound, zero schema) — header-shape only, NOT full module validity.
+    // The file is slangc output compiled from the same-shape source the
+    // caller is A/Bing, and deeper spirv-val clean is on the caller
+    // (bench-only path, never shipped): crafted bytes with a valid header
+    // still reach the driver unverified, risking device loss at best.
+    let module = unsafe {
+        ctx.device
+            .create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                label: Some(path),
+                spirv: Some(std::borrow::Cow::Owned(words)),
+                entry_points: std::borrow::Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                    name: std::borrow::Cow::Borrowed("main"),
+                    workgroup_size: (0, 0, 0),
+                }]),
+                dxil: None,
+                hlsl: None,
+                metallib: None,
+                msl: None,
+                glsl: None,
+                wgsl: None,
+            })
+    };
+    let pipe = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(path),
+            layout: Some(&pipe_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                // Hard `false`, matching the baked baselines (a variant
+                // measured with zero-init ON times a different kernel):
+                // same-shape slangc output is safe uninitialized — every
+                // kernel here writes scratch before reading it.
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    Ok((stem, pipe))
+}
+
+/// Governor soak duration for [`soak_and_measure`]: tens of ms of
+/// continuous load to ramp the Adreno governor off its idle clock.
+const SOAK_MS: u64 = 500;
+
+/// Clock soak + timed run for the microbenches: the Adreno governor idles
+/// near 222 MHz and needs tens of ms of continuous load to ramp; a short
+/// warmup times the ramp, not the kernel. Soak [`SOAK_MS`], then time
+/// `iters` dispatches via `run`. Returns ms/iter and the current GPU clock.
+///
+/// The `run` closures block on `poll_wait`, so this must run on an executor
+/// with no other tasks (today: `pollster::block_on` from a sync entry).
+fn soak_and_measure(run: impl Fn(u32) -> std::time::Duration, iters: u32) -> (f64, String) {
+    // `iters == 0` would print `inf` ms (f64 division) instead of failing;
+    // both harness entries `ensure!(iters >= 1)`, so a zero here is a
+    // caller bug that must fail fast in release too.
+    assert!(iters >= 1, "soak_and_measure: iters must be >= 1");
+    let soak_start = std::time::Instant::now();
+    while soak_start.elapsed() < std::time::Duration::from_millis(SOAK_MS) {
+        run(10);
+    }
+    let mhz = gpu_cur_freq_mhz()
+        .map(|f| format!("{f}MHz"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let dt = run(iters);
+    (dt.as_secs_f64() * 1e3 / iters as f64, mhz)
+}
+
 /// Whether the LM head uploads a flat-planes Q6_K twin for decode GEMV
 /// (see [`repack_q6_k_flat`]): passthrough-only (the flat kernel is
 /// SPIR-V-only, Vulkan-only, and needs subgroups). `CERA_WGPU_FLAT_Q6K=0`
@@ -1988,7 +2233,8 @@ impl GpuLfm2Model {
         // binding validation. Resident binds q and d separately, so the
         // bound is the larger half, not the raw total.
         let lm_head_bound_bytes = if let Some((q, d)) = lm_head_repack.as_ref() {
-            (q.len().max(d.len()) as u64 * 4).div_ceil(4) * 4
+            // u32 counts times 4: already a multiple of 4, no round-up.
+            q.len().max(d.len()) as u64 * 4
         } else {
             (lm_head_bytes.len() as u64).div_ceil(4) * 4
         };
@@ -3682,13 +3928,25 @@ impl GpuLfm2Model {
         });
     }
 
-    /// Whether a prefill dispatch label is a register-tiled GEMM. Those run
-    /// from SPIR-V passthrough on Vulkan (no naga bounds checks); every
-    /// other prefill label is WGSL-compiled — including `gemm_stream_*`,
-    /// which also ships a SPIR-V twin but is proven to mix safely (450M
-    /// pp512), and `mul_mat_f32`, which has no SPIR-V twin at all (harmless
-    /// over-split: F32-weight prefills are rare and stay correct).
-    fn is_reg_tile_label(label: &str) -> bool {
+    /// Chunk length past which `emit_prefill_cmds` splits `mul_mat_*`
+    /// dispatches into their own passes (the Adreno guard): a merged pass
+    /// mixing kinds loses the device on 2.6B shapes past 128 tokens. The
+    /// pass-split integration test pins the boundary (128 vs 129) with its
+    /// own literals — it cannot see this private const.
+    const ADRENO_PASS_SPLIT_TOKENS: u32 = 128;
+
+    /// Whether a prefill dispatch label belongs to the Adreno-split kind
+    /// (`mul_mat_*`, including non-passthrough members by design), for the
+    /// Adreno kind split in `emit_prefill_cmds`. Empirical split, not a
+    /// SPIR-V/WGSL split: `mul_mat_*` dispatches run in their own passes
+    /// past [`ADRENO_PASS_SPLIT_TOKENS`] tokens, and everything else merges
+    /// as before (including `transpose_cast_f16` and `gemm_stream_*`, which
+    /// both ship SPIR-V twins and are both proven to mix safely).
+    /// `mul_mat_f32` has no SPIR-V twin at all (harmless over-split:
+    /// F32-weight prefills are rare and stay correct). Mechanism unknown;
+    /// do not reclassify labels without re-running the 2.6B n>128 Adreno
+    /// soak.
+    fn is_adreno_split_label(label: &str) -> bool {
         label.starts_with("mul_mat_")
     }
 
@@ -3697,13 +3955,14 @@ impl GpuLfm2Model {
     /// segment. When the timestamp profiler is active each dispatch keeps
     /// its own pass so per-op attribution survives — production runs merged.
     ///
-    /// Adreno guard (`chunk_n > 128`): a merged pass mixing `mul_mat_*`
-    /// (SPIR-V passthrough) with WGSL dispatches loses the device on 2.6B
-    /// shapes past 128 tokens — zero validation errors, all maps fail after.
-    /// Verified safe: same mix at n ≤ 128, either kind merged alone at
-    /// n = 129, and stream+WGSL merged at n = 512. So long chunks split
-    /// runs at kind boundaries too (WGSL still merges with WGSL,
-    /// `mul_mat_*` with `mul_mat_*`); short chunks merge exactly as before.
+    /// Adreno guard (`chunk_n > ADRENO_PASS_SPLIT_TOKENS`): a merged pass
+    /// mixing `mul_mat_*` with other dispatches loses the device on 2.6B
+    /// shapes past 128 tokens (zero validation errors, all maps fail after). Verified
+    /// safe: same mix at n ≤ 128, either kind merged alone at n = 129,
+    /// and stream+WGSL merged at n = 512, so this is an empirical
+    /// `mul_mat_*`-vs-rest split, not a SPIR-V/WGSL one (mechanism
+    /// unknown; see `is_adreno_split_label`). Long chunks split runs at kind
+    /// boundaries too; short chunks merge exactly as before.
     fn emit_prefill_cmds(
         &self,
         enc: &mut wgpu::CommandEncoder,
@@ -3748,7 +4007,7 @@ impl GpuLfm2Model {
         // borrow is scoped to its own block — holding one `ComputePass`
         // across loop iterations unifies its borrow region and conflicts
         // with the copies.
-        let split_spv = chunk_n > 128;
+        let split_kinds = chunk_n > Self::ADRENO_PASS_SPLIT_TOKENS;
         let owned: Vec<PrefillCmd> = std::mem::take(cmds);
         let mut i = 0usize;
         let mut seg = 0u32;
@@ -3757,12 +4016,12 @@ impl GpuLfm2Model {
             // every dispatch shares one kind, reproducing the old shape).
             let mut j = i;
             if let PrefillCmd::Dispatch { label, .. } = &owned[i] {
-                let kind0 = split_spv && Self::is_reg_tile_label(label);
+                let kind0 = split_kinds && Self::is_adreno_split_label(label);
                 j += 1;
                 while j < owned.len() {
                     match &owned[j] {
                         PrefillCmd::Dispatch { label, .. }
-                            if !split_spv || Self::is_reg_tile_label(label) == kind0 =>
+                            if !split_kinds || Self::is_adreno_split_label(label) == kind0 =>
                         {
                             j += 1;
                         }
@@ -5688,9 +5947,12 @@ impl GpuLfm2Model {
         let t_map = std::time::Instant::now();
         let argmax = self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1);
         let Some(&tok) = argmax.first() else {
-            // The map failure itself is already loud (`read_mapped_u32`
-            // eprintlns); this turns the old index-OOB panic into a cause.
-            panic!("argmax readback empty: GPU→CPU map failed (device lost?)");
+            // The map failure is recorded first-wins in the readback slot
+            // (and loud on stderr); return a dummy the session never
+            // samples — its post-greedy drain surfaces the record as a
+            // typed `Backend` error instead of unwinding out of the core
+            // library. All production `forward_greedy` callers drain.
+            return 0;
         };
         if host_prof {
             eprintln!(
@@ -8540,6 +8802,16 @@ impl Model for GpuLfm2Model {
         self.forward_greedy_inner(tokens, pos, state)
     }
 
+    fn take_decode_error(&self) -> Option<CeraError> {
+        // Blocking readbacks zero-fill on map failure (see
+        // `GpuContext::warn_readback_zeros`); drain the sticky record so
+        // the session fails the generation instead of sampling the zeros.
+        // Sticky-until-taken also covers prefill readbacks: a prefill fault
+        // is still pending at the next session check (the session checks
+        // after `append_tokens` too, so no bad token is emitted first).
+        self.ctx.take_readback_fault()
+    }
+
     fn supports_embedding_input(&self) -> bool {
         true
     }
@@ -9088,6 +9360,139 @@ fn gpu_cur_freq_mhz() -> Option<u64> {
     None
 }
 
+/// Largest single microbench dim. Kills `u32` overflow in the `n_pad`
+/// round-up and the `*4` byte math (legit shapes are in the hundreds).
+const BENCH_MAX_DIM: u64 = 1 << 24;
+/// Largest estimated worst-case transient allocation for one microbench
+/// shape, in bytes (host synth + packed + twins + device buffers — see the
+/// estimators below). A typo'd giant shape must fail with a message, not
+/// abort in the allocator. Sized so the CLI's own default `gemv-bench`
+/// shapes validate: the 128000x2048 LM-head row estimates ~1.53 GiB
+/// under the deliberately over-counting estimator.
+const BENCH_MAX_BYTES: u64 = 1 << 31;
+
+/// Stream-`(q, d)` twin bytes for an `(m, k)` weight matrix: `q` holds
+/// `m*k/8` u32s, `d` holds `m*ceil(nb/2)` u32s (`nb = k/32`), with a
+/// zero-padded lane when `nb` is odd — so the twins are exactly `packed`
+/// only at even block counts, and `packed + 2*m` bytes otherwise.
+/// Checked `u64` math — `None` on overflow.
+fn stream_twin_bytes(m: u64, k: u64) -> Option<u64> {
+    let nb = k.div_ceil(32);
+    let q = m.checked_mul(k.div_ceil(8))?.checked_mul(4)?;
+    let d = m.checked_mul(nb.div_ceil(2))?.checked_mul(4)?;
+    q.checked_add(d)
+}
+
+/// Estimated worst-case transient bytes for one GEMV `(m, k)` shape: synth
+/// f32 weights (`m*k*4`), `raw` + stream twins on host and device
+/// (`2*packed + 2*twins`; the twins match `packed` at even block counts),
+/// `x` at 2× (host + device), and `y` at 3× (`expected` + downloaded
+/// `got` + device). Checked `u64` math — `None` on overflow. Deliberately
+/// an over-estimate: the cap is a typo guard, not a precise allocator
+/// model.
+fn gemv_bench_bytes(m: u32, k: u32) -> Option<u64> {
+    let (m, k) = (u64::from(m), u64::from(k));
+    let synth = m.checked_mul(k)?.checked_mul(4)?;
+    let packed = m.checked_mul(k.div_ceil(32))?.checked_mul(18)?;
+    let twins = stream_twin_bytes(m, k)?;
+    let weights = synth
+        .checked_add(packed.checked_mul(2)?)?
+        .checked_add(twins.checked_mul(2)?)?;
+    let x_io = k.checked_mul(4)?.checked_mul(2)?;
+    let y_io = m.checked_mul(4)?.checked_mul(3)?;
+    let io = x_io.checked_add(y_io)?;
+    weights.checked_add(io)
+}
+
+/// Estimated worst-case transient bytes for one GEMM `(m, n, k)` shape:
+/// synth f32 weights (`m*k*4`) plus host `raw` and stream twins on host
+/// and device (`packed + 2*twins` — GEMM never uploads `raw`; the CPU
+/// reference keeps it), B row-major f32 (`n*k*4`), the transposed f16 twin
+/// (`k*n_pad*2`, host + device), and the outputs at 4× (`m*n_pad*4`:
+/// `expected` + downloaded `got` + the `base_out` clone variants score
+/// against + device). Checked `u64` math — `None` on overflow (including
+/// the `n_pad` round-up).
+fn gemm_bench_bytes(m: u32, n: u32, k: u32) -> Option<u64> {
+    let (m, n, k) = (u64::from(m), u64::from(n), u64::from(k));
+    let n_pad = n.checked_next_multiple_of(32)?;
+    let synth = m.checked_mul(k)?.checked_mul(4)?;
+    let packed = m.checked_mul(k.div_ceil(32))?.checked_mul(18)?;
+    let twins = stream_twin_bytes(m, k)?;
+    let weights = synth
+        .checked_add(packed)?
+        .checked_add(twins.checked_mul(2)?)?;
+    let b = n.checked_mul(k)?.checked_mul(4)?;
+    let b16 = k.checked_mul(n_pad)?.checked_mul(2)?.checked_mul(2)?;
+    let out = m.checked_mul(n_pad)?.checked_mul(4)?.checked_mul(4)?;
+    weights.checked_add(b)?.checked_add(b16)?.checked_add(out)
+}
+
+/// Validate one GEMV `(m, k)` bench shape: dims must be positive (a zero
+/// dim reaches GPU dispatches parameterized with 0 — a device-loss-shaped
+/// footgun), bounded (see the consts above), `k` a Q4_0 block multiple
+/// (the quantizer asserts it), and the estimated transient within budget.
+///
+/// Called by the CLI after parsing AND at the `pub` harness entries below
+/// (which a direct library caller reaches without the CLI) — the one home
+/// for shape validation, before any context creation or allocation.
+///
+/// Internal CLI harness, not semver-stable.
+#[doc(hidden)]
+pub fn validate_gemv_shape(m: u32, k: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        m >= 1 && k >= 1,
+        "m={m} k={k}: dims must be >= 1 (a zero dim reaches GPU dispatches)"
+    );
+    anyhow::ensure!(
+        u64::from(m) <= BENCH_MAX_DIM && u64::from(k) <= BENCH_MAX_DIM,
+        "m={m} k={k}: dims must be <= {BENCH_MAX_DIM}"
+    );
+    anyhow::ensure!(
+        k.is_multiple_of(32),
+        "m={m} k={k}: k must be a multiple of 32"
+    );
+    let bytes = gemv_bench_bytes(m, k)
+        .ok_or_else(|| anyhow::anyhow!("m={m} k={k}: shape overflows u64 byte math"))?;
+    anyhow::ensure!(
+        bytes <= BENCH_MAX_BYTES,
+        "m={m} k={k}: estimated transient {bytes} bytes exceeds the {BENCH_MAX_BYTES}-byte cap"
+    );
+    Ok(())
+}
+
+/// Validate one GEMM `(m, n, k)` bench shape: the GEMV bounds on m/k plus
+/// n's own bounds (the kernel's fiber width needs `n >= 32`) and the
+/// GEMM transient budget. Same two call sites as [`validate_gemv_shape`].
+///
+/// Internal CLI harness, not semver-stable.
+#[doc(hidden)]
+pub fn validate_gemm_shape(m: u32, n: u32, k: u32) -> anyhow::Result<()> {
+    // Same legs as the GEMV validator, restated (not delegated) so every
+    // message names the full `m n k` shape in one format.
+    anyhow::ensure!(
+        m >= 1 && n >= 1 && k >= 1,
+        "m={m} n={n} k={k}: dims must be >= 1 (a zero dim reaches GPU dispatches)"
+    );
+    anyhow::ensure!(
+        u64::from(m) <= BENCH_MAX_DIM
+            && u64::from(n) <= BENCH_MAX_DIM
+            && u64::from(k) <= BENCH_MAX_DIM,
+        "m={m} n={n} k={k}: dims must be <= {BENCH_MAX_DIM}"
+    );
+    anyhow::ensure!(
+        k.is_multiple_of(32),
+        "m={m} n={n} k={k}: k must be a multiple of 32"
+    );
+    anyhow::ensure!(n >= 32, "m={m} n={n} k={k}: n must be >= 32 (fiber width)");
+    let bytes = gemm_bench_bytes(m, n, k)
+        .ok_or_else(|| anyhow::anyhow!("m={m} n={n} k={k}: shape overflows u64 byte math"))?;
+    anyhow::ensure!(
+        bytes <= BENCH_MAX_BYTES,
+        "m={m} n={n} k={k}: estimated transient {bytes} bytes exceeds the {BENCH_MAX_BYTES}-byte cap"
+    );
+    Ok(())
+}
+
 /// Device-side Q4_0 GEMV microbench: `fast` (raw blocks) vs `stream`
 /// (resident (q, d)) across `(m, k)` shapes. Synthetic weights (quantized
 /// on host), `iters` timed dispatches per kernel in one submit, parity vs
@@ -9101,6 +9506,9 @@ fn gpu_cur_freq_mhz() -> Option<u64> {
 /// keep the baseline's contract: same 4 bindings (w, x, y, params), same
 /// params `[m, k, 0, 0]`, entry `main`. The grid adapts to the variant's
 /// rows-per-workgroup (`@nr`, default 8), so NR variants A/B in one run.
+///
+/// Internal CLI harness, not semver-stable.
+#[doc(hidden)]
 pub fn gemv_q4_0_microbench(
     shapes: &[(u32, u32)],
     iters: u32,
@@ -9119,51 +9527,19 @@ async fn gemv_q4_0_microbench_async(
     spv_paths: &[String],
 ) -> anyhow::Result<()> {
     use crate::backend::wgpu::shaders;
-    use crate::quant::dequantize_q4_0_row;
     use anyhow::Context;
 
-    fn synth_vec(n: usize, salt: u32) -> Vec<f32> {
-        (0..n)
-            .map(|i| {
-                let x = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(salt);
-                ((x >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    /// Row-major f32 to Q4_0 blocks (18 bytes per 32 elems), GGUF layout:
-    /// f16 scale + 16 bytes, byte i holding w[i] (low nibble) / w[i+16].
-    fn quantize_q4_0(weights: &[f32], m: usize, k: usize) -> Vec<u8> {
-        assert_eq!(k % 32, 0);
-        let nb = k / 32;
-        let mut out = Vec::with_capacity(m * nb * 18);
-        for row in 0..m {
-            for b in 0..nb {
-                let start = row * k + b * 32;
-                let block = &weights[start..start + 32];
-                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                let d = if amax == 0.0 { 1.0 } else { amax / 7.0 };
-                out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
-                let id = 1.0 / d;
-                for qi in 0..16 {
-                    let lo = ((block[qi] * id + 8.5) as i32).clamp(0, 15) as u8;
-                    let hi = ((block[16 + qi] * id + 8.5) as i32).clamp(0, 15) as u8;
-                    out.push(lo | (hi << 4));
-                }
-            }
-        }
-        out
-    }
-
-    fn cpu_ref(raw: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f32> {
-        let nb = k / 32;
-        let mut y = vec![0.0f32; m];
-        let mut row_f32 = vec![0.0f32; k];
-        for (r, y_r) in y.iter_mut().enumerate() {
-            dequantize_q4_0_row(&raw[r * nb * 18..(r + 1) * nb * 18], &mut row_f32);
-            *y_r = row_f32.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
-        }
-        y
+    // Validate before touching the GPU: the `pub` sync wrapper below
+    // delegates here, so a direct library caller reaches this without the
+    // CLI's pre-validation (shapes, iters, and kernel selection all have
+    // host-side checks here).
+    anyhow::ensure!(iters >= 1, "iters must be >= 1");
+    anyhow::ensure!(
+        kernels.contains(&"fast") || kernels.contains(&"stream"),
+        "kernels must select at least one of fast,stream (got {kernels:?})"
+    );
+    for &(m, k) in shapes {
+        validate_gemv_shape(m, k)?;
     }
 
     let ctx = GpuContext::new_async().await?;
@@ -9204,79 +9580,20 @@ async fn gemv_q4_0_microbench_async(
             }
             None => (spec.as_str(), 8),
         };
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading experimental SPIR-V {path}"))?;
-        anyhow::ensure!(
-            bytes.len() % 4 == 0,
-            "{path}: SPIR-V size {} is not a multiple of 4",
-            bytes.len()
-        );
-        let words: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect();
-        let layout = fast_pipe.get_bind_group_layout(0);
-        let pipe_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemv_bench_variant_layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        // SAFETY: the file is slangc output compiled from the same-shape
-        // source the caller is A/Bing; spirv-val clean is on the caller
-        // (bench-only path, never shipped).
-        let module = unsafe {
-            ctx.device
-                .create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                    label: Some(path),
-                    spirv: Some(std::borrow::Cow::Owned(words)),
-                    entry_points: std::borrow::Cow::Borrowed(&[
-                        wgpu::PassthroughShaderEntryPoint {
-                            name: std::borrow::Cow::Borrowed("main"),
-                            workgroup_size: (0, 0, 0),
-                        },
-                    ]),
-                    dxil: None,
-                    hlsl: None,
-                    metallib: None,
-                    msl: None,
-                    glsl: None,
-                    wgsl: None,
-                })
-        };
-        let pipe = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(path),
-                layout: Some(&pipe_layout),
-                module: &module,
-                entry_point: Some("main"),
-                // Same as the baked `fast` pipeline: the kernel writes its
-                // scratch before reading it, so no zero-init (and a fair A/B
-                // needs identical options).
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            });
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
+        let (stem, pipe) = load_spv_variant(&ctx, &fast_pipe, path)?;
         variants.push((stem, pipe, nr));
     }
 
     for (shape_idx, &(m, k)) in shapes.iter().enumerate() {
+        // Validated at entry (`4*m*k <= BENCH_MAX_BYTES`, so `m*k <= 2^29`):
+        // every product below fits `usize` on 64- and 32-bit, and every
+        // allocation is inside the transient budget.
         let (m_us, k_us) = (m as usize, k as usize);
-        let weights = synth_vec(m_us * k_us, 0x5EED);
-        let raw = quantize_q4_0(&weights, m_us, k_us);
+        let weights = synth_q4_0_vec(m_us * k_us, SYNTH_SALT_WEIGHTS);
+        let raw = quantize_q4_0_synth(&weights, m_us, k_us);
         let (q, d) = repack_q4_0_stream(&raw, m_us, k_us);
-        let x = synth_vec(k_us, 0xB0B);
-        let expected = cpu_ref(&raw, &x, m_us, k_us);
+        let x = synth_q4_0_vec(k_us, SYNTH_SALT_INPUTS);
+        let expected = cpu_gemv_q4_0_ref(&raw, &x, m_us, k_us);
 
         let raw_buf = ctx.upload_storage(&raw, "bench.raw");
         let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "bench.q");
@@ -9388,21 +9705,11 @@ async fn gemv_q4_0_microbench_async(
             } else {
                 1
             };
-            // Clock soak: the Adreno governor idles near 222 MHz and needs
-            // tens of ms of continuous load to ramp; a 5-iter warmup (~2 ms)
-            // times the ramp, not the kernel. Soak 500 ms so every variant
-            // times at ramped clocks.
             let (mut ms, mut gbps, mut max_diff, mut mhz) = (0.0, 0.0, 0.0f32, "n/a".to_string());
             for _ in 0..rounds {
-                let soak_start = std::time::Instant::now();
-                while soak_start.elapsed() < std::time::Duration::from_millis(500) {
-                    run(pipe, bg, *rows_per_wg, 10);
-                }
-                mhz = gpu_cur_freq_mhz()
-                    .map(|f| format!("{f}MHz"))
-                    .unwrap_or_else(|| "n/a".to_string());
-                let dt = run(pipe, bg, *rows_per_wg, iters);
-                ms = dt.as_secs_f64() * 1e3 / iters as f64;
+                let (ms_new, mhz_new) = soak_and_measure(|n| run(pipe, bg, *rows_per_wg, n), iters);
+                ms = ms_new;
+                mhz = mhz_new;
                 gbps = bytes_per_iter as f64 / (ms / 1e3) / 1e9;
                 let got = ctx.download_f32_async(&y_buf, m_us).await?;
                 max_diff = expected
@@ -9431,6 +9738,9 @@ async fn gemv_q4_0_microbench_async(
 /// same 5 bindings (q, d, b16, dst, params), same grid
 /// `(m/256, n_pad/32)`, same `[numthreads(256,1,1)]`, same params
 /// `[m, k, n_valid, n_pad, y_stride]`, entry `main`.
+///
+/// Internal CLI harness, not semver-stable.
+#[doc(hidden)]
 pub fn gemm_q4_0_microbench(
     shapes: &[(u32, u32, u32)],
     iters: u32,
@@ -9446,57 +9756,15 @@ async fn gemm_q4_0_microbench_async(
     spv_paths: &[String],
     spv_ny: u32,
 ) -> anyhow::Result<()> {
-    use crate::quant::dequantize_q4_0_row;
-    use anyhow::Context;
-
-    fn synth_vec(n: usize, salt: u32) -> Vec<f32> {
-        (0..n)
-            .map(|i| {
-                let x = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(salt);
-                ((x >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    /// Row-major f32 to Q4_0 blocks (18 bytes per 32 elems), GGUF layout:
-    /// f16 scale + 16 bytes, byte i holding w[i] (low nibble) / w[i+16].
-    fn quantize_q4_0(weights: &[f32], m: usize, k: usize) -> Vec<u8> {
-        assert_eq!(k % 32, 0);
-        let nb = k / 32;
-        let mut out = Vec::with_capacity(m * nb * 18);
-        for row in 0..m {
-            for b in 0..nb {
-                let start = row * k + b * 32;
-                let block = &weights[start..start + 32];
-                let amax = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                let d = if amax == 0.0 { 1.0 } else { amax / 7.0 };
-                out.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
-                let id = 1.0 / d;
-                for qi in 0..16 {
-                    let lo = ((block[qi] * id + 8.5) as i32).clamp(0, 15) as u8;
-                    let hi = ((block[16 + qi] * id + 8.5) as i32).clamp(0, 15) as u8;
-                    out.push(lo | (hi << 4));
-                }
-            }
-        }
-        out
-    }
-
-    fn cpu_ref(raw: &[u8], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
-        let nb = k / 32;
-        let mut y = vec![0.0f32; n * m];
-        let mut row_f32 = vec![0.0f32; k];
-        for r in 0..m {
-            dequantize_q4_0_row(&raw[r * nb * 18..(r + 1) * nb * 18], &mut row_f32);
-            for c in 0..n {
-                let mut acc = 0.0f32;
-                for t in 0..k {
-                    acc += row_f32[t] * b[c * k + t];
-                }
-                y[c * m + r] = acc;
-            }
-        }
-        y
+    // Validate before touching the GPU (see the GEMV entry): shapes, iters,
+    // and the variant fiber width (`div_ceil(ny)` below panics on 0).
+    anyhow::ensure!(iters >= 1, "iters must be >= 1");
+    anyhow::ensure!(
+        spv_ny == 32 || spv_ny == 64,
+        "spv_ny must be 32 or 64 (got {spv_ny})"
+    );
+    for &(m, n, k) in shapes {
+        validate_gemm_shape(m, n, k)?;
     }
 
     let ctx = GpuContext::new_async().await?;
@@ -9515,83 +9783,31 @@ async fn gemm_q4_0_microbench_async(
     // above), module swapped for the file's SPIR-V.
     let mut variants: Vec<(String, wgpu::ComputePipeline)> = Vec::new();
     for path in spv_paths {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading experimental SPIR-V {path}"))?;
-        anyhow::ensure!(
-            bytes.len() % 4 == 0,
-            "{path}: SPIR-V size {} is not a multiple of 4",
-            bytes.len()
-        );
-        let words: Vec<u32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect();
-        let layout = base_pipe.get_bind_group_layout(0);
-        let pipe_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemm_bench_variant_layout"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        // SAFETY: the file is slangc output compiled from the same-shape
-        // source the caller is A/Bing; spirv-val clean is on the caller
-        // (bench-only path, never shipped).
-        let module = unsafe {
-            ctx.device
-                .create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                    label: Some(path),
-                    spirv: Some(std::borrow::Cow::Owned(words)),
-                    entry_points: std::borrow::Cow::Borrowed(&[
-                        wgpu::PassthroughShaderEntryPoint {
-                            name: std::borrow::Cow::Borrowed("main"),
-                            workgroup_size: (0, 0, 0),
-                        },
-                    ]),
-                    dxil: None,
-                    hlsl: None,
-                    metallib: None,
-                    msl: None,
-                    glsl: None,
-                    wgsl: None,
-                })
-        };
-        let pipe = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(path),
-                layout: Some(&pipe_layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.clone());
-        variants.push((stem, pipe));
+        variants.push(load_spv_variant(&ctx, &base_pipe, path)?);
     }
 
     for (shape_idx, &(m, n, k)) in shapes.iter().enumerate() {
-        anyhow::ensure!(k % 32 == 0, "k={k} must be a multiple of 32");
-        anyhow::ensure!(n >= 32, "n={n} must be >= 32 (fiber width)");
+        // Validated at entry (dims, `k % 32`, `n >= 32`, transient budget),
+        // so every product below fits `usize` on 64- and 32-bit and every
+        // allocation is inside the budget. The `checked_` pad stays as the
+        // computation itself, not as validation.
         let (m_us, n_us, k_us) = (m as usize, n as usize, k as usize);
-        let n_pad = n.next_multiple_of(32) as usize;
-        let weights = synth_vec(m_us * k_us, 0x5EED);
-        let raw = quantize_q4_0(&weights, m_us, k_us);
+        let n_pad = n
+            .checked_next_multiple_of(32)
+            .ok_or_else(|| anyhow::anyhow!("n={n} overflows u32 when padded to 32"))?
+            as usize;
+        let weights = synth_q4_0_vec(m_us * k_us, SYNTH_SALT_WEIGHTS);
+        let raw = quantize_q4_0_synth(&weights, m_us, k_us);
         let (q, d) = repack_q4_0_stream(&raw, m_us, k_us);
         // B row-major f32 [n][k], then host transpose+cast to [k][n_pad] f16.
-        let b = synth_vec(n_us * k_us, 0xB0B);
+        let b = synth_q4_0_vec(n_us * k_us, SYNTH_SALT_INPUTS);
         let mut b16 = vec![0u16; k_us * n_pad];
         for kk in 0..k_us {
             for nn in 0..n_us {
                 b16[kk * n_pad + nn] = half::f16::from_f32(b[nn * k_us + kk]).to_bits();
             }
         }
-        let expected = cpu_ref(&raw, &b, m_us, n_us, k_us);
+        let expected = cpu_gemm_q4_0_ref(&raw, &b, m_us, n_us, k_us);
 
         let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "bench.q");
         let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "bench.d");
@@ -9673,17 +9889,9 @@ async fn gemm_q4_0_microbench_async(
             let rounds = if shape_idx == 0 && idx == 0 { 2 } else { 1 };
             let (mut ms, mut tflops, mut mhz, mut got) = (0.0, 0.0, "n/a".to_string(), Vec::new());
             for _ in 0..rounds {
-                // Clock soak (see gemv-bench): the Adreno governor needs tens of
-                // ms of continuous load to ramp out of its ~222 MHz idle.
-                let soak_start = std::time::Instant::now();
-                while soak_start.elapsed() < std::time::Duration::from_millis(500) {
-                    run(pipe, 10, ny);
-                }
-                mhz = gpu_cur_freq_mhz()
-                    .map(|f| format!("{f}MHz"))
-                    .unwrap_or_else(|| "n/a".to_string());
-                let dt = run(pipe, iters, ny);
-                ms = dt.as_secs_f64() * 1e3 / iters as f64;
+                let (ms_new, mhz_new) = soak_and_measure(|n| run(pipe, n, ny), iters);
+                ms = ms_new;
+                mhz = mhz_new;
                 tflops = flops_per_iter / (ms / 1e3) / 1e12;
                 got = ctx.download_f32_async(&y_buf, n_pad * m_us).await?;
             }
@@ -9717,7 +9925,243 @@ async fn gemm_q4_0_microbench_async(
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use crate::backend::wgpu::GpuContext;
+    use crate::backend::wgpu::{DevicePollExt, GpuContext};
+
+    /// `--spv` bytes are validated before reaching the driver: word
+    /// alignment, the size cap, and the 5-word header shape each fail with
+    /// the file named. Pure host check — runs without a GPU.
+    #[test]
+    fn spv_bytes_reject_mistyped_paths() {
+        use super::{SPV_MAGIC, SPV_MAX_BYTES, check_spv_bytes, check_spv_size};
+        // Minimal valid header: magic, 1.0, generator 0, bound 1, schema 0.
+        let words = [SPV_MAGIC, 0x0001_0000, 0, 1, 0];
+        let mut good = vec![0u8; 20];
+        for (i, w) in words.iter().enumerate() {
+            good[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(check_spv_bytes("k.spv", &good).unwrap(), words.to_vec());
+        // Text file: word-aligned but wrong magic.
+        let err = check_spv_bytes("note.txt", b"helloworld12").unwrap_err();
+        assert!(err.to_string().contains("bad SPIR-V magic"), "{err}");
+        assert!(err.to_string().contains("note.txt"), "{err}");
+        // Truncated binary: not a multiple of 4.
+        let err = check_spv_bytes("cut.spv", &[0u8; 7]).unwrap_err();
+        assert!(err.to_string().contains("not a multiple of 4"), "{err}");
+        // Empty file: aligned, but no magic word.
+        let err = check_spv_bytes("empty.spv", &[]).unwrap_err();
+        assert!(err.to_string().contains("bad SPIR-V magic"), "{err}");
+        // Magic but too short for the 5-word header.
+        let mut short = vec![0u8; 12];
+        short[0..4].copy_from_slice(&SPV_MAGIC.to_le_bytes());
+        let err = check_spv_bytes("short.spv", &short).unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+        // Header legs, each broken alone: version major != 1, bound 0,
+        // schema != 0.
+        for (i, word, leg) in [
+            (1, 0x0002_0000u32, "version"),
+            (3, 0u32, "bound"),
+            (4, 1u32, "schema"),
+        ] {
+            let mut bad = good.clone();
+            bad[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+            let err = check_spv_bytes("bad.spv", &bad).unwrap_err();
+            assert!(err.to_string().contains(leg), "{leg}: {err}");
+        }
+        // Exact cap boundary, pinned without a 64 MiB vec.
+        assert!(check_spv_size(SPV_MAX_BYTES).is_ok());
+        let err = check_spv_size(SPV_MAX_BYTES + 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// Bench shape validation: zero dims, misaligned `k`/`n` legs, giant
+    /// dims, and the byte-budget boundary each fail with the shape named.
+    /// Pure host checks — run without a GPU.
+    #[test]
+    fn bench_shapes_reject_zero_giant_and_misaligned() {
+        use super::{validate_gemm_shape, validate_gemv_shape};
+        // Zero dims reach GPU dispatches: rejected on every leg.
+        assert!(validate_gemv_shape(0, 64).is_err());
+        assert!(validate_gemv_shape(64, 0).is_err());
+        assert!(validate_gemm_shape(0, 64, 64).is_err());
+        assert!(validate_gemm_shape(64, 0, 64).is_err());
+        assert!(validate_gemm_shape(64, 64, 0).is_err());
+        // Misaligned legs: k must be a Q4_0 block multiple, n the fiber width.
+        assert!(validate_gemv_shape(64, 100).is_err());
+        assert!(validate_gemm_shape(64, 16, 64).is_err());
+        // Giant dims: over the dim cap, or inside it but over the byte budget.
+        assert!(validate_gemv_shape(1 << 24, 1 << 24).is_err());
+        // These two exceed the byte budget as well as the dim cap, so a
+        // bare `is_err` pins only the disjunction: deleting the dim cap
+        // would stay green. Pin the dim-cap message instead.
+        let err = validate_gemv_shape(u32::MAX, 64).unwrap_err();
+        assert!(err.to_string().contains("dims must be <="), "{err}");
+        let err = validate_gemm_shape(64, u32::MAX - 1, 64).unwrap_err();
+        assert!(err.to_string().contains("dims must be <="), "{err}");
+        assert!(validate_gemm_shape(1 << 20, 1 << 20, 64).is_err());
+        // The hole a pure product cap admits: (65536, 65536) needs ~16 GiB
+        // of synth weights alone — must fail with a message, not abort in
+        // the allocator.
+        let err = validate_gemv_shape(65536, 65536).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        let err = validate_gemm_shape(65536, 64, 65536).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        // Sane shapes pass.
+        assert!(validate_gemv_shape(256, 1024).is_ok());
+        assert!(validate_gemm_shape(256, 64, 1024).is_ok());
+        // The CLI's own default `gemv-bench` shapes must validate,
+        // including the 128000x2048 LM-head row (~1.53 GiB estimated).
+        for (m, k) in [
+            (512, 2048),
+            (2048, 2048),
+            (6144, 2048),
+            (2048, 6144),
+            (10752, 2048),
+            (2048, 10752),
+            (128000, 2048),
+        ] {
+            assert!(
+                validate_gemv_shape(m, k).is_ok(),
+                "default shape {m},{k} rejected"
+            );
+        }
+        // The CLI's own default `gemm-bench` shapes must validate too
+        // (mirrors the `GemmBench` clap `default_value`).
+        for (m, n, k) in [
+            (10752, 128, 2048),
+            (10752, 512, 2048),
+            (2048, 128, 2048),
+            (2048, 512, 2048),
+            (6144, 512, 2048),
+        ] {
+            assert!(
+                validate_gemm_shape(m, n, k).is_ok(),
+                "default shape {m},{n},{k} rejected"
+            );
+        }
+    }
+
+    /// The Adreno kind table, pinned host-side: every `mul_mat_*` label
+    /// `encode_mul_mat_reg_tile` emits (including `mul_mat_f32`, which has
+    /// no SPIR-V twin) splits into its own passes past 128 tokens, while
+    /// the proven-safe mixers and ordinary batch labels merge. The
+    /// pass-count integration test only proves *a* split exists, so a
+    /// narrowing edit that keeps its fixture green would silently change
+    /// on-device grouping, so this table pins the contract instead. Do not
+    /// reclassify without the 2.6B n>128 Adreno soak.
+    #[test]
+    fn adreno_split_label_table() {
+        use super::GpuLfm2Model;
+        for label in [
+            "mul_mat_tile",
+            "mul_mat_tile_stream",
+            "mul_mat_q8_0",
+            "mul_mat_q4k",
+            "mul_mat_q5k",
+            "mul_mat_q6k",
+            "mul_mat_f32",
+        ] {
+            assert!(
+                GpuLfm2Model::is_adreno_split_label(label),
+                "{label} must stay in the Adreno-split kind"
+            );
+        }
+        for label in [
+            "gemm_stream_q4_0",
+            "gemm_stream_q4_0_k64",
+            "transpose_cast_f16",
+            "rmsnorm_batch",
+            "attention_prefill",
+            "kv_append",
+        ] {
+            assert!(
+                !GpuLfm2Model::is_adreno_split_label(label),
+                "{label} must stay out of the Adreno-split kind"
+            );
+        }
+    }
+
+    /// The transient-byte estimators, pinned by value: every live buffer
+    /// the harnesses hold at peak (host twins, downloads, the `base_out`
+    /// clone, device buffers) must be counted, or the typo-guard cap
+    /// admits shapes that abort in the allocator. Both block-count
+    /// parities are pinned: the `d` twin's padded lane makes odd counts
+    /// slightly larger than `packed`.
+    #[test]
+    fn bench_byte_estimators_count_every_live_buffer() {
+        use super::{gemm_bench_bytes, gemv_bench_bytes, stream_twin_bytes};
+        // Twins at odd nb (k=32, nb=1): q 32*4*4 = 512, d 32*1*4 = 128 —
+        // 640 vs packed 576 (the padded `d` lane).
+        assert_eq!(stream_twin_bytes(32, 32), Some(512 + 128));
+        // Twins at even nb (k=64, nb=2): q 32*8*4 = 1024, d 32*1*4 = 128 —
+        // exactly packed (1152).
+        assert_eq!(stream_twin_bytes(32, 64), Some(1024 + 128));
+        // GEMV (32, 32): synth 4096; raw 576 host + device; twins 640
+        // host + device; x 32*4 at 2×; y 32*4 at 3× (expected + got +
+        // device).
+        assert_eq!(
+            gemv_bench_bytes(32, 32),
+            Some(4096 + 2 * 576 + 2 * 640 + 2 * 128 + 3 * 128)
+        );
+        // GEMV (32, 64): synth 8192; raw and twins 1152 each, host +
+        // device; x 64*4 at 2×; y 32*4 at 3×.
+        assert_eq!(
+            gemv_bench_bytes(32, 64),
+            Some(8192 + 2 * 1152 + 2 * 1152 + 2 * 256 + 3 * 128)
+        );
+        // GEMM (32, 32, 32): synth 4096; host raw 576 (never uploaded);
+        // twins 640 host + device; B 32*32*4; b16 32*32*2 at 2×; out
+        // 32*32*4 at 4× (expected + got + base_out + device).
+        assert_eq!(
+            gemm_bench_bytes(32, 32, 32),
+            Some(4096 + 576 + 2 * 640 + 4096 + 2 * 2048 + 4 * 4096)
+        );
+        // Genuine u64 overflow (here the synth product) is None, not
+        // wrap. (Merely huge shapes like n = u32::MAX - 1 return a huge
+        // estimate and fail at the budget check instead.)
+        assert_eq!(gemv_bench_bytes(u32::MAX, u32::MAX), None);
+    }
+
+    /// The `pub` harness entries validate on the host before touching the
+    /// GPU: bad shapes, `iters == 0`, an empty kernel selection, and a bad
+    /// `spv_ny` all fail here, not on a device. (No GPU needed — validation
+    /// precedes context creation.)
+    #[test]
+    fn microbench_entries_reject_bad_inputs_without_gpu() {
+        use super::{gemm_q4_0_microbench, gemv_q4_0_microbench};
+        // Assert the validation message, not mere `is_err()`: both entries
+        // create the GPU context after validation, so on a GPU-less host
+        // every input errors at context creation and bare `is_err()`
+        // passes vacuously. The message pins validation-first order too
+        // (a reorder surfaces the context error instead).
+        let err = gemv_q4_0_microbench(&[(0, 64)], 1, &["fast"], &[]).unwrap_err();
+        assert!(err.to_string().contains("dims must be"), "{err:?}");
+        let err = gemv_q4_0_microbench(&[(65536, 65536)], 1, &["fast"], &[]).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err:?}");
+        let err = gemv_q4_0_microbench(&[(64, 64)], 0, &["fast"], &[]).unwrap_err();
+        assert!(err.to_string().contains("iters must be"), "{err:?}");
+        let err = gemv_q4_0_microbench(&[(64, 64)], 1, &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("kernels must select"), "{err:?}");
+        let err = gemm_q4_0_microbench(&[(64, 16, 64)], 1, &[], 32).unwrap_err();
+        assert!(err.to_string().contains("n must be"), "{err:?}");
+        let err = gemm_q4_0_microbench(&[(64, 64, 64)], 1, &[], 0).unwrap_err();
+        assert!(err.to_string().contains("spv_ny must be"), "{err:?}");
+    }
+
+    /// `soak_and_measure` ms/iter math, pinned host-side with a fake `run`
+    /// (no GPU: the closure never touches one). Takes ~`SOAK_MS` wall.
+    #[test]
+    fn soak_and_measure_reports_ms_per_iter() {
+        use super::soak_and_measure;
+        let (ms, mhz) = soak_and_measure(|n| std::time::Duration::from_millis(10 * n as u64), 4);
+        assert!((ms - 10.0).abs() < 1e-6, "ms/iter math: {ms}");
+        // Pin the frequency-suffix contract, not mere non-emptiness (both
+        // branches of the helper produce non-empty strings, so `is_empty`
+        // could never fail): `n/a` off-Android, `{f}MHz` on it.
+        assert!(
+            mhz == "n/a" || mhz.ends_with("MHz"),
+            "freq suffix contract: {mhz}"
+        );
+    }
 
     /// `repack_q6_k_flat` must de-interleave every block into its plane at
     /// the offsets the flat kernel indexes: `ql[(row*nb+b)*128 + i]`,
@@ -9835,6 +10279,68 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// GPU context gated on SPIR-V passthrough, or `None` to skip.
+    /// Fail-closed under `CERA_REQUIRE_*`, like every passthrough test.
+    fn passthrough_ctx_or_skip(label: &str) -> Option<GpuContext> {
+        let ctx = gpu_ctx_or_skip()?;
+        let passthrough = ctx.supports_spirv_passthrough() && ctx.has_subgroup;
+        crate::backend::wgpu::require_passthrough_or_skip(&ctx, passthrough, label);
+        if !passthrough {
+            return None;
+        }
+        Some(ctx)
+    }
+
+    /// Bind the standard stream-kernel `(q, d, x, y, params)` group at
+    /// bindings 0-4. Shared by the stream-kernel tests so a layout fix
+    /// lands once. Binding 2 is the dense RHS: vector `x` for GEMV/reg-tile,
+    /// B/B16 for GEMM.
+    fn bind_stream_qdxyp(
+        ctx: &GpuContext,
+        pipe: &wgpu::ComputePipeline,
+        q: &wgpu::Buffer,
+        d: &wgpu::Buffer,
+        rhs: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        params: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: d.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rhs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: y.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Max absolute elementwise difference over flat slices.
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len(), "max_abs_diff: length mismatch");
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     /// The tiled LM-head GEMV binds weight row-slices at byte offset
@@ -10051,6 +10557,397 @@ mod tests {
             // f16→f32→f16 is the identity on finite values, so a bits
             // comparison pins the upload plumbing exactly.
             assert_eq!(half::f16::from_f32(got).to_bits(), exp, "elem {i} differs");
+        }
+    }
+
+    /// The resident-stream decode kernel (`gemv_q4_0_stream`) matches the
+    /// CPU dequant+dot reference on synthetic Q4_0: exact-multiple rows plus
+    /// a ragged row count (exercises the per-row guards). f32 accumulation,
+    /// so the tolerance only absorbs summation-order differences.
+    #[test]
+    fn stream_gemv_matches_cpu() {
+        use super::{
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemv_q4_0_ref, quantize_q4_0_synth,
+            repack_q4_0_stream, synth_q4_0_vec,
+        };
+        let Some(ctx) = passthrough_ctx_or_skip("gemv_q4_0_stream") else {
+            return;
+        };
+        for (m, k) in [(256usize, 256usize), (200, 128)] {
+            let weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let (q, d) = repack_q4_0_stream(&raw, m, k);
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let expected = cpu_gemv_q4_0_ref(&raw, &x, m, k);
+            let pipe = ctx.gemv_q4_0_stream_passthrough();
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.d");
+            let x_buf = ctx.upload_f32(&x, "test.x");
+            let y_buf = ctx.create_storage_rw(m as u64 * 4, "test.y");
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+                "test.params",
+            );
+            let bg = bind_stream_qdxyp(&ctx, &pipe, &q_buf, &d_buf, &x_buf, &y_buf, &params_buf);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(16), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+            let got = ctx.download_f32(&y_buf, m);
+            assert_eq!(got.len(), m);
+            let max_diff = max_abs_diff(&expected, &got);
+            assert!(
+                max_diff < 1e-2,
+                "m={m} k={k}: max_diff={max_diff:.3e} exceeds f32-order noise"
+            );
+        }
+    }
+
+    /// The resident-stream prefill kernels (`gemm_stream_q4_0` k-slice-32 and
+    /// `_k64`) match the CPU reference within f16-fiber tolerance, and each
+    /// other bitwise (production dispatches k64 whenever k % 64 == 0 as the
+    /// bit-exact faster twin). Shapes cover n_pad padding (n=48),
+    /// multi-col-groups, the odd k/32 scale lane (k=96), and a small k64
+    /// twin (k=64). The B16 input comes from the production
+    /// `transpose_cast_f16` kernel (dispatched here, then byte-compared
+    /// against the host layout), so the test pins the production chain,
+    /// not the GEMM given a host-fabricated B16.
+    #[test]
+    fn stream_gemm_matches_cpu_and_twins_agree() {
+        use super::{
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemm_q4_0_ref, quantize_q4_0_synth,
+            repack_q4_0_stream, synth_q4_0_vec,
+        };
+        let Some(ctx) = passthrough_ctx_or_skip("gemm_stream_q4_0") else {
+            return;
+        };
+        for (m, n, k) in [(256usize, 32usize, 128usize), (512, 48, 96), (128, 64, 64)] {
+            let n_pad = n.next_multiple_of(32);
+            // Alternate per-block amplitude (×1/×0.125): uniform synth
+            // weights give every block the same scale, so a (q, d) lane
+            // mismatch is near-invisible on them (0.14 vs the 0.5 bound)
+            // — the modulation makes scale-pairing bugs fail loudly.
+            let mut weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            for (i, w) in weights.iter_mut().enumerate() {
+                if (i / 32) % 2 == 1 {
+                    *w *= 0.125;
+                }
+            }
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let (q, d) = repack_q4_0_stream(&raw, m, k);
+            // B row-major f32 [n][k], plus the host transpose+cast to
+            // [k][n_pad] f16 the production kernel must reproduce.
+            let b = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            let mut b16 = vec![0u16; k * n_pad];
+            for kk in 0..k {
+                for nn in 0..n {
+                    b16[kk * n_pad + nn] = half::f16::from_f32(b[nn * k + kk]).to_bits();
+                }
+            }
+            let expected = cpu_gemm_q4_0_ref(&raw, &b, m, n, k);
+            // Dispatch the production transpose kernel (params `[n, n_pad,
+            // k, 0]`, grid `(n_pad/32, k/32)`, cf.
+            // `encode_gemm_stream_q4_0`) over the f32 B.
+            let x_buf = ctx.upload_f32(&b, "test.x");
+            let t_params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[n as u32, n_pad as u32, k as u32, 0u32]),
+                "test.t_params",
+            );
+            let t_pipe = ctx.transpose_cast_f16_passthrough();
+            let b16_buf = ctx.create_storage_rw((k * n_pad * 2) as u64, "test.b16");
+            let t_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &t_pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b16_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: t_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut t_enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = t_enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&t_pipe);
+                pass.set_bind_group(0, &t_bg, &[]);
+                pass.dispatch_workgroups((n_pad / 32) as u32, (k as u32).div_ceil(32), 1);
+            }
+            ctx.submit_encoder(t_enc);
+            ctx.device.poll_wait();
+            // Direct oracle: the kernel's B16 must equal the host layout
+            // byte for byte, padding included.
+            let got_b16 = ctx.download_u32(&b16_buf, k * n_pad / 2);
+            assert_eq!(
+                bytemuck::cast_slice::<u32, u16>(&got_b16),
+                b16.as_slice(),
+                "m={m} n={n} k={k}: transpose_cast_f16 output differs from host layout"
+            );
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.d");
+            // The GEMM reads the kernel-produced B16: end-to-end chain.
+            let b_buf = b16_buf;
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, n as u32, n_pad as u32, m as u32]),
+                "test.params",
+            );
+            // Fresh output per run: sharing one `y_buf` across the k32/k64
+            // runs would let a k64 under-write read stale k32 values and
+            // pass the twin check vacuously.
+            let run = |pipe: &wgpu::ComputePipeline| {
+                let y_buf = ctx.create_storage_rw(n_pad as u64 * m as u64 * 4, "test.y");
+                let bg = bind_stream_qdxyp(&ctx, pipe, &q_buf, &d_buf, &b_buf, &y_buf, &params_buf);
+                let mut enc = ctx.device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, &bg, &[]);
+                    // `n_pad.div_ceil(32)` where production spells
+                    // `n.div_ceil(32)`: provably the same grid
+                    // (`n_pad/32 == ⌈n/32⌉`), so don't "fix" the spelling.
+                    pass.dispatch_workgroups(
+                        (m as u32).div_ceil(256),
+                        (n_pad as u32).div_ceil(32),
+                        1,
+                    );
+                }
+                ctx.submit_encoder(enc);
+                ctx.device.poll_wait();
+                ctx.download_f32(&y_buf, n_pad * m)
+            };
+            let got32 = run(&ctx.gemm_stream_q4_0_passthrough());
+            // k64 only where production selects it (k % 64 == 0).
+            // Production also requires `use_gemm_k64()` (the
+            // `CERA_WGPU_GEMM_K64=0` hatch disables the twin), but this is
+            // a kernel-level agreement check, so it runs regardless.
+            if k % 64 == 0 {
+                let got64 = run(&ctx.gemm_stream_q4_0_k64_passthrough());
+                assert_eq!(
+                    got64, got32,
+                    "k64 twin differs bitwise at m={m} n={n} k={k}"
+                );
+            }
+            // Packed columns [n][m]; ignore the [n, n_pad) padding. f16 fiber
+            // accumulation, so the CPU bound is loose by design: layout bugs
+            // fail at O(1-10) — demonstrated, not reasoned (column rotation
+            // in `stream_gemm_tolerance_catches_layout_scale_errors`,
+            // scale pairing in
+            // `stream_gemm_tolerance_catches_scale_pairing_errors`).
+            let mut max_diff = 0.0f32;
+            for c in 0..n {
+                for r in 0..m {
+                    max_diff = max_diff.max((expected[c * m + r] - got32[c * m + r]).abs());
+                }
+            }
+            assert!(
+                max_diff < 0.5,
+                "m={m} n={n} k={k}: max_diff={max_diff:.3e} exceeds f16-fiber noise"
+            );
+        }
+    }
+
+    /// The stream-GEMM 0.5 bound catches layout-scale errors: a
+    /// column-rotated reference — exactly what a B-transpose layout bug
+    /// produces (`y'[c] = y[c-1]`) — fails the comparison at O(1-10) on
+    /// every test shape. Host-only (pins the bound's tightness, so a
+    /// future loosening fails here); the lavapipe CI leg executes the
+    /// kernel side this bound guards.
+    #[test]
+    fn stream_gemm_tolerance_catches_layout_scale_errors() {
+        use super::{
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemm_q4_0_ref, quantize_q4_0_synth,
+            synth_q4_0_vec,
+        };
+        for (m, n, k) in [(256usize, 32usize, 128usize), (512, 48, 96), (128, 64, 64)] {
+            let weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let b = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            let expected = cpu_gemm_q4_0_ref(&raw, &b, m, n, k);
+            // Simulate the layout bug: every column reads its predecessor.
+            let mut buggy = vec![0.0f32; expected.len()];
+            for c in 0..n {
+                for r in 0..m {
+                    buggy[c * m + r] = expected[((c + n - 1) % n) * m + r];
+                }
+            }
+            let max_diff = max_abs_diff(&expected, &buggy);
+            assert!(
+                max_diff >= 0.5,
+                "m={m} n={n} k={k}: layout-scale error only reached {max_diff:.3e}; \
+                 the 0.5 bound would miss it"
+            );
+        }
+    }
+
+    /// The stream-GEMM 0.5 bound also catches scale-pairing errors: every
+    /// block decoded with its neighbor's scale — exactly what a (q, d)
+    /// lane mismatch produces — fails at O(1-10) on every test shape.
+    /// Host-only, same style as the rotation probe above.
+    ///
+    /// The weights alternate per-block amplitude (×1/×0.125): uniform synth
+    /// weights give every block the same scale, so ANY scale permutation is
+    /// near-invisible on them (0.14 here before the modulation). The kernel
+    /// test above modulates identically, so the bound catches the bug
+    /// class where it manifests in both places.
+    #[test]
+    fn stream_gemm_tolerance_catches_scale_pairing_errors() {
+        use super::{
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemm_q4_0_ref, quantize_q4_0_synth,
+            synth_q4_0_vec,
+        };
+        for (m, n, k) in [(256usize, 32usize, 128usize), (512, 48, 96), (128, 64, 64)] {
+            let mut weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            for (i, w) in weights.iter_mut().enumerate() {
+                if (i / 32) % 2 == 1 {
+                    *w *= 0.125;
+                }
+            }
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let b = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            let expected = cpu_gemm_q4_0_ref(&raw, &b, m, n, k);
+            // Simulate the pairing bug: swap the f16 scale (bytes 0..2 of
+            // each 18-byte block) between adjacent blocks in every row.
+            let nb = k / 32;
+            let mut buggy_raw = raw.clone();
+            for r in 0..m {
+                for blk in (0..nb).step_by(2) {
+                    if blk + 1 >= nb {
+                        break;
+                    }
+                    let a = r * nb * 18 + blk * 18;
+                    let bb = a + 18;
+                    buggy_raw.swap(a, bb);
+                    buggy_raw.swap(a + 1, bb + 1);
+                }
+            }
+            let buggy = cpu_gemm_q4_0_ref(&buggy_raw, &b, m, n, k);
+            let max_diff = max_abs_diff(&expected, &buggy);
+            assert!(
+                max_diff >= 0.5,
+                "m={m} n={n} k={k}: scale-pairing error only reached {max_diff:.3e}; \
+                 the 0.5 bound would miss it"
+            );
+        }
+    }
+
+    /// The stream-GEMV 1e-2 bound catches nibble-order errors: every block
+    /// decoded with swapped nibbles — exactly what a low/high lane mixup
+    /// produces — fails far above f32-order noise on both test shapes.
+    /// Host-only (pins the bound's tightness, so a future loosening fails
+    /// here); the lavapipe CI leg executes the kernel side this bound guards.
+    #[test]
+    fn stream_gemv_tolerance_catches_nibble_errors() {
+        use super::{
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemv_q4_0_ref, quantize_q4_0_synth,
+            synth_q4_0_vec,
+        };
+        for (m, k) in [(256usize, 256usize), (200, 128)] {
+            let weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let expected = cpu_gemv_q4_0_ref(&raw, &x, m, k);
+            // Simulate the nibble bug: swap the low/high 4-bit quants of
+            // every byte (bytes 2..18 of each 18-byte block).
+            let mut buggy_raw = raw.clone();
+            for blk in buggy_raw.chunks_mut(18) {
+                for b in &mut blk[2..18] {
+                    *b = (*b).rotate_left(4);
+                }
+            }
+            let buggy = cpu_gemv_q4_0_ref(&buggy_raw, &x, m, k);
+            let max_diff = max_abs_diff(&expected, &buggy);
+            assert!(
+                max_diff >= 1e-2,
+                "m={m} k={k}: nibble-order error only reached {max_diff:.3e}; \
+                 the 1e-2 bound would miss it"
+            );
+        }
+    }
+
+    /// The resident-stream register-tiled fallthrough
+    /// (`mul_mat_reg_tile_q4_0_stream`, production's path for n < 32 /
+    /// strided B) matches the CPU reference. f32 accumulation like the raw
+    /// twin, so the tolerance only absorbs summation-order differences.
+    /// Shapes cover packed strides plus one padded case (`x_stride = k+16`,
+    /// `y_stride = m+8`), pinning the stride legs of the kernel's address
+    /// math a packed-only test would leave unexercised.
+    #[test]
+    fn stream_reg_tile_matches_cpu() {
+        use super::{
+            MUL_MAT_TILE_M, MUL_MAT_TILE_N, MUL_MAT_TILE_WG_M, MUL_MAT_TILE_WG_N,
+            SYNTH_SALT_INPUTS, SYNTH_SALT_WEIGHTS, cpu_gemm_q4_0_ref, quantize_q4_0_synth,
+            repack_q4_0_stream, synth_q4_0_vec,
+        };
+        let Some(ctx) = passthrough_ctx_or_skip("mul_mat_reg_tile_q4_0_stream") else {
+            return;
+        };
+        // (m, n, k, x_stride, y_stride); packed legs spell out the strides.
+        for (m, n, k, xs, ys) in [
+            (128usize, 8usize, 128usize, 128usize, 128usize),
+            (128, 72, 128, 128, 128),
+            (100, 8, 64, 64, 100),
+            (96, 16, 96, 112, 104),
+        ] {
+            let weights = synth_q4_0_vec(m * k, SYNTH_SALT_WEIGHTS);
+            let raw = quantize_q4_0_synth(&weights, m, k);
+            let (q, d) = repack_q4_0_stream(&raw, m, k);
+            // X rows are `xs` wide (valid values in `[..k]`, zeros past);
+            // the CPU reference runs on the packed valid region.
+            let mut x = vec![0.0f32; n * xs];
+            let packed = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            for c in 0..n {
+                x[c * xs..c * xs + k].copy_from_slice(&packed[c * k..(c + 1) * k]);
+            }
+            let expected = cpu_gemm_q4_0_ref(&raw, &packed, m, n, k);
+            let pipe = ctx.mul_mat_reg_tile_q4_0_stream_passthrough();
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.d");
+            let x_buf = ctx.upload_f32(&x, "test.x");
+            let y_buf = ctx.create_storage_rw(n as u64 * ys as u64 * 4, "test.y");
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, n as u32, xs as u32, ys as u32]),
+                "test.params",
+            );
+            let bg = bind_stream_qdxyp(&ctx, &pipe, &q_buf, &d_buf, &x_buf, &y_buf, &params_buf);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(
+                    (m as u32).div_ceil(MUL_MAT_TILE_WG_M * MUL_MAT_TILE_M),
+                    (n as u32).div_ceil(MUL_MAT_TILE_WG_N * MUL_MAT_TILE_N),
+                    1,
+                );
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+            // Compare the valid `[n][m]` region, skipping `y_stride`
+            // padding (whose contents the kernel does not define).
+            let got = ctx.download_f32(&y_buf, n * ys);
+            assert_eq!(got.len(), n * ys);
+            let mut max_diff = 0.0f32;
+            for c in 0..n {
+                for r in 0..m {
+                    max_diff = max_diff.max((expected[c * m + r] - got[c * ys + r]).abs());
+                }
+            }
+            assert!(
+                max_diff < 1e-2,
+                "m={m} n={n} k={k} xs={xs} ys={ys}: max_diff={max_diff:.3e} exceeds f32-order noise"
+            );
         }
     }
 }

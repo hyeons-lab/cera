@@ -203,8 +203,15 @@ fn compile_slang_multitarget(want_wgsl: bool, want_msl: bool) {
         println!("cargo:rerun-if-changed={src}");
 
         let entries = slang_entry_points(&src, name);
+        let wanted = slang_targets(&src);
 
         for (target, ext) in &targets {
+            // Per-kernel allowlist (`// slang-targets:`): a target the
+            // kernel does not list is neither compiled nor expected as a
+            // committed fallback, so a dead twin cannot rot while CI is green.
+            if !wanted.iter().any(|t| t == ext) {
+                continue;
+            }
             let committed = format!("{dir}/{name}.{ext}");
             let out = format!("{out_dir}/{name}.{ext}");
             println!("cargo:rerun-if-changed={committed}");
@@ -287,37 +294,10 @@ fn apply_msl_postpass(path: &str, name: &str) {
     }
 }
 
-/// Entry-point names to pass to slangc for a multi-target kernel.
-///
-/// slangc has no entry-point auto-discovery (no `-entry` compiles the default
-/// `main`), so every `[shader]` function needs its own `-entry`. A kernel whose
-/// single entry matches its basename needs nothing; anything else declares its
-/// entries in a `// slang-entries: a b c` header line, which both `just slang`
-/// and the CI drift check parse the same way. Entries are collected from every
-/// matching header line (mirroring the shell `sed ... p` sites, which print all
-/// matches), so all three stay identical and the committed output can never
-/// drift from what CI regenerates. Files in practice carry exactly one header.
-fn slang_entry_points(src_path: &str, basename: &str) -> Vec<String> {
-    // Fail fast rather than defaulting to the basename: an unreadable `.slang`
-    // is a repo-integrity problem, and silently falling through to the committed
-    // artifact would hide it.
-    let text = std::fs::read_to_string(src_path)
-        .unwrap_or_else(|e| panic!("failed to read Slang source {src_path}: {e}"));
-    let mut names: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("//")
-            && let Some(list) = rest.trim_start().strip_prefix("slang-entries:")
-        {
-            names.extend(list.split_whitespace().map(str::to_string));
-        }
-    }
-    if names.is_empty() {
-        vec![basename.to_string()]
-    } else {
-        names
-    }
-}
+// `// slang-*` header readers live in their own file so `tests/slang_headers.rs`
+// can `include!` the same source and exercise it directly (same pattern as
+// `build_support/msl_postpass.rs`).
+include!("build_support/slang_headers.rs");
 
 /// Locate slangc: `SLANGC` env, then PATH, then the default local install.
 /// Every candidate (including `SLANGC`) is probed with `-v`, so a bad `SLANGC`

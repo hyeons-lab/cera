@@ -49,18 +49,19 @@ slang:
     # Multi-target kernels: one source, WGSL *and* MSL. Unlike the SPIR-V
     # kernels above, the entry points are the kernel's own function names rather
     # than `main`, because both backends look each kernel up by name. slangc has
-    # no auto-discovery, so pass one -entry per entry point: default to the
-    # basename, or read a `// slang-entries: a b c` header for kernels whose
-    # entry name differs (gelu) or that expose several (elementwise). build.rs
-    # and the CI drift check parse the same header.
+    # no auto-discovery, so pass one -entry per entry point. Header parsing
+    # (entries defaulting to the basename, targets defaulting to both, empty
+    # targets failing fast, unknown targets rejected) lives in
+    # scripts/slang-headers.sh, shared with the CI drift check; build.rs is
+    # the canonical Rust copy.
     dir=cera/src/backend/shaders/slang
     for f in "$dir"/*.slang; do
         name=$(basename "$f" .slang)
-        entries=$(sed -n 's|^[[:space:]]*//[[:space:]]*slang-entries:[[:space:]]*||p' "$f")
-        [ -z "$entries" ] && entries="$name"
+        entries=$(./scripts/slang-headers.sh entries "$f")
         entry_args=()
         for e in $entries; do entry_args+=(-entry "$e"); done
-        for target in wgsl metal; do
+        targets=$(./scripts/slang-headers.sh targets "$f")
+        for target in $targets; do
             echo "==> slangc $name -> $target ($entries)"
             "$SLANGC" "$f" -target "$target" -O3 "${entry_args[@]}" -stage compute -o "$dir/$name.$target"
         done
@@ -356,8 +357,10 @@ jvm-libs-host:
 # files (same bytes the Rust code embeds): at install they extract to the
 # app's `nativeLibraryDir`, where the FastRPC loader opens them by path
 # (see `HexagonNpu.setup`). arm64-v8a only: x86_64 Android has no Hexagon
-# DSP, and 32-bit ABIs build without the feature. Filenames must match
-# `HexagonArch::skel_filename` exactly.
+# DSP, and 32-bit ABIs build without the feature. The set comes from the
+# embedded skel dir itself (not a hand-synced arch list), so adding an
+# arch to Rust stages its skel with no recipe change; a CI step pins the
+# Rust/Kotlin filename lists to that same set.
 android-libs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -371,10 +374,8 @@ android-libs:
         build -p cera-ffi --release --features ffi-buffer
     mkdir -p "$out"
     cp -r target/android-libs-64/* target/android-libs-32/* "$out/"
-    for arch in v73 v75 v79 v81; do
-        cp "cera/src/backend/hexagon/skels/libggml-htp-$arch.so" "$out/arm64-v8a/"
-    done
-    [ "$(ls "$out"/arm64-v8a/libggml-htp-v*.so | wc -l | tr -d ' ')" = "4" ]
+    mkdir -p "$out/arm64-v8a"
+    cp cera/src/backend/hexagon/skels/libggml-htp-v*.so "$out/arm64-v8a/"
     scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
     ls -la "$out"/*/libcera_ffi.so "$out"/arm64-v8a/libggml-htp-v*.so
 

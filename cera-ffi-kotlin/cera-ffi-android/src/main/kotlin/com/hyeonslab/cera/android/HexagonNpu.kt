@@ -49,8 +49,20 @@ object HexagonNpu {
     /**
      * Point the FastRPC loader at this app's extracted skels. Idempotent
      * (repeats are no-ops); the process environment is set exactly once
-     * because `setenv` is not thread-safe.
+     * because `setenv` is not thread-safe. A pre-existing value is
+     * preserved (merged, `;`-joined, deduplicated), never clobbered, so
+     * calling this after `hexagon_install_skels` keeps the staged dir.
+     * Do not combine the two in one process unless that merge is what
+     * you want; pick one staging flow per app.
      *
+     * The two staging flows — this function and Rust `install_skels`
+     * (FFI `hexagon_install_skels`) — serialize internally but against
+     * *different* monitors, so they may compose only sequentially, on one
+     * thread, during single-threaded startup. Concurrent composition can
+     * lost-update `ADSP_LIBRARY_PATH` and drop a skel dir.
+     *
+     * @throws IllegalArgumentException when `nativeLibraryDir` contains
+     *   `;`, which would silently split into two loader search entries.
      * @throws IllegalStateException when the skels are missing from
      *   `nativeLibraryDir`: either the APK was built without extracted
      *   native libs, or this ABI ships no skels (arm64-v8a only — x86_64
@@ -68,6 +80,12 @@ object HexagonNpu {
         if (installed) {
             return
         }
+        // A `;` in the dir would silently become two loader search entries,
+        // breaking skel resolution with no error naming the cause (mirrors
+        // the Rust-side rejection in `install_skels`).
+        require(!nativeLibraryDir.contains(';')) {
+            "nativeLibraryDir contains ';', which splits into two loader entries: $nativeLibraryDir"
+        }
         val missing = skelFiles.filter { !File(nativeLibraryDir, it).exists() }
         if (missing.isNotEmpty()) {
             val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
@@ -83,8 +101,20 @@ object HexagonNpu {
                     },
             )
         }
+        // `;` is the separator the FastRPC loader parses (same form the
+        // Rust `install_skels` writes); entries are deduplicated so a
+        // second staging flow composing in either order stays valid.
+        // A failed read aborts setup: it is not proof of absence, and the
+        // `setenv(..., true)` below would clobber someone else's loader
+        // paths. Matches the fail-loud `setenv` arm and the Rust side.
+        val cur = try {
+            Os.getenv("ADSP_LIBRARY_PATH")
+        } catch (e: ErrnoException) {
+            throw RuntimeException("failed to read ADSP_LIBRARY_PATH", e)
+        }
+        val merged = mergeAdspPaths("$nativeLibraryDir;$VENDOR_PATHS", cur)
         try {
-            Os.setenv("ADSP_LIBRARY_PATH", "$nativeLibraryDir;$VENDOR_PATHS", true)
+            Os.setenv("ADSP_LIBRARY_PATH", merged, true)
         } catch (e: ErrnoException) {
             throw RuntimeException("failed to set ADSP_LIBRARY_PATH", e)
         }
@@ -107,4 +137,18 @@ object HexagonNpu {
             false
         }
     }
+}
+
+/**
+ * Merge a staged path list with the current `ADSP_LIBRARY_PATH` value:
+ * `;`-joined, empty entries dropped, first occurrence wins. Pure (no
+ * Android APIs) so plain JVM unit tests can pin the separator and the
+ * dedup order without a device (compiling still needs the Android SDK).
+ * Mirrors Rust `merge_adsp_paths` case for case; keep the two in sync.
+ */
+internal fun mergeAdspPaths(staged: String, current: String?): String {
+    return (staged.split(';') + current?.split(';').orEmpty())
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .joinToString(";")
 }

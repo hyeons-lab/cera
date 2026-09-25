@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
+use crate::CeraError;
 use crate::backend::wgsl_pp::Preprocessor;
 use crate::tensor::DType;
 use half::f16;
@@ -229,6 +230,17 @@ pub struct GpuContext {
     /// and an index-OOB panic on the empty argmax readback — so every
     /// submit/download choke point fails fast when this is set.
     device_lost: Arc<std::sync::Mutex<Option<String>>>,
+    /// Sticky record of the last blocking-readback map failure (the
+    /// `warn_readback_zeros` sites below). The in-flight failure returns
+    /// zeros to its caller *before* `fail_if_device_lost` can fire on a
+    /// later call, so without this slot a GPU decode fault would be
+    /// sampled as token 0 and generation would continue. The model drains
+    /// it via [`Self::take_readback_fault`] into `take_decode_error`.
+    /// Shared across clones like `device_lost`: a fault observed through
+    /// any handle poisons the shared device for all of them. Each model
+    /// owns its context 1:1 in every production topology, and the session
+    /// gate allows one live session per model, so the take is unambiguous.
+    readback_fault: Arc<std::sync::Mutex<Option<CeraError>>>,
 }
 
 impl Clone for GpuContext {
@@ -248,6 +260,7 @@ impl Clone for GpuContext {
             staging: Arc::clone(&self.staging),
             staging_size: Arc::clone(&self.staging_size),
             device_lost: Arc::clone(&self.device_lost),
+            readback_fault: Arc::clone(&self.readback_fault),
         }
     }
 }
@@ -569,6 +582,7 @@ impl GpuContext {
             staging: Arc::new(std::sync::Mutex::new(None)),
             staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             device_lost: Arc::clone(&device_lost),
+            readback_fault: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -718,8 +732,15 @@ impl GpuContext {
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
             // Mirror `download_f32`: an empty vec here used to travel all
-            // the way to an index-OOB panic in the decode path. Say so now.
+            // the way to an index-OOB panic in the decode path. Say so now,
+            // and record first-wins: the sole caller (`forward_greedy_inner`)
+            // returns a dummy the session never samples — its post-greedy
+            // drain surfaces this record instead of a panic unwinding out
+            // of the core library.
             eprintln!("[cera::wgpu] read_mapped_u32: readback map failed; returning empty");
+            self.record_readback_fault(
+                "read_mapped_u32: GPU readback map failed; returned empty".to_string(),
+            );
             return Vec::new();
         }
 
@@ -731,10 +752,69 @@ impl GpuContext {
             eprintln!(
                 "[cera::wgpu] read_mapped_u32: get_mapped_range failed after successful map; returning empty"
             );
+            self.record_readback_fault(
+                "read_mapped_u32: get_mapped_range failed after successful map; returned empty"
+                    .to_string(),
+            );
             Vec::new()
         };
         staging.unmap();
         result
+    }
+
+    /// Loud-zeros note shared by every blocking readback that zero-fills on
+    /// map failure: a failed map is otherwise indistinguishable from a
+    /// compute skip, so say so at the swallow site. `op` is the caller name
+    /// (keeps the message greppable). `read_mapped_u32` keeps its own
+    /// message: it returns empty, not zeros, under a different contract.
+    ///
+    /// Also records the fault in [`Self::readback_fault`] (sticky until
+    /// taken): the zeros return to the caller before any later
+    /// `fail_if_device_lost` can fire, so the record is what lets the
+    /// session fail the generation instead of sampling token 0. First
+    /// fault wins: one forward can fail several readbacks before the
+    /// session takes once, and the surfaced detail should name the first
+    /// failed op, not a downstream map. The `eprintln` above stays
+    /// unconditional so the full failure order is preserved in logs.
+    fn warn_readback_zeros(&self, op: &str, count: usize) {
+        // A failed map used to return zeros silently, indistinguishable
+        // from a compute skip. Say so loudly; the caller can't tell otherwise.
+        eprintln!("[cera::wgpu] {op}: readback map failed; returning {count} zeros");
+        self.record_readback_fault(format!(
+            "{op}: GPU readback map failed; returned {count} zeros"
+        ));
+    }
+
+    /// Twin of [`Self::warn_readback_zeros`] for the rarer failure one step
+    /// later: the map succeeded but `get_mapped_range` failed, so the
+    /// pre-zeroed buffer returns as-is. Same loud-plus-record contract, so
+    /// a message/record-policy fix lands in two helpers instead of six
+    /// call sites (`read_mapped_u32` keeps its own block: it returns
+    /// empty, not zeros, under a different contract).
+    fn warn_mapped_range_zeros(&self, op: &str, count: usize) {
+        eprintln!(
+            "[cera::wgpu] {op}: get_mapped_range failed after successful map; returning zeros"
+        );
+        self.record_readback_fault(format!(
+            "{op}: get_mapped_range failed after successful map; returned {count} zeros"
+        ));
+    }
+
+    /// First-wins record into the sticky readback-fault slot (drained via
+    /// [`Self::take_readback_fault`]): one forward can fail several
+    /// readbacks before the session takes once, and the surfaced detail
+    /// names the first failed op. Callers `eprintln` unconditionally so
+    /// the full failure order stays in logs.
+    fn record_readback_fault(&self, detail: String) {
+        crate::model::record_first_fault(&self.readback_fault, CeraError::Backend(detail));
+    }
+
+    /// Take a recorded blocking-readback failure, if any since the last
+    /// take. The model drains this into `take_decode_error`; the session
+    /// discards any stale record at generate start, so only the current
+    /// attempt's faults surface. Sticky until taken.
+    pub(crate) fn take_readback_fault(&self) -> Option<CeraError> {
+        crate::model::take_fault(&self.readback_fault)
     }
 
     /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
@@ -785,9 +865,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
-            // A failed map used to return zeros silently — indistinguishable
-            // from a compute skip. Say so loudly; the caller can't tell otherwise.
-            eprintln!("[cera::wgpu] download_f32: readback map failed; returning {count} zeros");
+            self.warn_readback_zeros("download_f32", count);
             return vec![0.0f32; count];
         }
 
@@ -796,9 +874,7 @@ impl GpuContext {
             bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
             drop(data);
         } else {
-            eprintln!(
-                "[cera::wgpu] download_f32: get_mapped_range failed after successful map; returning zeros"
-            );
+            self.warn_mapped_range_zeros("download_f32", count);
         }
         staging.unmap();
         result
@@ -894,6 +970,7 @@ impl GpuContext {
     /// Used by the argmax kernel which writes `out: array<u32>`.
     pub fn download_u32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
         use std::sync::atomic::Ordering;
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<u32>()) as u64;
         let staging_guard = {
             let mut guard = self.staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -932,6 +1009,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("download_u32", count);
             return vec![0u32; count];
         }
 
@@ -939,6 +1017,8 @@ impl GpuContext {
         if let Ok(data) = slice.get_mapped_range() {
             bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
             drop(data);
+        } else {
+            self.warn_mapped_range_zeros("download_u32", count);
         }
         staging.unmap();
         result
@@ -947,6 +1027,7 @@ impl GpuContext {
     /// Read f16 data back from a GPU buffer and convert to f32 (blocking).
     pub fn download_f16_as_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<f16>()) as u64;
         // copy_buffer_to_buffer requires 4-byte alignment for size and offsets.
         let aligned_size = size.div_ceil(4) * 4;
@@ -987,6 +1068,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("download_f16_as_f32", count);
             return vec![0.0f32; count];
         }
 
@@ -995,6 +1077,8 @@ impl GpuContext {
             // Slicing to exact byte count before casting to handle potential 2-byte padding.
             bytemuck::cast_slice_mut(&mut f16_data).copy_from_slice(&data[0..size as usize]);
             drop(data);
+        } else {
+            self.warn_mapped_range_zeros("download_f16_as_f32", count);
         }
         staging.unmap();
         f16_data.iter().map(|&x| x.to_f32()).collect()
@@ -1614,17 +1698,11 @@ impl GpuContext {
             })
     }
 
-    /// Q4_0 streaming repack feeding the rotating prefill twin. Four
-    /// bindings (0 = raw Q4_0 weight bytes as u32, 1 = repacked q scratch,
-    /// 2 = repacked d scratch, 3 = params). Same passthrough gating as
-    /// `gemm_stream_q4_0_passthrough`.
-    ///
-    /// # Safety
     /// Q4_0 decode GEMV over the resident stream layout
     /// (`spirv/gemv_q4_0_stream.slang`, entry `main`): 64-thread,
     /// subgroup-reduction twin of `gemv_q4_0_fast` that reads the
     /// pre-transposed (q, d) repack instead of raw 18-byte blocks. 5-binding
-    /// interface (q, d, x, y, params), NR=8 dispatch — see
+    /// interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch; see
     /// `GpuLfm2Model::make_gemv_bg`. SPIR-V-only: the resident layout only
     /// exists where passthrough does, so there is no WGSL twin.
     ///
@@ -1959,8 +2037,8 @@ pub mod shaders {
     pub const RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.wgsl"));
     /// One decode K/V row into its cache slot (`dst[off+i] = src[i]`), so the
     /// attn block merges pre+post into one pass. Generated from
-    /// `shaders/slang/kv_append.slang` by build.rs and shared with the Metal
-    /// backend (which never dispatches it).
+    /// `shaders/slang/kv_append.slang` by build.rs; WGSL-only
+    /// (`// slang-targets: wgsl`), since no Metal pipeline consumes it.
     pub const KV_APPEND: &str = include_str!(concat!(env!("OUT_DIR"), "/kv_append.wgsl"));
     /// Mixture-of-experts routing (`lfm2moe`), generated from
     /// `shaders/slang/moe_route.slang` and shared with the Metal backend.
@@ -2112,7 +2190,7 @@ pub mod shaders {
     pub const ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.wgsl"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
-    /// F32-KV twin of [`FLASH_ATTENTION`](Self::FLASH_ATTENTION) for the audio
+    /// F32-KV twin of [`FLASH_ATTENTION`] for the audio
     /// detokenizer (`wgpu_audio_decoder`): same math/grid/params, bindings 1/2
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
     pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
@@ -2252,37 +2330,57 @@ impl KvShiftParams {
     }
 }
 
+/// Fail closed when a passthrough case cannot run: with
+/// `CERA_REQUIRE_PASSTHROUGH=1` (the lavapipe CI leg) a skip is a
+/// failure, so the SPIR-V twin never reports green untested; elsewhere
+/// it is a visible note. The canonical copy for lib unit tests (every
+/// `#[cfg(test)]` module in this crate imports it); integration tests
+/// share one mirror in `tests/common` (`fail_closed_passthrough_skip`,
+/// named for its skip-only contract), since a `#[cfg(test)]` item is not
+/// linkable from an integration binary (keep the two in sync by hand).
+#[cfg(test)]
+pub(crate) fn require_passthrough_or_skip(ctx: &GpuContext, ran: bool, label: &str) {
+    if ran {
+        return;
+    }
+    assert!(
+        std::env::var("CERA_REQUIRE_PASSTHROUGH")
+            .unwrap_or_default()
+            .is_empty(),
+        "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) takes {}",
+        ctx.backend,
+        if ctx.supports_spirv_passthrough() {
+            "passthrough without SUBGROUP"
+        } else {
+            "no SPIR-V passthrough"
+        },
+    );
+    eprintln!(
+        "[gpu-passthrough] SKIP {label} passthrough on backend ({})",
+        ctx.backend
+    );
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Fail closed when a passthrough case cannot run: with
-    /// `CERA_REQUIRE_PASSTHROUGH=1` (the lavapipe CI leg) a skip is a
-    /// failure, so the SPIR-V twin never reports green untested; elsewhere
-    /// it is a visible note. Mirrors `wgpu_mul_mat_parity.rs`, which keeps
-    /// its own copy (it cannot use this private helper).
-    fn require_passthrough_or_skip(ctx: &GpuContext, ran: bool, label: &str) {
-        if ran {
-            return;
-        }
-        assert!(
-            std::env::var("CERA_REQUIRE_PASSTHROUGH")
-                .unwrap_or_default()
-                .is_empty(),
-            "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) takes {}",
-            ctx.backend,
-            if ctx.supports_spirv_passthrough() {
-                "passthrough without SUBGROUP"
-            } else {
-                "no SPIR-V passthrough"
-            },
-        );
-        eprintln!(
-            "[wgpu-gemv-parity] SKIP {label} passthrough on backend ({})",
-            ctx.backend
-        );
+    /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
+    /// exactly as `kv_append` lays them out. One copy for every oracle that
+    /// mirrors the layout, so a layout fix cannot land on one oracle only.
+    fn pack_f16_pairs(x: &[f32]) -> Vec<u32> {
+        assert!(x.len().is_multiple_of(2));
+        x.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| {
+                let lo = half::f16::from_f32(p[0]).to_bits() as u32;
+                let hi = half::f16::from_f32(p[1]).to_bits() as u32;
+                lo | (hi << 16)
+            })
+            .collect()
     }
 
     #[test]
@@ -2570,13 +2668,10 @@ mod tests {
         let x: Vec<f32> = (0..k).map(|i| (i as f32 - 31.0) * 0.05).collect();
 
         // Pack A to f16, two values per u32 (low half = even index).
+        // Same single f32→f16 conversion the helper performs, so the shared
+        // copy is bitwise-identical; `a_f16` stays for the CPU reference.
         let a_f16: Vec<f16> = a.iter().map(|&v| f16::from_f32(v)).collect();
-        let mut a_packed = Vec::with_capacity((m * k) as usize / 2);
-        for pair in a_f16.chunks(2) {
-            let lo = pair[0].to_bits() as u32;
-            let hi = pair[1].to_bits() as u32;
-            a_packed.push(lo | (hi << 16));
-        }
+        let a_packed = pack_f16_pairs(&a);
 
         // CPU reference from the f16-rounded weights.
         let mut expected = vec![0.0f32; m as usize];
@@ -4665,18 +4760,6 @@ mod tests {
             let round_f16 = |x: &[f32]| -> Vec<f32> {
                 x.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect()
             };
-            let pack_pairs = |x: &[f32]| -> Vec<u32> {
-                assert!(x.len().is_multiple_of(2));
-                x.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|p| {
-                        let lo = half::f16::from_f32(p[0]).to_bits() as u32;
-                        let hi = half::f16::from_f32(p[1]).to_bits() as u32;
-                        lo | (hi << 16)
-                    })
-                    .collect()
-            };
             let k_r = round_f16(&k);
             let v_r = round_f16(&v);
             let params: [u32; 8] = [
@@ -4691,8 +4774,8 @@ mod tests {
             ];
 
             let q_buf = ctx.upload_f32(&q, "q");
-            let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_pairs(&k)), "k");
-            let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_pairs(&v)), "v");
+            let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&k)), "k");
+            let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&v)), "v");
             let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let out_len = (n_heads * head_dim) as usize;
             let out_f = ctx.create_storage_rw(out_len as u64 * 4, "out_flash");
@@ -6628,21 +6711,9 @@ mod tests {
         // Pack K/V pairs LE (even elem in the low bits), exactly as
         // `kv_append` lays them out; the fixture already holds f16-rounded
         // values.
-        let pack_pairs = |x: &[f32]| -> Vec<u32> {
-            assert!(x.len().is_multiple_of(2));
-            x.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|p| {
-                    let lo = half::f16::from_f32(p[0]).to_bits() as u32;
-                    let hi = half::f16::from_f32(p[1]).to_bits() as u32;
-                    lo | (hi << 16)
-                })
-                .collect()
-        };
         let q_buf = ctx.upload_f32(&f.q_batch, "q");
-        let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_pairs(&f.k_cache)), "k");
-        let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_pairs(&f.v_cache)), "v");
+        let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.k_cache)), "k");
+        let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.v_cache)), "v");
         let out_buf = ctx.create_storage_rw((f.ref_out.len() as u64) * 4, "out");
 
         let mut q_base = 0u32;

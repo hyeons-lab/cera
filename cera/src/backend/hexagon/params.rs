@@ -248,7 +248,7 @@ pub fn build_rope_kernel_params(
 /// Build kernel parameters for SetRows dispatch.
 ///
 /// Mirrors `ggml_hexagon_precompute_set_rows_params` +
-/// `htp_set_rows_vtcm_layout_build`: `n_rows` value rows (src0->ne[1]),
+/// `htp_set_rows_vtcm_layout_build`: `n_rows` value rows (src0->ne\[1\]),
 /// `idx_ne1`/`idx_ne2` index-vector dims (1 for a flat positions vector),
 /// `src0_ne2` value dim-2 (head count for KV), `ne00` row width,
 /// `dst_f16` cache dtype.
@@ -290,8 +290,8 @@ pub fn build_set_rows_kernel_params(
 /// Build kernel parameters for SsmConv dispatch.
 ///
 /// Mirrors `ggml_hexagon_precompute_ssm_conv_params`: `d_conv` taps
-/// (src1->ne[0], 3 for LFM2 short conv), `d_inner` channels (src0->ne[1]),
-/// `n_t` new positions (dst->ne[1]), `n_s` sequences (dst->ne[2], 1),
+/// (src1->ne\[0\], 3 for LFM2 short conv), `d_inner` channels (src0->ne\[1\]),
+/// `n_t` new positions (dst->ne\[1\]), `n_s` sequences (dst->ne\[2\], 1),
 /// `ncs` src0 dim-0 (`d_conv - 1 + n_t`).
 pub fn build_ssm_conv_kernel_params(
     d_conv: usize,

@@ -1,5 +1,7 @@
 //! Audio-aware generation loop with text ↔ audio modality switching.
 
+use std::sync::atomic::AtomicBool;
+
 use anyhow::Result;
 
 use crate::kv_cache::InferenceState;
@@ -650,6 +652,17 @@ impl<'a> AudioOutputDecoder<'a> {
 // generate_audio
 // ---------------------------------------------------------------------------
 
+/// Fail `generate_audio` on a recorded backend fault — the `Session`
+/// `check_decode_error` equivalent for this standalone driver, which feeds
+/// `&dyn Model` straight in and would otherwise sample zero logits as real
+/// output and advance `pos` over the hole.
+fn check_audio_decode_error(model: &dyn Model) -> Result<()> {
+    if let Some(e) = model.take_decode_error() {
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Generate text + audio from a model with vocoder.
 ///
 /// `gpu`: optional GPU backend for depthformer + detokenizer acceleration.
@@ -666,6 +679,9 @@ pub fn generate_audio(
     mut audio_callback: impl FnMut(&[f32], u32),
 ) -> Result<AudioGenerateResult> {
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+    // Discard any stale decode error (mirrors `Session`): only this
+    // attempt's own faults may fail it at the checks below.
+    let _ = model.take_decode_error();
 
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config)?;
@@ -681,13 +697,33 @@ pub fn generate_audio(
 
     let start = Instant::now();
 
-    // Prefill.
-    let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
+    // Prefill through the chunked entry point (one chunk: `ubatch == 0`
+    // disables session-level chunking) so a backend fault stops `consumed`
+    // at the KV prefix that exists instead of advancing `pos` over a hole
+    // — the `Session::append_tokens` accounting, minus cancellation (this
+    // standalone driver has no cancel flag to poll).
+    let no_cancel = AtomicBool::new(false);
+    let (consumed, prefill_logits) =
+        model.forward_prefill_chunked(prompt_tokens, 0, &mut state, 0, &no_cancel);
+    check_audio_decode_error(model)?;
+    if consumed < prompt_tokens.len() {
+        anyhow::bail!(
+            "prefill fault after {consumed}/{} tokens",
+            prompt_tokens.len()
+        );
+    }
+    let mut logits = match prefill_logits {
+        Some(logits) => logits,
+        None => anyhow::bail!(
+            "prefill produced no logits for {} tokens",
+            prompt_tokens.len()
+        ),
+    };
 
     let mut modality = Modality::Text;
     let mut generated = 0usize;
     let mut text_tokens = 0usize;
-    let mut pos = prompt_tokens.len();
+    let mut pos = consumed;
 
     // Interleaved mode counters.
     let mut modality_budget = match config.mode {
@@ -744,6 +780,7 @@ pub fn generate_audio(
             if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
             {
                 let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+                check_audio_decode_error(model)?;
                 pos += 1;
 
                 modality = Modality::Audio;
@@ -761,6 +798,7 @@ pub fn generate_audio(
                                 break;
                             }
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
                             break;
@@ -790,12 +828,14 @@ pub fn generate_audio(
                         // decoding the last audio code embedding and sampling
                         // text from those logits (not by injecting TEXT_END).
                         logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                        check_audio_decode_error(model)?;
                         next_token = sampler.sample(&mut logits);
                         pos += 1;
                         break;
                     }
 
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                    check_audio_decode_error(model)?;
                     pos += 1;
                 }
 
@@ -811,11 +851,13 @@ pub fn generate_audio(
 
             // Normal text: forward and sample next token.
             logits = model.forward(&[next_token], pos, &mut state);
+            check_audio_decode_error(model)?;
             next_token = sampler.sample(&mut logits);
             pos += 1;
         } else {
             // Sequential audio mode: embedding from the audio_start token.
             let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+            check_audio_decode_error(model)?;
             // The output norm naturally produces the right scale (~0.14 RMS)
             // when the hidden state has the activation outlier at channel 1455.
             pos += 1;
@@ -844,6 +886,7 @@ pub fn generate_audio(
                             text_done = true;
                             modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
                             break;
@@ -878,6 +921,7 @@ pub fn generate_audio(
                     modality = Modality::Text;
                     modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                     logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                    check_audio_decode_error(model)?;
                     next_token = sampler.sample(&mut logits);
                     pos += 1;
                     break;
@@ -885,6 +929,7 @@ pub fn generate_audio(
 
                 // Feed codes back as embedding → next hidden state.
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                check_audio_decode_error(model)?;
                 pos += 1;
             }
         }
@@ -1002,5 +1047,221 @@ mod tests {
         assert!(rms_mixed > 0.04 && rms_mixed < 0.06);
         assert_eq!(watchdog.total_voiced_frames, 1);
         assert_eq!(watchdog.consecutive_silent_frames, 0);
+    }
+
+    /// Minimal `Model` with a poisonable decode-error slot, for pinning
+    /// `check_audio_decode_error` without audio weight fixtures.
+    struct PoisonableModel {
+        slot: std::sync::Mutex<Option<crate::CeraError>>,
+    }
+
+    impl PoisonableModel {
+        fn with_slot(err: Option<crate::CeraError>) -> Self {
+            Self {
+                slot: std::sync::Mutex::new(err),
+            }
+        }
+    }
+
+    impl Model for PoisonableModel {
+        fn forward(&self, _tokens: &[u32], _pos: usize, _state: &mut InferenceState) -> Vec<f32> {
+            Vec::new()
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            // Never read by the drain under test; the mock exists only to
+            // carry the slot.
+            unimplemented!("PoisonableModel carries no config")
+        }
+        fn take_decode_error(&self) -> Option<crate::CeraError> {
+            self.slot.lock().unwrap().take()
+        }
+    }
+
+    #[test]
+    fn audio_decode_error_drains_sticky_slot() {
+        // Poisoned drains to Err once, then is clean (sticky until taken).
+        let poisoned = PoisonableModel::with_slot(Some(crate::CeraError::Backend(
+            "injected audio fault".into(),
+        )));
+        assert!(check_audio_decode_error(&poisoned).is_err());
+        assert!(check_audio_decode_error(&poisoned).is_ok());
+        // A clean model never trips the drain.
+        let clean = PoisonableModel::with_slot(None);
+        assert!(check_audio_decode_error(&clean).is_ok());
+    }
+
+    /// `Model` with a real config and a scripted `forward_prefill_chunked`,
+    /// for driving `generate_audio`'s prefill-fault branches without silicon.
+    struct ScriptedPrefillModel {
+        config: crate::model::ModelConfig,
+        consumed: usize,
+        logits: Option<Vec<f32>>,
+    }
+
+    impl Model for ScriptedPrefillModel {
+        fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+            state.seq_len += tokens.len();
+            vec![0.0; self.config.vocab_size]
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.config
+        }
+        fn forward_prefill_chunked(
+            &self,
+            _tokens: &[u32],
+            _start_pos: usize,
+            _state: &mut InferenceState,
+            _ubatch: usize,
+            _cancel: &AtomicBool,
+        ) -> (usize, Option<Vec<f32>>) {
+            (self.consumed, self.logits.clone())
+        }
+    }
+
+    fn scripted_model(consumed: usize, logits: Option<Vec<f32>>) -> ScriptedPrefillModel {
+        ScriptedPrefillModel {
+            config: crate::model::ModelConfig {
+                architecture: "mock".into(),
+                n_layers: 0,
+                hidden_size: 0,
+                intermediate_size: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                head_dim: 0,
+                vocab_size: 100,
+                max_seq_len: 1024,
+                rope_theta: 0.0,
+                rms_norm_eps: 0.0,
+                block_types: Vec::new(),
+                conv_kernel_size: None,
+                ssm: None,
+                kv_heads_per_layer: Vec::new(),
+                scalars: crate::model::ScalarMultipliers::default(),
+                moe: None,
+                is_causal: true,
+                class_labels: Vec::new(),
+            },
+            consumed,
+            logits,
+        }
+    }
+
+    /// Vocoder weights with real (tiny) configs and empty owned tensors:
+    /// `generate_audio`'s prefill bails fire before any decode, so only
+    /// `AudioOutputDecoder::new` must construct (it reads configs only).
+    /// `n_fft`/`hop_length` are nonzero because `IstftStreamer::new`
+    /// plans a real FFT.
+    fn empty_vocoder_weights() -> (AudioDecoderWeights, DetokenizerWeights) {
+        use crate::model::audio_decoder::{
+            CodebookWeights, DecoderConfig, DepthformerConfig, DetokenizerConfig,
+        };
+        use crate::model::weights::MmapWeight;
+        let dec = AudioDecoderWeights {
+            depthformer_config: DepthformerConfig {
+                n_layer: 0,
+                n_embd: 4,
+                n_head: 1,
+                n_head_kv: 1,
+                n_embd_head: 4,
+                ffn_dim: 4,
+                rms_norm_eps: 1e-5,
+                rope_freq_base: 10000.0,
+                max_seq_len: 8,
+            },
+            decoder_config: DecoderConfig {
+                n_codebook: 1,
+                n_vocab: 4,
+                n_embd: 4,
+                rms_norm_eps: 1e-5,
+            },
+            depthformer_layers: Vec::new(),
+            depth_linear_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            depth_linear_b: Vec::new(),
+            depth_embeddings: Vec::new(),
+            audio_embedding: CodebookWeights {
+                embedding: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+                norm: Vec::new(),
+                to_logits: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            },
+        };
+        let detok = DetokenizerWeights {
+            config: DetokenizerConfig {
+                n_layer: 0,
+                n_embd: 4,
+                n_head: 1,
+                n_head_kv: 1,
+                n_embd_head: 4,
+                ffn_dim: 4,
+                d_conv: 0,
+                rms_norm_eps: 1e-5,
+                rope_freq_base: 10000.0,
+                swa_window_size: 0,
+                n_codes: 1,
+                n_fft: 8,
+                hop_length: 2,
+                sample_rate: 24000,
+                layer_is_conv: Vec::new(),
+            },
+            output_norm: Vec::new(),
+            emb_weight: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            lin_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            lin_b: Vec::new(),
+            layers: Vec::new(),
+        };
+        (dec, detok)
+    }
+
+    fn audio_test_config() -> AudioGenerateConfig {
+        AudioGenerateConfig {
+            max_tokens: 4,
+            sampler: SamplerConfig::default(),
+            audio_temperature: 0.0,
+            audio_top_k: 1,
+            mode: AudioMode::Sequential,
+            gpu_depthformer: false,
+        }
+    }
+
+    #[test]
+    fn generate_audio_short_prefill_is_fault_not_silent() {
+        let model = scripted_model(1, Some(vec![0.0; 100]));
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let err = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("prefill fault after 1/3"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn generate_audio_missing_logits_bails() {
+        let model = scripted_model(3, None);
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let err = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("produced no logits"), "{err:?}");
     }
 }

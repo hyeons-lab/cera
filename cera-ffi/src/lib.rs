@@ -452,11 +452,15 @@ pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
 /// caller stages a private writable directory; Android apps instead use
 /// the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
 /// (which points the loader at `nativeLibraryDir`), so this call is not
-/// needed there. Call once at startup, before [`hexagon_probe`] or
+/// needed there. Do not combine the two in one process unless merging
+/// both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+/// flow per app. Call once at startup, before [`hexagon_probe`] or
 /// loading a model with [`BackendPreference::Hexagon`]. Returns the
 /// number of skels written (0 when all were already present and fresh).
 /// Re-running is cheap and idempotent (files are only rewritten when
-/// their bytes differ, and the loader path is not duplicated).
+/// their bytes differ, and the loader path is not duplicated). A `dir`
+/// containing `;` is rejected: it would silently split into two loader
+/// search entries.
 #[uniffi::export]
 pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError> {
     #[cfg(feature = "hexagon")]
@@ -2349,8 +2353,9 @@ impl Session {
     ///   includes both "manifest didn't list a mmproj" (no warn
     ///   logged) and "mmproj listed but failed to open/parse"
     ///   (warn logged at `CeraEngine::from_path`).
-    /// - `ContextOverflow` / `Cancelled` propagate from the
-    ///   underlying prefill.
+    /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+    ///   underlying prefill (a backend fault recorded mid-prefill surfaces
+    ///   as `Backend`, not `Cancelled`).
     pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError> {
         if samples.is_empty() {
             return Err(FfiError::EmptyInput);
@@ -2384,7 +2389,7 @@ impl Session {
     ///
     /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
     /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
-    /// `>= vocab_size`.
+    /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
     pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError> {
         let hs = self.lock_inner()?.hidden_states_for_tokens(&tokens)?;
         Ok(f32_vec_to_le_bytes(&hs))
@@ -2560,8 +2565,9 @@ impl Session {
     /// - `Backend(...)` for image decode failure, missing vision
     ///   encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
     ///   mismatch.
-    /// - `ContextOverflow` / `Cancelled` propagate from the
-    ///   underlying prefill.
+    /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+    ///   underlying prefill (a backend fault recorded mid-prefill surfaces
+    ///   as `Backend`, not `Cancelled`).
     pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
         // Delegate to the core methods (rather than always calling
         // `append_image_with_opts`) so the session default stays

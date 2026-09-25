@@ -44,6 +44,8 @@
 
 @group(0) @binding(0) var<storage, read> k_cache: array<u32>;
 @group(0) @binding(1) var<storage, read_write> scratch: array<f32>;
+@group(0) @binding(2) var<storage, read> params: array<u32, 8>;
+@group(0) @binding(3) var<storage, read> freq_factors: array<f32>;
 
 // One packed half as f32. A pure helper (no barrier) is safe here — only
 // `workgroupBarrier()` in helpers miscompiles on naga's SPIR-V path.
@@ -51,8 +53,6 @@ fn k_at(i: u32) -> f32 {
     let pair = unpack2x16float(k_cache[i >> 1u]);
     return select(pair.x, pair.y, (i & 1u) == 1u);
 }
-@group(0) @binding(2) var<storage, read> params: array<u32, 8>;
-@group(0) @binding(3) var<storage, read> freq_factors: array<f32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn kv_shift(

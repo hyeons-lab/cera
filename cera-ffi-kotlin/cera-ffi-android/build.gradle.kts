@@ -43,6 +43,7 @@ dependencies {
     // Android needs JNA's `@aar` artifact (bundles the per-ABI JNI dispatch libs).
     api("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     api(libs.kotlinx.coroutines.core)
+    testImplementation(libs.junit)
 }
 
 mavenPublishing {

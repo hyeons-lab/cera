@@ -396,6 +396,10 @@ pub fn repack_q6_k(
     Ok(())
 }
 
+/// ggml Q8_0 quant bound: `quantize_row_q8_0_ref` scales by `amax / 127`
+/// so the int8 quants span the full symmetric range.
+const Q8_0_QUANT_MAX: f32 = 127.0;
+
 /// Quantize 32 f32 values to one Q8_0 block (absmax/127 scale).
 ///
 /// Mirrors ggml `quantize_row_q8_0_ref`: `d = amax / 127`, quants are
@@ -405,7 +409,7 @@ fn quantize_q8_0_block(vals: &[f32; 32]) -> BlockQ8_0 {
     for &v in vals {
         amax = amax.max(v.abs());
     }
-    let d = amax / 127.0;
+    let d = amax / Q8_0_QUANT_MAX;
     let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
     let mut quants = [0i8; 32];
     for (q, &v) in quants.iter_mut().zip(vals.iter()) {
@@ -665,7 +669,10 @@ mod tests {
             }
         }
         let amax = vals.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        assert!(max_err <= amax / 127.0, "max_err={max_err} amax={amax}");
+        assert!(
+            max_err <= amax / Q8_0_QUANT_MAX,
+            "max_err={max_err} amax={amax}"
+        );
 
         // All-zero block requants to zero blocks.
         let zero = vec![0u8; 176];

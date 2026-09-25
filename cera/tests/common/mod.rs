@@ -21,11 +21,77 @@
 //!
 //! [`write_lora_gguf`] serializes an adapter fixture, shared by
 //! `moe_lora_parity`, `metal_moe_oracle` and `wgpu_moe_oracle`.
+//!
+//! [`models_dir`] resolves the oracle-model directory
+//! (`CERA_ORACLE_MODELS_DIR` or `target/oracle/models/`), shared by the
+//! migrated suites (several older suites still resolve fixtures on their
+//! own).
+//!
+//! [`fixture_or_skip`] resolves one fixture under it (or skips), and
+//! [`prompt_tokens`] tokenizes the shared prefill prompt — one home for
+//! the `gpu_lfm2_*` suites' fixture preamble.
+//!
+//! [`fail_closed_passthrough_skip`] is the fail-closed SPIR-V passthrough
+//! skip gate shared by the integration suites (lib unit tests share the
+//! canonical `backend::wgpu::require_passthrough_or_skip` copy instead).
 
 #![allow(dead_code)]
 
 #[cfg(feature = "remote")]
 pub mod download;
+
+/// Directory holding oracle/fixture GGUFs: `CERA_ORACLE_MODELS_DIR` when
+/// set, else `target/oracle/models/` under the workspace. One definition
+/// for all suites (a copy per file is how the copies drift).
+///
+/// Callers: `gpu_transformer_parity`, `oracle_text`, and
+/// [`fixture_or_skip`] (which serves the `gpu_lfm2_*` suites).
+pub fn models_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
+        return std::path::PathBuf::from(d);
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
+}
+
+/// Resolve `fixture` under [`models_dir`], or skip the calling test.
+///
+/// A missing fixture skips with a loud `eprintln` carrying the suite's
+/// `tag`; `CERA_REQUIRE_MODEL` set turns the miss into a hard failure so a
+/// CI leg proves the kernels executed rather than reporting green on
+/// skips. One definition for all suites (a copy per file is how the
+/// copies — and the fail-closed policy — drift).
+///
+/// Callers: the `gpu_lfm2_*` suites.
+pub fn fixture_or_skip(fixture: &str, tag: &str) -> Option<std::path::PathBuf> {
+    let p = models_dir().join(fixture);
+    if p.exists() {
+        return Some(p);
+    }
+    assert!(
+        std::env::var("CERA_REQUIRE_MODEL")
+            .unwrap_or_default()
+            .is_empty(),
+        "CERA_REQUIRE_MODEL is set but {fixture} is absent at {}",
+        p.display()
+    );
+    eprintln!("[{tag}] SKIP (absent): {}", p.display());
+    None
+}
+
+/// `n` prompt tokens from `path`'s own tokenizer over the shared fox/dog
+/// prompt. Shared by the prefill suites so the measured prefix is identical
+/// everywhere (and lengthening the prompt is one edit, not one per suite).
+pub fn prompt_tokens(path: &std::path::Path, n: usize) -> Vec<u32> {
+    let gguf = cera::gguf::GgufFile::open(path)
+        .unwrap_or_else(|e| panic!("open gguf {}: {e}", path.display()));
+    let tok = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)
+        .unwrap_or_else(|e| panic!("tokenizer for {}: {e}", path.display()));
+    let text = "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(60);
+    let mut t = tok.encode(&text);
+    assert!(t.len() >= n, "fixture prompt too short: {} < {n}", t.len());
+    t.truncate(n);
+    t
+}
 
 /// Per-token hidden states for `tokens`, with an optional LoRA adapter attached
 /// to the inference state.
@@ -76,6 +142,45 @@ pub fn metal_context() -> Option<cera::backend::metal::MetalContext> {
             None
         }
     }
+}
+
+/// Fail closed when a SPIR-V passthrough case cannot run: with
+/// `CERA_REQUIRE_PASSTHROUGH=1` (the lavapipe CI leg) a skip is a
+/// failure, so the SPIR-V twin never reports green untested; elsewhere
+/// it is a visible note. Mirrors `backend::wgpu::require_passthrough_or_skip`
+/// (same assert text, same skip label); keep the two in sync by hand.
+/// The name differs deliberately: the lib copy takes `ran` and returns
+/// early when the case ran, while this one only ever fires the skip path
+/// (callers pre-branch), so sharing the name would promise a contract
+/// this signature does not keep.
+///
+/// Defined once here rather than once per test binary: a copy per file is
+/// how the copies drift (the old inline copy hardcoded a non-Vulkan-only
+/// message while the canonical grew subgroup-aware). It cannot come from
+/// `wgpu.rs` itself (an integration test is a separate crate and cannot
+/// name a `#[cfg(test)]` item in the library); `tests/common/` is the
+/// home shared across test binaries instead.
+///
+/// Callers: `wgpu_mul_mat_parity` (both check sites). `tag` completes
+/// `SKIP {tag} passthrough on ...` (e.g. "K-quant").
+#[cfg(feature = "gpu")]
+pub fn fail_closed_passthrough_skip(ctx: &cera::backend::wgpu::GpuContext, tag: &str) {
+    assert!(
+        std::env::var("CERA_REQUIRE_PASSTHROUGH")
+            .unwrap_or_default()
+            .is_empty(),
+        "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) takes {}",
+        ctx.backend,
+        if ctx.supports_spirv_passthrough() {
+            "passthrough without SUBGROUP"
+        } else {
+            "no SPIR-V passthrough"
+        },
+    );
+    eprintln!(
+        "[gpu-passthrough] SKIP {tag} passthrough on backend ({})",
+        ctx.backend
+    );
 }
 
 /// Resolve a dense (llama/qwen2/qwen3) GGUF for the speculative-decoding tests

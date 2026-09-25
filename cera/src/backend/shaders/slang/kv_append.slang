@@ -1,3 +1,7 @@
+// slang-targets: wgsl
+// (No Metal twin: nothing compiles or dispatches one, so none is
+// generated, committed, or drift-checked. Drop this header if Metal
+// grows a kv_append pipeline.)
 // Append f32 rows to the packed-f16 KV cache: one thread per u32 word packs
 // two f32 halves (`dst[off + w] = pack(src[2w], src[2w+1])`). One thread per
 // WORD (not per float) so no two threads share a word. n is always even

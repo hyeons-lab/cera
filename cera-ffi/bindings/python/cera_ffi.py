@@ -499,7 +499,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 18871:
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -769,9 +769,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 51530:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -805,7 +805,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -9867,8 +9867,9 @@ class SessionProtocol(typing.Protocol):
         includes both "manifest didn't list a mmproj" (no warn
         logged) and "mmproj listed but failed to open/parse"
         (warn logged at `CeraEngine::from_path`).
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         raise NotImplementedError
     def append_image(self, bytes: bytes,max_long_size: typing.Optional[int]) -> None:
@@ -9921,8 +9922,9 @@ class SessionProtocol(typing.Protocol):
         - `Backend(...)` for image decode failure, missing vision
         encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
         mismatch.
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         raise NotImplementedError
     def append_text(self, text: str) -> None:
@@ -10146,7 +10148,7 @@ class SessionProtocol(typing.Protocol):
 
         Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
         doesn't implement hidden-state extraction; `InvalidToken` if any id is
-        `>= vocab_size`.
+        `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
 """
         raise NotImplementedError
     def hidden_states_for_tokens_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> bytes:
@@ -10377,8 +10379,9 @@ class Session(SessionProtocol):
         includes both "manifest didn't list a mmproj" (no warn
         logged) and "mmproj listed but failed to open/parse"
         (warn logged at `CeraEngine::from_path`).
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(samples)
@@ -10447,8 +10450,9 @@ class Session(SessionProtocol):
         - `Backend(...)` for image decode failure, missing vision
         encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
         mismatch.
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         
         _UniffiFfiConverterBytes.check_lower(bytes)
@@ -10888,7 +10892,7 @@ class Session(SessionProtocol):
 
         Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
         doesn't implement hidden-state extraction; `InvalidToken` if any id is
-        `>= vocab_size`.
+        `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
 """
         
         _UniffiFfiConverterSequenceUInt32.check_lower(tokens)
@@ -15498,11 +15502,15 @@ def hexagon_install_skels(dir: str) -> int:
     caller stages a private writable directory; Android apps instead use
     the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
     (which points the loader at `nativeLibraryDir`), so this call is not
-    needed there. Call once at startup, before [`hexagon_probe`] or
+    needed there. Do not combine the two in one process unless merging
+    both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+    flow per app. Call once at startup, before [`hexagon_probe`] or
     loading a model with [`BackendPreference::Hexagon`]. Returns the
     number of skels written (0 when all were already present and fresh).
     Re-running is cheap and idempotent (files are only rewritten when
-    their bytes differ, and the loader path is not duplicated).
+    their bytes differ, and the loader path is not duplicated). A `dir`
+    containing `;` is rejected: it would silently split into two loader
+    search entries.
 """
     
     _UniffiFfiConverterString.check_lower(dir)

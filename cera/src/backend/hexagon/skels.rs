@@ -45,10 +45,28 @@ static SKEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// read the environment: `set_var` is process-global and cannot be made
 /// sound against foreign threads (JVM, loader) racing a `getenv` from
 /// inside this process.
+///
+/// The two staging flows — this function and Kotlin `HexagonNpu.setup` —
+/// serialize internally (this side via `SKEL_ENV_LOCK`) but against
+/// *different* monitors, so they may compose only sequentially, on one
+/// thread, during single-threaded startup. Concurrent composition can
+/// lost-update `ADSP_LIBRARY_PATH` and drop a skel dir.
 pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     // Held for the whole install: serializes the file writes (shared
     // `.so.tmp` names) as well as the `ADSP_LIBRARY_PATH` update below.
     let _env_guard = SKEL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir_str = dir
+        .to_str()
+        .ok_or_else(|| CeraError::Backend("skel dir is not UTF-8".into()))?;
+    if dir_str.contains(';') {
+        // Fail fast, before writing anything: a `;` in the dir would
+        // silently become two loader search entries (legal on
+        // Linux/Android filesystems), breaking skel resolution with no
+        // error naming the cause.
+        return Err(CeraError::Backend(format!(
+            "skel dir {dir_str:?} contains ';', which splits into two loader entries"
+        )));
+    }
     std::fs::create_dir_all(dir)
         .map_err(|e| CeraError::Backend(format!("skel dir {}: {e}", dir.display())))?;
     let mut count = 0;
@@ -83,19 +101,14 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             count += 1;
         }
     }
-    let dir_str = dir
-        .to_str()
-        .ok_or_else(|| CeraError::Backend("skel dir is not UTF-8".into()))?;
-    let merged = match std::env::var("ADSP_LIBRARY_PATH") {
-        Ok(cur) if !cur.is_empty() => {
-            if cur.split(':').any(|p| p == dir_str) {
-                cur
-            } else {
-                format!("{dir_str}:{cur}")
-            }
-        }
-        _ => dir_str.to_string(),
-    };
+    // `;`-joined: the separator the FastRPC loader parses (verified with
+    // the AAR flow on a retail S25U) and the one `HexagonNpu.setup` writes.
+    // A `:`-joined value would reach the loader as one path containing a
+    // literal `:`, failing skel resolution whenever the var is pre-set.
+    // `var_os`, not `var(...).ok()`: a non-UTF8 current value must fail
+    // loudly (same as a non-UTF8 dir above), not silently clobber someone
+    // else's loader paths on the merge.
+    let merged = merge_adsp_paths_os(dir_str, std::env::var_os("ADSP_LIBRARY_PATH").as_deref())?;
     // SAFETY: the mutex serializes every Rust-side `ADSP_LIBRARY_PATH`
     // read-modify-write; the caller upholds the documented startup-only
     // requirement, which is what keeps foreign-thread `getenv` out of the
@@ -104,9 +117,118 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     Ok(count)
 }
 
+/// Merge a staged path list with the current `ADSP_LIBRARY_PATH` value:
+/// staged entries first, `;`-joined, empty segments dropped, first
+/// occurrence wins. This is the one merge contract both staging flows
+/// implement (Kotlin `HexagonNpu.mergeAdspPaths` mirrors it case for
+/// case, and the unit tests below mirror its truth table), so composing
+/// the flows in either order — sequentially — yields the same dir set.
+fn merge_adsp_paths(staged: &str, current: Option<&str>) -> String {
+    let mut seen = std::collections::HashSet::<&str>::new();
+    staged
+        .split(';')
+        .chain(current.unwrap_or("").split(';'))
+        .filter(|p| !p.is_empty())
+        .filter(|p| seen.insert(*p))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// `merge_adsp_paths` over a possibly non-UTF8 current value: refuses to
+/// merge (rather than clobber) when the conversion fails. Pure over
+/// `&OsStr` so the refusal arm is unit-testable without touching the
+/// process env (this file allows exactly one env writer).
+fn merge_adsp_paths_os(
+    staged: &str,
+    current: Option<&std::ffi::OsStr>,
+) -> Result<String, CeraError> {
+    let current = match current {
+        None => None,
+        Some(v) => Some(v.to_str().ok_or_else(|| {
+            CeraError::Backend(
+                "ADSP_LIBRARY_PATH is not UTF-8; refusing to merge rather than clobber it".into(),
+            )
+        })?),
+    };
+    Ok(merge_adsp_paths(staged, current))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Restores `ADSP_LIBRARY_PATH` on drop, so a mid-test panic cannot
+    /// leak a dirty loader var into the rest of the suite (the manual
+    /// trailing restore it replaces could).
+    struct RestoreAdspPath(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreAdspPath {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => unsafe { std::env::set_var("ADSP_LIBRARY_PATH", v) },
+                None => unsafe { std::env::remove_var("ADSP_LIBRARY_PATH") },
+            }
+        }
+    }
+
+    /// Truth-table pins for [`merge_adsp_paths`], mirroring Kotlin
+    /// `MergeAdspPathsTest` case for case: `;` separator (a `:`-joined
+    /// value passes through as one opaque entry), staged-first order,
+    /// first-wins dedup, empty segments dropped.
+    #[test]
+    fn merge_adsp_paths_truth_table() {
+        assert_eq!(
+            merge_adsp_paths("/data/app/lib;/odm/lib/rfsa/adsp", None),
+            "/data/app/lib;/odm/lib/rfsa/adsp"
+        );
+        assert_eq!(
+            merge_adsp_paths("/data/app/lib;/vendor/dsp", Some("/staged/by/rust")),
+            "/data/app/lib;/vendor/dsp;/staged/by/rust"
+        );
+        assert_eq!(
+            merge_adsp_paths(
+                "/data/app/lib;/vendor/dsp",
+                Some("/vendor/dsp;/data/app/lib")
+            ),
+            "/data/app/lib;/vendor/dsp"
+        );
+        assert_eq!(
+            merge_adsp_paths("/data/app/lib;", Some(";/data/app/lib;")),
+            "/data/app/lib"
+        );
+        assert_eq!(
+            merge_adsp_paths("/data/app/lib", Some("/a:/b")),
+            "/data/app/lib;/a:/b"
+        );
+        // Empty-string current contributes no entries, exactly like `None`
+        // (mirrored by the Kotlin table's empty-string case).
+        assert_eq!(merge_adsp_paths("/data/app/lib", Some("")), "/data/app/lib");
+        // Idempotent: merging the merged value changes nothing.
+        let once = merge_adsp_paths("/d", Some("/v;/o"));
+        assert_eq!(merge_adsp_paths("/d", Some(&once)), once);
+    }
+
+    // Unix-only: fabricating a non-UTF8 `OsStr` needs `OsStringExt`
+    // (`ADSP_LIBRARY_PATH` itself is an Android/Linux concept).
+    #[cfg(unix)]
+    #[test]
+    fn merge_refuses_non_utf8_current() {
+        use std::os::unix::ffi::OsStringExt;
+        // A non-UTF8 current value fails loudly instead of being silently
+        // clobbered on the merge (pure `&OsStr` helper: no env touched).
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let err = merge_adsp_paths_os("/d", Some(&bad)).unwrap_err();
+        assert!(
+            matches!(err, CeraError::Backend(ref s) if s.contains("not UTF-8")),
+            "{err:?}"
+        );
+        // UTF-8 and absent currents merge exactly like `merge_adsp_paths`.
+        assert_eq!(
+            merge_adsp_paths_os("/d", Some(std::ffi::OsStr::new("/v;/o"))).unwrap(),
+            "/d;/v;/o"
+        );
+        assert_eq!(merge_adsp_paths_os("/d", None).unwrap(), "/d");
+    }
 
     /// Pins the `install_skels` contract the FFI docs promise: count means
     /// files written (0 when fresh), same-length corruption is repaired,
@@ -114,9 +236,11 @@ mod tests {
     #[test]
     fn install_is_idempotent_and_repairs_corruption() {
         // NOTE: process-global env assertion; safe only because no other
-        // test touches `ADSP_LIBRARY_PATH` (a second one would race this).
-        // Save/restore so the suite leaves no trace either way.
-        let prev = std::env::var_os("ADSP_LIBRARY_PATH");
+        // test in this binary may write `ADSP_LIBRARY_PATH` — not even via
+        // a restore guard's `Drop`, which would race these exact-merge
+        // assertions just the same. Save/restore so the suite leaves no
+        // trace either way.
+        let _restore = RestoreAdspPath(std::env::var_os("ADSP_LIBRARY_PATH"));
         let dir = std::env::temp_dir().join(format!("skel-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -126,8 +250,26 @@ mod tests {
         assert_eq!(install_skels(&dir).unwrap(), 0);
         let v = std::env::var("ADSP_LIBRARY_PATH").unwrap();
         assert_eq!(
-            v.split(':').filter(|p| *p == dir.to_str().unwrap()).count(),
+            v.split(';').filter(|p| *p == dir.to_str().unwrap()).count(),
             1
+        );
+        // A pre-set `;`-joined value merges (same separator the FastRPC
+        // loader and `HexagonNpu.setup` use), still without duplicating.
+        unsafe {
+            std::env::set_var(
+                "ADSP_LIBRARY_PATH",
+                "/vendor/lib/rfsa/adsp;/odm/lib/rfsa/adsp",
+            )
+        };
+        assert_eq!(install_skels(&dir).unwrap(), 0);
+        assert_eq!(
+            std::env::var("ADSP_LIBRARY_PATH").unwrap(),
+            format!("{};/vendor/lib/rfsa/adsp;/odm/lib/rfsa/adsp", dir.display())
+        );
+        assert_eq!(install_skels(&dir).unwrap(), 0);
+        assert_eq!(
+            std::env::var("ADSP_LIBRARY_PATH").unwrap(),
+            format!("{};/vendor/lib/rfsa/adsp;/odm/lib/rfsa/adsp", dir.display())
         );
         // Same-length corruption is still repaired.
         let p = dir.join(PROBE_ARCHS[0].skel_filename());
@@ -138,10 +280,19 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), embedded_skel(PROBE_ARCHS[0]));
 
         let _ = std::fs::remove_dir_all(&dir);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("ADSP_LIBRARY_PATH", v) },
-            None => unsafe { std::env::remove_var("ADSP_LIBRARY_PATH") },
-        }
+        // Env restore is the `_restore` guard's `Drop` (panic-safe).
+    }
+
+    /// A staging dir containing `;` fails closed instead of silently
+    /// splitting into two loader search entries.
+    #[test]
+    fn install_rejects_semicolon_dir() {
+        // No restore guard here on purpose: the `;` rejection returns before
+        // any env write, so there is nothing to restore — and a guard's
+        // `Drop` would race the idempotent test's phased assertions above
+        // (see its NOTE). A second env writer in this binary is forbidden.
+        let err = install_skels(std::path::Path::new("/tmp/skel-test-;")).unwrap_err();
+        assert!(err.to_string().contains("';'"), "unexpected error: {err}");
     }
 }
 

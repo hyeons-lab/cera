@@ -148,6 +148,15 @@ pub struct WeightRef {
     /// only on the target/feature combo whose `gemm_preq` reads it.
     #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
     pub repacked: Option<std::sync::Arc<RepackedWeight>>,
+    /// Set by `with_repack_if` when the loader skipped the CPU int8 repack
+    /// on a weight that would otherwise have qualified (see `repacked`).
+    /// The naive GEMM fallback warns once per dtype when it serves such a
+    /// weight, so a repack-less model reused on CPU fails loud instead of
+    /// slow-silent. `pub` for consistency with the sibling fields (like any
+    /// added field this breaks downstream struct literals; 0.x permits it —
+    /// construct via `WeightRef::new`). Same cfg as `repacked`.
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+    pub repack_loader_skipped: bool,
     #[cfg(has_blas)]
     pub cached_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     #[cfg(has_blas)]
@@ -164,6 +173,8 @@ impl WeightRef {
             k,
             #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
             repacked: None,
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+            repack_loader_skipped: false,
             #[cfg(has_blas)]
             cached_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
             #[cfg(has_blas)]
@@ -264,15 +275,32 @@ impl WeightRef {
     #[allow(unused_mut, unused_variables)]
     pub(crate) fn with_repack_if(mut self, _gguf: &GgufFile, do_repack: bool) -> Self {
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
-        if do_repack {
+        {
             let gguf = _gguf;
+            // Whether this weight would have qualified for a repack: when
+            // the loader skips it, record the skip so the naive GEMM
+            // fallback can warn instead of running slow-silent. Q4_0 and
+            // Q4_K are disjoint dtypes, so one predicate covers both arms
+            // (a weight that qualified for one can never take the other).
+            let mut qualifies =
+                self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k);
+            #[cfg(target_arch = "x86_64")]
+            {
+                qualifies |=
+                    self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k);
+            }
+            if !do_repack {
+                self.repacked = None;
+                self.repack_loader_skipped = qualifies;
+                return self;
+            }
             let mut kind = None;
-            if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {
-                // One repack per process, chosen by the resolved tier: the smmla
-                // interleave on i8mm (1.59x the vdot twin's per-thread prefill),
-                // the vdot one everywhere else. The tier is fixed per process
-                // (env override included), so the repack always matches the
-                // dispatch, and the extra-copy cost never doubles.
+            // One repack per process, chosen by the resolved tier: the smmla
+            // interleave on i8mm (1.59x the vdot twin's per-thread prefill),
+            // the vdot one everywhere else. The tier is fixed per process
+            // (env override included), so the repack always matches the
+            // dispatch, and the extra-copy cost never doubles.
+            if qualifies && self.dtype == DType::Q4_0 {
                 if crate::backend::cpu_features::cpu_features().tier
                     == crate::backend::cpu_features::CpuTier::NeonI8mm
                 {
@@ -287,10 +315,7 @@ impl WeightRef {
             }
             #[cfg(target_arch = "x86_64")]
             {
-                if kind.is_none()
-                    && self.dtype == DType::Q4KM
-                    && cpu::q4_k_repack_supported(self.m, self.k)
-                {
+                if qualifies && self.dtype == DType::Q4KM {
                     let (packed, dsc, dmn) =
                         cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
@@ -303,6 +328,7 @@ impl WeightRef {
                     k: self.k,
                 })
             });
+            self.repack_loader_skipped = false;
         }
         self
     }
@@ -727,6 +753,63 @@ fn k_quant_gemm_available() -> bool {
     }
 }
 
+/// Bit index for the warn-once fast-path bitset. An explicit match, not
+/// `dtype as u8`: `DType` has no pinned discriminants, so a reorder must
+/// fail closed at compile time (non-exhaustive match) rather than alias
+/// two dtypes onto one bit.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+fn dtype_warn_bit(dtype: DType) -> u32 {
+    match dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::BF16 => 2,
+        DType::I32 => 3,
+        DType::U8 => 4,
+        DType::Q4_0 => 5,
+        DType::Q4_1 => 6,
+        DType::Q4KM => 7,
+        DType::Q5KM => 8,
+        DType::Q8_0 => 9,
+        DType::Q6K => 10,
+    }
+}
+
+/// Dedupe probe shared by the once-per-dtype warnings: true when `dtype`
+/// is first seen. Each warning holds its own `static SEEN` and emits its
+/// own message; only the lock-and-check is shared, so a dedupe-policy fix
+/// lands once. A Vec, not a HashSet: `DType` is not `Hash`, the set holds
+/// a handful of entries at most, and deriving `Hash` on a core enum to
+/// dedupe a warning would be the tail wagging the dog.
+///
+/// `warned` is a lock-free fast path: the repackless warning sits on the
+/// per-dispatch hot path, and every call taking the mutex would bounce a
+/// shared cache line on every GEMM forever. The bitset is a hint only —
+/// the mutex-held Vec stays the arbiter — so `Relaxed` is sound: a stale
+/// read just locks once more, and a bit is only ever set while holding
+/// the lock, after the Vec push it shadows.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+fn warn_once_per_dtype(
+    seen: &std::sync::Mutex<Vec<DType>>,
+    warned: &std::sync::atomic::AtomicU64,
+    dtype: DType,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let bit = 1u64 << dtype_warn_bit(dtype);
+    if warned.load(Ordering::Relaxed) & bit != 0 {
+        return false;
+    }
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // a poisoned warn-dedupe set must not kill inference
+    };
+    if guard.contains(&dtype) {
+        return false;
+    }
+    guard.push(dtype);
+    warned.fetch_or(bit, Ordering::Relaxed);
+    true
+}
+
 /// Report — once per offending dtype — that a weight knocked prefill off the
 /// batched GEMM path.
 ///
@@ -735,22 +818,69 @@ fn k_quant_gemm_available() -> bool {
 /// both times because the fallback said nothing. If prefill is slow and this is
 /// quiet, the dtypes are not the reason.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+static UNBATCHABLE_SEEN: std::sync::Mutex<Vec<DType>> = std::sync::Mutex::new(Vec::new());
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+static UNBATCHABLE_WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+static REPACKLESS_SEEN: std::sync::Mutex<Vec<DType>> = std::sync::Mutex::new(Vec::new());
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+static REPACKLESS_WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only reset for the repackless dedupe set: warn-count assertions
+/// are otherwise coupled to process-global state (any other test
+/// dispatching a skipped load first would silently consume the slot).
+#[cfg(all(
+    test,
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    not(has_blas)
+))]
+pub(crate) fn reset_repackless_warned() {
+    // Hold the guard across both resets: clearing the Vec and then storing
+    // 0 after the unlock would let a racing dispatch's bit vanish while its
+    // dtype stays in the Vec (perf-only — the Vec stays the arbiter — but
+    // needless).
+    let mut seen = REPACKLESS_SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    seen.clear();
+    REPACKLESS_WARNED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 pub(crate) fn warn_unbatchable(tensor: &str, dtype: DType) {
-    use std::sync::Mutex;
-    // A Vec, not a HashSet: `DType` is not `Hash`, the set holds a handful of
-    // entries at most, and deriving `Hash` on a core enum to dedupe a warning
-    // would be the tail wagging the dog.
-    static SEEN: Mutex<Vec<DType>> = Mutex::new(Vec::new());
-    let mut guard = match SEEN.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(), // a poisoned warn-dedupe set must not kill inference
-    };
-    if !guard.contains(&dtype) {
-        guard.push(dtype);
+    if warn_once_per_dtype(&UNBATCHABLE_SEEN, &UNBATCHABLE_WARNED, dtype) {
         tracing::warn!(
             "prefill fell back to the per-token path: `{tensor}` is {dtype:?}, which is \
              not supported on the batched path for this model. Prefill will be several \
              times slower than it should be."
+        );
+        // No `tracing` subscriber on the shipping mobile/FFI platforms;
+        // without this the warning is invisible exactly where the slow
+        // path runs (same pairing as `warn_repackless_dispatch`).
+        eprintln!(
+            "[cera::cpu] prefill fell back to the per-token path: `{tensor}` is {dtype:?}, \
+             unsupported on the batched path; prefill will be several times slower."
+        );
+    }
+}
+
+/// Report, once per dtype, that CPU prefill served a weight whose int8
+/// repack the loader skipped (see `with_repack_if`). Before the no-repack
+/// loaders a missing repack meant an odd unsupported shape; now it can
+/// mean a whole GPU/Metal-loader model reused on CPU, several times
+/// slower than it should be, with nothing pointing at the cause.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn warn_repackless_dispatch(dtype: DType) {
+    if warn_once_per_dtype(&REPACKLESS_SEEN, &REPACKLESS_WARNED, dtype) {
+        tracing::warn!(
+            "CPU dispatch without int8 repacks (no_repack loader): {dtype:?} weights \
+             take the naive GEMM path. Prefill will be several times slower than it \
+             should be; load with repacks for CPU inference."
+        );
+        // No `tracing` subscriber on the shipping mobile/FFI platforms;
+        // without this the warning — the pointer at the cause — is
+        // invisible exactly where the slow path runs.
+        eprintln!(
+            "[cera::cpu] CPU dispatch without int8 repacks (no_repack loader): {dtype:?} \
+             weights take the naive GEMM path; load with repacks for CPU inference."
         );
     }
 }
@@ -959,7 +1089,8 @@ pub(crate) fn gemm_preq_rowmajor(
         return true;
     }
     // Naive (non-repacked) fallback: standard-layout dispatch into a column
-    // scratch, transposed to `out[n, m]`.
+    // scratch, transposed to `out[n, m]`. (The repackless warning lives in
+    // `gemm_preq` below, so this path and the direct column callers share it.)
     let mut col_out = vec![0.0f32; m * n];
     if gemm_preq(gguf, wref, b_scales, b_quants, &mut col_out, m, n, k) {
         gemm_out_to_rows(&col_out, m, n, m, out);
@@ -1109,6 +1240,15 @@ pub(crate) fn gemm_preq(
         // kernels need dotprod (aarch64) / int8 (x86), which a low-tier
         // override (or ancient hardware) lacks. Returning false here would
         // leave stale activations in `out` — callers ignore the return.
+    }
+    // A skipped loader implies `repacked == None` (`with_repack_if` sets one
+    // or the other), so reaching here with the flag means the naive path is
+    // about to serve a weight that qualified for a repack. Warn here, in the
+    // shared core, so both the row-major wrapper above and the direct column
+    // callers (every llama prefill site) fail loud instead of slow-silent.
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+    if wref.repack_loader_skipped {
+        warn_repackless_dispatch(wref.dtype);
     }
 
     let ran = cpu::gemm_preq_dispatch(wref.dtype, data, b_scales, b_quants, out, m, n, k);
@@ -2939,5 +3079,246 @@ mod decode_attn_tests {
         // Unaligned k on quantized type
         let w_unaligned = WeightRef::new(3000, 100, DType::Q4_0, 4, 30);
         assert!(w_unaligned.slice_rows(0, 2).is_err());
+    }
+}
+
+/// Host-side pins for the no-repack contract: the skip flag
+/// (`with_repack_if`) and the warn-once it drives
+/// (`warn_repackless_dispatch`). The model-level test in `lfm2.rs` covers
+/// the same flag on real weights but needs a GGUF fixture (local-only);
+/// these run on every CI leg with a synthetic single-tensor GGUF.
+#[cfg(test)]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+mod repack_flag_tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
+    use crate::backend::cpu;
+    use crate::gguf::GgufFile;
+
+    /// Data-section offset of the synthetic GGUFs below (header + padding
+    /// to the GGUF alignment).
+    const SYNTH_DATA_OFF: usize = 32;
+
+    /// Minimal GGUF (valid header, zero tensors/metadata) with `size`
+    /// payload bytes appended at the data section. `weight_data` slices raw
+    /// backing bytes by offset, so the payload needs no tensor infos.
+    /// `paint` fills the payload (Q4_0 blocks need real scales for the
+    /// values to be non-zero; the flag tests leave zeros). Returns the file
+    /// plus the payload's `(start, size)` for `WeightRef::new`.
+    fn synth_gguf(size: usize, paint: impl Fn(&mut [u8])) -> (GgufFile, u64, usize) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x46554747u32.to_le_bytes()); // magic "GGUF"
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // kv_count
+        assert_eq!(bytes.len(), 24);
+        bytes.resize(SYNTH_DATA_OFF + size, 0);
+        paint(&mut bytes[SYNTH_DATA_OFF..]);
+        let gguf = GgufFile::from_bytes(std::sync::Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic GGUF parses");
+        (gguf, SYNTH_DATA_OFF as u64, size)
+    }
+
+    /// Paint each 18-byte Q4_0 block with scale 1.0 (`0x3C00`) and patterned
+    /// nibbles, so the dequantized weights are non-zero and varied (a zero
+    /// payload would let a no-op fallback pass a value comparison).
+    fn paint_q4_0_nonzero(payload: &mut [u8]) {
+        let (blocks, remainder) = payload.as_chunks_mut::<18>();
+        assert!(
+            remainder.is_empty(),
+            "payload is not a whole number of Q4_0 blocks"
+        );
+        for (b, block) in blocks.iter_mut().enumerate() {
+            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+            for (j, byte) in block[2..].iter_mut().enumerate() {
+                *byte = (b.wrapping_mul(31) + j.wrapping_mul(17) + 5) as u8;
+            }
+        }
+    }
+
+    /// Q4_0 payload (`m` rows of `k/32` blocks) with non-zero values.
+    fn synth_q4_0_gguf(m: usize, k: usize) -> (GgufFile, u64, usize) {
+        synth_gguf(m * (k / 32) * 18, paint_q4_0_nonzero)
+    }
+
+    #[test]
+    fn repack_skip_flag_marks_qualifying_weights() {
+        let (m, k) = (32usize, 64usize);
+        let (gguf, start, size) = synth_q4_0_gguf(m, k);
+        // On tiers without an int8 kernel nothing qualifies and nothing
+        // flags; assert the flag tracks the predicate, not a constant.
+        let can_repack = cpu::q4_0_repack_supported(m, k);
+        let lite = WeightRef::new(start, size, DType::Q4_0, m, k).with_repack_if(&gguf, false);
+        assert_eq!(lite.repack_loader_skipped, can_repack);
+        assert!(lite.repacked.is_none());
+        let full = WeightRef::new(start, size, DType::Q4_0, m, k).with_repack_if(&gguf, true);
+        assert!(!full.repack_loader_skipped);
+        assert_eq!(full.repacked.is_some(), can_repack);
+        // A dtype the CPU never repacks is never flagged, even when the
+        // loader skips (the false branch reads no weight bytes, so the
+        // Q4_0-layout size is harmless here).
+        let other = WeightRef::new(start, size, DType::Q6K, m, k).with_repack_if(&gguf, false);
+        assert!(!other.repack_loader_skipped);
+    }
+
+    /// The x86-only Q4_K arm of `with_repack_if` flags qualifying weights
+    /// exactly like the Q4_0 arm (same `loader_skipped` contract, same
+    /// predicate-tracking shape). Zero payload: the `false` branch reads no
+    /// weight bytes, and the repack itself is multiplication-only over the
+    /// blocks (zero-safe) when the predicate holds.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn repack_skip_flag_marks_q4k_on_x86() {
+        let (m, k) = (8usize, 256usize);
+        let (gguf, start, size) = synth_gguf(m * (k / 256) * 144, |_| {});
+        let can_repack = cpu::q4_k_repack_supported(m, k);
+        let lite = WeightRef::new(start, size, DType::Q4KM, m, k).with_repack_if(&gguf, false);
+        assert_eq!(lite.repack_loader_skipped, can_repack);
+        assert!(lite.repacked.is_none());
+        let full = WeightRef::new(start, size, DType::Q4KM, m, k).with_repack_if(&gguf, true);
+        assert!(!full.repack_loader_skipped);
+        assert_eq!(full.repacked.is_some(), can_repack);
+    }
+
+    /// Collects the `message` field of every `WARN` event. Minimal clone of
+    /// the capture in `cera/tests/unbatchable_warning.rs` (an integration
+    /// test whose helper this unit test cannot import); same no-target-
+    /// filter rationale.
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            let mut msg = String::new();
+            event.record(&mut Msg(&mut msg));
+            if !msg.is_empty() {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).push(msg);
+            }
+        }
+    }
+
+    #[test]
+    fn repackless_dispatch_warns_once() {
+        let (m, k, n) = (32usize, 64usize, 2usize);
+        let (gguf, start, size) = synth_q4_0_gguf(m, k);
+        if !cpu::q4_0_repack_supported(m, k) {
+            assert!(
+                std::env::var("CERA_REQUIRE_CPU_REPACK")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_CPU_REPACK is set but this tier cannot repack Q4_0, \
+                 so the repackless warn path executed zero times"
+            );
+            eprintln!("SKIP: tier cannot repack Q4_0, no skipped load to warn about");
+            return;
+        }
+        // Absolute warn counts: decoupled from whatever else ran in this
+        // binary (the dedupe set is process-global).
+        reset_repackless_warned();
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let warned = || {
+            capture
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|m| m.contains("without int8 repacks"))
+                .count()
+        };
+
+        let b: Vec<f32> = (0..n * k).map(|i| i as f32 * 0.01 - 0.5).collect();
+        let mut scales = vec![0.0f32; n * (k / 32)];
+        let mut quants = vec![0i8; n * k];
+        quantize_rows(&b, k, n, &mut scales, &mut quants);
+        let full = WeightRef::new(start, size, DType::Q4_0, m, k).with_repack_if(&gguf, true);
+        let lite = WeightRef::new(start, size, DType::Q4_0, m, k).with_repack_if(&gguf, false);
+        let mut out = vec![9.0f32; n * m];
+        // Full load first: the repacked path runs, and must stay silent.
+        assert!(gemm_preq_rowmajor(
+            &gguf, &full, &scales, &quants, &mut out, n, m, k
+        ));
+        assert_eq!(warned(), 0, "full load warned with repacks present");
+        let full_out = out.clone();
+        // Skipped load: the naive path runs and warns exactly once no
+        // matter how often it is served. Fresh sentinel per dispatch: the
+        // execution pin below must see what THIS dispatch wrote.
+        out.fill(9.0);
+        assert!(gemm_preq_rowmajor(
+            &gguf, &lite, &scales, &quants, &mut out, n, m, k
+        ));
+        assert_eq!(warned(), 1, "skipped load did not warn");
+        let lite_out = out.clone();
+        out.fill(9.0);
+        assert!(gemm_preq_rowmajor(
+            &gguf, &lite, &scales, &quants, &mut out, n, m, k
+        ));
+        assert_eq!(warned(), 1, "warning fired more than once per dtype");
+        // The fallback actually ran: the naive result matches the repacked
+        // one (summation order differs, so closeness, not equality) and is
+        // non-zero (the synthetic weights are painted for this). A lite
+        // path that writes nothing fails the closeness leg (the 9.0
+        // sentinel survives); a zero-emitting stub fails the non-zero leg.
+        let max_full = full_out.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        assert!(
+            max_full > 1.0,
+            "synthetic weights produced all-zero output; pin is vacuous"
+        );
+        let max_diff = lite_out
+            .iter()
+            .zip(full_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3 * max_full,
+            "lite diverged from repacked: max_diff={max_diff:.3e} max_full={max_full:.3e}"
+        );
+        // Column path (direct `gemm_preq`, the llama prefill shape) warns
+        // too — delta-counted past the row-major legs above.
+        reset_repackless_warned();
+        let before = warned();
+        let mut col_out = vec![7.0f32; m * n];
+        assert!(gemm_preq(
+            &gguf,
+            &lite,
+            &scales,
+            &quants,
+            &mut col_out,
+            m,
+            n,
+            k
+        ));
+        assert_eq!(
+            warned() - before,
+            1,
+            "column path stayed silent on skipped load"
+        );
+        assert!(
+            col_out.iter().any(|&v| v != 7.0),
+            "column dispatch wrote nothing"
+        );
     }
 }

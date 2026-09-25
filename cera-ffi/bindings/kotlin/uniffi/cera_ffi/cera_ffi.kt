@@ -2628,7 +2628,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 18871) {
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
@@ -2838,10 +2838,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 51530) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -2892,7 +2892,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
@@ -10779,8 +10779,9 @@ public interface SessionInterface {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendAudio`(
         `samples`: List<kotlin.Float>,
@@ -10836,8 +10837,9 @@ public interface SessionInterface {
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendImage`(
         `bytes`: kotlin.ByteArray,
@@ -11073,7 +11075,7 @@ public interface SessionInterface {
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray
 
@@ -11394,8 +11396,9 @@ open class Session :
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendAudio`(
@@ -11461,8 +11464,9 @@ open class Session :
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendImage`(
@@ -11892,7 +11896,7 @@ open class Session :
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     @Throws(FfiException::class)
     override fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray =
@@ -17857,11 +17861,15 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
  * caller stages a private writable directory; Android apps instead use
  * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
  * (which points the loader at `nativeLibraryDir`), so this call is not
- * needed there. Call once at startup, before [`hexagon_probe`] or
+ * needed there. Do not combine the two in one process unless merging
+ * both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+ * flow per app. Call once at startup, before [`hexagon_probe`] or
  * loading a model with [`BackendPreference::Hexagon`]. Returns the
  * number of skels written (0 when all were already present and fresh).
  * Re-running is cheap and idempotent (files are only rewritten when
- * their bytes differ, and the loader path is not duplicated).
+ * their bytes differ, and the loader path is not duplicated). A `dir`
+ * containing `;` is rejected: it would silently split into two loader
+ * search entries.
  */
 @Throws(FfiException::class)
 fun `hexagonInstallSkels`(`dir`: kotlin.String): kotlin.UInt =

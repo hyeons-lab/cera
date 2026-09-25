@@ -1365,7 +1365,9 @@ impl Session {
     /// Errors: [`CeraError::EmptyInput`] on empty input;
     /// [`CeraError::UnsupportedModality`] if the backend doesn't implement
     /// hidden-state extraction (probe via [`Model::supports_hidden_states`]);
-    /// [`CeraError::InvalidToken`] if any id is `>= vocab_size`.
+    /// [`CeraError::InvalidToken`] if any id is `>= vocab_size`;
+    /// [`CeraError::Backend`] if a backend fault was recorded during
+    /// extraction (surfaces instead of stale/zero vectors).
     ///
     /// For a per-call adapter choice instead of the session-attached set,
     /// see [`Self::hidden_states_for_tokens_using`].
@@ -1395,6 +1397,7 @@ impl Session {
     ) -> Result<Vec<f32>, CeraError> {
         self.ensure_usable()?;
         Self::resize_pools_for_cpuset();
+        self.discard_stale_decode_error();
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1475,6 +1478,11 @@ impl Session {
         let prev = std::mem::replace(&mut state.lora, lora);
         let out = model.hidden_states(tokens, state);
         state.lora = prev;
+        // The extraction forward returns bare vectors: drain the sticky
+        // slot so a recorded backend fault surfaces as `Err` instead of
+        // stale/zero vectors silently returned as `Ok`. Placed after the
+        // LoRA restore to preserve the no-fallible-step-between invariant.
+        self.check_decode_error()?;
         Ok(out)
     }
 
@@ -1560,9 +1568,11 @@ impl Session {
     ///    audio is too short to produce any encoder frames (less than
     ///    one window after center-padded STFT). Non-16kHz inputs are
     ///    automatically resampled to 16kHz.
-    /// 5. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
-    ///    propagated from the underlying [`Self::append_embeddings`]
-    ///    call.
+    /// 5. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`] /
+    ///    [`CeraError::Backend`] propagated from the underlying
+    ///    [`Self::append_embeddings`] call (a backend fault recorded
+    ///    mid-prefill surfaces as [`CeraError::Backend`], not
+    ///    [`CeraError::Cancelled`]).
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {
         self.ensure_usable()?;
         // Before validation like the other append entries: the CPU encode
@@ -1657,7 +1667,10 @@ impl Session {
     /// `SessionConfig::ubatch_size` so long prompts can be cancelled
     /// mid-flight. Returns `CeraError::Cancelled` when cancel fires
     /// before the full slice is consumed, or `CeraError::InvalidToken`
-    /// if any token ID is `>= vocab_size`.
+    /// if any token ID is `>= vocab_size`. A short prefill with no
+    /// cancel armed — or a backend failure recorded mid-prefill —
+    /// returns `CeraError::Backend`: a fault, not user cancellation
+    /// (a `Cancelled` here would read as resumable at the FFI boundary).
     ///
     /// On cancellation:
     /// - Tokens already fed through the kernel stay in KV; `position()`
@@ -1683,6 +1696,7 @@ impl Session {
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
         self.ensure_usable()?;
         Self::resize_pools_for_cpuset();
+        self.discard_stale_decode_error();
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1769,6 +1783,17 @@ impl Session {
             self.config.ubatch_size as usize,
             &self.cancel,
         );
+        // Drain the sticky decode-error slot BEFORE advancing any session
+        // accounting: a backend failure mid-prefill records the error
+        // out-of-band while `consumed` still counts every chunk (only the
+        // Hexagon override returns a short prefix). Draining after the
+        // advance would position the session over unverified KV, then
+        // return Err — the next op would continue past the hole. A
+        // faulted append advances nothing and clears `last_logits` like
+        // the short path below: without this, logits from a previous
+        // successful append would survive and seed the next `generate()`
+        // from pre-append state.
+        self.check_decode_error_clearing_logits()?;
         self.prefill_elapsed += prefill_start.elapsed();
         self.prefill_tokens = self.prefill_tokens.saturating_add(consumed as u32);
         self.current_pos += consumed;
@@ -1784,11 +1809,93 @@ impl Session {
             // text from mid-prompt state. Force the caller to re-append
             // (or `reset`) before generating.
             self.last_logits = None;
-            Err(CeraError::Cancelled)
+            if self.cancel.load(Ordering::Relaxed) {
+                Err(CeraError::Cancelled)
+            } else {
+                // Short prefill with no cancel and no recorded backend
+                // error: the backend stopped early for an unknown reason.
+                // A fault, not user cancellation.
+                Err(CeraError::Backend(format!(
+                    "chunked prefill returned short without cancel (consumed {consumed}/{} tokens)",
+                    tokens.len()
+                )))
+            }
         } else {
             self.last_logits = logits;
             Ok(())
         }
+    }
+
+    /// Poll the model's sticky decode-error slot, converting a recorded
+    /// backend failure into a session error.
+    ///
+    /// GPU/NPU backends surface *asynchronous* failures (lost device,
+    /// kernel errors, NPU faults) out-of-band: the forward call returns
+    /// normally — possibly with stale or zeroed outputs — and records
+    /// the real error where [`Model::take_decode_error`] drains it.
+    /// Every forward on the session's prefill/decode/spec paths is
+    /// followed by this check so a poisoned backend surfaces as `Err`
+    /// at the first affected call instead of silently producing
+    /// garbage tokens.
+    ///
+    /// Entry points (`append_tokens`, `append_embeddings`,
+    /// `generate_inner`, `hidden_states_for_tokens_inner`) *discard* a
+    /// stale slot before doing work, so only errors recorded *during*
+    /// the current call are reported — a previous call's failure can't
+    /// fail a fresh one.
+    fn check_decode_error(&self) -> Result<(), CeraError> {
+        if let Some(err) = self.model.take_decode_error() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Discard any error a previous call recorded, so only failures from
+    /// the current call surface. Every fallible entry point (`append_*`,
+    /// `generate_inner`, `hidden_states_for_tokens_inner`) calls this
+    /// first; see [`Self::check_decode_error`] for the discipline.
+    fn discard_stale_decode_error(&self) {
+        let _ = self.model.take_decode_error();
+    }
+
+    /// Drain the sticky slot, clearing `last_logits` on fault so no stale
+    /// seed survives for the next `generate()`. Both append paths share
+    /// this (their ordering comments differ and stay at the call sites).
+    fn check_decode_error_clearing_logits(&mut self) -> Result<(), CeraError> {
+        if let Err(e) = self.check_decode_error() {
+            self.last_logits = None;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Sync the verified frontier for a generate-loop fault drain so the
+    /// early return matches the loop tail: `current_pos`, the cross-thread
+    /// `position_atomic`, and `token_history` (truncated to its length before
+    /// this iteration's push, since the current iteration did not complete).
+    /// All nine drain sites share this (six plain, three spec); the audio
+    /// sites need the atomic store because the audio path advances `pos`
+    /// without storing. Truncating is uniform even where the pushed token
+    /// already verified (a late audio fault past its embedding drain):
+    /// history lags rather than leads the frontier, and nothing drafts
+    /// from history on those paths. Takes disjoint fields instead of
+    /// `&mut self` because the audio decoder borrows `self` immutably
+    /// across the whole loop (a `&mut self` helper is E0502).
+    fn sync_frontier_on_err(
+        current_pos: &mut usize,
+        position_atomic: &AtomicU32,
+        token_history: &mut Vec<u32>,
+        pos: usize,
+        history_len: usize,
+        err: CeraError,
+    ) -> CeraError {
+        // Sync the verified frontier: `pos` counts verified
+        // iterations (this drain precedes its `+= 1`); the
+        // loop-end sync is skipped on this early return.
+        *current_pos = pos;
+        position_atomic.store(pos as u32, Ordering::Relaxed);
+        token_history.truncate(history_len);
+        err
     }
 
     /// Append a sequence of pre-computed hidden-dim embeddings —
@@ -1804,7 +1911,9 @@ impl Session {
     /// `embeddings` is a flat row-major buffer of length
     /// `n_tokens * hidden_size`. Position advances by `n_tokens`.
     /// Returns `Err(EmptyInput)` for `n_tokens == 0`,
-    /// `Err(Backend(...))` for shape mismatch.
+    /// `Err(Backend(...))` for shape mismatch. A backend failure recorded
+    /// mid-prefill surfaces as `Err(Backend(..))` (a fault, not user
+    /// cancellation); `last_logits` is cleared like `append_tokens`.
     ///
     /// Mirrors `append_tokens`'s context-shift logic
     /// (`n_keep`-aware) and `last_logits` semantics. Cancellation
@@ -1829,6 +1938,7 @@ impl Session {
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
         Self::resize_pools_for_cpuset();
+        self.discard_stale_decode_error();
         if n_tokens == 0 {
             return Err(CeraError::EmptyInput);
         }
@@ -1926,6 +2036,12 @@ impl Session {
                 self.current_pos,
                 &mut self.state,
             );
+            // Drain BEFORE advancing: on fault this chunk's KV may not
+            // exist, so position and accounting must not advance over the
+            // hole (unlike `append_tokens`, where `consumed` measures what
+            // the backend actually wrote). A faulted append also clears
+            // `last_logits` so no stale seed survives for `generate()`.
+            self.check_decode_error_clearing_logits()?;
             self.prefill_elapsed += prefill_start.elapsed();
             self.prefill_tokens = self.prefill_tokens.saturating_add((end - ti) as u32);
             self.current_pos += end - ti;
@@ -2009,8 +2125,11 @@ impl Session {
     /// 5. [`CeraError::Backend`] when the encoder's
     ///    `projection_dim` doesn't match the LLM's `hidden_size`
     ///    (mismatched mmproj loaded against a different LLM).
-    /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`]
-    ///    propagated from [`Self::append_embeddings`].
+    /// 6. [`CeraError::ContextOverflow`] / [`CeraError::Cancelled`] /
+    ///    [`CeraError::Backend`] propagated from
+    ///    [`Self::append_embeddings`] (a backend fault recorded
+    ///    mid-prefill surfaces as [`CeraError::Backend`], not
+    ///    [`CeraError::Cancelled`]).
     pub fn append_image(&mut self, bytes: &[u8]) -> Result<(), CeraError> {
         self.ensure_usable()?;
         self.append_image_with_opts(bytes, self.image_max_long_size)
@@ -2485,6 +2604,7 @@ impl Session {
     ) -> Result<GenerateSummary, CeraError> {
         self.ensure_usable()?;
         Self::resize_pools_for_cpuset();
+        self.discard_stale_decode_error();
         // Prefill happened in `append_*`, which accumulated its token count and
         // wall time on the session. Consume them here — unconditionally, so
         // EVERY `generate()` call (including the no-op early exits below)
@@ -2859,6 +2979,7 @@ impl Session {
                 text_done = true;
             }
 
+            let history_len = self.token_history.len();
             self.token_history.push(token);
             if !is_audio_transition {
                 pending.push(token);
@@ -2877,6 +2998,16 @@ impl Session {
                 }
 
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
+                if let Err(e) = self.check_decode_error() {
+                    return Err(Self::sync_frontier_on_err(
+                        &mut self.current_pos,
+                        &self.position_atomic,
+                        &mut self.token_history,
+                        pos,
+                        history_len,
+                        e,
+                    ));
+                }
                 pos += 1;
 
                 let mut audio_budget =
@@ -2909,6 +3040,24 @@ impl Session {
                                 pos,
                                 &mut self.state,
                             );
+                            // `decode_frame` runs the vocoder, not the LLM: it
+                            // takes no `Model` handle, so it cannot poison the
+                            // slot between the `forward_embedding` check above
+                            // and this one — this drain covers exactly the
+                            // `TOKEN_TEXT_END` forward. (The vocoder's own
+                            // failures, if any, don't flow through this slot;
+                            // the standalone driver's drains live in
+                            // `audio_engine::check_audio_decode_error`.)
+                            if let Err(e) = self.check_decode_error() {
+                                return Err(Self::sync_frontier_on_err(
+                                    &mut self.current_pos,
+                                    &self.position_atomic,
+                                    &mut self.token_history,
+                                    pos,
+                                    history_len,
+                                    e,
+                                ));
+                            }
                             if greedy {
                                 greedy_next = crate::sampler::argmax(&text_end_logits);
                             }
@@ -2939,6 +3088,16 @@ impl Session {
                         logits =
                             self.model
                                 .forward_from_embedding(&audio_emb, pos, &mut self.state);
+                        if let Err(e) = self.check_decode_error() {
+                            return Err(Self::sync_frontier_on_err(
+                                &mut self.current_pos,
+                                &self.position_atomic,
+                                &mut self.token_history,
+                                pos,
+                                history_len,
+                                e,
+                            ));
+                        }
                         if greedy {
                             greedy_next = crate::sampler::argmax(&logits);
                         }
@@ -2950,6 +3109,16 @@ impl Session {
                     emb =
                         self.model
                             .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
+                    if let Err(e) = self.check_decode_error() {
+                        return Err(Self::sync_frontier_on_err(
+                            &mut self.current_pos,
+                            &self.position_atomic,
+                            &mut self.token_history,
+                            pos,
+                            history_len,
+                            e,
+                        ));
+                    }
                     pos += 1;
                     self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
@@ -2985,10 +3154,30 @@ impl Session {
                 // — that's fine, greedy mode never reads it after the
                 // initial argmax.
                 greedy_next = self.model.forward_greedy(&[token], pos, &mut self.state);
+                if let Err(e) = self.check_decode_error() {
+                    return Err(Self::sync_frontier_on_err(
+                        &mut self.current_pos,
+                        &self.position_atomic,
+                        &mut self.token_history,
+                        pos,
+                        history_len,
+                        e,
+                    ));
+                }
             } else {
                 // Stochastic: full forward. Logits stay pristine for the
                 // next iteration's sample and for chaining across calls.
                 logits = self.model.forward(&[token], pos, &mut self.state);
+                if let Err(e) = self.check_decode_error() {
+                    return Err(Self::sync_frontier_on_err(
+                        &mut self.current_pos,
+                        &self.position_atomic,
+                        &mut self.token_history,
+                        pos,
+                        history_len,
+                        e,
+                    ));
+                }
             }
             pos += 1;
             self.position_atomic.store(pos as u32, Ordering::Relaxed);
@@ -3162,6 +3351,8 @@ impl Session {
             }
             // `t`'s KV is not in the cache yet; a forward below (plain or the
             // verify batch) adds it.
+            let spec_history_len = self.token_history.len();
+            let spec_pos = self.current_pos;
             emit!(t);
             if generated >= opts.max_tokens {
                 // `t` is the final token: add its KV (so `current_pos` matches
@@ -3172,6 +3363,16 @@ impl Session {
                 let _ = self
                     .model
                     .forward_greedy(&[t], self.current_pos, &mut self.state);
+                if let Err(e) = self.check_decode_error() {
+                    return Err(Self::sync_frontier_on_err(
+                        &mut self.current_pos,
+                        &self.position_atomic,
+                        &mut self.token_history,
+                        spec_pos,
+                        spec_history_len,
+                        e,
+                    ));
+                }
                 self.current_pos += 1;
                 self.position_atomic
                     .store(self.current_pos as u32, Ordering::Relaxed);
@@ -3195,6 +3396,16 @@ impl Session {
             }
             if draft.is_empty() {
                 next_logits = self.model.forward(&[t], self.current_pos, &mut self.state);
+                if let Err(e) = self.check_decode_error() {
+                    return Err(Self::sync_frontier_on_err(
+                        &mut self.current_pos,
+                        &self.position_atomic,
+                        &mut self.token_history,
+                        spec_pos,
+                        spec_history_len,
+                        e,
+                    ));
+                }
                 self.current_pos += 1;
                 self.position_atomic
                     .store(self.current_pos as u32, Ordering::Relaxed);
@@ -3214,6 +3425,20 @@ impl Session {
                 vocab,
                 &mut rewinds_proven,
             );
+            // Verify ran target forwards through the shared model handle;
+            // drain any failure it recorded before trusting `vr` — an
+            // accepted draft decided from poisoned logits is a silent
+            // corruption, not a speedup.
+            if let Err(e) = self.check_decode_error() {
+                return Err(Self::sync_frontier_on_err(
+                    &mut self.current_pos,
+                    &self.position_atomic,
+                    &mut self.token_history,
+                    spec_pos,
+                    spec_history_len,
+                    e,
+                ));
+            }
 
             // Emit accepted drafts under the stop / budget policy. On an early
             // stop, roll the KV back to the tokens actually kept.
@@ -3753,25 +3978,135 @@ mod tests {
 
     struct MockTestModel {
         config: crate::model::ModelConfig,
+        /// Failure armed for the next `forward`-family call: taken (fail
+        /// once), recorded into `decode_error`, and zero logits returned.
+        fail_forward: std::sync::Mutex<Option<CeraError>>,
+        /// `forward`-family calls to let succeed before an armed failure
+        /// fires (0 = the next call fails).
+        fail_after: std::sync::Mutex<usize>,
+        /// Sticky decode-error slot drained by `take_decode_error`.
+        decode_error: std::sync::Mutex<Option<CeraError>>,
+        /// `forward_prefill_logits_all` calls, distinguishing spec accept
+        /// rounds (more tokens per batch) from reject rounds.
+        batches_seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockTestModel {
+        fn new(config: crate::model::ModelConfig) -> Self {
+            Self {
+                config,
+                fail_forward: std::sync::Mutex::new(None),
+                fail_after: std::sync::Mutex::new(0),
+                decode_error: std::sync::Mutex::new(None),
+                batches_seen: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Arm `err` for the next `forward`-family call (fail once).
+        fn fail_next_forward(&self, err: CeraError) {
+            *self.fail_after.lock().unwrap() = 0;
+            *self.fail_forward.lock().unwrap() = Some(err);
+        }
+
+        /// Arm `err` for the `forward`-family call after `n` succeeding
+        /// calls (fail once), so tests can fault mid-loop.
+        fn fail_after_n_forwards(&self, n: usize, err: CeraError) {
+            *self.fail_after.lock().unwrap() = n;
+            *self.fail_forward.lock().unwrap() = Some(err);
+        }
+
+        /// Inject `err` directly into the poison slot, as if a previous
+        /// call's backend had recorded it.
+        fn poison(&self, err: CeraError) {
+            *self.decode_error.lock().unwrap() = Some(err);
+        }
+
+        /// Fail-once hook shared by the `forward`-family test doubles:
+        /// moves an armed error into the poison slot once `fail_after`
+        /// succeeding calls have elapsed. Callers always return their
+        /// fixed shapes; the session surfaces the recorded fault via
+        /// the slot.
+        fn record_armed_failure(&self) {
+            let mut after = self.fail_after.lock().unwrap();
+            if *after > 0 {
+                *after -= 1;
+                return;
+            }
+            drop(after);
+            if let Some(err) = self.fail_forward.lock().unwrap().take() {
+                *self.decode_error.lock().unwrap() = Some(err);
+            }
+        }
     }
 
     impl crate::model::Model for MockTestModel {
         fn forward(
             &self,
-            _tokens: &[u32],
+            tokens: &[u32],
             _pos: usize,
-            _state: &mut crate::kv_cache::InferenceState,
+            state: &mut crate::kv_cache::InferenceState,
         ) -> Vec<f32> {
+            // Record an armed failure (fail once); the session surfaces it
+            // via the poison slot. Advance regardless: the session errors
+            // out before observing KV state, and the verify path truncates
+            // (asserting `len <= seq_len`) before the session's post-verify
+            // check sees the error.
+            self.record_armed_failure();
+            state.seq_len += tokens.len();
             vec![0.0; self.config.vocab_size]
         }
         fn config(&self) -> &crate::model::ModelConfig {
             &self.config
         }
+        fn take_decode_error(&self) -> Option<CeraError> {
+            self.decode_error.lock().unwrap().take()
+        }
+        fn supports_all_logits(&self) -> bool {
+            true
+        }
+        fn forward_prefill_logits_all(
+            &self,
+            tokens: &[u32],
+            _start_pos: usize,
+            state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            self.batches_seen.fetch_add(1, Ordering::Relaxed);
+            // Record an armed failure (fail once); always return the full
+            // row-major block (`verify_draft` asserts the row count) and
+            // advance (it truncates before the session's post-verify check
+            // surfaces the recorded fault).
+            self.record_armed_failure();
+            state.seq_len += tokens.len();
+            vec![0.0; tokens.len() * self.config.vocab_size]
+        }
+        fn supports_embedding_input(&self) -> bool {
+            true
+        }
+        fn forward_from_embedding(
+            &self,
+            _embedding: &[f32],
+            _pos: usize,
+            state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            self.record_armed_failure();
+            state.seq_len += 1;
+            vec![0.0; self.config.vocab_size]
+        }
+        fn supports_hidden_states(&self) -> bool {
+            true
+        }
+        fn hidden_states(
+            &self,
+            tokens: &[u32],
+            _state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            self.record_armed_failure();
+            vec![0.0; tokens.len() * self.config.hidden_size.max(1)]
+        }
     }
 
-    #[test]
-    fn append_tokens_rejects_out_of_bounds_token() {
-        let config = crate::model::ModelConfig {
+    fn mock_config() -> crate::model::ModelConfig {
+        crate::model::ModelConfig {
             architecture: "mock".into(),
             n_layers: 0,
             hidden_size: 0,
@@ -3791,8 +4126,13 @@ mod tests {
             moe: None,
             is_causal: true,
             class_labels: Vec::new(),
-        };
-        let model = Arc::new(MockTestModel { config });
+        }
+    }
+
+    #[test]
+    fn append_tokens_rejects_out_of_bounds_token() {
+        let config = mock_config();
+        let model = Arc::new(MockTestModel::new(config));
         let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
         let mut session = Session::new(
             model,
@@ -3820,28 +4160,8 @@ mod tests {
         // bert/qwen35/gemma4/bailingmoe3): install must refuse rather than
         // silently produce base-model output. The gate fires before the
         // adapter is even inspected, so any adapter trips it.
-        let config = crate::model::ModelConfig {
-            architecture: "mock".into(),
-            n_layers: 0,
-            hidden_size: 0,
-            intermediate_size: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: 100,
-            max_seq_len: 1024,
-            rope_theta: 0.0,
-            rms_norm_eps: 0.0,
-            block_types: Vec::new(),
-            conv_kernel_size: None,
-            ssm: None,
-            kv_heads_per_layer: Vec::new(),
-            scalars: crate::model::ScalarMultipliers::default(),
-            moe: None,
-            is_causal: true,
-            class_labels: Vec::new(),
-        };
-        let model = Arc::new(MockTestModel { config });
+        let config = mock_config();
+        let model = Arc::new(MockTestModel::new(config));
         let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
         let mut session = Session::new(
             model,
@@ -3872,28 +4192,8 @@ mod tests {
 
     #[test]
     fn session_into_chat_refusal_preserves_session() {
-        let config = crate::model::ModelConfig {
-            architecture: "mock".into(),
-            n_layers: 0,
-            hidden_size: 0,
-            intermediate_size: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: 100,
-            max_seq_len: 1024,
-            rope_theta: 0.0,
-            rms_norm_eps: 0.0,
-            block_types: Vec::new(),
-            conv_kernel_size: None,
-            ssm: None,
-            kv_heads_per_layer: Vec::new(),
-            scalars: crate::model::ScalarMultipliers::default(),
-            moe: None,
-            is_causal: true,
-            class_labels: Vec::new(),
-        };
-        let model = Arc::new(MockTestModel { config });
+        let config = mock_config();
+        let model = Arc::new(MockTestModel::new(config));
         let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
         let session = Session::new(
             model,
@@ -3912,28 +4212,8 @@ mod tests {
 
     #[test]
     fn session_into_chat_refuses_sliding_context() {
-        let config = crate::model::ModelConfig {
-            architecture: "mock".into(),
-            n_layers: 0,
-            hidden_size: 0,
-            intermediate_size: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: 100,
-            max_seq_len: 1024,
-            rope_theta: 0.0,
-            rms_norm_eps: 0.0,
-            block_types: Vec::new(),
-            conv_kernel_size: None,
-            ssm: None,
-            kv_heads_per_layer: Vec::new(),
-            scalars: crate::model::ScalarMultipliers::default(),
-            moe: None,
-            is_causal: true,
-            class_labels: Vec::new(),
-        };
-        let model = Arc::new(MockTestModel { config });
+        let config = mock_config();
+        let model = Arc::new(MockTestModel::new(config));
         let tokenizer = Arc::new(BpeTokenizer::chat_for_test());
         let session = Session::new(
             model,
@@ -3951,6 +4231,347 @@ mod tests {
         assert_eq!(err, chat::ValidationError::SlidingContext);
         assert!(preserved.is_usable());
         assert_eq!(preserved.position(), 0);
+    }
+
+    /// Build a session over a poison-capable mock, returning the model
+    /// handle (for arming failures) alongside the session.
+    fn poison_test_session() -> (Arc<MockTestModel>, Session) {
+        poison_test_session_with_config(mock_config())
+    }
+
+    fn poison_test_session_with_config(
+        config: crate::model::ModelConfig,
+    ) -> (Arc<MockTestModel>, Session) {
+        let model = Arc::new(MockTestModel::new(config));
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let session = Session::new(
+            model.clone(),
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+        (model, session)
+    }
+
+    fn greedy_opts(max_tokens: u32) -> GenerateOpts {
+        GenerateOpts {
+            temperature: 0.0,
+            max_tokens,
+            ..GenerateOpts::default()
+        }
+    }
+
+    #[test]
+    fn generate_fails() {
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        model.fail_next_forward(CeraError::Backend("injected decode fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&greedy_opts(4), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "injected decode fault"));
+        assert!(
+            sink.tokens.is_empty(),
+            "faulted generate emitted {:?}",
+            sink.tokens
+        );
+    }
+
+    #[test]
+    fn stochastic_generate_fails() {
+        // The stochastic-`forward` drain (not just the greedy one) must
+        // surface a recorded fault: the default opts are stochastic.
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        model.fail_next_forward(CeraError::Backend("injected stochastic fault".into()));
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            max_tokens: 4,
+            ..GenerateOpts::default()
+        };
+        let err = session.generate(&opts, &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+    }
+
+    #[test]
+    fn generate_fault_syncs_verified_prefix() {
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        // Fail on the third decode forward: two iterations verify first.
+        model.fail_after_n_forwards(2, CeraError::Backend("late fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&greedy_opts(8), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "late fault"));
+        // KV[0..5] verified (3 prefill + 2 decoded); the authoritative
+        // cursor resumes there instead of rewinding to the stale entry
+        // position (which would misalign the append-only KV on the next
+        // op). `position()` already tracked the frontier via its
+        // per-iteration store; the fix is the cursor agreeing with it.
+        assert_eq!(session.current_pos, 5);
+        assert_eq!(session.position(), 5);
+        assert!(session.last_logits().is_none());
+    }
+
+    #[test]
+    fn generate_fault_truncates_unverified_history() {
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        // Fail on the third decode forward: two iterations verify first,
+        // the third pushes its token before the failing forward.
+        model.fail_after_n_forwards(2, CeraError::Backend("late fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&greedy_opts(8), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "late fault"));
+        // History must mirror the verified KV frontier (5): the faulted
+        // iteration's pushed token never verified and must not survive to
+        // pollute later spec drafts (or grow history across faulted calls).
+        assert_eq!(session.current_pos, 5);
+        assert_eq!(session.position(), 5);
+        assert_eq!(session.token_history.len(), 5);
+        assert_eq!(&session.token_history[..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn frontier_sync_repairs_audio_skew() {
+        // The audio path advances `pos` without storing `position_atomic`,
+        // so a fault there can leave `current_pos`, `position()`, and
+        // `token_history` all disagreeing. No weights-free test can drive
+        // a fault through the audio branch of `generate`, so pin the
+        // shared drain helper directly against that exact skew shape.
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        session.current_pos = 3;
+        session.position_atomic.store(3, Ordering::Relaxed);
+        session.token_history.extend([0, 0, 0]);
+        model.poison(CeraError::Backend("audio fault".into()));
+        let err = match session.check_decode_error() {
+            Err(e) => Session::sync_frontier_on_err(
+                &mut session.current_pos,
+                &session.position_atomic,
+                &mut session.token_history,
+                5,
+                5,
+                e,
+            ),
+            Ok(()) => panic!("poisoned slot must drain as Err"),
+        };
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "audio fault"));
+        assert_eq!(session.current_pos, 5);
+        assert_eq!(session.position(), 5);
+        assert_eq!(session.token_history.len(), 5);
+    }
+
+    #[test]
+    fn generate_discards_stale() {
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        // A previous call's failure must not fail this generation: the
+        // entry discard drops it before the first forward.
+        model.poison(CeraError::Backend("stale fault".into()));
+        let mut sink = RecordingSink::default();
+        let summary = session.generate(&greedy_opts(4), &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 4);
+        assert_eq!(summary.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(sink.tokens, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn append_fails_on_prefill() {
+        let (model, mut session) = poison_test_session();
+        model.fail_next_forward(CeraError::Backend("injected prefill fault".into()));
+        let err = session.append_tokens(&[1, 2, 3]).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "injected prefill fault"));
+        // The drain runs before any accounting, so a faulted append
+        // advances nothing: no position, no stats, no draft history, and
+        // no logits (a subsequent `generate` must see `EmptyInput`,
+        // not mid-prefill state).
+        assert_eq!(session.position(), 0);
+        assert_eq!(session.prefill_tokens, 0);
+        assert_eq!(session.prefill_elapsed, Duration::ZERO);
+        assert!(session.token_history.is_empty());
+        assert!(session.last_logits().is_none());
+    }
+
+    #[test]
+    fn append_discards_stale() {
+        let (model, mut session) = poison_test_session();
+        model.poison(CeraError::Backend("stale fault".into()));
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        assert!(session.last_logits().is_some());
+    }
+
+    #[test]
+    fn append_fault_clears_prior_logits() {
+        // The fresh-session case (`append_fails_on_prefill`) cannot see
+        // the stale seed: pre-seed `last_logits` with a successful append,
+        // then fault the next one. Without the drain-path clear, the old
+        // logits would survive and seed a silent wrong `generate()`.
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        assert!(session.last_logits().is_some());
+        model.fail_next_forward(CeraError::Backend("injected prefill fault".into()));
+        let err = session.append_tokens(&[4, 5]).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+        assert!(session.last_logits().is_none());
+        let mut sink = RecordingSink::default();
+        assert!(matches!(
+            session.generate(&greedy_opts(2), &mut sink),
+            Err(CeraError::EmptyInput)
+        ));
+    }
+
+    #[test]
+    fn hidden_states_fault_surfaces_instead_of_stale_vectors() {
+        // Extraction returns bare vectors: without the post-call drain a
+        // recorded fault would come back as `Ok` zeros. Fault it and
+        // demand the error.
+        let (model, mut session) = poison_test_session();
+        model.fail_next_forward(CeraError::Backend("injected extraction fault".into()));
+        let err = session.hidden_states_for_tokens(&[1, 2]).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+    }
+
+    #[test]
+    fn hidden_states_discards_stale() {
+        let (model, mut session) = poison_test_session();
+        model.poison(CeraError::Backend("stale fault".into()));
+        assert!(session.hidden_states_for_tokens(&[1, 2]).is_ok());
+    }
+
+    #[test]
+    fn append_embeddings_fault_advances_nothing() {
+        // The per-chunk drain must fire before position and accounting
+        // advance: on fault, the chunk's KV may not exist, and advancing
+        // over the hole corrupts every later position.
+        let mut config = mock_config();
+        config.hidden_size = 8;
+        let (model, mut session) = poison_test_session_with_config(config);
+        model.fail_next_forward(CeraError::Backend("injected embedding fault".into()));
+        let err = session.append_embeddings(&[0.0; 16], 2).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+        // The per-chunk drain fires before position AND accounting advance:
+        // a drain placed between the accounting and position lines must fail.
+        assert_eq!(session.position(), 0);
+        assert_eq!(session.prefill_tokens, 0);
+        assert_eq!(session.prefill_elapsed, Duration::ZERO);
+        assert!(session.last_logits().is_none());
+    }
+
+    /// Drafter returning a canned script, one entry per `draft` call
+    /// (empty once the script runs out), for deterministic spec tests.
+    #[derive(Clone)]
+    struct CannedDrafter {
+        script: Vec<Vec<u32>>,
+        calls: usize,
+    }
+
+    impl crate::spec::Drafter for CannedDrafter {
+        fn draft(&mut self, _tokens: &[u32], max_k: usize) -> Vec<u32> {
+            let d = self.script.get(self.calls).cloned().unwrap_or_default();
+            self.calls += 1;
+            d.into_iter().take(max_k).collect()
+        }
+        fn clone_drafter(&self) -> Box<dyn crate::spec::Drafter> {
+            Box::new(self.clone())
+        }
+        fn reset(&mut self) {
+            self.calls = 0;
+        }
+    }
+
+    fn spec_opts(max_tokens: u32, k: usize) -> GenerateOpts {
+        GenerateOpts {
+            temperature: 0.0,
+            max_tokens,
+            spec: Some(SpecDecode { ngram: 2, k }),
+            ..GenerateOpts::default()
+        }
+    }
+
+    fn spec_test_session(script: Vec<Vec<u32>>) -> (Arc<MockTestModel>, Session) {
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        session.drafter = Some(Box::new(CannedDrafter { script, calls: 0 }));
+        (model, session)
+    }
+
+    #[test]
+    fn spec_accepts_matching_draft() {
+        // Zero-logit rows argmax to 0, so canned 0-drafts verify clean.
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        let mut sink = RecordingSink::default();
+        let summary = session.generate(&spec_opts(3, 2), &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        // One verify batch covered all three tokens (t + 2 accepted).
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn spec_rejects_mismatched_draft() {
+        let (model, mut session) = spec_test_session(vec![vec![5, 5], vec![5, 5], vec![5, 5]]);
+        let mut sink = RecordingSink::default();
+        let summary = session.generate(&spec_opts(3, 2), &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        // Every round rejected: two verify batches (the final token takes
+        // the plain final-step forward, not a batch).
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn spec_surfaces_verify_poison() {
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        model.fail_next_forward(CeraError::Backend("injected verify fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&spec_opts(4, 2), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(ref s) if s == "injected verify fault"));
+        assert!(
+            sink.tokens.is_empty(),
+            "faulted spec generate emitted {:?}",
+            sink.tokens
+        );
+        // The fault was recorded by the verify batch, not a plain step.
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 1);
+        // The faulted token was emitted (pushed to history) before the
+        // verify batch failed, so it never verified: history must mirror
+        // the verified frontier (3), not run one ahead into later drafts.
+        assert_eq!(session.current_pos, 3);
+        assert_eq!(session.position(), 3);
+        assert_eq!(session.token_history.len(), 3);
+    }
+
+    #[test]
+    fn spec_final_step_fault_syncs_frontier() {
+        // `max_tokens = 1`: the first emission takes the final-token path
+        // (`forward_greedy`, no verify batch). Fault it and demand the
+        // same frontier parity as the verify-batch site.
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        model.fail_next_forward(CeraError::Backend("injected final-step fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&spec_opts(1, 2), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+        // No verify batch ran: the fault came from the final-step forward.
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+        assert_eq!(session.current_pos, 3);
+        assert_eq!(session.position(), 3);
+        assert_eq!(session.token_history.len(), 3);
+    }
+
+    #[test]
+    fn spec_plain_step_fault_syncs_frontier() {
+        // An empty draft takes the plain-step path (`forward`, no verify
+        // batch). Fault it and demand the same frontier parity.
+        let (model, mut session) = spec_test_session(vec![vec![]]);
+        model.fail_next_forward(CeraError::Backend("injected plain-step fault".into()));
+        let mut sink = RecordingSink::default();
+        let err = session.generate(&spec_opts(4, 2), &mut sink).unwrap_err();
+        assert!(matches!(err, CeraError::Backend(_)));
+        // No verify batch ran: the fault came from the plain-step forward.
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+        assert_eq!(session.current_pos, 3);
+        assert_eq!(session.position(), 3);
+        assert_eq!(session.token_history.len(), 3);
     }
 }
 

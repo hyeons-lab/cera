@@ -19,7 +19,7 @@
 //! own model.
 #![cfg(feature = "gpu")]
 
-use std::path::PathBuf;
+mod common;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
@@ -28,29 +28,6 @@ use cera::model::{Model, load_model, load_model_gpu};
 /// The `core` fixture set's LFM2 model, fetched on pull requests, so this
 /// file gets real PR coverage rather than an `arch`-tier skip-as-pass.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
-
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
-
-fn fixture_or_skip() -> Option<PathBuf> {
-    let p = models_dir().join(FIXTURE);
-    if p.exists() {
-        return Some(p);
-    }
-    assert!(
-        std::env::var("CERA_REQUIRE_MODEL")
-            .unwrap_or_default()
-            .is_empty(),
-        "CERA_REQUIRE_MODEL is set but {FIXTURE} is absent at {}",
-        p.display()
-    );
-    eprintln!("[gpu-embd] SKIP (absent): {}", p.display());
-    None
-}
 
 /// A model instance per call; see the module docs on statefulness.
 fn load_gpu(path: &std::path::Path) -> Option<Box<dyn Model>> {
@@ -121,7 +98,7 @@ const MIN_CROSS_BACKEND_COSINE: f32 = 0.99;
 /// `UnsupportedModality` before reaching any of the work below.
 #[test]
 fn gpu_model_advertises_embedding_input() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -135,7 +112,7 @@ fn gpu_model_advertises_embedding_input() {
 /// The oracle: identical embedding in, matching logits out.
 #[test]
 fn forward_from_embedding_matches_the_cpu_model() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -170,7 +147,7 @@ fn forward_from_embedding_matches_the_cpu_model() {
 /// `pos` threaded through wrongly looks like.
 #[test]
 fn successive_embeddings_advance_the_kv_cache() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -207,7 +184,7 @@ fn successive_embeddings_advance_the_kv_cache() {
 /// prompt lands its patches at the wrong positions on one backend only.
 #[test]
 fn cpu_and_gpu_agree_on_position_after_a_prefix() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -260,7 +237,7 @@ fn cpu_and_gpu_agree_on_position_after_a_prefix() {
 /// a bare cosine to interpret.
 #[test]
 fn forward_embedding_matches_the_cpu_model() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -305,7 +282,7 @@ fn forward_embedding_matches_the_cpu_model() {
 /// `forward_from_embedding`, different tail.
 #[test]
 fn forward_hidden_from_embedding_matches_the_cpu_model() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };
@@ -340,7 +317,7 @@ fn forward_hidden_from_embedding_matches_the_cpu_model() {
 /// if the override seeded the frames wrongly, or skipped them.
 #[test]
 fn multi_frame_prefill_from_embeddings_matches_the_cpu_model() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };

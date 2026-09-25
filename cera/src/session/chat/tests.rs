@@ -282,9 +282,11 @@ fn actual_recovery_restores_pending_boundary_and_full_metadata() {
         let before = snapshot(&mut chat);
         model.fault.store(PARTIAL_PREFILL, Ordering::Relaxed);
         let error = chat.ingest(&user("next")).unwrap_err();
+        // Short-without-cancel is a backend fault, not user cancellation
+        // (a `Cancelled` here would read as resumable at the FFI boundary).
         assert!(matches!(
             error.cause,
-            IngestCause::Execution(CeraError::Cancelled)
+            IngestCause::Execution(CeraError::Backend(_))
         ));
         assert_eq!(error.recovery, RecoveryOutcome::Restored);
         assert!(error.rewind_error.is_none() && error.recovery_error.is_none());

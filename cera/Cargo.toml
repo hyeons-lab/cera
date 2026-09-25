@@ -171,6 +171,10 @@ name = "gpu_lfm2_prefill_equivalence"
 required-features = ["mmap"]
 
 [[test]]
+name = "gpu_lfm2_prefill_pass_split"
+required-features = ["mmap"]
+
+[[test]]
 name = "gpu_transformer_parity"
 required-features = ["mmap"]
 

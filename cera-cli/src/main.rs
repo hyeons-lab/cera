@@ -2563,6 +2563,51 @@ fn relax_oom_score() {
     let _ = std::fs::write("/proc/self/oom_score_adj", "0");
 }
 
+/// Parse a `--shapes` list into `N`-tuples: tokens containing commas
+/// are split into numbers, and a comma-free token run is regrouped;
+/// both paths chunk into `N`-tuples. `what` names the tuple (`"m,k"`)
+/// for error text. Element errors name the shape and the offending token.
+#[cfg(feature = "gpu")]
+fn parse_shape_list<const N: usize>(raw: &str, what: &str) -> Result<Vec<[u32; N]>> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let groups: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
+        tokens.iter().map(|t| t.to_string()).collect()
+    } else {
+        anyhow::ensure!(
+            tokens.len().is_multiple_of(N),
+            "shapes must be `{what}` {N}-tuples (got {})",
+            tokens.len()
+        );
+        tokens
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .map(|c| c.join(","))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for group in &groups {
+        // A token may itself hold several comma-joined numbers when the
+        // user passes one comma-separated run.
+        let nums: Vec<&str> = group.split(',').filter(|s| !s.is_empty()).collect();
+        anyhow::ensure!(
+            nums.len().is_multiple_of(N) && !nums.is_empty(),
+            "shape {group:?} must look like `{what}`"
+        );
+        for chunk in nums.as_chunks::<N>().0 {
+            let mut arr = [0u32; N];
+            for (i, tok) in chunk.iter().enumerate() {
+                arr[i] = tok.parse().with_context(|| {
+                    format!("shape {group:?}: element {i} ({tok:?}) is not a u32")
+                })?;
+            }
+            out.push(arr);
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "no shapes parsed");
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     #[cfg(target_os = "android")]
     relax_oom_score();
@@ -4931,40 +4976,13 @@ fn main() -> Result<()> {
             spv,
         } => {
             anyhow::ensure!(iters >= 1, "--iters must be >= 1");
-            // Each whitespace token is one `m,k` pair; a bare comma-separated
-            // `m,k,m,k,...` run is regrouped into pairs.
-            let tokens: Vec<&str> = shapes.split_whitespace().collect();
-            let pair_strs: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
-                tokens.iter().map(|t| t.to_string()).collect()
-            } else {
-                anyhow::ensure!(
-                    tokens.len().is_multiple_of(2),
-                    "shapes must be `m,k` pairs (got {})",
-                    tokens.len()
-                );
-                tokens
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| format!("{},{}", c[0], c[1]))
-                    .collect()
-            };
             let mut shapes_out: Vec<(u32, u32)> = Vec::new();
-            for pair in &pair_strs {
-                // A token may itself hold several comma-joined numbers when
-                // the user passes one comma-separated run.
-                let nums: Vec<&str> = pair.split(',').filter(|s| !s.is_empty()).collect();
-                anyhow::ensure!(
-                    nums.len().is_multiple_of(2) && !nums.is_empty(),
-                    "shape {pair:?} must look like `m,k`"
-                );
-                for mk in nums.as_chunks::<2>().0 {
-                    let (m, k): (u32, u32) = (mk[0].parse()?, mk[1].parse()?);
-                    anyhow::ensure!(k % 32 == 0, "k={k} must be a multiple of 32");
-                    shapes_out.push((m, k));
-                }
+            for [m, k] in parse_shape_list::<2>(&shapes, "m,k")? {
+                // Same validator the harness entries run (one home in the
+                // lib): fails fast here with the shape attached.
+                cera::model::gpu_lfm2::validate_gemv_shape(m, k)?;
+                shapes_out.push((m, k));
             }
-            anyhow::ensure!(!shapes_out.is_empty(), "no shapes parsed");
             let kernels: Vec<&str> = kernels
                 .split([',', ' '])
                 .filter(|s| !s.is_empty())
@@ -4989,40 +5007,13 @@ fn main() -> Result<()> {
                 spv_ny == 32 || spv_ny == 64,
                 "--spv-ny must be 32 or 64 (got {spv_ny})"
             );
-            // Each whitespace token is one `m,n,k` triple; a bare
-            // comma-separated run is regrouped into triples.
-            let tokens: Vec<&str> = shapes.split_whitespace().collect();
-            let triple_strs: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
-                tokens.iter().map(|t| t.to_string()).collect()
-            } else {
-                anyhow::ensure!(
-                    tokens.len().is_multiple_of(3),
-                    "shapes must be `m,n,k` triples (got {})",
-                    tokens.len()
-                );
-                tokens
-                    .as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|c| format!("{},{},{}", c[0], c[1], c[2]))
-                    .collect()
-            };
             let mut shapes_out: Vec<(u32, u32, u32)> = Vec::new();
-            for triple in &triple_strs {
-                let nums: Vec<&str> = triple.split(',').filter(|s| !s.is_empty()).collect();
-                anyhow::ensure!(
-                    nums.len().is_multiple_of(3) && !nums.is_empty(),
-                    "shape {triple:?} must look like `m,n,k`"
-                );
-                for mnk in nums.as_chunks::<3>().0 {
-                    let (m, n, k): (u32, u32, u32) =
-                        (mnk[0].parse()?, mnk[1].parse()?, mnk[2].parse()?);
-                    anyhow::ensure!(k % 32 == 0, "k={k} must be a multiple of 32");
-                    anyhow::ensure!(n >= 32, "n={n} must be >= 32");
-                    shapes_out.push((m, n, k));
-                }
+            for [m, n, k] in parse_shape_list::<3>(&shapes, "m,n,k")? {
+                // Same validator the harness entry runs (one home in the
+                // lib): fails fast here with the shape attached.
+                cera::model::gpu_lfm2::validate_gemm_shape(m, n, k)?;
+                shapes_out.push((m, n, k));
             }
-            anyhow::ensure!(!shapes_out.is_empty(), "no shapes parsed");
             cera::model::gpu_lfm2::gemm_q4_0_microbench(&shapes_out, iters, &spv, spv_ny)?;
         }
         Command::Bench {
@@ -6904,5 +6895,112 @@ mod tests {
             }
             _ => panic!("expected CompareQuants command"),
         }
+    }
+
+    /// `--shapes` parsing for the bench harnesses: pairs, triples, and the
+    /// bare-run regroup, plus every error branch (arity, token, empty).
+    /// `#[cfg]`-gated with the helper (gpu-only callers); the `cera-cli
+    /// (gpu)` CI leg runs these, since default CI compiles the helper out.
+    #[cfg(feature = "gpu")]
+    mod shape_list_tests {
+        use super::super::{Cli, Command, parse_shape_list};
+        use clap::Parser;
+
+        #[test]
+        fn bench_defaults_parse_and_validate() {
+            // Pin the transcription end to end: the real clap defaults must
+            // survive the same parse+validate chain `main` runs, so a
+            // default edit that breaks bare `gemv-bench`/`gemm-bench` fails
+            // here, not at runtime. (The lib suite pins transcribed tuples
+            // against the same validators; this pins the actual strings.)
+            let gemv = Cli::try_parse_from(["cera", "gemv-bench"]).unwrap();
+            let Command::GemvBench { shapes, .. } = gemv.command else {
+                panic!("gemv-bench parsed to wrong variant")
+            };
+            for [m, k] in parse_shape_list::<2>(&shapes, "m,k").unwrap() {
+                cera::model::gpu_lfm2::validate_gemv_shape(m, k).unwrap();
+            }
+            let gemm = Cli::try_parse_from(["cera", "gemm-bench"]).unwrap();
+            let Command::GemmBench { shapes, .. } = gemm.command else {
+                panic!("gemm-bench parsed to wrong variant")
+            };
+            for [m, n, k] in parse_shape_list::<3>(&shapes, "m,n,k").unwrap() {
+                cera::model::gpu_lfm2::validate_gemm_shape(m, n, k).unwrap();
+            }
+        }
+
+        #[test]
+        fn pairs_and_triples() {
+            assert_eq!(
+                parse_shape_list::<2>("128,2048 256,1024", "m,k").unwrap(),
+                [[128, 2048], [256, 1024]]
+            );
+            assert_eq!(
+                parse_shape_list::<3>("256,32,128", "m,n,k").unwrap(),
+                [[256, 32, 128]]
+            );
+        }
+
+        #[test]
+        fn bare_run_regroups() {
+            assert_eq!(
+                parse_shape_list::<2>("128 2048 256 1024", "m,k").unwrap(),
+                [[128, 2048], [256, 1024]]
+            );
+            assert_eq!(
+                parse_shape_list::<3>("256 32 128", "m,n,k").unwrap(),
+                [[256, 32, 128]]
+            );
+        }
+
+        #[test]
+        fn odd_count_rejected() {
+            let err = parse_shape_list::<2>("128 2048 256", "m,k").unwrap_err();
+            assert!(err.to_string().contains("2-tuples"), "unexpected: {err:?}");
+            let err = parse_shape_list::<3>("1,2,3,4", "m,n,k").unwrap_err();
+            assert!(err.to_string().contains("m,n,k"), "unexpected: {err:?}");
+        }
+
+        #[test]
+        fn bad_token_names_shape_and_token() {
+            let err = parse_shape_list::<2>("abc,def", "m,k").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("abc,def"), "shape unnamed: {msg}");
+            assert!(msg.contains("abc"), "token unnamed: {msg}");
+        }
+
+        #[test]
+        fn empty_rejected() {
+            assert!(parse_shape_list::<2>("", "m,k").is_err());
+            assert!(parse_shape_list::<2>("   ", "m,k").is_err());
+        }
+
+        #[test]
+        fn commas_only_group_rejected() {
+            // Names the `!nums.is_empty()` conjunct: a group of nothing
+            // but commas has no numbers to form a tuple from.
+            let err = parse_shape_list::<2>(",", "m,k").unwrap_err();
+            assert!(err.to_string().contains("m,k"), "unexpected: {err:?}");
+        }
+
+        #[test]
+        fn mixed_and_sloppy_commas_pinned() {
+            // Mixed comma+bare tokens error (the bare token is not a pair).
+            assert!(parse_shape_list::<2>("128,2048 256", "m,k").is_err());
+            // Trailing/double commas are silently accepted (empties
+            // filtered): documented leniency, pinned so a strictness change
+            // is deliberate.
+            assert_eq!(
+                parse_shape_list::<2>("128,2048,", "m,k").unwrap(),
+                [[128, 2048]]
+            );
+            assert_eq!(
+                parse_shape_list::<2>("128,,2048", "m,k").unwrap(),
+                [[128, 2048]]
+            );
+        }
+
+        // Shape *validation* lives in the lib (`validate_gemv_shape` /
+        // `validate_gemm_shape`) with its tests; the CLI only parses.
     }
 }

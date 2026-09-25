@@ -12,6 +12,8 @@ kotlinxCoroutines = "1.10.2"
 
 [libraries]
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+# Plain JVM unit tests only (mergeAdspPaths); no Robolectric, no device.
+junit = "junit:junit:4.13.2"
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 
 [plugins]

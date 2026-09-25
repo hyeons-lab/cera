@@ -17,6 +17,44 @@ use crate::session::CeraError;
 /// Staging buffer size for batch queue serialization (4 MB).
 const STAGING_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
+/// Cap on consecutive stale responses drained in one flush. Stale responses
+/// are bounded by prior timeouts (one per timed-out batch); anything past
+/// this is firmware misbehavior, and an uncapped drain would hang the flush
+/// (including from `Drop`) on a stuck seq.
+const MAX_CONSECUTIVE_STALE: u32 = 32;
+
+/// One stale-drain decision: what the drain loop does with a freshly-read
+/// `rsp_seq` when `expected` was awaited and `drained` stale responses
+/// have already been consumed this flush. Pure so the seq/cap boundary is
+/// unit-testable without a DSP.
+#[derive(Debug, PartialEq, Eq)]
+enum StaleDrainAction {
+    /// `rsp_seq < expected`, under the cap: count and keep draining.
+    DrainStale,
+    /// `rsp_seq < expected`, over the cap: fail the flush closed.
+    CapExceeded,
+    /// `rsp_seq == expected`: this batch's response; stop draining.
+    Current,
+    /// `rsp_seq > expected`: a future batch's response (desync); fail.
+    Future,
+}
+
+fn stale_drain_action(rsp_seq: u64, expected: u64, drained: u32) -> StaleDrainAction {
+    if rsp_seq < expected {
+        // `drained >= MAX` is the overflow-free form of
+        // `drained + 1 > MAX` (this response would be the 33rd).
+        if drained >= MAX_CONSECUTIVE_STALE {
+            StaleDrainAction::CapExceeded
+        } else {
+            StaleDrainAction::DrainStale
+        }
+    } else if rsp_seq == expected {
+        StaleDrainAction::Current
+    } else {
+        StaleDrainAction::Future
+    }
+}
+
 /// An active DSP command queue session managing batched request and response dispatch.
 pub struct HexagonQueueSession {
     driver: Arc<FastRpcDriver>,
@@ -341,6 +379,7 @@ impl HexagonQueueSession {
         // attribution by one batch.
         let mut read_res: Result<(), CeraError> = Ok(());
         if write_res.is_ok() {
+            let mut stale_drained = 0u32;
             loop {
                 let rsp_bytes = unsafe {
                     std::slice::from_raw_parts_mut(
@@ -357,22 +396,42 @@ impl HexagonQueueSession {
                         break;
                     }
                     Ok(_) => {
-                        if rsp.seq < self.seq {
-                            tracing::warn!(
-                                stale_seq = rsp.seq,
-                                expected_seq = self.seq,
-                                "drained stale DSP queue response"
-                            );
-                            continue;
+                        match stale_drain_action(rsp.seq, self.seq, stale_drained) {
+                            StaleDrainAction::DrainStale => {
+                                stale_drained += 1;
+                                tracing::warn!(
+                                    stale_seq = rsp.seq,
+                                    expected_seq = self.seq,
+                                    "drained stale DSP queue response"
+                                );
+                                // No `tracing` subscriber on the shipping NPU
+                                // platforms; without this the drain is silent
+                                // exactly where field debugging needs it.
+                                eprintln!(
+                                    "[cera-hexagon] drained stale DSP queue response \
+                                     (stale seq {}, expected {})",
+                                    rsp.seq, self.seq
+                                );
+                                continue;
+                            }
+                            StaleDrainAction::CapExceeded => {
+                                stale_drained += 1;
+                                read_res = Err(CeraError::Backend(format!(
+                                    "DSP queue returned {stale_drained} consecutive stale \
+                                     responses (expected seq {})",
+                                    self.seq
+                                )));
+                                break;
+                            }
+                            StaleDrainAction::Current => break,
+                            StaleDrainAction::Future => {
+                                read_res = Err(CeraError::Backend(format!(
+                                    "DSP queue sequence mismatch (expected {}, got {})",
+                                    self.seq, rsp.seq
+                                )));
+                                break;
+                            }
                         }
-                        if rsp.seq != self.seq {
-                            read_res = Err(CeraError::Backend(format!(
-                                "DSP queue sequence mismatch (expected {}, got {})",
-                                self.seq, rsp.seq
-                            )));
-                            break;
-                        }
-                        break;
                     }
                 }
             }
@@ -471,7 +530,12 @@ impl HexagonQueueSession {
 
 impl Drop for HexagonQueueSession {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // Unpropagatable from `Drop`, but worth one line: `flush` returns
+        // `Ok` when idle, so normal shutdown never reaches the `eprintln`
+        // anyway — only a genuine mid-batch death prints, ungated.
+        if let Err(e) = self.flush() {
+            eprintln!("[cera-hexagon] drop flush failed: {e}");
+        }
         if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() && self.prof_flushes > 0 {
             let rtt = self.prof_host_us.saturating_sub(self.prof_dsp_us) / self.prof_flushes;
             eprintln!(
@@ -545,5 +609,24 @@ mod tests {
         );
         assert!(HexagonQueueSession::batch_index(65535, "buffers").is_err());
         assert!(HexagonQueueSession::batch_index(usize::MAX, "tensors").is_err());
+    }
+
+    /// The drain decision table: stale/current/future seqs plus the exact
+    /// 32-cap boundary (the 33rd consecutive stale fails the flush).
+    #[test]
+    fn stale_drain_action_table() {
+        use super::StaleDrainAction::*;
+        // Stale seqs drain while under the cap...
+        assert_eq!(stale_drain_action(5, 10, 0), DrainStale);
+        assert_eq!(stale_drain_action(9, 10, 31), DrainStale);
+        // ...and the 33rd consecutive stale (32 already drained) fails.
+        assert_eq!(stale_drain_action(5, 10, 32), CapExceeded);
+        assert_eq!(stale_drain_action(9, 10, u32::MAX), CapExceeded);
+        // The awaited batch's own response stops the drain.
+        assert_eq!(stale_drain_action(10, 10, 7), Current);
+        assert_eq!(stale_drain_action(0, 0, 0), Current);
+        // A future batch's response is a desync, never drained past.
+        assert_eq!(stale_drain_action(11, 10, 7), Future);
+        assert_eq!(stale_drain_action(u64::MAX, 10, 0), Future);
     }
 }
