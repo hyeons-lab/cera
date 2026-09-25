@@ -414,8 +414,8 @@ pub struct CoreTopology {
     pub pin_cores: Vec<usize>,
     /// How many leading entries of `pin_cores` are *performance* cores, as
     /// detected. Distinct from `perf_core_count`, which is a pool width and so
-    /// moves with `CERA_THREADS`; this is a fact about the silicon and does
-    /// not. `pin_cores` is fastest-first, so `pin_cores[..fast_cores]` is
+    /// moves with `CERA_THREADS` and the CPU-allowance clamp; this is a fact
+    /// about the silicon and does not. `pin_cores` is fastest-first, so `pin_cores[..fast_cores]` is
     /// exactly the fast set.
     ///
     /// Kept separate because the two diverge exactly where it matters:
@@ -733,8 +733,13 @@ fn process_cpu_allowance() -> Option<usize> {
     if ok != 0 {
         return None;
     }
+    // Bound spelled from the set size rather than `CPU_SETSIZE`: the constant
+    // is `size_t` on Android, where `as usize` would trip `unnecessary_cast`
+    // under the repo's `-D warnings` gate (same convention as the pinning
+    // helper in `threadpool.rs`).
+    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
     let mut count = 0;
-    for cpu in 0..libc::CPU_SETSIZE as usize {
+    for cpu in 0..capacity {
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
             count += 1;
         }
@@ -753,7 +758,7 @@ fn process_cpu_allowance() -> Option<usize> {
     not(any(target_os = "linux", target_os = "android")),
     allow(
         dead_code,
-        reason = "only the sysfs detector calls it; tested on all hosts"
+        reason = "only clamp_to_cpu_allowance calls it; tested on all hosts"
     )
 )]
 fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
@@ -1142,6 +1147,66 @@ mod tests {
             core_weights: vec![WEIGHT_FULL; 8],
         };
         assert_eq!(clamp_perf_count(detected, 0).perf_core_count, 1);
+    }
+
+    /// The clamp runs *before* the `CERA_THREADS` override, so a deliberate
+    /// oversubscription past the allowance survives the composition: width 8
+    /// on a 6-CPU allowance with 8 pinnable cores stays 8. Pure, no env use;
+    /// if the order ever flips this reads 6.
+    #[test]
+    fn allowance_clamp_preserves_explicit_oversubscription() {
+        let detected = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: vec![6, 7, 0, 1, 2, 3, 4, 5],
+            fast_cores: 8,
+            core_weights: vec![WEIGHT_FULL; 8],
+        };
+        let clamped = clamp_perf_count(detected, 6);
+        assert_eq!(clamped.perf_core_count, 6);
+        let overridden = apply_thread_override(clamped, Some(8), true);
+        assert_eq!(overridden.perf_core_count, 8);
+    }
+
+    /// The allowance probe reads the process leader's mask, not the calling
+    /// thread's: pinning the caller to one CPU must not shrink the allowance.
+    /// Linux/Android only, and skipped under Miri, which cannot execute the
+    /// raw affinity syscalls. The caller's mask is restored on drop (each
+    /// `#[test]` runs on its own thread, so the pin is contained either way).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn cpu_allowance_ignores_calling_thread_pin() {
+        let before = process_cpu_allowance().expect("allowance probe works");
+        let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
+        };
+        assert_eq!(ok, 0);
+        struct Restore(libc::cpu_set_t);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.0);
+                }
+            }
+        }
+        let _restore = Restore(saved);
+        // Pin to a CPU the process may actually run on: CPU 0 may sit outside
+        // a container's mask, where `sched_setaffinity` would refuse (EINVAL).
+        let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+        let mut only = None;
+        for cpu in 0..capacity {
+            if unsafe { libc::CPU_ISSET(cpu, &saved) } {
+                only = Some(cpu);
+                break;
+            }
+        }
+        let only = only.expect("caller mask is non-empty");
+        let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(only, &mut one) };
+        let ok =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) };
+        assert_eq!(ok, 0);
+        assert_eq!(process_cpu_allowance(), Some(before));
     }
 
     /// End to end through the real allowance probe: an absurd detected width
