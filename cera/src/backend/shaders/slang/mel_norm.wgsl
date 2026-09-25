@@ -95,7 +95,7 @@ fn mel_norm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup_
         partial_0 = partial_2;
     }
     var _S6 : f32 = block_sum_0(tid_1, partial_0);
-    var _S7 : f32 = 1.0f / sqrt(_S6 / f32(eff_0 - u32(1)) + eps_0);
+    var _S7 : f32 = 1.0f / (sqrt(_S6 / f32(eff_0 - u32(1))) + eps_0);
     t_0 = tid_1;
     for(;;)
     {

@@ -11,7 +11,7 @@
 //   output but always zero. They are the trailing center-padding, and the C++
 //   reference zeroes them rather than trimming the frame count.
 // - The variance is the **unbiased** estimator (denominator `eff - 1`), with
-//   `eps` added before the sqrt, not after.
+//   `eps` added after the sqrt (`sqrt(var) + eps`), matching NeMo.
 // - `eff <= 1` zeroes the whole row. A single live frame centers to exactly 0
 //   and its unbiased variance is undefined, so this is the reference's behaviour
 //   and not a special case invented here.
@@ -115,7 +115,7 @@ void mel_norm(uint3 lid : SV_GroupThreadID, uint3 wid : SV_GroupID) {
         float d = mel_buf[row + t] - mean;
         partial += d * d;
     }
-    float inv_std = 1.0f / sqrt(block_sum(tid, partial) / float(eff - 1u) + eps);
+    float inv_std = 1.0f / (sqrt(block_sum(tid, partial) / float(eff - 1u)) + eps);
 
     // Pass 3: normalize the live frames, zero the tail, transpose on the way out.
     for (uint t = tid; t < n_frames; t += WG) {

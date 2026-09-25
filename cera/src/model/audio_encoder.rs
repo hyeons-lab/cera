@@ -70,15 +70,16 @@ pub const HOP_LEN: usize = 160;
 pub const PREEMPH: f32 = 0.97;
 /// Floor added inside the natural-log of mel energies, ~`2^-24`.
 pub const LOG_MEL_EPS: f32 = 5.960_464_5e-8;
-/// Floor added to the per-feature variance *before* the square root, in the
-/// mel-spectrogram normalization. Distinct from [`LOG_MEL_EPS`] and from
-/// [`AudioEncoderConfig::eps`]: this one guards a `1/sqrt(var)` on a nearly
-/// constant mel bin, and it is what the C++ reference uses there.
+/// Offset added to the per-feature std-dev *after* the square root
+/// (`1/(sqrt(var) + eps)`), in the mel-spectrogram normalization, matching
+/// NeMo. Distinct from [`LOG_MEL_EPS`] and from
+/// [`AudioEncoderConfig::eps`]: this one guards the normalization of a
+/// nearly constant mel bin.
 ///
 /// `f64` because the CPU normalization accumulates in f64 and this is the
 /// literal it has always used there; the GPU front-end narrows it once, at the
 /// point it packs the value into a kernel's params. Typing it `f32` instead
-/// would round the CPU's floor through f32 and change the shipping path.
+/// would round the CPU's offset through f32 and change the shipping path.
 pub const NORM_VAR_EPS: f64 = 1e-5;
 
 /// Linearly resample `samples` from `sr_in` to `sr_out` Hz.

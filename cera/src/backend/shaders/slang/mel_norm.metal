@@ -213,7 +213,7 @@ float block_sum_0(uint tid_0, float v_0, KernelContext_0 thread* kernelContext_0
 
 
 
-    float _S7 = 1.0f / sqrt(_S6 / float(eff_0 - 1U) + eps_0);
+    float _S7 = 1.0f / (sqrt(_S6 / float(eff_0 - 1U)) + eps_0);
 
 #line 118
     t_0 = tid_1;
