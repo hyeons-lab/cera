@@ -467,6 +467,12 @@ pub trait Model: Send + Sync {
         let mut consumed = 0usize;
         let mut last_logits: Option<Vec<f32>> = None;
         for chunk in tokens.chunks(ubatch) {
+            // Resize CPU pools between chunks (a no-op unless the cpuset
+            // moved): a long token prefill must not run fully stale. Gated
+            // exactly like `backend::threadpool`, which exists only where
+            // the `RowPool` does.
+            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+            crate::backend::threadpool::resize_pools_for_cpuset();
             let logits = self.forward_prefill(chunk, start_pos + consumed, state);
             consumed += chunk.len();
             last_logits = Some(logits);
