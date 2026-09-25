@@ -334,11 +334,27 @@ sample_cera() { # backend label mask
   # use); harmless for cpu/gpu cells, required for hexagon.
   local skel_dir="/data/local/tmp"
   [[ -n "$LLAMA_BENCH" ]] && skel_dir="$(dirname "$LLAMA_BENCH")"
-  local base="cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
+  # OOM containment: adb-shell children inherit oom_score_adj -1000
+  # (unkillable), so a cell that exhausts memory deadlock-panics the phone
+  # instead of dying (measured: cera GPU on 2.6B rebooted an S25U three
+  # times). Mark the remote shell normally-killable first; both engines
+  # inherit it. Best-effort (`;`, never `&&`) so a hardening failure can
+  # never skip the cell itself.
+  local oom_guard='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
+  local base="${oom_guard}cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
+  # Thermal pacing: 2.6B vulkan decode loses the Adreno context when a run
+  # starts hot (intra-run headroom past ~0.85 after a long soak) while the
+  # same invocation is green cold. CERA_BENCH_COOLDOWN_SECS (default 0)
+  # idles the device before each cera invocation so heat-soaked cells
+  # start in the green regime. Targeted at cera GPU (llama OpenCL never
+  # tripped); set only for runs that need it.
+  local cooldown="${CERA_BENCH_COOLDOWN_SECS:-0}"
   local pre dec
   start_samplers "$key"
+  if [[ "$backend" == "gpu" && "$cooldown" -gt 0 ]]; then sleep "$cooldown"; fi
   pre=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1 || true)
+  if [[ "$backend" == "gpu" && "$cooldown" -gt 0 ]]; then sleep "$cooldown"; fi
   dec=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1 || true)
   stop_samplers
   printf '%s\n' "$pre" >> "$LOG"
@@ -383,7 +399,10 @@ sample_llama() { # threads label mask [ngl] [device]
   # RowPool cell; taskset with no mask is a syntax error, so omit it entirely.
   [[ -n "$mask" ]] && pin="taskset $mask "
   start_samplers "$key"
-  out=$("${ADB[@]}" shell "cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
+  # Same OOM containment as sample_cera (see above): a runaway cell must
+  # die as SIGKILL, never panic the shared phone.
+  local oom_guard='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
+  out=$("${ADB[@]}" shell "${oom_guard}cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
 -m \"$DEVICE_DIR/$MODEL\" -t $t ${dev_flag}-ngl $ngl -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   stop_samplers
   printf '%s\n' "$out" >> "$LOG"
@@ -426,18 +445,27 @@ build_cells() {
 }
 
 # One pass over every cell, engines interleaved.
+# CERA_BENCH_SKIP trims the matrix without editing it: a space-separated list
+# of cell-group tokens to skip (`cera-cpu` drops all 3 cera CPU cells,
+# `llama-cpu` drops all 4 llama CPU cells, `gpu` cera's wgpu cell, `hexagon`
+# cera's NPU cell, `htp` llama's HTP cell, `opencl` llama's OpenCL cell).
+# Skipped cells still get a CSV row (NA), so a partial run stays comparable
+# to a full one. Empty (default) runs everything.
+skip_cell() { # token
+  [[ " ${CERA_BENCH_SKIP:-} " == *" $1 "* ]]
+}
 one_pass() {
-  sample_cera cpu "$CERA_DEFAULT" ""
-  sample_llama "$N_MID" mid "$MID_MASK"
-  sample_cera cpu "$CERA_PRIME" "$PRIME_MASK"
-  sample_llama 1 prime "$PRIME_MASK"
-  sample_cera cpu "$CERA_MID" "$MID_MASK"
-  sample_llama "$N_BIG" big "$BIG_MASK"
-  sample_cera gpu "$CERA_GPU" ""
-  sample_llama "$N_ALL" all ""
-  sample_cera hexagon "$CERA_HEXAGON" ""
-  sample_llama "$N_ALL" htp0 "" 99 HTP0
-  sample_llama "$N_ALL" opencl "" 99 GPUOpenCL
+  skip_cell cera-cpu || sample_cera cpu "$CERA_DEFAULT" ""
+  skip_cell llama-cpu || sample_llama "$N_MID" mid "$MID_MASK"
+  skip_cell cera-cpu || sample_cera cpu "$CERA_PRIME" "$PRIME_MASK"
+  skip_cell llama-cpu || sample_llama 1 prime "$PRIME_MASK"
+  skip_cell cera-cpu || sample_cera cpu "$CERA_MID" "$MID_MASK"
+  skip_cell llama-cpu || sample_llama "$N_BIG" big "$BIG_MASK"
+  skip_cell gpu || sample_cera gpu "$CERA_GPU" ""
+  skip_cell llama-cpu || sample_llama "$N_ALL" all ""
+  skip_cell hexagon || sample_cera hexagon "$CERA_HEXAGON" ""
+  skip_cell htp || sample_llama "$N_ALL" htp0 "" 99 HTP0
+  skip_cell opencl || sample_llama "$N_ALL" opencl "" 99 GPUOpenCL
 }
 
 detect_topology

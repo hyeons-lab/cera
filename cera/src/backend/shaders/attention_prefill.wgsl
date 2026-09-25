@@ -36,10 +36,13 @@
 //
 // Bind group 0:
 //   @binding(0) q_batch:   array<f32>    n_queries × q_stride floats
-//   @binding(1) k_cache:   array<f32>    seq_len × kv_dim floats
-//   @binding(2) v_cache:   array<f32>    seq_len × kv_dim floats
+//   @binding(1) k_cache:   array<u32>    seq_len × kv_dim packed halves
+//   @binding(2) v_cache:   array<u32>    seq_len × kv_dim packed halves
 //   @binding(3) out_batch: array<f32>    n_queries × out_stride floats (rw)
 //   @binding(4) params:    array<u32, 12>
+//
+// K/V are LE f16 halves packed 2-per-u32 (see `flash_attention.wgsl`):
+// kv_dim and head_dim are even (asserted host-side), accumulation stays f32.
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
 //          start_pos, <unused>, q_stride, out_stride, q_base, n_sub )
 //
@@ -54,8 +57,8 @@
 // Dispatch: (n_heads, ceil(n_sub / 8), 1) workgroups of 256 threads.
 
 @group(0) @binding(0) var<storage, read> q_batch: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
-@group(0) @binding(2) var<storage, read> v_cache: array<f32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<u32>;
+@group(0) @binding(2) var<storage, read> v_cache: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_batch: array<f32>;
 @group(0) @binding(4) var<storage, read> params: array<u32, 12>;
 
@@ -157,9 +160,13 @@ fn attention_prefill(
         var score = NEG_INF;
         if t < seq_len {
             var dot = 0.0;
+            // k_base is even (kv_dim and kv_h_offset are multiples of the
+            // even head_dim), so stepping dd by 2 walks whole u32 words.
             let k_base = t * kv_dim + kv_h_offset;
-            for (var dd = 0u; dd < head_dim; dd += 1u) {
-                dot += q_shared[q * MAX_HEAD_DIM + dd] * k_cache[k_base + dd];
+            for (var dd = 0u; dd < head_dim; dd += 2u) {
+                let pair = unpack2x16float(k_cache[(k_base + dd) >> 1u]);
+                dot += q_shared[q * MAX_HEAD_DIM + dd] * pair.x
+                    + q_shared[q * MAX_HEAD_DIM + dd + 1u] * pair.y;
             }
             score = dot * scale;
         }
@@ -218,10 +225,13 @@ fn attention_prefill(
             if dd >= head_dim { break; }
             var a = acc[q * MAX_HEAD_DIM + dd] * corr;
             let vd = kv_h_offset + dd;
+            // vd's lane is loop-invariant; hoist it out of the row walk.
+            let vd_hi = (vd & 1u) == 1u;
             for (var jj = 0u; jj < TILE; jj += 1u) {
                 let tt = base + jj;
                 if tt < seq_len {
-                    a += tile_scores[q * TILE + jj] * v_cache[tt * kv_dim + vd];
+                    let pair = unpack2x16float(v_cache[(tt * kv_dim + vd) >> 1u]);
+                    a += tile_scores[q * TILE + jj] * select(pair.x, pair.y, vd_hi);
                 }
             }
             acc[q * MAX_HEAD_DIM + dd] = a;

@@ -1,5 +1,12 @@
 // FlashAttention (Dao 2022) for one query vector — the decode path.
 //
+// F32-KV TWIN of `flash_attention.wgsl` (which reads packed f16 halves):
+// kept for the audio detokenizer (`wgpu_audio_decoder`), whose sliding-window
+// caches are small enough that f16 buys nothing and whose exact CPU/GPU parity
+// test pins f32 bitwise. Same math, same grid, same params — only bindings
+// 1/2 stay `array<f32>`. If you change the algorithm here, change it there.
+//
+
 // Online-softmax, single tiled pass over the KV cache with bounded workgroup
 // memory (TILE scores, not seq_len) and no external scores scratch buffer:
 // 5 bindings, each K/V row read once. Matches a plain batched-softmax reference
@@ -21,23 +28,16 @@
 //
 // Bind group 0:
 //   @binding(0) q: array<f32>        (all heads concatenated, read)
-//   @binding(1) k_cache: array<u32>  (seq_len × kv_dim packed halves, read)
-//   @binding(2) v_cache: array<u32>  (seq_len × kv_dim packed halves, read)
+//   @binding(1) k_cache: array<f32>  (seq_len × kv_dim, read)
+//   @binding(2) v_cache: array<f32>  (seq_len × kv_dim, read)
 //   @binding(3) out: array<f32>      (all heads concatenated, read-write)
 //   @binding(4) params: array<u32,8> (n_heads, n_kv_heads, head_dim, kv_dim,
 //                                      seq_len, scale_bits, _, _)
 // Dispatch: (n_heads, 1, 1).
-//
-// The KV cache stores LE f16 halves packed 2-per-u32 (WGSL has no f16
-// storage without SHADER_F16, which Adreno withholds; `unpack2x16float`
-// is core and needs no feature). Bytes are identical to a native f16
-// slab, so prefix snapshots stay cross-backend compatible. kv_dim and
-// head_dim are even (asserted host-side), so every pair load is aligned
-// and every u32 holds exactly one dim-pair. Accumulation stays f32.
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> k_cache: array<u32>;
-@group(0) @binding(2) var<storage, read> v_cache: array<u32>;
+@group(0) @binding(1) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(2) var<storage, read> v_cache: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<storage, read> params: array<u32, 8>;
 
@@ -98,12 +98,9 @@ fn flash_attention(
         var score = NEG_INF;
         if t < seq_len {
             var dot = 0.0;
-            // k_base is even (kv_dim and kv_h_offset are multiples of the
-            // even head_dim), so stepping d by 2 walks whole u32 words.
             let k_base = t * kv_dim + kv_h_offset;
-            for (var d = 0u; d < head_dim; d += 2u) {
-                let pair = unpack2x16float(k_cache[(k_base + d) >> 1u]);
-                dot += q_shared[d] * pair.x + q_shared[d + 1u] * pair.y;
+            for (var d = 0u; d < head_dim; d += 1u) {
+                dot += q_shared[d] * k_cache[k_base + d];
             }
             score = dot * scale;
         }
@@ -172,13 +169,10 @@ fn flash_attention(
         if tid < head_dim {
             var a = acc[tid] * corr;
             let vd = kv_h_offset + tid;
-            // vd's lane is loop-invariant; hoist it out of the row walk.
-            let vd_hi = (vd & 1u) == 1u;
             for (var jj = 0u; jj < TILE; jj += 1u) {
                 let tt = base + jj;
                 if tt < seq_len {
-                    let pair = unpack2x16float(v_cache[(tt * kv_dim + vd) >> 1u]);
-                    a += tile_scores[jj] * select(pair.x, pair.y, vd_hi);
+                    a += tile_scores[jj] * v_cache[tt * kv_dim + vd];
                 }
             }
             acc[tid] = a;

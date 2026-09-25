@@ -252,10 +252,19 @@ impl WeightRef {
     /// not. It wants a measurement, not an assumption: the extra copy and its
     /// resident memory are still real, and speculative decoding is off by
     /// default.
-    #[allow(unused_mut)]
-    pub(crate) fn with_repack(mut self, _gguf: &GgufFile) -> Self {
+    pub(crate) fn with_repack(self, gguf: &GgufFile) -> Self {
+        self.with_repack_if(gguf, true)
+    }
+
+    /// Attach the CPU int8 repack unless `do_repack` is false. The GPU and
+    /// Metal loaders resolve weight metadata from the CPU model but never
+    /// dispatch CPU kernels, so they pass false: the repack would be
+    /// gigabytes (1 byte/elem + f32 scales) allocated only to be freed
+    /// after upload — the dominant half of GPU load-time peak RSS.
+    #[allow(unused_mut, unused_variables)]
+    pub(crate) fn with_repack_if(mut self, _gguf: &GgufFile, do_repack: bool) -> Self {
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
-        {
+        if do_repack {
             let gguf = _gguf;
             let mut kind = None;
             if self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k) {

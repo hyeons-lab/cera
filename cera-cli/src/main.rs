@@ -1009,6 +1009,63 @@ enum Command {
         draft_model: Option<String>,
     },
 
+    /// Microbenchmark Q4_0 GEMV kernels (`fast` raw vs `stream` resident).
+    ///
+    /// Synthetic weights, no model file: times `iters` dispatches per
+    /// kernel per shape in one submit and checks parity against a CPU
+    /// reference. For kernel iteration without full-model runs.
+    #[cfg(feature = "gpu")]
+    GemvBench {
+        /// Shapes as `m,k` pairs, comma- or space-separated (k must be a multiple of 32).
+        #[arg(
+            long,
+            default_value = "512,2048 2048,2048 6144,2048 2048,6144 10752,2048 2048,10752 128000,2048"
+        )]
+        shapes: String,
+
+        /// Timed dispatches per kernel per shape (plus a 500 ms GPU clock soak).
+        #[arg(long, default_value_t = 100)]
+        iters: u32,
+
+        /// Kernels to run: comma-separated `fast,stream`.
+        #[arg(long, default_value = "fast,stream")]
+        kernels: String,
+
+        /// Experimental SPIR-V files to A/B against the built-in kernels
+        /// (same 4-binding/params contract, entry `main`). Each is `path`
+        /// or `path@nr` (rows-per-workgroup, default 8).
+        #[arg(long)]
+        spv: Vec<String>,
+    },
+
+    /// Microbenchmark the Q4_0 prefill GEMM (`gemm_stream_q4_0`).
+    ///
+    /// Synthetic weights, no model file: times `iters` dispatches per
+    /// kernel per shape in one submit and checks parity against a CPU
+    /// reference. `--spv` A/Bs experimental SPIR-V variants (same
+    /// bindings/grid/params contract, entry `main`) without rebuilding.
+    #[cfg(feature = "gpu")]
+    GemmBench {
+        /// Shapes as `m,n,k` triples, comma- or space-separated (k must be a multiple of 32, n >= 32).
+        #[arg(
+            long,
+            default_value = "10752,128,2048 10752,512,2048 2048,128,2048 2048,512,2048 6144,512,2048"
+        )]
+        shapes: String,
+
+        /// Timed dispatches per kernel per shape (plus a 500 ms GPU clock soak).
+        #[arg(long, default_value_t = 20)]
+        iters: u32,
+
+        /// Experimental SPIR-V files to A/B against the built-in kernel.
+        #[arg(long)]
+        spv: Vec<String>,
+
+        /// Fiber width of the `--spv` variants (grid Y = n_pad/ny; 32 or 64).
+        #[arg(long, default_value_t = 32)]
+        spv_ny: u32,
+    },
+
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
     ///
     /// Discovery surface for the `--bundle-id` / `--quant` flags on
@@ -2492,7 +2549,23 @@ fn setup_kv_compression(
     }
 }
 
+/// On Android, mark this process normally-killable. Processes spawned from
+/// `adb shell` inherit `oom_score_adj` -1000 (unkillable), so when a big
+/// model exhausts memory the OOM killer finds no victim and the kernel
+/// deadlock-panics the phone instead of killing the run (measured: 2.6B
+/// GPU bench rebooted an S25U three times). Best-effort: failure is
+/// silently ignored, and non-Android builds compile this out.
+#[cfg(target_os = "android")]
+fn relax_oom_score() {
+    // Silently ignored on failure (runs before logging is set up, and a
+    // bench run must never fail over this); worst case the process stays
+    // unkillable and an OOM behaves as before.
+    let _ = std::fs::write("/proc/self/oom_score_adj", "0");
+}
+
 fn main() -> Result<()> {
+    #[cfg(target_os = "android")]
+    relax_oom_score();
     // Default to `warn` when RUST_LOG is unset, rather than the empty filter
     // `from_default_env()` yields — which showed nothing at all.
     //
@@ -4849,6 +4922,108 @@ fn main() -> Result<()> {
                     cancel.store(false, Ordering::Relaxed);
                 }
             }
+        }
+        #[cfg(feature = "gpu")]
+        Command::GemvBench {
+            shapes,
+            iters,
+            kernels,
+            spv,
+        } => {
+            anyhow::ensure!(iters >= 1, "--iters must be >= 1");
+            // Each whitespace token is one `m,k` pair; a bare comma-separated
+            // `m,k,m,k,...` run is regrouped into pairs.
+            let tokens: Vec<&str> = shapes.split_whitespace().collect();
+            let pair_strs: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
+                tokens.iter().map(|t| t.to_string()).collect()
+            } else {
+                anyhow::ensure!(
+                    tokens.len().is_multiple_of(2),
+                    "shapes must be `m,k` pairs (got {})",
+                    tokens.len()
+                );
+                tokens
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| format!("{},{}", c[0], c[1]))
+                    .collect()
+            };
+            let mut shapes_out: Vec<(u32, u32)> = Vec::new();
+            for pair in &pair_strs {
+                // A token may itself hold several comma-joined numbers when
+                // the user passes one comma-separated run.
+                let nums: Vec<&str> = pair.split(',').filter(|s| !s.is_empty()).collect();
+                anyhow::ensure!(
+                    nums.len().is_multiple_of(2) && !nums.is_empty(),
+                    "shape {pair:?} must look like `m,k`"
+                );
+                for mk in nums.as_chunks::<2>().0 {
+                    let (m, k): (u32, u32) = (mk[0].parse()?, mk[1].parse()?);
+                    anyhow::ensure!(k % 32 == 0, "k={k} must be a multiple of 32");
+                    shapes_out.push((m, k));
+                }
+            }
+            anyhow::ensure!(!shapes_out.is_empty(), "no shapes parsed");
+            let kernels: Vec<&str> = kernels
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .collect();
+            for k in &kernels {
+                anyhow::ensure!(
+                    *k == "fast" || *k == "stream",
+                    "unknown kernel {k:?} (want fast,stream)"
+                );
+            }
+            cera::model::gpu_lfm2::gemv_q4_0_microbench(&shapes_out, iters, &kernels, &spv)?;
+        }
+        #[cfg(feature = "gpu")]
+        Command::GemmBench {
+            shapes,
+            iters,
+            spv,
+            spv_ny,
+        } => {
+            anyhow::ensure!(iters >= 1, "--iters must be >= 1");
+            anyhow::ensure!(
+                spv_ny == 32 || spv_ny == 64,
+                "--spv-ny must be 32 or 64 (got {spv_ny})"
+            );
+            // Each whitespace token is one `m,n,k` triple; a bare
+            // comma-separated run is regrouped into triples.
+            let tokens: Vec<&str> = shapes.split_whitespace().collect();
+            let triple_strs: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
+                tokens.iter().map(|t| t.to_string()).collect()
+            } else {
+                anyhow::ensure!(
+                    tokens.len().is_multiple_of(3),
+                    "shapes must be `m,n,k` triples (got {})",
+                    tokens.len()
+                );
+                tokens
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|c| format!("{},{},{}", c[0], c[1], c[2]))
+                    .collect()
+            };
+            let mut shapes_out: Vec<(u32, u32, u32)> = Vec::new();
+            for triple in &triple_strs {
+                let nums: Vec<&str> = triple.split(',').filter(|s| !s.is_empty()).collect();
+                anyhow::ensure!(
+                    nums.len().is_multiple_of(3) && !nums.is_empty(),
+                    "shape {triple:?} must look like `m,n,k`"
+                );
+                for mnk in nums.as_chunks::<3>().0 {
+                    let (m, n, k): (u32, u32, u32) =
+                        (mnk[0].parse()?, mnk[1].parse()?, mnk[2].parse()?);
+                    anyhow::ensure!(k % 32 == 0, "k={k} must be a multiple of 32");
+                    anyhow::ensure!(n >= 32, "n={n} must be >= 32");
+                    shapes_out.push((m, n, k));
+                }
+            }
+            anyhow::ensure!(!shapes_out.is_empty(), "no shapes parsed");
+            cera::model::gpu_lfm2::gemm_q4_0_microbench(&shapes_out, iters, &spv, spv_ny)?;
         }
         Command::Bench {
             model,

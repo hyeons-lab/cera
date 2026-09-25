@@ -26,8 +26,10 @@ static const uint NQ = 32u;
 static const uint WG_SIZE = 64u;
 static const uint BLOCK_BYTES = 18u;
 // Subgroup-combine scratch: one float per subgroup per row. Sized for the
-// smallest plausible subgroup (8 -> 8 subgroups); real hardware is 16..64.
-static const uint MAX_SUBGROUPS = 8u;
+// smallest conformant subgroup (1 lane -> 64 subgroups, 2KB); real mobile
+// hardware is 16..64 lanes, but a size-4 software device must not write out
+// of bounds.
+static const uint MAX_SUBGROUPS = 64u;
 
 groupshared float sg_scratch[NR * MAX_SUBGROUPS];
 
@@ -190,7 +192,10 @@ void main(
     GroupMemoryBarrierWithGroupSync();
 
     if (tid == 0u) {
-        uint nsg = WG_SIZE / lane_count;
+        // A wider-than-workgroup subgroup (128 lanes) still fills slot 0 via
+        // its first lane; without the clamp nsg would be 0 and the combine
+        // would write zeros.
+        uint nsg = max(WG_SIZE / lane_count, 1u);
         [unroll]
         for (uint r = 0u; r < NR; r++) {
             float t = 0.0f;

@@ -11,9 +11,10 @@
 //! detokenizer attention is non-causal over the sliding window, so each token's
 //! query is attended with the decode `flash_attention` kernel that reads the
 //! whole live window). Weights are dequantized to f32 and uploaded, matching the
-//! Metal decoder's precision path. KV caches are f32 (the WGPU `flash_attention`
-//! kernel reads `array<f32>`), so there is no f16 cast and the path is a touch
-//! more accurate than Metal's f16 cache.
+//! Metal decoder's precision path. KV caches are f32 via the dedicated
+//! `FLASH_ATTENTION_F32` twin (the main `flash_attention` kernel reads packed
+//! f16 halves for the LLM path), so there is no f16 cast and the path is a
+//! touch more accurate than Metal's f16 cache.
 //!
 //! Scope: both the detokenizer and depthformer run on WGPU. The depthformer
 //! samples codebooks with a WGPU compute pipeline while fallback CPU decoding
@@ -305,7 +306,7 @@ impl WgpuAudioDecoder {
                 "audio_detok_conv1d_fused_batch",
             ),
             flash_attention: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION,
+                shaders::FLASH_ATTENTION_F32,
                 "flash_attention",
                 "audio_detok_flash_attention",
             ),

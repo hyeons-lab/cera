@@ -78,9 +78,13 @@ const SLANG_KERNELS: &[&str] = &[
     "mul_mat_reg_tile_q5_k",
     "mul_mat_reg_tile_q6_k",
     "gemm_stream_q4_0",
+    "gemm_stream_q4_0_k64",
     "transpose_cast_f16",
     "gemv_q4_0_fast",
     "gemv_q6_k",
+    "gemv_q6_k_flat",
+    "gemv_q4_0_stream",
+    "mul_mat_reg_tile_q4_0_stream",
 ];
 
 fn compile_slang_kernels() {
@@ -147,6 +151,7 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "rmsnorm_batch",
     "argmax_f32",
     "rmsnorm",
+    "kv_append",
     "conv1d",
     "conv1d_fused",
     "conv1d_fused_batch",
@@ -167,7 +172,6 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "moe_combine",
     "ffn_swiglu_q4_0",
     "gemv_q4_0_fast",
-    "gemv_q4_0_qkv",
     "bert_flash_attention",
 ];
 

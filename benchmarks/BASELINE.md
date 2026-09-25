@@ -251,6 +251,17 @@ empty context (documented harness asymmetry, disfavours cera by a few percent).
 | cera | default RowPool (unpinned) | 679 | 15.0% | 66.2 | 7.8% |
 | llama.cpp | t8 big (cpu0-7) | 1642 | 17.1% | 232.0 | 7.3% |
 | llama.cpp | t8 all (unpinned) | 1413 | 13.7% | 257.1 | 4.0% |
+| cera | hexagon in-app, stock APK (probe-app) | 8127 | — | 128.6 | — |
+
+In-app row: same model, prompt=512/decode=128 greedy via the FFI
+`Session.generate` summary, 1 warmup + 3 measured (median; per-run
+prefill 8127/8533/8127, decode 128.0/128.6/128.8/128.5 incl. warmup).
+No taskset pinning (apps cannot pin), no equilibrium protocol — first
+reading, not a matrix. Prefill 0.94x the shell cell (8127 vs 8685),
+decode 1.03x (128.6 vs 124.6): the stock tier matches shell within
+noise, with the usual caveat that the shell decode starts from a
+128-token prompt while the app decodes at 512 depth (disfavours the
+app by a few percent).
 
 Read:
 
@@ -353,6 +364,231 @@ throttle multiplies host cost. llama's leaner host path suffers less.
 not host work; similarly decode needs fusion (41 passes/token) plus
 kernel efficiency to close sustained. Documented as follow-ups, not
 attempted here.
+
+### S25U, `LFM2.5-2.6B-Agent-Q4_0.gguf`: full matrix (2026-09-24)
+
+Same device, bigger model (30 layers, hidden 2048). Protocol: `--prompt
+512 --decode 128 --decode-prompt 128 --runs 3 --warmup 1 --passes 3
+--equil-warm 1`, battery 79→75% on USB (plugged_not_charging) for the
+CPU+NPU half, 79% flat for the GPU half (run later, after the device
+cooled). cera release from this worktree (WS3 + stream-twin budget gate +
+OOM hardening + prefill kind-split); llama binary
+`/data/local/tmp/llama-bench` (still unidentified). cera hexagon ran with
+`ADSP_LIBRARY_PATH=/data/local/tmp` — `llama-bin/` has no HTP skels, and
+the CLI never calls `install_skels` (FFI-only), so pointing the harness
+at `llama-bin/llama-bench` fails DSP open. GPU rows are from the latest
+re-run (`bench_26b_gpu_flat.csv`, `--passes 5 --equil-warm 2`,
+`CERA_BENCH_COOLDOWN_SECS=60`, serial-pinned after a network adb device
+made `adb` ambiguous mid-run) with the flat-planes Q6_K LM head; it
+supersedes `bench_26b_gpu_final.csv` (k64 GEMM + F1/F2/F3 fusion + f16-KV
+work, launched once headroom fell below 0.4), which itself superseded
+the gpu3 rows (295.0/25.2 vs 472.3/33.5, a re-run after the
+rotating-twin + memory work below). Artifacts: `bench_26b_cpu_npu.csv` /
+`bench_26b_gpu_flat.csv` + `_raw.log`s.
+
+| Engine | Config | Prefill | CoV | Decode | CoV |
+|---|---|---|---|---|---|
+| cera | default RowPool (unpinned) | 174.0 | 4.6% | 25.7 | 4.4% |
+| cera | pin prime (mask c0) | 194.0 | 2.9% | 23.9 | 3.4% |
+| cera | pin mid (cpu0-5) | 194.0 | 1.5% | 27.0 | 1.7% |
+| cera | hexagon (HTP v79) | 1589.0 | 2.4% | 24.5 | 0.3% |
+| llama.cpp | t1 prime (mask c0) | 62.0 | 2.2% | 17.6 | 1.3% |
+| llama.cpp | t6 mid (cpu0-5) | 117.7 | 3.5% | 33.3 | 5.0% |
+| llama.cpp | t8 big (cpu0-7) | 150.4 | 3.5% | 34.6 | 0.6% |
+| llama.cpp | t8 all (unpinned) | 160.2 | 9.4% | 34.5 | 5.0% |
+| llama.cpp | t8 htp0, ngl 99 | 1591.7 | 1.2% | 27.7 | 0.1% |
+| cera | wgpu-vulkan (Adreno 830) | 425.0 | 0.1% | 27.2 | 0.4% |
+| llama.cpp | t8 opencl (Adreno 830) | 445.1 | 0.7% | 33.4 | 0.1% |
+
+Read:
+
+- **CPU prefill is cera's at every matched width**, best-vs-best 194 vs
+  160.2 (1.21x). The WS2 smmla repack closed the old per-thread gap and
+  then some: cera is flat 174→194 across unpinned/prime/mid while llama
+  climbs 62→160 with threads but never catches up at this model size.
+- **CPU decode is llama's 1.28x best-vs-best** (34.6 vs 27.0) and 1.23x
+  at matched 6 threads (33.3 vs 27.0). Usual asymmetry applies (cera
+  decodes from a 128-token KV depth, llama `tg` from an empty context),
+  worth a few percent, not the gap. Single-threaded decode flips: cera
+  23.9 vs llama 17.6 (1.36x).
+- **NPU prefill is a tie: 1589 vs 1591.7.** Same HTP v79, same
+  `libggml-htp-v79.so` DSP image, both CoVs ~2% — neither engine has an
+  edge moving Q4_0 GEMMs through the HTP.
+- **NPU decode goes to llama 1.13x** (27.7 vs 24.5, both CoVs <0.5%).
+  Small, real, same direction as the 450M matrix (1.27x there).
+- **GPU prefill is llama's by 5%: 445.1 vs 425.0** (CoVs 0.7%/0.1%).
+  Artifact `bench_26b_gpu_flat.csv` (5 passes, 2 warmups, 60 s cooldowns,
+  battery 79→79%), superseding `bench_26b_gpu_final.csv` (426.0/27.8 vs
+  440.4/31.6). Cross-run drift dominates the small moves here: llama's own
+  decode shifted 31.6 → 33.4 between the two runs, so the ±2% cera moves
+  are conditions, not code.
+- **GPU decode goes to llama 1.23x** (33.4 vs 27.2, CoVs ≤0.4%). The
+  flat-planes Q6_K LM head (`repack_q6_k_flat` + `gemv_q6_k_flat`, NR=8,
+  this run's only code change vs gpu_final) is a profiled -0.9 ms/token
+  of GPU time (tail 4.0 → 3.2 ms) and wins an order-swapped same-phone
+  A/B both ways (27.25 vs 26.75 tok/s, 128-token decode) — but this
+  matrix ran under CPU-throttled conditions after hours of continuous
+  benchmarking, which inflated the host side (wgpu `finish()` ~1.2 ms
+  fixed per submit has no clock headroom to spare) and ate the GPU win.
+  A re-matrix on a rested phone should show the flat win in the headline
+  numbers; prefill stays tied-ish (1.05x).
+
+Caveats. No throttling warnings; per-run thermal headroom 0.20–0.87
+across the two halves, so these are warm-equilibrium numbers, not
+ceilings and not throttled. `soc_big` still reads empty on this device
+(NA columns) and the prime-core clock swept 1017–4473 MHz; interleaving
+(CPU+NPU half) and 90 s cooldowns (GPU half) spread the drift, and all
+CoVs are single-digit. The cera vulkan cell needed the prefill
+kind-split fix to run at all on this model: without it, all prefills
+complete in ~1 ms (460K tok/s) and decode panics on an empty argmax map
+with zero wgpu errors — the silent-device-loss signature. Mixed
+SPIR-V/WGSL passes in one submission lose the Adreno 830 past ~128
+prompt tokens, so `emit_prefill_cmds` now splits compute passes by
+backend kind past that length, and a device-lost callback fails fast
+instead of recording phantom numbers.
+
+Memory, same model (VmHWM sampled on device during vulkan load):
+7.02 GB before → 3.34 GB after, steady ~2.6 → ~1.7 GB. Two changes,
+both verified by `cera logits` CPU-vs-GPU parity (top-1 identical,
+top-10 within fp16-vs-f32 noise on two prompts): the GPU/Metal loaders
+no longer build the CPU int8 repacks they never read (`-3.25 GB` peak),
+and the input-embedding lookup dequantizes rows from the retained mmap
+instead of a 1.0 GB f32 host copy (vocab is 128k). The untied-F16 head
+upload got the same row-chunked treatment (no vocab-sized f32 transient
+there either). A KV-f16 follow-up
+was scoped and deferred: WGSL can't express f16 storage on Adreno (no
+`SHADER_F16`), so it needs packed-halves surgery across the attention
+kernels plus numerics validation, for ~64–128 MB on this model.
+
+### Rerun, same model, post-rebase binary (2026-09-24 afternoon)
+
+Same protocol and halves (CPU+NPU interleaved, GPU with 90 s
+cooldowns), battery 80→75% then 76–79% charging. cera rebuilt from
+this worktree after the rebase onto `origin/main` (`#451`, which
+includes the upstream repacked-Q4_0 activation fix); llama binary
+unchanged. Artifacts: `bench_26b_r2_cpu_npu.csv` /
+`bench_26b_r2_gpu.csv` + `_raw.log`s.
+
+| Engine | Config | Prefill | CoV | Decode | CoV |
+|---|---|---|---|---|---|
+| cera | default RowPool (unpinned) | 143.0 | 1.8% | 26.0 | 7.5% |
+| cera | pin prime (mask c0) | 191.0 | 2.9% | 25.8 | 4.7% |
+| cera | pin mid (cpu0-5) | 192.0 | 2.4% | 26.0 | 5.5% |
+| cera | hexagon (HTP v79) | 1636.0 | 3.0% | 24.2 | 1.5% |
+| llama.cpp | t1 prime (mask c0) | 59.5 | 5.9% | 17.4 | 0.9% |
+| llama.cpp | t6 mid (cpu0-5) | 108.1 | 3.2% | 31.4 | 4.1% |
+| llama.cpp | t8 big (cpu0-7) | 142.9 | 6.6% | 32.6 | 5.1% |
+| llama.cpp | t8 all (unpinned) | 142.2 | 7.1% | 34.1 | 0.9% |
+| llama.cpp | t8 htp0, ngl 99 | 1545.3 | 3.0% | 27.4 | 0.7% |
+| cera | wgpu-vulkan (Adreno 830) | 295.0 | 0.2% | 25.3 | 0.2% |
+| llama.cpp | t8 opencl (Adreno 830) | 459.8 | 1.0% | 33.3 | 1.5% |
+
+Read vs the morning matrix: same verdicts everywhere, all within run
+variance. CPU prefill cera best-vs-best 192 vs 142.9 (1.34x, was
+1.21x — llama's t8-all row came in lower this half, 142 vs 160);
+CPU decode llama 1.31x (34.1 vs 26.0). NPU prefill still a tie with
+cera numerically ahead (1636 vs 1545, 1.06x); NPU decode llama
+1.13x. GPU rows are near-identical to the morning: cera prefill
+295.0 exactly, decode 25.3 vs 25.2; llama 459.8/33.3 vs 472.3/33.5
+(prefill gap 1.56x, decode 1.32x). The rebase changed nothing
+measurable on this model: every cera row reproduces the morning
+matrix within run variance.
+
+### GPU fix, item by item (2026-09-24 afternoon)
+
+Quick A/Bs (2 runs each, 512/64 unless noted — direction-finding, not
+matrix-grade), same device/binaries as the rerun above:
+
+- **QKV unfuse.** The fused decode QKV kernel predates the WS3 subgroup
+  upgrade and has no SPIR-V twin; an env-gated A/B (unfused 25.4 vs
+  fused 24.8–24.9, greedy-identical) showed it net-negative, so it was
+  removed outright (kernel, pipeline, setup, shaders). +2% decode.
+- **Resident stream layout.** Q4_0 weights now upload pre-transposed
+  (same bytes) instead of raw; decode and prefill read the resident
+  (q, d) directly. Deleted the rotating twin (per-GEMM GPU repack +
+  ~150 MB scratch) and the permanent twin (2x weights on small models).
+  Prefill 295 → 342 (+16%, exactly the profiled 15.3% repack share);
+  decode 24.7 → 23.5 (−5%, the new GEMV trails the old raw kernel up
+  to 8% on wide shapes — see below); load +~2 s one-time (single-
+  threaded host repack of 1.5 GB; rayon parallelization is open).
+  Greedy outputs identical; small-n prefill (new (q, d) reg-tile
+  fallthrough) identical to CPU. `CERA_WGPU_STREAM_GEMM=0` restores
+  raw upload + old kernels as an escape hatch.
+- **`cera gemv-bench`.** New device-side GEMV microbench (synthetic
+  weights, both kernels, CPU parity) for kernel iteration without
+  full-model runs. Drove the new GEMV from 3.3x slower than the raw
+  kernel (K-parallel mapping, strided 4*m reads) to ±8% (16 rows x
+  8-way K-split, 2 rows/thread, y-trick, streaming x): e.g.
+  10752x2048 47.6 vs 51.1 GB/s, 2048x2048 38.8 vs 35.6 (win),
+  512x2048 18.2 vs 3.9 (win). Remaining deficit concentrates on wide
+  shapes; 4 rows/thread was tried and lost on model-critical shapes.
+
+Net vs the afternoon rerun: GPU prefill 295 → ~342 (gap 1.56x →
+~1.35x), decode ~25.3 → ~23.5. Decode recovery is fusion work (next).
+
+- **Tail merge (F1).** The output norm + LM-head projection + optional
+  logit scale + argmax were 4 dispatches across 3 passes; they now run
+  in one `tail` pass (sequential RAW chain, same guarantee the merged
+  `conv` pass relies on). 71 → 69 passes/token, greedy-identical.
+- **Out-of-place norms + one pass per layer (F2).** New `rmsnorm_out`
+  shader entry (out-of-place twin, WGSL bindings 3..6 reusing the
+  Metal-only set) lets both per-layer norms read `hidden` directly,
+  deleting the hidden->scratch blits that split each layer's block and
+  FFN into separate compute passes. Conv layers run block+FFN in one
+  `layer_conv` pass; attn layers run the FFN inside `attn_post`.
+  69 → 39 passes/token, decode 26.3 → 28.2 (+7%, 128/32),
+  greedy-identical. The in-place kernel stays for the tail/loop norms.
+- **`cera gemm-bench`.** Device-side prefill-GEMM microbench mirroring
+  `gemv-bench` (synthetic weights, TFLOP/s + parity), plus `--spv` to
+  A/B experimental SPIR-V variants without rebuilding (same
+  bindings/grid/params contract, `--spv-ny` for fiber width). Variants
+  score against the baseline's own output: f16 fiber accumulation over
+  k=2048 with unit-scale synthetic inputs genuinely disagrees with the
+  f32 CPU reference by O(10) for every kernel including the shipped
+  one, so the CPU diff is printed as a sanity anchor, not a gate.
+- **K-slice-64 streaming GEMM.** `gemm-bench` showed the streaming
+  GEMM barrier-bound: a k-slice-64 twin (same 1x32 fiber/grid, 8
+  q-words + 2 scales per slice, 4 KB B shmem) beats the k-slice-32
+  kernel +28-33% at n >= 64 (2.73 vs 2.05 TFLOP/s at
+  10752x512x2048), tied at n=32, bit-exact everywhere. Dispatched
+  when k % 64 == 0 (all LFM2/Qwen shapes), else the k-slice-32
+  kernel; `CERA_WGPU_GEMM_K64=0` forces k-slice-32. Tried and
+  rejected: k-slice-128 (loses to 64), 1x64 fibers (3x slower,
+  shmem broadcast pressure), vector half4 staging loads (no change —
+  confirms the old measurement). Prefill 342 → 421 (+23%, 512/64),
+  greedy-identical, all 166 GEMMs on the k64 path.
+
+Net now vs the afternoon rerun: GPU prefill 295 → 421 (gap 1.56x →
+1.09x), decode ~25.3 → ~28 (128/32; gap 1.32x → ~1.19x). Remaining
+prefill at n=512: GEMM 81%, attention_prefill 10%, transpose 3%.
+
+- **In-pass KV append + one pass per attn layer (F3).** New
+  `kv_append` kernel (multi-target Slang) replaces the two
+  encoder-level K/V cache blits with dispatches, so the attn block
+  merges pre+post+FFN into one `layer_attn` pass (shared pre/post
+  helpers; TurboQuant keeps the split, its attention runs in its own
+  encode passes). 39 → 31 passes/token, greedy-identical, decode
+  flat at ~28 (128/32): pass boundaries no longer bind decode, the
+  GEMVs do (~42 GB/s effective vs ~50 for llama).
+- **Packed-f16 KV cache.** The wgpu uncompressed cache was f32; it
+  now stores LE halves packed 2-per-u32 (WGSL has no f16 storage
+  without SHADER_F16, withheld on Adreno — `unpack2x16float` is core
+  and the bytes match native f16 slabs, so `AttentionF16` snapshots
+  stay mutually loadable with CPU/Metal; legacy f32 entries convert
+  on restore). `flash_attention`/`attention_prefill` unpack on read
+  (f32 accumulation kept), `kv_append` packs on write (one thread
+  per word), prefill KV writes became pack dispatches (fewer pass
+  splits than the old blits), `kv_shift` reads packed + writes f32
+  scratch with a `kv_append` writeback. Saves 64 MiB on the 2.6B at
+  4k ctx (scales linearly), perf unchanged (prefill 421, decode
+  27.9). Numerics: kernel oracles exact vs f16-rounded refs, 6/6
+  CPU==GPU at 20 tokens, pre-f16 GPU parity exact; at 60 tokens
+  CPU/GPU flip 3/5 prompts (coherent paraphrases) — the CPU
+  `--kv-cache-mode f16` control matches f32 on all three, so the
+  flips are GPU decode-kernel order, not KV rounding. The audio
+  detokenizer shares `flash_attention` but keeps f32 via a dedicated
+  `flash_attention_f32.wgsl` twin (its caches are tiny and its exact
+  CPU/GPU parity test pins f32 bitwise).
 
 ## Mac: cera vs llama.cpp on M1 Max
 

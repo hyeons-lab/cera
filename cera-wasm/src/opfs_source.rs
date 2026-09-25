@@ -44,7 +44,9 @@ impl OpfsGpuWeightSource {
     ) -> Result<Self, JsError> {
         let config = Lfm2Model::parse_config(&gguf, context_size)
             .map_err(|e| JsError::new(&format!("parsing LFM2 config: {e:#}")))?;
-        let layer_refs = Lfm2Model::resolve_all_layer_refs(&gguf, &config)
+        // No CPU repacks: this source only resolves metadata for GPU upload
+        // (see `with_repack_if`).
+        let layer_refs = Lfm2Model::resolve_all_layer_refs(&gguf, &config, false)
             .map_err(|e| JsError::new(&format!("resolving layer refs: {e:#}")))?;
         let output_ref = cera::model::transformer::resolve_weight(&gguf, "output.weight").ok();
 

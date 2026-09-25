@@ -651,7 +651,9 @@ impl MetalLfm2Model {
         path: Option<&std::path::Path>,
         context_size: usize,
     ) -> Result<Self> {
-        let cpu = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+        // No CPU repacks: the Metal loader only resolves metadata from this
+        // model (see `with_repack_if`).
+        let cpu = super::lfm2::Lfm2Model::from_gguf_no_repack(gguf, context_size)?;
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -668,7 +670,10 @@ impl MetalLfm2Model {
         let model_id = path
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let cpu = super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?;
+        // No CPU repacks: the Metal loader only resolves metadata from this
+        // model (see `with_repack_if`).
+        let cpu =
+            super::llama::LlamaModel::from_gguf_with_id_no_repack(gguf, context_size, model_id)?;
         if let Some(sw) = cpu.sliding_window() {
             tracing::warn!(
                 "Model specifies sliding window attention ({sw} tokens), which is not accelerated on Metal; full dense attention will be applied"

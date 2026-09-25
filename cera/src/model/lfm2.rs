@@ -494,9 +494,12 @@ impl Lfm2Model {
     }
 
     /// Resolve all layer weight references for an LFM2 model from its GGUF tensor index.
+    /// When `repack` is false the CPU int8 repacks are skipped (see
+    /// `with_repack_if`) — for loaders that only resolve metadata.
     pub fn resolve_all_layer_refs(
         gguf: &GgufFile,
         config: &ModelConfig,
+        repack: bool,
     ) -> Result<Vec<LayerWeightRefs>> {
         let mut layer_refs = Vec::with_capacity(config.n_layers);
         for (i, bt) in config.block_types.iter().enumerate() {
@@ -541,11 +544,11 @@ impl Lfm2Model {
             } else {
                 FfnRefs::Dense(DenseFfnRefs {
                     gate: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     up: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_up.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     down: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_down.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     gate_up_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
                 })
             };
@@ -558,14 +561,14 @@ impl Lfm2Model {
                                 gguf,
                                 &format!("blk.{i}.shortconv.in_proj.weight"),
                             )?
-                            .with_repack(gguf),
+                            .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(
                                 gguf,
                                 &format!("blk.{i}.shortconv.out_proj.weight"),
                             )?
-                            .with_repack(gguf),
+                            .with_repack_if(gguf, repack),
                         ),
                         None,
                         None,
@@ -578,19 +581,19 @@ impl Lfm2Model {
                         None,
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_q.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_k.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_v.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_output.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                     )
                 };
@@ -617,6 +620,34 @@ impl Lfm2Model {
         gguf: GgufFile,
         context_size: usize,
         model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, true)
+    }
+
+    /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
+    /// resolve weight metadata from this model but never dispatch CPU
+    /// kernels — the repacks would be gigabytes allocated only to be freed
+    /// after upload. Do NOT use for CPU inference (dispatch falls back to
+    /// the slow path without them... it stays correct, just slower).
+    pub fn from_gguf_with_id_no_repack(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, false)
+    }
+
+    /// Load without the CPU int8 repacks (see
+    /// [`from_gguf_with_id_no_repack`](Self::from_gguf_with_id_no_repack)).
+    pub fn from_gguf_no_repack(gguf: GgufFile, context_size: usize) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, String::new(), false)
+    }
+
+    fn from_gguf_impl(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        repack: bool,
     ) -> Result<Self> {
         let config = Self::parse_config(&gguf, context_size)?;
         let n_layers = config.n_layers;
@@ -688,7 +719,7 @@ impl Lfm2Model {
             }
         }
 
-        let layer_refs = Self::resolve_all_layer_refs(&gguf, &config)?;
+        let layer_refs = Self::resolve_all_layer_refs(&gguf, &config, repack)?;
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
 
         let prefix_cache = Mutex::new(KvPrefixCache::for_model(
@@ -5204,5 +5235,67 @@ mod loader_tests {
                 .contains("lfm2.embedding_length must be > 0"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_repack_tests {
+    use super::*;
+
+    /// The no-repack loader resolves identical metadata without the CPU int8
+    /// repacks (gigabytes the GPU/Metal loaders would allocate only to free
+    /// after upload). Needs the 230M model locally; skips without it.
+    #[test]
+    fn no_repack_skips_cpu_repacks() {
+        let home = std::env::var("HOME").expect("HOME unset");
+        let path = std::path::PathBuf::from(home)
+            .join(".leap/models/LFM2.5-230M-Q4_0/LFM2.5-230M-Q4_0.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let full = Lfm2Model::from_gguf(GgufFile::open(&path).unwrap(), 64).unwrap();
+        let lite = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 64).unwrap();
+        assert_eq!(full.config.n_layers, lite.config.n_layers);
+        assert_eq!(full.config.hidden_size, lite.config.hidden_size);
+        assert_eq!(full.layer_refs.len(), lite.layer_refs.len());
+        assert!(lite.config.moe.is_none(), "test model must be dense");
+
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+        {
+            fn projection_refs(refs: &[LayerWeightRefs]) -> Vec<&WeightRef> {
+                let mut out = Vec::new();
+                for layer in refs {
+                    let FfnRefs::Dense(dense) = &layer.ffn else {
+                        unreachable!("test model must be dense");
+                    };
+                    out.extend([&dense.gate, &dense.up, &dense.down]);
+                    out.extend(layer.shortconv_in_proj.iter());
+                    out.extend(layer.shortconv_out_proj.iter());
+                    out.extend(layer.attn_q.iter());
+                    out.extend(layer.attn_k.iter());
+                    out.extend(layer.attn_v.iter());
+                    out.extend(layer.attn_output.iter());
+                }
+                out
+            }
+            let full_refs = projection_refs(&full.layer_refs);
+            let lite_refs = projection_refs(&lite.layer_refs);
+            // Same metadata resolved...
+            assert_eq!(full_refs.len(), lite_refs.len());
+            assert!(
+                full_refs.iter().all(|w| w.dtype == DType::Q4_0),
+                "test model must be all-Q4_0 projections"
+            );
+            // ...repacks present in the full load, absent in the lite one.
+            assert!(
+                full_refs.iter().any(|w| w.repacked.is_some()),
+                "full load repacked nothing; test exercises no path"
+            );
+            assert!(
+                lite_refs.iter().all(|w| w.repacked.is_none()),
+                "no-repack load still repacked weights"
+            );
+        }
     }
 }
