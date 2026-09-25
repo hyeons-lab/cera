@@ -1216,9 +1216,12 @@ pub(crate) mod neon {
     }
 
     /// Unified 2-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Gate and Up projections).
-    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
-    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon`).
-    #[target_feature(enable = "neon,dotprod")]
+    ///
+    /// Ungated dispatcher: the tier check must dominate the *call* to the
+    /// `dotprod` twin, not just the intrinsic use inside it. Calling a
+    /// `#[target_feature]` function on hardware without the feature is UB at
+    /// the call boundary (LLVM compiles the whole body assuming `sdot`), so
+    /// this function itself carries no attribute.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_q4_0_q8_0_fused2_neon(
         a1_quant: &[u8],
@@ -1239,7 +1242,29 @@ pub(crate) mod neon {
             }
             return;
         }
+        unsafe {
+            gemv_q4_0_q8_0_fused2_neon_dotprod(
+                a1_quant, a2_quant, x_scales, x_quants, y1, y2, _m, k,
+            )
+        }
+    }
 
+    /// Dotprod twin of [`gemv_q4_0_q8_0_fused2_neon`]: only callable where
+    /// the dispatcher has established `tier >= NeonDotprod`.
+    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
+    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon_dotprod`).
+    #[target_feature(enable = "neon,dotprod")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemv_q4_0_q8_0_fused2_neon_dotprod(
+        a1_quant: &[u8],
+        a2_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y1: &mut [f32],
+        y2: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
         let blocks_per_row = k / 32;
         let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
 
@@ -1412,11 +1437,10 @@ pub(crate) mod neon {
     /// `out[r] = silu(gate[r] · x) * (up[r] · x)`. Single-row loop (see the
     /// register-budget note inside); the two matrices supply the ILP.
     ///
-    /// The `dotprod` attribute is load-bearing, not decorative: without it
-    /// LLVM refuses to inline `vdotq_s32` into this body and emits a real
-    /// call per dot product (measured 11x slower on Oryon). The runtime
-    /// tier check below keeps this sound on non-dotprod CPUs.
-    #[target_feature(enable = "neon,dotprod")]
+    /// Ungated dispatcher: the tier check must dominate the *call* to the
+    /// `dotprod` twin. Calling a `#[target_feature]` function on hardware
+    /// without the feature is UB at the call boundary, so this function
+    /// itself carries no attribute.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_q4_0_gate_up_swiglu_neon(
         gate_quant: &[u8],
@@ -1437,7 +1461,30 @@ pub(crate) mod neon {
             crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
             return;
         }
+        unsafe {
+            gemv_q4_0_gate_up_swiglu_neon_dotprod(
+                gate_quant, up_quant, x_scales, x_quants, out, _m, k,
+            )
+        }
+    }
 
+    /// Dotprod twin of [`gemv_q4_0_gate_up_swiglu_neon`]: only callable where
+    /// the dispatcher has established `tier >= NeonDotprod`.
+    ///
+    /// The `dotprod` attribute is load-bearing, not decorative: without it
+    /// LLVM refuses to inline `vdotq_s32` into this body and emits a real
+    /// call per dot product (measured 11x slower on Oryon).
+    #[target_feature(enable = "neon,dotprod")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemv_q4_0_gate_up_swiglu_neon_dotprod(
+        gate_quant: &[u8],
+        up_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        out: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
         let blocks_per_row = k / 32;
         let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
 
@@ -1603,10 +1650,45 @@ pub(crate) mod neon {
     /// `out[r] = silu(gate[r] @ x) * (up[r] @ x)`.
     /// Shares activation loads and precomputed column sums across both projections,
     /// eliminating intermediate buffers and the separate silu_mul pass.
-    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
-    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon`).
-    #[target_feature(enable = "neon,dotprod")]
+    ///
+    /// Ungated dispatcher: the tier check must dominate the *call* to the
+    /// `dotprod` twin (calling a `#[target_feature]` function without the
+    /// feature is UB at the call boundary).
     pub unsafe fn gemv_q4k_gate_up_swiglu_neon(
+        gate_quant: &[u8],
+        up_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        out: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        debug_assert!(
+            k.is_multiple_of(256),
+            "Q4_K GEMV: k must be divisible by 256"
+        );
+        let out = &mut out[.._m];
+        if cpu_features().tier < CpuTier::NeonDotprod {
+            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
+            let mut up_tmp = vec![0.0f32; _m];
+            crate::backend::cpu::gemv_q4km_f32(gate_quant, &xf, out, _m, k);
+            crate::backend::cpu::gemv_q4km_f32(up_quant, &xf, &mut up_tmp, _m, k);
+            crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
+            return;
+        }
+        unsafe {
+            gemv_q4k_gate_up_swiglu_neon_dotprod(
+                gate_quant, up_quant, x_scales, x_quants, out, _m, k,
+            )
+        }
+    }
+
+    /// Dotprod twin of [`gemv_q4k_gate_up_swiglu_neon`]: only callable where
+    /// the dispatcher has established `tier >= NeonDotprod`.
+    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
+    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon_dotprod`).
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemv_q4k_gate_up_swiglu_neon_dotprod(
         gate_quant: &[u8],
         up_quant: &[u8],
         x_scales: &[f32],
@@ -1621,16 +1703,6 @@ pub(crate) mod neon {
         );
         let blocks_per_row = k / 256;
         let row_bytes = blocks_per_row * size_of::<BlockQ4KM>();
-
-        let out = &mut out[.._m];
-        if cpu_features().tier < CpuTier::NeonDotprod {
-            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
-            let mut up_tmp = vec![0.0f32; _m];
-            crate::backend::cpu::gemv_q4km_f32(gate_quant, &xf, out, _m, k);
-            crate::backend::cpu::gemv_q4km_f32(up_quant, &xf, &mut up_tmp, _m, k);
-            crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
-            return;
-        }
 
         let nb32 = k / 32;
         let mut stack_xqs = [0i32; 1024];
@@ -1931,10 +2003,45 @@ pub(crate) mod neon {
     /// Evaluates both gate and up projections in a single fused pass, evaluates
     /// the SiLU activation in vector registers, and writes the multiplied result directly
     /// to `out`. Eliminates the intermediate buffer round-trip and threadpool barrier.
-    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
-    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon`).
-    #[target_feature(enable = "neon,dotprod")]
+    ///
+    /// Ungated dispatcher: the tier check must dominate the *call* to the
+    /// `dotprod` twin (calling a `#[target_feature]` function without the
+    /// feature is UB at the call boundary).
     pub unsafe fn gemv_q5k_gate_up_swiglu_neon(
+        gate_quant: &[u8],
+        up_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        out: &mut [f32],
+        _m: usize,
+        k: usize,
+    ) {
+        debug_assert!(
+            k.is_multiple_of(256),
+            "Q5_K GEMV: k must be divisible by 256"
+        );
+        let out = &mut out[.._m];
+        if cpu_features().tier < CpuTier::NeonDotprod {
+            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
+            let mut up_tmp = vec![0.0f32; _m];
+            crate::backend::cpu::gemv_q5km_f32(gate_quant, &xf, out, _m, k);
+            crate::backend::cpu::gemv_q5km_f32(up_quant, &xf, &mut up_tmp, _m, k);
+            crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
+            return;
+        }
+        unsafe {
+            gemv_q5k_gate_up_swiglu_neon_dotprod(
+                gate_quant, up_quant, x_scales, x_quants, out, _m, k,
+            )
+        }
+    }
+
+    /// Dotprod twin of [`gemv_q5k_gate_up_swiglu_neon`]: only callable where
+    /// the dispatcher has established `tier >= NeonDotprod`.
+    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
+    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon_dotprod`).
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn gemv_q5k_gate_up_swiglu_neon_dotprod(
         gate_quant: &[u8],
         up_quant: &[u8],
         x_scales: &[f32],
@@ -1949,16 +2056,6 @@ pub(crate) mod neon {
         );
         let blocks_per_row = k / 256;
         let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
-
-        let out = &mut out[.._m];
-        if cpu_features().tier < CpuTier::NeonDotprod {
-            let xf = reconstruct_q8_0_input(x_scales, x_quants, k);
-            let mut up_tmp = vec![0.0f32; _m];
-            crate::backend::cpu::gemv_q5km_f32(gate_quant, &xf, out, _m, k);
-            crate::backend::cpu::gemv_q5km_f32(up_quant, &xf, &mut up_tmp, _m, k);
-            crate::backend::cpu::silu_mul_inplace(out, &up_tmp);
-            return;
-        }
 
         let nb32 = k / 32;
         let mut stack_xqs = [0i32; 1024];
@@ -2711,9 +2808,10 @@ pub(crate) mod neon {
     }
 
     /// Unified 3-matrix Q4_0 GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
-    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
-    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon`).
-    #[target_feature(enable = "neon,dotprod")]
+    ///
+    /// Ungated dispatcher: the tier check must dominate the *call* to the
+    /// `dotprod` twin (calling a `#[target_feature]` function without the
+    /// feature is UB at the call boundary).
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_q4_0_q8_0_concat3_neon(
         a1_quant: &[u8],
@@ -2737,7 +2835,33 @@ pub(crate) mod neon {
             }
             return;
         }
+        unsafe {
+            gemv_q4_0_q8_0_concat3_neon_dotprod(
+                a1_quant, a2_quant, a3_quant, x_scales, x_quants, y1, y2, y3, m1, m2, m3, k,
+            )
+        }
+    }
 
+    /// Dotprod twin of [`gemv_q4_0_q8_0_concat3_neon`]: only callable where
+    /// the dispatcher has established `tier >= NeonDotprod`.
+    // Load-bearing: without `dotprod`, `vdotq_s32` becomes a real call per
+    // dot product (see the note on `gemv_q4_0_gate_up_swiglu_neon_dotprod`).
+    #[target_feature(enable = "neon,dotprod")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemv_q4_0_q8_0_concat3_neon_dotprod(
+        a1_quant: &[u8],
+        a2_quant: &[u8],
+        a3_quant: &[u8],
+        x_scales: &[f32],
+        x_quants: &[i8],
+        y1: &mut [f32],
+        y2: &mut [f32],
+        y3: &mut [f32],
+        m1: usize,
+        m2: usize,
+        m3: usize,
+        k: usize,
+    ) {
         let total_m = m1 + m2 + m3;
         let blocks_per_row = k / 32;
         let row_bytes = blocks_per_row * size_of::<BlockQ4_0>();
@@ -7604,13 +7728,12 @@ pub(crate) mod neon {
         }
     }
 
-    // Verify each NEON-without-dotprod fallback against its `*_dotprod` sibling.
-    // These only run on dotprod-capable hardware (e.g. Apple Silicon) — where
-    // both paths are valid to call — and assert they agree to f32 tolerance.
-    // Both consume the same q8_0-quantized input; the Q4_0/Q8_0 `_base` kernels
-    // use the bit-identical emulated `vdotq_s32`, so they differ from the
-    // dotprod path only in f32 scale-accumulation order, while the Q6_K path
-    // reconstructs to f32 and reuses `vec_dot_q6_k_f32`.
+    // NEON kernel parity tests. The original core verifies each
+    // NEON-without-dotprod fallback against its `*_dotprod` sibling (these
+    // only run on dotprod-capable hardware, e.g. Apple Silicon, where both
+    // paths are valid to call, and assert they agree to f32 tolerance); the
+    // module has since grown the GEMV/GEMM fusion, layout, and i8mm-twin
+    // parity tests too. (Name kept: CI filters on `fallback_tests`.)
     #[cfg(test)]
     mod fallback_tests {
         use super::*;

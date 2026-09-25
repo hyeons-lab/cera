@@ -38,26 +38,37 @@ fn random_q4_0(m: usize, k: usize) -> Vec<u8> {
     aquant
 }
 
-fn bench_plain(m: usize, k: usize) {
-    const ITERS: usize = 20;
-    const WARMUP: usize = 3;
-    let aquant = random_q4_0(m, k);
+fn quantize_input(k: usize) -> (Vec<f32>, Vec<i8>) {
     let x: Vec<f32> = (0..k)
         .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
         .collect();
-    let (xs, xq) = quantize_f32_to_q8_0(&x);
-    let mut y = vec![0.0f32; m];
-    for _ in 0..WARMUP {
-        gemv_q4_0_with_q8(&aquant, &xs, &xq, &mut y, m, k);
+    quantize_f32_to_q8_0(&x)
+}
+
+/// Run `f` `warmup` times untimed, then `iters` times timed; return the
+/// median seconds. One scaffold for every probe below, so a statistics
+/// fix lands once instead of once per bench.
+fn time_median(warmup: usize, iters: usize, mut f: impl FnMut()) -> f64 {
+    for _ in 0..warmup {
+        f();
     }
-    let mut dts = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
+    let mut dts = Vec::with_capacity(iters);
+    for _ in 0..iters {
         let t = Instant::now();
-        gemv_q4_0_with_q8(&aquant, &xs, &xq, &mut y, m, k);
+        f();
         dts.push(t.elapsed().as_secs_f64());
     }
     dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = dts[ITERS / 2];
+    dts[iters / 2]
+}
+
+fn bench_plain(m: usize, k: usize) {
+    let aquant = random_q4_0(m, k);
+    let (xs, xq) = quantize_input(k);
+    let mut y = vec![0.0f32; m];
+    let med = time_median(3, 20, || {
+        gemv_q4_0_with_q8(&aquant, &xs, &xq, &mut y, m, k);
+    });
     let chk: f64 = y.iter().step_by(1024).map(|v| *v as f64).sum();
     println!(
         "plain m={m} k={k}: median {:.6}s, {:.1} GB/s (chk {chk:.3})",
@@ -67,26 +78,13 @@ fn bench_plain(m: usize, k: usize) {
 }
 
 fn bench_fused(m: usize, k: usize) {
-    const ITERS: usize = 20;
-    const WARMUP: usize = 3;
     let gate = random_q4_0(m, k);
     let up = random_q4_0(m, k);
-    let x: Vec<f32> = (0..k)
-        .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
-        .collect();
-    let (xs, xq) = quantize_f32_to_q8_0(&x);
+    let (xs, xq) = quantize_input(k);
     let mut y = vec![0.0f32; m];
-    for _ in 0..WARMUP {
+    let med = time_median(3, 20, || {
         gemv_q4_0_gate_up_swiglu_with_q8(&gate, &up, &xs, &xq, &mut y, m, k);
-    }
-    let mut dts = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
-        let t = Instant::now();
-        gemv_q4_0_gate_up_swiglu_with_q8(&gate, &up, &xs, &xq, &mut y, m, k);
-        dts.push(t.elapsed().as_secs_f64());
-    }
-    dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = dts[ITERS / 2];
+    });
     let chk: f64 = y.iter().step_by(1024).map(|v| *v as f64).sum();
     println!(
         "fused m={m} k={k}: median {:.6}s, {:.1} GB/s (chk {chk:.3})",
@@ -96,27 +94,14 @@ fn bench_fused(m: usize, k: usize) {
 }
 
 fn bench_fused_same_ptr(m: usize, k: usize) {
-    const ITERS: usize = 20;
-    const WARMUP: usize = 3;
     // Same matrix for gate AND up: if the fused loop is intrinsically slow
     // this stays slow; if the two-region ping-pong is the problem this flies.
     let gate = random_q4_0(m, k);
-    let x: Vec<f32> = (0..k)
-        .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
-        .collect();
-    let (xs, xq) = quantize_f32_to_q8_0(&x);
+    let (xs, xq) = quantize_input(k);
     let mut y = vec![0.0f32; m];
-    for _ in 0..WARMUP {
+    let med = time_median(3, 20, || {
         gemv_q4_0_gate_up_swiglu_with_q8(&gate, &gate, &xs, &xq, &mut y, m, k);
-    }
-    let mut dts = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
-        let t = Instant::now();
-        gemv_q4_0_gate_up_swiglu_with_q8(&gate, &gate, &xs, &xq, &mut y, m, k);
-        dts.push(t.elapsed().as_secs_f64());
-    }
-    dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = dts[ITERS / 2];
+    });
     println!(
         "fused-sameptr m={m} k={k}: median {:.6}s, {:.1} GB/s",
         med,
@@ -125,32 +110,17 @@ fn bench_fused_same_ptr(m: usize, k: usize) {
 }
 
 fn bench_unfused(m: usize, k: usize) {
-    const ITERS: usize = 20;
-    const WARMUP: usize = 3;
     // The candidate fix measured directly: two plain GEMVs + SiLU pass.
     let gate = random_q4_0(m, k);
     let up = random_q4_0(m, k);
-    let x: Vec<f32> = (0..k)
-        .map(|i| ((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
-        .collect();
-    let (xs, xq) = quantize_f32_to_q8_0(&x);
+    let (xs, xq) = quantize_input(k);
     let mut yg = vec![0.0f32; m];
     let mut yu = vec![0.0f32; m];
-    for _ in 0..WARMUP {
+    let med = time_median(3, 20, || {
         gemv_q4_0_with_q8(&gate, &xs, &xq, &mut yg, m, k);
         gemv_q4_0_with_q8(&up, &xs, &xq, &mut yu, m, k);
         silu_mul_inplace(&mut yg, &yu);
-    }
-    let mut dts = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
-        let t = Instant::now();
-        gemv_q4_0_with_q8(&gate, &xs, &xq, &mut yg, m, k);
-        gemv_q4_0_with_q8(&up, &xs, &xq, &mut yu, m, k);
-        silu_mul_inplace(&mut yg, &yu);
-        dts.push(t.elapsed().as_secs_f64());
-    }
-    dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = dts[ITERS / 2];
+    });
     println!(
         "unfused m={m} k={k}: median {:.6}s, {:.1} GB/s",
         med,
@@ -159,8 +129,6 @@ fn bench_unfused(m: usize, k: usize) {
 }
 
 fn bench_gemm(m: usize, k: usize, n: usize) {
-    const ITERS: usize = 10;
-    const WARMUP: usize = 2;
     let aquant = random_q4_0(m, k);
     // B packed column-major to match `quantize_columns`: column j occupies
     // quants[j*k..(j+1)*k], scales[j*nb..(j+1)*nb].
@@ -176,7 +144,7 @@ fn bench_gemm(m: usize, k: usize, n: usize) {
         b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
     }
     let mut out = vec![0.0f32; m * n];
-    for _ in 0..WARMUP {
+    let med = time_median(2, 10, || {
         let ran = gemm_preq_dispatch(
             DType::Q4_0,
             &aquant,
@@ -188,25 +156,7 @@ fn bench_gemm(m: usize, k: usize, n: usize) {
             k,
         );
         assert!(ran, "no GEMM kernel ran for Q4_0");
-    }
-    let mut dts = Vec::with_capacity(ITERS);
-    for _ in 0..ITERS {
-        let t = Instant::now();
-        let ran = gemm_preq_dispatch(
-            DType::Q4_0,
-            &aquant,
-            &b_scales,
-            &b_quants,
-            &mut out,
-            m,
-            n,
-            k,
-        );
-        assert!(ran);
-        dts.push(t.elapsed().as_secs_f64());
-    }
-    dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = dts[ITERS / 2];
+    });
     let flops = 2.0 * m as f64 * k as f64 * n as f64;
     let chk: f64 = out.iter().step_by(100003).map(|v| *v as f64).sum();
     println!(
