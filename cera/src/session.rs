@@ -1565,6 +1565,10 @@ impl Session {
     ///    call.
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        // Before validation like the other append entries: the CPU encode
+        // below dispatches on the pools long before `append_embeddings`'s
+        // hook would fire.
+        Self::resize_pools_for_cpuset();
         if !self.capabilities.audio_in {
             return Err(CeraError::UnsupportedModality);
         }
@@ -2463,7 +2467,11 @@ impl Session {
     /// cheap no-op otherwise. Called at generation boundaries (append and
     /// generate entry, each decode token, each prefill chunk) and before
     /// hidden-state extraction. No-op stub where the threadpool module is
-    /// compiled out (wasm, no-`parallel`).
+    /// compiled out (wasm, no-`parallel`). Only
+    /// `Model::forward_prefill_chunked`'s hook presence is pinned (see
+    /// `chunked_prefill_per_chunk_hook_converges_pools`); entry hooks and
+    /// per-iteration granularity are pinned only by review: no test moves
+    /// the cpuset mid-operation.
     fn resize_pools_for_cpuset() {
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
         crate::backend::threadpool::resize_pools_for_cpuset();
@@ -2889,6 +2897,7 @@ impl Session {
                         finish = FinishReason::ContextFull;
                         break;
                     }
+                    Self::resize_pools_for_cpuset();
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
                         crate::audio_engine::FrameOutcome::End => {
@@ -3136,6 +3145,7 @@ impl Session {
                 finish = FinishReason::ContextFull;
                 break;
             }
+            Self::resize_pools_for_cpuset();
 
             // The target's argmax at the current position — always correct. Like
             // the normal greedy loop, a stop token ends decode *without* being

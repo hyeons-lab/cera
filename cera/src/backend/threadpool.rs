@@ -1030,23 +1030,39 @@ fn rebuild_pools_for_allowance(allowed: usize) -> bool {
     let new_prefill = rebuild_prefill.then(|| build_prefill(&topo));
     let new_decode = rebuild_decode.then(|| build_decode(&topo));
     // Swap each rebuilt pool under its slot try-lock, fixed order, with no
-    // early return between: a contended slot defers only its own pool (see
-    // `pool_swap_helper_defers_only_contended_slot`), so a first-use build
-    // on one slot never strands a ready swap on the other.
+    // early return between: a contended slot defers only its own pool, so a
+    // first-use build on one slot never strands a ready swap on the other
+    // (see `pool_swap_rebuilt_pools_attempts_both_despite_contention`).
+    swap_rebuilt_pools(
+        (&PREFILL_SLOT, new_prefill),
+        (&DECODE_SLOT, new_decode),
+        allowed,
+    )
+}
+
+/// Swap each rebuilt pool into its slot, attempting every pool even when an
+/// earlier slot contends: contention defers only its own pool. Slots are
+/// parameters (rather than the globals) so tests can drive one contended
+/// and one free slot deterministically.
+fn swap_rebuilt_pools(
+    (prefill_slot, prefill_new): (&Mutex<Option<PoolSlot>>, Option<RowPool>),
+    (decode_slot, decode_new): (&Mutex<Option<PoolSlot>>, Option<RowPool>),
+    allowed: usize,
+) -> bool {
     let mut rebuilt = false;
-    if let Some(new) = new_prefill {
-        rebuilt |= swap_rebuilt_pool(&PREFILL_SLOT, "prefill", new, allowed);
+    if let Some(new) = prefill_new {
+        rebuilt |= swap_rebuilt_pool(prefill_slot, "prefill", new, allowed);
     }
-    if let Some(new) = new_decode {
-        rebuilt |= swap_rebuilt_pool(&DECODE_SLOT, "decode", new, allowed);
+    if let Some(new) = decode_new {
+        rebuilt |= swap_rebuilt_pool(decode_slot, "decode", new, allowed);
     }
     rebuilt
 }
 
 /// Swap one rebuilt pool into its slot. Returns whether it swapped; a
-/// contended slot logs and defers this pool to the next boundary (the other
-/// pool still swaps). Poisoned proceeds (the last accessor unwound, so
-/// nothing is mid-build).
+/// contended slot logs and defers this pool to the next boundary (the caller
+/// still attempts the other pool). Poisoned proceeds (the last accessor
+/// unwound, so nothing is mid-build).
 fn swap_rebuilt_pool(
     slot: &Mutex<Option<PoolSlot>>,
     name: &str,
@@ -1064,9 +1080,10 @@ fn swap_rebuilt_pool(
         }
     };
     let Some(entry) = guard.as_mut() else {
-        tracing::debug!(
-            "cera: {name} pool slot unbuilt at swap; resize to {allowed} deferred to next boundary"
-        );
+        // Unreachable in practice (slots transition None->Some and
+        // Some->Some only, and the snapshot saw Some): fail closed with an
+        // honest message rather than misreporting a deferral.
+        tracing::debug!("cera: {name} pool slot unbuilt at swap; first use will size fresh");
         return false;
     };
     tracing::info!(
@@ -1895,6 +1912,38 @@ mod tests {
         );
     }
 
+    /// Staged/target ends for an explicit-allowance excursion. The target
+    /// stays distinct from ambient, flipping the ends on 1-CPU hosts; the
+    /// staged end may equal ambient there (or when ambient is unknown),
+    /// where staging is a harmless no-op. A concurrent ambient resize
+    /// pre-landing the target would make `true` unattainable (the staged
+    /// pool already tracks, the held pool refuses), spinning the test to
+    /// its deadline; with the target distinct, ambient resizes only pull
+    /// away, which retries absorb.
+    fn flip_ends(ambient: usize) -> (usize, usize) {
+        if ambient == 1 {
+            (1, usize::MAX)
+        } else {
+            (usize::MAX, 1)
+        }
+    }
+
+    /// `flip_ends` keeps the target off-ambient on every host shape. Direct
+    /// mapping pin: no host in CI exercises the 1-CPU leg, so deleting the
+    /// branch would regress those runners (target pre-landed, `true`
+    /// unattainable) with a green suite.
+    #[test]
+    fn flip_ends_pins_off_ambient_mapping() {
+        assert_eq!(flip_ends(1), (1, usize::MAX));
+        assert_eq!(flip_ends(8), (usize::MAX, 1));
+        assert_eq!(flip_ends(usize::MAX), (usize::MAX, 1));
+        for ambient in [1usize, 2, 8, usize::MAX] {
+            let (staged, target) = flip_ends(ambient);
+            assert_ne!(target, ambient, "target must stay off-ambient");
+            assert_ne!(staged, target, "ends must differ");
+        }
+    }
+
     /// Restores the ambient allowance on exit, including on panic, so later
     /// tests inherit normally-sized pools. Best-effort retry: a single shot
     /// can lose to a concurrent test dispatch; correctness never depends on
@@ -1943,12 +1992,12 @@ mod tests {
         }
     }
 
-    /// Resize tracks an explicit allowance: narrowing rebuilds both pools to
-    /// the calibrate-predicted widths for that allowance, widening restores
-    /// them, and the landing rebuild reports true. Uses the
-    /// explicit-allowance seam so the test is deterministic (no cpuset
-    /// mutation); restores the ambient allowance on exit, including on panic,
-    /// so later tests inherit normally-sized pools.
+    /// Resize tracks an explicit allowance: staging one end and landing the
+    /// other reaches the calibrate-predicted widths for each, and the
+    /// landing rebuild reports true. Uses the explicit-allowance seam so the
+    /// test is deterministic (no cpuset mutation); restores the ambient
+    /// allowance on exit, including on panic, so later tests inherit
+    /// normally-sized pools.
     ///
     /// Degenerate-host caveat: on a 1-CPU runner the narrow leg equals the
     /// wide leg, so only the exact-width assertions (not the change itself)
@@ -1964,16 +2013,17 @@ mod tests {
         let _restore = RestoreAmbient(ambient);
         let _ = RowPool::prefill();
         let _ = RowPool::decode();
-        // Widen first so the narrow leg below proves a change even on hosts
-        // whose ambient allowance is already small.
-        stage_and_verify(usize::MAX);
+        // Drive a change in both directions (ends flip on 1-CPU hosts;
+        // see `flip_ends`).
+        let (staged, target) = flip_ends(ambient);
+        stage_and_verify(staged);
         // The landing rebuild reports true (retried past concurrent
         // dispatches, like the staging above; deadline-bounded for the same
         // reason).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut landed = false;
         loop {
-            if rebuild_pools_for_allowance(1) {
+            if rebuild_pools_for_allowance(target) {
                 landed = true;
                 break;
             }
@@ -1985,7 +2035,7 @@ mod tests {
         assert!(landed);
         // Per-pool gating means the landing rebuild may have swapped only
         // the idle pool; converge the other before asserting widths.
-        stage_and_verify(1);
+        stage_and_verify(target);
         stage_and_verify(ambient);
     }
 
@@ -2004,15 +2054,16 @@ mod tests {
     fn pool_resize_skips_when_busy() {
         let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let ambient = crate::backend::cpu_features::cpu_allowance();
-        // Declared before `_held` so drop order releases the lock first,
-        // then re-stages.
+        // `_restore` drops at fn scope end, after any pin-loop lock
+        // release, then re-stages ambient.
         let _restore = RestoreAmbient(ambient);
         let _ = RowPool::decode();
         let _ = RowPool::prefill();
         // Stage a tracked allowance that differs from the rebuild target so
         // the busy gate (not the no-op leg) is what refuses decode below.
-        stage_allowance(usize::MAX);
-        let expect_pre = expect_widths(1).0;
+        let (staged, target) = flip_ends(ambient);
+        stage_allowance(staged);
+        let expect_pre = expect_widths(target).0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         // Pin the CURRENT decode pool for the whole attempt: fetch, lock,
         // verify the slot still holds it, then drive the landing loop with
@@ -2037,7 +2088,7 @@ mod tests {
             }
             let w_dec = decode.num_threads();
             loop {
-                if rebuild_pools_for_allowance(1) {
+                if rebuild_pools_for_allowance(target) {
                     saw_true = true;
                 }
                 // Break only on an observed swap plus the full post-state:
@@ -2075,14 +2126,15 @@ mod tests {
         let _restore = RestoreAmbient(ambient);
         let _ = RowPool::decode();
         let _ = RowPool::prefill();
-        stage_allowance(usize::MAX);
-        let expect_dec = expect_widths(1).1;
+        let (staged, target) = flip_ends(ambient);
+        stage_allowance(staged);
+        let expect_dec = expect_widths(target).1;
         let _slot_held = PREFILL_SLOT.lock().unwrap_or_else(|p| p.into_inner());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_true = false;
         let mut landed = false;
         loop {
-            if rebuild_pools_for_allowance(1) {
+            if rebuild_pools_for_allowance(target) {
                 saw_true = true;
             }
             // Gate the break on an observed swap, not the width alone:
@@ -2105,12 +2157,12 @@ mod tests {
     }
 
     /// The swap helper refuses a contended slot and swaps a free one. Direct
-    /// pin of the per-pool swap contract: rebuild calls it once per pool
-    /// with no early return between, so contention defers only its own pool
-    /// (that wiring is structural, verified by read). The decode leg loops:
-    /// a concurrent accessor's brief slot hold can refuse one attempt, and
-    /// a concurrent ambient resize can slip between the swap and the width
-    /// read.
+    /// pin of the per-pool swap contract; the no-early-return wiring across
+    /// pools is pinned by
+    /// `pool_swap_rebuilt_pools_attempts_both_despite_contention`. The
+    /// decode leg loops: a concurrent accessor's brief slot hold can refuse
+    /// one attempt, and a concurrent ambient resize can slip between the
+    /// swap and the width read.
     #[test]
     fn pool_swap_helper_defers_only_contended_slot() {
         let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -2144,6 +2196,143 @@ mod tests {
         }
     }
 
+    /// The multi-pool swap attempts every pool even when an earlier slot
+    /// contends: with the prefill slot held, the decode swap still lands
+    /// and the call reports true, while prefill is untouched. Local slots
+    /// keep this deterministic with no serial lock: the globals path cannot
+    /// stage this state, since a held slot reports `Deferred` before any
+    /// swap runs.
+    #[test]
+    fn pool_swap_rebuilt_pools_attempts_both_despite_contention() {
+        fn lock(slot: &Mutex<Option<PoolSlot>>) -> std::sync::MutexGuard<'_, Option<PoolSlot>> {
+            slot.lock().unwrap_or_else(|p| p.into_inner())
+        }
+        let fresh = sized_topo_for_pools(usize::MAX);
+        let prefill_slot = Mutex::new(Some(PoolSlot {
+            pool: Arc::new(build_prefill(&fresh)),
+            allowance: usize::MAX,
+        }));
+        let decode_slot = Mutex::new(Some(PoolSlot {
+            pool: Arc::new(build_decode(&fresh)),
+            allowance: usize::MAX,
+        }));
+        let _held = lock(&prefill_slot);
+        let topo = sized_topo_for_pools(1);
+        let rebuilt = swap_rebuilt_pools(
+            (&prefill_slot, Some(build_prefill(&topo))),
+            (&decode_slot, Some(build_decode(&topo))),
+            1,
+        );
+        assert!(rebuilt, "contended prefill vetoed the decode swap");
+        drop(_held);
+        assert_eq!(
+            lock(&prefill_slot)
+                .as_ref()
+                .expect("prefill slot built")
+                .allowance,
+            usize::MAX,
+            "contended pool must be untouched"
+        );
+        let decode = lock(&decode_slot);
+        let entry = decode.as_ref().expect("decode slot built");
+        assert_eq!(entry.allowance, 1);
+        assert_eq!(entry.pool.num_threads(), expect_widths(1).1);
+    }
+
+    /// The per-chunk resize hook in `Model::forward_prefill_chunked`
+    /// converges the pools: staging off-ambient, then driving chunks until
+    /// both slots track the ambient allowance. A stub `Model` (only
+    /// `forward` + `config` are required)
+    /// keeps this free of weights. Pins the tracked allowance, not widths
+    /// (exact under any env override). Kill note: with the hook deleted
+    /// this fails deterministically single-threaded; under parallel load a
+    /// concurrent ambient resize can also converge the slots, so
+    /// demonstrate the kill with `--test-threads=1`.
+    #[test]
+    fn chunked_prefill_per_chunk_hook_converges_pools() {
+        use crate::kv_cache::InferenceState;
+        use crate::model::{Model, ModelConfig, ScalarMultipliers};
+        use std::sync::atomic::AtomicBool;
+
+        struct StubModel {
+            config: ModelConfig,
+        }
+        impl Model for StubModel {
+            fn forward(
+                &self,
+                _tokens: &[u32],
+                _pos: usize,
+                _state: &mut InferenceState,
+            ) -> Vec<f32> {
+                Vec::new()
+            }
+            fn config(&self) -> &ModelConfig {
+                &self.config
+            }
+        }
+
+        let _serial = RESIZE_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let ambient = crate::backend::cpu_features::cpu_allowance();
+        let _restore = RestoreAmbient(ambient);
+        let _ = RowPool::prefill();
+        let _ = RowPool::decode();
+        // Stage the off-ambient end so the hook has work to do.
+        let (_, off_ambient) = flip_ends(ambient);
+        stage_allowance(off_ambient);
+        let config = ModelConfig {
+            architecture: "stub".into(),
+            n_layers: 1,
+            hidden_size: 8,
+            intermediate_size: 8,
+            n_heads: 2,
+            n_kv_heads: 2,
+            head_dim: 4,
+            vocab_size: 16,
+            max_seq_len: 64,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+            block_types: Vec::new(),
+            conv_kernel_size: None,
+            ssm: None,
+            kv_heads_per_layer: vec![2],
+            scalars: ScalarMultipliers::default(),
+            moe: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let model = StubModel { config };
+        let mut state =
+            InferenceState::for_prefill(&model.config, 4).expect("scratch state builds");
+        let cancel = AtomicBool::new(false);
+        let tracks_ambient = || {
+            [&PREFILL_SLOT, &DECODE_SLOT].iter().all(|slot| {
+                slot.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                    .expect("pool built")
+                    .allowance
+                    == ambient
+            })
+        };
+        // Drive chunks until converged: a concurrent dispatch can defer one
+        // pool on any single pass, and per-pool gating converges each pool
+        // independently across passes. Deadline-bounded like the staging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (consumed, _) =
+                model.forward_prefill_chunked(&[1, 2, 3, 4], 0, &mut state, 2, &cancel);
+            assert_eq!(consumed, 4, "both chunks must run through the hook");
+            if tracks_ambient() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "chunked prefill did not converge pools to ambient"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// A poisoned dispatch lock (a dispatcher panicked) must not wedge
     /// resize: the gate proceeds through poison, the swap heals the slot
     /// with a fresh lock, and the new pool dispatches. Staging ambient
@@ -2165,10 +2354,25 @@ mod tests {
         }));
         assert!(outcome.is_err(), "poison probe did not panic");
         assert!(pool.dispatch_lock.is_poisoned());
-        // Poison is not business: the gate proceeds through it...
-        assert!(idle_guard(&pool).is_some());
-        // ...and the rebuild heals the slot with a fresh lock.
-        stage_and_verify(1);
+        // Poison is not business: the gate proceeds through it. Retried: a
+        // concurrent dispatch holds the lock transiently, and `try_lock`
+        // reports `WouldBlock` on a held lock even when poisoned.
+        let gate_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if idle_guard(&pool).is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= gate_deadline,
+                "prefill dispatch lock never idle"
+            );
+            std::thread::yield_now();
+        }
+        // ...and the rebuild heals the slot with a fresh lock. The target
+        // flips on 1-CPU hosts (see `flip_ends`) so the heal is a real swap
+        // there too.
+        let (_, target) = flip_ends(ambient);
+        stage_and_verify(target);
         assert!(!RowPool::prefill().dispatch_lock.is_poisoned());
         // The healed pool dispatches correctly.
         let mut y = vec![0.0f32; 64];
