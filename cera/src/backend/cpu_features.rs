@@ -737,9 +737,13 @@ pub(crate) fn cpu_allowance() -> usize {
     let probed = process_cpu_allowance();
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let probed: Option<usize> = None;
+    // Floor at 1: an empty leader mask would otherwise store allowance 0
+    // while the width floors at 1, flapping a width-identical rebuild on
+    // every 0/1 probe disagreement.
     probed
         .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
         .unwrap_or(usize::MAX)
+        .max(1)
 }
 
 /// CPUs the process may run on, read from the process leader's affinity mask.

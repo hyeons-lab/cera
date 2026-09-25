@@ -1394,6 +1394,7 @@ impl Session {
         lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
     ) -> Result<Vec<f32>, CeraError> {
         self.ensure_usable()?;
+        Self::resize_pools_for_cpuset();
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -2460,8 +2461,9 @@ impl Session {
 
     /// Rebuild the CPU pools if the cpuset moved since they were sized; a
     /// cheap no-op otherwise. Called at generation boundaries (append and
-    /// generate entry, each decode token, each prefill chunk). No-op stub
-    /// where the threadpool module is compiled out (wasm, no-`parallel`).
+    /// generate entry, each decode token, each prefill chunk) and before
+    /// hidden-state extraction. No-op stub where the threadpool module is
+    /// compiled out (wasm, no-`parallel`).
     fn resize_pools_for_cpuset() {
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
         crate::backend::threadpool::resize_pools_for_cpuset();
