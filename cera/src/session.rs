@@ -1677,6 +1677,7 @@ impl Session {
     ///   ```
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        Self::resize_pools_for_cpuset();
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
@@ -1822,6 +1823,7 @@ impl Session {
         n_tokens: usize,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        Self::resize_pools_for_cpuset();
         if n_tokens == 0 {
             return Err(CeraError::EmptyInput);
         }
@@ -1908,6 +1910,7 @@ impl Session {
         let mut last_logits: Option<Vec<f32>> = None;
         let mut ti = 0usize;
         while ti < n_tokens {
+            Self::resize_pools_for_cpuset();
             let end = (ti + chunk_size).min(n_tokens);
             let chunk = &embeddings[ti * hidden_size..end * hidden_size];
             let prefill_start = Instant::now();
@@ -2455,6 +2458,15 @@ impl Session {
         }
     }
 
+    /// Rebuild the CPU pools if the cpuset moved since they were sized; a
+    /// cheap no-op otherwise. Called at generation boundaries (append and
+    /// generate entry, each decode token, each prefill chunk). No-op stub
+    /// where the threadpool module is compiled out (wasm, no-`parallel`).
+    fn resize_pools_for_cpuset() {
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        crate::backend::threadpool::resize_pools_for_cpuset();
+    }
+
     fn generate_inner<S: ModalitySink + ?Sized>(
         &mut self,
         opts: &GenerateOpts,
@@ -2462,6 +2474,7 @@ impl Session {
         observation: &mut DecodeObservation,
     ) -> Result<GenerateSummary, CeraError> {
         self.ensure_usable()?;
+        Self::resize_pools_for_cpuset();
         // Prefill happened in `append_*`, which accumulated its token count and
         // wall time on the session. Consume them here — unconditionally, so
         // EVERY `generate()` call (including the no-op early exits below)
@@ -2733,6 +2746,7 @@ impl Session {
                 finish = FinishReason::ContextFull;
                 break;
             }
+            Self::resize_pools_for_cpuset();
 
             began_step = true;
             let token = if greedy {

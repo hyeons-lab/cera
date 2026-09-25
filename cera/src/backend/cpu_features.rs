@@ -631,7 +631,7 @@ pub fn detect_topology() -> CoreTopology {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(topo) = detect_topology_sysfs() {
-        return apply_thread_override(clamp_to_cpu_allowance(topo), forced, pinning_on);
+        return compose_clamp_and_override(topo, cpu_allowance(), forced, pinning_on);
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -674,10 +674,11 @@ pub fn detect_topology() -> CoreTopology {
 }
 
 /// Cap a detected topology's pool width at the CPUs this process may actually
-/// run on. The allowance probe honors cpuset/cgroup affinity on Linux, so it
-/// sees the restriction the sysfs detector (which reads host-wide files)
-/// cannot: an Android app without a visible Activity sits in the `foreground`
-/// cpuset (no prime cluster), and a container sees its quota the same way.
+/// run on, then apply the `CERA_THREADS` override. The allowance probe honors
+/// cpuset/cgroup affinity on Linux, so it sees the restriction the sysfs
+/// detector (which reads host-wide files) cannot: an Android app without a
+/// visible Activity sits in the `foreground` cpuset (no prime cluster), and a
+/// container sees its quota the same way.
 ///
 /// Without this, the natural path sizes the pools for silicon the process can
 /// never touch, which is the same cliff [`apply_thread_override`] clamps the
@@ -687,9 +688,17 @@ pub fn detect_topology() -> CoreTopology {
 /// `CERA_PIN`: the collapse reproduces unpinned, so the override's pinning
 /// exemption does not apply here.
 ///
-/// Runs *before* the `CERA_THREADS` override so the knob keeps its documented
+/// The allowance is sampled on every pool sizing: the initial build and each
+/// cpuset resize re-probe it (see `resize_pools_for_cpuset`), so a later
+/// cpuset change re-sizes the pools at the next generation boundary instead
+/// of leaving them stuck. The [`core_topology`] cache keeps the startup
+/// sample for direct readers.
+///
+/// Runs the clamp *before* the override so the knob keeps its documented
 /// meaning (an explicit width, clamped only to pinnable cores): a deliberate
 /// oversubscription sweep can still ask for more, but the default never does.
+/// The order test calls this seam, pinning clamp-before-override order; the
+/// detector's sysfs call-site use is pinned only by review.
 // `allow`, not `expect`: only the sysfs detector calls it, so it is dead in a
 // normal non-Linux build but live in a test build (see below).
 #[cfg_attr(
@@ -699,16 +708,37 @@ pub fn detect_topology() -> CoreTopology {
         reason = "only the sysfs detector calls it; tested on all hosts"
     )
 )]
-fn clamp_to_cpu_allowance(topo: CoreTopology) -> CoreTopology {
+pub(crate) fn compose_clamp_and_override(
+    topo: CoreTopology,
+    allowed: usize,
+    forced: Option<usize>,
+    pinning_on: bool,
+) -> CoreTopology {
+    apply_thread_override(clamp_perf_count(topo, allowed), forced, pinning_on)
+}
+
+/// CPUs this process may run on. On Linux/Android this is the leader-mask
+/// probe, falling back to the calling thread's parallelism and then to no
+/// clamp; elsewhere it is just the calling thread's parallelism, unclamped
+/// when even that is unknown. Split out so the seam above takes the
+/// allowance as a plain argument and stays testable without touching
+/// affinity; the pool resizer also calls it directly to detect cpuset
+/// changes.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    allow(
+        dead_code,
+        reason = "only the sysfs detector calls it; tested on all hosts"
+    )
+)]
+pub(crate) fn cpu_allowance() -> usize {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let allowed = process_cpu_allowance()
-        .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
-        .unwrap_or(usize::MAX);
+    let probed = process_cpu_allowance();
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let allowed = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(usize::MAX);
-    clamp_perf_count(topo, allowed)
+    let probed: Option<usize> = None;
+    probed
+        .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// CPUs the process may run on, read from the process leader's affinity mask.
@@ -722,7 +752,10 @@ fn clamp_to_cpu_allowance(topo: CoreTopology) -> CoreTopology {
 /// falls back to `available_parallelism`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_cpu_allowance() -> Option<usize> {
+    // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid empty set.
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `getpid` addresses the process leader; the size/pointer pair
+    // describes `set` exactly, and the return value is checked.
     let ok = unsafe {
         libc::sched_getaffinity(
             libc::getpid(),
@@ -740,6 +773,7 @@ fn process_cpu_allowance() -> Option<usize> {
     let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
     let mut count = 0;
     for cpu in 0..capacity {
+        // SAFETY: `cpu` is bounded by the set's own bit capacity.
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
             count += 1;
         }
@@ -747,7 +781,7 @@ fn process_cpu_allowance() -> Option<usize> {
     Some(count)
 }
 
-/// Pure half of [`clamp_to_cpu_allowance`]: cap `perf_core_count` at `allowed`
+/// Pure half of the clamp/override seam: cap `perf_core_count` at `allowed`
 /// CPUs. `pin_cores`/`core_weights` are intentionally left alone: the clamp
 /// reproduces the measured-good shape (width at the usable count), with
 /// out-of-reach pins failing open to unpinned execution (a refused
@@ -758,7 +792,7 @@ fn process_cpu_allowance() -> Option<usize> {
     not(any(target_os = "linux", target_os = "android")),
     allow(
         dead_code,
-        reason = "only clamp_to_cpu_allowance calls it; tested on all hosts"
+        reason = "only compose_clamp_and_override calls it; tested on all hosts"
     )
 )]
 fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
@@ -1149,10 +1183,11 @@ mod tests {
         assert_eq!(clamp_perf_count(detected, 0).perf_core_count, 1);
     }
 
-    /// The clamp runs *before* the `CERA_THREADS` override, so a deliberate
-    /// oversubscription past the allowance survives the composition: width 8
-    /// on a 6-CPU allowance with 8 pinnable cores stays 8. Pure, no env use;
-    /// if the order ever flips this reads 6.
+    /// The clamp runs *before* the `CERA_THREADS` override, through the same
+    /// seam the detector calls, so a deliberate oversubscription past the
+    /// allowance survives it: width 8 on a 6-CPU allowance with 8 pinnable
+    /// cores stays 8. Pure, no env use; if the seam's order ever flips this
+    /// reads 6.
     #[test]
     fn allowance_clamp_preserves_explicit_oversubscription() {
         let detected = CoreTopology {
@@ -1161,10 +1196,8 @@ mod tests {
             fast_cores: 8,
             core_weights: vec![WEIGHT_FULL; 8],
         };
-        let clamped = clamp_perf_count(detected, 6);
-        assert_eq!(clamped.perf_core_count, 6);
-        let overridden = apply_thread_override(clamped, Some(8), true);
-        assert_eq!(overridden.perf_core_count, 8);
+        let composed = compose_clamp_and_override(detected, 6, Some(8), true);
+        assert_eq!(composed.perf_core_count, 8);
     }
 
     /// The allowance probe reads the process leader's mask, not the calling
@@ -1176,7 +1209,14 @@ mod tests {
     #[test]
     fn cpu_allowance_ignores_calling_thread_pin() {
         let before = process_cpu_allowance().expect("allowance probe works");
+        if before <= 1 {
+            eprintln!("skip: 1-CPU allowance cannot discriminate leader vs caller mask");
+            return;
+        }
+        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
         let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: pid 0 addresses the calling thread; the size/pointer pair
+        // describes `saved` exactly, and the return value is checked.
         let ok = unsafe {
             libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
         };
@@ -1184,6 +1224,8 @@ mod tests {
         struct Restore(libc::cpu_set_t);
         impl Drop for Restore {
             fn drop(&mut self) {
+                // SAFETY: same pair as above, describing the saved mask;
+                // best-effort (a return code is unusable in `Drop`).
                 unsafe {
                     libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.0);
                 }
@@ -1195,14 +1237,18 @@ mod tests {
         let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
         let mut only = None;
         for cpu in 0..capacity {
+            // SAFETY: `cpu` is bounded by the set's own bit capacity.
             if unsafe { libc::CPU_ISSET(cpu, &saved) } {
                 only = Some(cpu);
                 break;
             }
         }
         let only = only.expect("caller mask is non-empty");
+        // SAFETY: all-zero bitmask, as above.
         let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `only` was observed set above, so it is in bounds.
         unsafe { libc::CPU_SET(only, &mut one) };
+        // SAFETY: pid 0 with the pair describing `one`; return checked.
         let ok =
             unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) };
         assert_eq!(ok, 0);
@@ -1210,8 +1256,10 @@ mod tests {
     }
 
     /// End to end through the real allowance probe: an absurd detected width
-    /// comes back within the process allowance (and never zero). Skipped under
-    /// Miri, which cannot execute the raw `sched_getaffinity` probe.
+    /// comes back within the process allowance (and never zero). Fails closed
+    /// on hosts too wide to clamp (or where the allowance is unknown) instead
+    /// of passing vacuously. Skipped under Miri, which cannot execute the raw
+    /// `sched_getaffinity` probe.
     #[cfg(not(miri))]
     #[test]
     fn cpu_allowance_clamp_smoke() {
@@ -1221,10 +1269,14 @@ mod tests {
             fast_cores: 128,
             core_weights: vec![WEIGHT_FULL; 128],
         };
-        let clamped = clamp_to_cpu_allowance(detected);
         let allowance = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(usize::MAX);
+        assert!(
+            allowance < 128,
+            "host too wide ({allowance}); smoke vacuous"
+        );
+        let clamped = compose_clamp_and_override(detected, cpu_allowance(), None, true);
         assert!(clamped.perf_core_count >= 1);
         assert!(clamped.perf_core_count <= allowance.min(128));
     }

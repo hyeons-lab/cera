@@ -533,8 +533,8 @@ fn env_overrides() -> Overrides {
 /// Pure — every input is a parameter, so tests exercise the rule without
 /// touching process environment or depending on the runner's topology. (The env
 /// lookups above are read per call rather than cached in a `OnceLock` like the
-/// sibling knobs; this runs exactly once, inside `RowPool::decode()`'s own
-/// `OnceLock`, so caching would buy nothing.)
+/// sibling knobs; this runs once per pool build (initial sizing plus cpuset
+/// resizes), so caching would buy nothing.)
 fn width_for_shape(
     max_t: usize,
     narrow: usize,
