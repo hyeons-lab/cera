@@ -17,9 +17,9 @@ import uniffi.cera_ffi.hexagonProbe
 import java.io.File
 
 /**
- * On-device NPU gate: runs the AAR's [HexagonNpu.setup] (verifies the
- * extracted skels, points the FastRPC loader at them), then probes the
- * Hexagon NPU — all as a normal app UID (no adb shell privileges).
+ * On-device NPU gate: runs the AAR's [HexagonNpu.setup] (extracts the
+ * DSP skels, points the FastRPC loader at them), then probes the
+ * Hexagon NPU, all as a normal app UID (no adb shell privileges).
  * Reports the access route too, since DSP policy varies per
  * OEM/SoC/firmware: `direct` means this process can open the FastRPC
  * node itself (shell/rooted/eng), `hal-fallback` means the probe
@@ -50,12 +50,11 @@ class MainActivity : Activity() {
             // Route first: setup itself may throw, and the route is the
             // interesting datum on every tier, success or failure.
             val route = if (HexagonNpu.hasDirectNodeAccess()) "direct" else "hal-fallback"
-            val libDir = applicationInfo.nativeLibraryDir
             val result = try {
-                HexagonNpu.setup(libDir)
+                val skelDir = HexagonNpu.setup(this@MainActivity)
                 val p = hexagonProbe()
                 val probe =
-                    "OK route=$route libDir=$libDir " +
+                    "OK route=$route skelDir=$skelDir " +
                         "arch=${p.arch} threads=${p.threads} " +
                         "hvx=${p.hvxUnits} hmx=${p.hmxUnits} vtcm=${p.vtcmBytes}"
                 Log.i("CeraProbe", probe)
@@ -67,7 +66,7 @@ class MainActivity : Activity() {
                     "$probe | ${runGenerateBenchmark(model) { runOnUiThread { view.text = "$probe\n$it" } }}"
                 }
             } catch (e: Exception) {
-                "FAIL route=$route libDir=$libDir ${e.javaClass.simpleName}: ${e.message}"
+                "FAIL route=$route ${e.javaClass.simpleName}: ${e.message}"
             }
             Log.i("CeraProbe", result)
             runOnUiThread { view.text = result }

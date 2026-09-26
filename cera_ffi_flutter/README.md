@@ -183,7 +183,7 @@ final engine = CeraEngine.fromPath(
 );
 ```
 
-On Android apps, the AAR manifest configuration (`extractNativeLibs="true"` and `<uses-native-library android:name="libcdsprpc.so">`) merges into the consuming application automatically. Call `HexagonNpu.setup(context)` once at startup in your Android `MainActivity.kt` (or call `hexagonInstallSkels(supportDir)` in Dart) to register the extracted skeleton search path before initializing the engine.
+On Android apps, the AAR manifest configuration (`<uses-native-library android:name="libcdsprpc.so">`) merges into the consuming application automatically. Call `HexagonNpu.setup(context)` once at startup in your Android `MainActivity.kt` (or call `hexagonInstallSkels(supportDir)` in Dart) to extract embedded DSP skeletons and register the search path before initializing the engine.
 
 ### Voice Modes & Speech Processing
 

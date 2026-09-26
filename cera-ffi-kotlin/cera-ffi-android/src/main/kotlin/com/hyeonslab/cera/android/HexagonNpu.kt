@@ -12,22 +12,21 @@ import java.io.File
  * startup, on the main thread, before [uniffi.cera_ffi.hexagonProbe] or
  * loading a model with the Hexagon backend.
  *
- * What it does: verifies the DSP skels the AAR ships in `jniLibs` were
- * extracted to `nativeLibraryDir` (real files the FastRPC loader can
- * open by path), then points the loader there via `ADSP_LIBRARY_PATH`.
+ * What it does: extracts the embedded DSP skels from `libcera_ffi.so`
+ * into `context.noBackupFilesDir/cera_skels` (real files the FastRPC loader
+ * can open by path), then points the loader there via `ADSP_LIBRARY_PATH`.
  * The app never opens `/dev/fastrpc-*` itself: `libcdsprpc.so` routes
  * around the denied open through Qualcomm's DSP service, which hands
  * back an already-open fd.
  *
- * Requires the AAR manifest entries (merged automatically into
- * consumers): `extractNativeLibs="true"` and
+ * Requires the AAR manifest entry (merged automatically into consumers):
  * `<uses-native-library android:name="libcdsprpc.so">`.
  */
 object HexagonNpu {
     /**
      * DSP skel filenames, one per supported Hexagon architecture. Must
      * match `HexagonArch::skel_filename` in the Rust backend and the
-     * files `just android-libs` stages into `jniLibs/arm64-v8a`.
+     * files embedded in `libcera_ffi.so`.
      */
     val skelFiles: List<String> = listOf(
         "libggml-htp-v73.so",
@@ -47,61 +46,79 @@ object HexagonNpu {
     private var installed = false
 
     /**
-     * Point the FastRPC loader at this app's extracted skels. Idempotent
-     * (repeats are no-ops); the process environment is set exactly once
-     * because `setenv` is not thread-safe. A pre-existing value is
-     * preserved (merged, `;`-joined, deduplicated), never clobbered, so
-     * calling this after `hexagon_install_skels` keeps the staged dir.
-     * Do not combine the two in one process unless that merge is what
-     * you want; pick one staging flow per app.
+     * Extract embedded DSP skels into `context.noBackupFilesDir/cera_skels`
+     * and point the FastRPC loader there. Idempotent (repeats are no-ops);
+     * the process environment is set exactly once because `setenv` is not
+     * thread-safe.
      *
-     * The two staging flows — this function and Rust `install_skels`
-     * (FFI `hexagon_install_skels`) — serialize internally but against
-     * *different* monitors, so they may compose only sequentially, on one
-     * thread, during single-threaded startup. Concurrent composition can
-     * lost-update `ADSP_LIBRARY_PATH` and drop a skel dir.
-     *
-     * @throws IllegalArgumentException when `nativeLibraryDir` contains
-     *   `;`, which would silently split into two loader search entries.
-     * @throws IllegalStateException when the skels are missing from
-     *   `nativeLibraryDir`: either the APK was built without extracted
-     *   native libs, or this ABI ships no skels (arm64-v8a only — x86_64
-     *   Android has no Hexagon DSP). The message names which case it is.
+     * @param context Application or activity context.
+     * @return Absolute path to the directory where skels were installed.
+     * @throws IllegalArgumentException when the target dir contains `;`.
+     * @throws IllegalStateException when skels fail to extract or this ABI
+     *   has no Hexagon DSP support (arm64-v8a only).
      * @throws RuntimeException when the environment update itself fails.
      */
     @Synchronized
-    fun setup(context: Context) {
-        setup(context.applicationInfo.nativeLibraryDir)
+    fun setup(context: Context): String {
+        val skelDir = File(context.noBackupFilesDir, "cera_skels")
+        val dir = skelDir.absolutePath
+        setup(dir)
+        return dir
     }
 
-    /** Same as [setup], for callers that already hold the library dir. */
+    /**
+     * Point the FastRPC loader at the specified skel directory, extracting
+     * embedded skels into it if they are not already present.
+     *
+     * @param dir Absolute path to a writable directory for skel files.
+     */
     @Synchronized
-    fun setup(nativeLibraryDir: String) {
+    fun setup(dir: String) {
         if (installed) {
             return
         }
-        // A `;` in the dir would silently become two loader search entries,
+        // A ';' in the dir would silently become two loader search entries,
         // breaking skel resolution with no error naming the cause (mirrors
         // the Rust-side rejection in `install_skels`).
-        require(!nativeLibraryDir.contains(';')) {
-            "nativeLibraryDir contains ';', which splits into two loader entries: $nativeLibraryDir"
+        require(!dir.contains(';')) {
+            "skel dir contains ';', which splits into two loader entries: $dir"
         }
-        val missing = skelFiles.filter { !File(nativeLibraryDir, it).exists() }
+        val targetDir = File(dir)
+        if (!targetDir.exists()) {
+            targetDir.mkdirs()
+        }
+        try {
+            uniffi.cera_ffi.hexagonInstallSkels(dir)
+        } catch (e: Exception) {
+            val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+            val missing = skelFiles.filter { !File(dir, it).exists() }
+            if (missing.isNotEmpty()) {
+                throw IllegalStateException(
+                    "Hexagon DSP skels missing from $dir (${missing.joinToString()}): " +
+                        if (abi == "arm64-v8a") {
+                            "failed to extract embedded skels: ${e.message}"
+                        } else {
+                            "skels ship on arm64-v8a only (this device is $abi, " +
+                                "which has no Hexagon DSP); treat the NPU as unavailable"
+                        },
+                    e,
+                )
+            }
+        }
+        val missing = skelFiles.filter { !File(dir, it).exists() }
         if (missing.isNotEmpty()) {
             val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
             throw IllegalStateException(
-                "Hexagon DSP skels missing from $nativeLibraryDir " +
-                    "(${missing.joinToString()}): " +
+                "Hexagon DSP skels missing from $dir (${missing.joinToString()}): " +
                     if (abi == "arm64-v8a") {
-                        "the APK was built without extracted native libs " +
-                            "(needs extractNativeLibs, see the AAR manifest)"
+                        "skel extraction failed to write DSP binaries"
                     } else {
                         "skels ship on arm64-v8a only (this device is $abi, " +
                             "which has no Hexagon DSP); treat the NPU as unavailable"
                     },
             )
         }
-        // `;` is the separator the FastRPC loader parses (same form the
+        // ';' is the separator the FastRPC loader parses (same form the
         // Rust `install_skels` writes); entries are deduplicated so a
         // second staging flow composing in either order stays valid.
         // A failed read aborts setup: it is not proof of absence, and the
@@ -112,7 +129,7 @@ object HexagonNpu {
         } catch (e: ErrnoException) {
             throw RuntimeException("failed to read ADSP_LIBRARY_PATH", e)
         }
-        val merged = mergeAdspPaths("$nativeLibraryDir;$VENDOR_PATHS", cur)
+        val merged = mergeAdspPaths("$dir;$VENDOR_PATHS", cur)
         try {
             Os.setenv("ADSP_LIBRARY_PATH", merged, true)
         } catch (e: ErrnoException) {

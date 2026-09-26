@@ -8,12 +8,12 @@ runs on, and what blocks the rest.
 | artifact | NPU content | notes |
 |---|---|---|
 | `cera` (crates.io) | `hexagon` feature (off by default) + 4 embedded DSP skels (~3.2 MB) | `cargo package` includes `src/backend/hexagon/skels/` (no `package.include` filter) |
-| `cera-ffi-android` AAR | hexagon on arm64-v8a + x86_64; lean on 32-bit; 4 skels in `jniLibs/arm64-v8a` | FFI surface identical everywhere; `hexagon_probe()` reports unavailable where off |
+| `cera-ffi-android` AAR | hexagon on arm64-v8a + x86_64; lean on 32-bit; skels embedded in libcera_ffi.so | FFI surface identical everywhere; `hexagon_probe()` reports unavailable where off |
 | AAR `assets/NOTICE` | MIT attribution for the embedded skels | required: MIT covers binaries too |
 | `cera-ffi-jvm` / xcframework / npm / crates | unchanged (no hexagon) | host platforms have no DSP |
 
 Recipes: `just android-libs` (split 64/32 build), `just bindings`
-(Kotlin/Swift/Python regen — the AAR consumes
+(Kotlin/Swift/Python regen: the AAR consumes
 `cera-ffi/bindings/kotlin` directly, no copy step), publish pipeline
 (`publish.yml`) calls `just android-libs`.
 
@@ -24,7 +24,7 @@ import com.hyeonslab.cera.android.HexagonNpu
 import uniffi.cera_ffi.*
 
 // Once at startup, on the main thread, before loading a model:
-HexagonNpu.setup(context) // verifies extracted skels, sets ADSP_LIBRARY_PATH
+HexagonNpu.setup(context) // extracts skels to noBackupFilesDir, sets ADSP_LIBRARY_PATH
 
 // Gate NPU use on a live probe (fast: one driver open + hwinfo):
 val backend = try {
@@ -36,33 +36,30 @@ val backend = try {
 }
 ```
 
-Three packaging requirements make the stock tier work (all verified on
+Two packaging requirements make the stock tier work (all verified on
 a retail S25 Ultra, SELinux enforcing, via a normally installed APK):
 
 1. **Manifest**: `<uses-native-library android:name="libcdsprpc.so"
-   android:required="false"/>` inside `<application>` — grants the app
+   android:required="false"/>` inside `<application>`: grants the app
    linker namespace access to the vendor FastRPC client (on the vendor
    public list). The AAR manifest carries this and it merges into
    consumers automatically; `required=false` so devices without the lib
    still install (the probe then reports unavailable).
-2. **Extracted skels**: the AAR ships the four skels in
-   `jniLibs/arm64-v8a/`; they must be real files at install time (the
-   FastRPC loader opens them by path), so the APK needs
-   `android:extractNativeLibs="true"` (also in the AAR manifest, merged
-   into consumers). arm64-v8a only — x86_64 Android has no Hexagon DSP.
-3. **`ADSP_LIBRARY_PATH`**: `HexagonNpu.setup` points the loader at
-   `nativeLibraryDir` plus the vendor fallback paths, set once before
-   the first FastRPC call. It fails fast with an actionable message
-   when the skels are missing (wrong packaging) or the ABI ships none.
+2. **Embedded skels & `ADSP_LIBRARY_PATH`**: `libcera_ffi.so` embeds the
+   four DSP skels in `.rodata` via `include_bytes!`. At startup,
+   `HexagonNpu.setup(context)` writes them to `context.noBackupFilesDir/cera_skels`
+   and points FastRPC's loader at that directory plus vendor fallback paths.
+   Because skels are not packaged as host `.so` files in `jniLibs/`, all
+   libraries in the AAR remain 16KB-page-aligned (`0x4000`) and apps do
+   not require `android:extractNativeLibs="true"`.
 
 `hexagonInstallSkels` (write embedded skels into a caller-staged dir)
-remains for JVM/desktop/shell flows; Android apps use the AAR path
-above instead. The `probe-app` module is a runnable reference + the
-on-device gate: `./gradlew :probe-app:installDebug`, launch from the
-launcher, `adb logcat -s CeraProbe`. It also reports the access route
-(`direct` vs `hal-fallback`, see below), since DSP policy varies per
-OEM/SoC/firmware — that route string is the datum to record when
-validating a new device.
+underlies `HexagonNpu.setup` and remains available for JVM/desktop/shell
+flows. The `probe-app` module is a runnable reference and the on-device
+gate: `./gradlew :probe-app:installDebug`, launch from the launcher,
+`adb logcat -s CeraProbe`. It also reports the access route (`direct` vs
+`hal-fallback`, see below), since DSP policy varies per OEM/SoC/firmware;
+that route string is the datum to record when validating a new device.
 
 ## Device support matrix
 
@@ -139,18 +136,16 @@ and is not needed for it.
 
 1. `just android-libs` green; arm64/x86_64 `.so` contain
    `libggml-htp-v*` strings, 32-bit don't; all four pass
-   `assert-ffibuffer.sh`; `jniLibs/arm64-v8a` holds the 4 skels.
-2. AAR unzips with `jni/<4 abis>/libcera_ffi.so` +
-   `jni/arm64-v8a/libggml-htp-v*.so` (4 files; AGP strips their
-   symtabs, loadable sections intact) + `assets/NOTICE`
-   (byte-identical MIT block to `skels/LICENSE`); AAR manifest
-   carries `extractNativeLibs` + `uses-native-library`.
+   `assert-ffibuffer.sh`; all four pass `assert-16k-pages.py`.
+2. AAR unzips with `jni/<4 abis>/libcera_ffi.so` (16KB page-aligned) +
+   `assets/NOTICE` (byte-identical MIT block to `skels/LICENSE`);
+   AAR manifest carries `<uses-native-library android:name="libcdsprpc.so">`.
 3. `probe-app`, installed normally and launched from the launcher
    (never via `run-as`), reports `OK route=hal-fallback arch=V..`
    on a granting device; where the grant is absent it must fail
    cleanly (no crash). Record the route string per device.
 4. Existing on-device determinism matrix still green (logits m=1..8
-   x5, greedy md5 2x2x6, 256-token pair) — any skel/host change can
+   x5, greedy md5 2x2x6, 256-token pair): any skel/host change can
    silently re-phase the DSP race.
 5. Skel/host skew guard: after any skel rebuild, update `SOURCE.md`
    md5s + provenance and re-run gate 4.

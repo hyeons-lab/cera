@@ -341,10 +341,11 @@ additionally carries explicit `-z max-page-size=16384` /
 of NDK default). Two checks enforce it:
 `scripts/assert-16k-pages.py` runs in the `android-abis` CI job on each
 built `.so`, and `just android-libs` (what the release pipeline stages
-into the AAR's `jniLibs/`) runs it on the staged set. Larger alignment
-is backward compatible: 16KB-aligned libraries load fine on 4KB-page
-devices. The Hexagon DSP skels are exempt (DSP-side ELFs loaded into
-the CDSP by FastRPC, never mapped by Android's linker).
+into the AAR's `jniLibs/`) runs it on the staged set. Larger alignment is backward compatible: 16KB-aligned libraries load
+fine on 4KB-page devices. Hexagon DSP skel binaries are embedded directly
+in `libcera_ffi.so` and extracted to app storage at runtime by
+`HexagonNpu.setup(context)`, so all binaries packaged in `jniLibs/` are
+16KB-page-aligned.
 
 ## Apple platforms
 

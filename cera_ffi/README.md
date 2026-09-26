@@ -244,7 +244,7 @@ final engine = CeraEngine.fromPath(
 );
 ```
 
-For Android apps built with `cera_ffi_flutter`, DSP skeleton libraries are bundled in the AAR's `jniLibs/arm64-v8a/` and configured via `HexagonNpu.setup(context)`. Standalone Dart environments on Linux or Android aarch64 can extract embedded skeletons by calling `hexagonInstallSkels(skelDir)` before probing or model loading.
+For Android apps built with `cera_ffi_flutter`, DSP skeleton libraries are embedded in `libcera_ffi.so` and extracted directly to app storage via `HexagonNpu.setup(context)`. Standalone Dart environments on Linux or Android aarch64 can extract embedded skeletons by calling `hexagonInstallSkels(skelDir)` before probing or model loading.
 
 ### Voice Activity Detection (Silero VAD v5)
 

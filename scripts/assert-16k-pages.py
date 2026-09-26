@@ -8,7 +8,7 @@ load native libraries whose LOAD segments are only 4KB-aligned. Google Play
 requires 16KB-clean binaries for updates. NDK r28+ aligns to 16KB by
 default, but this repo pins r27c (whose default is still 4KB), so every
 Android target carries explicit `-z max-page-size=16384` linker flags (see
-`.cargo/config.toml`) — and this script enforces the result, because a flag
+`.cargo/config.toml`), and this script enforces the result, because a flag
 that silently stops reaching the link would ship a library that crashes on
 first load for 16KB-page users, caught only by running on that hardware.
 
@@ -18,10 +18,10 @@ Pure stdlib (no readelf/llvm-readelf), so the same check runs on the Linux
 CI runners, on macOS dev machines, and anywhere else with python3. Checks
 32- and 64-bit, little- and big-endian ELFs.
 
-Scope: host-loaded ELFs only (libcera_ffi.so per ABI, the cera binary).
-The Hexagon skels (libggml-htp-v*.so) are DSP-side QuRT ELFs loaded into
-the CDSP by FastRPC, never mapped by Android's linker, so the page-size
-requirement does not apply to them; do not point this script at them.
+Scope: host-loaded ELFs (libcera_ffi.so per ABI, the cera binary).
+Hexagon DSP skels are embedded inside libcera_ffi.so and extracted to app
+storage at runtime by HexagonNpu.setup, so all binaries staged in jniLibs
+are checked.
 """
 
 import struct

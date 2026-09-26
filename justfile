@@ -349,18 +349,14 @@ jvm-libs-host:
 # 64-bit ABIs only: no shipping NPU phone is 32-bit, and the Play store has
 # required 64-bit since 2019. The two invocations build into scratch dirs and
 # merge (cargo-ndk owns its `-o` root per invocation). The FFI surface is
-# identical on all ABIs — without the feature, `hexagon_probe()` simply
+# identical on all ABIs: without the feature, `hexagon_probe()` simply
 # reports unavailable, only `Auto` falls back to CPU, and explicit
 # `BackendPreference::Hexagon` reports `Backend/Hexagon backend not available`.
-#
-# The DSP skels are ALSO staged as standalone `jniLibs/arm64-v8a/lib*.so`
-# files (same bytes the Rust code embeds): at install they extract to the
-# app's `nativeLibraryDir`, where the FastRPC loader opens them by path
-# (see `HexagonNpu.setup`). arm64-v8a only: x86_64 Android has no Hexagon
-# DSP, and 32-bit ABIs build without the feature. The set comes from the
-# embedded skel dir itself (not a hand-synced arch list), so adding an
-# arch to Rust stages its skel with no recipe change; a CI step pins the
-# Rust/Kotlin filename lists to that same set.
+# The DSP skels are embedded directly inside `libcera_ffi.so` on 64-bit
+# ABIs (via include_bytes!) and extracted to app storage at runtime by
+# `HexagonNpu.setup(context)` (or `hexagonInstallSkels`). They are not
+# packaged into `jniLibs/`, ensuring all libraries in the AAR are 16KB
+# page-aligned.
 android-libs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -374,16 +370,11 @@ android-libs:
         build -p cera-ffi --release --features ffi-buffer
     mkdir -p "$out"
     cp -r target/android-libs-64/* target/android-libs-32/* "$out/"
-    mkdir -p "$out/arm64-v8a"
-    cp cera/src/backend/hexagon/skels/libggml-htp-v*.so "$out/arm64-v8a/"
     scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
     # 16KB page alignment (Play requirement, Android 15+ hardware): every
-    # host-loaded .so must be 16KB-clean. The skels are deliberately NOT
-    # checked — they are DSP-side ELFs loaded into the CDSP by FastRPC,
-    # never mapped by Android's linker, so the requirement does not apply
-    # to them (see the script header).
-    python3 scripts/assert-16k-pages.py "$out"/*/libcera_ffi.so
-    ls -la "$out"/*/libcera_ffi.so "$out"/arm64-v8a/libggml-htp-v*.so
+    # host-loaded .so must be 16KB-clean.
+    python3 scripts/assert-16k-pages.py "$out"/*/*.so
+    ls -la "$out"/*/*.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift
