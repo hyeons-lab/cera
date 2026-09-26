@@ -725,63 +725,209 @@ fn compose_clamp_and_override(
     apply_thread_override(clamp_perf_count(topo, allowed), forced, pinning_on)
 }
 
-/// CPUs this process may run on. On Linux/Android this is the leader-mask
-/// probe, falling back to the calling thread's parallelism and then to no
-/// clamp; elsewhere it is just the calling thread's parallelism, unclamped
-/// when even that is unknown. Split out so the seam above takes the
-/// allowance as a plain argument and stays testable without touching
-/// affinity; the pool resizer also calls it directly to detect cpuset
-/// changes.
+/// CPUs this process may run on: the cpuset-cgroup probe on Linux/Android,
+/// the calling thread's parallelism elsewhere. Unclamped (`usize::MAX`)
+/// when the platform probe reports nothing usable. Split out so the seam
+/// above takes the allowance as a plain argument and stays testable without
+/// touching the platform; the pool resizer also calls it directly to detect
+/// cpuset changes.
 pub(crate) fn cpu_allowance() -> usize {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let probed = process_cpu_allowance();
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let probed: Option<usize> = None;
-    // Floor at 1: an empty leader mask would otherwise store allowance 0
-    // while the width floors at 1, flapping a width-identical rebuild on
-    // every 0/1 probe disagreement.
-    probed
-        .or_else(|| std::thread::available_parallelism().map(|p| p.get()).ok())
-        .unwrap_or(usize::MAX)
-        .max(1)
+    // Floor at 1: a zero count would otherwise store allowance 0 while the
+    // width floors at 1, flapping a width-identical rebuild on every 0/1
+    // probe disagreement. (The parsers below never yield 0; this is insurance
+    // against a future one that does.)
+    allowance_probe().unwrap_or(usize::MAX).max(1)
 }
 
-/// CPUs the process may run on, read from the process leader's affinity mask.
+/// Platform half of [`cpu_allowance`]: the cpuset cgroup on Linux/Android
+/// (see [`process_cpu_allowance`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn allowance_probe() -> Option<usize> {
+    process_cpu_allowance()
+}
+
+/// Platform half of [`cpu_allowance`] off Linux/Android: the calling
+/// thread's parallelism, which is trustworthy there because those platforms
+/// pin nothing.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn allowance_probe() -> Option<usize> {
+    std::thread::available_parallelism().map(|p| p.get()).ok()
+}
+
+/// CPUs the process may run on: our cpuset's CPU set from the cgroup
+/// filesystem, or every online CPU when no cpuset restriction is configured.
 ///
-/// `available_parallelism` reports the *calling thread's* mask, and this
-/// topology is cached process-wide in a `OnceLock`: had the first caller been
-/// a thread an embedder pinned to one core (audio callback, platform worker),
-/// the width would freeze at that thread's mask for the process lifetime. The
-/// leader (TGID) is effectively never pinned, so its mask is the process
-/// allowance. `None` when the probe itself fails, in which case the caller
-/// falls back to `available_parallelism`.
+/// This deliberately reads cgroup files, never a thread affinity mask. The
+/// previous revision read the process leader's mask on the theory that the
+/// leader is never pinned — but the pool pins its calling thread (usually
+/// the leader) by design, so the first resize hook after the pin claimed saw
+/// a 1-CPU "allowance" and collapsed both pools to one worker (measured on a
+/// Snapdragon 8 Elite: prefill 554 tok/s against 1827 at the true width).
+/// Thread affinity is polluted by our own pinning; the cgroup is not.
+///
+/// Resolution: the cgroup path from `/proc/self/cpuset`, the hierarchy
+/// mount from `/proc/self/mountinfo`, then the deepest configured set
+/// walking up to the mount root (effective before configured at each
+/// level). Covers Android's `/dev/cpuset` (v1, `noprefix` names), container
+/// v1 (`cpuset.cpus`), and unified v2 (`cpuset.cpus.effective`). When no
+/// level configures a set, the hierarchy restricts nothing and the allowance
+/// is every online CPU (`/sys/devices/system/cpu/online`).
+///
+/// `None` only when the filesystem gives nothing at all, in which case the
+/// caller runs unclamped (the pre-clamp behavior). There is deliberately no
+/// affinity fallback: any affinity read can report our own pinning as a
+/// restriction, which is the misread above. For the same reason a `taskset`
+/// narrowing is not honored (worker pins escape it regardless);
+/// `CERA_THREADS` is the deliberate way down.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_cpu_allowance() -> Option<usize> {
-    // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid empty set.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `getpid` addresses the process leader; the size/pointer pair
-    // describes `set` exactly, and the return value is checked.
-    let ok = unsafe {
-        libc::sched_getaffinity(
-            libc::getpid(),
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &mut set,
-        )
-    };
-    if ok != 0 {
-        return None;
+    allowance_from_paths(
+        std::path::Path::new("/proc/self/cpuset"),
+        std::path::Path::new("/proc/self/mountinfo"),
+        std::path::Path::new("/sys/devices/system/cpu/online"),
+    )
+}
+
+/// [`process_cpu_allowance`] over explicit paths: the cpuset's set when the
+/// hierarchy configures one, else every online CPU (no configured set means
+/// no restriction), else unknown. Paths are parameters so tests can point
+/// them at fixtures; uncfg'd so those tests run on every host.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn allowance_from_paths(
+    cpuset_path: &std::path::Path,
+    mountinfo_path: &std::path::Path,
+    online_path: &std::path::Path,
+) -> Option<usize> {
+    cgroup_cpuset_cpu_count(cpuset_path, mountinfo_path).or_else(|| read_cpu_list_file(online_path))
+}
+
+/// CPU count of this process's cpuset: `cpuset_path` is the
+/// `/proc/self/cpuset` equivalent (our cgroup path), `mountinfo_path` the
+/// `/proc/self/mountinfo` equivalent. The hierarchy files themselves are read
+/// at the mount points the mountinfo names.
+///
+/// Tries the v1 cpuset hierarchy first (on hybrid systems it is authoritative
+/// for placement, and the cpuset path names a v1 path there), then v2. Within
+/// a hierarchy, walks from our cgroup up to the mount root and takes the
+/// deepest level that configures a set — an empty or missing file means
+/// "unset, inherit", not "zero CPUs".
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn cgroup_cpuset_cpu_count(
+    cpuset_path: &std::path::Path,
+    mountinfo_path: &std::path::Path,
+) -> Option<usize> {
+    let cgroup = std::fs::read_to_string(cpuset_path).ok()?;
+    let rel = cgroup.trim().strip_prefix('/').unwrap_or(cgroup.trim());
+    let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
+    let (v1, v2) = find_cgroup_mounts(&mountinfo);
+    // Both v1 filename spellings: plain `cpuset.*` normally, bare
+    // `cpus`/`effective_cpus` under the `noprefix` mount option Android
+    // uses. Only one spelling exists per mount, so their relative order
+    // cannot matter; effective-before-configured does.
+    const V1_FILES: [&str; 4] = [
+        "cpuset.effective_cpus",
+        "effective_cpus",
+        "cpuset.cpus",
+        "cpus",
+    ];
+    const V2_FILES: [&str; 2] = ["cpuset.cpus.effective", "cpuset.cpus"];
+    if let Some(mount) = v1
+        && let Some(n) = walk_cgroup_up(&mount, rel, &V1_FILES)
+    {
+        return Some(n);
     }
-    // Bound spelled from the set size rather than `CPU_SETSIZE`: the constant
-    // is `size_t` on Android, where `as usize` would trip `unnecessary_cast`
-    // under the repo's `-D warnings` gate (same convention as the pinning
-    // helper in `threadpool.rs`).
-    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
-    let mut count = 0;
-    for cpu in 0..capacity {
-        // SAFETY: `cpu` is bounded by the set's own bit capacity.
-        if unsafe { libc::CPU_ISSET(cpu, &set) } {
-            count += 1;
+    if let Some(mount) = v2
+        && let Some(n) = walk_cgroup_up(&mount, rel, &V2_FILES)
+    {
+        return Some(n);
+    }
+    None
+}
+
+/// Deepest configured CPU set from `rel` (our cgroup, relative to `mount`)
+/// up to and including the mount root, trying `files` (effective-first) at
+/// each level. Purely textual: a level whose files are missing or empty
+/// inherits from its parent.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn walk_cgroup_up(mount: &std::path::Path, rel: &str, files: &[&str]) -> Option<usize> {
+    let mut dir = mount.join(rel);
+    loop {
+        for name in files {
+            if let Some(n) = read_cpu_list_file(&dir.join(name)) {
+                return Some(n);
+            }
         }
+        if dir == mount {
+            return None;
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
+/// Mount points of the v1 cpuset hierarchy and the v2 hierarchy from
+/// mountinfo text: `(v1_cpuset, v2)`, each `None` when absent.
+///
+/// A mountinfo line is `id parent major:minor root mountpoint opts... -
+/// fstype source superopts`; the mountpoint is the fifth field and escapes
+/// spaces as `\040`. A v1 cpuset hierarchy is fstype `cgroup` with a `cpuset`
+/// super option; v2 is fstype `cgroup2` (its cpuset controller may still be
+/// disabled, which surfaces later as missing files). Malformed lines are
+/// skipped, and the first mount of each kind wins.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn find_cgroup_mounts(mountinfo: &str) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let mut v1 = None;
+    let mut v2 = None;
+    for line in mountinfo.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut post = post.split_whitespace();
+        let (Some(fstype), _, Some(superopts)) = (post.next(), post.next(), post.next()) else {
+            continue;
+        };
+        let Some(mountpoint) = pre.split_whitespace().nth(4) else {
+            continue;
+        };
+        let unescaped = || std::path::PathBuf::from(mountpoint.replace(r"\040", " "));
+        if fstype == "cgroup2" {
+            v2.get_or_insert_with(unescaped);
+        } else if fstype == "cgroup" && superopts.split(',').any(|opt| opt == "cpuset") {
+            v1.get_or_insert_with(unescaped);
+        }
+    }
+    (v1, v2)
+}
+
+/// Read a CPU-list file and count its CPUs; `None` when the file is missing,
+/// empty, or malformed.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn read_cpu_list_file(path: &std::path::Path) -> Option<usize> {
+    parse_cpu_list(std::fs::read_to_string(path).ok()?.trim())
+}
+
+/// Count the CPUs in a kernel CPU-list string: `0-7` is 8, `0-3,8` is 5, a
+/// lone `4` is 1. Ranges are inclusive; surrounding whitespace is tolerated.
+/// `None` on empty input or any malformed item. A valid list always counts
+/// at least 1, so callers can treat `None` as "unset, keep looking".
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn parse_cpu_list(s: &str) -> Option<usize> {
+    let mut count = 0usize;
+    for item in s.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return None;
+        }
+        let (lo, hi) = match item.split_once('-') {
+            Some((a, b)) => (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?),
+            None => {
+                let cpu = item.parse::<u32>().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if lo > hi {
+            return None;
+        }
+        count += (hi - lo + 1) as usize;
     }
     Some(count)
 }
@@ -1198,40 +1344,45 @@ mod tests {
         assert_eq!(composed.perf_core_count, 8);
     }
 
-    /// The allowance probe reads the process leader's mask, not the calling
-    /// thread's: pinning the caller to one CPU must not shrink the allowance.
-    /// Linux/Android only, and skipped under Miri, which cannot execute the
-    /// raw affinity syscalls. The caller's mask is restored on drop (each
-    /// `#[test]` runs on its own thread, so the pin is contained either way).
+    /// Pin thread `tid` (`0` = caller, `getpid()` = process leader) to the
+    /// first CPU in its current mask, restoring the saved mask on drop.
+    /// Shared by the allowance immunity tests below.
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
-    #[test]
-    fn cpu_allowance_ignores_calling_thread_pin() {
-        let before = process_cpu_allowance().expect("allowance probe works");
-        if before <= 1 {
-            eprintln!("skip: 1-CPU allowance cannot discriminate leader vs caller mask");
-            return;
-        }
-        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
-        let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        // SAFETY: pid 0 addresses the calling thread; the size/pointer pair
-        // describes `saved` exactly, and the return value is checked.
-        let ok = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
-        };
-        assert_eq!(ok, 0);
-        struct Restore(libc::cpu_set_t);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                // SAFETY: same pair as above, describing the saved mask;
-                // best-effort (a return code is unusable in `Drop`).
-                unsafe {
-                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &self.0);
-                }
+    struct RestoreMask {
+        tid: libc::pid_t,
+        saved: libc::cpu_set_t,
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    impl Drop for RestoreMask {
+        fn drop(&mut self) {
+            // SAFETY: pair describes the saved mask; best-effort (a return
+            // code is unusable in `Drop`).
+            unsafe {
+                libc::sched_setaffinity(
+                    self.tid,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &self.saved,
+                );
             }
         }
-        let _restore = Restore(saved);
-        // Pin to a CPU the process may actually run on: CPU 0 may sit outside
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    fn pin_thread_to_single_cpu(tid: libc::pid_t) -> RestoreMask {
+        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
+        let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the size/pointer pair describes `saved` exactly, and the
+        // return value is checked.
+        let ok = unsafe {
+            libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut saved)
+        };
+        assert_eq!(ok, 0);
+        // Pin to a CPU the thread may actually run on: CPU 0 may sit outside
         // a container's mask, where `sched_setaffinity` would refuse (EINVAL).
+        // Bound spelled from the set size rather than `CPU_SETSIZE`: the
+        // constant is `size_t` on Android, where `as usize` would trip
+        // `unnecessary_cast` under the repo's `-D warnings` gate.
         let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
         let mut only = None;
         for cpu in 0..capacity {
@@ -1241,16 +1392,191 @@ mod tests {
                 break;
             }
         }
-        let only = only.expect("caller mask is non-empty");
+        let only = only.expect("thread mask is non-empty");
         // SAFETY: all-zero bitmask, as above.
         let mut one: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         // SAFETY: `only` was observed set above, so it is in bounds.
         unsafe { libc::CPU_SET(only, &mut one) };
-        // SAFETY: pid 0 with the pair describing `one`; return checked.
+        // SAFETY: pair describes `one`; return checked.
         let ok =
-            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) };
+            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &one) };
         assert_eq!(ok, 0);
+        RestoreMask { tid, saved }
+    }
+
+    /// The allowance probe reads the cpuset cgroup, not the calling
+    /// thread's mask: pinning the caller to one CPU must not shrink the
+    /// allowance. Linux/Android only, and skipped under Miri, which cannot
+    /// execute the raw affinity syscalls. The caller's mask is restored on
+    /// drop (each `#[test]` runs on its own thread, so the pin is contained
+    /// either way).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn cpu_allowance_ignores_calling_thread_pin() {
+        let before = process_cpu_allowance().expect("allowance probe works");
+        if before <= 1 {
+            eprintln!("skip: 1-CPU allowance cannot discriminate");
+            return;
+        }
+        let _restore = pin_thread_to_single_cpu(0);
         assert_eq!(process_cpu_allowance(), Some(before));
+    }
+
+    /// The allowance probe reads the cpuset cgroup, not the process
+    /// leader's mask: pinning the leader to one CPU must not shrink the
+    /// allowance either. Regression test for a collapse measured on-device,
+    /// where the pool's caller-pin (which pins the dispatching thread,
+    /// usually the leader) made the next resize hook read a 1-CPU
+    /// "allowance" and rebuild both pools to a single worker. Fails against
+    /// the old leader-mask probe (which returns 1 here); passes against the
+    /// cgroup read. Linux/Android only, skipped under Miri; the leader's
+    /// mask is restored on drop (pinning it narrows only the harness's main
+    /// thread, and only for the probe call).
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn cpu_allowance_ignores_leader_self_pin() {
+        let before = process_cpu_allowance().expect("allowance probe works");
+        if before <= 1 {
+            eprintln!("skip: 1-CPU cpuset cannot discriminate");
+            return;
+        }
+        // SAFETY: `getpid` is always valid.
+        let leader = unsafe { libc::getpid() };
+        let _restore = pin_thread_to_single_cpu(leader);
+        assert_eq!(process_cpu_allowance(), Some(before));
+    }
+
+    #[test]
+    fn parse_cpu_list_counts_ranges_and_singles() {
+        assert_eq!(parse_cpu_list("0-7"), Some(8));
+        assert_eq!(parse_cpu_list("0-3,8"), Some(5));
+        assert_eq!(parse_cpu_list("4"), Some(1));
+        assert_eq!(parse_cpu_list("0-0"), Some(1));
+        assert_eq!(parse_cpu_list(" 0-1 , 4 "), Some(3));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("abc"), None);
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("0-3,"), None);
+        assert_eq!(parse_cpu_list("0-7-9"), None);
+    }
+
+    /// mountinfo parsing finds the v1 cpuset hierarchy and the v2 hierarchy
+    /// (Android-shaped fixture: v1 cpuset at `/dev/cpuset` plus a v2 mount),
+    /// skips malformed lines, and unescapes `\040`.
+    #[test]
+    fn find_cgroup_mounts_android_shaped() {
+        let mountinfo = "\
+64 42 0:26 / /dev/blkio rw shared:20 - cgroup none rw,blkio\n\
+not a mountinfo line\n\
+72 42 0:30 / /dev/cpuset rw shared:24 - cgroup none rw,cpuset,noprefix\n\
+66 45 0:27 / /sys/fs/cgroup rw shared:21 - cgroup2 none rw\n";
+        let (v1, v2) = find_cgroup_mounts(mountinfo);
+        assert_eq!(v1, Some(std::path::PathBuf::from("/dev/cpuset")));
+        assert_eq!(v2, Some(std::path::PathBuf::from("/sys/fs/cgroup")));
+        assert_eq!(find_cgroup_mounts("garbage\n"), (None, None));
+        let escaped = "1 1 0:1 / /my\\040dir rw - cgroup2 none rw\n";
+        assert_eq!(
+            find_cgroup_mounts(escaped).1,
+            Some(std::path::PathBuf::from("/my dir"))
+        );
+    }
+
+    /// End to end over fixture files: an Android-shaped v1 hierarchy
+    /// (`noprefix` names) resolves the cgroup's set, prefers the effective
+    /// file, and inherits from the parent when the leaf is empty.
+    #[cfg(not(miri))]
+    #[test]
+    fn cgroup_probe_prefers_effective_and_inherits_up() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = tmp.path().join("cpuset");
+        let leaf = mount.join("foreground");
+        std::fs::create_dir_all(&leaf).expect("mkdirs");
+        std::fs::write(leaf.join("cpus"), "0-5\n").expect("write");
+        std::fs::write(leaf.join("effective_cpus"), "0-3\n").expect("write");
+        let cpuset = tmp.path().join("cpuset_path");
+        std::fs::write(&cpuset, "/foreground\n").expect("write");
+        let mountinfo = tmp.path().join("mountinfo");
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "72 42 0:30 / {} rw - cgroup none rw,cpuset,noprefix\n",
+                mount.display()
+            ),
+        )
+        .expect("write");
+        // Effective (4) wins over configured (6).
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(4));
+        // Empty files inherit the parent level.
+        std::fs::write(leaf.join("effective_cpus"), "").expect("write");
+        std::fs::write(leaf.join("cpus"), "").expect("write");
+        std::fs::write(mount.join("cpus"), "0-7\n").expect("write");
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
+        // Nothing anywhere: no restriction visible.
+        std::fs::remove_file(mount.join("cpus")).expect("remove");
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), None);
+    }
+
+    /// Prefixed v1 names and the v2 fallback: a container-shaped v1
+    /// hierarchy resolves `cpuset.cpus`, and v2 is consulted only when v1
+    /// yields nothing.
+    #[cfg(not(miri))]
+    #[test]
+    fn cgroup_probe_prefixed_v1_then_v2() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let v1 = tmp.path().join("v1");
+        let v2 = tmp.path().join("v2");
+        let leaf1 = v1.join("docker").join("abc");
+        let leaf2 = v2.join("docker").join("abc");
+        std::fs::create_dir_all(&leaf1).expect("mkdirs");
+        std::fs::create_dir_all(&leaf2).expect("mkdirs");
+        std::fs::write(leaf1.join("cpuset.cpus"), "0-1\n").expect("write");
+        std::fs::write(leaf2.join("cpuset.cpus.effective"), "0-7\n").expect("write");
+        let cpuset = tmp.path().join("cpuset_path");
+        std::fs::write(&cpuset, "/docker/abc\n").expect("write");
+        let mountinfo = tmp.path().join("mountinfo");
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "1 1 0:1 / {} rw - cgroup none rw,cpuset\n2 1 0:2 / {} rw - cgroup2 none rw\n",
+                v1.display(),
+                v2.display()
+            ),
+        )
+        .expect("write");
+        // v1 (2 CPUs) wins over v2 (8).
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(2));
+        // v1 gone: v2 answers.
+        std::fs::remove_file(leaf1.join("cpuset.cpus")).expect("remove");
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
+    }
+
+    /// Composition: the cpuset wins when configured, else the online CPUs,
+    /// else unknown.
+    #[cfg(not(miri))]
+    #[test]
+    fn allowance_from_paths_prefers_cpuset_then_online() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = tmp.path().join("cpuset");
+        std::fs::create_dir_all(mount.join("fg")).expect("mkdirs");
+        std::fs::write(mount.join("fg").join("cpus"), "0-1\n").expect("write");
+        let cpuset = tmp.path().join("cpuset_path");
+        std::fs::write(&cpuset, "/fg\n").expect("write");
+        let mountinfo = tmp.path().join("mountinfo");
+        std::fs::write(
+            &mountinfo,
+            format!("1 1 0:1 / {} rw - cgroup none rw,cpuset\n", mount.display()),
+        )
+        .expect("write");
+        let online = tmp.path().join("online");
+        std::fs::write(&online, "0-7\n").expect("write");
+        // Cpuset (2) wins over online (8).
+        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), Some(2));
+        // No cpuset anywhere: online answers.
+        std::fs::remove_file(mount.join("fg").join("cpus")).expect("remove");
+        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), Some(8));
+        // Nothing anywhere: unknown.
+        std::fs::remove_file(&online).expect("remove");
+        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), None);
     }
 
     /// End to end through the real allowance probe: an absurd detected width
@@ -1267,9 +1593,9 @@ mod tests {
             fast_cores: 128,
             core_weights: vec![WEIGHT_FULL; 128],
         };
-        // Oracle is the same probe the seam uses: `available_parallelism`
-        // reads the calling thread's mask while the seam reads the process
-        // leader's, and the two differ under a pinned test thread.
+        // Oracle is the seam's own probe: it reads the cpuset cgroup (or the
+        // online CPUs), never a thread mask, so a pinned test thread cannot
+        // skew it the way `available_parallelism` would.
         let allowed = cpu_allowance();
         assert!(allowed < 128, "host too wide ({allowed}); smoke vacuous");
         let clamped = compose_clamp_and_override(detected, allowed, None, true);
