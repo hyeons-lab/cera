@@ -300,6 +300,26 @@ void main() {
       expect(whisperOpts.temperature, 0.0);
     },
   );
+
+  test('Hexagon NPU bindings and backend preferences are exposed', () {
+    expect(BackendPreference.values, contains(BackendPreference.hexagon));
+    expect(CeraBackend.values, contains(CeraBackend.hexagon));
+
+    const info = HexagonProbeInfo(
+      arch: 'V79',
+      threads: 4,
+      hvxUnits: 2,
+      hmxUnits: 1,
+      vtcmBytes: 8388608,
+    );
+    expect(info.arch, 'V79');
+    expect(info.threads, 4);
+    expect(info.hvxUnits, 2);
+    expect(info.hmxUnits, 1);
+    expect(info.vtcmBytes, 8388608);
+
+    expect(_hexagonFunctionGuard, isA<Function>());
+  });
 }
 
 void Function(FfiSileroVad) get _vadSurfaceGuard => (FfiSileroVad vad) {
@@ -343,6 +363,11 @@ void Function(FfiWhisperModel) get _whisperModelSurfaceGuard => (
 void Function() get _hotwordFunctionGuard => () {
   final FfiHotwordConfig Function() _ = hotwordDefaultConfig;
   final FfiWhisperTranscribeOpts Function() _ = whisperDefaultTranscribeOpts;
+};
+
+void Function() get _hexagonFunctionGuard => () {
+  final HexagonProbeInfo Function() _ = hexagonProbe;
+  final int Function(String) _ = hexagonInstallSkels;
 };
 
 /// Compile-time reference to every method that used to be a runtime stub.

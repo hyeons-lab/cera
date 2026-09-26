@@ -152,6 +152,7 @@ class ChatController extends ValueNotifier<ChatState> {
       final backend = switch (backendStr) {
         'cpu' => CeraBackend.cpu,
         'gpu' => CeraBackend.gpu,
+        'hexagon' => CeraBackend.hexagon,
         _ => CeraBackend.auto,
       };
       final turboQuant = prefs.getBool('cera_turboquant') ?? false;

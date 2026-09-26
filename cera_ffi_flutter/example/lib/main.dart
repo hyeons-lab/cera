@@ -363,7 +363,7 @@ class _ChatPageState extends State<ChatPage> {
                         contentPadding: EdgeInsets.zero,
                         title: const Text('Compute Backend'),
                         subtitle: Text(
-                          'Choose between Auto (WebGPU / Metal), GPU only, or CPU backend (WASM / Single-core).',
+                          'Choose between Auto (GPU / NPU / Fallback), GPU (WebGPU / Metal), NPU (Qualcomm Hexagon), or CPU.',
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -381,6 +381,10 @@ class _ChatPageState extends State<ChatPage> {
                             DropdownMenuItem(
                               value: CeraBackend.gpu,
                               child: Text('GPU (WebGPU / Metal)'),
+                            ),
+                            DropdownMenuItem(
+                              value: CeraBackend.hexagon,
+                              child: Text('NPU (Qualcomm Hexagon)'),
                             ),
                             DropdownMenuItem(
                               value: CeraBackend.cpu,

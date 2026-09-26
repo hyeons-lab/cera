@@ -154,6 +154,37 @@ into text. For token-by-token output use `generateStreamingAsync` with a
 `Cera.generate`. Drive it from `Isolate.run`, or use `generateStreamingAsync`,
 or use `Cera` and skip the question.
 
+### Qualcomm Hexagon NPU (Android)
+
+On Snapdragon hardware (SM8550+ / v73+), Cera executes inference directly on the Hexagon Tensor Processor (HTP) via FastRPC Unsigned PD. The Android AAR bundles the DSP skeleton libraries in `jniLibs/arm64-v8a/` and configures them automatically:
+
+```dart
+// Probe hardware support and capabilities:
+try {
+  final probe = hexagonProbe();
+  debugPrint('Hexagon NPU available: ${probe.arch} (${probe.threads} threads, ${probe.hvxUnits} HVX units)');
+} catch (e) {
+  debugPrint('Hexagon NPU not available: $e');
+}
+
+// Request Hexagon with the portable async API:
+final cera = await Cera.openPath(
+  modelPath,
+  options: const CeraOptions(backend: CeraBackend.hexagon),
+);
+
+// Or via low-level synchronous EngineConfig:
+final engine = CeraEngine.fromPath(
+  modelPath,
+  const EngineConfig(
+    contextSize: 2048,
+    backend: BackendPreference.hexagon,
+  ),
+);
+```
+
+On Android apps, the AAR manifest configuration (`extractNativeLibs="true"` and `<uses-native-library android:name="libcdsprpc.so">`) merges into the consuming application automatically. Call `HexagonNpu.setup(context)` once at startup in your Android `MainActivity.kt` (or call `hexagonInstallSkels(supportDir)` in Dart) to register the extracted skeleton search path before initializing the engine.
+
 ### Voice Modes & Speech Processing
 
 The [example app](example/README.md) implements four voice modes in its own

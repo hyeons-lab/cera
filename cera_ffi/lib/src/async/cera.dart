@@ -21,9 +21,10 @@ import 'cera_web.dart' if (dart.library.ffi) 'cera_io.dart' as impl;
 /// Which compute backend to run on.
 ///
 /// A preference, not a guarantee, and what each value can promise differs by
-/// platform because the backends do: natively the choice is between the CPU
-/// and whichever GPU backend exists (Metal on Apple, `wgpu` elsewhere), and on
-/// the web it is between WebGPU and the wasm CPU build. See each value.
+/// platform because the backends do: natively the choice is between the CPU,
+/// whichever GPU backend exists (Metal on Apple, `wgpu` elsewhere), and Qualcomm
+/// Hexagon NPU on Snapdragon hardware; on the web it is between WebGPU and the
+/// wasm CPU build. See each value.
 enum CeraBackend {
   /// Pick the fastest backend that can serve the model, falling back rather
   /// than failing.
@@ -49,6 +50,14 @@ enum CeraBackend {
   /// while on other platforms it attempts GPU acceleration with automatic
   /// CPU fallback if GPU features are omitted from the native binary.
   gpu,
+
+  /// Prefer the Qualcomm Hexagon NPU backend on supported Snapdragon hardware.
+  ///
+  /// On supported Qualcomm Snapdragon chipsets (SM8550+ / v73+ on Android arm64-v8a
+  /// or Linux aarch64), this targets the Hexagon Tensor Processor (HTP) via FastRPC
+  /// Unsigned PD. When Hexagon hardware acceleration is unavailable, the engine falls
+  /// back according to the native runtime configuration.
+  hexagon,
 }
 
 /// Where the web implementation loads its JavaScript and wasm from.

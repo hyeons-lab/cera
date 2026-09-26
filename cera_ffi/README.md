@@ -201,7 +201,7 @@ print(reply.text);
 
 See [`example/chat.dart`](example/chat.dart) for the complete multi-turn conversational chat workflow.
 
-Native Metal/wgpu models permit one live session per loaded model. Close a raw
+Native Metal/Hexagon/wgpu models permit one live session per loaded model. Close a raw
 session before creating another on that model; reset and cancellation retain
 ownership. CPU sessions can share a model. The portable `Cera` adapter handles
 replacement when applying a seed to an empty conversation and keeps the current
@@ -214,6 +214,37 @@ extra model memory and first-use setup. See the
 [GPU ownership guide](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md)
 and [native consumer](example/gpu_ownership_probe.dart) for runnable fixtures and
 seeded generation, transcription, recovery and continuation checks.
+
+### Qualcomm Hexagon NPU (Android & Linux aarch64)
+
+The native Qualcomm Hexagon NPU backend accelerates inference on Snapdragon chipsets (SM8550+ / v73+) through FastRPC Unsigned PD.
+
+```dart
+// Probe hardware support and capabilities (DSP arch, threads, HVX/HMX units, VTCM):
+try {
+  final probe = hexagonProbe();
+  print('Hexagon NPU available: ${probe.arch} (${probe.threads} threads, ${probe.hvxUnits} HVX units)');
+} catch (e) {
+  print('Hexagon NPU not available: $e');
+}
+
+// Request Hexagon with the portable async API:
+final cera = await Cera.openPath(
+  '/path/to/model.gguf',
+  options: const CeraOptions(backend: CeraBackend.hexagon),
+);
+
+// Or via low-level synchronous EngineConfig:
+final engine = CeraEngine.fromPath(
+  '/path/to/model.gguf',
+  const EngineConfig(
+    contextSize: 2048,
+    backend: BackendPreference.hexagon,
+  ),
+);
+```
+
+For Android apps built with `cera_ffi_flutter`, DSP skeleton libraries are bundled in the AAR's `jniLibs/arm64-v8a/` and configured via `HexagonNpu.setup(context)`. Standalone Dart environments on Linux or Android aarch64 can extract embedded skeletons by calling `hexagonInstallSkels(skelDir)` before probing or model loading.
 
 ### Voice Activity Detection (Silero VAD v5)
 
