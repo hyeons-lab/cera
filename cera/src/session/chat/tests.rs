@@ -2107,3 +2107,78 @@ fn profile_custom_builder_and_continuation() {
     assert_eq!(profile.turn_end(), "<<<");
     assert_eq!(profile.eos(), 99);
 }
+
+#[test]
+fn prompt_prefills_think_detects_unclosed_opener() {
+    assert!(prompt_prefills_think("<|im_start|>assistant\n<think>"));
+    assert!(prompt_prefills_think("<|im_start|>assistant\n<think>\n"));
+    assert!(prompt_prefills_think("<|im_start|>assistant\n<thought>"));
+    assert!(prompt_prefills_think("<|im_start|>assistant\n<thought>\n"));
+    assert!(prompt_prefills_think(
+        "<|im_start|>assistant\n<|thought_start|>"
+    ));
+    assert!(prompt_prefills_think(
+        "<|im_start|>user\nold <think>done</think><|im_end|>\n<|im_start|>assistant\n<think>"
+    ));
+    assert!(!prompt_prefills_think("<|im_start|>assistant\n"));
+    assert!(!prompt_prefills_think(
+        "<|im_start|>user\nWhat is <think>?<|im_end|>\n<|im_start|>assistant\n"
+    ));
+    assert!(!prompt_prefills_think(
+        "<|im_start|>user\nWhat is <thought>?<|im_end|>\n<|im_start|>assistant\n"
+    ));
+    assert!(!prompt_prefills_think(
+        "<|im_start|>user\nWhat is <|thought_start|>?<|im_end|>\n<|im_start|>assistant\n"
+    ));
+    assert!(!prompt_prefills_think("<think>done</think> answer"));
+    assert!(!prompt_prefills_think("<thought>done</thought> answer"));
+    assert!(!prompt_prefills_think(
+        "<|thought_start|>done<|thought_end|> answer"
+    ));
+    assert!(!prompt_prefills_think("no tags at all"));
+    assert!(!prompt_prefills_think(""));
+    assert!(!prompt_prefills_think("stray </think> without opener"));
+    assert!(!prompt_prefills_think("stray </thought> without opener"));
+    assert!(!prompt_prefills_think(
+        "stray <|thought_end|> without opener"
+    ));
+}
+
+#[test]
+fn ingest_records_prefilled_think_from_template() {
+    let profile = Profile::discover(fixtures::think_prefill_tokenizer()).unwrap();
+    let mut chat = Chat::new(MockMultimodalExecution::default(), profile, 0)
+        .ok()
+        .unwrap();
+    assert!(!chat.prefilled_think());
+    chat.ingest(&Message::user("hi")).unwrap();
+    assert!(
+        chat.prefilled_think(),
+        "think-prefilling template must flag the session"
+    );
+    chat.reset().unwrap();
+    assert!(!chat.prefilled_think());
+
+    let plain_profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let mut plain = Chat::new(MockMultimodalExecution::default(), plain_profile, 0)
+        .ok()
+        .unwrap();
+    plain.ingest(&Message::user("hi")).unwrap();
+    assert!(
+        !plain.prefilled_think(),
+        "plain template must not flag the session"
+    );
+}
+
+#[test]
+fn restore_resets_prefilled_think_to_false() {
+    let (_model, mut chat) = setup(fixtures::think_prefill_tokenizer());
+    chat.ingest(&user("hi")).unwrap();
+    assert!(chat.prefilled_think());
+    let checkpoint = chat.checkpoint().unwrap();
+    chat.restore(&checkpoint).unwrap();
+    assert!(
+        !chat.prefilled_think(),
+        "checkpoint restore must fall back to stream parsing"
+    );
+}

@@ -91,6 +91,10 @@
 
 use std::sync::Arc;
 
+use cera::session::chat::{
+    THINK_CLOSE_TAGS as CLOSE_THOUGHT_TAGS, THINK_OPEN_TAGS as OPEN_THOUGHT_TAGS,
+};
+
 uniffi::setup_scaffolding!();
 
 mod audio_pipeline;
@@ -1875,9 +1879,6 @@ pub trait ModalitySink: Send + Sync {
     fn on_done(&self, reason: FinishReason);
 }
 
-const OPEN_THOUGHT_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"];
-const CLOSE_THOUGHT_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
-
 fn find_thought_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
         .filter_map(|&tag| text.find(tag).map(|pos| (pos, tag)))
@@ -1918,35 +1919,77 @@ impl StreamingThinkingParser {
         }
     }
 
+    /// Parser starting inside a thinking block, for prompts that prefill
+    /// the opener (see `cera::session::chat::prompt_prefills_think`): the
+    /// first generated tokens are reasoning with no opener in the stream.
+    fn new_thinking() -> Self {
+        Self {
+            state: ThinkingState::Thinking,
+            buffer: String::new(),
+        }
+    }
+
     fn feed(&mut self, chunk: &str) -> Vec<(bool, String)> {
         self.buffer.push_str(chunk);
         let mut emissions = Vec::new();
 
         loop {
-            let (tags, is_thought, next_state) = match self.state {
-                ThinkingState::Content => (OPEN_THOUGHT_TAGS, false, ThinkingState::Thinking),
-                ThinkingState::Thinking => (CLOSE_THOUGHT_TAGS, true, ThinkingState::Content),
-            };
-
-            if let Some((pos, tag)) = find_thought_tag(&self.buffer, tags) {
-                if pos > 0 {
-                    let text = self.buffer[..pos].to_string();
-                    emissions.push((is_thought, text));
+            match self.state {
+                ThinkingState::Thinking => {
+                    if let Some((pos, tag)) = find_thought_tag(&self.buffer, CLOSE_THOUGHT_TAGS) {
+                        if pos > 0 {
+                            emissions.push((true, self.buffer[..pos].to_string()));
+                        }
+                        self.buffer.drain(..pos + tag.len());
+                        self.state = ThinkingState::Content;
+                        continue;
+                    }
+                    let hold = thought_partial_suffix_len(&self.buffer, CLOSE_THOUGHT_TAGS);
+                    let safe_len = self.buffer.len() - hold;
+                    if safe_len > 0 {
+                        emissions.push((true, self.buffer[..safe_len].to_string()));
+                        self.buffer.drain(..safe_len);
+                    }
+                    break;
                 }
-                let tag_len = tag.len();
-                self.buffer.drain(..pos + tag_len);
-                self.state = next_state;
-                continue;
-            }
+                ThinkingState::Content => {
+                    // In content state, a close tag before any opener is stray (the
+                    // opener was prefilled and consumed at ingest, or the model
+                    // emitted a bare closer): drop it rather than leaking markup
+                    // into the answer.
+                    let open = find_thought_tag(&self.buffer, OPEN_THOUGHT_TAGS);
+                    let close = find_thought_tag(&self.buffer, CLOSE_THOUGHT_TAGS);
+                    let open_pos = open.map(|(pos, _)| pos);
 
-            let hold = thought_partial_suffix_len(&self.buffer, tags);
-            let safe_len = self.buffer.len() - hold;
-            if safe_len > 0 {
-                let text = self.buffer[..safe_len].to_string();
-                self.buffer.drain(..safe_len);
-                emissions.push((is_thought, text));
+                    if let Some((close_pos, close_tag)) = close
+                        && open_pos.is_none_or(|open_idx| close_pos < open_idx)
+                    {
+                        if close_pos > 0 {
+                            emissions.push((false, self.buffer[..close_pos].to_string()));
+                        }
+                        self.buffer.drain(..close_pos + close_tag.len());
+                        continue;
+                    }
+
+                    if let Some((pos, tag)) = open {
+                        if pos > 0 {
+                            emissions.push((false, self.buffer[..pos].to_string()));
+                        }
+                        self.buffer.drain(..pos + tag.len());
+                        self.state = ThinkingState::Thinking;
+                        continue;
+                    }
+
+                    let hold = thought_partial_suffix_len(&self.buffer, OPEN_THOUGHT_TAGS)
+                        .max(thought_partial_suffix_len(&self.buffer, CLOSE_THOUGHT_TAGS));
+                    let safe_len = self.buffer.len() - hold;
+                    if safe_len > 0 {
+                        emissions.push((false, self.buffer[..safe_len].to_string()));
+                        self.buffer.drain(..safe_len);
+                    }
+                    break;
+                }
             }
-            break;
         }
 
         emissions
@@ -1981,11 +2024,27 @@ impl ForeignSinkAdapter {
         inner: Arc<dyn ModalitySink>,
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
     ) -> Self {
+        Self::new_with_initial_thinking(inner, tokenizer, false)
+    }
+
+    /// Adapter whose thinking parser starts inside a thinking block when
+    /// `thinking` is set. Chat callers pass the session's
+    /// [`cera::session::chat::Chat::prefilled_think`]; raw sessions have no
+    /// prompt introspection and keep the content default.
+    pub(crate) fn new_with_initial_thinking(
+        inner: Arc<dyn ModalitySink>,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+        thinking: bool,
+    ) -> Self {
         Self {
             inner,
             tokenizer,
             pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
+            parser: if thinking {
+                StreamingThinkingParser::new_thinking()
+            } else {
+                StreamingThinkingParser::new()
+            },
             done_called: false,
             done_reason: None,
         }
@@ -4886,6 +4945,102 @@ mod tests {
 
         let flushed = parser.flush();
         assert!(flushed.is_none());
+    }
+
+    #[test]
+    fn thinking_parser_prefilled_start_routes_to_thought() {
+        // Prefilled `<think>` (consumed at ingest, never in the stream):
+        // reasoning arrives with no opener and must still route to thought.
+        let mut parser = StreamingThinkingParser::new_thinking();
+        let out = parser.feed("Reasoning step 1. ");
+        assert_eq!(out, vec![(true, "Reasoning step 1. ".to_string())]);
+        let out = parser.feed("done.</think>Final answer.");
+        assert_eq!(
+            out,
+            vec![
+                (true, "done.".to_string()),
+                (false, "Final answer.".to_string()),
+            ]
+        );
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn thinking_parser_drops_stray_closer_in_content() {
+        // Bare `</think>` with no opener (untemplated spill, or the tail of
+        // a prefilled block the session did not flag): dropped, never
+        // leaked into the answer.
+        let mut parser = StreamingThinkingParser::new();
+        let out = parser.feed("Answer.</think> More.");
+        assert_eq!(
+            out,
+            vec![
+                (false, "Answer.".to_string()),
+                (false, " More.".to_string()),
+            ]
+        );
+        assert!(parser.flush().is_none());
+
+        // Split across feeds: the partial closer is held, then dropped whole.
+        let mut parser = StreamingThinkingParser::new();
+        let out = parser.feed("Answer.</th");
+        assert_eq!(out, vec![(false, "Answer.".to_string())]);
+        let out = parser.feed("ink> More.");
+        assert_eq!(out, vec![(false, " More.".to_string())]);
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn adapter_prefilled_thinking_routes_tokens_to_thought() {
+        use cera::ModalitySink as CoreSink;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            thought: Mutex<Vec<String>>,
+            text: Mutex<Vec<String>>,
+        }
+
+        impl ModalitySink for Recorder {
+            fn on_thought_chunk(&self, text: String) {
+                self.thought.lock().unwrap().push(text);
+            }
+            fn on_text_chunk(&self, text: String) {
+                self.text.lock().unwrap().push(text);
+            }
+            fn on_audio_frames(&self, _pcm: Vec<f32>, _sample_rate: u32) {}
+            fn on_done(&self, _reason: FinishReason) {}
+        }
+
+        let vocab = vec![
+            b"thought".to_vec(),  // 0
+            b"</think>".to_vec(), // 1
+            b"answer".to_vec(),   // 2
+        ];
+        let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vocab));
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+
+        // Prefilled session: the opener never appears in the stream, so the
+        // leading text must still route to thought, then flip on the closer.
+        let mut adapter = ForeignSinkAdapter::new_with_initial_thinking(
+            recorder.clone() as Arc<dyn ModalitySink>,
+            tokenizer.clone(),
+            true,
+        );
+        adapter.on_text_tokens(&[0, 1, 2]);
+        adapter.flush_pending();
+        assert_eq!(&*recorder.thought.lock().unwrap(), &["thought"]);
+        assert_eq!(&*recorder.text.lock().unwrap(), &["answer"]);
+
+        // Default session: same stream is plain content with the stray
+        // closer dropped.
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let mut adapter =
+            ForeignSinkAdapter::new(recorder.clone() as Arc<dyn ModalitySink>, tokenizer);
+        adapter.on_text_tokens(&[0, 1, 2]);
+        adapter.flush_pending();
+        assert!(recorder.thought.lock().unwrap().is_empty());
+        assert_eq!(recorder.text.lock().unwrap().join(""), "thoughtanswer");
     }
 
     #[test]

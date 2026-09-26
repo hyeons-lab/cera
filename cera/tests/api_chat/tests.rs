@@ -782,6 +782,20 @@ fn profile_discovery_and_turn_framing_for_lfm2_5_template() {
 }
 
 #[test]
+fn think_prefill_template_flags_thinking_session() {
+    let tokenizer = fixtures::think_prefill_tokenizer();
+    let profile = Profile::discover(tokenizer).unwrap();
+    let mut chat = Chat::new(TraceExecution::default(), profile, 0).unwrap();
+    assert!(!chat.prefilled_think());
+    let summary = chat.ingest_messages(&[user("hi")]).unwrap();
+    assert!(summary.input_tokens > 0);
+    assert!(
+        chat.prefilled_think(),
+        "think-prefilling template must flag the session"
+    );
+}
+
+#[test]
 #[ignore = "requires the pinned public GGUF; tests/api_chat/run.py verifies its SHA-256 and runs this test"]
 fn public_lfm2_tokenizer_boundary_and_ten_turns() {
     let path = std::env::var("CERA_CHAT_PROFILE_MODEL")

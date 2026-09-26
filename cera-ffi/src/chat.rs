@@ -675,7 +675,9 @@ impl ChatSession {
                 }
             };
             let tokenizer = chat.profile().tokenizer().clone();
-            let mut adapter = ForeignSinkAdapter::new(sink, tokenizer);
+            let thinking = chat.prefilled_think();
+            let mut adapter =
+                ForeignSinkAdapter::new_with_initial_thinking(sink, tokenizer, thinking);
             let report_result = chat
                 .generate_into(&core, &mut adapter)
                 .map_err(FfiError::from);

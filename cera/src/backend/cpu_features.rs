@@ -397,7 +397,10 @@ pub struct CoreTopology {
     pub perf_core_count: usize,
     /// OS core indices to pin workers to, fastest-first, covering **every**
     /// usable core rather than only the performance ones. Empty when the
-    /// platform has no usable affinity. A pool wider than this list would leave
+    /// platform has no usable affinity. Raw detection lists every core the
+    /// platform reports; policy intersects it with the process's usable set
+    /// (see `intersect_pins_with_usable`), so a shaped topology names only
+    /// reachable cores. A pool wider than this list would leave
     /// its surplus workers unpinned, which is the 35x cliff described on
     /// `apply_thread_override`; both that function and
     /// `calibrate::prefill_thread_count` clamp to this length precisely so that
@@ -414,9 +417,11 @@ pub struct CoreTopology {
     pub pin_cores: Vec<usize>,
     /// How many leading entries of `pin_cores` are *performance* cores, as
     /// detected. Distinct from `perf_core_count`, which is a pool width and so
-    /// moves with `CERA_THREADS` and the CPU-allowance clamp; this is a fact
-    /// about the silicon and does not. `pin_cores` is fastest-first, so `pin_cores[..fast_cores]` is
-    /// exactly the fast set.
+    /// moves with `CERA_THREADS` and usable-set shaping; this is a fact
+    /// about the silicon and does not, except to stay a valid prefix of a
+    /// shaped pin list (usable-set shaping preserves partition membership
+    /// across filtering, and `apply_thread_override` re-clamps it). `pin_cores`
+    /// is fastest-first, so `pin_cores[..fast_cores]` is exactly the fast set.
     ///
     /// Kept separate because the two diverge exactly where it matters:
     /// `CERA_THREADS=8` on a 6P+2E part raises the width to 8, and a consumer
@@ -505,8 +510,10 @@ impl CoreTopology {
 pub const WEIGHT_FULL: u32 = 256;
 
 /// Highest plausible CPU index to probe in sysfs. A hard bound so a malformed
-/// `/sys` can't loop unboundedly; real parts are far below this.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// `/sys` can't loop unboundedly; real parts are far below this. Also bounds
+/// the usable-set parser ([`parse_cpu_set`]), so the two share one horizon:
+/// an id past it is unrepresentable to detection anyway.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
 const MAX_CPUS: usize = 512;
 
 /// `cpu_capacity` (kernel EAS scale, 1024 = fastest core on the SoC) at/above
@@ -519,7 +526,7 @@ const CAP_MID: u32 = 400;
 /// Resolved core topology for this host, detected once and cached.
 pub fn core_topology() -> &'static CoreTopology {
     static TOPOLOGY: OnceLock<CoreTopology> = OnceLock::new();
-    TOPOLOGY.get_or_init(|| apply_pool_policy(core_topology_raw().clone(), cpu_allowance()))
+    TOPOLOGY.get_or_init(|| apply_pool_policy(core_topology_raw().clone(), &cpu_usable_cpus()))
 }
 
 /// Raw platform detection ([`detect_topology_raw`]), cached process-wide.
@@ -630,25 +637,26 @@ fn linux_physical_cores() -> Option<usize> {
 }
 
 /// Uncached topology detection: raw platform detection plus the pool-width
-/// policy (allowance clamp, then the `CERA_THREADS` override). Prefer
+/// policy (usable-set shaping, then the `CERA_THREADS` override). Prefer
 /// [`core_topology`]; exposed for tests.
 ///
 /// Precedence: a valid `CERA_THREADS` override sets the thread count (see
 /// `apply_thread_override` for the clamp it is subject to); otherwise the
 /// platform detector picks the perf-core count; otherwise all logical cores.
 /// The clamp is uniform across platforms: where there is no cpuset concept
-/// the allowance is the thread parallelism and the clamp is a no-op unless
-/// the process itself is restricted.
+/// the usable answer is the thread parallelism and the clamp is a no-op
+/// unless the process itself is restricted.
 pub fn detect_topology() -> CoreTopology {
-    apply_pool_policy(detect_topology_raw(), cpu_allowance())
+    apply_pool_policy(detect_topology_raw(), &cpu_usable_cpus())
 }
 
-/// Pool-width policy over raw detection: allowance clamp, then the
-/// `CERA_THREADS` override. Single place the env reads live so the cached,
-/// uncached, and resize paths cannot diverge; callers supply the allowance
-/// (fresh probe, or explicit in tests).
-pub(crate) fn apply_pool_policy(raw: CoreTopology, allowed: usize) -> CoreTopology {
-    compose_clamp_and_override(raw, allowed, env_usize("CERA_THREADS"), !pinning_disabled())
+/// Pool-width policy over raw detection: usable-set shaping (width clamp
+/// plus pin intersection), then the `CERA_THREADS` override. Single place
+/// the env reads live so the cached, uncached, and resize paths cannot
+/// diverge; callers supply the usable answer (fresh probe, or explicit in
+/// tests).
+pub(crate) fn apply_pool_policy(raw: CoreTopology, usable: &UsableCpus) -> CoreTopology {
+    compose_clamp_and_override(raw, usable, env_usize("CERA_THREADS"), !pinning_disabled())
 }
 
 /// Raw platform detection, before the allowance clamp and thread overrides:
@@ -711,47 +719,95 @@ fn detect_topology_raw() -> CoreTopology {
 /// of leaving them stuck. The [`core_topology`] cache keeps the startup
 /// sample for direct readers.
 ///
-/// Runs the clamp *before* the override so the knob keeps its documented
-/// meaning (an explicit width, clamped only to pinnable cores): a deliberate
-/// oversubscription sweep can still ask for more, but the default never does.
-/// The order test calls this seam, pinning clamp-before-override order; the
+/// Runs the clamp, then the pin intersection, then the override, so the
+/// knob keeps its documented meaning (an explicit width, clamped only to
+/// pinnable cores): a deliberate oversubscription sweep can still ask for
+/// more, but the default never does. Intersecting before the override is
+/// what clamps the knob to *reachable* cores rather than detected ones. The
+/// order test calls this seam, pinning clamp-before-override order; the
 /// detector's sysfs call-site use is pinned only by review.
 fn compose_clamp_and_override(
     topo: CoreTopology,
-    allowed: usize,
+    usable: &UsableCpus,
     forced: Option<usize>,
     pinning_on: bool,
 ) -> CoreTopology {
-    apply_thread_override(clamp_perf_count(topo, allowed), forced, pinning_on)
+    let clamped = clamp_perf_count(topo, usable.count());
+    let intersected = match usable {
+        UsableCpus::Known(set) => intersect_pins_with_usable(clamped, set),
+        UsableCpus::CountOnly(_) => clamped,
+    };
+    apply_thread_override(intersected, forced, pinning_on)
 }
 
-/// CPUs this process may run on: the cpuset-cgroup probe on Linux/Android,
-/// the calling thread's parallelism elsewhere. Unclamped (`usize::MAX`)
-/// when the platform probe reports nothing usable. Split out so the seam
-/// above takes the allowance as a plain argument and stays testable without
-/// touching the platform; the pool resizer also calls it directly to detect
-/// cpuset changes.
-pub(crate) fn cpu_allowance() -> usize {
-    // Floor at 1: a zero count would otherwise store allowance 0 while the
-    // width floors at 1, flapping a width-identical rebuild on every 0/1
-    // probe disagreement. (The parsers below never yield 0; this is insurance
-    // against a future one that does.)
-    allowance_probe().unwrap_or(usize::MAX).max(1)
+/// CPUs this process may run on: the exact set where the platform reveals
+/// it (every Linux/Android probe tier resolves a membership, not a count),
+/// or only a count where it does not (other platforms' thread parallelism,
+/// or a total probe miss, which reads unclamped as `usize::MAX`).
+///
+/// The set half is what lets policy filter pins down to reachable cores
+/// instead of merely narrowing the width and hoping the surplus pins fail
+/// open (see [`intersect_pins_with_usable`]). Split out so the seam above
+/// takes the answer as a plain argument and stays testable without touching
+/// the platform; the pool resizer probes this once per boundary and threads
+/// it through the rebuild so width and pins shape from one sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UsableCpus {
+    /// Exact usable set, ascending. Guaranteed non-empty: all probe tiers
+    /// return `None` on empty or zero-bit sets to fall back to the next tier
+    /// or `CountOnly(usize::MAX)`.
+    // `allow`, not `expect`: off Linux/Android this is dead in a normal
+    // build (the probe only yields counts there) but live in a test build,
+    // so an `expect` would fire as unfulfilled in one of them.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(
+            dead_code,
+            reason = "only the Linux/Android probe constructs it; tested on all hosts"
+        )
+    )]
+    Known(Vec<usize>),
+    /// Only a count is known; pins stay as detected (the pre-intersection
+    /// shape). `usize::MAX` means unclamped.
+    CountOnly(usize),
 }
 
-/// Platform half of [`cpu_allowance`]: the cpuset cgroup on Linux/Android
-/// (see [`process_cpu_allowance`]).
+impl UsableCpus {
+    /// Width half of the usable answer: the set length, or the bare count.
+    ///
+    /// Floored at 1: a zero count would otherwise store allowance 0 while
+    /// the width floors at 1, flapping a width-identical rebuild on every
+    /// 0/1 probe disagreement. (The probes below never yield 0; this is
+    /// insurance against a future one that does.)
+    pub(crate) fn count(&self) -> usize {
+        match self {
+            UsableCpus::Known(set) => set.len(),
+            UsableCpus::CountOnly(n) => *n,
+        }
+        .max(1)
+    }
+}
+
+/// CPUs this process may run on (see [`UsableCpus`]).
+pub(crate) fn cpu_usable_cpus() -> UsableCpus {
+    usable_probe().unwrap_or(UsableCpus::CountOnly(usize::MAX))
+}
+
+/// Platform half of [`cpu_usable_cpus`]: the cpuset cgroup on Linux/Android
+/// (see [`process_cpu_set`]).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn allowance_probe() -> Option<usize> {
-    process_cpu_allowance()
+fn usable_probe() -> Option<UsableCpus> {
+    process_cpu_set().map(UsableCpus::Known)
 }
 
-/// Platform half of [`cpu_allowance`] off Linux/Android: the calling
+/// Platform half of [`cpu_usable_cpus`] off Linux/Android: the calling
 /// thread's parallelism, which is trustworthy there because those platforms
 /// pin nothing.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn allowance_probe() -> Option<usize> {
-    std::thread::available_parallelism().map(|p| p.get()).ok()
+fn usable_probe() -> Option<UsableCpus> {
+    std::thread::available_parallelism()
+        .map(|p| UsableCpus::CountOnly(p.get()))
+        .ok()
 }
 
 /// CPUs the process may run on, resolved in three tiers: our cpuset's CPU
@@ -774,63 +830,71 @@ fn allowance_probe() -> Option<usize> {
 ///    up to the mount root (effective before configured at each level).
 ///    Covers Android's `/dev/cpuset` (v1, `noprefix` names), container v1
 ///    (`cpuset.cpus`), and unified v2 (`cpuset.cpus.effective`).
-/// 2. Leader mask, via [`leader_effective_count`]: skipped while the leader
+/// 2. Leader mask, via [`leader_effective_set`]: skipped while the leader
 ///    holds our caller-pin (its mask is ours, not the world's); a migration
 ///    that rewrites the mask shows up as "not ours" and is trusted again.
 /// 3. Online CPUs (`/sys/devices/system/cpu/online`): no configured set and
 ///    no trustworthy mask means no visible restriction.
 ///
-/// `None` only when the filesystem gives nothing at all, in which case the
-/// caller runs unclamped (the pre-clamp behavior). A `taskset` narrowing is
-/// honored only through tier 2 (and only where the cgroup is unreadable):
-/// where the cgroup reads, it wins, because worker pins escape a taskset
-/// regardless; `CERA_THREADS` is the deliberate way down.
+/// Every tier resolves a membership, not a count, so policy can filter pins
+/// to reachable cores (see [`intersect_pins_with_usable`]); the width is the
+/// set's length. `None` only when the filesystem gives nothing at all, in
+/// which case the caller runs unclamped (the pre-clamp behavior). A `taskset`
+/// narrowing is honored only through tier 2 (and only where the cgroup is
+/// unreadable): where the cgroup reads, it wins, because worker pins escape
+/// a taskset regardless; `CERA_THREADS` is the deliberate way down.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn process_cpu_allowance() -> Option<usize> {
-    probe_with_leader(
+fn process_cpu_set() -> Option<Vec<usize>> {
+    probe_set_with_leader(
         std::path::Path::new("/proc/self/cpuset"),
         std::path::Path::new("/proc/self/mountinfo"),
         std::path::Path::new("/sys/devices/system/cpu/online"),
-        leader_effective_count(),
+        leader_effective_set,
     )
 }
 
-/// [`process_cpu_allowance`] over explicit inputs: `leader` is the tier-2
+/// [`process_cpu_set`] over explicit inputs: `leader` is the tier-2
 /// leader-mask reading (already distrusted while self-pinned). Paths and the
 /// leader reading are parameters so tests can point them at fixtures; uncfg'd
 /// past Linux-or-test so those tests run on every host.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn probe_with_leader(
+fn probe_set_with_leader<F: FnOnce() -> Option<Vec<usize>>>(
     cpuset_path: &std::path::Path,
     mountinfo_path: &std::path::Path,
     online_path: &std::path::Path,
-    leader: Option<usize>,
-) -> Option<usize> {
-    cgroup_cpuset_cpu_count(cpuset_path, mountinfo_path)
-        .or(leader)
-        .or_else(|| read_cpu_list_file(online_path))
+    leader: F,
+) -> Option<Vec<usize>> {
+    cgroup_cpuset_cpu_set(cpuset_path, mountinfo_path)
+        .filter(|s| !s.is_empty())
+        .or_else(|| leader().filter(|s| !s.is_empty()))
+        .or_else(|| read_cpu_set_file(online_path).filter(|s| !s.is_empty()))
 }
 
-/// Tier-2 allowance: the process leader's affinity-mask CPU count, or `None`
+/// Tier-2 usable set: the process leader's affinity-mask CPUs, or `None`
 /// while the leader holds our caller-pin (its mask is ours then, and would
 /// misread as a 1-CPU cpuset) or the probe itself fails. The leader (TGID) is
 /// read rather than the caller because the topology cache is process-wide: a
 /// thread an embedder pinned to one core must not freeze the width. Kept
-/// separate from [`probe_with_leader`] (which takes the reading as an
+/// separate from [`probe_set_with_leader`] (which takes the reading as an
 /// argument) so the composition stays fixture-testable.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn leader_effective_count() -> Option<usize> {
+fn leader_effective_set() -> Option<Vec<usize>> {
     // SAFETY: `getpid` addresses the process leader and always succeeds.
     let leader = unsafe { libc::getpid() };
     if crate::backend::threadpool::thread_self_pinned(leader) {
         return None;
     }
-    leader_mask_count(leader)
+    leader_mask_set(leader)
 }
 
-/// CPU count of thread `tid`'s affinity mask; `None` when the probe fails.
+/// Ascending CPU ids of thread `tid`'s affinity mask; `None` when the probe
+/// fails or yields a zero-bit mask (possible across a cpuset migration),
+/// allowing callers to fall back to subsequent probe tiers.
+/// Unlike the text parser this is not horizon-filtered: the mask is already
+/// bounded by the `cpu_set_t` bits, and ids past it simply never match a
+/// detected pin.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn leader_mask_count(tid: libc::pid_t) -> Option<usize> {
+fn leader_mask_set(tid: libc::pid_t) -> Option<Vec<usize>> {
     // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid empty set.
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     // SAFETY: the size/pointer pair describes `set` exactly, and the return
@@ -845,17 +909,17 @@ fn leader_mask_count(tid: libc::pid_t) -> Option<usize> {
     // under the repo's `-D warnings` gate (same convention as the pinning
     // helper in `threadpool.rs`).
     let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
-    let mut count = 0;
+    let mut cpus = Vec::new();
     for cpu in 0..capacity {
         // SAFETY: `cpu` is bounded by the set's own bit capacity.
         if unsafe { libc::CPU_ISSET(cpu, &set) } {
-            count += 1;
+            cpus.push(cpu);
         }
     }
-    Some(count)
+    if cpus.is_empty() { None } else { Some(cpus) }
 }
 
-/// CPU count of this process's cpuset: `cpuset_path` is the
+/// CPU set of this process's cpuset: `cpuset_path` is the
 /// `/proc/self/cpuset` equivalent (our cgroup path), `mountinfo_path` the
 /// `/proc/self/mountinfo` equivalent. The hierarchy files themselves are read
 /// at the mount points the mountinfo names.
@@ -863,13 +927,13 @@ fn leader_mask_count(tid: libc::pid_t) -> Option<usize> {
 /// Tries the v1 cpuset hierarchy first (on hybrid systems it is authoritative
 /// for placement, and the cpuset path names a v1 path there), then v2. Within
 /// a hierarchy, walks from our cgroup up to the mount root and takes the
-/// deepest level that configures a set — an empty or missing file means
+/// deepest level that configures a set: an empty or missing file means
 /// "unset, inherit", not "zero CPUs".
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn cgroup_cpuset_cpu_count(
+fn cgroup_cpuset_cpu_set(
     cpuset_path: &std::path::Path,
     mountinfo_path: &std::path::Path,
-) -> Option<usize> {
+) -> Option<Vec<usize>> {
     let cgroup = std::fs::read_to_string(cpuset_path).ok()?;
     let rel = cgroup.trim().strip_prefix('/').unwrap_or(cgroup.trim());
     let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
@@ -886,14 +950,14 @@ fn cgroup_cpuset_cpu_count(
     ];
     const V2_FILES: [&str; 2] = ["cpuset.cpus.effective", "cpuset.cpus"];
     if let Some(mount) = v1
-        && let Some(n) = walk_cgroup_up(&mount, rel, &V1_FILES)
+        && let Some(set) = walk_cgroup_set_up(&mount, rel, &V1_FILES)
     {
-        return Some(n);
+        return Some(set);
     }
     if let Some(mount) = v2
-        && let Some(n) = walk_cgroup_up(&mount, rel, &V2_FILES)
+        && let Some(set) = walk_cgroup_set_up(&mount, rel, &V2_FILES)
     {
-        return Some(n);
+        return Some(set);
     }
     None
 }
@@ -903,12 +967,12 @@ fn cgroup_cpuset_cpu_count(
 /// each level. Purely textual: a level whose files are missing or empty
 /// inherits from its parent.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn walk_cgroup_up(mount: &std::path::Path, rel: &str, files: &[&str]) -> Option<usize> {
+fn walk_cgroup_set_up(mount: &std::path::Path, rel: &str, files: &[&str]) -> Option<Vec<usize>> {
     let mut dir = mount.join(rel);
     loop {
         for name in files {
-            if let Some(n) = read_cpu_list_file(&dir.join(name)) {
-                return Some(n);
+            if let Some(set) = read_cpu_set_file(&dir.join(name)) {
+                return Some(set);
             }
         }
         if dir == mount {
@@ -952,20 +1016,30 @@ fn find_cgroup_mounts(mountinfo: &str) -> (Option<std::path::PathBuf>, Option<st
     (v1, v2)
 }
 
-/// Read a CPU-list file and count its CPUs; `None` when the file is missing,
-/// empty, or malformed.
+/// Read a CPU-list file and resolve its set; `None` when the file is
+/// missing, empty, malformed, or names nothing below [`MAX_CPUS`].
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn read_cpu_list_file(path: &std::path::Path) -> Option<usize> {
-    parse_cpu_list(std::fs::read_to_string(path).ok()?.trim())
+fn read_cpu_set_file(path: &std::path::Path) -> Option<Vec<usize>> {
+    parse_cpu_set(std::fs::read_to_string(path).ok()?.trim())
 }
 
-/// Count the CPUs in a kernel CPU-list string: `0-7` is 8, `0-3,8` is 5, a
-/// lone `4` is 1. Ranges are inclusive; surrounding whitespace is tolerated.
-/// `None` on empty input or any malformed item. A valid list always counts
-/// at least 1, so callers can treat `None` as "unset, keep looking".
+/// Membership of a kernel CPU-list string: `0-7` is cpus `0..=7`, `0-3,8`
+/// adds cpu 8, a lone `4` is just cpu 4. Ranges are inclusive; surrounding
+/// whitespace is tolerated. Always ascending and deduped, so overlapping or
+/// unordered items (`8,0-3`) still resolve to one set.
+///
+/// `None` on empty input or any malformed item, the same "unset, keep
+/// looking" contract the tiers rely on. Two bounds keep the collection
+/// honest: ids at/above [`MAX_CPUS`] are dropped (past the sysfs detector's
+/// own horizon, so no detected pin can name them), and an input that names
+/// nothing below it reads as `None` rather than an empty set, so the tiers
+/// fall through to a signal that does. A hostile span like `0-u32::MAX`
+/// therefore resolves to the horizon prefix instead of a 4-billion-entry
+/// vector; the range loop below is capped the same way, so it cannot hang
+/// on one either.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn parse_cpu_list(s: &str) -> Option<usize> {
-    let mut count = 0usize;
+fn parse_cpu_set(s: &str) -> Option<Vec<usize>> {
+    let mut present = [false; MAX_CPUS];
     for item in s.split(',') {
         let item = item.trim();
         if item.is_empty() {
@@ -981,25 +1055,28 @@ fn parse_cpu_list(s: &str) -> Option<usize> {
         if lo > hi {
             return None;
         }
-        // `hi - lo` cannot overflow (`lo <= hi` is checked above), but the
-        // `+ 1` can in `u32` (the full `0-u32::MAX` span): it panics in debug
-        // and wraps to `Some(0)` in release, breaking the at-least-1
-        // invariant the walk relies on. Accumulate in `usize` with checks so
-        // only a genuine overflow reads as malformed ("unset, keep looking").
-        count = count
-            .checked_add(usize::try_from(hi - lo).ok()?)
-            .and_then(|n| n.checked_add(1))?;
+        // Capped at the horizon: an uncapped `RangeInclusive` would either
+        // hang (a hostile full-`u32` span) or name unrepresentable ids. A
+        // `lo` past the horizon yields an empty range, contributing nothing.
+        let hi = hi.min(MAX_CPUS as u32 - 1);
+        for cpu in lo..=hi {
+            present[cpu as usize] = true;
+        }
     }
-    Some(count)
+    let set: Vec<usize> = present
+        .iter()
+        .enumerate()
+        .filter_map(|(cpu, &p)| p.then_some(cpu))
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
 }
 
 /// Pure half of the clamp/override seam: cap `perf_core_count` at `allowed`
-/// CPUs. `pin_cores`/`core_weights` are intentionally left alone: the clamp
-/// reproduces the measured-good shape (width at the usable count), with
-/// out-of-reach pins failing open to unpinned execution (a refused
-/// `sched_setaffinity` leaves the thread on its inherited mask; see
-/// `RowPool::build`). Filtering the pin set down to the affinity mask so every
-/// worker lands pinned is a separate follow-up.
+/// CPUs. Width only: pins, weights, and the fast set are shaped by
+/// [`intersect_pins_with_usable`] next, which filters them down to the
+/// usable set so every worker lands pinned instead of failing open to
+/// unpinned execution (a refused `sched_setaffinity` leaves the thread on
+/// its inherited mask; see `RowPool::build`).
 fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
     let allowed = allowed.max(1);
     if topo.perf_core_count > allowed {
@@ -1013,6 +1090,50 @@ fn clamp_perf_count(mut topo: CoreTopology, allowed: usize) -> CoreTopology {
         );
         topo.perf_core_count = allowed;
     }
+    topo
+}
+
+/// Filter `pin_cores`/`core_weights` down to the usable set, keeping
+/// detected (fastest-first) order and carrying each weight with its core.
+/// Width and the fast prefix re-clamp to the kept list, so both stay valid
+/// prefixes of it (the same re-clamp [`apply_thread_override`] applies; a
+/// fast core the set excludes is not a core a worker can sit on).
+///
+/// An empty intersection, or an empty usable set, keeps the detected
+/// shape and trusts the kernel to constrain it (the pre-intersection
+/// behavior): the set disagrees with every detected pin, so one of the two
+/// is stale, and dropping all pins would trade possibly-wrong placement for
+/// certainly-unpinned execution. Width was already clamped to the set's
+/// length before this runs, so the fallback still sizes correctly.
+fn intersect_pins_with_usable(mut topo: CoreTopology, usable: &[usize]) -> CoreTopology {
+    if usable.is_empty() {
+        return topo;
+    }
+    let mut pins = Vec::with_capacity(topo.pin_cores.len());
+    let mut weights = Vec::with_capacity(topo.core_weights.len());
+    let mut surviving_fast = 0;
+    for (i, &cpu) in topo.pin_cores.iter().enumerate() {
+        if usable.contains(&cpu) {
+            pins.push(cpu);
+            if i < topo.fast_cores {
+                surviving_fast += 1;
+            }
+            // `core_weights[i]` is `pin_cores[i]`'s weight by construction
+            // (every producer truncates the two in lockstep); fail open to
+            // full speed rather than panic pool sizing if one ever drifts.
+            weights.push(topo.core_weights.get(i).copied().unwrap_or(WEIGHT_FULL));
+        }
+    }
+    if pins.is_empty() {
+        tracing::debug!(
+            "cera: usable set {usable:?} excludes every detected pin; keeping detected pins (kernel constrains)"
+        );
+        return topo;
+    }
+    topo.perf_core_count = topo.perf_core_count.min(pins.len());
+    topo.fast_cores = surviving_fast;
+    topo.pin_cores = pins;
+    topo.core_weights = weights;
     topo
 }
 
@@ -1401,8 +1522,108 @@ mod tests {
             fast_cores: 8,
             core_weights: vec![WEIGHT_FULL; 8],
         };
-        let composed = compose_clamp_and_override(detected, 6, Some(8), true);
+        let composed =
+            compose_clamp_and_override(detected, &UsableCpus::CountOnly(6), Some(8), true);
         assert_eq!(composed.perf_core_count, 8);
+    }
+
+    /// The width half floors at one: an empty known set (e.g. from tests)
+    /// and a zero count both read as one worker, never zero.
+    #[test]
+    fn usable_count_floors_at_one() {
+        assert_eq!(UsableCpus::Known(vec![]).count(), 1);
+        assert_eq!(UsableCpus::Known(vec![0, 1, 2]).count(), 3);
+        assert_eq!(UsableCpus::CountOnly(0).count(), 1);
+        assert_eq!(UsableCpus::CountOnly(usize::MAX).count(), usize::MAX);
+    }
+
+    /// Intersection keeps usable pins in detected (fastest-first) order with
+    /// their weights, and re-clamps width and the fast prefix to the kept
+    /// list. Tensor-G5-shaped: the prime (cpu 7) sits outside the usable
+    /// set, so it drops while the P-cluster pins keep their weights.
+    #[test]
+    fn intersect_pins_keeps_usable_in_detected_order() {
+        let detected = CoreTopology {
+            perf_core_count: 7,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 7,
+            core_weights: vec![256, 206, 206, 206, 206, 206, 52, 52],
+        };
+        let shaped = intersect_pins_with_usable(detected, &[0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(shaped.pin_cores, vec![6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(shaped.core_weights, vec![206, 206, 206, 206, 206, 52, 52]);
+        assert_eq!(shaped.perf_core_count, 7);
+        assert_eq!(shaped.fast_cores, 6);
+    }
+
+    /// A width narrower than the kept list survives the intersection: the
+    /// clamp ran first, and the intersection only ever narrows further.
+    #[test]
+    fn intersect_pins_preserves_narrower_width() {
+        let detected = CoreTopology {
+            perf_core_count: 2,
+            pin_cores: vec![7, 6, 5, 4],
+            fast_cores: 4,
+            core_weights: vec![WEIGHT_FULL; 4],
+        };
+        let shaped = intersect_pins_with_usable(detected, &[4, 5, 6, 7]);
+        assert_eq!(shaped.perf_core_count, 2);
+        assert_eq!(shaped.pin_cores, vec![7, 6, 5, 4]);
+    }
+
+    /// A usable set disjoint from every detected pin keeps the detected
+    /// shape (trust but verify): one of the two is stale, and dropping all
+    /// pins would trade possibly-wrong placement for certainly-unpinned
+    /// execution. Same for an empty usable set.
+    #[test]
+    fn intersect_pins_empty_falls_back_to_detected() {
+        let detected = CoreTopology {
+            perf_core_count: 4,
+            pin_cores: vec![7, 6, 5, 4],
+            fast_cores: 4,
+            core_weights: vec![WEIGHT_FULL; 4],
+        };
+        assert_eq!(
+            intersect_pins_with_usable(detected.clone(), &[0, 1, 2, 3]),
+            detected
+        );
+        assert_eq!(intersect_pins_with_usable(detected.clone(), &[]), detected);
+    }
+
+    /// End to end through the seam: a known set shapes pins before the
+    /// override runs, so `CERA_THREADS` clamps to *reachable* cores rather
+    /// than detected ones.
+    #[test]
+    fn compose_known_set_shapes_pins_before_override() {
+        let detected = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 8,
+            core_weights: vec![WEIGHT_FULL; 8],
+        };
+        let usable = UsableCpus::Known(vec![0, 1, 2, 3, 4, 5]);
+        let composed = compose_clamp_and_override(detected, &usable, Some(8), true);
+        assert_eq!(composed.perf_core_count, 6);
+        assert_eq!(composed.pin_cores, vec![5, 4, 3, 2, 1, 0]);
+        assert_eq!(composed.fast_cores, 6);
+    }
+
+    /// The count-only leg pins the legacy shape (width-only, pins
+    /// untouched) for platforms without a set signal.
+    #[test]
+    fn compose_count_only_leaves_pins_untouched() {
+        let detected = CoreTopology {
+            perf_core_count: 8,
+            pin_cores: vec![7, 6, 5, 4, 3, 2, 1, 0],
+            fast_cores: 8,
+            core_weights: vec![WEIGHT_FULL; 8],
+        };
+        let composed =
+            compose_clamp_and_override(detected.clone(), &UsableCpus::CountOnly(6), None, true);
+        assert_eq!(composed.perf_core_count, 6);
+        assert_eq!(composed.pin_cores, detected.pin_cores);
+        assert_eq!(composed.core_weights, detected.core_weights);
+        assert_eq!(composed.fast_cores, 8);
     }
 
     /// Pin thread `tid` (`0` = caller, `getpid()` = process leader) to the
@@ -1482,7 +1703,7 @@ mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     static AFFINITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The allowance probe reads the cpuset cgroup, not the calling
+    /// The usable-set probe reads the cpuset cgroup, not the calling
     /// thread's mask: pinning the caller to one CPU must not shrink the
     /// allowance. Linux/Android only, and skipped under Miri, which cannot
     /// execute the raw affinity syscalls. The caller's mask is restored on
@@ -1490,15 +1711,15 @@ mod tests {
     /// either way).
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
-    fn cpu_allowance_ignores_calling_thread_pin() {
+    fn usable_set_ignores_calling_thread_pin() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
-        let before = process_cpu_allowance().expect("allowance probe works");
-        if before <= 1 {
+        let before = process_cpu_set().expect("usable-set probe works");
+        if before.len() <= 1 {
             eprintln!("skip: 1-CPU allowance cannot discriminate");
             return;
         }
         let (_restore, _) = pin_thread_to_single_cpu(0);
-        assert_eq!(process_cpu_allowance(), Some(before));
+        assert_eq!(process_cpu_set(), Some(before));
     }
 
     /// The allowance probe over a pinned leader. Regression test for a collapse
@@ -1527,41 +1748,41 @@ mod tests {
     /// test, an accepted residual.
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
-    fn cpu_allowance_ignores_leader_self_pin() {
+    fn usable_set_ignores_leader_self_pin() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
         let cpuset = std::path::Path::new("/proc/self/cpuset");
         let mountinfo = std::path::Path::new("/proc/self/mountinfo");
         let online = std::path::Path::new("/sys/devices/system/cpu/online");
-        let tier1 = cgroup_cpuset_cpu_count(cpuset, mountinfo);
-        let before = process_cpu_allowance().expect("allowance probe works");
-        if before <= 1 {
+        let tier1 = cgroup_cpuset_cpu_set(cpuset, mountinfo);
+        let before = process_cpu_set().expect("usable-set probe works");
+        if before.len() <= 1 {
             eprintln!("skip: 1-CPU allowance cannot discriminate");
             return;
         }
         // The pin/restore legs only discriminate when the leader's mask is
         // wider than one CPU; under a `taskset`-narrowed harness they would
         // pass vacuously.
-        let leader_cpus = leader_mask_count(leader).expect("leader mask probe works");
-        if leader_cpus <= 1 {
+        let leader_cpus = leader_mask_set(leader).expect("leader mask probe works");
+        if leader_cpus.len() <= 1 {
             eprintln!("skip: leader mask cannot discriminate");
             return;
         }
         let (restore, cpu) = pin_thread_to_single_cpu(leader);
         match tier1 {
-            Some(_) => assert_eq!(process_cpu_allowance(), Some(before)),
+            Some(_) => assert_eq!(process_cpu_set(), Some(before)),
             // No cgroup tier: the directly pinned leader is genuinely
             // restricted, and tier 2 reports exactly the pinned mask.
-            None => assert_eq!(process_cpu_allowance(), Some(1)),
+            None => assert_eq!(process_cpu_set(), Some(vec![cpu])),
         }
         // Same mask, now described by our claim: distrusted everywhere, so
         // the probe falls back past tier 2. The pin cannot move tier 1 (a
         // mask is not a cgroup file), hence this exact composition.
         let _inject = crate::backend::threadpool::debug_set_caller_pin_for_test(leader as i64, cpu);
         assert_eq!(
-            process_cpu_allowance(),
-            tier1.or_else(|| read_cpu_list_file(online))
+            process_cpu_set(),
+            tier1.or_else(|| read_cpu_set_file(online))
         );
         // Snapshot the pre-pin mask out of the guard (`cpu_set_t` is `Copy`).
         let saved = *restore.saved();
@@ -1615,51 +1836,65 @@ mod tests {
         assert!(!thread_self_pinned(me));
     }
 
-    /// Tier-2 reading: the leader's live mask count, or `None` while the
+    /// Tier-2 reading: the leader's live mask set, or `None` while the
     /// leader holds our caller-pin. The pin half is faked with the test
     /// injector (see above); the mask half is a real leader pin, restored
     /// on drop. Linux/Android only, skipped under Miri.
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
-    fn leader_effective_count_skips_self_pin() {
+    fn leader_effective_set_skips_self_pin() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
-        let before = leader_effective_count().expect("leader probe works");
-        if before <= 1 {
+        let before = leader_effective_set().expect("leader probe works");
+        if before.len() <= 1 {
             eprintln!("skip: 1-CPU mask cannot discriminate");
             return;
         }
         let (_restore, cpu) = pin_thread_to_single_cpu(leader);
-        // Directly pinned (not through our claim): trusted, reads 1.
-        assert_eq!(leader_effective_count(), Some(1));
+        // Directly pinned (not through our claim): trusted, reads the pin.
+        assert_eq!(leader_effective_set(), Some(vec![cpu]));
         // Same mask, now described by our claim: distrusted, reads `None`.
         let _inject = crate::backend::threadpool::debug_set_caller_pin_for_test(leader as i64, cpu);
-        assert_eq!(leader_effective_count(), None);
+        assert_eq!(leader_effective_set(), None);
     }
 
     #[test]
-    fn parse_cpu_list_counts_ranges_and_singles() {
-        assert_eq!(parse_cpu_list("0-7"), Some(8));
-        assert_eq!(parse_cpu_list("0-3,8"), Some(5));
-        assert_eq!(parse_cpu_list("4"), Some(1));
-        assert_eq!(parse_cpu_list("0-0"), Some(1));
-        assert_eq!(parse_cpu_list(" 0-1 , 4 "), Some(3));
-        assert_eq!(parse_cpu_list(""), None);
-        assert_eq!(parse_cpu_list("abc"), None);
-        assert_eq!(parse_cpu_list("3-1"), None);
-        assert_eq!(parse_cpu_list("0-3,"), None);
-        assert_eq!(parse_cpu_list("0-7-9"), None);
-        // Full-`u32`-range span: the `+ 1` used to overflow in `u32` (debug
-        // panic, release wrap to `Some(0)`). Width-aware expectation: the
-        // true count where it fits `usize`, `None` on 32-bit.
-        let full_span = usize::try_from(u64::from(u32::MAX) + 1).ok();
-        assert_eq!(parse_cpu_list("0-4294967295"), full_span);
-        // Two full spans pin summation across items on 64-bit (a
-        // last-span-wins regression fails); on 32-bit both legs pin
-        // overflow to `None`.
-        let doubled = full_span.and_then(|n| n.checked_add(n));
-        assert_eq!(parse_cpu_list("0-4294967295,0-4294967295"), doubled);
+    fn parse_cpu_set_resolves_ranges_and_singles() {
+        assert_eq!(parse_cpu_set("0-7"), Some((0..8).collect()));
+        assert_eq!(parse_cpu_set("0-3,8"), Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(parse_cpu_set("4"), Some(vec![4]));
+        assert_eq!(parse_cpu_set("0-0"), Some(vec![0]));
+        assert_eq!(parse_cpu_set(" 0-1 , 4 "), Some(vec![0, 1, 4]));
+        assert_eq!(parse_cpu_set(""), None);
+        assert_eq!(parse_cpu_set("abc"), None);
+        assert_eq!(parse_cpu_set("3-1"), None);
+        assert_eq!(parse_cpu_set("0-3,"), None);
+        assert_eq!(parse_cpu_set("0-7-9"), None);
+    }
+
+    /// Unordered and overlapping items still resolve to one ascending,
+    /// deduped set: the intersection walks it per pin, so order from the
+    /// kernel file cannot leak into shaped topologies.
+    #[test]
+    fn parse_cpu_set_orders_and_dedupes() {
+        assert_eq!(parse_cpu_set("8,0-3"), Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(parse_cpu_set("0-3,2-5"), Some((0..6).collect()));
+        assert_eq!(parse_cpu_set("4,4,4"), Some(vec![4]));
+    }
+
+    /// Ids past the horizon are dropped (no detected pin can name them),
+    /// and an input naming nothing below it reads as unset so the tiers
+    /// fall through. The full-`u32`-span leg pins both bounds at once: it
+    /// must resolve to the horizon prefix, not hang and not allocate
+    /// 4 billion entries.
+    #[test]
+    fn parse_cpu_set_drops_ids_past_horizon() {
+        assert_eq!(parse_cpu_set("0-3,9999"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(parse_cpu_set("9999"), None);
+        assert_eq!(parse_cpu_set("600-700"), None);
+        let horizon: Vec<usize> = (0..MAX_CPUS).collect();
+        assert_eq!(parse_cpu_set("0-4294967295"), Some(horizon));
     }
 
     /// mountinfo parsing finds the v1 cpuset hierarchy and the v2 hierarchy
@@ -1709,16 +1944,22 @@ not a mountinfo line\n\
             ),
         )
         .expect("write");
-        // Effective (4) wins over configured (6).
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(4));
+        // Effective ([0,1,2,3]) wins over configured ([0..=5]).
+        assert_eq!(
+            cgroup_cpuset_cpu_set(&cpuset, &mountinfo),
+            Some(vec![0, 1, 2, 3])
+        );
         // Empty files inherit the parent level.
         std::fs::write(leaf.join("effective_cpus"), "").expect("write");
         std::fs::write(leaf.join("cpus"), "").expect("write");
         std::fs::write(mount.join("cpus"), "0-7\n").expect("write");
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
+        assert_eq!(
+            cgroup_cpuset_cpu_set(&cpuset, &mountinfo),
+            Some((0..8).collect())
+        );
         // Nothing anywhere: no restriction visible.
         std::fs::remove_file(mount.join("cpus")).expect("remove");
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), None);
+        assert_eq!(cgroup_cpuset_cpu_set(&cpuset, &mountinfo), None);
     }
 
     /// Prefixed v1 names and the v2 fallback: a container-shaped v1
@@ -1751,24 +1992,30 @@ not a mountinfo line\n\
             ),
         )
         .expect("write");
-        // Prefixed effective (1) wins over prefixed configured (2).
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(1));
-        // Effective gone: prefixed configured (2) resolves.
+        // Prefixed effective ([0]) wins over prefixed configured ([0,1]).
+        assert_eq!(cgroup_cpuset_cpu_set(&cpuset, &mountinfo), Some(vec![0]));
+        // Effective gone: prefixed configured ([0,1]) resolves.
         std::fs::remove_file(leaf1.join("cpuset.effective_cpus")).expect("remove");
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(2));
-        // v1 gone: v2 effective (8) wins over v2 configured (16).
+        assert_eq!(cgroup_cpuset_cpu_set(&cpuset, &mountinfo), Some(vec![0, 1]));
+        // v1 gone: v2 effective ([0..=7]) wins over v2 configured ([0..=15]).
         std::fs::remove_file(leaf1.join("cpuset.cpus")).expect("remove");
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
-        // v2 effective gone: v2 configured (16) resolves.
+        assert_eq!(
+            cgroup_cpuset_cpu_set(&cpuset, &mountinfo),
+            Some((0..8).collect())
+        );
+        // v2 effective gone: v2 configured ([0..=15]) resolves.
         std::fs::remove_file(leaf2.join("cpuset.cpus.effective")).expect("remove");
-        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(16));
+        assert_eq!(
+            cgroup_cpuset_cpu_set(&cpuset, &mountinfo),
+            Some((0..16).collect())
+        );
     }
 
     /// Composition: the cpuset wins when configured, else the leader
     /// reading, else the online CPUs, else unknown.
     #[cfg(not(miri))]
     #[test]
-    fn probe_with_leader_prefers_cpuset_then_leader_then_online() {
+    fn probe_set_with_leader_prefers_cpuset_then_leader_then_online() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mount = tmp.path().join("cpuset");
         std::fs::create_dir_all(mount.join("fg")).expect("mkdirs");
@@ -1783,35 +2030,55 @@ not a mountinfo line\n\
         .expect("write");
         let online = tmp.path().join("online");
         std::fs::write(&online, "0-7\n").expect("write");
-        // Cpuset (2) wins over leader (6) and online (8).
+        // Distinct memberships per tier so the legs discriminate by member,
+        // not just length: cpuset [0,1], leader [10..=15], online [0..=7].
+        let leader = Some((10..16).collect::<Vec<usize>>());
+        // Cpuset ([0,1]) wins over leader and online; leader closure must not be called.
+        let mut leader_called = false;
         assert_eq!(
-            probe_with_leader(&cpuset, &mountinfo, &online, Some(6)),
-            Some(2)
+            probe_set_with_leader(&cpuset, &mountinfo, &online, || {
+                leader_called = true;
+                leader.clone()
+            }),
+            Some(vec![0, 1])
         );
-        // No cpuset anywhere: leader (6) answers.
+        assert!(
+            !leader_called,
+            "fallback leader closure evaluated eagerly on cpuset hit"
+        );
+        // No cpuset anywhere: leader ([10..=15]) answers.
         std::fs::remove_file(mount.join("fg").join("cpus")).expect("remove");
         assert_eq!(
-            probe_with_leader(&cpuset, &mountinfo, &online, Some(6)),
-            Some(6)
+            probe_set_with_leader(&cpuset, &mountinfo, &online, || leader),
+            Some((10..16).collect())
         );
-        // Leader skipped (self-pinned): online (8) answers.
+        // Empty leader mask (zero-bit migration state) falls through to online:
         assert_eq!(
-            probe_with_leader(&cpuset, &mountinfo, &online, None),
-            Some(8)
+            probe_set_with_leader(&cpuset, &mountinfo, &online, || Some(vec![])),
+            Some((0..8).collect())
+        );
+        // Leader skipped (self-pinned): online ([0..=7]) answers.
+        assert_eq!(
+            probe_set_with_leader(&cpuset, &mountinfo, &online, || None),
+            Some((0..8).collect())
         );
         // Nothing anywhere: unknown.
         std::fs::remove_file(&online).expect("remove");
-        assert_eq!(probe_with_leader(&cpuset, &mountinfo, &online, None), None);
+        assert_eq!(
+            probe_set_with_leader(&cpuset, &mountinfo, &online, || None),
+            None
+        );
     }
 
-    /// End to end through the real allowance probe: an absurd detected width
-    /// comes back within the process allowance (and never zero). Fails closed
-    /// on hosts too wide to clamp (or where the allowance is unknown) instead
-    /// of passing vacuously. Skipped under Miri, which cannot execute the raw
+    /// End to end through the real usable-set probe: an absurd detected
+    /// width comes back within the process allowance (and never zero), and
+    /// every surviving pin is usable. Fails closed on hosts too wide to
+    /// clamp (or where the allowance is unknown) instead of passing
+    /// vacuously. Skipped under Miri, which cannot execute the raw
     /// `sched_getaffinity` probe.
     #[cfg(not(miri))]
     #[test]
-    fn cpu_allowance_clamp_smoke() {
+    fn cpu_usable_set_clamp_smoke() {
         let detected = CoreTopology {
             perf_core_count: 128,
             pin_cores: (0..128).collect(),
@@ -1821,11 +2088,23 @@ not a mountinfo line\n\
         // Oracle is the seam's own probe: it reads the cpuset cgroup (or the
         // online CPUs), never a thread mask, so a pinned test thread cannot
         // skew it the way `available_parallelism` would.
-        let allowed = cpu_allowance();
+        let usable = cpu_usable_cpus();
+        let allowed = usable.count();
         assert!(allowed < 128, "host too wide ({allowed}); smoke vacuous");
-        let clamped = compose_clamp_and_override(detected, allowed, None, true);
+        let clamped = compose_clamp_and_override(detected, &usable, None, true);
         assert!(clamped.perf_core_count >= 1);
         assert!(clamped.perf_core_count <= allowed.min(128));
+        if let UsableCpus::Known(set) = &usable {
+            let pins: Vec<usize> = (0..128).collect();
+            if pins.iter().any(|cpu| set.contains(cpu)) {
+                // Nonempty intersection: every surviving pin is usable.
+                assert!(clamped.pin_cores.iter().all(|cpu| set.contains(cpu)));
+            } else {
+                // Disjoint (an exotic harness pinned past cpu 127): the
+                // trust-but-verify fallback keeps the detected pins.
+                assert_eq!(clamped.pin_cores, pins);
+            }
+        }
     }
 
     /// Policy is applied to the RAW cache so widening restores width:
@@ -1852,11 +2131,18 @@ not a mountinfo line\n\
             eprintln!("skip: 1-CPU detection cannot discriminate narrow vs wide");
             return;
         }
-        let narrow = compose_clamp_and_override(raw.clone(), 1, None, false);
+        let narrow =
+            compose_clamp_and_override(raw.clone(), &UsableCpus::CountOnly(1), None, false);
         assert_eq!(narrow.perf_core_count, 1);
-        let wide = compose_clamp_and_override(raw.clone(), usize::MAX, None, false);
+        let wide = compose_clamp_and_override(
+            raw.clone(),
+            &UsableCpus::CountOnly(usize::MAX),
+            None,
+            false,
+        );
         assert_eq!(wide.perf_core_count, raw.perf_core_count);
-        let stuck = compose_clamp_and_override(narrow, usize::MAX, None, false);
+        let stuck =
+            compose_clamp_and_override(narrow, &UsableCpus::CountOnly(usize::MAX), None, false);
         assert_eq!(stuck.perf_core_count, 1);
     }
 

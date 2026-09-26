@@ -34,6 +34,22 @@ pub const BOS: &str = "<|startoftext|>";
 /// End-of-sequence special token text.
 pub const END: &str = "<|im_end|>";
 
+/// Thinking-block open tags recognized across model families.
+pub const THINK_OPEN_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"];
+/// Thinking-block close tags recognized across model families.
+pub const THINK_CLOSE_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
+
+/// True when `rendered` ends with a thinking-block opener tag (ignoring
+/// trailing whitespace): thinking models (LFM2.5 2.6B and up) prefill
+/// `<think>` as the final prompt token, so the first generated tokens are
+/// reasoning even though no opener appears in the generated stream. Stream
+/// parsers must start in thinking state in that case instead of waiting for
+/// an opener that already passed.
+pub fn prompt_prefills_think(rendered: &str) -> bool {
+    let trimmed = rendered.trim_end();
+    THINK_OPEN_TAGS.iter().any(|&tag| trimmed.ends_with(tag))
+}
+
 /// Message author role in conversational chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -982,6 +998,7 @@ pub struct Chat<E = CoreExecution> {
     terminal_committed: Option<bool>,
     tools: Vec<ToolDef>,
     tool_format: ToolFormat,
+    prefilled_think: bool,
 }
 
 impl<E: Execution> std::fmt::Debug for Chat<E> {
@@ -1017,12 +1034,23 @@ impl<E: Execution> Chat<E> {
             terminal_committed: None,
             tools: Vec::new(),
             tool_format: ToolFormat::Lfm2Pythonic,
+            prefilled_think: false,
         })
     }
 
     /// Extract the underlying execution engine.
     pub fn into_inner(self) -> E {
         self.execution
+    }
+
+    /// True when the ingested prompt ends inside an unclosed thinking block
+    /// (see [`prompt_prefills_think`]). Stream sinks must start in thinking
+    /// state then: the opener already passed as part of the prompt, so the
+    /// first generated tokens are reasoning with no opener in the stream.
+    /// Not covered by checkpoints: a restore-then-continue across a thinking
+    /// boundary falls back to stream parsing until the next ingest.
+    pub fn prefilled_think(&self) -> bool {
+        self.prefilled_think
     }
 
     /// Shared handle to the cancellation flag, if supported.
@@ -1054,6 +1082,7 @@ impl<E: Execution> Chat<E> {
 
     /// Restore a previously captured checkpoint into this chat session.
     pub fn restore(&mut self, checkpoint: &checkpoint::ChatCheckpoint) -> Result<(), CeraError> {
+        self.prefilled_think = false;
         if checkpoint.phase == SessionPhase::Unusable {
             return Err(CeraError::Format(
                 "cannot restore chat checkpoint in Unusable phase".to_string(),
@@ -1213,6 +1242,7 @@ impl<E: Execution> Chat<E> {
         let before = self.position();
         let initial = replace || self.phase == SessionPhase::Idle;
         let rendered = self.profile.render(messages, initial, &self.tools)?;
+        let prefilled_think = prompt_prefills_think(&rendered);
         let mut tokens = Vec::with_capacity(
             rendered.len().saturating_div(2) + self.profile.newline_tokens.len() + 1,
         );
@@ -1331,6 +1361,7 @@ impl<E: Execution> Chat<E> {
             Ok(()) => {
                 self.phase = SessionPhase::PromptReady;
                 self.terminal_committed = None;
+                self.prefilled_think = prefilled_think;
                 Ok(IngestSummary {
                     input_tokens: self.position().saturating_sub(ingest_start),
                     position_before: before,
@@ -1354,10 +1385,12 @@ impl<E: Execution> Chat<E> {
                     RecoveryOutcome::Reset => {
                         self.phase = SessionPhase::Idle;
                         self.terminal_committed = None;
+                        self.prefilled_think = false;
                     }
                     _ => {
                         self.phase = SessionPhase::Unusable;
                         self.terminal_committed = None;
+                        self.prefilled_think = false;
                     }
                 }
                 Err(error)
@@ -1559,6 +1592,7 @@ impl<E: Execution> Chat<E> {
     pub fn reset(&mut self) -> Result<(), CeraError> {
         self.phase = SessionPhase::Unusable;
         self.terminal_committed = None;
+        self.prefilled_think = false;
         self.execution.reset(true)?;
         self.phase = SessionPhase::Idle;
         Ok(())
@@ -1571,6 +1605,7 @@ impl<E: Execution> Chat<E> {
         }
         self.phase = SessionPhase::RawContext;
         self.terminal_committed = None;
+        self.prefilled_think = false;
         Ok(&mut self.execution)
     }
 }
