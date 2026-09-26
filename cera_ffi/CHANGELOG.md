@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+
+- Add Qualcomm Hexagon NPU backend and FastRPC runtime integration.
+- Add structured CPU topology discovery and dynamic worker threadpool resizing.
+- Align package and native artifact versions at 0.7.0.
+
 ## 0.6.3
 
 - Add LoRA composition, per-request seeds, and extraction overrides to the session API.
