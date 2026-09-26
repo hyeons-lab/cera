@@ -981,7 +981,14 @@ fn parse_cpu_list(s: &str) -> Option<usize> {
         if lo > hi {
             return None;
         }
-        count += (hi - lo + 1) as usize;
+        // `hi - lo` cannot overflow (`lo <= hi` is checked above), but the
+        // `+ 1` can in `u32` (the full `0-u32::MAX` span): it panics in debug
+        // and wraps to `Some(0)` in release, breaking the at-least-1
+        // invariant the walk relies on. Accumulate in `usize` with checks so
+        // only a genuine overflow reads as malformed ("unset, keep looking").
+        count = count
+            .checked_add(usize::try_from(hi - lo).ok()?)
+            .and_then(|n| n.checked_add(1))?;
     }
     Some(count)
 }
@@ -1408,6 +1415,15 @@ mod tests {
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    impl RestoreMask {
+        /// The mask `Drop` restores, for post-drop verification: the restore
+        /// syscall's result is unusable in `Drop`.
+        fn saved(&self) -> &libc::cpu_set_t {
+            &self.saved
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     impl Drop for RestoreMask {
         fn drop(&mut self) {
             // SAFETY: pair describes the saved mask; best-effort (a return
@@ -1499,8 +1515,16 @@ mod tests {
     /// tier 2 to tier 1 (or the online CPUs), never to the 1-CPU mask. That leg
     /// fails against the old leader-mask probe (which returns 1 here).
     /// Linux/Android only, skipped under Miri; the leader's mask is restored
-    /// on drop (pinning it narrows only the harness's main thread, and only
-    /// for the probe calls).
+    /// on drop and the restore is verified afterwards, so a swallowed
+    /// restore failure fails this test rather than passing silently while
+    /// leaving later-spawned test threads narrowed (threads inherit their
+    /// creator's mask). Pinning narrows only the harness's main thread and
+    /// only until the guard drops (verified by the read after); the
+    /// `AFFINITY_TEST_LOCK` held above serializes the sibling affinity
+    /// tests, so the verification cannot race a sibling leader pin. A test
+    /// thread
+    /// spawned inside the window would inherit the 1-CPU mask for its own
+    /// test, an accepted residual.
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn cpu_allowance_ignores_leader_self_pin() {
@@ -1516,7 +1540,15 @@ mod tests {
             eprintln!("skip: 1-CPU allowance cannot discriminate");
             return;
         }
-        let (_restore, cpu) = pin_thread_to_single_cpu(leader);
+        // The pin/restore legs only discriminate when the leader's mask is
+        // wider than one CPU; under a `taskset`-narrowed harness they would
+        // pass vacuously.
+        let leader_cpus = leader_mask_count(leader).expect("leader mask probe works");
+        if leader_cpus <= 1 {
+            eprintln!("skip: leader mask cannot discriminate");
+            return;
+        }
+        let (restore, cpu) = pin_thread_to_single_cpu(leader);
         match tier1 {
             Some(_) => assert_eq!(process_cpu_allowance(), Some(before)),
             // No cgroup tier: the directly pinned leader is genuinely
@@ -1530,6 +1562,25 @@ mod tests {
         assert_eq!(
             process_cpu_allowance(),
             tier1.or_else(|| read_cpu_list_file(online))
+        );
+        // Snapshot the pre-pin mask out of the guard (`cpu_set_t` is `Copy`).
+        let saved = *restore.saved();
+        drop(restore);
+        // Re-read the live mask: the restore result is unusable in `Drop`
+        // (rationale in this test's doc), so verify it here.
+        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
+        let mut cur: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the size/pointer pair describes `cur` exactly, and the
+        // return value is checked.
+        let ok = unsafe {
+            libc::sched_getaffinity(leader, std::mem::size_of::<libc::cpu_set_t>(), &mut cur)
+        };
+        assert_eq!(ok, 0);
+        // SAFETY: both masks are valid sets read from the kernel; `CPU_EQUAL`
+        // only compares bits (marked `unsafe` by libc).
+        assert!(
+            unsafe { libc::CPU_EQUAL(&saved, &cur) },
+            "leader mask restore mismatch"
         );
     }
 
@@ -1599,18 +1650,31 @@ mod tests {
         assert_eq!(parse_cpu_list("3-1"), None);
         assert_eq!(parse_cpu_list("0-3,"), None);
         assert_eq!(parse_cpu_list("0-7-9"), None);
+        // Full-`u32`-range span: the `+ 1` used to overflow in `u32` (debug
+        // panic, release wrap to `Some(0)`). Width-aware expectation: the
+        // true count where it fits `usize`, `None` on 32-bit.
+        let full_span = usize::try_from(u64::from(u32::MAX) + 1).ok();
+        assert_eq!(parse_cpu_list("0-4294967295"), full_span);
+        // Two full spans pin summation across items on 64-bit (a
+        // last-span-wins regression fails); on 32-bit both legs pin
+        // overflow to `None`.
+        let doubled = full_span.and_then(|n| n.checked_add(n));
+        assert_eq!(parse_cpu_list("0-4294967295,0-4294967295"), doubled);
     }
 
     /// mountinfo parsing finds the v1 cpuset hierarchy and the v2 hierarchy
     /// (Android-shaped fixture: v1 cpuset at `/dev/cpuset` plus a v2 mount),
-    /// skips malformed lines, and unescapes `\040`.
+    /// skips malformed lines, and unescapes `\040`. Second v1 and v2 lines
+    /// pin the documented first-mount-wins precedence.
     #[test]
     fn find_cgroup_mounts_android_shaped() {
         let mountinfo = "\
 64 42 0:26 / /dev/blkio rw shared:20 - cgroup none rw,blkio\n\
 not a mountinfo line\n\
 72 42 0:30 / /dev/cpuset rw shared:24 - cgroup none rw,cpuset,noprefix\n\
-66 45 0:27 / /sys/fs/cgroup rw shared:21 - cgroup2 none rw\n";
+73 42 0:31 / /dev/cpuset2 rw shared:25 - cgroup none rw,cpuset\n\
+66 45 0:27 / /sys/fs/cgroup rw shared:21 - cgroup2 none rw\n\
+67 45 0:28 / /sys/fs/cgroup2 rw shared:22 - cgroup2 none rw\n";
         let (v1, v2) = find_cgroup_mounts(mountinfo);
         assert_eq!(v1, Some(std::path::PathBuf::from("/dev/cpuset")));
         assert_eq!(v2, Some(std::path::PathBuf::from("/sys/fs/cgroup")));
@@ -1659,7 +1723,8 @@ not a mountinfo line\n\
 
     /// Prefixed v1 names and the v2 fallback: a container-shaped v1
     /// hierarchy resolves `cpuset.cpus`, and v2 is consulted only when v1
-    /// yields nothing.
+    /// yields nothing. Both spellings are planted per level to pin
+    /// effective-before-configured.
     #[cfg(not(miri))]
     #[test]
     fn cgroup_probe_prefixed_v1_then_v2() {
@@ -1671,7 +1736,9 @@ not a mountinfo line\n\
         std::fs::create_dir_all(&leaf1).expect("mkdirs");
         std::fs::create_dir_all(&leaf2).expect("mkdirs");
         std::fs::write(leaf1.join("cpuset.cpus"), "0-1\n").expect("write");
+        std::fs::write(leaf1.join("cpuset.effective_cpus"), "0-0\n").expect("write");
         std::fs::write(leaf2.join("cpuset.cpus.effective"), "0-7\n").expect("write");
+        std::fs::write(leaf2.join("cpuset.cpus"), "0-15\n").expect("write");
         let cpuset = tmp.path().join("cpuset_path");
         std::fs::write(&cpuset, "/docker/abc\n").expect("write");
         let mountinfo = tmp.path().join("mountinfo");
@@ -1684,11 +1751,17 @@ not a mountinfo line\n\
             ),
         )
         .expect("write");
-        // v1 (2 CPUs) wins over v2 (8).
+        // Prefixed effective (1) wins over prefixed configured (2).
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(1));
+        // Effective gone: prefixed configured (2) resolves.
+        std::fs::remove_file(leaf1.join("cpuset.effective_cpus")).expect("remove");
         assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(2));
-        // v1 gone: v2 answers.
+        // v1 gone: v2 effective (8) wins over v2 configured (16).
         std::fs::remove_file(leaf1.join("cpuset.cpus")).expect("remove");
         assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
+        // v2 effective gone: v2 configured (16) resolves.
+        std::fs::remove_file(leaf2.join("cpuset.cpus.effective")).expect("remove");
+        assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(16));
     }
 
     /// Composition: the cpuset wins when configured, else the leader

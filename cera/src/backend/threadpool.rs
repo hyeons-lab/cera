@@ -1103,7 +1103,9 @@ fn swap_rebuilt_pool(
 /// Rebuild both pools when the process CPU allowance changed since they were
 /// sized (cpuset/cgroup migration, e.g. Android background to foreground),
 /// so performance is never stuck at a departed cpuset's width. Cheap no-op
-/// when unchanged: one affinity syscall plus two integer compares. On change
+/// when unchanged: one three-tier allowance probe (cgroup filesystem
+/// reads, one or two affinity syscalls, and the online-CPU fallback when
+/// the cgroup and leader tiers miss) plus two integer compares. On change
 /// it rebuilds only idle pools; a mid-dispatch pool defers to the next
 /// boundary instead of blocking it. Returns true when it swapped at least
 /// one pool.
