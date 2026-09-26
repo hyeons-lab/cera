@@ -1133,6 +1133,8 @@ jobs:
           java-version: 21
           cache: gradle
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
       - name: Install compileSdk platform + build-tools
         # Pinned to what `cera-ffi-kotlin/gradle/libs.versions.toml` declares
         # (compileSdk 36; build-tools track the SDK major). The unit-test
@@ -1533,6 +1535,12 @@ jobs:
     name: Android ABI (${{ matrix.abi }})
     needs: check
     runs-on: ubuntu-latest
+    # Restore the 16KB ELF page-alignment linker flags from .cargo/config.toml.
+    # The workflow-level RUSTFLAGS: "" overrides .cargo/config.toml for every
+    # target. NDK r28c defaults to 16KB for 64-bit ABIs, but 32-bit ABIs
+    # (armeabi-v7a and x86) require explicit linker flags for 16KB alignment.
+    env:
+      RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
     strategy:
       fail-fast: false
       matrix:

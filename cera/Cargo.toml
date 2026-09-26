@@ -194,6 +194,11 @@ required-features = ["mmap"]
 name = "wgpu_moe_prefill_dispatch"
 required-features = ["mmap"]
 
+[[test]]
+name = "wgpu_mul_mat_parity"
+required-features = ["mmap"]
+
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
