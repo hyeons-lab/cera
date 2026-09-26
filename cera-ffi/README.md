@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> The 0.6.2 bindings include chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 bindings include Qualcomm Hexagon NPU support, chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
@@ -67,9 +67,10 @@ filesystem tree manually" workaround.
 | 23+ | Reactive Streaming: `AsyncThrowingStream` (Swift), `Flow` (Kotlin), `Iterator` generator (Python), and `Stream` (Dart) |
 | 24+ | Structured Outputs: JSON Schema compilation to GBNF, `GenerateOpts.withJsonSchema`, and `completeJson` |
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
-| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
+| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/Hexagon/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 | 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
+| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -318,7 +319,7 @@ app's `jniLibs/` as needed.
 
 ### NDK version
 
-CI pins NDK **r27c**, a stable release the workspace is validated
+CI pins NDK **r28c**, a stable release the workspace is validated
 against. The workflow installs it through `nttld/setup-ndk@v1` by
 version string (no checksum; the action fetches from Google's CDN
 which serves signed artifacts). Bumping is a one-line change: update
@@ -328,6 +329,23 @@ The `cargo ndk` flag shape is compatible across recent NDK majors so
 the pin is mostly about toolchain + sysroot stability across runs,
 not a hard constraint; later NDKs that keep the `armv7-linux-androideabi`
 and `i686-linux-android` sysroots should drop in cleanly.
+
+### 16KB page size
+
+Every published Android `.so` is 16KB-page clean: LOAD segments aligned
+to 16KB, as Android 15+ hardware and Google Play require. CI pins NDK
+r28c, whose default is already 16KB, and `.cargo/config.toml`
+additionally carries explicit `-z max-page-size=16384` /
+`-z common-page-size=16384` linker flags for all four Android targets
+(Google's documented recipe, kept so the requirement holds regardless
+of NDK default). Two checks enforce it:
+`scripts/assert-16k-pages.py` runs in the `android-abis` CI job on each
+built `.so`, and `just android-libs` (what the release pipeline stages
+into the AAR's `jniLibs/`) runs it on the staged set. Larger alignment is backward compatible: 16KB-aligned libraries load
+fine on 4KB-page devices. Hexagon DSP skel binaries are embedded directly
+in `libcera_ffi.so` and extracted to app storage at runtime by
+`HexagonNpu.setup(context)`, so all binaries packaged in `jniLibs/` are
+16KB-page-aligned.
 
 ## Apple platforms
 

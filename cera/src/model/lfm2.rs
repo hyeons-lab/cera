@@ -140,7 +140,7 @@ pub struct LayerWeightRefs {
     #[allow(dead_code)]
     pub qkv_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     #[allow(dead_code, clippy::type_complexity)]
-    pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<(Vec<u8>, Vec<f32>)>>>,
+    pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<(Vec<u8>, Vec<f32>, bool)>>>,
 }
 
 // ── LFM2 Model ─────────────────────────────────────────────────────────────
@@ -494,9 +494,12 @@ impl Lfm2Model {
     }
 
     /// Resolve all layer weight references for an LFM2 model from its GGUF tensor index.
+    /// When `repack` is false the CPU int8 repacks are skipped (see
+    /// `with_repack_if`) — for loaders that only resolve metadata.
     pub fn resolve_all_layer_refs(
         gguf: &GgufFile,
         config: &ModelConfig,
+        repack: bool,
     ) -> Result<Vec<LayerWeightRefs>> {
         let mut layer_refs = Vec::with_capacity(config.n_layers);
         for (i, bt) in config.block_types.iter().enumerate() {
@@ -541,11 +544,11 @@ impl Lfm2Model {
             } else {
                 FfnRefs::Dense(DenseFfnRefs {
                     gate: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     up: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_up.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     down: Self::resolve_weight(gguf, &format!("blk.{i}.ffn_down.weight"))?
-                        .with_repack(gguf),
+                        .with_repack_if(gguf, repack),
                     gate_up_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
                 })
             };
@@ -558,14 +561,14 @@ impl Lfm2Model {
                                 gguf,
                                 &format!("blk.{i}.shortconv.in_proj.weight"),
                             )?
-                            .with_repack(gguf),
+                            .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(
                                 gguf,
                                 &format!("blk.{i}.shortconv.out_proj.weight"),
                             )?
-                            .with_repack(gguf),
+                            .with_repack_if(gguf, repack),
                         ),
                         None,
                         None,
@@ -578,19 +581,19 @@ impl Lfm2Model {
                         None,
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_q.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_k.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_v.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                         Some(
                             Self::resolve_weight(gguf, &format!("blk.{i}.attn_output.weight"))?
-                                .with_repack(gguf),
+                                .with_repack_if(gguf, repack),
                         ),
                     )
                 };
@@ -617,6 +620,34 @@ impl Lfm2Model {
         gguf: GgufFile,
         context_size: usize,
         model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, true)
+    }
+
+    /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
+    /// resolve weight metadata from this model but never dispatch CPU
+    /// kernels — the repacks would be gigabytes allocated only to be freed
+    /// after upload. Do NOT use for CPU inference (dispatch falls back to
+    /// the slow path without them... it stays correct, just slower).
+    pub fn from_gguf_with_id_no_repack(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, false)
+    }
+
+    /// Load without the CPU int8 repacks (see
+    /// [`from_gguf_with_id_no_repack`](Self::from_gguf_with_id_no_repack)).
+    pub fn from_gguf_no_repack(gguf: GgufFile, context_size: usize) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, String::new(), false)
+    }
+
+    fn from_gguf_impl(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        repack: bool,
     ) -> Result<Self> {
         let config = Self::parse_config(&gguf, context_size)?;
         let n_layers = config.n_layers;
@@ -688,7 +719,7 @@ impl Lfm2Model {
             }
         }
 
-        let layer_refs = Self::resolve_all_layer_refs(&gguf, &config)?;
+        let layer_refs = Self::resolve_all_layer_refs(&gguf, &config, repack)?;
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
 
         let prefix_cache = Mutex::new(KvPrefixCache::for_model(
@@ -2367,6 +2398,15 @@ impl Lfm2Model {
         let mut t_ffn_down = Duration::ZERO;
         #[allow(unused_mut)]
         let mut t_residuals = Duration::ZERO;
+        // B-activation quantization for every in-layer GEMM (attn/conv/FFN).
+        // Split out of the GEMM phases so the profile line separates kernel
+        // time from packing time.
+        #[allow(unused_mut)]
+        let mut t_quant = Duration::ZERO;
+        // Attention scores (Q transpose + flash over heads + output
+        // transpose-back) on the uncompressed path; TQ debug modes excluded.
+        #[allow(unused_mut)]
+        let mut t_attn_scores = Duration::ZERO;
 
         for layer in 0..cfg.n_layers {
             let t0 = Instant::now();
@@ -2417,7 +2457,7 @@ impl Lfm2Model {
                     if blas_ok {
                         #[cfg(not(has_blas))]
                         {
-                            let t = Instant::now();
+                            let t_q = Instant::now();
                             transformer::quantize_rows(
                                 &normed,
                                 hs,
@@ -2425,6 +2465,10 @@ impl Lfm2Model {
                                 &mut bq_scales,
                                 &mut bq_quants,
                             );
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
+                            }
+                            let t = Instant::now();
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 in_proj,
@@ -2720,7 +2764,7 @@ impl Lfm2Model {
                         // Phase 3: Batch out_proj GEMM
                         #[cfg(not(has_blas))]
                         {
-                            let t_o = Instant::now();
+                            let t_q = Instant::now();
                             transformer::quantize_rows(
                                 &out_proj_input,
                                 hs,
@@ -2728,6 +2772,10 @@ impl Lfm2Model {
                                 &mut bq_scales,
                                 &mut bq_quants,
                             );
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
+                            }
+                            let t_o = Instant::now();
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 out_proj,
@@ -2853,7 +2901,7 @@ impl Lfm2Model {
                         }
                         #[cfg(not(has_blas))]
                         {
-                            let t_qkv = Instant::now();
+                            let t_q = Instant::now();
                             transformer::quantize_rows(
                                 &normed,
                                 hs,
@@ -2861,8 +2909,16 @@ impl Lfm2Model {
                                 &mut bq_scales,
                                 &mut bq_quants,
                             );
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
+                            }
+                            let t_qkv = Instant::now();
 
                             let qkv_dim = hs + 2 * kv_dim;
+                            // (concatenated packed, concatenated scales, smmla layout?).
+                            // Concatenation is layout-agnostic (per-super-row blocks
+                            // in both repacks), but the fused dispatch must match the
+                            // layout all three shards share.
                             let qkv_repacked = refs.qkv_repacked.get_or_init(|| {
                                 #[allow(clippy::collapsible_if)]
                                 if let (Some(q_rp), Some(k_rp), Some(v_rp)) = (
@@ -2870,41 +2926,79 @@ impl Lfm2Model {
                                     &attn_k_ref.repacked,
                                     &attn_v_ref.repacked,
                                 ) {
-                                    if let (
-                                        transformer::Repacked::Q40 {
-                                            packed: q_p,
-                                            scales: q_s,
-                                        },
-                                        transformer::Repacked::Q40 {
-                                            packed: k_p,
-                                            scales: k_s,
-                                        },
-                                        transformer::Repacked::Q40 {
-                                            packed: v_p,
-                                            scales: v_s,
-                                        },
-                                    ) = (&q_rp.kind, &k_rp.kind, &v_rp.kind)
-                                    {
-                                        let mut p =
-                                            Vec::with_capacity(q_p.len() + k_p.len() + v_p.len());
-                                        p.extend_from_slice(q_p);
-                                        p.extend_from_slice(k_p);
-                                        p.extend_from_slice(v_p);
+                                    for smmla in [false, true] {
+                                        let shards = if smmla {
+                                            match (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
+                                                (
+                                                    transformer::Repacked::Q40Smmla {
+                                                        packed: q_p,
+                                                        scales: q_s,
+                                                    },
+                                                    transformer::Repacked::Q40Smmla {
+                                                        packed: k_p,
+                                                        scales: k_s,
+                                                    },
+                                                    transformer::Repacked::Q40Smmla {
+                                                        packed: v_p,
+                                                        scales: v_s,
+                                                    },
+                                                ) => Some((q_p, q_s, k_p, k_s, v_p, v_s)),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            match (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
+                                                (
+                                                    transformer::Repacked::Q40 {
+                                                        packed: q_p,
+                                                        scales: q_s,
+                                                    },
+                                                    transformer::Repacked::Q40 {
+                                                        packed: k_p,
+                                                        scales: k_s,
+                                                    },
+                                                    transformer::Repacked::Q40 {
+                                                        packed: v_p,
+                                                        scales: v_s,
+                                                    },
+                                                ) => Some((q_p, q_s, k_p, k_s, v_p, v_s)),
+                                                _ => None,
+                                            }
+                                        };
+                                        if let Some((q_p, q_s, k_p, k_s, v_p, v_s)) = shards {
+                                            let mut p = Vec::with_capacity(
+                                                q_p.len() + k_p.len() + v_p.len(),
+                                            );
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+                                            p.extend_from_slice(v_p);
 
-                                        let mut s =
-                                            Vec::with_capacity(q_s.len() + k_s.len() + v_s.len());
-                                        s.extend_from_slice(q_s);
-                                        s.extend_from_slice(k_s);
-                                        s.extend_from_slice(v_s);
-                                        return Some((p, s));
+                                            let mut s = Vec::with_capacity(
+                                                q_s.len() + k_s.len() + v_s.len(),
+                                            );
+                                            s.extend_from_slice(q_s);
+                                            s.extend_from_slice(k_s);
+                                            s.extend_from_slice(v_s);
+                                            return Some((p, s, smmla));
+                                        }
                                     }
                                 }
                                 None
                             });
 
                             let mut ran_fused = false;
-                            if let Some((p, s)) = qkv_repacked.as_ref() {
-                                ran_fused =
+                            if let Some((p, s, smmla)) = qkv_repacked.as_ref() {
+                                ran_fused = if *smmla {
+                                    crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                                        p,
+                                        s,
+                                        &bq_scales,
+                                        &bq_quants,
+                                        &mut proj_mat[..qkv_dim * n],
+                                        n,
+                                        qkv_dim,
+                                        hs,
+                                    )
+                                } else {
                                     crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
                                         p,
                                         s,
@@ -2914,7 +3008,8 @@ impl Lfm2Model {
                                         n,
                                         qkv_dim,
                                         hs,
-                                    );
+                                    )
+                                };
                                 if ran_fused {
                                     for j in 0..n {
                                         let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
@@ -3236,11 +3331,17 @@ impl Lfm2Model {
                             let n_heads = cfg.n_heads;
                             let head_chunk = n * head_dim;
                             let flash_buf = &mut flash_out[..n_heads * head_chunk];
-                            for j in 0..n {
-                                for r in 0..hs {
-                                    q_col[r * n + j] = q_mat[j * hs + r];
+                            let t_scores = Instant::now();
+                            // Q transpose to head-major columns, row-parallel: 2MB
+                            // of strided writes per layer is ~1ms serial.
+                            let q_mat_ptr = q_mat.as_ptr() as usize;
+                            cpu::par_rows_n(&mut q_col[..hs * n], n, 64, move |(r, row)| unsafe {
+                                let src =
+                                    core::slice::from_raw_parts(q_mat_ptr as *const f32, n * hs);
+                                for j in 0..n {
+                                    row[j] = src[j * hs + r];
                                 }
-                            }
+                            });
                             let q_ref = &q_col[..hs * n];
 
                             let is_causal = cfg.is_causal
@@ -3265,15 +3366,29 @@ impl Lfm2Model {
                                 );
                             });
 
-                            for h in 0..n_heads {
-                                let src_base = h * n * head_dim;
-                                for j in 0..n {
-                                    let dst_base = j * hs + h * head_dim;
-                                    let src = &flash_buf
-                                        [src_base + j * head_dim..src_base + (j + 1) * head_dim];
-                                    out_proj_input[dst_base..dst_base + head_dim]
-                                        .copy_from_slice(src);
-                                }
+                            // Output transpose back to token-major, row-parallel over
+                            // tokens (each row gathers one head-block per head).
+                            let flash_ptr = flash_buf.as_ptr() as usize;
+                            cpu::par_rows_n(
+                                &mut out_proj_input[..n * hs],
+                                hs,
+                                64,
+                                move |(j, row)| unsafe {
+                                    let src_all = core::slice::from_raw_parts(
+                                        flash_ptr as *const f32,
+                                        n_heads * n * head_dim,
+                                    );
+                                    for h in 0..n_heads {
+                                        let src_base = h * n * head_dim + j * head_dim;
+                                        let dst_base = h * head_dim;
+                                        row[dst_base..dst_base + head_dim].copy_from_slice(
+                                            &src_all[src_base..src_base + head_dim],
+                                        );
+                                    }
+                                },
+                            );
+                            if profile_prefill {
+                                t_attn_scores += t_scores.elapsed();
                             }
                         } else if use_tq {
                             state.scratch.scores.clear();
@@ -3453,7 +3568,7 @@ impl Lfm2Model {
                         // Phase 3: Batch output projection GEMM
                         #[cfg(not(has_blas))]
                         {
-                            let t_ao = Instant::now();
+                            let t_q = Instant::now();
                             transformer::quantize_rows(
                                 &out_proj_input,
                                 hs,
@@ -3461,6 +3576,10 @@ impl Lfm2Model {
                                 &mut bq_scales,
                                 &mut bq_quants,
                             );
+                            if profile_prefill {
+                                t_quant += t_q.elapsed();
+                            }
+                            let t_ao = Instant::now();
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 attn_output_ref,
@@ -3659,7 +3778,19 @@ impl Lfm2Model {
                 }) {
                     // Pre-quantize all n columns to Q8_0 — only needed for the NEON fallback.
                     #[cfg(not(has_blas))]
-                    transformer::quantize_rows(&ffn_input, hs, n, &mut bq_scales, &mut bq_quants);
+                    {
+                        let t_q = Instant::now();
+                        transformer::quantize_rows(
+                            &ffn_input,
+                            hs,
+                            n,
+                            &mut bq_scales,
+                            &mut bq_quants,
+                        );
+                        if profile_prefill {
+                            t_quant += t_q.elapsed();
+                        }
+                    }
 
                     // Gate + Up via Single-Dispatch Fused AMX GEMM (AMX Gate + Up)
                     #[cfg(has_blas)]
@@ -3763,7 +3894,19 @@ impl Lfm2Model {
 
                     // Re-quantize gate_mat columns for down projection — only needed for NEON fallback.
                     #[cfg(not(has_blas))]
-                    transformer::quantize_rows(&gate_mat, is, n, &mut dq_scales, &mut dq_quants);
+                    {
+                        let t_q = Instant::now();
+                        transformer::quantize_rows(
+                            &gate_mat,
+                            is,
+                            n,
+                            &mut dq_scales,
+                            &mut dq_quants,
+                        );
+                        if profile_prefill {
+                            t_quant += t_q.elapsed();
+                        }
+                    }
 
                     // Down via batched GEMM
                     #[cfg(has_blas)]
@@ -3951,7 +4094,7 @@ impl Lfm2Model {
 
         if profile_prefill {
             eprintln!(
-                "[PROFILE PREFILL] n={n} | norm: {:.2}ms | conv_in: {:.2}ms | conv_core: {:.2}ms | conv_out: {:.2}ms | attn_qkv: {:.2}ms | attn_out: {:.2}ms | ffn_norm: {:.2}ms | ffn_gate_up: {:.2}ms | ffn_down: {:.2}ms | residuals: {:.2}ms",
+                "[PROFILE PREFILL] n={n} | norm: {:.2}ms | conv_in: {:.2}ms | conv_core: {:.2}ms | conv_out: {:.2}ms | attn_qkv: {:.2}ms | attn_out: {:.2}ms | ffn_norm: {:.2}ms | ffn_gate_up: {:.2}ms | ffn_down: {:.2}ms | residuals: {:.2}ms | quant: {:.2}ms | attn_scores: {:.2}ms",
                 t_norm.as_secs_f64() * 1000.0,
                 t_conv_in.as_secs_f64() * 1000.0,
                 t_conv_core.as_secs_f64() * 1000.0,
@@ -3962,6 +4105,8 @@ impl Lfm2Model {
                 t_ffn_gate_up.as_secs_f64() * 1000.0,
                 t_ffn_down.as_secs_f64() * 1000.0,
                 t_residuals.as_secs_f64() * 1000.0,
+                t_quant.as_secs_f64() * 1000.0,
+                t_attn_scores.as_secs_f64() * 1000.0,
             );
         }
 
@@ -5090,5 +5235,69 @@ mod loader_tests {
                 .contains("lfm2.embedding_length must be > 0"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "mmap"))]
+mod no_repack_tests {
+    use super::*;
+
+    /// The no-repack loader resolves identical metadata without the CPU int8
+    /// repacks (gigabytes the GPU/Metal loaders would allocate only to free
+    /// after upload). Needs the 230M model locally; skips without it.
+    #[test]
+    fn no_repack_skips_cpu_repacks() {
+        let home = std::env::var("HOME").expect("HOME unset");
+        let path = std::path::PathBuf::from(home)
+            .join(".leap/models/LFM2.5-230M-Q4_0/LFM2.5-230M-Q4_0.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let full = Lfm2Model::from_gguf(GgufFile::open(&path).unwrap(), 64).unwrap();
+        let lite = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 64).unwrap();
+        assert_eq!(full.config.n_layers, lite.config.n_layers);
+        assert_eq!(full.config.hidden_size, lite.config.hidden_size);
+        assert_eq!(full.layer_refs.len(), lite.layer_refs.len());
+        assert!(lite.config.moe.is_none(), "test model must be dense");
+
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+        {
+            fn projection_refs(refs: &[LayerWeightRefs]) -> Vec<&WeightRef> {
+                let mut out = Vec::new();
+                for layer in refs {
+                    let FfnRefs::Dense(dense) = &layer.ffn else {
+                        unreachable!("test model must be dense");
+                    };
+                    out.extend([&dense.gate, &dense.up, &dense.down]);
+                    out.extend(layer.shortconv_in_proj.iter());
+                    out.extend(layer.shortconv_out_proj.iter());
+                    out.extend(layer.attn_q.iter());
+                    out.extend(layer.attn_k.iter());
+                    out.extend(layer.attn_v.iter());
+                    out.extend(layer.attn_output.iter());
+                }
+                out
+            }
+            let full_refs = projection_refs(&full.layer_refs);
+            let lite_refs = projection_refs(&lite.layer_refs);
+            // Same metadata resolved...
+            assert_eq!(full_refs.len(), lite_refs.len());
+            assert!(
+                full_refs
+                    .iter()
+                    .all(|w| w.dtype == crate::tensor::DType::Q4_0),
+                "test model must be all-Q4_0 projections"
+            );
+            // ...repacks present in the full load, absent in the lite one.
+            assert!(
+                full_refs.iter().any(|w| w.repacked.is_some()),
+                "full load repacked nothing; test exercises no path"
+            );
+            assert!(
+                lite_refs.iter().all(|w| w.repacked.is_none()),
+                "no-repack load still repacked weights"
+            );
+        }
     }
 }

@@ -22,3 +22,4 @@ rootProject.name = "cera-ffi-kotlin"
 
 include(":cera-ffi-jvm")
 include(":cera-ffi-android")
+include(":probe-app")

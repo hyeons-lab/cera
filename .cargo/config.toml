@@ -23,6 +23,29 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # No extra flags — generic aarch64 baseline. The NEON / dotprod hot-path kernels
 # are opted in per-function via `#[target_feature(enable = "neon,dotprod")]`.
 
+# Android: force 16KB ELF alignment. Devices with 16KB pages (Android 15+)
+# refuse to load native libraries whose LOAD segments are 4KB-aligned, and
+# Google Play requires 16KB-clean binaries. CI and the release pipeline pin
+# NDK r28c, whose default is already 16KB; the explicit flags below (Google's
+# documented recipe for r27 and older) stay so the requirement holds even if
+# the pin ever moves to an NDK with a 4KB default:
+# https://developer.android.com/guide/practices/page-sizes
+# Verified to reach the link under cargo-ndk (a 4096 probe visibly changed
+# the output alignment); `scripts/assert-16k-pages.py` enforces the result
+# in CI and in `just android-libs`. Larger alignment stays backward
+# compatible: 16KB-aligned segments load fine on 4KB-page devices.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]
+
 [target.wasm32-unknown-unknown]
 # `simd128` is wasm's only SIMD feature and every browser and Node release since
 # 2021 has it, so there is no tier to runtime-dispatch between and no reason to

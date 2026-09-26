@@ -11,9 +11,10 @@
 //! detokenizer attention is non-causal over the sliding window, so each token's
 //! query is attended with the decode `flash_attention` kernel that reads the
 //! whole live window). Weights are dequantized to f32 and uploaded, matching the
-//! Metal decoder's precision path. KV caches are f32 (the WGPU `flash_attention`
-//! kernel reads `array<f32>`), so there is no f16 cast and the path is a touch
-//! more accurate than Metal's f16 cache.
+//! Metal decoder's precision path. KV caches are f32 via the dedicated
+//! `FLASH_ATTENTION_F32` twin (the main `flash_attention` kernel reads packed
+//! f16 halves for the LLM path), so there is no f16 cast and the path is a
+//! touch more accurate than Metal's f16 cache.
 //!
 //! Scope: both the detokenizer and depthformer run on WGPU. The depthformer
 //! samples codebooks with a WGPU compute pipeline while fallback CPU decoding
@@ -144,6 +145,11 @@ pub struct WgpuAudioDecoder {
     kv_v: Vec<Option<Buffer>>,
     n_past: AtomicUsize,
     session_active: AtomicBool,
+    /// Sticky record of a failed sync depthformer sample (see
+    /// `sample_audio_frame`): the async error has no readback slot to
+    /// land in, so the sync wrapper records it here for
+    /// [`crate::model::audio_decoder::AudioGpu::take_audio_error`].
+    sample_error: std::sync::Mutex<Option<crate::CeraError>>,
 }
 
 fn get_detok_tensor(gguf: &GgufFile, name1: &str, name2: &str) -> Result<crate::tensor::Tensor> {
@@ -305,7 +311,7 @@ impl WgpuAudioDecoder {
                 "audio_detok_conv1d_fused_batch",
             ),
             flash_attention: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION,
+                shaders::FLASH_ATTENTION_F32,
                 "flash_attention",
                 "audio_detok_flash_attention",
             ),
@@ -570,6 +576,7 @@ impl WgpuAudioDecoder {
             kv_v,
             n_past: AtomicUsize::new(0),
             session_active: AtomicBool::new(false),
+            sample_error: std::sync::Mutex::new(None),
         })
     }
 
@@ -1255,6 +1262,21 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
         self.depthformer.is_some()
     }
 
+    fn take_audio_error(&self) -> Option<crate::CeraError> {
+        // Drain every context this decoder owns (detokenizer plus the
+        // depthformer's private context) and the sync-sample slot. All
+        // three are cleared; the first `Some` in this fixed order wins.
+        // Callers discard before each bare call, so a take here holds at
+        // most the current attempt's fault.
+        let a = self.ctx.take_readback_fault();
+        let b = self
+            .depthformer
+            .as_ref()
+            .and_then(|df| df.ctx.take_readback_fault());
+        let c = crate::model::take_fault(&self.sample_error);
+        a.or(b).or(c)
+    }
+
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         if let Some(ref _df) = self.depthformer {
             #[cfg(not(target_arch = "wasm32"))]
@@ -1263,6 +1285,11 @@ impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
                     .unwrap_or_else(|e| {
                         tracing::error!(
                             "[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}"
+                        );
+                        eprintln!("[cera::wgpu_audio_decoder] sample_frame_async failed: {e:#}");
+                        crate::model::record_first_fault(
+                            &self.sample_error,
+                            crate::CeraError::Backend(format!("sample_frame_async: {e:#}")),
                         );
                         [0; 8]
                     })

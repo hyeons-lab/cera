@@ -1459,7 +1459,17 @@ struct WgpuVisionEncoder {
 #[cfg(feature = "gpu")]
 impl VisionGpuEncode for WgpuVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
-        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+        // Drain the readback slot around the encode (mirrors Session's
+        // discard-at-entry/drain-after-work discipline): a map/range fault
+        // mid-encode otherwise returns Ok(zero embeddings) that the
+        // session prefills as valid, while the Err arm's CPU fallback
+        // (built for exactly this fault class) never fires.
+        let _ = self.ops.ctx.take_readback_fault();
+        let out = encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)?;
+        if let Some(e) = self.ops.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
     }
 
     fn encode_image_async<'a>(
@@ -1487,7 +1497,17 @@ struct MetalVisionEncoder {
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VisionGpuEncode for MetalVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
-        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+        // Drain the command-error slot around the encode (mirrors
+        // Session's discard-at-entry/drain-after-work discipline): a
+        // commit fault mid-encode otherwise returns Ok(stale embeddings)
+        // that the session prefills as valid, while the Err arm's CPU fallback (built for
+        // exactly this fault class) never fires.
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
     }
 }
 
@@ -1501,7 +1521,7 @@ pub fn build_gpu_vision_encoder(
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu => None,
+        BP::Cpu | BP::Hexagon => None,
         BP::Metal => try_metal_vision_encoder(weights),
         BP::Gpu => try_wgpu_vision_encoder(weights),
         BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
@@ -1795,6 +1815,49 @@ mod tests {
             Err(_) => return, // no Metal device (CI)
         };
         run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3, 0.0);
+    }
+
+    /// Encode through the `VisionGpuEncode` impl (not the inner
+    /// `encode_image_gpu` the parity tests call): pins that the
+    /// discard/drain wrapper neither breaks normal encodes nor reports a
+    /// stray fault. The fault-conversion half (mid-encode fault becomes
+    /// `Err` so the session's CPU fallback fires) needs a real device
+    /// fault and is not injectable here; there is no poison seam for the
+    /// readback/command slots.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_wgpu_encode_wrapper_happy_path() {
+        use crate::engine::BackendPreference as BP;
+        let enc = synth_encoder();
+        let encoder = match build_gpu_vision_encoder(&enc, BP::Gpu) {
+            Some(e) => e,
+            None => return, // no GPU (CI)
+        };
+        let cfg = &enc.config;
+        let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
+        let cpu_out = enc.encode_image(&pixels, 8, 8).unwrap();
+        let gpu_out = encoder.encode_image(&pixels, 8, 8).unwrap();
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        assert!(!gpu_out.iter().all(|&x| x == 0.0));
+    }
+
+    /// Metal twin of `test_wgpu_encode_wrapper_happy_path` (same
+    /// discard/drain wrapper shape over `take_cmd_error`).
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn test_metal_encode_wrapper_happy_path() {
+        use crate::engine::BackendPreference as BP;
+        let enc = synth_encoder();
+        let encoder = match build_gpu_vision_encoder(&enc, BP::Metal) {
+            Some(e) => e,
+            None => return, // no Metal device (CI)
+        };
+        let cfg = &enc.config;
+        let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
+        let cpu_out = enc.encode_image(&pixels, 8, 8).unwrap();
+        let gpu_out = encoder.encode_image(&pixels, 8, 8).unwrap();
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        assert!(!gpu_out.iter().all(|&x| x == 0.0));
     }
 
     /// Q8_0 linear weights → exercises the Metal simdgroup `gemm_q8_0` path.

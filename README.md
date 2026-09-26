@@ -5,7 +5,7 @@ on your laptop's CPU, an Apple GPU, a cross-platform Vulkan/DX12 GPU, a phone,
 or in the browser, from a single dependency-free core.
 
 > [!NOTE]
-> The 0.6.2 API includes corrections to chat lifecycle, streaming, checkpoint validation, JSON Schema constraints and audio processing. See the [0.6 API guide](docs/API_0_6.md) for usage and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 release adds the native Qualcomm Hexagon NPU backend, dynamic CPU topology discovery and worker threadpool resizing, and core lifecycle enhancements. See the [API guide](docs/API_0_6.md) for usage and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 ## Why Cera
 
@@ -54,9 +54,10 @@ Falcon H1 and Mamba-2. See the [loading dispatch](cera/src/model/mod.rs) for
 architecture aliases and backend admission rules.
 
 Metal and wgpu support `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
-`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`. The listed `qwen35`,
-`mistral3` and `bailingmoe3` families use CPU; requesting an unsupported GPU
-backend explicitly returns an error. Auto selection can fall back to CPU.
+`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`. Qualcomm Hexagon NPU supports
+`lfm2` (`HexagonLfm2Model`). The listed `qwen35`, `mistral3` and `bailingmoe3` families
+use CPU; requesting an unsupported GPU or NPU backend explicitly returns an error.
+Auto selection can fall back to CPU.
 The LFM2 and supported dense-transformer paths use batched-GEMM prefill,
 including on CPU, with tiled flash attention for long prompts where supported.
 
@@ -89,12 +90,12 @@ or you can pin one:
 
 | Backend | `--device` | Platforms | Notes |
 |---------|-----------|-----------|-------|
-| **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature |
+| **CPU** | `cpu` | everywhere | Scalar reference + **NEON** (aarch64) / **AVX2** (x86_64) kernels; optional **Accelerate/OpenBLAS** via the `blas` feature; dynamic cpuset awareness |
 | **Native Metal** | `metal` | macOS, iOS | Hand-written MSL shaders, single-encoder dispatch, GPU argmax |
+| **Qualcomm Hexagon NPU** | `hexagon` | Android, Linux (aarch64) | FastRPC Unsigned Process Domain, shared DMA memory, repacked 32x32 Q4_0/Q8_0 matrix kernels on Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` uses native Metal on macOS and iOS, and wgpu where a GPU is
-available, falling back to CPU otherwise.
+`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise.
 
 ### Quantization
 
@@ -129,9 +130,9 @@ One Rust core, consumed from many places:
 | **Rust (API client)** | [`cera-client`](cera-client/) | any Rust project (`cargo add cera-client`); OpenAI and OpenRouter endpoints |
 | **CLI** | [`cera-cli`](cera-cli/) | the `cera` binary |
 | **Kotlin / Swift / Python** | [`cera-ffi`](cera-ffi/) (UniFFI) | JVM, Apple platforms (LLMs, ChatSession, VAD, KWS, Whisper) |
-| **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR) |
+| **Android** | [`cera-ffi-kotlin`](cera-ffi-kotlin/) | Android apps (AAR; includes Qualcomm Hexagon NPU support) |
 | **iOS / macOS** | [`Package.swift`](Package.swift) (SwiftPM XCFramework) | Apple apps (`.package(url:)`), Metal GPU (Auto: Metal → CPU) |
-| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, ChatSession, VAD, KWS, Whisper) |
+| **Flutter** | [`cera_ffi_flutter`](cera_ffi_flutter/) | cross-platform apps; ships the native library per platform (LLMs, ChatSession, VAD, KWS, Whisper, Hexagon NPU) |
 | **Dart (no Flutter)** | [`cera_ffi`](cera_ffi/) | CLI / server; bring your own `cera-ffi` cdylib (ChatSession, explicit loading) |
 | **Browser / Node** | [`cera-wasm`](cera-wasm/) (`@hyeons-lab/cera-wasm`) | WebAssembly + WebGPU |
 
@@ -262,7 +263,7 @@ the handle. See [streaming and cancellation](docs/API_0_6.md#streaming-and-cance
 
 ## Session checkpointing & persistence
 
-CPU Session and Chat support resumable snapshots. Native Metal/wgpu Session
+CPU Session and Chat support resumable snapshots. Native Metal/Hexagon/wgpu Session
 checkpoint and restore operations reject backend-owned state; browser
 `WebGpuSession` has a separate device snapshot API.
 
@@ -271,7 +272,7 @@ checkpoint and restore operations reject backend-owned state; browser
 - **Browser WebGPU checkpointing**: Async GPU readback/export and synchronous restore/import into a compatible session.
 - **Continuation state preservation**: Restores live sequence length, KV cache states, and terminal token commitment for seamless multi-turn resumption.
 
-Version 0.6.2 validates row geometry, KV precision and compression identity,
+Version 0.6.2 and newer validates row geometry, KV precision and compression identity,
 including TurboQuant seeds. Recreate older f16/TurboQuant snapshots whose
 fingerprints lack compression identity; plain f32 fingerprints are unchanged.
 See [checkpoint compatibility](docs/API_0_6.md#checkpoints-and-compatibility).
@@ -358,14 +359,14 @@ Cera includes support for **DSpark** ([arXiv:2407.08608](https://arxiv.org/abs/2
 - **Parallel GPU Verification**: Validates draft token sequences in a single forward pass with batched LM-head verification on CPU, Metal, and WebGPU.
 - **Automatic Drafter Discovery**: Bundle loader automatically discovers and attaches paired DSpark sidecar models from LeapBundles and Hugging Face repositories.
 
-## Sharing a loaded GPU model
+## Sharing a loaded GPU or NPU model
 
-Metal and wgpu permit one live `Session` per loaded model. A second session
+Metal, Hexagon, and wgpu permit one live `Session` per loaded model. A second session
 returns `Busy` until the first is dropped; reset and cancellation keep ownership.
 CPU models continue to support shared weights across concurrent sessions. Load
-separate GPU models for simultaneous conversations. The
+separate GPU or NPU models for simultaneous conversations. The
 [session ownership walkthrough](docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
-and executable CPU/Metal/wgpu checks.
+and executable checks.
 
 LFM2-Audio transcription during a live GPU conversation uses a cached secondary
 model built from retained weights. This preserves conversation KV and costs

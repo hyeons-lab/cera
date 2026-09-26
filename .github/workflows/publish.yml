@@ -471,7 +471,9 @@ jobs:
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r27c
+          # r28 floor: first NDK with 16KB ELF alignment by default (see
+          # the android-abis job in ci.yml). Keep in sync with it.
+          ndk-version: r28c
       - name: Build Android jniLibs
         if: ${{ matrix.android }}
         env:
@@ -479,14 +481,9 @@ jobs:
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
           cargo install cargo-ndk --version '^4' --locked
-          # `--features ffi-buffer` is required even though Kotlin never calls
-          # the trampolines: the same AAR backs the Flutter plugin, and its
-          # Dart bindings call nothing else.
-          cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
-            --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
-            build -p cera-ffi --release --features ffi-buffer
-          scripts/assert-ffibuffer.sh \
-            cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
+          # Single source of truth for the jniLibs build (ffi-buffer +
+          # hexagon-on-64-bit split); see the recipe comment in justfile.
+          just android-libs
 
       - name: Upload staged native libs
         uses: actions/upload-artifact@v7

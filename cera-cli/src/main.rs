@@ -359,7 +359,7 @@ enum Command {
         #[arg(long, requires = "tools")]
         constrain_tools: bool,
 
-        /// Device to use: cpu, gpu, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -622,7 +622,7 @@ enum Command {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -749,7 +749,7 @@ enum Command {
         #[arg(short, long)]
         prompt: String,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -843,7 +843,7 @@ enum Command {
         #[arg(long)]
         add_bos: bool,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -951,7 +951,7 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
 
-        /// Device to use: cpu, gpu, metal, or auto.
+        /// Device to use: cpu, gpu, metal, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -1007,6 +1007,63 @@ enum Command {
         /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
         #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
         draft_model: Option<String>,
+    },
+
+    /// Microbenchmark Q4_0 GEMV kernels (`fast` raw vs `stream` resident).
+    ///
+    /// Synthetic weights, no model file: times `iters` dispatches per
+    /// kernel per shape in one submit and checks parity against a CPU
+    /// reference. For kernel iteration without full-model runs.
+    #[cfg(feature = "gpu")]
+    GemvBench {
+        /// Shapes as `m,k` pairs, comma- or space-separated (k must be a multiple of 32).
+        #[arg(
+            long,
+            default_value = "512,2048 2048,2048 6144,2048 2048,6144 10752,2048 2048,10752 128000,2048"
+        )]
+        shapes: String,
+
+        /// Timed dispatches per kernel per shape (plus a 500 ms GPU clock soak).
+        #[arg(long, default_value_t = 100)]
+        iters: u32,
+
+        /// Kernels to run: comma-separated `fast,stream`.
+        #[arg(long, default_value = "fast,stream")]
+        kernels: String,
+
+        /// Experimental SPIR-V files to A/B against the built-in kernels
+        /// (same 4-binding/params contract, entry `main`). Each is `path`
+        /// or `path@nr` (rows-per-workgroup, default 8).
+        #[arg(long)]
+        spv: Vec<String>,
+    },
+
+    /// Microbenchmark the Q4_0 prefill GEMM (`gemm_stream_q4_0`).
+    ///
+    /// Synthetic weights, no model file: times `iters` dispatches per
+    /// kernel per shape in one submit and checks parity against a CPU
+    /// reference. `--spv` A/Bs experimental SPIR-V variants (same
+    /// bindings/grid/params contract, entry `main`) without rebuilding.
+    #[cfg(feature = "gpu")]
+    GemmBench {
+        /// Shapes as `m,n,k` triples, comma- or space-separated (k must be a multiple of 32, n >= 32).
+        #[arg(
+            long,
+            default_value = "10752,128,2048 10752,512,2048 2048,128,2048 2048,512,2048 6144,512,2048"
+        )]
+        shapes: String,
+
+        /// Timed dispatches per kernel per shape (plus a 500 ms GPU clock soak).
+        #[arg(long, default_value_t = 20)]
+        iters: u32,
+
+        /// Experimental SPIR-V files to A/B against the built-in kernel.
+        #[arg(long)]
+        spv: Vec<String>,
+
+        /// Fiber width of the `--spv` variants (grid Y = n_pad/ny; 32 or 64).
+        #[arg(long, default_value_t = 32)]
+        spv_ny: u32,
     },
 
     /// List bundles published on `huggingface.co/LiquidAI/LeapBundles`.
@@ -1714,6 +1771,7 @@ fn load_engine_from_spec(
             BackendPreference::Cpu => "CPU",
             BackendPreference::Gpu => "wgpu",
             BackendPreference::Metal => "native Metal",
+            BackendPreference::Hexagon => "Hexagon NPU",
         },
         engine.metadata().architecture,
     );
@@ -2491,7 +2549,68 @@ fn setup_kv_compression(
     }
 }
 
+/// On Android, mark this process normally-killable. Processes spawned from
+/// `adb shell` inherit `oom_score_adj` -1000 (unkillable), so when a big
+/// model exhausts memory the OOM killer finds no victim and the kernel
+/// deadlock-panics the phone instead of killing the run (measured: 2.6B
+/// GPU bench rebooted an S25U three times). Best-effort: failure is
+/// silently ignored, and non-Android builds compile this out.
+#[cfg(target_os = "android")]
+fn relax_oom_score() {
+    // Silently ignored on failure (runs before logging is set up, and a
+    // bench run must never fail over this); worst case the process stays
+    // unkillable and an OOM behaves as before.
+    let _ = std::fs::write("/proc/self/oom_score_adj", "0");
+}
+
+/// Parse a `--shapes` list into `N`-tuples: tokens containing commas
+/// are split into numbers, and a comma-free token run is regrouped;
+/// both paths chunk into `N`-tuples. `what` names the tuple (`"m,k"`)
+/// for error text. Element errors name the shape and the offending token.
+#[cfg(feature = "gpu")]
+fn parse_shape_list<const N: usize>(raw: &str, what: &str) -> Result<Vec<[u32; N]>> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let groups: Vec<String> = if tokens.iter().any(|t| t.contains(',')) {
+        tokens.iter().map(|t| t.to_string()).collect()
+    } else {
+        anyhow::ensure!(
+            tokens.len().is_multiple_of(N),
+            "shapes must be `{what}` {N}-tuples (got {})",
+            tokens.len()
+        );
+        tokens
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .map(|c| c.join(","))
+            .collect()
+    };
+    let mut out = Vec::new();
+    for group in &groups {
+        // A token may itself hold several comma-joined numbers when the
+        // user passes one comma-separated run.
+        let nums: Vec<&str> = group.split(',').filter(|s| !s.is_empty()).collect();
+        anyhow::ensure!(
+            nums.len().is_multiple_of(N) && !nums.is_empty(),
+            "shape {group:?} must look like `{what}`"
+        );
+        for chunk in nums.as_chunks::<N>().0 {
+            let mut arr = [0u32; N];
+            for (i, tok) in chunk.iter().enumerate() {
+                arr[i] = tok.parse().with_context(|| {
+                    format!("shape {group:?}: element {i} ({tok:?}) is not a u32")
+                })?;
+            }
+            out.push(arr);
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "no shapes parsed");
+    Ok(out)
+}
+
 fn main() -> Result<()> {
+    #[cfg(target_os = "android")]
+    relax_oom_score();
     // Default to `warn` when RUST_LOG is unset, rather than the empty filter
     // `from_default_env()` yields — which showed nothing at all.
     //
@@ -4849,6 +4968,54 @@ fn main() -> Result<()> {
                 }
             }
         }
+        #[cfg(feature = "gpu")]
+        Command::GemvBench {
+            shapes,
+            iters,
+            kernels,
+            spv,
+        } => {
+            anyhow::ensure!(iters >= 1, "--iters must be >= 1");
+            let mut shapes_out: Vec<(u32, u32)> = Vec::new();
+            for [m, k] in parse_shape_list::<2>(&shapes, "m,k")? {
+                // Same validator the harness entries run (one home in the
+                // lib): fails fast here with the shape attached.
+                cera::model::gpu_lfm2::validate_gemv_shape(m, k)?;
+                shapes_out.push((m, k));
+            }
+            let kernels: Vec<&str> = kernels
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .collect();
+            for k in &kernels {
+                anyhow::ensure!(
+                    *k == "fast" || *k == "stream",
+                    "unknown kernel {k:?} (want fast,stream)"
+                );
+            }
+            cera::model::gpu_lfm2::gemv_q4_0_microbench(&shapes_out, iters, &kernels, &spv)?;
+        }
+        #[cfg(feature = "gpu")]
+        Command::GemmBench {
+            shapes,
+            iters,
+            spv,
+            spv_ny,
+        } => {
+            anyhow::ensure!(iters >= 1, "--iters must be >= 1");
+            anyhow::ensure!(
+                spv_ny == 32 || spv_ny == 64,
+                "--spv-ny must be 32 or 64 (got {spv_ny})"
+            );
+            let mut shapes_out: Vec<(u32, u32, u32)> = Vec::new();
+            for [m, n, k] in parse_shape_list::<3>(&shapes, "m,n,k")? {
+                // Same validator the harness entry runs (one home in the
+                // lib): fails fast here with the shape attached.
+                cera::model::gpu_lfm2::validate_gemm_shape(m, n, k)?;
+                shapes_out.push((m, n, k));
+            }
+            cera::model::gpu_lfm2::gemm_q4_0_microbench(&shapes_out, iters, &spv, spv_ny)?;
+        }
         Command::Bench {
             model,
             hf,
@@ -6728,5 +6895,112 @@ mod tests {
             }
             _ => panic!("expected CompareQuants command"),
         }
+    }
+
+    /// `--shapes` parsing for the bench harnesses: pairs, triples, and the
+    /// bare-run regroup, plus every error branch (arity, token, empty).
+    /// `#[cfg]`-gated with the helper (gpu-only callers); the `cera-cli
+    /// (gpu)` CI leg runs these, since default CI compiles the helper out.
+    #[cfg(feature = "gpu")]
+    mod shape_list_tests {
+        use super::super::{Cli, Command, parse_shape_list};
+        use clap::Parser;
+
+        #[test]
+        fn bench_defaults_parse_and_validate() {
+            // Pin the transcription end to end: the real clap defaults must
+            // survive the same parse+validate chain `main` runs, so a
+            // default edit that breaks bare `gemv-bench`/`gemm-bench` fails
+            // here, not at runtime. (The lib suite pins transcribed tuples
+            // against the same validators; this pins the actual strings.)
+            let gemv = Cli::try_parse_from(["cera", "gemv-bench"]).unwrap();
+            let Command::GemvBench { shapes, .. } = gemv.command else {
+                panic!("gemv-bench parsed to wrong variant")
+            };
+            for [m, k] in parse_shape_list::<2>(&shapes, "m,k").unwrap() {
+                cera::model::gpu_lfm2::validate_gemv_shape(m, k).unwrap();
+            }
+            let gemm = Cli::try_parse_from(["cera", "gemm-bench"]).unwrap();
+            let Command::GemmBench { shapes, .. } = gemm.command else {
+                panic!("gemm-bench parsed to wrong variant")
+            };
+            for [m, n, k] in parse_shape_list::<3>(&shapes, "m,n,k").unwrap() {
+                cera::model::gpu_lfm2::validate_gemm_shape(m, n, k).unwrap();
+            }
+        }
+
+        #[test]
+        fn pairs_and_triples() {
+            assert_eq!(
+                parse_shape_list::<2>("128,2048 256,1024", "m,k").unwrap(),
+                [[128, 2048], [256, 1024]]
+            );
+            assert_eq!(
+                parse_shape_list::<3>("256,32,128", "m,n,k").unwrap(),
+                [[256, 32, 128]]
+            );
+        }
+
+        #[test]
+        fn bare_run_regroups() {
+            assert_eq!(
+                parse_shape_list::<2>("128 2048 256 1024", "m,k").unwrap(),
+                [[128, 2048], [256, 1024]]
+            );
+            assert_eq!(
+                parse_shape_list::<3>("256 32 128", "m,n,k").unwrap(),
+                [[256, 32, 128]]
+            );
+        }
+
+        #[test]
+        fn odd_count_rejected() {
+            let err = parse_shape_list::<2>("128 2048 256", "m,k").unwrap_err();
+            assert!(err.to_string().contains("2-tuples"), "unexpected: {err:?}");
+            let err = parse_shape_list::<3>("1,2,3,4", "m,n,k").unwrap_err();
+            assert!(err.to_string().contains("m,n,k"), "unexpected: {err:?}");
+        }
+
+        #[test]
+        fn bad_token_names_shape_and_token() {
+            let err = parse_shape_list::<2>("abc,def", "m,k").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("abc,def"), "shape unnamed: {msg}");
+            assert!(msg.contains("abc"), "token unnamed: {msg}");
+        }
+
+        #[test]
+        fn empty_rejected() {
+            assert!(parse_shape_list::<2>("", "m,k").is_err());
+            assert!(parse_shape_list::<2>("   ", "m,k").is_err());
+        }
+
+        #[test]
+        fn commas_only_group_rejected() {
+            // Names the `!nums.is_empty()` conjunct: a group of nothing
+            // but commas has no numbers to form a tuple from.
+            let err = parse_shape_list::<2>(",", "m,k").unwrap_err();
+            assert!(err.to_string().contains("m,k"), "unexpected: {err:?}");
+        }
+
+        #[test]
+        fn mixed_and_sloppy_commas_pinned() {
+            // Mixed comma+bare tokens error (the bare token is not a pair).
+            assert!(parse_shape_list::<2>("128,2048 256", "m,k").is_err());
+            // Trailing/double commas are silently accepted (empties
+            // filtered): documented leniency, pinned so a strictness change
+            // is deliberate.
+            assert_eq!(
+                parse_shape_list::<2>("128,2048,", "m,k").unwrap(),
+                [[128, 2048]]
+            );
+            assert_eq!(
+                parse_shape_list::<2>("128,,2048", "m,k").unwrap(),
+                [[128, 2048]]
+            );
+        }
+
+        // Shape *validation* lives in the lib (`validate_gemv_shape` /
+        // `validate_gemm_shape`) with its tests; the CLI only parses.
     }
 }

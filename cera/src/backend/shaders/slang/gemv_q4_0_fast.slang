@@ -1,7 +1,33 @@
 // slang-entries: gemv_q4_0_fast
 //
 // Fast Q4_0 Matrix-Vector Multiply (GEMV) in Slang for both Metal and WGSL.
-// Tiled across NR=4 output rows per workgroup with direct register-staged activations.
+// Tiled across NR=8 output rows per workgroup with direct register-staged activations.
+//
+// Reduction is a shared-memory tree (6 barriers): this file must stay naga-
+// parseable, and naga does not implement `enable subgroups` yet, so the
+// subgroup reduction lives in the SPIR-V twin
+// (`spirv/gemv_q4_0_fast.slang`, entry `main`, passthrough on Vulkan). The
+// host dispatches the twin when `supports_spirv_passthrough()`, else this.
+// Both share the K loop below — keep them in sync (same math, same NR/NQ).
+//
+// v2 (WS3): 64 threads/workgroup covering NQ=32 blocks per iteration, mirroring
+// the handwritten Metal kernel's 2-simdgroup shape. The 32-thread v1 left the
+// Adreno latency-bound at ~25 GB/s against ~106 GB/s for dense f16 on the same
+// GPU; doubling the threads doubles the outstanding loads per workgroup.
+// Threads with ix >= nb (only when k < 1024) skip the loop with zero
+// accumulators, so narrow-k projections stay correct.
+//
+// v3 (WS3): NR 8 -> 16 tried and REVERTED. The theory (amortize the 16
+// activation loads over more rows) was sound but ffn REGRESSED 15%
+// (3600 -> 4128 us) while lm_head stayed flat at 1486 us: the doubled
+// [unroll] row loop (~1100 instructions) and/or the 48 live registers +
+// 4 KB shared per workgroup cost more than the saved loads. NR=8 stands.
+//
+// v4 (WS3): subgroup reduction, in the SPIR-V twin only (see above).
+// llama.cpp's Adreno Q4_0 kernel (mul_mv_q4_0_f32, 64 threads x 4 rows,
+// `sub_group_reduce_add`) has no shared memory and no barriers at all; our
+// 6-barrier tree was the structural gap. The twin keeps one barrier and
+// NR*8 shared floats for the cross-subgroup combine.
 
 [[vk::binding(0)]] StructuredBuffer<uint>    w      : register(t0);
 [[vk::binding(1)]] StructuredBuffer<float>   x      : register(t1);
@@ -9,8 +35,8 @@
 [[vk::binding(3)]] StructuredBuffer<uint4>   params : register(t3);
 
 static const uint NR = 8u;
-static const uint NQ = 16u;
-static const uint WG_SIZE = 32u;
+static const uint NQ = 32u;
+static const uint WG_SIZE = 64u;
 static const uint BLOCK_BYTES = 18u;
 
 groupshared float partials[NR * WG_SIZE];
@@ -30,23 +56,19 @@ uint q_pair(uint qs_byte) {
     return ((qs_byte & 2u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
 }
 
-[shader("compute")]
-[numthreads(WG_SIZE, 1, 1)]
-void gemv_q4_0_fast(
-    uint3 lid : SV_GroupThreadID,
-    uint3 wid : SV_GroupID
+// The K loop: each thread accumulates its blocks' partial dots for NR rows
+// into `sumf`. Shared by both entries; only the reduction differs.
+void q4_block_loop(
+    uint m,
+    uint k,
+    uint r0,
+    uint ix,
+    uint il,
+    inout float sumf[NR]
 ) {
-    uint m = params[0].x;
-    uint k = params[0].y;
     uint nb = k / 32u;
     uint row_bytes = nb * BLOCK_BYTES;
-    uint r0 = get_wid(wid) * NR;
-    uint tid = lid.x;
 
-    uint ix = tid / 2u;
-    uint il = (tid & 1u) * 8u;
-
-    float sumf[NR];
     [unroll]
     for (uint r = 0u; r < NR; r++) {
         sumf[r] = 0.0f;
@@ -55,6 +77,8 @@ void gemv_q4_0_fast(
     uint yb_off = ix * 32u + il;
     uint ib = ix;
 
+    // Threads with ix >= nb (only when k < 1024, i.e. nb < NQ) skip the
+    // loop with sumf == 0 and still join the reduction below — correct.
     while (ib < nb) {
         float a0  = x[yb_off + 0u];
         float a1  = x[yb_off + 1u];
@@ -73,22 +97,26 @@ void gemv_q4_0_fast(
         float a14 = x[yb_off + 22u];
         float a15 = x[yb_off + 23u];
 
+        // Reciprocal mults, not divides: the divisors are exact powers of two
+        // (1/256, 1/16, 1/4096 are all exactly representable), so the products
+        // are bit-identical to the quotients — while a driver that fails to
+        // fold `x / const` pays ~20-40 cycles per divide, 8x per block.
         float y0 = a0;
-        float y1 = a1 / 256.0f;
+        float y1 = a1 * 0.00390625f;
         float y2 = a2;
-        float y3 = a3 / 256.0f;
+        float y3 = a3 * 0.00390625f;
         float y4 = a4;
-        float y5 = a5 / 256.0f;
+        float y5 = a5 * 0.00390625f;
         float y6 = a6;
-        float y7 = a7 / 256.0f;
-        float y8 = a8 / 16.0f;
-        float y9 = a9 / 4096.0f;
-        float y10 = a10 / 16.0f;
-        float y11 = a11 / 4096.0f;
-        float y12 = a12 / 16.0f;
-        float y13 = a13 / 4096.0f;
-        float y14 = a14 / 16.0f;
-        float y15 = a15 / 4096.0f;
+        float y7 = a7 * 0.00390625f;
+        float y8 = a8 * 0.0625f;
+        float y9 = a9 * 0.000244140625f;
+        float y10 = a10 * 0.0625f;
+        float y11 = a11 * 0.000244140625f;
+        float y12 = a12 * 0.0625f;
+        float y13 = a13 * 0.000244140625f;
+        float y14 = a14 * 0.0625f;
+        float y15 = a15 * 0.000244140625f;
 
         float sumy0 = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7);
         float sumy1 = (a8 + a9) + (a10 + a11) + (a12 + a13) + (a14 + a15);
@@ -136,6 +164,24 @@ void gemv_q4_0_fast(
         ib += NQ;
         yb_off += NQ * 32u;
     }
+}
+
+[shader("compute")]
+[numthreads(WG_SIZE, 1, 1)]
+void gemv_q4_0_fast(
+    uint3 lid : SV_GroupThreadID,
+    uint3 wid : SV_GroupID
+) {
+    uint m = params[0].x;
+    uint k = params[0].y;
+    uint r0 = get_wid(wid) * NR;
+    uint tid = lid.x;
+
+    uint ix = tid / 2u;
+    uint il = (tid & 1u) * 8u;
+
+    float sumf[NR];
+    q4_block_loop(m, k, r0, ix, il, sumf);
 
     [unroll]
     for (uint r = 0u; r < NR; r++) {

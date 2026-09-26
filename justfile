@@ -49,18 +49,19 @@ slang:
     # Multi-target kernels: one source, WGSL *and* MSL. Unlike the SPIR-V
     # kernels above, the entry points are the kernel's own function names rather
     # than `main`, because both backends look each kernel up by name. slangc has
-    # no auto-discovery, so pass one -entry per entry point: default to the
-    # basename, or read a `// slang-entries: a b c` header for kernels whose
-    # entry name differs (gelu) or that expose several (elementwise). build.rs
-    # and the CI drift check parse the same header.
+    # no auto-discovery, so pass one -entry per entry point. Header parsing
+    # (entries defaulting to the basename, targets defaulting to both, empty
+    # targets failing fast, unknown targets rejected) lives in
+    # scripts/slang-headers.sh, shared with the CI drift check; build.rs is
+    # the canonical Rust copy.
     dir=cera/src/backend/shaders/slang
     for f in "$dir"/*.slang; do
         name=$(basename "$f" .slang)
-        entries=$(sed -n 's|^[[:space:]]*//[[:space:]]*slang-entries:[[:space:]]*||p' "$f")
-        [ -z "$entries" ] && entries="$name"
+        entries=$(./scripts/slang-headers.sh entries "$f")
         entry_args=()
         for e in $entries; do entry_args+=(-entry "$e"); done
-        for target in wgsl metal; do
+        targets=$(./scripts/slang-headers.sh targets "$f")
+        for target in $targets; do
             echo "==> slangc $name -> $target ($entries)"
             "$SLANGC" "$f" -target "$target" -O3 "${entry_args[@]}" -stage compute -o "$dir/$name.$target"
         done
@@ -343,12 +344,37 @@ jvm-libs-host:
 # `ffi-buffer` is not optional here even though Kotlin never uses it: the same
 # AAR backs the Flutter plugin, whose Dart bindings call `uniffi_ffibuffer_*`.
 # See scripts/assert-ffibuffer.sh.
+#
+# `hexagon` (Hexagon NPU backend + embedded DSP skels, ~3.2 MB) ships on the
+# 64-bit ABIs only: no shipping NPU phone is 32-bit, and the Play store has
+# required 64-bit since 2019. The two invocations build into scratch dirs and
+# merge (cargo-ndk owns its `-o` root per invocation). The FFI surface is
+# identical on all ABIs: without the feature, `hexagon_probe()` simply
+# reports unavailable, only `Auto` falls back to CPU, and explicit
+# `BackendPreference::Hexagon` reports `Backend/Hexagon backend not available`.
+# The DSP skels are embedded directly inside `libcera_ffi.so` on 64-bit
+# ABIs (via include_bytes!) and extracted to app storage at runtime by
+# `HexagonNpu.setup(context)` (or `hexagonInstallSkels`). They are not
+# packaged into `jniLibs/`, ensuring all libraries in the AAR are 16KB
+# page-aligned.
 android-libs:
-    cargo ndk -o cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs \
-        --target arm64-v8a --target armeabi-v7a --target x86_64 --target x86 \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs
+    rm -rf target/android-libs-64 target/android-libs-32
+    cargo ndk -o target/android-libs-64 \
+        --target arm64-v8a --target x86_64 \
+        build -p cera-ffi --release --features ffi-buffer,hexagon
+    cargo ndk -o target/android-libs-32 \
+        --target armeabi-v7a --target x86 \
         build -p cera-ffi --release --features ffi-buffer
-    scripts/assert-ffibuffer.sh \
-        cera-ffi-kotlin/cera-ffi-android/src/main/jniLibs/*/libcera_ffi.so
+    mkdir -p "$out"
+    cp -r target/android-libs-64/* target/android-libs-32/* "$out/"
+    scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
+    # 16KB page alignment (Play requirement, Android 15+ hardware): every
+    # host-loaded .so must be 16KB-clean.
+    python3 scripts/assert-16k-pages.py "$out"/*/*.so
+    ls -la "$out"/*/*.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform
 # targets and assemble a `CeraFFI.xcframework` ready for Swift

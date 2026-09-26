@@ -27,44 +27,17 @@
 //! these tests report a ~0.96 cosine and a 10x submit count out of nowhere.
 #![cfg(feature = "gpu")]
 
-use std::path::PathBuf;
+mod common;
 use std::sync::atomic::AtomicBool;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::{Model, load_model_gpu};
 use cera::sampler::argmax;
-use cera::tokenizer::BpeTokenizer;
 
 /// The `core` fixture set's LFM2 model — fetched on pull requests, so this file
 /// has real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
-
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
-
-/// Resolve the fixture, or signal skip. `CERA_REQUIRE_MODEL` turns absence into
-/// a hard failure — the GPU job fetches this fixture, so a skip there would mean
-/// the job is green without having run anything. Mirrors `CERA_REQUIRE_GPU`.
-fn fixture_or_skip() -> Option<PathBuf> {
-    let p = models_dir().join(FIXTURE);
-    if p.exists() {
-        return Some(p);
-    }
-    assert!(
-        std::env::var("CERA_REQUIRE_MODEL")
-            .unwrap_or_default()
-            .is_empty(),
-        "CERA_REQUIRE_MODEL is set but {FIXTURE} is absent at {}",
-        p.display()
-    );
-    eprintln!("[gpu-lfm2] SKIP (absent): {}", p.display());
-    None
-}
 
 /// A model instance per call — see the module docs on statefulness.
 fn load(path: &std::path::Path) -> Option<Box<dyn Model>> {
@@ -86,16 +59,6 @@ fn load(path: &std::path::Path) -> Option<Box<dyn Model>> {
 fn state(m: &dyn Model) -> InferenceState {
     InferenceState::from_config_with_compression(m.config(), &KvCompression::None)
         .expect("inference state")
-}
-
-fn tokens(path: &std::path::Path, n: usize) -> Vec<u32> {
-    let gguf = GgufFile::open(path).expect("open gguf");
-    let tok = BpeTokenizer::from_gguf(&gguf).expect("tokenizer");
-    let text = "The quick brown fox jumps over the lazy dog near the riverbank. ".repeat(60);
-    let mut t = tok.encode(&text);
-    assert!(t.len() >= n, "fixture prompt too short: {} < {n}", t.len());
-    t.truncate(n);
-    t
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -121,10 +84,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// within one call.
 #[test]
 fn chunked_prefill_matches_monolithic() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-lfm2") else {
         return;
     };
-    let toks = tokens(&path, 256);
+    let toks = common::prompt_tokens(&path, 256);
 
     let Some(m) = load(&path) else { return };
     let mono = m.forward_prefill(&toks, 0, &mut state(m.as_ref()));
@@ -177,12 +140,12 @@ fn chunked_prefill_matches_monolithic() {
 /// LFM2 counterpart to `gpu_transformer_parity`'s dense-arch differential.
 #[test]
 fn batched_prefill_matches_per_token() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-lfm2") else {
         return;
     };
     // Short on purpose: the per-token leg is 16 submits/token and this runs on
     // software Vulkan in CI.
-    let toks = tokens(&path, 24);
+    let toks = common::prompt_tokens(&path, 24);
 
     let Some(m) = load(&path) else { return };
     let batched = m.forward_prefill(&toks, 0, &mut state(m.as_ref()));

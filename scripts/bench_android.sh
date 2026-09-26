@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Android benchmark harness: cera (CPU + wgpu/Vulkan) vs llama.cpp, on-device.
+# Android benchmark harness: cera (CPU + wgpu/Vulkan + Hexagon) vs llama.cpp
+# (CPU + OpenCL + HTP), on-device.
 #
 # Companion to scripts/bench_matrix.sh (which is the Mac/desktop equivalent).
 # Emits one CSV row per config plus the raw stdout of every run, because the
@@ -22,7 +23,9 @@
 #
 # The model must already be on the device at $DEVICE_DIR/<name.gguf>, and the
 # cera binary is pushed from target/aarch64-linux-android/release/cera (build
-# with: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu).
+# with: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu,hexagon).
+# The hexagon feature is required: without it the hexagon cell builds fine but
+# fails on-device ("Hexagon backend not available") and reports NA.
 set -euo pipefail
 
 DEVICE_DIR="/data/local/tmp/cera-bench"
@@ -50,6 +53,14 @@ PASSES=5
 # here from 93% down to 14% before this was noticed.
 MIN_BATTERY=30
 FORCE=no
+# OOM containment prefix for every on-device shell: adb-shell children
+# inherit oom_score_adj -1000 (unkillable), so a cell that exhausts memory
+# deadlock-panics the phone instead of dying (measured: GPU bench rebooted
+# an S25U three times). Mark the remote shell normally-killable first; both
+# engines inherit it. Best-effort (`;`, never `&&`) so a hardening failure
+# can never skip the cell itself. Single-quoted: `$$` is the REMOTE shell's
+# pid, expanded on-device, not this script's.
+OOM_GUARD='echo 0 > /proc/$$/oom_score_adj 2>/dev/null; '
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -200,9 +211,11 @@ echo "==> pushing cera to $DEVICE_DIR"
 # peak a cold phone can hit for two seconds.
 # ---------------------------------------------------------------------------
 
-# Live BIG-cluster temperature, integer C. Must come from "Current temperatures
+# Live SoC temperature, integer C. Must come from "Current temperatures
 # from HAL"; the "Cached temperatures" section earlier in the same dumpsys is
-# stale and reads high long after the device has cooled.
+# stale and reads high long after the device has cooled. Sensor name differs
+# by vendor: Pixels expose the big cluster as BIG, Samsungs report the whole
+# SoC as AP (mType=0 either way), so BIG is tried first with AP as fallback.
 soc_big() {
   # `|| true` on every sampler: these run inside the background sampling loop and
   # their last command is a pipeline over adb output, so a transient adb failure
@@ -210,7 +223,7 @@ soc_big() {
   # caller down mid-matrix. An empty sample is the correct degradation.
   "${ADB[@]}" shell "dumpsys thermalservice" 2>/dev/null \
     | awk '/Current temperatures from HAL/,/Current cooling devices/' \
-    | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1 || true
+    | sed -n -e 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' -e 's/.*mValue=\([0-9.]*\), mType=0, mName=AP, .*/\1/p' | head -1 | cut -d. -f1 || true
 }
 
 # Mid-run CPU frequency on a perf core, MHz. This is the variable that actually
@@ -329,11 +342,32 @@ stop_samplers() {
 sample_cera() { # backend label mask
   local backend="$1" mask="$3" key="cera|$2"
   local pin=""; [[ -n "$mask" ]] && pin="taskset $mask "
-  local base="cd \"$DEVICE_DIR\" && ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
+  # Hexagon skels live next to the llama libs (same DSP images both engines
+  # use); harmless for cpu/gpu cells, required for hexagon.
+  local skel_dir="/data/local/tmp"
+  [[ -n "$LLAMA_BENCH" ]] && skel_dir="$(dirname "$LLAMA_BENCH")"
+  local base="${OOM_GUARD}cd \"$DEVICE_DIR\" && ADSP_LIBRARY_PATH=\"$skel_dir\" ${pin}./cera bench -m \"$MODEL\" --device \"$backend\" \
 --runs $RUNS --warmup $WARMUP --no-cache --gpu-io"
+  # Thermal pacing: 2.6B vulkan decode loses the Adreno context when a run
+  # starts hot (intra-run headroom past ~0.85 after a long soak) while the
+  # same invocation is green cold. CERA_BENCH_COOLDOWN_SECS (default 0)
+  # idles the device before each cera invocation so heat-soaked cells
+  # start in the green regime. Targeted at cera GPU (llama OpenCL never
+  # tripped); set only for runs that need it.
+  local cooldown="${CERA_BENCH_COOLDOWN_SECS:-0}"
+  # Fail LOUD on garbage: `[[ $cooldown -gt 0 ]]` below is silently false
+  # for non-numeric input, fail-opening a guard against Adreno context loss.
+  # Exits the whole matrix — a silently unguarded run would report numbers
+  # from the red regime as if they were green-regime measurements.
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || {
+    echo "error: non-numeric CERA_BENCH_COOLDOWN_SECS=$cooldown (want seconds)" >&2
+    exit 1
+  }
   local pre dec
   start_samplers "$key"
+  if [[ "$backend" == "gpu" && "$cooldown" -gt 0 ]]; then sleep "$cooldown"; fi
   pre=$("${ADB[@]}" shell "$base --prompt-tokens $PROMPT --max-tokens 0" 2>&1 || true)
+  if [[ "$backend" == "gpu" && "$cooldown" -gt 0 ]]; then sleep "$cooldown"; fi
   dec=$("${ADB[@]}" shell "$base --prompt-tokens $DECODE_PROMPT --max-tokens $DECODE" 2>&1 || true)
   stop_samplers
   printf '%s\n' "$pre" >> "$LOG"
@@ -360,20 +394,26 @@ llama_cfg() { # threads label mask
   if [[ -n "$3" ]]; then echo "t$1-$2-$3"; else echo "t$1-$2"; fi
 }
 
-sample_llama() { # threads label mask
+sample_llama() { # threads label mask [ngl] [device]
   [[ -n "$LLAMA_BENCH" ]] || return 0
   # Declared separately from the substitution: `local x=$(...)` makes `local`
   # the command whose status is seen, masking a failure inside (SC2155).
   local t="$1" mask="$3" key rt
+  # Explicit -ngl, defaulting to 0: on Snapdragon the build registers OpenCL
+  # and HTP backends, and the -ngl default (-1, auto) would silently offload
+  # the "CPU" cells. On Tensor Pixels no GPU backend registers, so this is a
+  # no-op there.
+  local ngl="${4:-0}" device="${5:-}"
   key="llama.cpp|$(llama_cfg "$1" "$2" "$3")"
   rt=$(dirname "$LLAMA_BENCH")
-  local out pin=""
+  local out pin="" dev_flag=""
+  [[ -n "$device" ]] && dev_flag="--device $device "
   # An empty mask means "unpinned", the symmetric counterpart to cera's default
   # RowPool cell; taskset with no mask is a syntax error, so omit it entirely.
   [[ -n "$mask" ]] && pin="taskset $mask "
   start_samplers "$key"
-  out=$("${ADB[@]}" shell "cd \"$rt\" && LD_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
--m \"$DEVICE_DIR/$MODEL\" -t $t -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
+  out=$("${ADB[@]}" shell "${OOM_GUARD}cd \"$rt\" && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ${pin}./\"$(basename "$LLAMA_BENCH")\" \
+-m \"$DEVICE_DIR/$MODEL\" -t $t ${dev_flag}-ngl $ngl -p $PROMPT -n $DECODE -r $RUNS -o md" 2>&1) || true
   stop_samplers
   printf '%s\n' "$out" >> "$LOG"
   # One `sed -n` per field rather than `grep | sed`, matching `sample_cera`. The
@@ -395,9 +435,12 @@ build_cells() {
   CERA_PRIME="pin-prime-$PRIME_MASK"
   CERA_MID="pin-mid-$MID_MASK"
   CERA_GPU="wgpu-vulkan"
+  CERA_HEXAGON="hexagon"
   LLAMA_PRIME=$(llama_cfg 1 prime "$PRIME_MASK")
   LLAMA_MID=$(llama_cfg "$N_MID" mid "$MID_MASK")
   LLAMA_BIG=$(llama_cfg "$N_BIG" big "$BIG_MASK")
+  LLAMA_HTP=$(llama_cfg "$N_ALL" htp0 "")
+  LLAMA_OCL=$(llama_cfg "$N_ALL" opencl "")
   # Unpinned, every core. Without this cell the matrix has no counterpart to
   # cera's default RowPool, which is also unpinned across every core, so a
   # best-vs-best prefill comparison silently pits cera on N cores against llama
@@ -405,21 +448,34 @@ build_cells() {
   LLAMA_ALL=$(llama_cfg "$N_ALL" all "")
   CELLS=(
     "cera|$CERA_DEFAULT" "cera|$CERA_PRIME" "cera|$CERA_MID" "cera|$CERA_GPU"
+    "cera|$CERA_HEXAGON"
     "llama.cpp|$LLAMA_PRIME" "llama.cpp|$LLAMA_MID" "llama.cpp|$LLAMA_BIG"
-    "llama.cpp|$LLAMA_ALL"
+    "llama.cpp|$LLAMA_ALL" "llama.cpp|$LLAMA_HTP" "llama.cpp|$LLAMA_OCL"
   )
 }
 
 # One pass over every cell, engines interleaved.
+# CERA_BENCH_SKIP trims the matrix without editing it: a space-separated list
+# of cell-group tokens to skip (`cera-cpu` drops all 3 cera CPU cells,
+# `llama-cpu` drops all 4 llama CPU cells, `gpu` cera's wgpu cell, `hexagon`
+# cera's NPU cell, `htp` llama's HTP cell, `opencl` llama's OpenCL cell).
+# Skipped cells still get a CSV row (NA), so a partial run stays comparable
+# to a full one. Empty (default) runs everything.
+skip_cell() { # token
+  [[ " ${CERA_BENCH_SKIP:-} " == *" $1 "* ]]
+}
 one_pass() {
-  sample_cera cpu "$CERA_DEFAULT" ""
-  sample_llama "$N_MID" mid "$MID_MASK"
-  sample_cera cpu "$CERA_PRIME" "$PRIME_MASK"
-  sample_llama 1 prime "$PRIME_MASK"
-  sample_cera cpu "$CERA_MID" "$MID_MASK"
-  sample_llama "$N_BIG" big "$BIG_MASK"
-  sample_cera gpu "$CERA_GPU" ""
-  sample_llama "$N_ALL" all ""
+  skip_cell cera-cpu || sample_cera cpu "$CERA_DEFAULT" ""
+  skip_cell llama-cpu || sample_llama "$N_MID" mid "$MID_MASK"
+  skip_cell cera-cpu || sample_cera cpu "$CERA_PRIME" "$PRIME_MASK"
+  skip_cell llama-cpu || sample_llama 1 prime "$PRIME_MASK"
+  skip_cell cera-cpu || sample_cera cpu "$CERA_MID" "$MID_MASK"
+  skip_cell llama-cpu || sample_llama "$N_BIG" big "$BIG_MASK"
+  skip_cell gpu || sample_cera gpu "$CERA_GPU" ""
+  skip_cell llama-cpu || sample_llama "$N_ALL" all ""
+  skip_cell hexagon || sample_cera hexagon "$CERA_HEXAGON" ""
+  skip_cell htp || sample_llama "$N_ALL" htp0 "" 99 HTP0
+  skip_cell opencl || sample_llama "$N_ALL" opencl "" 99 GPUOpenCL
 }
 
 detect_topology

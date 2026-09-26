@@ -27,7 +27,7 @@
 
 #![cfg(any(feature = "gpu", all(feature = "metal", target_os = "macos")))]
 
-use std::path::PathBuf;
+mod common;
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
@@ -41,13 +41,6 @@ use cera::model::load_model_gpu;
 use cera::model::load_model_metal;
 use cera::sampler::argmax;
 use cera::tokenizer::BpeTokenizer;
-
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
 
 /// One greedy step's record: the chosen token plus the full logit vector it was
 /// chosen from. Keeping the logits lets the gate distinguish a real bug (GPU
@@ -111,7 +104,7 @@ fn greedy_decode(
 /// `Some(Ok(()))` on agreement.
 #[cfg(feature = "gpu")]
 fn check_parity(model_file: &str, prompt: &str, n_predict: usize) -> Option<Result<(), String>> {
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         eprintln!("skipping {model_file}: not found at {}", mp.display());
         return None;
@@ -245,7 +238,7 @@ fn check_batched_vs_pertoken(
     prompt: &str,
     n_predict: usize,
 ) -> Option<Result<(), String>> {
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         eprintln!("skipping {model_file}: not found at {}", mp.display());
         return None;
@@ -304,7 +297,7 @@ fn check_metal_batched_vs_pertoken(
     prompt: &str,
     n_predict: usize,
 ) -> Option<Result<(), String>> {
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         eprintln!("skipping {model_file}: not found at {}", mp.display());
         return None;
@@ -364,7 +357,7 @@ fn check_metal_matches_cpu(
     prompt: &str,
     n_predict: usize,
 ) -> Option<Result<(), String>> {
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         eprintln!("skipping {model_file}: not found at {}", mp.display());
         return None;
@@ -421,7 +414,7 @@ fn check_metal_matches_cpu(
 fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result<(), String>> {
     use cera::model::metal_lfm2::MetalLfm2Model;
 
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         eprintln!("skipping {model_file}: not found at {}", mp.display());
         return None;

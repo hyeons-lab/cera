@@ -1301,6 +1301,17 @@ RustBuffer uniffi_cera_ffi_fn_func_cpu_backend_report(RustCallStatus *_Nonnull o
 RustBuffer uniffi_cera_ffi_fn_func_detect_tool_format(RustBuffer architecture, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HEXAGON_INSTALL_SKELS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HEXAGON_INSTALL_SKELS
+uint32_t uniffi_cera_ffi_fn_func_hexagon_install_skels(RustBuffer dir, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HEXAGON_PROBE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HEXAGON_PROBE
+RustBuffer uniffi_cera_ffi_fn_func_hexagon_probe(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HOTWORD_DEFAULT_CONFIG
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_FUNC_HOTWORD_DEFAULT_CONFIG
 RustBuffer uniffi_cera_ffi_fn_func_hotword_default_config(RustCallStatus *_Nonnull out_status
@@ -1657,6 +1668,18 @@ uint16_t uniffi_cera_ffi_checksum_func_cpu_backend_report(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_DETECT_TOOL_FORMAT
 uint16_t uniffi_cera_ffi_checksum_func_detect_tool_format(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_HEXAGON_INSTALL_SKELS
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_HEXAGON_INSTALL_SKELS
+uint16_t uniffi_cera_ffi_checksum_func_hexagon_install_skels(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_HEXAGON_PROBE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_FUNC_HEXAGON_PROBE
+uint16_t uniffi_cera_ffi_checksum_func_hexagon_probe(void
     
 );
 #endif

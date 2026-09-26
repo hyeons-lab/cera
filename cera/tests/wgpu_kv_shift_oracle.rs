@@ -24,11 +24,14 @@
 //!
 //! ## Tolerance
 //!
-//! The wgpu KV cache is **f32** (Metal's is f16), so there is no half-precision
-//! round-trip floor here — only the difference between `cos/sin` evaluated at
-//! `pos` directly vs. at `pos+shift` then composed with `-shift`. `5e-5` is
-//! comfortably above that reassociation noise while still catching any sign
-//! error, dim-pair swap, or magnitude drift.
+//! The wgpu KV cache holds packed f16 halves: the populated cache is rounded
+//! to f16 and packed before upload, while the oracle rotates full-precision
+//! values. f16 has ~11 bits of mantissa, so the single store-then-load
+//! round-trip introduces ~2^-10 ≈ 1e-3 relative error on the ~1-magnitude
+//! values here (same floor as the f16-native Metal oracle, which uses the
+//! same tolerance). `1e-3` clears it while still catching any sign error,
+//! dim-pair swap, or magnitude drift; the `cos/sin` reassociation noise the
+//! old `5e-5` covered sits an order below.
 //!
 //! Gating: needs only a GPU adapter (wgpu → Metal/Vulkan/DX). Runs whenever the
 //! `gpu` feature is on; skips cleanly if no adapter is available. Excluded on
@@ -58,7 +61,7 @@ const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
 const NEW_SEQ_LEN: usize = SEQ_LEN - SHIFT;
 const RETAINED: usize = NEW_SEQ_LEN - N_KEEP;
 const FREQ_BASE: f32 = 10_000.0;
-const TOL: f32 = 5e-5;
+const TOL: f32 = 1e-3;
 
 /// Per-head initial K vector. The `+ h*0.5` term makes every KV head hold
 /// DISTINCT data, so a kernel regression in the read-side head offset
@@ -82,7 +85,9 @@ fn run_kv_shift(
 ) -> Vec<f32> {
     // Build the K cache: cell at absolute position `t` holds the forward-RoPE'd
     // head for that position. Each head starts from distinct data (see
-    // `head_initial`) so head addressing is actually under test.
+    // `head_initial`) so head addressing is actually under test. Rounded to
+    // f16 and packed LE, exactly as `kv_append` lays the cache out (the
+    // oracle side stays full-precision; see Tolerance).
     let mut k_cache = vec![0.0f32; SEQ_LEN * KV_DIM];
     for t in 0..SEQ_LEN {
         for h in 0..N_KV_HEADS {
@@ -92,8 +97,22 @@ fn run_kv_shift(
             k_cache[off..off + HEAD_DIM].copy_from_slice(&rotated);
         }
     }
+    for v in k_cache.iter_mut() {
+        *v = half::f16::from_f32(*v).to_f32();
+    }
+    assert!(k_cache.len().is_multiple_of(2));
+    let packed: Vec<u32> = k_cache
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| {
+            let lo = half::f16::from_f32(p[0]).to_bits() as u32;
+            let hi = half::f16::from_f32(p[1]).to_bits() as u32;
+            lo | (hi << 16)
+        })
+        .collect();
 
-    let k_buf = ctx.upload_f32(&k_cache, "k_cache");
+    let k_buf = ctx.upload_storage(bytemuck::cast_slice(&packed), "k_cache");
     let scratch = ctx.create_storage_rw((RETAINED * KV_DIM * 4) as u64, "scratch");
     let ff = freq_factors.unwrap_or(&[1.0]);
     let ff_buf = ctx.upload_f32(ff, "freq_factors");

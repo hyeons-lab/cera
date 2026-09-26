@@ -4338,6 +4338,11 @@ mod webgpu {
                             time_depthformer_ms += js_sys::Date::now() - t_df0;
 
                             let audio_emb = match outcome {
+                                cera::audio_engine::FrameOutcome::Fault(detail) => {
+                                    return Err(JsError::new(&format!(
+                                        "audio decoder fault: {detail}"
+                                    )));
+                                }
                                 cera::audio_engine::FrameOutcome::End => {
                                     console_info(&format!(
                                         "[cera-wasm] WebGpuSession vocoder emitted End code after {} frames",
@@ -4453,6 +4458,11 @@ mod webgpu {
                         time_depthformer_ms += js_sys::Date::now() - t_df0;
 
                         let audio_emb = match outcome {
+                            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                                return Err(JsError::new(&format!(
+                                    "audio decoder fault: {detail}"
+                                )));
+                            }
                             cera::audio_engine::FrameOutcome::End => {
                                 if text_done {
                                     break;

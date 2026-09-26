@@ -1,13 +1,13 @@
-// n_keep context shift on the f32 wgpu KV cache. WGSL port of the
+// n_keep context shift on the packed-f16 wgpu KV cache. WGSL port of the
 // `kv_shift_k_to_scratch` half of `kv_shift.metal`.
 //
 // This kernel reads each RETAINED K cell at its OLD position
 // (n_keep + shift + t_off), applies the RoPE delta R(-shift) so the cell's
 // stored angle matches its NEW position (n_keep + t_off), and writes the
-// rotated pair to a scratch buffer at the compact offset t_off. The two memcpy
-// halves of the Metal shift (move the rotated K back into the cache, ferry V
-// through scratch) are done host-side with `copy_buffer_to_buffer` — wgpu has a
-// native buffer blit, so unlike Metal no companion memcpy kernel is needed.
+// rotated pair to an f32 scratch buffer at the compact offset t_off. The
+// rotated K moves back into the cache via a `kv_append` dispatch (a blit
+// cannot pack); the V ferry stays a `copy_buffer_to_buffer` pair (packed
+// bytes move as bytes).
 //
 // Rotating into scratch (rather than in place) is required: the source range
 // [(n_keep+shift)*kv_dim ..) and destination [n_keep*kv_dim ..) overlap when
@@ -25,7 +25,7 @@
 //   1 = NORM/interl → pairs at (2d, 2d + 1)          (LLaMA/Mistral/Granite)
 //
 // Bind group 0:
-//   @binding(0) k_cache: array<f32>       (read, the live K cache)
+//   @binding(0) k_cache: array<u32>       (read, the live packed K cache)
 //   @binding(1) scratch: array<f32>       (read-write, retained*kv_dim floats)
 //   @binding(2) params:  array<u32, 8>    (n_keep, shift, retained, n_kv_heads,
 //                                           head_dim, freq_base_bits, rope_type,
@@ -42,10 +42,17 @@
 
 #include "common_decls.tmpl"
 
-@group(0) @binding(0) var<storage, read> k_cache: array<f32>;
+@group(0) @binding(0) var<storage, read> k_cache: array<u32>;
 @group(0) @binding(1) var<storage, read_write> scratch: array<f32>;
 @group(0) @binding(2) var<storage, read> params: array<u32, 8>;
 @group(0) @binding(3) var<storage, read> freq_factors: array<f32>;
+
+// One packed half as f32. A pure helper (no barrier) is safe here — only
+// `workgroupBarrier()` in helpers miscompiles on naga's SPIR-V path.
+fn k_at(i: u32) -> f32 {
+    let pair = unpack2x16float(k_cache[i >> 1u]);
+    return select(pair.x, pair.y, (i & 1u) == 1u);
+}
 
 @compute @workgroup_size(256, 1, 1)
 fn kv_shift(
@@ -91,8 +98,8 @@ fn kv_shift(
 
     let t_old = n_keep + t_off + shift;
     let src_base = t_old * kv_dim + head_off;
-    let x0 = k_cache[src_base + e0];
-    let x1 = k_cache[src_base + e1];
+    let x0 = k_at(src_base + e0);
+    let x1 = k_at(src_base + e1);
 
     // Same per-pair schedule as the forward path's `rope_angle`, negated so the
     // stored angle is reduced by `shift` — exactly what re-encodes the cell's

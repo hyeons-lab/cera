@@ -76,7 +76,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Rust core; retain existing engine and raw helpers",
-      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, }"
+      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, Hexagon, }"
     },
     {
       "source": "cera/src/engine.rs",
@@ -337,7 +337,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, }"
+      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, Hexagon, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -530,6 +530,13 @@
     },
     {
       "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "HexagonProbeInfo",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct HexagonProbeInfo { pub arch: String, pub threads: u32, pub hvx_units: u32, pub hmx_units: u32, pub vtcm_bytes: u64, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
       "kind": "functions",
       "owner": "<module>",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
@@ -537,6 +544,8 @@
         "cera_ffi_version": "pub fn cera_ffi_version() -> String",
         "cpu_backend_report": "pub fn cpu_backend_report() -> String",
         "detect_tool_format": "pub fn detect_tool_format(architecture: String) -> Option<ToolFormat>",
+        "hexagon_install_skels": "pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError>",
+        "hexagon_probe": "pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError>",
         "hotword_default_config": "pub fn hotword_default_config() -> FfiHotwordConfig",
         "list_leap_bundles": "pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, FfiError>",
         "list_leap_bundles_async": "pub async fn list_leap_bundles_async() -> Result<Vec<LeapBundleEntry>, FfiError>",

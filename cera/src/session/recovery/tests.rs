@@ -316,9 +316,11 @@ fn zero_reported_progress_is_still_a_mutation_attempt() {
     active.append_tokens(&[0, 1]).unwrap();
     let before = snapshot(&active);
     model.fault.store(1, Ordering::Relaxed);
+    // Short-without-cancel is a backend fault, not user cancellation
+    // (a `Cancelled` here would read as resumable at the FFI boundary).
     assert!(matches!(
         active.with_ingest_recovery(|s| s.append_tokens(&[0, 1])),
-        Err(CeraError::Cancelled)
+        Err(CeraError::Backend(_))
     ));
     assert_eq!(outcome(&active), RecoveryOutcome::Restored);
     assert_eq!(snapshot(&active), before);

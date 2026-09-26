@@ -17,9 +17,9 @@ class ChatController extends ValueNotifier<ChatState> {
   ChatController({Future<String?> Function()? defaultStoreDir})
     : _defaultStoreDir = defaultStoreDir ?? (() async => null),
       super(const ChatState()) {
-    const kAppRevisionBadge = 'rev27-api-reshape';
+    const kAppRevisionBadge = 'rev28-hexagon-backend';
     debugPrint(
-      '[cera:chat:version] ChatController v0.6.2 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController v0.7.0 (build: $kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
@@ -152,6 +152,7 @@ class ChatController extends ValueNotifier<ChatState> {
       final backend = switch (backendStr) {
         'cpu' => CeraBackend.cpu,
         'gpu' => CeraBackend.gpu,
+        'hexagon' => CeraBackend.hexagon,
         _ => CeraBackend.auto,
       };
       final turboQuant = prefs.getBool('cera_turboquant') ?? false;

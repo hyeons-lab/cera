@@ -1,3 +1,11 @@
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+    - ios/**
+    - windows/**
+    - macos/**
+    - linux/**
 include: package:lints/recommended.yaml
 
 # No `analyzer.exclude` here any more: the generated UniFFI bindings moved to the

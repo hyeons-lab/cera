@@ -9,7 +9,7 @@ The controller manages rendered prompt deltas through `Cera`. It recognizes
 ChatML, Llama and Gemma continuation delimiters; an unknown template asks the
 user to start a new chat before changing native state. This is separate from the
 native `ChatSession` coordinator and its phase/ownership API. See the
-[0.6 API guide](../../docs/API_0_6.md) for that distinction and checkpoint limits.
+[API guide](../../docs/API_0_6.md) for that distinction and checkpoint limits.
 
 ```bash
 flutter run                # whichever device is attached

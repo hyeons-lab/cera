@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
+use crate::CeraError;
 use crate::backend::wgsl_pp::Preprocessor;
 use crate::tensor::DType;
 use half::f16;
@@ -201,6 +202,17 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub adapter_name: String,
     pub backend: String,
+    /// Whether `SHADER_F16` was available and requested. Informational:
+    /// wgpu hides this flag on drivers with working Float16 (Adreno 830),
+    /// so fp16 passthrough kernels must NOT gate on it (see
+    /// `use_stream_gemm`); only WGSL `enable f16` shaders need it set.
+    pub shader_f16: bool,
+    /// Whether `SUBGROUP` was available and requested. Gates the subgroup
+    /// reduction in `gemv_q4_0_fast` — without it (or without SPIR-V
+    /// passthrough) the host uses the tree-reduction WGSL twin of the same
+    /// slang source, since `enable subgroups` fails module creation on
+    /// devices lacking the feature.
+    pub has_subgroup: bool,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
@@ -212,6 +224,23 @@ pub struct GpuContext {
     /// prerequisite for `Arc<dyn Model>: Send + Sync` through the FFI.
     staging: Arc<std::sync::Mutex<Option<wgpu::Buffer>>>,
     staging_size: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by the device-lost callback with the driver reason. wgpu drops
+    /// all work silently after loss (instant submits, failed maps, no
+    /// validation errors), which used to surface as absurd prefill tok/s
+    /// and an index-OOB panic on the empty argmax readback — so every
+    /// submit/download choke point fails fast when this is set.
+    device_lost: Arc<std::sync::Mutex<Option<String>>>,
+    /// Sticky record of the last blocking-readback map failure (the
+    /// `warn_readback_zeros` sites below). The in-flight failure returns
+    /// zeros to its caller *before* `fail_if_device_lost` can fire on a
+    /// later call, so without this slot a GPU decode fault would be
+    /// sampled as token 0 and generation would continue. The model drains
+    /// it via [`Self::take_readback_fault`] into `take_decode_error`.
+    /// Shared across clones like `device_lost`: a fault observed through
+    /// any handle poisons the shared device for all of them. Each model
+    /// owns its context 1:1 in every production topology, and the session
+    /// gate allows one live session per model, so the take is unambiguous.
+    readback_fault: Arc<std::sync::Mutex<Option<CeraError>>>,
 }
 
 impl Clone for GpuContext {
@@ -221,6 +250,8 @@ impl Clone for GpuContext {
             queue: self.queue.clone(),
             adapter_name: self.adapter_name.clone(),
             backend: self.backend.clone(),
+            shader_f16: self.shader_f16,
+            has_subgroup: self.has_subgroup,
             max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
@@ -228,6 +259,8 @@ impl Clone for GpuContext {
             profiler: self.profiler.clone(),
             staging: Arc::clone(&self.staging),
             staging_size: Arc::clone(&self.staging_size),
+            device_lost: Arc::clone(&self.device_lost),
+            readback_fault: Arc::clone(&self.readback_fault),
         }
     }
 }
@@ -320,9 +353,39 @@ impl GpuContext {
     ///
     /// Every GPU submit in this backend goes through here, so the submit count
     /// is exact and there is a single choke point to batch submissions at.
+    /// Fail fast when the device-lost callback has fired. A lost device
+    /// drops all work silently, so submitting/reading back anyway would
+    /// produce fake-instant timings and zero/empty readbacks. Panics like
+    /// `poll_wait` on a genuinely broken device: loss is unrecoverable
+    /// without recreating the whole context.
+    fn fail_if_device_lost(&self) {
+        if let Some(detail) = self
+            .device_lost
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            panic!("GPU device lost ({detail}); cannot continue");
+        }
+    }
+
     pub(crate) fn submit_encoder(&self, enc: wgpu::CommandEncoder) {
+        self.fail_if_device_lost();
         io_stats::record_submit();
-        self.queue.submit(Some(enc.finish()));
+        // The env read stays uncached so tests can toggle profiling
+        // mid-process; the timestamps below are the part worth skipping.
+        let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
+        let t0 = host_prof.then(std::time::Instant::now);
+        let cmd = enc.finish();
+        let t1 = host_prof.then(std::time::Instant::now);
+        self.queue.submit(Some(cmd));
+        if let (Some(t0), Some(t1)) = (t0, t1) {
+            eprintln!(
+                "[GPU-HOST] finish={:.0}µs qsubmit={:.0}µs",
+                t1.duration_since(t0).as_secs_f64() * 1e6,
+                t1.elapsed().as_secs_f64() * 1e6,
+            );
+        }
     }
 
     /// Initialize the GPU: request a high-performance adapter + device
@@ -370,6 +433,16 @@ impl GpuContext {
         let adapter_name = adapter.get_info().name.clone();
         let backend_kind = adapter.get_info().backend;
         let backend = format!("{backend_kind:?}");
+        if std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1") {
+            let f = adapter.features();
+            eprintln!(
+                "[GPU-HOST] adapter={adapter_name} backend={backend} SUBGROUP={} SUBGROUP_BARRIER={} TIMESTAMP={} SHADER_F16={}",
+                f.contains(wgpu::Features::SUBGROUP),
+                f.contains(wgpu::Features::SUBGROUP_BARRIER),
+                f.contains(wgpu::Features::TIMESTAMP_QUERY),
+                f.contains(wgpu::Features::SHADER_F16),
+            );
+        }
 
         let profile_requested = std::env::var("CERA_GPU_PROFILE").as_deref() == Ok("1");
         let has_timestamps =
@@ -427,8 +500,26 @@ impl GpuContext {
             eprintln!("[cera::wgpu] uncaptured error: {err:?}");
         }));
 
+        // Device loss is otherwise silent: wgpu drops all subsequent work
+        // (submits return instantly, maps fail, no validation errors), which
+        // is exactly how a 2.6B Adreno run reported 460K prefill tok/s and
+        // then panicked indexing an empty argmax readback. Record the
+        // reason so the submit/download choke points can fail fast with it.
+        let device_lost = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let device_lost_cb = Arc::clone(&device_lost);
+            device.set_device_lost_callback(move |reason, msg| {
+                let detail = format!("{reason:?}: {msg}");
+                eprintln!("[cera::wgpu] device lost: {detail}");
+                *device_lost_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail);
+            });
+        }
+
         let profiler = if has_timestamps {
-            let max_queries = 512u32; // enough for ~16 layers × ~16 dispatches
+            // 2.6B prefill in profile mode (1 pass/dispatch) needs ~650 passes x
+            // 2 queries; decode ~360 x 2. 2048 covers both with headroom.
+            let max_queries = 2048u32;
             let timestamp_period = queue.get_timestamp_period();
             let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("profiler"),
@@ -480,6 +571,8 @@ impl GpuContext {
             queue,
             adapter_name,
             backend,
+            shader_f16: features.contains(wgpu::Features::SHADER_F16),
+            has_subgroup: features.contains(wgpu::Features::SUBGROUP),
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size as u64,
             max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
@@ -488,6 +581,8 @@ impl GpuContext {
             profiler,
             staging: Arc::new(std::sync::Mutex::new(None)),
             staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            device_lost: Arc::clone(&device_lost),
+            readback_fault: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -620,6 +715,7 @@ impl GpuContext {
     /// The caller is responsible for having submitted that copy first; this
     /// reads whatever the buffer currently holds.
     pub fn read_mapped_u32(&self, staging: &wgpu::Buffer, count: usize) -> Vec<u32> {
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<u32>()) as u64;
         assert!(
             staging.size() >= size,
@@ -635,6 +731,16 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            // Mirror `download_f32`: an empty vec here used to travel all
+            // the way to an index-OOB panic in the decode path. Say so now,
+            // and record first-wins: the sole caller (`forward_greedy_inner`)
+            // returns a dummy the session never samples — its post-greedy
+            // drain surfaces this record instead of a panic unwinding out
+            // of the core library.
+            eprintln!("[cera::wgpu] read_mapped_u32: readback map failed; returning empty");
+            self.record_readback_fault(
+                "read_mapped_u32: GPU readback map failed; returned empty".to_string(),
+            );
             return Vec::new();
         }
 
@@ -643,16 +749,79 @@ impl GpuContext {
             drop(data);
             res
         } else {
+            eprintln!(
+                "[cera::wgpu] read_mapped_u32: get_mapped_range failed after successful map; returning empty"
+            );
+            self.record_readback_fault(
+                "read_mapped_u32: get_mapped_range failed after successful map; returned empty"
+                    .to_string(),
+            );
             Vec::new()
         };
         staging.unmap();
         result
     }
 
+    /// Loud-zeros note shared by every blocking readback that zero-fills on
+    /// map failure: a failed map is otherwise indistinguishable from a
+    /// compute skip, so say so at the swallow site. `op` is the caller name
+    /// (keeps the message greppable). `read_mapped_u32` keeps its own
+    /// message: it returns empty, not zeros, under a different contract.
+    ///
+    /// Also records the fault in [`Self::readback_fault`] (sticky until
+    /// taken): the zeros return to the caller before any later
+    /// `fail_if_device_lost` can fire, so the record is what lets the
+    /// session fail the generation instead of sampling token 0. First
+    /// fault wins: one forward can fail several readbacks before the
+    /// session takes once, and the surfaced detail should name the first
+    /// failed op, not a downstream map. The `eprintln` above stays
+    /// unconditional so the full failure order is preserved in logs.
+    fn warn_readback_zeros(&self, op: &str, count: usize) {
+        // A failed map used to return zeros silently, indistinguishable
+        // from a compute skip. Say so loudly; the caller can't tell otherwise.
+        eprintln!("[cera::wgpu] {op}: readback map failed; returning {count} zeros");
+        self.record_readback_fault(format!(
+            "{op}: GPU readback map failed; returned {count} zeros"
+        ));
+    }
+
+    /// Twin of [`Self::warn_readback_zeros`] for the rarer failure one step
+    /// later: the map succeeded but `get_mapped_range` failed, so the
+    /// pre-zeroed buffer returns as-is. Same loud-plus-record contract, so
+    /// a message/record-policy fix lands in two helpers instead of six
+    /// call sites (`read_mapped_u32` keeps its own block: it returns
+    /// empty, not zeros, under a different contract).
+    fn warn_mapped_range_zeros(&self, op: &str, count: usize) {
+        eprintln!(
+            "[cera::wgpu] {op}: get_mapped_range failed after successful map; returning zeros"
+        );
+        self.record_readback_fault(format!(
+            "{op}: get_mapped_range failed after successful map; returned {count} zeros"
+        ));
+    }
+
+    /// First-wins record into the sticky readback-fault slot (drained via
+    /// [`Self::take_readback_fault`]): one forward can fail several
+    /// readbacks before the session takes once, and the surfaced detail
+    /// names the first failed op. Callers `eprintln` unconditionally so
+    /// the full failure order stays in logs.
+    fn record_readback_fault(&self, detail: String) {
+        crate::model::record_first_fault(&self.readback_fault, CeraError::Backend(detail));
+    }
+
+    /// Take a recorded blocking-readback failure, if any since the last
+    /// take. The model drains this into `take_decode_error`; the session
+    /// discards any stale record at generate start, so only the current
+    /// attempt's faults surface. Sticky until taken.
+    pub(crate) fn take_readback_fault(&self) -> Option<CeraError> {
+        crate::model::take_fault(&self.readback_fault)
+    }
+
     /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
     /// staging buffer to avoid per-token allocation.
     pub fn download_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<f32>()) as u64;
         // Grow staging buffer if needed (typically allocated once for
         // vocab_size). Size check + possible re-allocation happen under
@@ -696,6 +865,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("download_f32", count);
             return vec![0.0f32; count];
         }
 
@@ -703,6 +873,8 @@ impl GpuContext {
         if let Ok(data) = slice.get_mapped_range() {
             bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
             drop(data);
+        } else {
+            self.warn_mapped_range_zeros("download_f32", count);
         }
         staging.unmap();
         result
@@ -798,6 +970,7 @@ impl GpuContext {
     /// Used by the argmax kernel which writes `out: array<u32>`.
     pub fn download_u32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
         use std::sync::atomic::Ordering;
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<u32>()) as u64;
         let staging_guard = {
             let mut guard = self.staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -836,6 +1009,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("download_u32", count);
             return vec![0u32; count];
         }
 
@@ -843,6 +1017,8 @@ impl GpuContext {
         if let Ok(data) = slice.get_mapped_range() {
             bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
             drop(data);
+        } else {
+            self.warn_mapped_range_zeros("download_u32", count);
         }
         staging.unmap();
         result
@@ -851,6 +1027,7 @@ impl GpuContext {
     /// Read f16 data back from a GPU buffer and convert to f32 (blocking).
     pub fn download_f16_as_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
+        self.fail_if_device_lost();
         let size = (count * std::mem::size_of::<f16>()) as u64;
         // copy_buffer_to_buffer requires 4-byte alignment for size and offsets.
         let aligned_size = size.div_ceil(4) * 4;
@@ -891,6 +1068,7 @@ impl GpuContext {
         self.device.poll_wait();
         let map_res = rx.recv().ok();
         if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("download_f16_as_f32", count);
             return vec![0.0f32; count];
         }
 
@@ -899,6 +1077,8 @@ impl GpuContext {
             // Slicing to exact byte count before casting to handle potential 2-byte padding.
             bytemuck::cast_slice_mut(&mut f16_data).copy_from_slice(&data[0..size as usize]);
             drop(data);
+        } else {
+            self.warn_mapped_range_zeros("download_f16_as_f32", count);
         }
         staging.unmap();
         f16_data.iter().map(|&x| x.to_f32()).collect()
@@ -1110,6 +1290,561 @@ impl GpuContext {
         }
     }
 
+    /// Fast Q4_0 decode GEMV via SPIR-V passthrough: the subgroup-reduction
+    /// twin (`spirv/gemv_q4_0_fast.slang`, entry `main`). Same 4-binding
+    /// interface as the WGSL twin (0 = weights, 1 = x, 2 = y, 3 = params),
+    /// same NR=8 dispatch — only the module source differs. Passthrough is
+    /// the only way to ship subgroups: naga cannot parse WGSL `enable
+    /// subgroups`, so the WGSL twin carries the 6-barrier tree instead.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q4_0_fast.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q4_0_fast_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q4_0_fast_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q4_0_fast_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q4_0_fast.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q4_0_fast.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q4_0_fast_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // The kernel writes `sg_scratch` (one float per subgroup
+                    // per row) before the combine reads it — same contract as
+                    // the naga path (see `create_pipeline_with_defines`).
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Flat-planes Q6_K decode GEMV via SPIR-V passthrough
+    /// (`spirv/gemv_q6_k_flat.slang`, entry `main`). Same 4-binding
+    /// interface as [`Self::gemv_q6_k_passthrough`], but binding 0 holds
+    /// `repack_q6_k_flat` planes instead of GGUF-interleaved blocks, and
+    /// NR=8 rows per workgroup. No WGSL twin: the flat layout only exists
+    /// where passthrough does.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q6_k_flat.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q6_k_flat_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q6_k_flat_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q6_k_flat_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q6_k_flat.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q6_k_flat.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q6_k_flat_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // The kernel writes `sg_scratch` before the combine
+                    // reads it — same contract as the naga path.
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Fast Q6_K decode GEMV via SPIR-V passthrough: 64-thread,
+    /// subgroup-reduction twin of the handwritten `gemv_q6_k.wgsl`
+    /// (`spirv/gemv_q6_k.slang`, entry `main`). Same 4-binding interface;
+    /// NR=1 here vs NR=2 on the WGSL twin (host gates rows on the
+    /// pipeline). Passthrough is the only way to ship subgroups: naga
+    /// cannot parse WGSL `enable subgroups`, so the WGSL twin keeps the
+    /// 5-barrier tree.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q6_k.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q6_k_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q6_k_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q6_k_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q6_k.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q6_k.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q6_k_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // The kernel writes `sg_scratch` before the combine
+                    // reads it — same contract as the naga path.
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Streaming Q4_0 prefill GEMM via SPIR-V passthrough. Five bindings
+    /// (0 = repacked nibbles, 1 = repacked scales, 2 = f32 activations,
+    /// 3 = dst, 4 = params); fp16 arithmetic inside (see `use_stream_gemm`
+    /// for why that needs no capability gate beyond passthrough).
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module whose binding
+    /// interface matches the layout above (our slangc-compiled
+    /// `gemm_stream_q4_0.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemm_stream_q4_0_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemm_stream_q4_0_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemm_stream_q4_0_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemm_stream_q4_0.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q4_0.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_stream_q4_0_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// K-slice-64 twin of `gemm_stream_q4_0_passthrough`: identical binding
+    /// interface and grid, each k-slice covers 64 k. Dispatched when k % 64
+    /// == 0 (+28-33% on Adreno 830, bit-exact).
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module whose binding
+    /// interface matches the layout above (our slangc-compiled
+    /// `gemm_stream_q4_0_k64.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemm_stream_q4_0_k64_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemm_stream_q4_0_k64_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemm_stream_q4_0_k64_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q4_0_k64.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_stream_q4_0_k64_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Transpose + f32->f16 cast feeding the streaming GEMM. Three bindings
+    /// (0 = f32 token-major activations, 1 = f16 k-major scratch, 2 =
+    /// params). Same passthrough gating as `gemm_stream_q4_0_passthrough`.
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module whose binding
+    /// interface matches the layout above (our slangc-compiled
+    /// `transpose_cast_f16.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn transpose_cast_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("transpose_cast_f16_passthrough_bgl"),
+                entries: &[storage(0, true), storage(1, false), storage(2, true)],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("transpose_cast_f16_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from transpose_cast_f16.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/transpose_cast_f16.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("transpose_cast_f16_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Q4_0 decode GEMV over the resident stream layout
+    /// (`spirv/gemv_q4_0_stream.slang`, entry `main`): 64-thread,
+    /// subgroup-reduction twin of `gemv_q4_0_fast` that reads the
+    /// pre-transposed (q, d) repack instead of raw 18-byte blocks. 5-binding
+    /// interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch; see
+    /// `GpuLfm2Model::make_gemv_bg`. SPIR-V-only: the resident layout only
+    /// exists where passthrough does, so there is no WGSL twin.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q4_0_stream.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q4_0_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q4_0_stream_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q4_0_stream_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q4_0_stream.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q4_0_stream.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q4_0_stream_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    // The kernel writes `sg_scratch` before the combine reads
+                    // it — same contract as `gemv_q4_0_fast_passthrough`.
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Register-tiled Q4_0 GEMM over the resident stream layout
+    /// (`spirv/mul_mat_reg_tile_q4_0_stream.slang`, entry `main`): the
+    /// prefill fallthrough for resident weights the streaming kernel
+    /// declines (n < 32, strided B). Same 64x64 tiling as
+    /// `mul_mat_reg_tile_q4_0`, only the shmem dequant loader differs.
+    /// 5-binding interface (q, d, x, y, params). SPIR-V-only, like the
+    /// layout it reads.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `mul_mat_reg_tile_q4_0_stream.slang`). Only call
+    /// when `supports_spirv_passthrough()` is true.
+    pub fn mul_mat_reg_tile_q4_0_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from mul_mat_reg_tile_q4_0_stream.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/mul_mat_reg_tile_q4_0_stream.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("mul_mat_reg_tile_q4_0_stream_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    // NOTE: no `repack_q4_0_stream` GPU kernel. The (q, d) repack is
+    // load-time only now (host `repack_q4_0_stream` in gpu_lfm2.rs): the
+    // resident stream layout deleted the per-GEMM on-GPU transpose along
+    // with the rotating twin it fed.
+
     /// Begin a compute pass, counting it and attaching a profiling span.
     ///
     /// Use this rather than `CommandEncoder::begin_compute_pass` directly.
@@ -1156,6 +1891,15 @@ impl GpuContext {
             beginning_of_pass_write_index: Some(idx),
             end_of_pass_write_index: Some(idx + 1),
         })
+    }
+
+    /// Whether timestamp profiling is active (`CERA_GPU_PROFILE=1` on a
+    /// TIMESTAMP_QUERY adapter). Models gate profile-only pass splits on this:
+    /// production keeps merged passes, profile runs split them for per-stage
+    /// attribution. (Mid-pass `write_timestamp` is not an alternative: on the
+    /// Adreno 830 it corrupts even the pass-boundary timestamps.)
+    pub fn profiling(&self) -> bool {
+        self.profiler.is_some()
     }
 
     /// Reset profiler for a new forward pass.
@@ -1291,6 +2035,11 @@ pub mod shaders {
     /// Each branch's binding set is dropped for the other target.
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const RMSNORM: &str = include_str!(concat!(env!("OUT_DIR"), "/rmsnorm.wgsl"));
+    /// One decode K/V row into its cache slot (`dst[off+i] = src[i]`), so the
+    /// attn block merges pre+post into one pass. Generated from
+    /// `shaders/slang/kv_append.slang` by build.rs; WGSL-only
+    /// (`// slang-targets: wgsl`), since no Metal pipeline consumes it.
+    pub const KV_APPEND: &str = include_str!(concat!(env!("OUT_DIR"), "/kv_append.wgsl"));
     /// Mixture-of-experts routing (`lfm2moe`), generated from
     /// `shaders/slang/moe_route.slang` and shared with the Metal backend.
     ///
@@ -1306,8 +2055,6 @@ pub mod shaders {
     /// Fused Q4_0 SwiGLU FFN: silu(gate) * up in a single pass.
     pub const FFN_SWIGLU_Q4_0: &str =
         include_str!(concat!(env!("OUT_DIR"), "/ffn_swiglu_q4_0.wgsl"));
-    /// Fused 3-in-1 Q/K/V Q4_0 GEMV in a single pass.
-    pub const GEMV_Q4_0_QKV: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv_q4_0_qkv.wgsl"));
     /// Weighted sum of a token's expert outputs, generated from
     /// `shaders/slang/moe_combine.slang`. See [`MOE_ROUTE`].
     pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.wgsl"));
@@ -1443,6 +2190,10 @@ pub mod shaders {
     pub const ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.wgsl"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
+    /// F32-KV twin of [`FLASH_ATTENTION`] for the audio
+    /// detokenizer (`wgpu_audio_decoder`): same math/grid/params, bindings 1/2
+    /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
+    pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
     /// `tq_rotate_q` (three entry points in one module).
@@ -1579,11 +2330,58 @@ impl KvShiftParams {
     }
 }
 
+/// Fail closed when a passthrough case cannot run: with
+/// `CERA_REQUIRE_PASSTHROUGH=1` (the lavapipe CI leg) a skip is a
+/// failure, so the SPIR-V twin never reports green untested; elsewhere
+/// it is a visible note. The canonical copy for lib unit tests (every
+/// `#[cfg(test)]` module in this crate imports it); integration tests
+/// share one mirror in `tests/common` (`fail_closed_passthrough_skip`,
+/// named for its skip-only contract), since a `#[cfg(test)]` item is not
+/// linkable from an integration binary (keep the two in sync by hand).
+#[cfg(test)]
+pub(crate) fn require_passthrough_or_skip(ctx: &GpuContext, ran: bool, label: &str) {
+    if ran {
+        return;
+    }
+    assert!(
+        std::env::var("CERA_REQUIRE_PASSTHROUGH")
+            .unwrap_or_default()
+            .is_empty(),
+        "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) takes {}",
+        ctx.backend,
+        if ctx.supports_spirv_passthrough() {
+            "passthrough without SUBGROUP"
+        } else {
+            "no SPIR-V passthrough"
+        },
+    );
+    eprintln!(
+        "[gpu-passthrough] SKIP {label} passthrough on backend ({})",
+        ctx.backend
+    );
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
+    /// exactly as `kv_append` lays them out. One copy for every oracle that
+    /// mirrors the layout, so a layout fix cannot land on one oracle only.
+    fn pack_f16_pairs(x: &[f32]) -> Vec<u32> {
+        assert!(x.len().is_multiple_of(2));
+        x.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| {
+                let lo = half::f16::from_f32(p[0]).to_bits() as u32;
+                let hi = half::f16::from_f32(p[1]).to_bits() as u32;
+                lo | (hi << 16)
+            })
+            .collect()
+    }
 
     #[test]
     fn kv_shift_workgroups_recovers_flat_index_bijectively() {
@@ -1870,13 +2668,10 @@ mod tests {
         let x: Vec<f32> = (0..k).map(|i| (i as f32 - 31.0) * 0.05).collect();
 
         // Pack A to f16, two values per u32 (low half = even index).
+        // Same single f32→f16 conversion the helper performs, so the shared
+        // copy is bitwise-identical; `a_f16` stays for the CPU reference.
         let a_f16: Vec<f16> = a.iter().map(|&v| f16::from_f32(v)).collect();
-        let mut a_packed = Vec::with_capacity((m * k) as usize / 2);
-        for pair in a_f16.chunks(2) {
-            let lo = pair[0].to_bits() as u32;
-            let hi = pair[1].to_bits() as u32;
-            a_packed.push(lo | (hi << 16));
-        }
+        let a_packed = pack_f16_pairs(&a);
 
         // CPU reference from the f16-rounded weights.
         let mut expected = vec![0.0f32; m as usize];
@@ -3610,49 +4405,64 @@ mod tests {
         let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
 
-        let pipeline = ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k");
-        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: x_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        // Both module sources (WGSL always; SPIR-V passthrough where the
+        // backend accepts it) against the same CPU reference. k=512 (nb=2)
+        // also covers the passthrough kernel's narrow-k skip (NQ=4 slots,
+        // slots 2-3 sit out) on backends that run it.
+        let use_passthrough = ctx.supports_spirv_passthrough() && ctx.has_subgroup;
+        require_passthrough_or_skip(&ctx, use_passthrough, "Q6_K");
+        for (label, passthrough) in [("wgsl", false), ("passthrough", true)] {
+            if passthrough && !use_passthrough {
+                continue;
+            }
+            let pipeline = if passthrough {
+                ctx.gemv_q6_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
+            };
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
-        }
-        ctx.submit_encoder(enc);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(m.div_ceil(2), 1, 1);
+            }
+            ctx.submit_encoder(enc);
 
-        let result = ctx.download_f32(&y_buf, m as usize);
-        for i in 0..m as usize {
-            let denom = expected[i].abs().max(1.0);
-            let rel = (expected[i] - result[i]).abs() / denom;
-            assert!(
-                rel < 5e-3,
-                "Q6_K GEMV mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
-                expected[i],
-                result[i]
-            );
+            let result = ctx.download_f32(&y_buf, m as usize);
+            for i in 0..m as usize {
+                let denom = expected[i].abs().max(1.0);
+                let rel = (expected[i] - result[i]).abs() / denom;
+                assert!(
+                    rel < 5e-3,
+                    "Q6_K GEMV [{label}] mismatch at row {i}: cpu={}, gpu={}, rel={rel:.2e}",
+                    expected[i],
+                    result[i]
+                );
+            }
         }
     }
 
@@ -3944,6 +4754,14 @@ mod tests {
             let v: Vec<f32> = (0..seq_len * kv_dim)
                 .map(|i| ((i * 11 + 1) % 19) as f32 * 0.05 - 0.45)
                 .collect();
+            // The cache holds packed halves: round K/V to f16 for the CPU
+            // reference and pack pairs LE (even elem in the low bits) for
+            // the upload, exactly as `kv_append` lays them out.
+            let round_f16 = |x: &[f32]| -> Vec<f32> {
+                x.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect()
+            };
+            let k_r = round_f16(&k);
+            let v_r = round_f16(&v);
             let params: [u32; 8] = [
                 n_heads,
                 n_kv_heads,
@@ -3956,8 +4774,8 @@ mod tests {
             ];
 
             let q_buf = ctx.upload_f32(&q, "q");
-            let k_buf = ctx.upload_f32(&k, "k");
-            let v_buf = ctx.upload_f32(&v, "v");
+            let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&k)), "k");
+            let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&v)), "v");
             let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let out_len = (n_heads * head_dim) as usize;
             let out_f = ctx.create_storage_rw(out_len as u64 * 4, "out_flash");
@@ -3986,7 +4804,7 @@ mod tests {
                 for (t, s) in scores.iter_mut().enumerate() {
                     let mut dot = 0.0f32;
                     for d in 0..hd {
-                        dot += q[h * hd + d] * k[t * kvd + kvo + d];
+                        dot += q[h * hd + d] * k_r[t * kvd + kvo + d];
                     }
                     *s = dot * scale;
                     mx = mx.max(*s);
@@ -3999,7 +4817,7 @@ mod tests {
                 for d in 0..hd {
                     let mut a = 0.0f32;
                     for (t, s) in scores.iter().enumerate() {
-                        a += s * v[t * kvd + kvo + d];
+                        a += s * v_r[t * kvd + kvo + d];
                     }
                     cpu_ref[h * hd + d] = a / sum;
                 }
@@ -4511,6 +5329,8 @@ mod tests {
             dtype: DType,
             shader: &'static str,
             entry: &'static str,
+            /// Build the pipeline via SPIR-V passthrough instead of WGSL.
+            passthrough: bool,
             rows_per_wg: u32,
             weight_bytes: &'a [u8],
             expected: &'a [f32],
@@ -4524,6 +5344,7 @@ mod tests {
                 dtype: DType::F32,
                 shader: shaders::GEMV_F32,
                 entry: "gemv_f32",
+                passthrough: false,
                 rows_per_wg: 8,
                 weight_bytes: f32_weight_bytes,
                 expected: &f32_expected,
@@ -4532,8 +5353,12 @@ mod tests {
             Case {
                 name: "q4_0",
                 dtype: DType::Q4_0,
+                // Mirror production selection (`GpuLfm2Model` pipelines):
+                // SPIR-V subgroup twin when passthrough is available, else
+                // the WGSL tree twin. Same NR=8 and bindings either way.
                 shader: shaders::GEMV_Q4_0_FAST,
                 entry: "gemv_q4_0_fast",
+                passthrough: ctx.supports_spirv_passthrough() && ctx.has_subgroup,
                 rows_per_wg: 8,
                 weight_bytes: &q4_bytes,
                 expected: &q4_expected,
@@ -4544,6 +5369,7 @@ mod tests {
                 dtype: DType::Q8_0,
                 shader: shaders::GEMV_Q8_0,
                 entry: "gemv_q8_0",
+                passthrough: false,
                 rows_per_wg: 8,
                 weight_bytes: &q8_bytes,
                 expected: &q8_expected,
@@ -4555,8 +5381,15 @@ mod tests {
         let params = [m, k, 0u32, 0u32];
         let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemv_dispatch_params");
 
+        // Only the q4_0 case above can take passthrough.
+        require_passthrough_or_skip(&ctx, cases.iter().any(|c| c.passthrough), "Q4_0");
+
         for case in cases {
-            let pipeline = ctx.create_pipeline(case.shader, case.entry, case.name);
+            let pipeline = if case.passthrough {
+                ctx.gemv_q4_0_fast_passthrough()
+            } else {
+                ctx.create_pipeline(case.shader, case.entry, case.name)
+            };
             let a_buf = ctx.upload_storage(case.weight_bytes, case.name);
             let y_buf = ctx.create_storage_rw((m as u64) * 4, "gemv_dispatch_y");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5801,6 +6634,12 @@ mod tests {
                 }
             }
         }
+        // The cache holds packed halves: round K/V to f16 here so the CPU
+        // reference below and the packed upload agree exactly (tolerance
+        // then covers only online-vs-batched accumulation order).
+        for v in k_cache.iter_mut().chain(v_cache.iter_mut()) {
+            *v = half::f16::from_f32(*v).to_f32();
+        }
 
         // CPU reference: per-query, per-head attention with causal mask.
         let mut ref_out = vec![0.0f32; (n_queries * out_stride) as usize];
@@ -5869,9 +6708,12 @@ mod tests {
             "attention_prefill",
             "attention_prefill",
         );
+        // Pack K/V pairs LE (even elem in the low bits), exactly as
+        // `kv_append` lays them out; the fixture already holds f16-rounded
+        // values.
         let q_buf = ctx.upload_f32(&f.q_batch, "q");
-        let k_buf = ctx.upload_f32(&f.k_cache, "k");
-        let v_buf = ctx.upload_f32(&f.v_cache, "v");
+        let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.k_cache)), "k");
+        let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&f.v_cache)), "v");
         let out_buf = ctx.create_storage_rw((f.ref_out.len() as u64) * 4, "out");
 
         let mut q_base = 0u32;
@@ -5889,7 +6731,7 @@ mod tests {
                 f.q_stride,
                 f.out_stride,
                 q_base,
-                0,
+                n_sub,
             ];
             let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -5923,7 +6765,7 @@ mod tests {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(f.n_heads, n_sub, 1);
+                pass.dispatch_workgroups(f.n_heads, n_sub.div_ceil(8), 1);
             }
             ctx.submit_encoder(enc);
             q_base += n_sub;
@@ -5972,7 +6814,7 @@ mod tests {
     }
 
     /// `attention_prefill` long-KV parity: a causal window spanning several
-    /// 256-key online-softmax tiles (with the boundary landing mid-tile) matches
+    /// 32-key online-softmax tiles (with the boundary landing mid-tile) matches
     /// the CPU reference. This is the case the pre-flash shader could not run under
     /// a 128 MiB storage-binding limit — its scores slab was
     /// `n_queries × n_heads × max_seq`; the flash kernel bounds workgroup memory to
@@ -5984,11 +6826,11 @@ mod tests {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
-        // start_pos 900 + 200 queries → last query seq_len 1100 > 4 × TILE(256).
+        // start_pos 900 + 200 queries → last query seq_len 1100 > 34 × TILE(32).
         let f = build_attn_prefill_fixture(4, 2, 32, 200, 900);
         assert!(
-            f.max_seq > 4 * 256,
-            "long-KV fixture must span >4 key tiles; got max_seq={}",
+            f.max_seq > 34 * 32,
+            "long-KV fixture must span >34 key tiles; got max_seq={}",
             f.max_seq
         );
         let got = run_gpu_attention_prefill(&ctx, &f);
@@ -6072,7 +6914,7 @@ mod tests {
             q_stride,
             out_stride,
             0, // q_base
-            0,
+            n, // n_sub (authoritative live-query count)
         ];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -6106,7 +6948,7 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(n_heads, n, 1);
+            pass.dispatch_workgroups(n_heads, n.div_ceil(8), 1);
         }
         ctx.submit_encoder(enc);
 

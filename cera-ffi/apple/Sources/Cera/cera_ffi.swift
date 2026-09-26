@@ -5222,8 +5222,9 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     func appendAudio(samples: [Float], sampleRate: UInt32) throws 
     
@@ -5276,8 +5277,9 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     func appendImage(bytes: Data, maxLongSize: UInt32?) throws 
     
@@ -5501,7 +5503,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     func hiddenStatesForTokens(tokens: [UInt32]) throws  -> Data
     
@@ -5761,8 +5763,9 @@ open class Session: SessionProtocol, @unchecked Sendable {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
 open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_audio(
@@ -5822,8 +5825,9 @@ open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCal
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
 open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_image(
@@ -6172,7 +6176,7 @@ open func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEn
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
 open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -7843,6 +7847,82 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
 
 
 /**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+public struct HexagonProbeInfo: Equatable, Hashable {
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     */
+    public var arch: String
+    public var threads: UInt32
+    public var hvxUnits: UInt32
+    public var hmxUnits: UInt32
+    public var vtcmBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+         */arch: String, threads: UInt32, hvxUnits: UInt32, hmxUnits: UInt32, vtcmBytes: UInt64) {
+        self.arch = arch
+        self.threads = threads
+        self.hvxUnits = hvxUnits
+        self.hmxUnits = hmxUnits
+        self.vtcmBytes = vtcmBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension HexagonProbeInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHexagonProbeInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HexagonProbeInfo {
+        return
+            try HexagonProbeInfo(
+                arch: FfiConverterString.read(from: &buf), 
+                threads: FfiConverterUInt32.read(from: &buf), 
+                hvxUnits: FfiConverterUInt32.read(from: &buf), 
+                hmxUnits: FfiConverterUInt32.read(from: &buf), 
+                vtcmBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HexagonProbeInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.arch, into: &buf)
+        FfiConverterUInt32.write(value.threads, into: &buf)
+        FfiConverterUInt32.write(value.hvxUnits, into: &buf)
+        FfiConverterUInt32.write(value.hmxUnits, into: &buf)
+        FfiConverterUInt64.write(value.vtcmBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lift(_ buf: RustBuffer) throws -> HexagonProbeInfo {
+    return try FfiConverterTypeHexagonProbeInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lower(_ value: HexagonProbeInfo) -> RustBuffer {
+    return FfiConverterTypeHexagonProbeInfo.lower(value)
+}
+
+
+/**
  * Recovery diagnostic retained after a failed `send_message` ingestion.
  * The call's original error is still returned separately. Generation failures
  * after successful ingestion do not create this report.
@@ -9183,7 +9263,7 @@ public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffe
 public enum BackendPreference: Equatable, Hashable {
     
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     case auto
     case cpu
@@ -9195,6 +9275,10 @@ public enum BackendPreference: Equatable, Hashable {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     case metal
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    case hexagon
 
 
 
@@ -9224,6 +9308,8 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case 4: return .metal
         
+        case 5: return .hexagon
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -9246,6 +9332,10 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case .metal:
             writeInt(&buf, Int32(4))
+        
+        
+        case .hexagon:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -12290,6 +12380,44 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 })
 }
 /**
+ * Write the embedded DSP skels into `dir` (created if missing) and
+ * point FastRPC's loader at it. For JVM/desktop/shell flows where the
+ * caller stages a private writable directory; Android apps instead use
+ * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+ * (which points the loader at `nativeLibraryDir`), so this call is not
+ * needed there. Do not combine the two in one process unless merging
+ * both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+ * flow per app. Call once at startup, before [`hexagon_probe`] or
+ * loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * number of skels written (0 when all were already present and fresh).
+ * Re-running is cheap and idempotent (files are only rewritten when
+ * their bytes differ, and the loader path is not duplicated). A `dir`
+ * containing `;` is rejected: it would silently split into two loader
+ * search entries.
+ */
+public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        FfiConverterString.lower(dir),$0
+    )
+})
+}
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. On Android, call the AAR's
+ * `HexagonNpu.setup` first so the loader can find the skel files
+ * (JVM/desktop flows use [`hexagon_install_skels`] instead).
+ */
+public func hexagonProbe()throws  -> HexagonProbeInfo  {
+    return try  FfiConverterTypeHexagonProbeInfo_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_probe($0
+    )
+})
+}
+/**
  * Default KWS configuration parameters.
  */
 public func hotwordDefaultConfig() -> FfiHotwordConfig  {
@@ -12504,6 +12632,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12708,10 +12842,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 51530) {
+    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+    if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -12762,7 +12896,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {

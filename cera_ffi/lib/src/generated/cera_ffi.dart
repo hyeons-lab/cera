@@ -1130,6 +1130,75 @@ class GenerateSummary {
   int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, totalDurationMs, decodeTokPerSec, promptEvalTokPerSec, finishReason);
 }
 
+/// Successful Hexagon NPU probe: the working DSP architecture plus
+/// hardware capabilities. See [`hexagon_probe`].
+class HexagonProbeInfo {
+  const HexagonProbeInfo({
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+    required this.arch,
+    required this.threads,
+    required this.hvxUnits,
+    required this.hmxUnits,
+    required this.vtcmBytes,
+  });
+
+  /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+  final String arch;
+  final int threads;
+  final int hvxUnits;
+  final int hmxUnits;
+  final int vtcmBytes;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'arch': this.arch,
+      'threads': this.threads,
+      'hvxUnits': this.hvxUnits,
+      'hmxUnits': this.hmxUnits,
+      'vtcmBytes': this.vtcmBytes,
+    };
+  }
+
+  factory HexagonProbeInfo.fromJson(Map<String, dynamic> json) {
+    return HexagonProbeInfo(
+      arch: json['arch'] as String,
+      threads: (json['threads'] as num).toInt(),
+      hvxUnits: (json['hvxUnits'] as num).toInt(),
+      hmxUnits: (json['hmxUnits'] as num).toInt(),
+      vtcmBytes: (json['vtcmBytes'] as num).toInt(),
+    );
+  }
+
+  HexagonProbeInfo copyWith({
+    String? arch,
+    int? threads,
+    int? hvxUnits,
+    int? hmxUnits,
+    int? vtcmBytes,
+  }) {
+    return HexagonProbeInfo(
+      arch: arch ?? this.arch,
+      threads: threads ?? this.threads,
+      hvxUnits: hvxUnits ?? this.hvxUnits,
+      hmxUnits: hmxUnits ?? this.hmxUnits,
+      vtcmBytes: vtcmBytes ?? this.vtcmBytes,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'HexagonProbeInfo(arch: $arch, threads: $threads, hvxUnits: $hvxUnits, hmxUnits: $hmxUnits, vtcmBytes: $vtcmBytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is HexagonProbeInfo && arch == other.arch && threads == other.threads && hvxUnits == other.hvxUnits && hmxUnits == other.hmxUnits && vtcmBytes == other.vtcmBytes;
+
+  @override
+  int get hashCode => Object.hash(arch, threads, hvxUnits, hmxUnits, vtcmBytes);
+}
+
 /// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
 /// model directory plus every per-quant manifest inside it. Feed
 /// `name` and one element of `quants` straight to
@@ -2374,13 +2443,15 @@ class SessionRecoveryStatus {
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
 enum BackendPreference {
-  /// Probe Metal → GPU → CPU at load time.
+  /// Probe Metal / Hexagon / GPU / CPU at load time.
   auto,
   cpu,
   /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
   gpu,
   /// Native Metal. Requires the `metal` feature + macOS.
   metal,
+  /// Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+  hexagon,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -4550,6 +4621,7 @@ String _encodeBackendPreference(BackendPreference value) {
     BackendPreference.cpu => 'cpu',
     BackendPreference.gpu => 'gpu',
     BackendPreference.metal => 'metal',
+    BackendPreference.hexagon => 'hexagon',
   };
 }
 
@@ -4559,6 +4631,7 @@ BackendPreference _decodeBackendPreference(String raw) {
     'cpu' => BackendPreference.cpu,
     'gpu' => BackendPreference.gpu,
     'metal' => BackendPreference.metal,
+    'hexagon' => BackendPreference.hexagon,
     _ => throw StateError('Unknown BackendPreference variant: $raw'),
   };
 }
@@ -6509,6 +6582,39 @@ GenerateSummary _uniffiDecodeGenerateSummary(Uint8List bytes) {
   return value;
 }
 
+void _uniffiWriteHexagonProbeInfo(HexagonProbeInfo value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.arch);
+  writer.writeU32(value.threads);
+  writer.writeU32(value.hvxUnits);
+  writer.writeU32(value.hmxUnits);
+  writer.writeU64(value.vtcmBytes);
+}
+
+Uint8List _uniffiEncodeHexagonProbeInfo(HexagonProbeInfo value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteHexagonProbeInfo(value, writer);
+  return writer.toBytes();
+}
+
+HexagonProbeInfo _uniffiReadHexagonProbeInfo(_UniFfiBinaryReader reader) {
+  return HexagonProbeInfo(
+    arch: reader.readString(),
+    threads: reader.readU32(),
+    hvxUnits: reader.readU32(),
+    hmxUnits: reader.readU32(),
+    vtcmBytes: reader.readU64(),
+  );
+}
+
+HexagonProbeInfo _uniffiDecodeHexagonProbeInfo(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadHexagonProbeInfo(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding HexagonProbeInfo');
+  }
+  return value;
+}
+
 void _uniffiWriteLeapBundleEntry(LeapBundleEntry value, _UniFfiBinaryWriter writer) {
   writer.writeString(value.name);
   writer.writeI32(value.quants.length);
@@ -7285,6 +7391,7 @@ void _uniffiWriteBackendPreference(BackendPreference value, _UniFfiBinaryWriter 
     BackendPreference.cpu => 2,
     BackendPreference.gpu => 3,
     BackendPreference.metal => 4,
+    BackendPreference.hexagon => 5,
   };
   writer.writeI32(tag);
 }
@@ -7306,6 +7413,8 @@ BackendPreference _uniffiReadBackendPreference(_UniFfiBinaryReader reader) {
       return BackendPreference.gpu;
     case 4:
       return BackendPreference.metal;
+    case 5:
+      return BackendPreference.hexagon;
     default:
       throw StateError('Unknown BackendPreference variant tag: $tag');
   }
@@ -8484,6 +8593,26 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format != 18753) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_detect_tool_format`: expected 18753, got $_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_hexagon_install_skels');
+      _checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 24481) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 24481, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_probe;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_hexagon_probe');
+      _checksum_uniffi_cera_ffi_checksum_func_hexagon_probe = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_probe`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe != 27471) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_probe`: expected 27471, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_func_hotword_default_config;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_func_hotword_default_config');
@@ -9171,8 +9300,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_audio`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_audio != 51530) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_audio`: expected 51530, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_audio');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_audio != 65327) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_audio`: expected 65327, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_audio');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_image;
     try {
@@ -9181,8 +9310,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_image != 13190) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_image`: expected 13190, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_image != 60729) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_image`: expected 60729, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_text;
     try {
@@ -9351,8 +9480,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens != 65100) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: expected 65100, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens != 60330) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: expected 60330, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters;
     try {
@@ -10441,6 +10570,143 @@ class CeraFfiFfi {
       if (!retReader.isDone) {
         throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
       }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _hexagonInstallSkelsFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_hexagon_install_skels');
+
+  int hexagonInstallSkels(String dir) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(3);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List dirBytes = Uint8List.fromList(utf8.encode(dir));
+      final ffi.Pointer<ffi.Uint8> dirPtr = dirBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(dirBytes.length);
+      if (dirBytes.isNotEmpty) { dirPtr.asTypedList(dirBytes.length).setAll(0, dirBytes); }
+      foreignArgPtrs.add(dirPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> dirFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      dirFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      dirFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> dirForeignPtr = calloc<_UniFfiForeignBytes>();
+      dirForeignPtr.ref
+        ..len = dirBytes.length
+        ..data = dirPtr;
+      final _UniFfiRustBuffer dirRustBuffer = _uniFfiRustBufferFromBytes(dirForeignPtr.ref, dirFromBytesStatusPtr);
+      calloc.free(dirForeignPtr);
+      final int dirFromBytesCode = dirFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer dirFromBytesErrBuf = dirFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(dirFromBytesStatusPtr);
+      if (dirFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> dirFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        dirFromBytesErrBufPtr.ref
+          ..capacity = dirFromBytesErrBuf.capacity
+          ..len = dirFromBytesErrBuf.len
+          ..data = dirFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(dirFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $dirFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = dirRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = dirRustBuffer.len;
+      (argBuf + 2).ref.ptr = dirRustBuffer.data.cast<ffi.Void>();
+      _hexagonInstallSkelsFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.u32;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _hexagonProbeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_func_hexagon_probe');
+
+  HexagonProbeInfo hexagonProbe() {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(0);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      _hexagonProbeFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeHexagonProbeInfo(retBytes);
       return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -29946,8 +30212,9 @@ final class Session {
   /// includes both "manifest didn't list a mmproj" (no warn
   /// logged) and "mmproj listed but failed to open/parse"
   /// (warn logged at `CeraEngine::from_path`).
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendAudio(List<double> samples, int sampleRate) {
     _ensureOpen();
     _ffi.sessionInvokeAppendAudio(_handle, samples, sampleRate);
@@ -30001,8 +30268,9 @@ final class Session {
   /// - `Backend(...)` for image decode failure, missing vision
   /// encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
   /// mismatch.
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendImage(Uint8List bytes, int? maxLongSize) {
     _ensureOpen();
     _ffi.sessionInvokeAppendImage(_handle, bytes, maxLongSize);
@@ -30243,7 +30511,7 @@ final class Session {
   ///
   /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
   /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
-  /// `>= vocab_size`.
+  /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
   Uint8List hiddenStatesForTokens(List<int> tokens) {
     _ensureOpen();
     return _ffi.sessionInvokeHiddenStatesForTokens(_handle, tokens);
@@ -31013,6 +31281,35 @@ String cpuBackendReport() {
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) {
   return _bindings().detectToolFormat(architecture);
+}
+
+/// Write the embedded DSP skels into `dir` (created if missing) and
+/// point FastRPC's loader at it. For JVM/desktop/shell flows where the
+/// caller stages a private writable directory; Android apps instead use
+/// the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+/// (which points the loader at `nativeLibraryDir`), so this call is not
+/// needed there. Do not combine the two in one process unless merging
+/// both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+/// flow per app. Call once at startup, before [`hexagon_probe`] or
+/// loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// number of skels written (0 when all were already present and fresh).
+/// Re-running is cheap and idempotent (files are only rewritten when
+/// their bytes differ, and the loader path is not duplicated). A `dir`
+/// containing `;` is rejected: it would silently split into two loader
+/// search entries.
+int hexagonInstallSkels(String dir) {
+  return _bindings().hexagonInstallSkels(dir);
+}
+
+/// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+/// tries each bundled DSP skel, and returns the first working device's
+/// capabilities (then closes it). Fails when the `hexagon` feature is
+/// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+/// unavailable to this process. On Android, call the AAR's
+/// `HexagonNpu.setup` first so the loader can find the skel files
+/// (JVM/desktop flows use [`hexagon_install_skels`] instead).
+HexagonProbeInfo hexagonProbe() {
+  return _bindings().hexagonProbe();
 }
 
 /// Default KWS configuration parameters.

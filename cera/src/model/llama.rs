@@ -209,6 +209,28 @@ impl LlamaModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, true)
+    }
+
+    /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
+    /// resolve weight metadata from this model but never dispatch CPU
+    /// kernels — the repacks would be gigabytes allocated only to be freed
+    /// after upload. Do NOT use for CPU inference (stays correct, just
+    /// slower: dispatch falls back to the naive path without them).
+    pub fn from_gguf_with_id_no_repack(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, false)
+    }
+
+    fn from_gguf_impl(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        repack: bool,
+    ) -> Result<Self> {
         ensure!(context_size > 0, "context_size must be > 0");
 
         // Metadata prefix is the architecture string itself
@@ -983,13 +1005,13 @@ impl LlamaModel {
             // that hit the batched prefill GEMM at `n > 1`. token_embd / output
             // stay excluded.
             layer_refs.push(LayerWeightRefs {
-                attn_q: attn_q.with_repack(&gguf),
-                attn_k: attn_k.with_repack(&gguf),
-                attn_v: attn_v.with_repack(&gguf),
-                attn_output: attn_output.with_repack(&gguf),
-                ffn_gate: ffn_gate.with_repack(&gguf),
-                ffn_up: ffn_up.with_repack(&gguf),
-                ffn_down: ffn_down.with_repack(&gguf),
+                attn_q: attn_q.with_repack_if(&gguf, repack),
+                attn_k: attn_k.with_repack_if(&gguf, repack),
+                attn_v: attn_v.with_repack_if(&gguf, repack),
+                attn_output: attn_output.with_repack_if(&gguf, repack),
+                ffn_gate: ffn_gate.with_repack_if(&gguf, repack),
+                ffn_up: ffn_up.with_repack_if(&gguf, repack),
+                ffn_down: ffn_down.with_repack_if(&gguf, repack),
             });
         }
 

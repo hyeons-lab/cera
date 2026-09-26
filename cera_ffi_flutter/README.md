@@ -3,7 +3,7 @@
 Flutter and Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine: on-device LLM inference with no network round trip.
 
-> The 0.6.2 plugin aligns native artifacts with the core chat, checkpoint, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 plugin aligns native artifacts with Qualcomm Hexagon NPU support, chat lifecycle, checkpoint, schema and audio corrections. See the [API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 This is the package Flutter apps depend on. It is an **FFI plugin**: the native
 library is fetched and linked by each platform's own build system, with no
@@ -26,13 +26,13 @@ The portable `Cera` facade accepts caller-rendered prompts. Native `ChatSession`
 is a separate coordinator with phases and ownership transfer; it is not
 available through generated web stubs. Check its phase before continuing a
 conversation, and reset or replace messages after `Interrupted`.
-CPU checkpoints are supported; native Metal/wgpu checkpoints are rejected.
+CPU checkpoints are supported; native Metal/Hexagon/wgpu checkpoints are rejected.
 
 ## Supported platforms
 
 | Platform | Minimum | Native library ships as | Notes |
 |----------|---------|------------------------|-------|
-| Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
+| Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a (with Qualcomm Hexagon NPU DSP skels), armeabi-v7a, x86_64 |
 | iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
 | Linux    | - | `libcera_ffi.so` | downloaded + checksummed by CMake |
@@ -153,6 +153,37 @@ into text. For token-by-token output use `generateStreamingAsync` with a
 **This `generate` blocks its isolate for the whole decode**, unlike
 `Cera.generate`. Drive it from `Isolate.run`, or use `generateStreamingAsync`,
 or use `Cera` and skip the question.
+
+### Qualcomm Hexagon NPU (Android)
+
+On Snapdragon hardware (SM8550+ / v73+), Cera executes inference directly on the Hexagon Tensor Processor (HTP) via FastRPC Unsigned PD. The Android AAR bundles the DSP skeleton libraries in `jniLibs/arm64-v8a/` and configures them automatically:
+
+```dart
+// Probe hardware support and capabilities:
+try {
+  final probe = hexagonProbe();
+  debugPrint('Hexagon NPU available: ${probe.arch} (${probe.threads} threads, ${probe.hvxUnits} HVX units)');
+} catch (e) {
+  debugPrint('Hexagon NPU not available: $e');
+}
+
+// Request Hexagon with the portable async API:
+final cera = await Cera.openPath(
+  modelPath,
+  options: const CeraOptions(backend: CeraBackend.hexagon),
+);
+
+// Or via low-level synchronous EngineConfig:
+final engine = CeraEngine.fromPath(
+  modelPath,
+  const EngineConfig(
+    contextSize: 2048,
+    backend: BackendPreference.hexagon,
+  ),
+);
+```
+
+On Android apps, the AAR manifest configuration (`<uses-native-library android:name="libcdsprpc.so">`) merges into the consuming application automatically. Call `HexagonNpu.setup(context)` once at startup in your Android `MainActivity.kt` (or call `hexagonInstallSkels(supportDir)` in Dart) to extract embedded DSP skeletons and register the search path before initializing the engine.
 
 ### Voice Modes & Speech Processing
 

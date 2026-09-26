@@ -1753,7 +1753,17 @@ struct MetalAudioEncoder {
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl AudioGpuEncode for MetalAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
-        encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)
+        // Drain the command-error slot around the encode (mirrors
+        // Session's discard-at-entry/drain-after-work discipline): a
+        // commit fault mid-encode otherwise returns Ok(stale embeddings)
+        // that the session prefills as valid, while the Err arm's CPU fallback (built for
+        // exactly this fault class) never fires.
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
     }
 }
 
@@ -1769,7 +1779,7 @@ pub fn build_gpu_audio_encoder(
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu | BP::Gpu => None,
+        BP::Cpu | BP::Gpu | BP::Hexagon => None,
         BP::Metal | BP::Auto => try_metal_audio_encoder(weights),
     }
 }

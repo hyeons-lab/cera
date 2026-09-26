@@ -852,6 +852,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_detect_tool_format(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_hexagon_install_skels(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_hexagon_probe(): Int
+
     external fun uniffi_cera_ffi_checksum_func_hotword_default_config(): Int
 
     external fun uniffi_cera_ffi_checksum_func_list_leap_bundles(): Int
@@ -2332,6 +2336,13 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        `dir`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_func_hexagon_probe(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_func_hotword_default_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_list_leap_bundles(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
@@ -2617,6 +2628,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2821,10 +2838,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 51530) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -2875,7 +2892,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
@@ -10762,8 +10779,9 @@ public interface SessionInterface {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendAudio`(
         `samples`: List<kotlin.Float>,
@@ -10819,8 +10837,9 @@ public interface SessionInterface {
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendImage`(
         `bytes`: kotlin.ByteArray,
@@ -11056,7 +11075,7 @@ public interface SessionInterface {
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray
 
@@ -11377,8 +11396,9 @@ open class Session :
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendAudio`(
@@ -11444,8 +11464,9 @@ open class Session :
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendImage`(
@@ -11875,7 +11896,7 @@ open class Session :
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     @Throws(FfiException::class)
     override fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray =
@@ -13151,6 +13172,57 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
 }
 
 /**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+data class HexagonProbeInfo(
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     */
+    var `arch`: kotlin.String,
+    var `threads`: kotlin.UInt,
+    var `hvxUnits`: kotlin.UInt,
+    var `hmxUnits`: kotlin.UInt,
+    var `vtcmBytes`: kotlin.ULong,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeHexagonProbeInfo : FfiConverterRustBuffer<HexagonProbeInfo> {
+    override fun read(buf: ByteBuffer): HexagonProbeInfo =
+        HexagonProbeInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+
+    override fun allocationSize(value: HexagonProbeInfo) =
+        (
+            FfiConverterString.allocationSize(value.`arch`) +
+                FfiConverterUInt.allocationSize(value.`threads`) +
+                FfiConverterUInt.allocationSize(value.`hvxUnits`) +
+                FfiConverterUInt.allocationSize(value.`hmxUnits`) +
+                FfiConverterULong.allocationSize(value.`vtcmBytes`)
+        )
+
+    override fun write(
+        value: HexagonProbeInfo,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`arch`, buf)
+        FfiConverterUInt.write(value.`threads`, buf)
+        FfiConverterUInt.write(value.`hvxUnits`, buf)
+        FfiConverterUInt.write(value.`hmxUnits`, buf)
+        FfiConverterULong.write(value.`vtcmBytes`, buf)
+    }
+}
+
+/**
  * Recovery diagnostic retained after a failed `send_message` ingestion.
  * The call's original error is still returned separately. Generation failures
  * after successful ingestion do not create this report.
@@ -14026,7 +14098,7 @@ public object FfiConverterTypeUserMessage : FfiConverterRustBuffer<UserMessage> 
 
 enum class BackendPreference {
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     AUTO,
     CPU,
@@ -14040,6 +14112,11 @@ enum class BackendPreference {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     METAL,
+
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    HEXAGON,
 
     ;
 
@@ -17775,6 +17852,47 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
     FfiConverterOptionalTypeToolFormat.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format(FfiConverterString.lower(`architecture`), _status)
+        },
+    )
+
+/**
+ * Write the embedded DSP skels into `dir` (created if missing) and
+ * point FastRPC's loader at it. For JVM/desktop/shell flows where the
+ * caller stages a private writable directory; Android apps instead use
+ * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
+ * (which points the loader at `nativeLibraryDir`), so this call is not
+ * needed there. Do not combine the two in one process unless merging
+ * both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
+ * flow per app. Call once at startup, before [`hexagon_probe`] or
+ * loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * number of skels written (0 when all were already present and fresh).
+ * Re-running is cheap and idempotent (files are only rewritten when
+ * their bytes differ, and the loader path is not duplicated). A `dir`
+ * containing `;` is rejected: it would silently split into two loader
+ * search entries.
+ */
+@Throws(FfiException::class)
+fun `hexagonInstallSkels`(`dir`: kotlin.String): kotlin.UInt =
+    FfiConverterUInt.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels(FfiConverterString.lower(`dir`), _status)
+        },
+    )
+
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. On Android, call the AAR's
+ * `HexagonNpu.setup` first so the loader can find the skel files
+ * (JVM/desktop flows use [`hexagon_install_skels`] instead).
+ */
+@Throws(FfiException::class)
+fun `hexagonProbe`(): HexagonProbeInfo =
+    FfiConverterTypeHexagonProbeInfo.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe(_status)
         },
     )
 

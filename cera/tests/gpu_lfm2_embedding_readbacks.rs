@@ -25,7 +25,7 @@
 //! **model**. A fresh `InferenceState` resets none of it, so this loads its own.
 #![cfg(feature = "gpu")]
 
-use std::path::PathBuf;
+mod common;
 
 use cera::backend::wgpu::io_stats;
 use cera::gguf::GgufFile;
@@ -37,29 +37,6 @@ const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 /// Enough frames that a per-frame readback is unmistakable against one, and in
 /// the range a real image lands in.
 const FRAMES: usize = 8;
-
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
-
-fn fixture_or_skip() -> Option<PathBuf> {
-    let p = models_dir().join(FIXTURE);
-    if p.exists() {
-        return Some(p);
-    }
-    assert!(
-        std::env::var("CERA_REQUIRE_MODEL")
-            .unwrap_or_default()
-            .is_empty(),
-        "CERA_REQUIRE_MODEL is set but {FIXTURE} is absent at {}",
-        p.display()
-    );
-    eprintln!("[gpu-embd-io] SKIP (absent): {}", p.display());
-    None
-}
 
 fn load_gpu(path: &std::path::Path) -> Option<Box<dyn Model>> {
     match load_model_gpu(GgufFile::open(path).expect("open gguf"), Some(path), 4096) {
@@ -89,7 +66,7 @@ fn synthetic_embedding(hidden_size: usize, salt: u32) -> Vec<f32> {
 
 #[test]
 fn an_image_costs_one_readback_not_one_per_patch() {
-    let Some(path) = fixture_or_skip() else {
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-embd-io") else {
         return;
     };
     let Some(gpu) = load_gpu(&path) else { return };

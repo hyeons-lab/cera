@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0
+
+- Add Qualcomm Hexagon NPU backend preference support.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.0.
+
 ## 0.6.3
 
 - Include the session additions (LoRA composition, per-request seeds, extraction overrides) and the ARM64 prefill correctness fix from `cera_ffi` 0.6.3.

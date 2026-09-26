@@ -894,6 +894,10 @@ impl MetalAudioDecoder {
         // 3. Encode layers
         let n_past = self.n_past.load(Ordering::Relaxed);
 
+        // Buffers on one queue complete in commit order, but waiting on the
+        // head buffer below only proves the layers *finished* — retain them
+        // so their final statuses are checked too (see after the wait).
+        let mut layer_bufs = Vec::with_capacity(self.layers.len());
         for (il, lw) in self.layers.iter().enumerate() {
             let cb = self.ctx.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
@@ -904,6 +908,7 @@ impl MetalAudioDecoder {
             }
             enc.end_encoding();
             cb.commit();
+            layer_bufs.push(cb);
         }
 
         // 4. Output norm + linear head per frame
@@ -937,8 +942,22 @@ impl MetalAudioDecoder {
                 self.barrier(enc);
             }
             enc.end_encoding();
+            // Split the wait from the check: the head wait settles every
+            // layer buffer too (one queue completes in commit order), but
+            // the checks must run layers-first so a layer fault cascading
+            // into the head wins the first-wins slot as the root cause
+            // instead of the head's downstream symptom. Review-only: no
+            // test pins this order (the success path records nothing, and
+            // faulting one buffer needs device injection), so keep the
+            // layers loop ahead of the head check by inspection.
             cb.commit();
             cb.wait_until_completed();
+            for layer_cb in &layer_bufs {
+                self.ctx
+                    .check_cmd_status(layer_cb, "detokenize_to_spectrum(layers)");
+            }
+            self.ctx
+                .check_cmd_status(cb, "detokenize_to_spectrum(head)");
         }
 
         self.n_past.store(n_past + n_frames, Ordering::Relaxed);
@@ -1032,8 +1051,7 @@ impl MetalAudioDecoder {
         );
 
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx.commit_and_wait(cb, "istft_to_pcm");
 
         let total = n_frames * hop_length;
         let mut pcm = vec![0.0f32; total];
@@ -1490,8 +1508,7 @@ impl MetalDepthformer {
             );
 
             enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
+            self.ctx.commit_and_wait(cb, "sample_frame");
 
             // 5. CPU: read logits, sample
             let logits = unsafe {
@@ -1575,6 +1592,22 @@ impl crate::model::audio_decoder::AudioGpu for MetalAudioDecoder {
     // `sample_audio_frame` panics in exactly that case.
     fn supports_depthformer(&self) -> bool {
         self.depthformer.is_some()
+    }
+
+    fn take_audio_error(&self) -> Option<crate::CeraError> {
+        // Drain every context this decoder owns (detokenizer plus the
+        // depthformer's private context). Both are cleared; the first
+        // `Some` in this fixed order wins. Callers discard before each
+        // bare call, so a take here holds at most the current attempt's
+        // fault. This replaces the old "stderr line only" residual: audio
+        // faults now surface through the engine instead of hanging on
+        // stale buffers.
+        let a = self.ctx.take_cmd_error();
+        let b = self
+            .depthformer
+            .as_ref()
+            .and_then(|df| df.ctx.take_cmd_error());
+        a.or(b)
     }
 
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {

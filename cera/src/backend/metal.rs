@@ -7,9 +7,12 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use metal::{
-    Buffer, CommandQueue, ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor,
-    Device, Library, MTLResourceOptions, MTLStorageMode,
+    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, CounterSampleBuffer,
+    CounterSampleBufferDescriptor, Device, Library, MTLCommandBufferStatus, MTLResourceOptions,
+    MTLStorageMode,
 };
+
+use crate::CeraError;
 
 pub mod params;
 pub use params::{
@@ -35,6 +38,19 @@ pub struct MetalContext {
     /// Cache compiled MSL libraries by source pointer address.
     /// Since sources are `include_str!` statics, pointer identity = source identity.
     library_cache: std::sync::Mutex<HashMap<usize, Library>>,
+    /// Sticky record of the last command buffer that finished in a
+    /// non-`Completed` status (see [`Self::commit_and_wait`]). Shared
+    /// buffers stay readable after a failure, so without this slot a dead
+    /// buffer's stale contents would be sampled as real output with no
+    /// record. The model drains it via [`Self::take_cmd_error`] into
+    /// `take_decode_error`. Each model owns its context 1:1, and the
+    /// session gate allows one live session per model, so the take is
+    /// unambiguous. Contexts owned by non-`Model` drivers
+    /// (`MetalAudioDecoder`, `MetalDepthformer` own private contexts)
+    /// drain through `AudioGpu::take_audio_error`, which the audio
+    /// engine checks after every bare call; do not assume audio faults
+    /// surface via `take_decode_error`.
+    cmd_error: std::sync::Mutex<Option<CeraError>>,
 }
 
 impl MetalContext {
@@ -48,7 +64,52 @@ impl MetalContext {
             queue,
             device_name,
             library_cache: std::sync::Mutex::new(HashMap::new()),
+            cmd_error: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Commit `cb`, block until it completes, and fail closed on a
+    /// non-`Completed` status: the failure is logged (shared buffers would
+    /// otherwise hand back stale contents indistinguishable from real
+    /// output) and recorded sticky-until-taken for `take_decode_error`.
+    /// `op` names the caller for the greppable message. Same status rule
+    /// the checked-KV-reset fence already applies inline.
+    pub fn commit_and_wait(&self, cb: &CommandBufferRef, op: &str) {
+        cb.commit();
+        cb.wait_until_completed();
+        self.check_cmd_status(cb, op);
+    }
+
+    /// Status half of [`Self::commit_and_wait`], split out for callers that
+    /// commit several buffers up front and wait once: buffers on one queue
+    /// complete in commit order, so after the last wait every earlier
+    /// buffer has a final status worth checking too.
+    ///
+    /// First fault wins the typed slot: multi-commit forwards can record
+    /// several failures per take, and the surfaced `Backend` detail should
+    /// name the root cause, not the last op. The `eprintln` stays
+    /// unconditional so the full failure order is preserved in logs.
+    pub fn check_cmd_status(&self, cb: &CommandBufferRef, op: &str) {
+        let status = cb.status();
+        if status != MTLCommandBufferStatus::Completed {
+            eprintln!(
+                "[cera::metal] {op}: command buffer finished with status {status:?}; results are stale"
+            );
+            crate::model::record_first_fault(
+                &self.cmd_error,
+                CeraError::Backend(format!(
+                    "Metal {op}: command buffer status {status:?} (expected Completed); results are stale"
+                )),
+            );
+        }
+    }
+
+    /// Take a recorded command-buffer failure, if any since the last take.
+    /// The model drains this into `take_decode_error`; the session discards
+    /// any stale record at generate start, so only the current attempt's
+    /// faults surface. Sticky until taken.
+    pub(crate) fn take_cmd_error(&self) -> Option<CeraError> {
+        crate::model::take_fault(&self.cmd_error)
     }
 
     /// Upload f32 data to a GPU buffer (shared storage, unified memory).
@@ -303,8 +364,7 @@ impl MetalContext {
         }
         enc.dispatch_thread_groups(grid, threads);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.commit_and_wait(cb, "run_kernel");
     }
 
     /// Upload a `[out_dim, in_dim]` row-major linear weight, keeping it packed
@@ -406,8 +466,6 @@ pub mod shaders {
     /// Fused Q4_0 SwiGLU FFN: silu(gate) * up in a single pass.
     pub const FFN_SWIGLU_Q4_0: &str =
         include_str!(concat!(env!("OUT_DIR"), "/ffn_swiglu_q4_0.metal"));
-    /// Fused 3-in-1 Q/K/V Q4_0 GEMV in a single pass.
-    pub const GEMV_Q4_0_QKV: &str = include_str!(concat!(env!("OUT_DIR"), "/gemv_q4_0_qkv.metal"));
     /// Generated from `shaders/slang/per_head_rmsnorm.slang` by build.rs and
     /// shared with the wgpu backend's
     /// `wgpu::shaders::PER_HEAD_RMSNORM`. A `__target_switch`
