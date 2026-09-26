@@ -1458,6 +1458,14 @@ mod tests {
         (RestoreMask { tid, saved }, only)
     }
 
+    /// Serializes the affinity tests below: pinning the process leader (or
+    /// probing the live allowance) is process-global, and the harness runs
+    /// tests on threads of one process. Without this, a sibling's leader pin
+    /// leaks into another test's tier-2 probe while the cgroup tier is
+    /// absent. Held for the whole body of each test that pins or probes.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    static AFFINITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The allowance probe reads the cpuset cgroup, not the calling
     /// thread's mask: pinning the caller to one CPU must not shrink the
     /// allowance. Linux/Android only, and skipped under Miri, which cannot
@@ -1467,6 +1475,7 @@ mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn cpu_allowance_ignores_calling_thread_pin() {
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         let before = process_cpu_allowance().expect("allowance probe works");
         if before <= 1 {
             eprintln!("skip: 1-CPU allowance cannot discriminate");
@@ -1476,28 +1485,52 @@ mod tests {
         assert_eq!(process_cpu_allowance(), Some(before));
     }
 
-    /// The allowance probe reads the cpuset cgroup, not the process
-    /// leader's mask: pinning the leader to one CPU must not shrink the
-    /// allowance either. Regression test for a collapse measured on-device,
-    /// where the pool's caller-pin (which pins the dispatching thread,
-    /// usually the leader) made the next resize hook read a 1-CPU
-    /// "allowance" and rebuild both pools to a single worker. Fails against
-    /// the old leader-mask probe (which returns 1 here); passes against the
-    /// cgroup read. Linux/Android only, skipped under Miri; the leader's
-    /// mask is restored on drop (pinning it narrows only the harness's main
-    /// thread, and only for the probe call).
+    /// The allowance probe over a pinned leader. Regression test for a collapse
+    /// measured on-device, where the pool's caller-pin (which pins the
+    /// dispatching thread, usually the leader) made the next resize hook read
+    /// a 1-CPU "allowance" and rebuild both pools to a single worker.
+    ///
+    /// Two legs because no single expectation holds everywhere. A direct pin
+    /// the claim does not describe is a genuine restriction where the cgroup
+    /// tier is absent (tier 2 honors it: the taskset case, e.g. cgroup2-only
+    /// systems without `/proc/self/cpuset`), while the cgroup tier wins over
+    /// the mask where present. The claim-injected leg then pins what must hold
+    /// on every system: once the mask is ours, the allowance falls back past
+    /// tier 2 to tier 1 (or the online CPUs), never to the 1-CPU mask. That leg
+    /// fails against the old leader-mask probe (which returns 1 here).
+    /// Linux/Android only, skipped under Miri; the leader's mask is restored
+    /// on drop (pinning it narrows only the harness's main thread, and only
+    /// for the probe calls).
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn cpu_allowance_ignores_leader_self_pin() {
-        let before = process_cpu_allowance().expect("allowance probe works");
-        if before <= 1 {
-            eprintln!("skip: 1-CPU cpuset cannot discriminate");
-            return;
-        }
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
-        let (_restore, _) = pin_thread_to_single_cpu(leader);
-        assert_eq!(process_cpu_allowance(), Some(before));
+        let cpuset = std::path::Path::new("/proc/self/cpuset");
+        let mountinfo = std::path::Path::new("/proc/self/mountinfo");
+        let online = std::path::Path::new("/sys/devices/system/cpu/online");
+        let tier1 = cgroup_cpuset_cpu_count(cpuset, mountinfo);
+        let before = process_cpu_allowance().expect("allowance probe works");
+        if before <= 1 {
+            eprintln!("skip: 1-CPU allowance cannot discriminate");
+            return;
+        }
+        let (_restore, cpu) = pin_thread_to_single_cpu(leader);
+        match tier1 {
+            Some(_) => assert_eq!(process_cpu_allowance(), Some(before)),
+            // No cgroup tier: the directly pinned leader is genuinely
+            // restricted, and tier 2 reports exactly the pinned mask.
+            None => assert_eq!(process_cpu_allowance(), Some(1)),
+        }
+        // Same mask, now described by our claim: distrusted everywhere, so
+        // the probe falls back past tier 2. The pin cannot move tier 1 (a
+        // mask is not a cgroup file), hence this exact composition.
+        let _inject = crate::backend::threadpool::debug_set_caller_pin_for_test(leader as i64, cpu);
+        assert_eq!(
+            process_cpu_allowance(),
+            tier1.or_else(|| read_cpu_list_file(online))
+        );
     }
 
     /// Self-pin detection reads the claim statics plus the live mask: a
@@ -1510,6 +1543,7 @@ mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn thread_self_pinned_matches_claim_and_live_mask() {
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         use crate::backend::threadpool::{debug_set_caller_pin_for_test, thread_self_pinned};
         // SAFETY: both always succeed.
         let me = unsafe { libc::gettid() };
@@ -1537,6 +1571,7 @@ mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn leader_effective_count_skips_self_pin() {
+        let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
         // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
         let before = leader_effective_count().expect("leader probe works");
