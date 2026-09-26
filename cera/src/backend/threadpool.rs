@@ -1365,7 +1365,36 @@ impl RowPool {
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
     {
-        self.dispatch_inner(y, n, min_rows, min_chunk_rows, 0, f);
+        self.dispatch_inner(y, n, min_rows, min_chunk_rows, 0, 0, f);
+    }
+
+    /// Like [`RowPool::dispatch_rows`], but with an explicit cap on active workers.
+    pub fn dispatch_rows_active<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        min_rows: usize,
+        max_active: usize,
+        f: F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.dispatch_rows_chunked_active(y, n, min_rows, MIN_CHUNK_ROWS, max_active, f);
+    }
+
+    /// Like [`RowPool::dispatch_rows_chunked`], but with an explicit cap on active workers.
+    pub fn dispatch_rows_chunked_active<F>(
+        &self,
+        y: &mut [f32],
+        n: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        max_active: usize,
+        f: F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        self.dispatch_inner(y, n, min_rows, min_chunk_rows, 0, max_active, f);
     }
 
     /// Like [`RowPool::dispatch_rows`], but caps the active worker count by the
@@ -1389,13 +1418,14 @@ impl RowPool {
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
     {
-        self.dispatch_inner(y, n, min_rows, MIN_CHUNK_ROWS, depth, f);
+        self.dispatch_inner(y, n, min_rows, MIN_CHUNK_ROWS, depth, 0, f);
     }
 
     /// Shared body of the `dispatch_rows*` family: split off any trailing
     /// partial row (run on the caller, matching serial `chunks_mut(n)`
     /// semantics), then run the exact rows in parallel. `depth` feeds the
-    /// work-based active cap (`0` = no cap); `min_chunk_rows` the steal floor.
+    /// work-based active cap (`0` = no cap); `min_chunk_rows` the steal floor;
+    /// `max_active` explicitly limits active workers (`0` = no cap).
     fn dispatch_inner<F>(
         &self,
         y: &mut [f32],
@@ -1403,6 +1433,7 @@ impl RowPool {
         min_rows: usize,
         min_chunk_rows: usize,
         depth: usize,
+        max_active: usize,
         f: F,
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
@@ -1416,7 +1447,16 @@ impl RowPool {
         // Split off any trailing partial row now; it runs on the caller after
         // the full rows (the parallel body only handles exact rows).
         let (body, tail) = y.split_at_mut(total_rows * n);
-        self.dispatch_body(body, n, total_rows, min_rows, min_chunk_rows, depth, &f);
+        self.dispatch_body(
+            body,
+            n,
+            total_rows,
+            min_rows,
+            min_chunk_rows,
+            depth,
+            max_active,
+            &f,
+        );
         if !tail.is_empty() {
             f(total_rows, tail);
         }
@@ -1433,6 +1473,7 @@ impl RowPool {
         min_rows: usize,
         min_chunk_rows: usize,
         depth: usize,
+        max_active: usize,
         f: &F,
     ) where
         F: Fn(usize, &mut [f32]) + Sync,
@@ -1445,6 +1486,10 @@ impl RowPool {
         // ops don't wake the whole pool. Within `active`, work is stolen (below).
         let rows_per_worker = total_rows.div_ceil(self.num_threads).max(min_rows);
         let mut active = total_rows.div_ceil(rows_per_worker).min(self.num_threads);
+
+        if max_active > 0 {
+            active = active.min(max_active);
+        }
 
         // Work cap: a GEMM with little total arithmetic can't keep the whole
         // pool busy, and only the `active` workers chosen here take part in the

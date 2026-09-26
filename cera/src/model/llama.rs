@@ -2102,7 +2102,8 @@ impl LlamaModel {
                 // `n_heads` of them (32 for Llama-1B), so the default steal floor
                 // would hand all heads to 2 workers. One head per steal unit lets
                 // every worker take a head.
-                cpu::par_rows_n_chunked(flash_buf, head_chunk, 1, 1, |(h, chunk)| {
+                let max_active = cpu::prefill_threads_for_tokens(n);
+                cpu::par_rows_n_chunked_active(flash_buf, head_chunk, 1, 1, max_active, |(h, chunk)| {
                     let kv_h = h / group_size;
                     cpu::flash_attention_gqa_cpu(
                         q_ref,

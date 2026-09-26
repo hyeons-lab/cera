@@ -904,6 +904,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_context_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens(): Int
@@ -1353,6 +1355,13 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+        `ptr`: Long,
+        `cacheDir`: RustBuffer.ByValue,
+        `maxWarmEntries`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -2704,6 +2713,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
@@ -4172,6 +4184,17 @@ public interface CeraEngineInterface {
     fun `clearPrefixCache`()
 
     /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    fun `configurePrefixCache`(
+        `cacheDir`: kotlin.String?,
+        `maxWarmEntries`: kotlin.UInt?,
+    )
+
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -4536,6 +4559,26 @@ open class CeraEngine :
                 )
             }
         }
+
+    /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    override fun `configurePrefixCache`(
+        `cacheDir`: kotlin.String?,
+        `maxWarmEntries`: kotlin.UInt?,
+    ) = callWithHandle {
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+                it,
+                FfiConverterOptionalString.lower(`cacheDir`),
+                FfiConverterOptionalUInt.lower(`maxWarmEntries`),
+                _status,
+            )
+        }
+    }
 
     /**
      * Resolved context-window size (KV cache cap) the engine was

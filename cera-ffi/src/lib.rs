@@ -1436,6 +1436,21 @@ impl CeraEngine {
         self.inner.clear_cache();
     }
 
+    /// Configure the model's KV prefix cache.
+    ///
+    /// When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+    /// When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+    pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>) {
+        let mut cfg = cera::kv_cache::KvCacheConfig {
+            cache_dir: cache_dir.map(std::path::PathBuf::from),
+            ..Default::default()
+        };
+        if let Some(warm) = max_warm_entries {
+            cfg.max_warm_entries = warm as usize;
+        }
+        self.inner.configure_cache(cfg);
+    }
+
     /// Detect PII entity spans in text using the loaded token classification model.
     pub fn detect_pii(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
         let spans = self.inner.detect_pii(&text)?;

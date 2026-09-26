@@ -457,6 +457,102 @@ pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) +
     f(0, total_rows);
 }
 
+/// Target worker cap for prefill passes given token sequence length `n`.
+/// For small prompt lengths (n <= 32), barrier sync across 8 cores can exceed arithmetic time.
+/// 2 threads (Prime cores) is ideal for n <= 32; 4 threads for n <= 64; full pool for n > 64.
+/// Overridable with `CERA_SMALL_PROMPT_THREADS`.
+pub fn prefill_threads_for_tokens(n: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let override_val = OVERRIDE.get_or_init(|| {
+        std::env::var("CERA_SMALL_PROMPT_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    if let Some(threads) = *override_val {
+        return threads.max(1);
+    }
+    if n <= 32 {
+        2
+    } else if n <= 64 {
+        4
+    } else {
+        usize::MAX
+    }
+}
+
+/// Row-parallel range dispatch for prefill passes with an active worker cap: executes
+/// `f(start_row, num_rows)` across at most `max_active` workers in the prefill pool.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_range_prefill_active(
+    total_rows: usize,
+    min_rows: usize,
+    max_active: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    if total_rows == 0 {
+        return;
+    }
+    let pool = super::threadpool::RowPool::prefill();
+    let nth = pool.num_threads().max(1).min(max_active);
+    let chunk = total_rows.div_ceil(nth).max(min_rows).max(1);
+    let n_chunks = total_rows.div_ceil(chunk);
+    let mut dummy_chunks = [0.0f32; 128];
+    if n_chunks <= dummy_chunks.len() {
+        pool.dispatch_rows_chunked_active(
+            &mut dummy_chunks[..n_chunks],
+            1,
+            1,
+            1,
+            max_active,
+            |t, slice| {
+                let m_start = t * chunk;
+                let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
+                if count > 0 {
+                    f(m_start, count);
+                }
+            },
+        );
+    } else {
+        let mut dummy = vec![0.0f32; n_chunks];
+        pool.dispatch_rows_chunked_active(
+            &mut dummy,
+            1,
+            1,
+            1,
+            max_active,
+            |t, slice| {
+                let m_start = t * chunk;
+                let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
+                if count > 0 {
+                    f(m_start, count);
+                }
+            },
+        );
+    }
+}
+
+/// Wasm32 fallback for `par_range_prefill_active`: runs serially on the calling thread.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_range_prefill_active(
+    total_rows: usize,
+    _min_rows: usize,
+    _max_active: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    f(0, total_rows);
+}
+
+/// Serial fallback for `par_range_prefill_active` without `parallel`: runs serially on the calling thread.
+#[cfg(not(feature = "parallel"))]
+pub fn par_range_prefill_active(
+    total_rows: usize,
+    _min_rows: usize,
+    _max_active: usize,
+    f: impl Fn(usize, usize) + Sync + Send,
+) {
+    f(0, total_rows);
+}
+
 /// Row-parallel range dispatch for prefill passes: executes `f(start_row, num_rows)` across
 /// the prefill worker pool.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
@@ -465,32 +561,7 @@ pub fn par_range_prefill(
     min_rows: usize,
     f: impl Fn(usize, usize) + Sync + Send,
 ) {
-    if total_rows == 0 {
-        return;
-    }
-    let pool = super::threadpool::RowPool::prefill();
-    let nth = pool.num_threads().max(1);
-    let chunk = total_rows.div_ceil(nth).max(min_rows).max(1);
-    let n_chunks = total_rows.div_ceil(chunk);
-    let mut dummy_chunks = [0.0f32; 128];
-    if n_chunks <= dummy_chunks.len() {
-        pool.dispatch_rows_chunked(&mut dummy_chunks[..n_chunks], 1, 1, 1, |t, slice| {
-            let m_start = t * chunk;
-            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-            if count > 0 {
-                f(m_start, count);
-            }
-        });
-    } else {
-        let mut dummy = vec![0.0f32; n_chunks];
-        pool.dispatch_rows_chunked(&mut dummy, 1, 1, 1, |t, slice| {
-            let m_start = t * chunk;
-            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-            if count > 0 {
-                f(m_start, count);
-            }
-        });
-    }
+    par_range_prefill_active(total_rows, min_rows, usize::MAX, f);
 }
 
 /// Wasm32 fallback for `par_range_prefill`: runs serially on the calling thread.
@@ -635,6 +706,54 @@ pub fn par_rows_n(y: &mut [f32], n: usize, _min_rows: usize, f: impl Fn((usize, 
     }
 }
 
+/// Like [`par_rows_n`] but with an explicit cap on active workers.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_n_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    max_active: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n_active: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    super::threadpool::RowPool::prefill().dispatch_rows_active(
+        y,
+        n,
+        min_rows,
+        max_active,
+        |row, row_slice| {
+            f((row, row_slice));
+        },
+    );
+}
+
+/// See the `wasm32` note on [`par_rows`].
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _max_active: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
+/// Serial fallback for builds without `parallel`.
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _max_active: usize,
+    f: impl Fn((usize, &mut [f32])),
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
 /// Like [`par_rows_n`] but with an explicit steal-chunk floor. Pass
 /// `min_chunk_rows = 1` for *few but expensive* rows (e.g. one flash-attention
 /// head per row) so every row is its own steal unit and all `active` workers
@@ -657,6 +776,58 @@ pub fn par_rows_n_chunked(
         min_chunk_rows,
         f,
     );
+}
+
+/// Like [`par_rows_n_chunked`] but with an explicit cap on active workers.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn par_rows_n_chunked_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    min_chunk_rows: usize,
+    max_active: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    debug_assert_ne!(n, 0, "par_rows_n_chunked_active: n must be > 0");
+    if n == 0 || y.is_empty() {
+        return;
+    }
+    super::threadpool::RowPool::prefill().dispatch_rows_chunked_active(
+        y,
+        n,
+        min_rows,
+        min_chunk_rows,
+        max_active,
+        |row, row_slice| {
+            f((row, row_slice));
+        },
+    );
+}
+
+/// See the `wasm32` note on [`par_rows`].
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn par_rows_n_chunked_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _min_chunk_rows: usize,
+    _max_active: usize,
+    f: impl Fn((usize, &mut [f32])) + Sync + Send,
+) {
+    par_rows_n(y, n, min_rows, f);
+}
+
+/// Serial fallback for builds without `parallel`.
+#[cfg(not(feature = "parallel"))]
+pub fn par_rows_n_chunked_active(
+    y: &mut [f32],
+    n: usize,
+    min_rows: usize,
+    _min_chunk_rows: usize,
+    _max_active: usize,
+    f: impl Fn((usize, &mut [f32])),
+) {
+    par_rows_n(y, n, min_rows, f);
 }
 
 /// Shared body of [`par_rows_n_chunked`] and [`par_rows_n_chunked_decode`]. The

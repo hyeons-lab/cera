@@ -6307,7 +6307,8 @@ pub(crate) mod neon {
 
         let sr_count = m / 8;
         if sr_count >= 2 {
-            crate::backend::cpu::par_rows_n(out, 8 * n, 1, compute_super_row);
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            crate::backend::cpu::par_rows_n_active(out, 8 * n, 1, max_active, compute_super_row);
         } else {
             out.chunks_mut(8 * n)
                 .enumerate()
@@ -6540,7 +6541,8 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                crate::backend::cpu::par_range_prefill(sr_count, 1, |start_sr, count| {
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                crate::backend::cpu::par_range_prefill_active(sr_count, 1, max_active, |start_sr, count| {
                     for sr in start_sr..start_sr + count {
                         compute_super_row(sr);
                     }
@@ -6849,7 +6851,8 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                crate::backend::cpu::par_range_prefill(sr_count, 1, |start_sr, count| {
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                crate::backend::cpu::par_range_prefill_active(sr_count, 1, max_active, |start_sr, count| {
                     for sr in start_sr..start_sr + count {
                         compute_super_row(sr);
                     }
@@ -7096,7 +7099,8 @@ pub(crate) mod neon {
 
         let sr_count = m / 8;
         if sr_count >= 2 {
-            crate::backend::cpu::par_rows_n(out, 8 * n, 1, compute_super_row);
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            crate::backend::cpu::par_rows_n_active(out, 8 * n, 1, max_active, compute_super_row);
         } else {
             out.chunks_mut(8 * n)
                 .enumerate()
@@ -7183,10 +7187,19 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                let nth = crate::backend::cpu::decode_par_threads().max(1);
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                let pool = crate::backend::threadpool::RowPool::prefill();
+                let nth = pool.num_threads().max(1).min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+                crate::backend::cpu::par_rows_n_chunked_active(
+                    &mut out[..sr_count],
+                    1,
+                    1,
+                    chunk,
+                    max_active,
+                    compute,
+                );
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
@@ -7303,10 +7316,19 @@ pub(crate) mod neon {
                     }
                 });
             } else {
-                let nth = crate::backend::cpu::decode_par_threads().max(1);
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                let pool = crate::backend::threadpool::RowPool::prefill();
+                let nth = pool.num_threads().max(1).min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked(&mut out[..sr_count], 1, 1, chunk, compute);
+                crate::backend::cpu::par_rows_n_chunked_active(
+                    &mut out[..sr_count],
+                    1,
+                    1,
+                    chunk,
+                    max_active,
+                    compute,
+                );
             }
         } else {
             (0..sr_count).for_each(compute_super_row);

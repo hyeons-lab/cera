@@ -364,7 +364,7 @@ android-libs:
     rm -rf target/android-libs-64 target/android-libs-32
     cargo ndk -o target/android-libs-64 \
         --target arm64-v8a --target x86_64 \
-        build -p cera-ffi --release --features ffi-buffer,hexagon
+        build -p cera-ffi --release --features ffi-buffer,hexagon,gpu
     cargo ndk -o target/android-libs-32 \
         --target armeabi-v7a --target x86 \
         build -p cera-ffi --release --features ffi-buffer
