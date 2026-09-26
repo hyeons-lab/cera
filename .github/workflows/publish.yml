@@ -471,7 +471,9 @@ jobs:
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r27c
+          # r28 floor: first NDK with 16KB ELF alignment by default (see
+          # the android-abis job in ci.yml). Keep in sync with it.
+          ndk-version: r28c
       - name: Build Android jniLibs
         if: ${{ matrix.android }}
         env:

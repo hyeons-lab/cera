@@ -377,6 +377,12 @@ android-libs:
     mkdir -p "$out/arm64-v8a"
     cp cera/src/backend/hexagon/skels/libggml-htp-v*.so "$out/arm64-v8a/"
     scripts/assert-ffibuffer.sh "$out"/*/libcera_ffi.so
+    # 16KB page alignment (Play requirement, Android 15+ hardware): every
+    # host-loaded .so must be 16KB-clean. The skels are deliberately NOT
+    # checked — they are DSP-side ELFs loaded into the CDSP by FastRPC,
+    # never mapped by Android's linker, so the requirement does not apply
+    # to them (see the script header).
+    python3 scripts/assert-16k-pages.py "$out"/*/libcera_ffi.so
     ls -la "$out"/*/libcera_ffi.so "$out"/arm64-v8a/libggml-htp-v*.so
 
 # Cross-compile `cera-ffi` to all three arm64-only Apple-platform

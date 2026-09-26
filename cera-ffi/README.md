@@ -318,7 +318,7 @@ app's `jniLibs/` as needed.
 
 ### NDK version
 
-CI pins NDK **r27c**, a stable release the workspace is validated
+CI pins NDK **r28c**, a stable release the workspace is validated
 against. The workflow installs it through `nttld/setup-ndk@v1` by
 version string (no checksum; the action fetches from Google's CDN
 which serves signed artifacts). Bumping is a one-line change: update
@@ -328,6 +328,22 @@ The `cargo ndk` flag shape is compatible across recent NDK majors so
 the pin is mostly about toolchain + sysroot stability across runs,
 not a hard constraint; later NDKs that keep the `armv7-linux-androideabi`
 and `i686-linux-android` sysroots should drop in cleanly.
+
+### 16KB page size
+
+Every published Android `.so` is 16KB-page clean: LOAD segments aligned
+to 16KB, as Android 15+ hardware and Google Play require. CI pins NDK
+r28c, whose default is already 16KB, and `.cargo/config.toml`
+additionally carries explicit `-z max-page-size=16384` /
+`-z common-page-size=16384` linker flags for all four Android targets
+(Google's documented recipe, kept so the requirement holds regardless
+of NDK default). Two checks enforce it:
+`scripts/assert-16k-pages.py` runs in the `android-abis` CI job on each
+built `.so`, and `just android-libs` (what the release pipeline stages
+into the AAR's `jniLibs/`) runs it on the staged set. Larger alignment
+is backward compatible: 16KB-aligned libraries load fine on 4KB-page
+devices. The Hexagon DSP skels are exempt (DSP-side ELFs loaded into
+the CDSP by FastRPC, never mapped by Android's linker).
 
 ## Apple platforms
 
