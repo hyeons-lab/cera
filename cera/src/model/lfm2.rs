@@ -5238,7 +5238,7 @@ mod loader_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mmap"))]
 mod no_repack_tests {
     use super::*;
 
@@ -5284,7 +5284,9 @@ mod no_repack_tests {
             // Same metadata resolved...
             assert_eq!(full_refs.len(), lite_refs.len());
             assert!(
-                full_refs.iter().all(|w| w.dtype == DType::Q4_0),
+                full_refs
+                    .iter()
+                    .all(|w| w.dtype == crate::tensor::DType::Q4_0),
                 "test model must be all-Q4_0 projections"
             );
             // ...repacks present in the full load, absent in the lite one.

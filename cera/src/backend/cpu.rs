@@ -1687,6 +1687,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     n: usize,
     k: usize,
 ) -> bool {
+    let _ = (packed, scales);
     let nb = k / 32;
     #[cfg(target_arch = "aarch64")]
     {
@@ -1735,6 +1736,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
     m: usize,
     k: usize,
 ) -> bool {
+    let _ = (packed, scales);
     let nb = k / 32;
     #[cfg(target_arch = "aarch64")]
     {
