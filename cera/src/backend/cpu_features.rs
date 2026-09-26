@@ -881,6 +881,7 @@ fn probe_set_with_leader<F: FnOnce() -> Option<Vec<usize>>>(
 fn leader_effective_set() -> Option<Vec<usize>> {
     // SAFETY: `getpid` addresses the process leader and always succeeds.
     let leader = unsafe { libc::getpid() };
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     if crate::backend::threadpool::thread_self_pinned(leader) {
         return None;
     }
@@ -1746,7 +1747,12 @@ mod tests {
     /// thread
     /// spawned inside the window would inherit the 1-CPU mask for its own
     /// test, an accepted residual.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
     #[test]
     fn usable_set_ignores_leader_self_pin() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
@@ -1812,7 +1818,12 @@ mod tests {
     /// live-mask half reads real masks): going through a real dispatch would
     /// be racy, since the claim is process-global and a concurrent pool test
     /// could hold it first. Linux/Android only, skipped under Miri.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
     #[test]
     fn thread_self_pinned_matches_claim_and_live_mask() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
@@ -1840,7 +1851,12 @@ mod tests {
     /// leader holds our caller-pin. The pin half is faked with the test
     /// injector (see above); the mask half is a real leader pin, restored
     /// on drop. Linux/Android only, skipped under Miri.
-    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "parallel",
+        not(target_arch = "wasm32"),
+        not(miri)
+    ))]
     #[test]
     fn leader_effective_set_skips_self_pin() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
