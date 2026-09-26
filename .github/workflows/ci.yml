@@ -476,6 +476,26 @@ jobs:
             --test metal_kv_shift_oracle \
             --test metal_params_layout \
             --test slang_multitarget_parity
+      # The cross-backend microbench needs `gpu` AND `metal` together: no
+      # other leg unifies that combo, so without this step its file
+      # compiles cfg'd-out (empty) everywhere and the code rots while
+      # every leg stays green. Compile plus lints only: the benches are
+      # `#[ignore]`d manual runs, not CI executions.
+      - name: Cross-backend bench compile (gpu+metal combo)
+        run: |
+          set -euo pipefail
+          cargo clippy -p cera --features "gpu metal" --test gemv_q4_0_bench -- -D warnings
+          # libtest exits 0 on an empty compile, so assert the target
+          # actually holds benches: a cfg change that empties it must fail
+          # here rather than silently un-covering the file.
+          # `|| true`: grep -c exits 1 on zero matches, which under `set -e`
+          # would abort before the annotation below could explain why.
+          COUNT=$(cargo test -p cera --features "gpu metal" --test gemv_q4_0_bench -- --list \
+                  | grep -c ': test$' || true)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::gemv_q4_0_bench holds zero tests under gpu+metal — did its cfg gate change? Update this step." >&2
+            exit 1
+          fi
 
   build-release:
     name: Release Build

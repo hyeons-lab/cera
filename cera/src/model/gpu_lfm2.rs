@@ -9990,11 +9990,13 @@ mod tests {
         assert!(validate_gemm_shape(64, 16, 64).is_err());
         // Giant dims: over the dim cap, or inside it but over the byte budget.
         assert!(validate_gemv_shape(1 << 24, 1 << 24).is_err());
-        // These two exceed the byte budget as well as the dim cap, so a
-        // bare `is_err` pins only the disjunction: deleting the dim cap
-        // would stay green. Pin the dim-cap message instead.
-        let err = validate_gemv_shape(u32::MAX, 64).unwrap_err();
-        assert!(err.to_string().contains("dims must be <="), "{err}");
+        // Dim-cap legs: the GEMV leg gets a partner value that passes
+        // every later gate (multiple of 32, ~239 MB against the 2 GiB
+        // budget), so deleting the leg flips exactly this assert. No
+        // GEMM partner exists (any over-cap dim forces the byte budget
+        // over: each trip region lower-bounds one transient term above
+        // the cap), so the GEMM leg pins the message instead.
+        assert!(validate_gemv_shape(1, (1 << 24) + 32).is_err());
         let err = validate_gemm_shape(64, u32::MAX - 1, 64).unwrap_err();
         assert!(err.to_string().contains("dims must be <="), "{err}");
         assert!(validate_gemm_shape(1 << 20, 1 << 20, 64).is_err());

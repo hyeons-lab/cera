@@ -152,6 +152,10 @@ fn bench_shape(shape: &Shape, iters: u32) {
     }
 }
 
+// Nine explicit params: the trailing (shader, entry, label) triple selects a
+// different pipeline at each call site, and bundling it would hide the
+// bench matrix the two calls spell out. Same allowance as `generate_audio`.
+#[allow(clippy::too_many_arguments)]
 fn bench_wgpu(
     ctx: &GpuContext,
     q4_padded: &[u8],

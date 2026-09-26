@@ -26,7 +26,17 @@ pub trait AudioGpu: Send + Sync {
         temperature: f32,
         top_k: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<[i32; 8]>> + Send + 'a>> {
-        Box::pin(async move { Ok(self.sample_audio_frame(embedding, temperature, top_k)) })
+        Box::pin(async move {
+            // Same drain discipline as the sync engine paths: discard a
+            // stale record, run the bare call, and fail the future on a
+            // fresh fault instead of returning zero/stale output as `Ok`.
+            let _ = self.take_audio_error();
+            let out = self.sample_audio_frame(embedding, temperature, top_k);
+            if let Some(e) = self.take_audio_error() {
+                return Err(e.into());
+            }
+            Ok(out)
+        })
     }
 
     /// Async depthformer sampling using a GPU hidden state buffer directly without CPU roundtrip.
@@ -51,7 +61,14 @@ pub trait AudioGpu: Send + Sync {
         cpu_weights: &'a DetokenizerWeights,
         codes: &'a [i32],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
-        Box::pin(async move { Ok(self.detokenize_to_spectrum(cpu_weights, codes)) })
+        Box::pin(async move {
+            let _ = self.take_audio_error();
+            let out = self.detokenize_to_spectrum(cpu_weights, codes);
+            if let Some(e) = self.take_audio_error() {
+                return Err(e.into());
+            }
+            Ok(out)
+        })
     }
 
     /// Reset depthformer KV caches (called per audio frame).
@@ -77,7 +94,26 @@ pub trait AudioGpu: Send + Sync {
         n_fft: usize,
         hop_length: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
-        Box::pin(async move { Ok(self.istft_to_pcm(spectrum, n_fft, hop_length)) })
+        Box::pin(async move {
+            let _ = self.take_audio_error();
+            let out = self.istft_to_pcm(spectrum, n_fft, hop_length);
+            if let Some(e) = self.take_audio_error() {
+                return Err(e.into());
+            }
+            Ok(out)
+        })
+    }
+
+    /// Drain a sticky backend fault recorded by the last bare call
+    /// ([`Self::sample_audio_frame`], [`Self::detokenize_to_spectrum`],
+    /// [`Self::istft_to_pcm`]), first-wins across the decoder's contexts.
+    /// The sync engine paths discard-then-drain around every call; the
+    /// async defaults below drain before returning `Ok`, so an async
+    /// fault surfaces as `Err`, never as zero/stale output. Backends
+    /// without fallible hardware (test doubles, CPU-only drivers) keep
+    /// the default `None`.
+    fn take_audio_error(&self) -> Option<crate::CeraError> {
+        None
     }
 
     /// Attempt to acquire an exclusive session lease for multi-frame generation.

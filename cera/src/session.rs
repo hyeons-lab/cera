@@ -3031,6 +3031,13 @@ impl Session {
                     Self::resize_pools_for_cpuset();
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
+                        // A vocoder sampling fault aborts the turn outright:
+                        // `decode_frame` runs the vocoder, not the LLM, so no
+                        // frontier position was consumed for this frame and
+                        // there is nothing to rewind.
+                        crate::audio_engine::FrameOutcome::Fault(detail) => {
+                            return Err(CeraError::Backend(detail));
+                        }
                         crate::audio_engine::FrameOutcome::End => {
                             if is_audio_transition || text_done {
                                 break;
@@ -4059,7 +4066,7 @@ mod tests {
             &self.config
         }
         fn take_decode_error(&self) -> Option<CeraError> {
-            self.decode_error.lock().unwrap().take()
+            crate::model::take_fault(&self.decode_error)
         }
         fn supports_all_logits(&self) -> bool {
             true

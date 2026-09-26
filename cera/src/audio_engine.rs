@@ -178,6 +178,16 @@ pub enum FrameOutcome {
     /// spectrum produced for this frame; caller should return control
     /// to the text modality per its mode's exit convention.
     End,
+    /// The GPU backend faulted mid-frame (see
+    /// `AudioGpu::take_audio_error`) and the stage has no CPU fallback
+    /// with coherent state, so the frame produced nothing usable.
+    /// Callers must abort generation with the error, not continue over
+    /// the hole: detokenize/ISTFT faults already fall back to CPU
+    /// inside `decode_frame`/`finish`, so only sampling faults arrive
+    /// here. Carries the fault detail string (`CeraError` is neither
+    /// `Clone` nor `PartialEq`, which this enum derives); callers
+    /// re-wrap with `CeraError::Backend`.
+    Fault(String),
 }
 
 /// Owns the audio output-decoder state and exposes per-frame operations.
@@ -337,7 +347,22 @@ impl<'a> AudioOutputDecoder<'a> {
         let t0 = Instant::now();
         let codes = match (self.use_gpu_df, self.gpu) {
             (true, Some(g)) => {
-                g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
+                // Drain the backend fault slot around the bare sample:
+                // a fault here must abort (the async path `?`s it), since
+                // CPU state went cold while the GPU drove sampling.
+                let _ = g.take_audio_error();
+                let codes = g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k);
+                if let Some(e) = g.take_audio_error() {
+                    // Backend details round-trip exactly; anything else
+                    // degrades to its display text (audio faults are
+                    // `Backend` by construction: every recorder passes it).
+                    let detail = match e {
+                        crate::CeraError::Backend(detail) => detail,
+                        other => other.to_string(),
+                    };
+                    return FrameOutcome::Fault(detail);
+                }
+                codes
             }
             _ => sample_audio_frame(
                 self.weights,
@@ -367,7 +392,20 @@ impl<'a> AudioOutputDecoder<'a> {
 
         let t1 = Instant::now();
         let spectrum = if let Some(g) = self.gpu {
-            g.detokenize_to_spectrum(self.detok_weights, &codes)
+            // Drain around the bare call; on a fault recompute on CPU,
+            // mirroring the async path's `Err(_) =>` arm below.
+            let _ = g.take_audio_error();
+            let spectrum = g.detokenize_to_spectrum(self.detok_weights, &codes);
+            if g.take_audio_error().is_some() {
+                detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    &codes,
+                )
+            } else {
+                spectrum
+            }
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -545,7 +583,20 @@ impl<'a> AudioOutputDecoder<'a> {
             let remainder = chunks.remainder();
             for codes in chunks {
                 let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum(self.detok_weights, codes)
+                    // Drain around the bare call; on a fault recompute
+                    // on CPU rather than extending zeros.
+                    let _ = g.take_audio_error();
+                    let spectrum = g.detokenize_to_spectrum(self.detok_weights, codes);
+                    if g.take_audio_error().is_some() {
+                        detokenize_to_spectrum(
+                            self.detok_weights,
+                            self.weights,
+                            &mut self.detok_state,
+                            codes,
+                        )
+                    } else {
+                        spectrum
+                    }
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
@@ -571,7 +622,17 @@ impl<'a> AudioOutputDecoder<'a> {
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
         let pcm = match self.gpu {
-            Some(g) => g.istft_to_pcm(&self.all_spectrum, n_fft, hop),
+            Some(g) => {
+                // ISTFT is stateless, so a faulted GPU run recomputes
+                // on CPU with identical output instead of failing.
+                let _ = g.take_audio_error();
+                let pcm = g.istft_to_pcm(&self.all_spectrum, n_fft, hop);
+                if g.take_audio_error().is_some() {
+                    istft_to_pcm(&self.all_spectrum, n_fft, hop)
+                } else {
+                    pcm
+                }
+            }
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
         self.all_spectrum.clear();
@@ -793,6 +854,11 @@ pub fn generate_audio(
                     }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
+                        // A sampling fault aborts generation: no codes, no
+                        // feedback embedding, nothing to continue with.
+                        FrameOutcome::Fault(detail) => {
+                            return Err(crate::CeraError::Backend(detail).into());
+                        }
                         FrameOutcome::End => {
                             if text_done {
                                 break;
@@ -869,6 +935,11 @@ pub fn generate_audio(
                 }
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
+                    // A sampling fault aborts generation: no codes, no
+                    // feedback embedding, nothing to continue with.
+                    FrameOutcome::Fault(detail) => {
+                        return Err(crate::CeraError::Backend(detail).into());
+                    }
                     FrameOutcome::End => match config.mode {
                         AudioMode::Sequential => {
                             // Sequential TTS: audio is the final output.
@@ -1073,7 +1144,7 @@ mod tests {
             unimplemented!("PoisonableModel carries no config")
         }
         fn take_decode_error(&self) -> Option<crate::CeraError> {
-            self.slot.lock().unwrap().take()
+            crate::model::take_fault(&self.slot)
         }
     }
 
@@ -1088,6 +1159,148 @@ mod tests {
         // A clean model never trips the drain.
         let clean = PoisonableModel::with_slot(None);
         assert!(check_audio_decode_error(&clean).is_ok());
+    }
+
+    /// Fault-injecting `AudioGpu` double: scripted `take_audio_error`
+    /// outcomes (one per take, in order; the script running dry reads as
+    /// clean) plus garbage outputs no real computation produces, so a
+    /// missed drain is observable.
+    struct ScriptedFaultGpu {
+        takes: std::sync::Mutex<std::collections::VecDeque<Option<crate::CeraError>>>,
+    }
+
+    impl ScriptedFaultGpu {
+        fn with_script(outcomes: Vec<Option<crate::CeraError>>) -> Self {
+            Self {
+                takes: std::sync::Mutex::new(outcomes.into()),
+            }
+        }
+
+        /// One fault on the first drain (covers a discard-then-drain pair).
+        fn fault_once() -> Self {
+            Self::with_script(vec![
+                None,
+                Some(crate::CeraError::Backend("injected audio fault".into())),
+            ])
+        }
+    }
+
+    impl crate::model::audio_decoder::AudioGpu for ScriptedFaultGpu {
+        fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+            [1; 8]
+        }
+
+        fn detokenize_to_spectrum(
+            &self,
+            _: &crate::model::audio_decoder::DetokenizerWeights,
+            _: &[i32],
+        ) -> Vec<f32> {
+            vec![7.0; 3]
+        }
+
+        fn istft_to_pcm(&self, _: &[f32], _: usize, _: usize) -> Vec<f32> {
+            vec![999.0; 5]
+        }
+
+        fn reset_depthformer(&self) {}
+
+        fn reset_detokenizer(&self) {}
+
+        fn supports_depthformer(&self) -> bool {
+            true
+        }
+
+        fn take_audio_error(&self) -> Option<crate::CeraError> {
+            self.takes.lock().unwrap().pop_front().flatten()
+        }
+    }
+
+    #[test]
+    fn gpu_sample_fault_is_frame_fault_not_codes() {
+        // A sampling fault aborts the frame: no codes are trusted, and no
+        // weight or streamer state is touched before the `Fault` return.
+        let (dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let outcome = decoder.decode_frame(&[0.0; 4]);
+        assert_eq!(outcome, FrameOutcome::Fault("injected audio fault".into()));
+    }
+
+    #[test]
+    fn gpu_detok_fault_falls_back_to_cpu() {
+        // Minimal head so the CPU fallback runs: 1-row zero codebook (all
+        // codes embed to zero), unit output norm, zero 10-wide head
+        // (matches the n_fft=8 streamer's 10-float frames).
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+        // Sample clean (discard + drain), detokenize faults (discard + drain).
+        let gpu = ScriptedFaultGpu::with_script(vec![
+            None,
+            None,
+            None,
+            Some(crate::CeraError::Backend("injected audio fault".into())),
+        ]);
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let outcome = decoder.decode_frame(&[0.0; 4]);
+        let FrameOutcome::Codes { pcm, codes, .. } = outcome else {
+            panic!("detok fault must fall back, not abort: {outcome:?}");
+        };
+        assert_eq!(codes, [1; 8]);
+        // Only the CPU recompute (all-zero spectrum) yields framed zero
+        // PCM; the double's 3-float garbage cannot produce this shape.
+        assert!(!pcm.is_empty() && pcm.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn gpu_istft_fault_recomputes_on_cpu() {
+        let (dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let mut decoder =
+            AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true).with_streaming(false);
+        // Preset spectrum with empty codes skips the detokenize loop, so
+        // only the ISTFT drain runs.
+        let spectrum = vec![0.5; 40];
+        decoder.all_spectrum = spectrum.clone();
+        let expected = crate::model::audio_decoder::istft_to_pcm(
+            &spectrum,
+            detok.config.n_fft,
+            detok.config.hop_length,
+        );
+        let mut got = Vec::new();
+        let n = decoder.finish(|pcm, _| got.extend_from_slice(pcm));
+        assert_eq!(got, expected);
+        assert_eq!(n, expected.len());
+        assert!(!expected.is_empty());
+    }
+
+    /// Poll a future that never pends (straight-line test bodies only).
+    fn block_on_ready<F: std::future::Future>(mut fut: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        // SAFETY: the future is never moved after pinning.
+        let mut pinned = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("test future pended unexpectedly"),
+        }
+    }
+
+    #[test]
+    fn async_default_detok_drain_fails_loud() {
+        // The trait's async defaults drain before `Ok`: a recorded fault
+        // (the Metal path, which has no explicit async override) must
+        // surface as `Err`, and a clean run passes the output through.
+        let (_dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let out = block_on_ready(gpu.detokenize_to_spectrum_async(&detok, &[0; 8]));
+        assert!(out.is_err());
+        let clean = ScriptedFaultGpu::with_script(vec![None, None]);
+        let out = block_on_ready(clean.detokenize_to_spectrum_async(&detok, &[0; 8]));
+        assert_eq!(out.unwrap(), vec![7.0; 3]);
     }
 
     /// `Model` with a real config and a scripted `forward_prefill_chunked`,

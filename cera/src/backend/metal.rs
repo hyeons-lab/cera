@@ -45,10 +45,11 @@ pub struct MetalContext {
     /// record. The model drains it via [`Self::take_cmd_error`] into
     /// `take_decode_error`. Each model owns its context 1:1, and the
     /// session gate allows one live session per model, so the take is
-    /// unambiguous. Never drained in contexts owned by non-`Model`
-    /// drivers (`MetalAudioDecoder`, `MetalDepthformer` own private
-    /// contexts): their only failure signal is the stderr line; do not
-    /// assume audio faults surface via `take_decode_error`.
+    /// unambiguous. Contexts owned by non-`Model` drivers
+    /// (`MetalAudioDecoder`, `MetalDepthformer` own private contexts)
+    /// drain through `AudioGpu::take_audio_error`, which the audio
+    /// engine checks after every bare call; do not assume audio faults
+    /// surface via `take_decode_error`.
     cmd_error: std::sync::Mutex<Option<CeraError>>,
 }
 

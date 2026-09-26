@@ -188,6 +188,9 @@ fn test_tts_prompt_token_prediction() {
                 println!("Frame {frame_idx}: Emitted END token");
                 break;
             }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault in regression test: {detail}");
+            }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,
                 pcm,
@@ -296,6 +299,9 @@ fn test_gpu_tts_prompt_token_prediction() {
             cera::audio_engine::FrameOutcome::End => {
                 println!("GPU Frame {frame_idx}: Emitted END token");
                 break;
+            }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault in regression test: {detail}");
             }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,
@@ -591,6 +597,9 @@ fn test_tts_studio_default_sample_text_synthesis() {
                 println!("Frame {f:2}: END token");
                 break;
             }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault in regression test: {detail}");
+            }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,
                 pcm,
@@ -661,6 +670,9 @@ fn test_tts_studio_default_sample_text_synthesis_us_male_voice() {
             cera::audio_engine::FrameOutcome::End => {
                 println!("Frame {f:2}: END token");
                 break;
+            }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault in regression test: {detail}");
             }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,
@@ -759,6 +771,9 @@ fn test_tts_studio_default_sample_text_synthesis_gpu() {
             cera::audio_engine::FrameOutcome::End => {
                 println!("Frame {f:2}: END token");
                 break;
+            }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault in regression test: {detail}");
             }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,
