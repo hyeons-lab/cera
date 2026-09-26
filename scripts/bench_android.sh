@@ -23,7 +23,9 @@
 #
 # The model must already be on the device at $DEVICE_DIR/<name.gguf>, and the
 # cera binary is pushed from target/aarch64-linux-android/release/cera (build
-# with: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu).
+# with: cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu,hexagon).
+# The hexagon feature is required: without it the hexagon cell builds fine but
+# fails on-device ("Hexagon backend not available") and reports NA.
 set -euo pipefail
 
 DEVICE_DIR="/data/local/tmp/cera-bench"
