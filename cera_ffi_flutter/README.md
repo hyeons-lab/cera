@@ -3,7 +3,7 @@
 Flutter and Dart bindings for the [Cera](https://github.com/hyeons-lab/cera)
 inference engine: on-device LLM inference with no network round trip.
 
-> The 0.6.2 plugin aligns native artifacts with the core chat, checkpoint, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 plugin aligns native artifacts with Qualcomm Hexagon NPU support, chat lifecycle, checkpoint, schema and audio corrections. See the [API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 This is the package Flutter apps depend on. It is an **FFI plugin**: the native
 library is fetched and linked by each platform's own build system, with no
@@ -26,13 +26,13 @@ The portable `Cera` facade accepts caller-rendered prompts. Native `ChatSession`
 is a separate coordinator with phases and ownership transfer; it is not
 available through generated web stubs. Check its phase before continuing a
 conversation, and reset or replace messages after `Interrupted`.
-CPU checkpoints are supported; native Metal/wgpu checkpoints are rejected.
+CPU checkpoints are supported; native Metal/Hexagon/wgpu checkpoints are rejected.
 
 ## Supported platforms
 
 | Platform | Minimum | Native library ships as | Notes |
 |----------|---------|------------------------|-------|
-| Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a, armeabi-v7a, x86_64 |
+| Android  | API 28 | `cera-ffi-android` AAR (Maven Central) | arm64-v8a (with Qualcomm Hexagon NPU DSP skels), armeabi-v7a, x86_64 |
 | iOS      | 15.0 | `CeraFFI.xcframework` | Metal enabled; device + simulator |
 | macOS    | 12.0 | `CeraFFI.xcframework` | Metal enabled; arm64 |
 | Linux    | - | `libcera_ffi.so` | downloaded + checksummed by CMake |

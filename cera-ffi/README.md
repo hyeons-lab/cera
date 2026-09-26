@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> The 0.6.2 bindings include chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 bindings include Qualcomm Hexagon NPU support, chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
@@ -67,9 +67,10 @@ filesystem tree manually" workaround.
 | 23+ | Reactive Streaming: `AsyncThrowingStream` (Swift), `Flow` (Kotlin), `Iterator` generator (Python), and `Stream` (Dart) |
 | 24+ | Structured Outputs: JSON Schema compilation to GBNF, `GenerateOpts.withJsonSchema`, and `completeJson` |
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
-| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
+| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/Hexagon/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 | 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
+| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.

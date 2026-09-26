@@ -4,7 +4,7 @@ Command-line interface for the [`cera`](https://github.com/hyeons-lab/cera/tree/
 a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
-> This checkout uses the 0.6.2 core. The CLI commands below are distinct from the library's Session/Chat APIs; see the [0.6 API guide](../docs/API_0_6.md) for those contracts and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> This checkout uses the 0.7.0 core. The CLI commands below are distinct from the library's Session/Chat APIs; see the [API guide](../docs/API_0_6.md) for those contracts and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
 > internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).
@@ -16,10 +16,10 @@ LeapBundles models locally.
 cargo install cera-cli
 ```
 
-This builds the `cera` binary. For an Apple Metal or wgpu GPU build:
+This builds the `cera` binary. For an Apple Metal, wgpu GPU, or Qualcomm Hexagon NPU build:
 
 ```sh
-cargo install cera-cli --features metal   # or gpu
+cargo install cera-cli --features metal   # or gpu, or hexagon
 ```
 
 ## Usage
@@ -106,7 +106,7 @@ cera compare-quants --cera-gguf ./cera.gguf --reference ./upstream.gguf --json
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
-(`cpu` / `gpu` / `metal` / `auto`, default `auto`), `--grammar` / `--json`, and
+(`cpu` / `gpu` / `metal` / `hexagon` / `auto`, default `auto`), `--grammar` / `--json`, and
 `--lora` to attach a LoRA adapter. For tool calling, `--tools <JSON|@file>`
 passes an array of OpenAI-style function schemas (rendered into the chat
 template; the reply's tool calls are parsed to a JSON array on stdout), and
@@ -123,7 +123,7 @@ their metadata).
 
 ### CPU tuning
 
-The CPU backend auto-detects thread count and core affinity per device. To pin
+The CPU backend auto-detects thread count, cgroup cpuset quota, and core affinity per device. To pin
 them for benchmarking or tuning, set `CERA_DECODE_THREADS=<n>` (fixed decode
 width), `CERA_PREFILL_THREADS=<n>` (prefill width on its own, so the two can be
 swept independently), `CERA_THREADS=<n>` (override the detected perf-core

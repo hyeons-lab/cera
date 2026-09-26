@@ -3,7 +3,7 @@
 `wasm-bindgen` browser / Node bindings for the
 [cera](https://github.com/hyeons-lab/cera) inference engine.
 
-> The 0.6.2 API includes chat callback recovery, checkpoint validation and schema corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 API includes chat callback recovery, checkpoint validation, prompt tail prefill scoping, and schema corrections. See the [API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 The CPU API covers explicit model loading, metadata/capability probes,
 tokenization, raw Session generation and the Chat coordinator. `Session.appendAudio`

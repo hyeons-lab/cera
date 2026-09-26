@@ -99,7 +99,7 @@ AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
 normally installed app (no root/setup). The AAR ships the DSP skels in
 `jniLibs/arm64-v8a` plus the manifest entries the NPU needs
 (`extractNativeLibs`, `<uses-native-library>`), which merge into
-consumers automatically — do not override `extractNativeLibs` to
+consumers automatically: do not override `extractNativeLibs` to
 `false` (the FastRPC loader opens the skels by path, so they must be
 extracted files, not entries inside the APK).
 
@@ -122,7 +122,7 @@ val backend = try {
 
 `HexagonNpu.setup` fails fast when the skels are missing (packaging
 bug on arm64-v8a) or the ABI ships none (x86_64 Android has no Hexagon
-DSP — treat the NPU as unavailable). DSP policy varies per
+DSP; treat the NPU as unavailable). DSP policy varies per
 OEM/SoC/firmware; `HexagonNpu.hasDirectNodeAccess()` reports which
 access route the device uses. Details, the support matrix, and the
 release gates live in `docs/ANDROID_NPU_PACKAGING.md`; the `probe-app`

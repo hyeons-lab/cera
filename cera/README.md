@@ -2,13 +2,13 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> The 0.6.2 API corrects chat lifecycle, streaming, checkpoint validation, structured output and audio processing. See the [0.6 API guide](../docs/API_0_6.md) for migration and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 release adds the native Qualcomm Hexagon NPU backend, dynamic CPU topology discovery and worker threadpool resizing, and core lifecycle enhancements. See the [API guide](../docs/API_0_6.md) for migration and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
 
 `cera` is the core library: GGUF loading, a quantized CPU kernel stack
-(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU and BLAS backends, a
+(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU, Qualcomm Hexagon NPU, and BLAS backends, a
 stateful session API with prefix caching, and a streaming token sink. It powers
 the [`cera-cli`](https://github.com/hyeons-lab/cera/tree/main/cera-cli) CLI, the
 [`cera-ffi`](https://github.com/hyeons-lab/cera/tree/main/cera-ffi) mobile
@@ -18,16 +18,19 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.6"
+cera = "0.7"
 ```
 
-## The 0.6 API
+## The 0.7 Release
 
+- **Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)**: Opt-in `hexagon` feature flag enabling FastRPC Unsigned Process Domain execution on Qualcomm Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite hardware. Features rpcmem DMA allocations, 32x32 tiled matrix repacking for Q4_0 and Q8_0 weights, asynchronous DSP command queues (`DspQueue`), and fused HTP operators with CPU fallback.
+- **Dynamic CPU Topology Discovery & Threadpool Resizing**: Structured CPU set discovery (`UsableCpus::Known`), cgroup cpuset quota and sandbox awareness, set identity comparison across core migrations, and automatic dynamic worker threadpool resizing.
+- **Prompt Tail Prefill Scoping**: Assistant prefill scoping strictly to the rendered prompt tail, preserving state hygiene across conversational turns and session restorations.
 - **Chat coordinator (`cera::session::chat`)**: `Session::into_chat()` transfers execution into `SessionChat`, with delta-only prefill and validated template profiles. Ingest another turn only from `TurnComplete`. Interrupted generation requires reset or replacement before a new user turn; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery can restore, reset or leave the session unusable. Legacy `Session::append_user_message` is deprecated in favor of this API.
 - **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.
 - **JSON Schema compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles a [documented subset](../docs/API_0_6.md#json-schema-constraints) with required/optional properties, bounded arrays, local refs and restricted `allOf` composition. Use `GenerateOpts::with_json_schema`; still check for truncated output and validate constraints outside the supported subset.
 - **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
-- **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
+- **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/Hexagon/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
 - **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD v5, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and wait-free cancellation across FFI boundaries.
 - **Expanded Model Architectures**: Native support for Mamba-2 SSM and hybrid architectures, Gemma 2, Olmo 2, Gemma 4 (PLE and cross-layer KV sharing), Olmo 3 (sliding window and YaRN RoPE), MiniCPM, Nanbeige 4.2, Qwen 3.5 / Ornith 1.0, Ministral 3, Phi-3 / Phi-4-mini, and Ling 3.0 Tiny.
 - **Prefix cache anchors (`cera::kv_cache::KvPrefixCache`)**: Warm memory and optional disk caching with caller-supplied anchor metadata. FlatBuffers v2 persistence retains existing snapshot precision; the engine does not automatically extract anchors or recompress cold entries.
@@ -178,14 +181,14 @@ mmproj encoder for VL bundles, and `Session::append_image` (or
 Verified against LFM2.5-VL-450M. The ViT encode runs on the GPU (native Metal or
 wgpu, selected by `BackendPreference`) with a CPU fallback.
 
-## Sharing a loaded GPU model
+## Sharing a loaded GPU or NPU model
 
-Metal and wgpu permit one live `Session` per loaded model. A second session
-returns `Busy` until the first is dropped; reset and cancellation keep ownership.
+Metal, Hexagon, and wgpu permit one live `Session` per loaded model. A second session
+returns `Busy` until the first is dropped (enforced via `ModelSessionGate`); reset and cancellation keep ownership.
 CPU models continue to support shared weights across concurrent sessions. Load
-separate GPU models for simultaneous conversations. The
+separate GPU or NPU models for simultaneous conversations. The
 [session ownership walkthrough](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
-and executable CPU/Metal/wgpu checks.
+and executable checks.
 
 LFM2-Audio transcription during a live GPU conversation uses a cached secondary
 model built from retained weights. This preserves conversation KV and costs
