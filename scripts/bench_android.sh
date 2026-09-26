@@ -211,9 +211,11 @@ echo "==> pushing cera to $DEVICE_DIR"
 # peak a cold phone can hit for two seconds.
 # ---------------------------------------------------------------------------
 
-# Live BIG-cluster temperature, integer C. Must come from "Current temperatures
+# Live SoC temperature, integer C. Must come from "Current temperatures
 # from HAL"; the "Cached temperatures" section earlier in the same dumpsys is
-# stale and reads high long after the device has cooled.
+# stale and reads high long after the device has cooled. Sensor name differs
+# by vendor: Pixels expose the big cluster as BIG, Samsungs report the whole
+# SoC as AP (mType=0 either way), so BIG is tried first with AP as fallback.
 soc_big() {
   # `|| true` on every sampler: these run inside the background sampling loop and
   # their last command is a pipeline over adb output, so a transient adb failure
@@ -221,7 +223,7 @@ soc_big() {
   # caller down mid-matrix. An empty sample is the correct degradation.
   "${ADB[@]}" shell "dumpsys thermalservice" 2>/dev/null \
     | awk '/Current temperatures from HAL/,/Current cooling devices/' \
-    | sed -n 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' | head -1 | cut -d. -f1 || true
+    | sed -n -e 's/.*mValue=\([0-9.]*\), mType=0, mName=BIG, .*/\1/p' -e 's/.*mValue=\([0-9.]*\), mType=0, mName=AP, .*/\1/p' | head -1 | cut -d. -f1 || true
 }
 
 # Mid-run CPU frequency on a perf core, MHz. This is the variable that actually

@@ -754,51 +754,105 @@ fn allowance_probe() -> Option<usize> {
     std::thread::available_parallelism().map(|p| p.get()).ok()
 }
 
-/// CPUs the process may run on: our cpuset's CPU set from the cgroup
-/// filesystem, or every online CPU when no cpuset restriction is configured.
+/// CPUs the process may run on, resolved in three tiers: our cpuset's CPU
+/// set from the cgroup filesystem; else the process leader's affinity mask,
+/// distrusted while it is exactly our own caller-pin; else every online CPU.
 ///
-/// This deliberately reads cgroup files, never a thread affinity mask. The
-/// previous revision read the process leader's mask on the theory that the
-/// leader is never pinned — but the pool pins its calling thread (usually
-/// the leader) by design, so the first resize hook after the pin claimed saw
-/// a 1-CPU "allowance" and collapsed both pools to one worker (measured on a
-/// Snapdragon 8 Elite: prefill 554 tok/s against 1827 at the true width).
-/// Thread affinity is polluted by our own pinning; the cgroup is not.
+/// The tiers exist because no single signal works everywhere. Thread affinity
+/// alone misreads our own pinning as a restriction: the pool pins its
+/// calling thread (usually the leader) by design, so a leader-mask probe saw
+/// a 1-CPU "allowance" after the pin claimed and collapsed both pools to one
+/// worker (measured on a Snapdragon 8 Elite: prefill 554 tok/s against 1827
+/// at the true width). But the cgroup files alone are unreadable inside the
+/// Android app sandbox (SELinux denies `/dev/cpuset`), where the leader mask
+/// is the only signal left — and there the leader is unpinned (the prime
+/// pin the caller-claim would take fails against the app cpuset), so the
+/// mask is trustworthy. Each tier covers the other's blind spot:
 ///
-/// Resolution: the cgroup path from `/proc/self/cpuset`, the hierarchy
-/// mount from `/proc/self/mountinfo`, then the deepest configured set
-/// walking up to the mount root (effective before configured at each
-/// level). Covers Android's `/dev/cpuset` (v1, `noprefix` names), container
-/// v1 (`cpuset.cpus`), and unified v2 (`cpuset.cpus.effective`). When no
-/// level configures a set, the hierarchy restricts nothing and the allowance
-/// is every online CPU (`/sys/devices/system/cpu/online`).
+/// 1. Cgroup: the cgroup path from `/proc/self/cpuset`, the hierarchy mount
+///    from `/proc/self/mountinfo`, then the deepest configured set walking
+///    up to the mount root (effective before configured at each level).
+///    Covers Android's `/dev/cpuset` (v1, `noprefix` names), container v1
+///    (`cpuset.cpus`), and unified v2 (`cpuset.cpus.effective`).
+/// 2. Leader mask, via [`leader_effective_count`]: skipped while the leader
+///    holds our caller-pin (its mask is ours, not the world's); a migration
+///    that rewrites the mask shows up as "not ours" and is trusted again.
+/// 3. Online CPUs (`/sys/devices/system/cpu/online`): no configured set and
+///    no trustworthy mask means no visible restriction.
 ///
 /// `None` only when the filesystem gives nothing at all, in which case the
-/// caller runs unclamped (the pre-clamp behavior). There is deliberately no
-/// affinity fallback: any affinity read can report our own pinning as a
-/// restriction, which is the misread above. For the same reason a `taskset`
-/// narrowing is not honored (worker pins escape it regardless);
-/// `CERA_THREADS` is the deliberate way down.
+/// caller runs unclamped (the pre-clamp behavior). A `taskset` narrowing is
+/// honored only through tier 2 (and only where the cgroup is unreadable):
+/// where the cgroup reads, it wins, because worker pins escape a taskset
+/// regardless; `CERA_THREADS` is the deliberate way down.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_cpu_allowance() -> Option<usize> {
-    allowance_from_paths(
+    probe_with_leader(
         std::path::Path::new("/proc/self/cpuset"),
         std::path::Path::new("/proc/self/mountinfo"),
         std::path::Path::new("/sys/devices/system/cpu/online"),
+        leader_effective_count(),
     )
 }
 
-/// [`process_cpu_allowance`] over explicit paths: the cpuset's set when the
-/// hierarchy configures one, else every online CPU (no configured set means
-/// no restriction), else unknown. Paths are parameters so tests can point
-/// them at fixtures; uncfg'd so those tests run on every host.
+/// [`process_cpu_allowance`] over explicit inputs: `leader` is the tier-2
+/// leader-mask reading (already distrusted while self-pinned). Paths and the
+/// leader reading are parameters so tests can point them at fixtures; uncfg'd
+/// past Linux-or-test so those tests run on every host.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn allowance_from_paths(
+fn probe_with_leader(
     cpuset_path: &std::path::Path,
     mountinfo_path: &std::path::Path,
     online_path: &std::path::Path,
+    leader: Option<usize>,
 ) -> Option<usize> {
-    cgroup_cpuset_cpu_count(cpuset_path, mountinfo_path).or_else(|| read_cpu_list_file(online_path))
+    cgroup_cpuset_cpu_count(cpuset_path, mountinfo_path)
+        .or(leader)
+        .or_else(|| read_cpu_list_file(online_path))
+}
+
+/// Tier-2 allowance: the process leader's affinity-mask CPU count, or `None`
+/// while the leader holds our caller-pin (its mask is ours then, and would
+/// misread as a 1-CPU cpuset) or the probe itself fails. The leader (TGID) is
+/// read rather than the caller because the topology cache is process-wide: a
+/// thread an embedder pinned to one core must not freeze the width. Kept
+/// separate from [`probe_with_leader`] (which takes the reading as an
+/// argument) so the composition stays fixture-testable.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn leader_effective_count() -> Option<usize> {
+    // SAFETY: `getpid` addresses the process leader and always succeeds.
+    let leader = unsafe { libc::getpid() };
+    if crate::backend::threadpool::thread_self_pinned(leader) {
+        return None;
+    }
+    leader_mask_count(leader)
+}
+
+/// CPU count of thread `tid`'s affinity mask; `None` when the probe fails.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn leader_mask_count(tid: libc::pid_t) -> Option<usize> {
+    // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the size/pointer pair describes `set` exactly, and the return
+    // value is checked.
+    let ok =
+        unsafe { libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if ok != 0 {
+        return None;
+    }
+    // Bound spelled from the set size rather than `CPU_SETSIZE`: the constant
+    // is `size_t` on Android, where `as usize` would trip `unnecessary_cast`
+    // under the repo's `-D warnings` gate (same convention as the pinning
+    // helper in `threadpool.rs`).
+    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    let mut count = 0;
+    for cpu in 0..capacity {
+        // SAFETY: `cpu` is bounded by the set's own bit capacity.
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// CPU count of this process's cpuset: `cpuset_path` is the
@@ -1369,7 +1423,7 @@ mod tests {
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
-    fn pin_thread_to_single_cpu(tid: libc::pid_t) -> RestoreMask {
+    fn pin_thread_to_single_cpu(tid: libc::pid_t) -> (RestoreMask, usize) {
         // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
         let mut saved: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         // SAFETY: the size/pointer pair describes `saved` exactly, and the
@@ -1401,7 +1455,7 @@ mod tests {
         let ok =
             unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &one) };
         assert_eq!(ok, 0);
-        RestoreMask { tid, saved }
+        (RestoreMask { tid, saved }, only)
     }
 
     /// The allowance probe reads the cpuset cgroup, not the calling
@@ -1418,7 +1472,7 @@ mod tests {
             eprintln!("skip: 1-CPU allowance cannot discriminate");
             return;
         }
-        let _restore = pin_thread_to_single_cpu(0);
+        let (_restore, _) = pin_thread_to_single_cpu(0);
         assert_eq!(process_cpu_allowance(), Some(before));
     }
 
@@ -1442,8 +1496,60 @@ mod tests {
         }
         // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
-        let _restore = pin_thread_to_single_cpu(leader);
+        let (_restore, _) = pin_thread_to_single_cpu(leader);
         assert_eq!(process_cpu_allowance(), Some(before));
+    }
+
+    /// Self-pin detection reads the claim statics plus the live mask: a
+    /// thread the claim names, whose mask is still exactly the pinned core,
+    /// reports self-pinned; any other thread, a widened mask, or an unreadable
+    /// one reports not. The claim half is faked with the test injector (the
+    /// live-mask half reads real masks): going through a real dispatch would
+    /// be racy, since the claim is process-global and a concurrent pool test
+    /// could hold it first. Linux/Android only, skipped under Miri.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn thread_self_pinned_matches_claim_and_live_mask() {
+        use crate::backend::threadpool::{debug_set_caller_pin_for_test, thread_self_pinned};
+        // SAFETY: both always succeed.
+        let me = unsafe { libc::gettid() };
+        let leader = unsafe { libc::getpid() };
+        // Unclaimed anywhere: nobody is self-pinned.
+        assert!(!thread_self_pinned(me));
+        assert!(!thread_self_pinned(leader));
+        let (_restore, cpu) = pin_thread_to_single_cpu(me);
+        let _inject = debug_set_caller_pin_for_test(me as i64, cpu);
+        // Claimed and still exactly the pin: self-pinned.
+        assert!(thread_self_pinned(me));
+        // Another thread (the unpinned leader) is not, nor is a bogus tid.
+        assert!(!thread_self_pinned(leader));
+        assert!(!thread_self_pinned(1 << 30));
+        // Widen the live mask back (the migration analog): the claim no
+        // longer describes reality, so the thread reports not-pinned again.
+        drop(_restore);
+        assert!(!thread_self_pinned(me));
+    }
+
+    /// Tier-2 reading: the leader's live mask count, or `None` while the
+    /// leader holds our caller-pin. The pin half is faked with the test
+    /// injector (see above); the mask half is a real leader pin, restored
+    /// on drop. Linux/Android only, skipped under Miri.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn leader_effective_count_skips_self_pin() {
+        // SAFETY: `getpid` is always valid.
+        let leader = unsafe { libc::getpid() };
+        let before = leader_effective_count().expect("leader probe works");
+        if before <= 1 {
+            eprintln!("skip: 1-CPU mask cannot discriminate");
+            return;
+        }
+        let (_restore, cpu) = pin_thread_to_single_cpu(leader);
+        // Directly pinned (not through our claim): trusted, reads 1.
+        assert_eq!(leader_effective_count(), Some(1));
+        // Same mask, now described by our claim: distrusted, reads `None`.
+        let _inject = crate::backend::threadpool::debug_set_caller_pin_for_test(leader as i64, cpu);
+        assert_eq!(leader_effective_count(), None);
     }
 
     #[test]
@@ -1550,11 +1656,11 @@ not a mountinfo line\n\
         assert_eq!(cgroup_cpuset_cpu_count(&cpuset, &mountinfo), Some(8));
     }
 
-    /// Composition: the cpuset wins when configured, else the online CPUs,
-    /// else unknown.
+    /// Composition: the cpuset wins when configured, else the leader
+    /// reading, else the online CPUs, else unknown.
     #[cfg(not(miri))]
     #[test]
-    fn allowance_from_paths_prefers_cpuset_then_online() {
+    fn probe_with_leader_prefers_cpuset_then_leader_then_online() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mount = tmp.path().join("cpuset");
         std::fs::create_dir_all(mount.join("fg")).expect("mkdirs");
@@ -1569,14 +1675,25 @@ not a mountinfo line\n\
         .expect("write");
         let online = tmp.path().join("online");
         std::fs::write(&online, "0-7\n").expect("write");
-        // Cpuset (2) wins over online (8).
-        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), Some(2));
-        // No cpuset anywhere: online answers.
+        // Cpuset (2) wins over leader (6) and online (8).
+        assert_eq!(
+            probe_with_leader(&cpuset, &mountinfo, &online, Some(6)),
+            Some(2)
+        );
+        // No cpuset anywhere: leader (6) answers.
         std::fs::remove_file(mount.join("fg").join("cpus")).expect("remove");
-        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), Some(8));
+        assert_eq!(
+            probe_with_leader(&cpuset, &mountinfo, &online, Some(6)),
+            Some(6)
+        );
+        // Leader skipped (self-pinned): online (8) answers.
+        assert_eq!(
+            probe_with_leader(&cpuset, &mountinfo, &online, None),
+            Some(8)
+        );
         // Nothing anywhere: unknown.
         std::fs::remove_file(&online).expect("remove");
-        assert_eq!(allowance_from_paths(&cpuset, &mountinfo, &online), None);
+        assert_eq!(probe_with_leader(&cpuset, &mountinfo, &online, None), None);
     }
 
     /// End to end through the real allowance probe: an absurd detected width

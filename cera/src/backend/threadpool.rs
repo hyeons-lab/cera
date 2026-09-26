@@ -103,6 +103,8 @@
 //! manage placement themselves.
 
 use std::cell::UnsafeCell;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -1129,6 +1131,84 @@ pub fn set_macos_thread_qos_interactive() {
     }
 }
 
+/// Caller-pin claim, process-wide: at most one thread holds it (see
+/// `pin_caller_once`). `OWNER` is the claiming thread's tid (`-1` = none)
+/// and `CORE` the core it was pinned to. The allowance probe reads these to
+/// tell our own pinning apart from an external restriction: a leader whose
+/// live mask is exactly our pin carries no information (see
+/// `thread_self_pinned`). Invariant: `OWNER != -1` exactly while `CLAIMED`.
+/// Release order is owner/core first, `CLAIMED` last; readers treat a
+/// half-published claim (`CLAIMED` set, `OWNER` still `-1`) as unclaimed,
+/// which is correct — the pin has not happened yet at that instant.
+/// `CLAIMED` lives on every platform (the claim protocol runs everywhere);
+/// owner/core only where pins are real.
+static CALLER_PIN_CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static CALLER_PIN_OWNER: AtomicI64 = AtomicI64::new(-1);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static CALLER_PIN_CORE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Whether thread `tid` currently holds our caller-pin: it claimed the pin
+/// and its live mask is still exactly that pin. A cpuset migration rewrites
+/// masks wholesale, which shows up here as "not ours" and lets the allowance
+/// probe trust the live mask again. Linux/Android only: the pin is a stub
+/// elsewhere, so there is nothing to detect.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn thread_self_pinned(tid: libc::pid_t) -> bool {
+    if CALLER_PIN_OWNER.load(Ordering::Acquire) != tid as i64 {
+        return false;
+    }
+    let core = CALLER_PIN_CORE.load(Ordering::Acquire);
+    if core == usize::MAX {
+        return false;
+    }
+    // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the size/pointer pair describes `set` exactly. Any failure
+    // (notably ESRCH for an exited thread) means "not ours".
+    let ok =
+        unsafe { libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if ok != 0 {
+        return false;
+    }
+    // Bound spelled from the set size rather than `CPU_SETSIZE`: the
+    // constant is `size_t` on Android, where `as usize` would trip
+    // `unnecessary_cast` under the repo's `-D warnings` gate.
+    let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    let mut count = 0;
+    let mut found = false;
+    for cpu in 0..capacity {
+        // SAFETY: `cpu` is bounded by the set's own bit capacity.
+        if unsafe { libc::CPU_ISSET(cpu, &set) } {
+            count += 1;
+            found = cpu == core;
+        }
+    }
+    // True only for exactly our singleton: a migrated (rewritten) mask or a
+    // widened one belongs to the outside world again.
+    count == 1 && found
+}
+
+/// Test-only injector for the caller-pin claim statics: pretend thread
+/// `owner` holds a pin to `core`. The live-mask half of detection still
+/// reads the real mask, so tests pin real threads and only fake the claim.
+/// Restores the unclaimed state on drop. Going through a real dispatch
+/// instead would be racy: the claim is process-global, and a concurrent
+/// pool test could hold it first.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn debug_set_caller_pin_for_test(owner: i64, core: usize) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALLER_PIN_OWNER.store(-1, Ordering::Release);
+            CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+        }
+    }
+    CALLER_PIN_OWNER.store(owner, Ordering::Release);
+    CALLER_PIN_CORE.store(core, Ordering::Release);
+    Restore
+}
+
 impl RowPool {
     /// Pin the calling thread (worker 0) to the pool's fastest core — held by
     /// at most one caller thread at a time, process-wide. Without the claim,
@@ -1148,11 +1228,15 @@ impl RowPool {
     /// (plus one relaxed load while another thread holds the claim). No-op
     /// when the platform has no affinity (`caller_pin == None`).
     fn pin_caller_once(&self) {
-        static CALLER_PIN_CLAIMED: AtomicBool = AtomicBool::new(false);
         /// Releases the claim when the holding thread exits.
         struct ClaimGuard;
         impl Drop for ClaimGuard {
             fn drop(&mut self) {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    CALLER_PIN_OWNER.store(-1, Ordering::Release);
+                    CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+                }
                 CALLER_PIN_CLAIMED.store(false, Ordering::Release);
             }
         }
@@ -1203,6 +1287,17 @@ impl RowPool {
             {
                 if pin_current_thread_to_core(core) {
                     claim.guard = Some(ClaimGuard);
+                    // Record the claim for the allowance probe (see
+                    // `thread_self_pinned`): the pinning thread's tid and
+                    // core, so a leader mask that is exactly our own pin
+                    // is never mistaken for an external restriction.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    {
+                        // SAFETY: `gettid` always succeeds.
+                        let tid = unsafe { libc::gettid() };
+                        CALLER_PIN_OWNER.store(tid as i64, Ordering::Release);
+                        CALLER_PIN_CORE.store(core, Ordering::Release);
+                    }
                     claim.retry_cooldown = PIN_RETRY_BACKOFF;
                 } else {
                     // Pin refused: release so another (or this) thread can
