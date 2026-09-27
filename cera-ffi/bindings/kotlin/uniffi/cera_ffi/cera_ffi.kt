@@ -2637,7 +2637,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481) {
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 41114) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
@@ -17900,14 +17900,11 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
 
 /**
  * Write the embedded DSP skels into `dir` (created if missing) and
- * point FastRPC's loader at it. For JVM/desktop/shell flows where the
- * caller stages a private writable directory; Android apps instead use
- * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
- * (which points the loader at `nativeLibraryDir`), so this call is not
- * needed there. Do not combine the two in one process unless merging
- * both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
- * flow per app. Call once at startup, before [`hexagon_probe`] or
- * loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * point FastRPC's loader at it. Caller stages a private writable directory;
+ * on Android, the `HexagonNpu.setup` helper invokes this function to extract
+ * skels into the application's internal files directory (`cera_skels`) and
+ * configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+ * or loading a model with [`BackendPreference::Hexagon`]. Returns the
  * number of skels written (0 when all were already present and fresh).
  * Re-running is cheap and idempotent (files are only rewritten when
  * their bytes differ, and the loader path is not duplicated). A `dir`

@@ -499,7 +499,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481:
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 41114:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -556,6 +556,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1528,6 +1530,13 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_context_size.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2463,6 +2472,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.restype = cty
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.restype = ctypes.c_uint16
@@ -12121,6 +12133,14 @@ class CeraEngineProtocol(typing.Protocol):
         or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
 """
         raise NotImplementedError
+    def configure_prefix_cache(self, cache_dir: typing.Optional[str],max_warm_entries: typing.Optional[int]) -> None:
+        """
+        Configure the model's KV prefix cache.
+
+        When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+        When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+"""
+        raise NotImplementedError
     def context_size(self, ) -> int:
         """
         Resolved context-window size (KV cache cap) the engine was
@@ -12735,6 +12755,30 @@ class CeraEngine(CeraEngineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def configure_prefix_cache(self, cache_dir: typing.Optional[str],max_warm_entries: typing.Optional[int]) -> None:
+        """
+        Configure the model's KV prefix cache.
+
+        When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+        When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+"""
+        
+        _UniffiFfiConverterOptionalString.check_lower(cache_dir)
+
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_warm_entries)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterOptionalString.lower(cache_dir),
+            _UniffiFfiConverterOptionalUInt32.lower(max_warm_entries),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -15498,14 +15542,11 @@ def detect_tool_format(architecture: str) -> typing.Optional[ToolFormat]:
 def hexagon_install_skels(dir: str) -> int:
     """
     Write the embedded DSP skels into `dir` (created if missing) and
-    point FastRPC's loader at it. For JVM/desktop/shell flows where the
-    caller stages a private writable directory; Android apps instead use
-    the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
-    (which points the loader at `nativeLibraryDir`), so this call is not
-    needed there. Do not combine the two in one process unless merging
-    both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
-    flow per app. Call once at startup, before [`hexagon_probe`] or
-    loading a model with [`BackendPreference::Hexagon`]. Returns the
+    point FastRPC's loader at it. Caller stages a private writable directory;
+    on Android, the `HexagonNpu.setup` helper invokes this function to extract
+    skels into the application's internal files directory (`cera_skels`) and
+    configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+    or loading a model with [`BackendPreference::Hexagon`]. Returns the
     number of skels written (0 when all were already present and fresh).
     Re-running is cheap and idempotent (files are only rewritten when
     their bytes differ, and the loader path is not duplicated). A `dir`

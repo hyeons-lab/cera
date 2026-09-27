@@ -8600,8 +8600,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 24481) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 24481, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 41114) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 41114, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_probe;
     try {
@@ -8852,6 +8852,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache != 5238) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: expected 5238, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache != 49295) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache`: expected 49295, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size;
     try {
@@ -14361,6 +14371,145 @@ class CeraFfiFfi {
       }
       (argBuf + 0).ref.u64 = clonedHandle;
       _ceraEngineClearPrefixCacheFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineConfigurePrefixCacheFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_configure_prefix_cache');
+
+  void ceraEngineInvokeConfigurePrefixCache(int handle, String? cacheDir, int? maxWarmEntries) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final cacheDirWriter = _UniFfiBinaryWriter();
+      if (cacheDir == null) {
+        cacheDirWriter.writeI8(0);
+      } else {
+        cacheDirWriter.writeI8(1);
+        cacheDirWriter.writeString(cacheDir!);
+      }
+      final Uint8List cacheDirBytes = cacheDirWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> cacheDirPtr = cacheDirBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(cacheDirBytes.length);
+      if (cacheDirBytes.isNotEmpty) { cacheDirPtr.asTypedList(cacheDirBytes.length).setAll(0, cacheDirBytes); }
+      foreignArgPtrs.add(cacheDirPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> cacheDirFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      cacheDirFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      cacheDirFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> cacheDirForeignPtr = calloc<_UniFfiForeignBytes>();
+      cacheDirForeignPtr.ref
+        ..len = cacheDirBytes.length
+        ..data = cacheDirPtr;
+      final _UniFfiRustBuffer cacheDirRustBuffer = _uniFfiRustBufferFromBytes(cacheDirForeignPtr.ref, cacheDirFromBytesStatusPtr);
+      calloc.free(cacheDirForeignPtr);
+      final int cacheDirFromBytesCode = cacheDirFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer cacheDirFromBytesErrBuf = cacheDirFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(cacheDirFromBytesStatusPtr);
+      if (cacheDirFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> cacheDirFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        cacheDirFromBytesErrBufPtr.ref
+          ..capacity = cacheDirFromBytesErrBuf.capacity
+          ..len = cacheDirFromBytesErrBuf.len
+          ..data = cacheDirFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(cacheDirFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $cacheDirFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = cacheDirRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = cacheDirRustBuffer.len;
+      (argBuf + 3).ref.ptr = cacheDirRustBuffer.data.cast<ffi.Void>();
+      final maxWarmEntriesWriter = _UniFfiBinaryWriter();
+      if (maxWarmEntries == null) {
+        maxWarmEntriesWriter.writeI8(0);
+      } else {
+        maxWarmEntriesWriter.writeI8(1);
+        maxWarmEntriesWriter.writeU32(maxWarmEntries!);
+      }
+      final Uint8List maxWarmEntriesBytes = maxWarmEntriesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> maxWarmEntriesPtr = maxWarmEntriesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(maxWarmEntriesBytes.length);
+      if (maxWarmEntriesBytes.isNotEmpty) { maxWarmEntriesPtr.asTypedList(maxWarmEntriesBytes.length).setAll(0, maxWarmEntriesBytes); }
+      foreignArgPtrs.add(maxWarmEntriesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> maxWarmEntriesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      maxWarmEntriesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      maxWarmEntriesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> maxWarmEntriesForeignPtr = calloc<_UniFfiForeignBytes>();
+      maxWarmEntriesForeignPtr.ref
+        ..len = maxWarmEntriesBytes.length
+        ..data = maxWarmEntriesPtr;
+      final _UniFfiRustBuffer maxWarmEntriesRustBuffer = _uniFfiRustBufferFromBytes(maxWarmEntriesForeignPtr.ref, maxWarmEntriesFromBytesStatusPtr);
+      calloc.free(maxWarmEntriesForeignPtr);
+      final int maxWarmEntriesFromBytesCode = maxWarmEntriesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer maxWarmEntriesFromBytesErrBuf = maxWarmEntriesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(maxWarmEntriesFromBytesStatusPtr);
+      if (maxWarmEntriesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> maxWarmEntriesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        maxWarmEntriesFromBytesErrBufPtr.ref
+          ..capacity = maxWarmEntriesFromBytesErrBuf.capacity
+          ..len = maxWarmEntriesFromBytesErrBuf.len
+          ..data = maxWarmEntriesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(maxWarmEntriesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $maxWarmEntriesFromBytesCode');
+      }
+      (argBuf + 4).ref.u64 = maxWarmEntriesRustBuffer.capacity;
+      (argBuf + 5).ref.u64 = maxWarmEntriesRustBuffer.len;
+      (argBuf + 6).ref.ptr = maxWarmEntriesRustBuffer.data.cast<ffi.Void>();
+      _ceraEngineConfigurePrefixCacheFfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 0).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
         final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
@@ -28938,6 +29087,15 @@ final class CeraEngine {
     _ffi.ceraEngineInvokeClearPrefixCache(_handle);
   }
 
+  /// Configure the model's KV prefix cache.
+  ///
+  /// When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+  /// When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+  void configurePrefixCache(String? cacheDir, int? maxWarmEntries) {
+    _ensureOpen();
+    _ffi.ceraEngineInvokeConfigurePrefixCache(_handle, cacheDir, maxWarmEntries);
+  }
+
   /// Resolved context-window size (KV cache cap) the engine was
   /// configured with. Mirrors the `context_size` field of the
   /// [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -31284,14 +31442,11 @@ ToolFormat? detectToolFormat(String architecture) {
 }
 
 /// Write the embedded DSP skels into `dir` (created if missing) and
-/// point FastRPC's loader at it. For JVM/desktop/shell flows where the
-/// caller stages a private writable directory; Android apps instead use
-/// the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
-/// (which points the loader at `nativeLibraryDir`), so this call is not
-/// needed there. Do not combine the two in one process unless merging
-/// both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
-/// flow per app. Call once at startup, before [`hexagon_probe`] or
-/// loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// point FastRPC's loader at it. Caller stages a private writable directory;
+/// on Android, the `HexagonNpu.setup` helper invokes this function to extract
+/// skels into the application's internal files directory (`cera_skels`) and
+/// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+/// or loading a model with [`BackendPreference::Hexagon`]. Returns the
 /// number of skels written (0 when all were already present and fresh).
 /// Re-running is cheap and idempotent (files are only rewritten when
 /// their bytes differ, and the loader path is not duplicated). A `dir`

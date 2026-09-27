@@ -414,6 +414,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_capabilities(uint64_t ptr, RustC
 void uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONFIGURE_PREFIX_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONFIGURE_PREFIX_CACHE
+void uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(uint64_t ptr, RustBuffer cache_dir, RustBuffer max_warm_entries, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONTEXT_SIZE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_CONTEXT_SIZE
 uint64_t uniffi_cera_ffi_fn_method_ceraengine_context_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -1824,6 +1829,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_capabilities(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CLEAR_PREFIX_CACHE
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CONFIGURE_PREFIX_CACHE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_CONFIGURE_PREFIX_CACHE
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache(void
     
 );
 #endif

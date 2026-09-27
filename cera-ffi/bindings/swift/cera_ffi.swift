@@ -913,6 +913,14 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func clearPrefixCache() 
     
     /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?) 
+    
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -1452,6 +1460,21 @@ open func capabilities() -> ModalityCapabilities  {
 open func clearPrefixCache()  {try! rustCall() {
     uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+open func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?)  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(cacheDir),
+        FfiConverterOptionUInt32.lower(maxWarmEntries),$0
     )
 }
 }
@@ -12381,14 +12404,11 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 }
 /**
  * Write the embedded DSP skels into `dir` (created if missing) and
- * point FastRPC's loader at it. For JVM/desktop/shell flows where the
- * caller stages a private writable directory; Android apps instead use
- * the AAR's bundled `jniLibs` skels plus the `HexagonNpu.setup` helper
- * (which points the loader at `nativeLibraryDir`), so this call is not
- * needed there. Do not combine the two in one process unless merging
- * both dirs into `ADSP_LIBRARY_PATH` is what you want; pick one staging
- * flow per app. Call once at startup, before [`hexagon_probe`] or
- * loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * point FastRPC's loader at it. Caller stages a private writable directory;
+ * on Android, the `HexagonNpu.setup` helper invokes this function to extract
+ * skels into the application's internal files directory (`cera_skels`) and
+ * configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+ * or loading a model with [`BackendPreference::Hexagon`]. Returns the
  * number of skels written (0 when all were already present and fresh).
  * Re-running is cheap and idempotent (files are only rewritten when
  * their bytes differ, and the loader path is not duplicated). A `dir`
@@ -12632,7 +12652,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 24481) {
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 41114) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
@@ -12708,6 +12728,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
