@@ -615,6 +615,12 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
         x if x == HtpOpCode::Clamp as u32 => "Clamp",
         x if x == HtpOpCode::Conv1D as u32 => "Conv1D",
         x if x == HtpOpCode::UnarySnake as u32 => "UnarySnake",
+        x if x == HtpOpCode::UnarySin as u32 => "UnarySin",
+        x if x == HtpOpCode::UnaryCos as u32 => "UnaryCos",
+        x if x == HtpOpCode::ConvTranspose1D as u32 => "ConvTranspose1D",
+        x if x == HtpOpCode::UnaryHardSigmoid as u32 => "UnaryHardSigmoid",
+        x if x == HtpOpCode::UnaryHardSwish as u32 => "UnaryHardSwish",
+        x if x == HtpOpCode::UnaryElu as u32 => "UnaryElu",
         _ => "unknown",
     }
 }
@@ -663,6 +669,21 @@ mod tests {
         assert_eq!(htp_opcode_name(HtpOpCode::Clamp as u32), "Clamp");
         assert_eq!(htp_opcode_name(HtpOpCode::Conv1D as u32), "Conv1D");
         assert_eq!(htp_opcode_name(HtpOpCode::UnarySnake as u32), "UnarySnake");
+        assert_eq!(htp_opcode_name(HtpOpCode::UnarySin as u32), "UnarySin");
+        assert_eq!(htp_opcode_name(HtpOpCode::UnaryCos as u32), "UnaryCos");
+        assert_eq!(
+            htp_opcode_name(HtpOpCode::ConvTranspose1D as u32),
+            "ConvTranspose1D"
+        );
+        assert_eq!(
+            htp_opcode_name(HtpOpCode::UnaryHardSigmoid as u32),
+            "UnaryHardSigmoid"
+        );
+        assert_eq!(
+            htp_opcode_name(HtpOpCode::UnaryHardSwish as u32),
+            "UnaryHardSwish"
+        );
+        assert_eq!(htp_opcode_name(HtpOpCode::UnaryElu as u32), "UnaryElu");
         assert_eq!(htp_opcode_name(9999), "unknown");
     }
 }

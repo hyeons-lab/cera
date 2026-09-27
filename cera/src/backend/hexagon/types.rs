@@ -117,6 +117,12 @@ pub enum HtpOpCode {
     Argmax = 62,
     Conv1D = 63,
     UnarySnake = 64,
+    UnarySin = 65,
+    UnaryCos = 66,
+    ConvTranspose1D = 67,
+    UnaryHardSigmoid = 68,
+    UnaryHardSwish = 69,
+    UnaryElu = 70,
 
     Invalid = 0xFFFF_FFFF,
 }

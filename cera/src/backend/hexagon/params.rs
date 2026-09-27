@@ -65,6 +65,26 @@ pub fn build_snake_params(alpha: f32) -> [i32; 16] {
     params
 }
 
+/// Host-computed parameters for 1D transposed convolution (`ConvTranspose1D`).
+///
+/// Encodes stride, padding, and dilation into `op.params[0..3]`.
+pub fn build_conv_transpose1d_params(stride: usize, pad: usize, dilation: usize) -> [i32; 16] {
+    let mut params = [0i32; 16];
+    params[0] = stride.max(1) as i32;
+    params[1] = pad as i32;
+    params[2] = dilation.max(1) as i32;
+    params
+}
+
+/// Host-computed parameters for Exponential Linear Unit (`UnaryElu`).
+///
+/// Encodes negative slope scale parameter `alpha` into `op.params[0]`.
+pub fn build_elu_params(alpha: f32) -> [i32; 16] {
+    let mut params = [0i32; 16];
+    params[0] = alpha.to_bits() as i32;
+    params
+}
+
 /// Host-computed kernel parameters for unary operations (RMS norm, activations).
 ///
 /// Mirrors `ggml_hexagon_precompute_unary_params` + `htp_unary_vtcm_layout_build`.
@@ -1496,5 +1516,34 @@ mod tests {
 
         let p_default = build_snake_params(1.0);
         assert_eq!(p_default[0], 1.0f32.to_bits() as i32);
+    }
+
+    #[test]
+    fn test_conv_transpose1d_params() {
+        let p = build_conv_transpose1d_params(2, 1, 3);
+        assert_eq!(p[0], 2);
+        assert_eq!(p[1], 1);
+        assert_eq!(p[2], 3);
+        for &val in &p[3..] {
+            assert_eq!(val, 0);
+        }
+
+        // Test clamping of zero stride and dilation to 1
+        let p_clamped = build_conv_transpose1d_params(0, 0, 0);
+        assert_eq!(p_clamped[0], 1);
+        assert_eq!(p_clamped[1], 0);
+        assert_eq!(p_clamped[2], 1);
+    }
+
+    #[test]
+    fn test_elu_params() {
+        let p = build_elu_params(1.0);
+        assert_eq!(p[0], 1.0f32.to_bits() as i32);
+        for &val in &p[1..] {
+            assert_eq!(val, 0);
+        }
+
+        let p_custom = build_elu_params(0.5);
+        assert_eq!(p_custom[0], 0.5f32.to_bits() as i32);
     }
 }

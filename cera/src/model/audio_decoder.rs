@@ -137,11 +137,23 @@ pub fn build_gpu_audio_decoder(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
-        BP::Hexagon => try_wgpu_audio_decoder(gguf),
+        BP::Hexagon => try_hexagon_audio_decoder(gguf),
         BP::Metal => try_metal_audio_decoder(gguf),
         BP::Gpu => try_wgpu_audio_decoder(gguf),
-        BP::Auto => try_metal_audio_decoder(gguf).or_else(|| try_wgpu_audio_decoder(gguf)),
+        BP::Auto => try_metal_audio_decoder(gguf)
+            .or_else(|| try_hexagon_audio_decoder(gguf))
+            .or_else(|| try_wgpu_audio_decoder(gguf)),
     }
+}
+
+#[cfg(feature = "hexagon")]
+fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    crate::model::audio_decoder_hexagon::try_hexagon_audio_decoder(gguf)
+}
+
+#[cfg(not(feature = "hexagon"))]
+fn try_hexagon_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+    None
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -1335,6 +1347,15 @@ fn detok_attn_block(
 pub fn detokenize_to_spectrum(
     weights: &DetokenizerWeights,
     _detok_weights: &AudioDecoderWeights,
+    state: &mut DetokenizerState,
+    codes: &[i32],
+) -> Vec<f32> {
+    detokenize_to_spectrum_with_state(weights, state, codes)
+}
+
+/// Run the detokenizer with state: codes → spectrogram frames (before ISTFT).
+pub fn detokenize_to_spectrum_with_state(
+    weights: &DetokenizerWeights,
     state: &mut DetokenizerState,
     codes: &[i32],
 ) -> Vec<f32> {
