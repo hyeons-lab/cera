@@ -5,7 +5,7 @@
 //! collapses host clocks (observed 4.47GHz -> 1.02GHz on Snapdragon 8 Elite),
 //! stretching every RPC round trip and cache op into a ~2.9ms/token tax.
 //!
-//! The fix is Android's Application-Responsive Performance Framework (ADPF):
+//! The fix is Android's Dynamic Performance Framework (ADPF):
 //! a hint session telling the power HAL this thread has periodic work with a
 //! ~10ms budget, so it holds adequate CPU. Symbols resolve at runtime from
 //! `libandroid.so` (API 33+); anything missing degrades to `None` and the

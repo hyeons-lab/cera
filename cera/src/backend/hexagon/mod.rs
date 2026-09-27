@@ -44,7 +44,7 @@ impl HexagonContext {
             .unwrap_or(false)
         {
             // Debug knob: park a spinner to hold CPU clocks across DSP-bound
-            // waits (validates governor effects; burns a core — ADPF is the
+            // waits (validates governor effects; burns a core, whereas ADPF is the
             // production answer). Detached: runs until process exit. `OnceLock`:
             // without it every model reload parks another thread and the
             // knob skews the runs it was meant to stabilize; the stored
