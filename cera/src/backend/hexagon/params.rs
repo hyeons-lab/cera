@@ -54,9 +54,12 @@ pub fn build_unary_kernel_params(
 ) -> [i32; 32] {
     let mut kparams = [0i32; 32];
     // Debug: single-threaded single-row blocking (pre-port behavior).
-    let legacy = std::env::var("CERA_HEXAGON_UNARY_T1")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let legacy = *LEGACY.get_or_init(|| {
+        std::env::var("CERA_HEXAGON_UNARY_T1")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
     let n_threads = if legacy {
         1
     } else {
@@ -76,7 +79,7 @@ pub fn build_unary_kernel_params(
     let rpt = if legacy {
         1
     } else {
-        avail / (n_threads.max(1) * per_row.max(1))
+        (avail / (n_threads.max(1) * per_row.max(1))).max(1)
     };
 
     kparams[0] = n_threads as i32;
@@ -382,7 +385,7 @@ pub fn build_flash_attn_kernel_params(
 ) -> [i32; 32] {
     let mut kparams = [0i32; 32];
     let n_threads = n_threads.max(1) as u8;
-    let g = (n_heads / n_kv_heads).max(1);
+    let g = (n_heads / n_kv_heads.max(1)).max(1);
     let n_kv_blocks = seq_len.div_ceil(64).max(1);
 
     // byte 0: kernel_type = 1 (HTP_FA_KERNEL_HVX)

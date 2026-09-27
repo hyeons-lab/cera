@@ -506,10 +506,8 @@ impl PrefillScratch {
         let is = config.intermediate_size;
         let head_dim = if config.head_dim > 0 {
             config.head_dim
-        } else if config.n_heads > 0 {
-            hs / config.n_heads
         } else {
-            64
+            hs.checked_div(config.n_heads).unwrap_or(64)
         };
         let max_kv_heads = config
             .kv_heads_per_layer
@@ -519,8 +517,8 @@ impl PrefillScratch {
             .unwrap_or(config.n_kv_heads);
         let max_kv_dim = max_kv_heads * head_dim;
         let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
-        let nb_hs = (hs + 31) / 32;
-        let nb_is = (is + 31) / 32;
+        let nb_hs = hs.div_ceil(32);
+        let nb_is = is.div_ceil(32);
 
         Self::resize_f32(&mut self.normed, hs * n);
         Self::resize_f32(&mut self.block_out, hs * n);

@@ -263,6 +263,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<HtpBufDesc>(), 24);
         assert_eq!(std::mem::size_of::<HtpTensor>(), 56);
         assert_eq!(std::mem::size_of::<HtpOpDesc>(), 232);
+        assert_eq!(std::mem::size_of::<HtpProfDesc>(), 48);
         assert_eq!(std::mem::size_of::<HtpOpBatchReq>(), 24);
         assert_eq!(std::mem::size_of::<HtpOpBatchRsp>(), 88);
         assert_eq!(std::mem::size_of::<DspQueueBuffer>(), 24);

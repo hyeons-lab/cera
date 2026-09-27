@@ -90,34 +90,9 @@ object HexagonNpu {
         try {
             uniffi.cera_ffi.hexagonInstallSkels(dir)
         } catch (e: Exception) {
-            val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
-            val missing = skelFiles.filter { !File(dir, it).exists() }
-            if (missing.isNotEmpty()) {
-                throw IllegalStateException(
-                    "Hexagon DSP skels missing from $dir (${missing.joinToString()}): " +
-                        if (abi == "arm64-v8a") {
-                            "failed to extract embedded skels: ${e.message}"
-                        } else {
-                            "skels ship on arm64-v8a only (this device is $abi, " +
-                                "which has no Hexagon DSP); treat the NPU as unavailable"
-                        },
-                    e,
-                )
-            }
+            checkSkelsPresent(dir, e)
         }
-        val missing = skelFiles.filter { !File(dir, it).exists() }
-        if (missing.isNotEmpty()) {
-            val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
-            throw IllegalStateException(
-                "Hexagon DSP skels missing from $dir (${missing.joinToString()}): " +
-                    if (abi == "arm64-v8a") {
-                        "skel extraction failed to write DSP binaries"
-                    } else {
-                        "skels ship on arm64-v8a only (this device is $abi, " +
-                            "which has no Hexagon DSP); treat the NPU as unavailable"
-                    },
-            )
-        }
+        checkSkelsPresent(dir, null)
         // ';' is the separator the FastRPC loader parses (same form the
         // Rust `install_skels` writes); entries are deduplicated so a
         // second staging flow composing in either order stays valid.
@@ -136,6 +111,26 @@ object HexagonNpu {
             throw RuntimeException("failed to set ADSP_LIBRARY_PATH", e)
         }
         installed = true
+    }
+
+    private fun checkSkelsPresent(dir: String, cause: Exception?) {
+        val missing = skelFiles.filter { !File(dir, it).exists() }
+        if (missing.isNotEmpty()) {
+            val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+            val detail = if (abi == "arm64-v8a") {
+                if (cause != null) {
+                    "failed to extract embedded skels: ${cause.message}"
+                } else {
+                    "skel extraction failed to write DSP binaries"
+                }
+            } else {
+                "skels ship on arm64-v8a only (this device is $abi, which has no Hexagon DSP); treat the NPU as unavailable"
+            }
+            throw IllegalStateException(
+                "Hexagon DSP skels missing from $dir (${missing.joinToString()}): $detail",
+                cause,
+            )
+        }
     }
 
     /**

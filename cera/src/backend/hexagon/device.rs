@@ -104,7 +104,7 @@ impl HexagonDevice {
         };
 
         // Query DSP capabilities via `htp_iface_hwinfo` (IDL Method 8).
-        // Like the start payload, scalars pack as one C struct — here a
+        // Like the start payload, scalars pack as one C struct, here a
         // single out-buffer. kparams thread counts derive from this
         // (llama's `sess->n_threads`); on failure take llama's
         // hwinfo-failure defaults.
@@ -227,15 +227,6 @@ impl HexagonDevice {
         self.arch
     }
 
-    /// Register a mapped buffer with the DSP skeleton.
-    pub fn mmap_buffer(&self, _fd: u32, _size: u64) -> Result<(), CeraError> {
-        Ok(())
-    }
-
-    /// Unregister a buffer from the DSP skeleton.
-    pub fn munmap_buffer(&self, _fd: u32) -> Result<(), CeraError> {
-        Ok(())
-    }
 
     /// Mutable reference to the command queue session.
     pub fn queue_session_mut(&mut self) -> &mut HexagonQueueSession {
@@ -298,5 +289,17 @@ mod tests {
                 HexagonArch::V81
             ]
         );
+    }
+
+    #[test]
+    fn test_hexagon_arch_from_u32() {
+        assert_eq!(HexagonArch::from_u32(73), Some(HexagonArch::V73));
+        assert_eq!(HexagonArch::from_u32(75), Some(HexagonArch::V75));
+        assert_eq!(HexagonArch::from_u32(79), Some(HexagonArch::V79));
+        assert_eq!(HexagonArch::from_u32(81), Some(HexagonArch::V81));
+        assert_eq!(HexagonArch::from_u32(0), None);
+        assert_eq!(HexagonArch::from_u32(72), None);
+        assert_eq!(HexagonArch::from_u32(74), None);
+        assert_eq!(HexagonArch::from_u32(100), None);
     }
 }

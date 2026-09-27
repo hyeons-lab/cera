@@ -94,6 +94,7 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             // A killed install may leave its `*.so.tmp.<pid>` behind; it is
             // never loader-visible and safe to delete.
             let tmp = path.with_extension(format!("so.tmp.{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
             std::fs::write(&tmp, bytes)
                 .map_err(|e| CeraError::Backend(format!("write {}: {e}", tmp.display())))?;
             std::fs::rename(&tmp, &path)

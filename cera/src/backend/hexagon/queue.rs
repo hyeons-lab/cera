@@ -10,7 +10,8 @@ use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
 use super::types::{
     DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER, DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT, DspQueueBuffer,
-    HtpBufDesc, HtpOpBatchReq, HtpOpBatchRsp, HtpOpDesc, HtpProfDesc, HtpStatus, HtpTensor,
+    HtpBufDesc, HtpOpBatchReq, HtpOpBatchRsp, HtpOpCode, HtpOpDesc, HtpProfDesc, HtpStatus,
+    HtpTensor,
 };
 use crate::session::CeraError;
 
@@ -22,6 +23,16 @@ const STAGING_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// this is firmware misbehavior, and an uncapped drain would hang the flush
 /// (including from `Drop`) on a stuck seq.
 const MAX_CONSECUTIVE_STALE: u32 = 32;
+
+fn step_enabled() -> bool {
+    static STEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| std::env::var_os("CERA_HEXAGON_STEP").is_some())
+}
+
+fn debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("CERA_HEXAGON_DEBUG").is_some())
+}
 
 /// One stale-drain decision: what the drain loop does with a freshly-read
 /// `rsp_seq` when `expected` was awaited and `drained` stale responses
@@ -165,7 +176,7 @@ impl HexagonQueueSession {
     /// would wedge the session, since every later registration fails the
     /// same way. No `seq` advance: nothing was attempted, so the
     /// stale-drain accounting is unaffected.
-    fn drop_pending_batch(&mut self) {
+    pub fn drop_pending_batch(&mut self) {
         self.bufs.clear();
         self.buf_map.clear();
         self.tens.clear();
@@ -255,7 +266,7 @@ impl HexagonQueueSession {
                 ))
             })?;
         }
-        if std::env::var_os("CERA_HEXAGON_STEP").is_some() {
+        if step_enabled() {
             eprintln!("[cera-hexagon] step op opcode={opcode}");
             self.flush().map_err(|e| {
                 CeraError::Backend(format!("HTP step failed on opcode {opcode}: {e}"))
@@ -270,7 +281,7 @@ impl HexagonQueueSession {
             return Ok(());
         }
 
-        if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!(
                 "[cera-hexagon] flush: bufs.len={} tens.len={} ops.len={}",
                 self.bufs.len(),
@@ -317,6 +328,7 @@ impl HexagonQueueSession {
         let total_bytes = bufs_bytes + tens_bytes + ops_bytes + prof_bytes;
 
         if total_bytes > self.staging_buf.size() {
+            self.drop_pending_batch();
             return Err(CeraError::Backend(format!(
                 "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
                 self.staging_buf.size()
@@ -442,7 +454,7 @@ impl HexagonQueueSession {
         // Attempts are single-shot: drop the batch and advance `seq` whether
         // this attempt succeeded or failed. Nothing ever retries (every
         // flush-error path aborts its forward), while the session outlives
-        // the forward — retaining a failed batch would piggyback stale ops
+        // the forward, retaining a failed batch would piggyback stale ops
         // onto the next forward's flush. And the drain above is correct only
         // if `seq` advances strictly per attempt: reusing a timed-out
         // batch's `seq` would accept its late response as the new batch's.
@@ -456,14 +468,18 @@ impl HexagonQueueSession {
         read_res?;
 
         if rsp.status != HtpStatus::Ok as u32 {
+            let status_detail = HtpStatus::from_u32(rsp.status)
+                .map(|s| format!("{s:?} ({})", rsp.status))
+                .unwrap_or_else(|| rsp.status.to_string());
             return Err(CeraError::Backend(format!(
-                "HTP batch seq {} failed with status {}",
-                rsp.seq, rsp.status
+                "HTP batch seq {} failed with status {status_detail}",
+                rsp.seq
             )));
         }
 
         if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() {
             self.record_profile(
+                rsp.seq,
                 n_ops,
                 rsp.usecs,
                 rsp.cycles_stop.saturating_sub(rsp.cycles_start),
@@ -479,6 +495,7 @@ impl HexagonQueueSession {
     /// firmware wrote into staging, and log a one-line batch summary.
     fn record_profile(
         &mut self,
+        batch_seq: u64,
         n_ops: usize,
         batch_usecs: u32,
         batch_cycles: u64,
@@ -500,7 +517,7 @@ impl HexagonQueueSession {
             if per_op {
                 eprintln!(
                     "[cera-hexagon] profile-op: seq={} idx={} op={} {} usec={}",
-                    self.seq,
+                    batch_seq,
                     i,
                     desc.opcode,
                     htp_opcode_name(desc.opcode),
@@ -518,7 +535,7 @@ impl HexagonQueueSession {
         };
         eprintln!(
             "[cera-hexagon] profile: seq={} ops={} dsp_op_us={} dsp_batch_us={} host_us={} mhz={:.1}",
-            self.seq,
+            batch_seq,
             n_ops,
             dsp_total,
             batch_usecs,
@@ -530,11 +547,15 @@ impl HexagonQueueSession {
 
 impl Drop for HexagonQueueSession {
     fn drop(&mut self) {
-        // Unpropagatable from `Drop`, but worth one line: `flush` returns
-        // `Ok` when idle, so normal shutdown never reaches the `eprintln`
-        // anyway — only a genuine mid-batch death prints, ungated.
-        if let Err(e) = self.flush() {
-            eprintln!("[cera-hexagon] drop flush failed: {e}");
+        // Do not attempt to flush uncommitted batches on drop: if the device
+        // session was already stopped, flushing will hang for 30 seconds
+        // awaiting a response that will never arrive. Discard pending work instead.
+        if !self.ops.is_empty() {
+            eprintln!(
+                "[cera-hexagon] dropping queue session with {} uncommitted ops; discarding batch",
+                self.ops.len()
+            );
+            self.drop_pending_batch();
         }
         if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() && self.prof_flushes > 0 {
             let rtt = self.prof_host_us.saturating_sub(self.prof_dsp_us) / self.prof_flushes;
@@ -573,22 +594,22 @@ impl Drop for HexagonQueueSession {
 /// pinned (see `HtpOpCode`); unknown ids print numerically via the `op` column.
 fn htp_opcode_name(opcode: u32) -> &'static str {
     match opcode {
-        0 => "Mul",
-        1 => "Add",
-        4 => "MulMat",
-        6 => "MulMatNx",
-        8 => "MulMatAdd",
-        9 => "RmsNorm",
-        10 => "RmsNormMul",
-        21 => "GluSwiglu",
-        27 => "Rope",
-        28 => "FlashAttnExt",
-        29 => "SetRows",
-        30 => "GetRows",
-        31 => "Scale",
-        32 => "Cpy",
-        39 => "SsmConv",
-        50 => "Concat",
+        x if x == HtpOpCode::Mul as u32 => "Mul",
+        x if x == HtpOpCode::Add as u32 => "Add",
+        x if x == HtpOpCode::MulMat as u32 => "MulMat",
+        x if x == HtpOpCode::MulMatNx as u32 => "MulMatNx",
+        x if x == HtpOpCode::MulMatAdd as u32 => "MulMatAdd",
+        x if x == HtpOpCode::RmsNorm as u32 => "RmsNorm",
+        x if x == HtpOpCode::RmsNormMul as u32 => "RmsNormMul",
+        x if x == HtpOpCode::GluSwiglu as u32 => "GluSwiglu",
+        x if x == HtpOpCode::Rope as u32 => "Rope",
+        x if x == HtpOpCode::FlashAttnExt as u32 => "FlashAttnExt",
+        x if x == HtpOpCode::SetRows as u32 => "SetRows",
+        x if x == HtpOpCode::GetRows as u32 => "GetRows",
+        x if x == HtpOpCode::Scale as u32 => "Scale",
+        x if x == HtpOpCode::Cpy as u32 => "Cpy",
+        x if x == HtpOpCode::SsmConv as u32 => "SsmConv",
+        x if x == HtpOpCode::Concat as u32 => "Concat",
         _ => "unknown",
     }
 }

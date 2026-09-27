@@ -25,7 +25,7 @@ use crate::backend::hexagon::{
     repacked_matrix_size_q6_k, repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
 };
 use crate::gguf::GgufFile;
-use crate::kv_cache::{InferenceState, KvCompression, KvRewindError};
+use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::session_gate::{ModelSessionGate, ModelSessionLease};
 use crate::model::{BlockType, Model, ModelConfig, record_first_fault, take_fault};
 use crate::session::CeraError;
@@ -290,6 +290,7 @@ pub struct HexagonLfm2Model {
     /// finds no chunking. Default on; `CERA_HEXAGON_HMX=0` forces HVX.
     use_hmx: bool,
     vtcm_budget: usize,
+    dump_act: bool,
     current_seq_len: AtomicUsize,
     /// Last decode failure, recorded by `forward` for
     /// [`Model::take_decode_error`]: the trait's decode surface has no
@@ -331,6 +332,7 @@ impl HexagonLfm2Model {
         let debug_barriers = std::env::var("CERA_HEXAGON_BARRIERS")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let dump_act = std::env::var_os("CERA_DUMP_ACT").is_some();
         let adpf_target_nanos: i64 = std::env::var("CERA_HEXAGON_ADPF_TARGET_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -381,10 +383,19 @@ impl HexagonLfm2Model {
             }
         };
 
-        let token_embd = gguf
+        let token_embd_tensor = gguf
             .get_tensor("token_embd.weight")
-            .map_err(|e| CeraError::Backend(format!("missing token_embd.weight: {e}")))?
-            .to_f32_vec();
+            .map_err(|e| CeraError::Backend(format!("missing token_embd.weight: {e}")))?;
+        let expected_elements = vocab_size
+            .checked_mul(hidden_size)
+            .ok_or_else(|| CeraError::Backend("vocab_size * hidden_size overflows usize".into()))?;
+        let token_embd = token_embd_tensor.to_f32_vec();
+        if token_embd.len() < expected_elements {
+            return Err(CeraError::Backend(format!(
+                "token_embd.weight has {} elements, expected at least {expected_elements}",
+                token_embd.len()
+            )));
+        }
 
         let driver = context.driver();
 
@@ -750,6 +761,11 @@ impl HexagonLfm2Model {
                     .map_err(|e| CeraError::Backend(format!("missing tensor {name}: {e}")))?;
                 let f32_vals = t.to_f32_vec();
                 let byte_size = f32_vals.len() * std::mem::size_of::<f32>();
+                if offset.saturating_add(byte_size) > buf.size() {
+                    return Err(CeraError::Backend(format!(
+                        "norm tensor {name} byte size ({byte_size}) exceeds weights buffer capacity at offset {offset}"
+                    )));
+                }
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         f32_vals.as_ptr() as *const u8,
@@ -891,6 +907,16 @@ impl HexagonLfm2Model {
                             CeraError::Backend(format!("missing shortconv.conv.weight: {e}"))
                         })?;
                     let conv_f32 = conv_tensor.to_f32_vec();
+                    let expected_conv_len = hidden_size.checked_mul(3).ok_or_else(|| {
+                        CeraError::Backend("hidden_size overflow calculating conv weight size".into())
+                    })?;
+                    if conv_f32.len() != expected_conv_len {
+                        return Err(CeraError::Backend(format!(
+                            "blk.{i}.shortconv.conv.weight size {} != hidden_size * 3 ({} * 3)",
+                            conv_f32.len(),
+                            hidden_size
+                        )));
+                    }
                     let mut w0_vec = vec![0.0f32; hidden_size];
                     let mut w1_vec = vec![0.0f32; hidden_size];
                     let mut w2_vec = vec![0.0f32; hidden_size];
@@ -989,13 +1015,12 @@ impl HexagonLfm2Model {
             use_ssm_conv,
             use_hmx,
             vtcm_budget,
+            dump_act,
             current_seq_len: AtomicUsize::new(0),
             decode_error: Mutex::new(None),
         })
     }
-}
 
-impl HexagonLfm2Model {
     /// Contiguous f32 vector descriptor (`[dim,1,1,1]`): the one spelling of
     /// the vec shape+strides all elementwise dispatches share.
     fn add_f32_vec(
@@ -1553,6 +1578,7 @@ impl HexagonLfm2Model {
         let fusable = (2..=4).contains(&n)
             && out_offsets.len() == n
             && ws.iter().all(|w| w.in_dim == k && w.wire_dtype == wtype)
+            && ws.iter().all(|w| w.out_dim <= w0.out_dim)
             && ws.iter().all(|w| {
                 (self.use_hmx && mm_is_hmx_eligible(wtype, pad32(k), pad32(w.out_dim), n_rows))
                     == hmx0
@@ -1565,8 +1591,7 @@ impl HexagonLfm2Model {
             unfused(self, session)?;
             return Ok(());
         }
-        debug_assert!(ws.iter().all(|w| w.out_dim <= w0.out_dim));
-        // HMX first, HVX fallback — the same selection as singles, with
+        // HMX first, HVX fallback: the same selection as singles, with
         // `n_weights` set. HVX forces QUANT_ROW: NX has no block kernel.
         let hmx_built = if hmx0 {
             build_hmx_mm_kernel_params(
@@ -2178,10 +2203,26 @@ impl HexagonLfm2Model {
         Ok(())
     }
 
+    /// Flush pending ops if debug_barriers is set.
+    #[inline]
+    fn debug_barrier(
+        &self,
+        session: &mut HexagonQueueSession,
+        label: &str,
+    ) -> Result<(), CeraError> {
+        if self.debug_barriers {
+            session
+                .flush()
+                .map_err(|e| CeraError::Backend(format!("{label} flush failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Debug helper: flush pending ops, then log RMS/max_abs of a scratch
     /// region. Active only with CERA_DUMP_ACT set. Mirrors the CPU backend's
     /// `[cera.hidden]` log points for cross-backend diffing.
     fn dump_hidden(
+        &self,
         session: &mut HexagonQueueSession,
         scratch: &RpcmemBuffer,
         layer_idx: usize,
@@ -2189,7 +2230,7 @@ impl HexagonLfm2Model {
         offset: usize,
         len: usize,
     ) {
-        if std::env::var("CERA_DUMP_ACT").is_err() {
+        if !self.dump_act {
             return;
         }
         if let Err(e) = session.flush() {
@@ -2525,7 +2566,14 @@ impl HexagonLfm2Model {
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
         let m = tokens.len();
-        assert!(!tokens.is_empty() && m <= PREFILL_MAX_ROWS);
+        if tokens.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        if m > PREFILL_MAX_ROWS {
+            return Err(CeraError::Backend(format!(
+                "prefill chunk size ({m}) exceeds maximum ({PREFILL_MAX_ROWS})"
+            )));
+        }
         let fwd_start = std::time::Instant::now();
 
         let vocab_size = self.config.vocab_size;
@@ -2535,6 +2583,15 @@ impl HexagonLfm2Model {
             )));
         }
 
+        let max_seq_len = self.config.max_seq_len;
+        let kv_len = start_pos + m;
+        if kv_len > max_seq_len {
+            return Err(CeraError::ContextOverflow {
+                max_seq_len: max_seq_len as u32,
+                by: (kv_len - max_seq_len) as u32,
+            });
+        }
+
         let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
 
         let hs = self.config.hidden_size;
@@ -2542,7 +2599,6 @@ impl HexagonLfm2Model {
         let scratch = &self.scratch_buf;
 
         // Gather token embeddings, positions, and the causal mask.
-        let kv_len = start_pos + m;
         unsafe {
             for (i, &t) in tokens.iter().enumerate() {
                 std::ptr::copy_nonoverlapping(
@@ -2576,11 +2632,11 @@ impl HexagonLfm2Model {
         let intermediate_size = self.config.intermediate_size;
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
-        let max_seq_len = self.config.max_seq_len;
         let rope_theta = self.config.rope_theta;
         let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let session = device.queue_session_mut();
+        session.drop_pending_batch();
 
         // Small-M determinism: cap ops per flush (reset after the final
         // flush below). Unconditional: the session outlives the forward and
@@ -2594,719 +2650,658 @@ impl HexagonLfm2Model {
             None
         });
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            match layer {
-                HexagonLayer::Attention(attn) => {
-                    let n_kv_heads = attn.kv_dim / head_dim;
-                    let q_dim = attn.q_dim;
-                    let kv_dim = attn.kv_dim;
-                    // Block norm over M rows.
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        attn.attn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        m,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill attn_norm flush failed: {e}"
-                        )));
-                    }
-                    // QKV projections (fused NX: one shared-activation op).
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.q, so.k, so.v],
-                        m,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!("prefill QKV flush failed: {e}")));
-                    }
-                    // Per-head QK norms over M*n_heads head-rows.
-                    if let Some(qn_offset) = attn.attn_q_norm_offset {
+        let run_res = (|| -> Result<(), CeraError> {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                match layer {
+                    HexagonLayer::Attention(attn) => {
+                        let n_kv_heads = attn.kv_dim / head_dim;
+                        let q_dim = attn.q_dim;
+                        let kv_dim = attn.kv_dim;
+                        // Block norm over M rows.
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.q,
+                            so.activation,
                             &self.weights_buf,
-                            qn_offset,
+                            attn.attn_norm_offset,
                             scratch,
-                            so.q,
+                            so.normed,
                             eps,
-                            head_dim,
-                            m * n_heads,
-                        )?;
-                    }
-                    if let Some(kn_offset) = attn.attn_k_norm_offset {
-                        Self::dispatch_rms_norm_mul(
-                            session,
-                            scratch,
-                            so.k,
-                            &self.weights_buf,
-                            kn_offset,
-                            scratch,
-                            so.k,
-                            eps,
-                            head_dim,
-                            m * n_kv_heads,
-                        )?;
-                    }
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill QK norm flush failed: {e}"
-                        )));
-                    }
-                    // RoPE (DSP, or host loop under the debug fallback).
-                    if self.cpu_rope {
-                        if let Err(e) = session.flush() {
-                            return Err(CeraError::Backend(format!(
-                                "prefill pre-RoPE flush failed: {e}"
-                            )));
-                        }
-                        let q_bytes = q_dim * m * 4;
-                        let k_bytes = kv_dim * m * 4;
-                        scratch.invalidate_cpu_cache(so.q, q_bytes);
-                        scratch.invalidate_cpu_cache(so.k, k_bytes);
-                        unsafe {
-                            for mm in 0..m {
-                                let q = std::slice::from_raw_parts_mut(
-                                    scratch.as_mut_ptr().add(so.q + mm * q_dim * 4) as *mut f32,
-                                    q_dim,
-                                );
-                                let k = std::slice::from_raw_parts_mut(
-                                    scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
-                                    kv_dim,
-                                );
-                                crate::backend::cpu::rope(
-                                    q,
-                                    k,
-                                    start_pos + mm,
-                                    n_heads,
-                                    n_kv_heads,
-                                    head_dim,
-                                    rope_theta,
-                                );
-                            }
-                        }
-                        scratch.flush_cpu_cache(so.q, q_bytes);
-                        scratch.flush_cpu_cache(so.k, k_bytes);
-                    } else {
-                        Self::dispatch_rope_m(
-                            session,
-                            scratch,
-                            so.q,
-                            scratch,
-                            so.pos,
-                            head_dim,
-                            n_heads,
+                            hs,
                             m,
-                            max_seq_len,
-                            rope_theta,
                         )?;
-                        Self::dispatch_rope_m(
+                        self.debug_barrier(session, "prefill attn_norm")?;
+                        // QKV projections (fused NX: one shared-activation op).
+                        self.dispatch_mul_mat_nx(
+                            session,
+                            &self.weights_buf,
+                            &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.q, so.k, so.v],
+                            m,
+                        )?;
+                        self.debug_barrier(session, "prefill QKV")?;
+                        // Per-head QK norms over M*n_heads head-rows.
+                        if let Some(qn_offset) = attn.attn_q_norm_offset {
+                            Self::dispatch_rms_norm_mul(
+                                session,
+                                scratch,
+                                so.q,
+                                &self.weights_buf,
+                                qn_offset,
+                                scratch,
+                                so.q,
+                                eps,
+                                head_dim,
+                                m * n_heads,
+                            )?;
+                        }
+                        if let Some(kn_offset) = attn.attn_k_norm_offset {
+                            Self::dispatch_rms_norm_mul(
+                                session,
+                                scratch,
+                                so.k,
+                                &self.weights_buf,
+                                kn_offset,
+                                scratch,
+                                so.k,
+                                eps,
+                                head_dim,
+                                m * n_kv_heads,
+                            )?;
+                        }
+                        self.debug_barrier(session, "prefill QK norm")?;
+                        // RoPE (DSP, or host loop under the debug fallback).
+                        if self.cpu_rope {
+                            session.flush().map_err(|e| {
+                                CeraError::Backend(format!("prefill pre-RoPE flush failed: {e}"))
+                            })?;
+                            let q_bytes = q_dim * m * 4;
+                            let k_bytes = kv_dim * m * 4;
+                            scratch.invalidate_cpu_cache(so.q, q_bytes);
+                            scratch.invalidate_cpu_cache(so.k, k_bytes);
+                            unsafe {
+                                for mm in 0..m {
+                                    let q = std::slice::from_raw_parts_mut(
+                                        scratch.as_mut_ptr().add(so.q + mm * q_dim * 4) as *mut f32,
+                                        q_dim,
+                                    );
+                                    let k = std::slice::from_raw_parts_mut(
+                                        scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
+                                        kv_dim,
+                                    );
+                                    crate::backend::cpu::rope(
+                                        q,
+                                        k,
+                                        start_pos + mm,
+                                        n_heads,
+                                        n_kv_heads,
+                                        head_dim,
+                                        rope_theta,
+                                    );
+                                }
+                            }
+                            scratch.flush_cpu_cache(so.q, q_bytes);
+                            scratch.flush_cpu_cache(so.k, k_bytes);
+                        } else {
+                            Self::dispatch_rope_m(
+                                session,
+                                scratch,
+                                so.q,
+                                scratch,
+                                so.pos,
+                                head_dim,
+                                n_heads,
+                                m,
+                                max_seq_len,
+                                rope_theta,
+                            )?;
+                            Self::dispatch_rope_m(
+                                session,
+                                scratch,
+                                so.k,
+                                scratch,
+                                so.pos,
+                                head_dim,
+                                n_kv_heads,
+                                m,
+                                max_seq_len,
+                                rope_theta,
+                            )?;
+                            self.debug_barrier(session, "prefill RoPE")?;
+                        }
+                        // Append M K/V rows (slots == positions: reuse pos vector).
+                        Self::dispatch_set_rows_m(
                             session,
                             scratch,
                             so.k,
                             scratch,
                             so.pos,
+                            &self.kv_state_buf,
+                            attn.k_offset,
                             head_dim,
                             n_kv_heads,
                             m,
                             max_seq_len,
-                            rope_theta,
                         )?;
-                        if self.debug_barriers
-                            && let Err(e) = session.flush()
-                        {
-                            return Err(CeraError::Backend(format!(
-                                "prefill RoPE flush failed: {e}"
-                            )));
-                        }
-                    }
-                    // Append M K/V rows (slots == positions: reuse pos vector).
-                    Self::dispatch_set_rows_m(
-                        session,
-                        scratch,
-                        so.k,
-                        scratch,
-                        so.pos,
-                        &self.kv_state_buf,
-                        attn.k_offset,
-                        head_dim,
-                        n_kv_heads,
-                        m,
-                        max_seq_len,
-                    )?;
-                    Self::dispatch_set_rows_m(
-                        session,
-                        scratch,
-                        so.v,
-                        scratch,
-                        so.pos,
-                        &self.kv_state_buf,
-                        attn.v_offset,
-                        head_dim,
-                        n_kv_heads,
-                        m,
-                        max_seq_len,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill SetRows flush failed: {e}"
-                        )));
-                    }
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) prefill v-proj",
-                        so.v,
-                        m * kv_dim,
-                    );
-                    // Multi-query attention over the valid prefix.
-                    self.dispatch_flash_attn_m(
-                        session,
-                        scratch,
-                        so.q,
-                        &self.kv_state_buf,
-                        attn.k_offset,
-                        &self.kv_state_buf,
-                        attn.v_offset,
-                        scratch,
-                        so.mask,
-                        scratch,
-                        so.attn_out,
-                        head_dim,
-                        n_heads,
-                        n_kv_heads,
-                        m,
-                        kv_len,
-                        max_seq_len,
-                        attn_scale,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill FlashAttn flush failed: {e}"
-                        )));
-                    }
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) prefill fa-out",
-                        so.attn_out,
-                        m * q_dim,
-                    );
-                    // o_proj + residual.
-                    self.dispatch_mul_mat_m(
-                        session,
-                        &self.weights_buf,
-                        &attn.attn_output,
-                        scratch,
-                        so.attn_out,
-                        scratch,
-                        so.normed,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) prefill attn-out",
-                        so.normed + (m - 1) * hs * 4,
-                        hs,
-                    );
-                    Self::dispatch_add_m(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) prefill block-out",
-                        so.activation + (m - 1) * hs * 4,
-                        hs,
-                    );
-                    // FFN.
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        attn.ffn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        m,
-                    )?;
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&attn.ffn_gate, &attn.ffn_up],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.ffn_gate, so.ffn_up],
-                        m,
-                    )?;
-                    Self::dispatch_swiglu(
-                        session,
-                        scratch,
-                        so.ffn_gate,
-                        scratch,
-                        so.ffn_up,
-                        scratch,
-                        so.ffn_out,
-                        intermediate_size,
-                        m,
-                    )?;
-                    self.dispatch_mul_mat_m(
-                        session,
-                        &self.weights_buf,
-                        &attn.ffn_down,
-                        scratch,
-                        so.ffn_out,
-                        scratch,
-                        so.normed,
-                        m,
-                    )?;
-                    Self::dispatch_add_m(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) prefill post-ffn",
-                        so.activation + (m - 1) * hs * 4,
-                        hs,
-                    );
-                }
-                HexagonLayer::Conv(conv) => {
-                    // Block norm + in_proj over M rows.
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        conv.attn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        m,
-                    )?;
-                    self.dispatch_mul_mat_m(
-                        session,
-                        &self.weights_buf,
-                        &conv.in_proj,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.conv_in,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) prefill conv_in r0",
-                        so.conv_in,
-                        3 * hs,
-                    );
-                    if m > 1 {
-                        Self::dump_hidden(
+                        Self::dispatch_set_rows_m(
+                            session,
+                            scratch,
+                            so.v,
+                            scratch,
+                            so.pos,
+                            &self.kv_state_buf,
+                            attn.v_offset,
+                            head_dim,
+                            n_kv_heads,
+                            m,
+                            max_seq_len,
+                        )?;
+                        self.debug_barrier(session, "prefill SetRows")?;
+                        self.dump_hidden(
                             session,
                             scratch,
                             layer_idx,
-                            "(conv) prefill conv_in r1",
-                            so.conv_in + 3 * hs * 4,
-                            3 * hs,
+                            "(attn) prefill v-proj",
+                            so.v,
+                            m * kv_dim,
+                        );
+                        // Multi-query attention over the valid prefix.
+                        self.dispatch_flash_attn_m(
+                            session,
+                            scratch,
+                            so.q,
+                            &self.kv_state_buf,
+                            attn.k_offset,
+                            &self.kv_state_buf,
+                            attn.v_offset,
+                            scratch,
+                            so.mask,
+                            scratch,
+                            so.attn_out,
+                            head_dim,
+                            n_heads,
+                            n_kv_heads,
+                            m,
+                            kv_len,
+                            max_seq_len,
+                            attn_scale,
+                        )?;
+                        self.debug_barrier(session, "prefill FlashAttn")?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(attn) prefill fa-out",
+                            so.attn_out,
+                            m * q_dim,
+                        );
+                        // o_proj + residual.
+                        self.dispatch_mul_mat_m(
+                            session,
+                            &self.weights_buf,
+                            &attn.attn_output,
+                            scratch,
+                            so.attn_out,
+                            scratch,
+                            so.normed,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(attn) prefill attn-out",
+                            so.normed + (m - 1) * hs * 4,
+                            hs,
+                        );
+                        Self::dispatch_add_m(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(attn) prefill block-out",
+                            so.activation + (m - 1) * hs * 4,
+                            hs,
+                        );
+                        // FFN.
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            scratch,
+                            so.activation,
+                            &self.weights_buf,
+                            attn.ffn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
+                            hs,
+                            m,
+                        )?;
+                        self.dispatch_mul_mat_nx(
+                            session,
+                            &self.weights_buf,
+                            &[&attn.ffn_gate, &attn.ffn_up],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.ffn_gate, so.ffn_up],
+                            m,
+                        )?;
+                        Self::dispatch_swiglu(
+                            session,
+                            scratch,
+                            so.ffn_gate,
+                            scratch,
+                            so.ffn_up,
+                            scratch,
+                            so.ffn_out,
+                            intermediate_size,
+                            m,
+                        )?;
+                        self.dispatch_mul_mat_m(
+                            session,
+                            &self.weights_buf,
+                            &attn.ffn_down,
+                            scratch,
+                            so.ffn_out,
+                            scratch,
+                            so.normed,
+                            m,
+                        )?;
+                        Self::dispatch_add_m(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(attn) prefill post-ffn",
+                            so.activation + (m - 1) * hs * 4,
+                            hs,
                         );
                     }
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill conv/in-proj flush failed: {e}"
-                        )));
-                    }
-                    // b * x straight out of the strided in_proj thirds (no
-                    // materializing copies); the DSP reads the row strides.
-                    Self::dispatch_mul_m_strided(
-                        session,
-                        scratch,
-                        so.conv_in,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_in + 2 * hs * 4,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_bx,
-                        hs,
-                        m,
-                        3 * hs * 4,
-                        3 * hs * 4,
-                    )?;
-                    // State prepend: CONCAT(state-as-[2, hs] + bx-as-[m,
-                    // hs]) into conv_x `[ncs, hs]`, time-inner — one op
-                    // replacing the s0/s1 scatter plus the bx transpose.
-                    Self::dispatch_concat_2d(
-                        session,
-                        &self.kv_state_buf,
-                        conv.state_offset,
-                        2,
-                        scratch,
-                        so.conv_bx,
-                        m,
-                        hs * 4,
-                        4,
-                        scratch,
-                        so.conv_x,
-                        hs,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill conv/scatter flush failed: {e}"
-                        )));
-                    }
-                    self.dispatch_ssm_conv(
-                        session,
-                        &self.weights_buf,
-                        conv.conv_ssm_offset,
-                        scratch,
-                        so.conv_x,
-                        scratch,
-                        so.conv_ssm_y,
-                        3,
-                        hs,
-                        m,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill conv/ssm-only flush failed: {e}"
-                        )));
-                    }
-                    // No transpose: the SsmConv worker writes token t's C
-                    // values at `t * C` (dst dim-1 stride is the token
-                    // stride), so `conv_ssm_y` already holds [M, C]
-                    // row-major. The gate and out_proj below read it
-                    // directly; the old strided copy was an identity that
-                    // took the firmware's scalar reshape path (10x wall
-                    // past m=128).
-                    // State writeback into the interleaved `[C, 2]` slots
-                    // (slot t at `state + c*8 + t*4`): last two bx rows
-                    // when m>=2, else shift + insert.
-                    if m >= 2 {
-                        Self::dispatch_cpy_2d(
+                    HexagonLayer::Conv(conv) => {
+                        // Block norm + in_proj over M rows.
+                        Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.conv_bx + (m - 2) * hs * 4,
+                            so.activation,
+                            &self.weights_buf,
+                            conv.attn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
                             hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset,
-                            8,
-                            8,
+                            m,
                         )?;
-                        Self::dispatch_cpy_2d(
+                        self.dispatch_mul_mat_m(
+                            session,
+                            &self.weights_buf,
+                            &conv.in_proj,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.conv_in,
+                            m,
+                        )?;
+                        self.dump_hidden(
                             session,
                             scratch,
-                            so.conv_bx + (m - 1) * hs * 4,
-                            hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            8,
-                            8,
-                        )?;
-                    } else {
-                        // Shift via scratch temp: odd->even overlaps in
-                        // the state slab, and CPY has memcpy (not
-                        // memmove) semantics.
-                        Self::dispatch_cpy_2d(
-                            session,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            hs,
-                            1,
-                            8,
-                            8,
-                            scratch,
-                            so.conv_t0,
-                            4,
-                            hs * 4,
-                        )?;
-                        Self::dispatch_cpy_2d(
+                            layer_idx,
+                            "(conv) prefill conv_in r0",
+                            so.conv_in,
+                            3 * hs,
+                        );
+                        if m > 1 {
+                            self.dump_hidden(
+                                session,
+                                scratch,
+                                layer_idx,
+                                "(conv) prefill conv_in r1",
+                                so.conv_in + 3 * hs * 4,
+                                3 * hs,
+                            );
+                        }
+                        self.debug_barrier(session, "prefill conv/in-proj")?;
+                        // b * x straight out of the strided in_proj thirds (no
+                        // materializing copies); the DSP reads the row strides.
+                        Self::dispatch_mul_m_strided(
                             session,
                             scratch,
-                            so.conv_t0,
-                            hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset,
-                            8,
-                            8,
-                        )?;
-                        Self::dispatch_cpy_2d(
-                            session,
+                            so.conv_in,
+                            HTP_TENSOR_COMPUTE,
+                            scratch,
+                            so.conv_in + 2 * hs * 4,
+                            HTP_TENSOR_COMPUTE,
                             scratch,
                             so.conv_bx,
                             hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            8,
-                            8,
+                            m,
+                            3 * hs * 4,
+                            3 * hs * 4,
                         )?;
-                    }
-                    // Gate with the strided c third in place (no materialize).
-                    Self::dispatch_mul_m_strided(
-                        session,
-                        scratch,
-                        so.conv_ssm_y,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_in + hs * 4,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_ssm_y,
-                        hs,
-                        m,
-                        hs * 4,
-                        3 * hs * 4,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill conv/ssm flush failed: {e}"
-                        )));
-                    }
-                    // out_proj + residual.
-                    self.dispatch_mul_mat_m(
-                        session,
-                        &self.weights_buf,
-                        &conv.out_proj,
-                        scratch,
-                        so.conv_ssm_y,
-                        scratch,
-                        so.normed,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) prefill conv_out r0",
-                        so.normed,
-                        hs,
-                    );
-                    if m > 1 {
-                        Self::dump_hidden(
+                        // State prepend: CONCAT(state-as-[2, hs] + bx-as-[m,
+                        // hs]) into conv_x `[ncs, hs]`, time-inner: one op
+                        // replacing the s0/s1 scatter plus the bx transpose.
+                        Self::dispatch_concat_2d(
+                            session,
+                            &self.kv_state_buf,
+                            conv.state_offset,
+                            2,
+                            scratch,
+                            so.conv_bx,
+                            m,
+                            hs * 4,
+                            4,
+                            scratch,
+                            so.conv_x,
+                            hs,
+                        )?;
+                        self.debug_barrier(session, "prefill conv/scatter")?;
+                        self.dispatch_ssm_conv(
+                            session,
+                            &self.weights_buf,
+                            conv.conv_ssm_offset,
+                            scratch,
+                            so.conv_x,
+                            scratch,
+                            so.conv_ssm_y,
+                            3,
+                            hs,
+                            m,
+                        )?;
+                        self.debug_barrier(session, "prefill conv/ssm-only")?;
+                        // No transpose: the SsmConv worker writes token t's C
+                        // values at `t * C` (dst dim-1 stride is the token
+                        // stride), so `conv_ssm_y` already holds [M, C]
+                        // row-major. The gate and out_proj below read it
+                        // directly; the old strided copy was an identity that
+                        // took the firmware's scalar reshape path (10x wall
+                        // past m=128).
+                        // State writeback into the interleaved `[C, 2]` slots
+                        // (slot t at `state + c*8 + t*4`): last two bx rows
+                        // when m>=2, else shift + insert.
+                        if m >= 2 {
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_bx + (m - 2) * hs * 4,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                8,
+                                8,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_bx + (m - 1) * hs * 4,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                8,
+                                8,
+                            )?;
+                        } else {
+                            // Shift via scratch temp: odd->even overlaps in
+                            // the state slab, and CPY has memcpy (not
+                            // memmove) semantics.
+                            Self::dispatch_cpy_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                hs,
+                                1,
+                                8,
+                                8,
+                                scratch,
+                                so.conv_t0,
+                                4,
+                                hs * 4,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_t0,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                8,
+                                8,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_bx,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                8,
+                                8,
+                            )?;
+                        }
+                        // Gate with the strided c third in place (no materialize).
+                        Self::dispatch_mul_m_strided(
+                            session,
+                            scratch,
+                            so.conv_ssm_y,
+                            HTP_TENSOR_COMPUTE,
+                            scratch,
+                            so.conv_in + hs * 4,
+                            HTP_TENSOR_COMPUTE,
+                            scratch,
+                            so.conv_ssm_y,
+                            hs,
+                            m,
+                            hs * 4,
+                            3 * hs * 4,
+                        )?;
+                        self.debug_barrier(session, "prefill conv/ssm")?;
+                        // out_proj + residual.
+                        self.dispatch_mul_mat_m(
+                            session,
+                            &self.weights_buf,
+                            &conv.out_proj,
+                            scratch,
+                            so.conv_ssm_y,
+                            scratch,
+                            so.normed,
+                            m,
+                        )?;
+                        self.dump_hidden(
                             session,
                             scratch,
                             layer_idx,
-                            "(conv) prefill conv_out r1",
-                            so.normed + hs * 4,
+                            "(conv) prefill conv_out r0",
+                            so.normed,
+                            hs,
+                        );
+                        if m > 1 {
+                            self.dump_hidden(
+                                session,
+                                scratch,
+                                layer_idx,
+                                "(conv) prefill conv_out r1",
+                                so.normed + hs * 4,
+                                hs,
+                            );
+                        }
+                        Self::dispatch_add_m(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) prefill block-out",
+                            so.activation + (m - 1) * hs * 4,
+                            hs,
+                        );
+                        self.debug_barrier(session, "prefill conv/out-proj")?;
+                        // FFN (same as attention blocks).
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            scratch,
+                            so.activation,
+                            &self.weights_buf,
+                            conv.ffn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
+                            hs,
+                            m,
+                        )?;
+                        self.dispatch_mul_mat_nx(
+                            session,
+                            &self.weights_buf,
+                            &[&conv.ffn_gate, &conv.ffn_up],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.ffn_gate, so.ffn_up],
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) prefill ffn_gate",
+                            so.ffn_gate,
+                            m * intermediate_size,
+                        );
+                        Self::dispatch_swiglu(
+                            session,
+                            scratch,
+                            so.ffn_gate,
+                            scratch,
+                            so.ffn_up,
+                            scratch,
+                            so.ffn_out,
+                            intermediate_size,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) prefill ffn_swiglu",
+                            so.ffn_out,
+                            m * intermediate_size,
+                        );
+                        self.dispatch_mul_mat_m(
+                            session,
+                            &self.weights_buf,
+                            &conv.ffn_down,
+                            scratch,
+                            so.ffn_out,
+                            scratch,
+                            so.normed,
+                            m,
+                        )?;
+                        Self::dispatch_add_m(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                            m,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "prefill post-ffn",
+                            so.activation + (m - 1) * hs * 4,
                             hs,
                         );
                     }
-                    Self::dispatch_add_m(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) prefill block-out",
-                        so.activation + (m - 1) * hs * 4,
-                        hs,
-                    );
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "prefill conv/out-proj flush failed: {e}"
-                        )));
-                    }
-                    // FFN (same as attention blocks).
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        conv.ffn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        m,
-                    )?;
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&conv.ffn_gate, &conv.ffn_up],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.ffn_gate, so.ffn_up],
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) prefill ffn_gate",
-                        so.ffn_gate,
-                        m * intermediate_size,
-                    );
-                    Self::dispatch_swiglu(
-                        session,
-                        scratch,
-                        so.ffn_gate,
-                        scratch,
-                        so.ffn_up,
-                        scratch,
-                        so.ffn_out,
-                        intermediate_size,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) prefill ffn_swiglu",
-                        so.ffn_out,
-                        m * intermediate_size,
-                    );
-                    self.dispatch_mul_mat_m(
-                        session,
-                        &self.weights_buf,
-                        &conv.ffn_down,
-                        scratch,
-                        so.ffn_out,
-                        scratch,
-                        so.normed,
-                        m,
-                    )?;
-                    Self::dispatch_add_m(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                        m,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "prefill post-ffn",
-                        so.activation + (m - 1) * hs * 4,
-                        hs,
-                    );
+                }
+                if (self.debug_barriers || m < SMALL_M_BARRIER_ROWS)
+                    && let Err(e) = session.flush()
+                {
+                    return Err(CeraError::Backend(format!(
+                        "prefill layer {layer_idx} flush failed: {e}"
+                    )));
                 }
             }
-            if (self.debug_barriers || m < SMALL_M_BARRIER_ROWS)
-                && let Err(e) = session.flush()
-            {
-                return Err(CeraError::Backend(format!(
-                    "prefill layer {layer_idx} flush failed: {e}"
-                )));
-            }
-        }
 
-        // Final norm + LM head on the last row only.
-        Self::dispatch_rms_norm_mul(
-            session,
-            scratch,
-            so.activation,
-            &self.weights_buf,
-            self.output_norm_offset,
-            scratch,
-            so.normed,
-            eps,
-            hs,
-            m,
-        )?;
-        self.dispatch_mul_mat(
-            session,
-            &self.weights_buf,
-            &self.lm_head,
-            scratch,
-            so.normed + (m - 1) * hs * 4,
-            scratch,
-            so.logits,
-        )?;
+            // Final norm + LM head on the last row only.
+            Self::dispatch_rms_norm_mul(
+                session,
+                scratch,
+                so.activation,
+                &self.weights_buf,
+                self.output_norm_offset,
+                scratch,
+                so.normed,
+                eps,
+                hs,
+                m,
+            )?;
+            self.dispatch_mul_mat(
+                session,
+                &self.weights_buf,
+                &self.lm_head,
+                scratch,
+                so.normed + (m - 1) * hs * 4,
+                scratch,
+                so.logits,
+            )?;
 
-        if let Err(e) = session.flush() {
-            session.set_max_ops_per_flush(None);
-            return Err(CeraError::Backend(format!(
-                "Hexagon NPU prefill execution failed: {e}"
-            )));
-        }
+            session.flush().map_err(|e| {
+                CeraError::Backend(format!("Hexagon NPU prefill execution failed: {e}"))
+            })?;
+            Ok(())
+        })();
+
         session.set_max_ops_per_flush(None);
+        if let Err(e) = run_res {
+            session.drop_pending_batch();
+            return Err(e);
+        }
 
         self.current_seq_len.store(start_pos + m, Ordering::SeqCst);
         state.seq_len = start_pos + m;
@@ -3318,7 +3313,9 @@ impl HexagonLfm2Model {
         if let Ok(mut adpf) = self.adpf.lock()
             && let Some(session) = adpf.as_mut()
         {
-            session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
+            let per_token_ns =
+                (fwd_start.elapsed().as_nanos() / m.max(1) as u128).min(i64::MAX as u128) as i64;
+            session.report(per_token_ns);
         }
         Ok(logits_slice.to_vec())
     }
@@ -3368,6 +3365,14 @@ impl HexagonLfm2Model {
             )));
         }
 
+        let max_seq = self.config.max_seq_len;
+        if pos >= max_seq {
+            return Err(CeraError::ContextOverflow {
+                max_seq_len: max_seq as u32,
+                by: (pos + 1 - max_seq) as u32,
+            });
+        }
+
         let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
 
         let hs = self.config.hidden_size;
@@ -3399,785 +3404,766 @@ impl HexagonLfm2Model {
         let max_seq_len = self.config.max_seq_len;
         let rope_theta = self.config.rope_theta;
         let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let vocab_size = self.config.vocab_size;
 
         let session = device.queue_session_mut();
+        session.drop_pending_batch();
 
         // Decode determinism: cap ops per flush (reset after the final flush
         // below). See `MAX_OPS_PER_FLUSH`.
         session.set_max_ops_per_flush(Some(decode_ops_cap()));
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            match layer {
-                HexagonLayer::Attention(attn) => {
-                    // Attention RMS norm (fused): normed = rmsnorm(act) * attn_norm
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        attn.attn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        1,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "Attention attn_norm flush failed: {e}"
-                        )));
-                    }
-
-                    // Projections: Q, K, V (fused NX).
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.q, so.k, so.v],
-                        1,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "Attention QKV proj flush failed: {e}"
-                        )));
-                    }
-
-                    let n_kv_heads = attn.kv_dim / head_dim;
-
-                    // Optional Q/K norm
-                    if let Some(qn_offset) = attn.attn_q_norm_offset {
+        let run_res = (|| -> Result<(), CeraError> {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                match layer {
+                    HexagonLayer::Attention(attn) => {
+                        // Attention RMS norm (fused): normed = rmsnorm(act) * attn_norm
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.q,
+                            so.activation,
                             &self.weights_buf,
-                            qn_offset,
+                            attn.attn_norm_offset,
                             scratch,
-                            so.q,
+                            so.normed,
                             eps,
-                            head_dim,
-                            n_heads,
-                        )?;
-                    }
-                    if let Some(kn_offset) = attn.attn_k_norm_offset {
-                        Self::dispatch_rms_norm_mul(
-                            session,
-                            scratch,
-                            so.k,
-                            &self.weights_buf,
-                            kn_offset,
-                            scratch,
-                            so.k,
-                            eps,
-                            head_dim,
-                            n_kv_heads,
-                        )?;
-                    }
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "Attention QK norm flush failed: {e}"
-                        )));
-                    }
-
-                    // RoPE on Q and K: DSP kernel by default, with an optional
-                    // host-CPU fallback (CERA_HEXAGON_CPU_ROPE=1) using the same
-                    // cpu::rope the CPU backend uses.
-                    if self.cpu_rope {
-                        // Host-CPU RoPE reads DSP-produced Q/K in place, so
-                        // this barrier is mandatory even in fused mode.
-                        if let Err(e) = session.flush() {
-                            return Err(CeraError::Backend(format!(
-                                "Attention pre-RoPE flush failed: {e}"
-                            )));
-                        }
-                        let q_bytes = attn.q_dim * 4;
-                        let k_bytes = attn.kv_dim * 4;
-                        scratch.invalidate_cpu_cache(so.q, q_bytes);
-                        scratch.invalidate_cpu_cache(so.k, k_bytes);
-                        unsafe {
-                            let q = std::slice::from_raw_parts_mut(
-                                scratch.as_mut_ptr().add(so.q) as *mut f32,
-                                attn.q_dim,
-                            );
-                            let k = std::slice::from_raw_parts_mut(
-                                scratch.as_mut_ptr().add(so.k) as *mut f32,
-                                attn.kv_dim,
-                            );
-                            crate::backend::cpu::rope(
-                                q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta,
-                            );
-                        }
-                        scratch.flush_cpu_cache(so.q, q_bytes);
-                        scratch.flush_cpu_cache(so.k, k_bytes);
-                    } else {
-                        Self::dispatch_rope(
-                            session,
-                            scratch,
-                            so.q,
-                            scratch,
-                            so.pos,
-                            head_dim,
-                            n_heads,
-                            max_seq_len,
-                            rope_theta,
-                        )?;
-                        Self::dispatch_rope(
-                            session,
-                            scratch,
-                            so.k,
-                            scratch,
-                            so.pos,
-                            head_dim,
-                            n_kv_heads,
-                            max_seq_len,
-                            rope_theta,
-                        )?;
-                        if self.debug_barriers
-                            && let Err(e) = session.flush()
-                        {
-                            return Err(CeraError::Backend(format!(
-                                "Attention RoPE flush failed: {e}"
-                            )));
-                        }
-                    }
-
-                    // SetRows K and V into KV cache
-                    Self::dispatch_set_rows(
-                        session,
-                        scratch,
-                        so.k,
-                        scratch,
-                        so.pos,
-                        &self.kv_state_buf,
-                        attn.k_offset,
-                        head_dim,
-                        n_kv_heads,
-                        max_seq_len,
-                    )?;
-                    Self::dispatch_set_rows(
-                        session,
-                        scratch,
-                        so.v,
-                        scratch,
-                        so.pos,
-                        &self.kv_state_buf,
-                        attn.v_offset,
-                        head_dim,
-                        n_kv_heads,
-                        max_seq_len,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "Attention SetRows flush failed: {e}"
-                        )));
-                    }
-
-                    // Flash Attention
-                    Self::dispatch_flash_attn_ext(
-                        session,
-                        scratch,
-                        so.q,
-                        &self.kv_state_buf,
-                        attn.k_offset,
-                        &self.kv_state_buf,
-                        attn.v_offset,
-                        &self.mask_buf,
-                        scratch,
-                        so.attn_out,
-                        head_dim,
-                        n_heads,
-                        n_kv_heads,
-                        pos + 1,
-                        max_seq_len,
-                        attn_scale,
-                    )?;
-                    if self.debug_barriers
-                        && let Err(e) = session.flush()
-                    {
-                        return Err(CeraError::Backend(format!(
-                            "Attention layer {layer_idx} FlashAttnExt flush failed: {e}"
-                        )));
-                    }
-
-                    // Attention output projection
-                    self.dispatch_mul_mat(
-                        session,
-                        &self.weights_buf,
-                        &attn.attn_output,
-                        scratch,
-                        so.attn_out,
-                        scratch,
-                        so.normed,
-                    )?;
-
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) block-out",
-                        so.normed,
-                        hs,
-                    );
-
-                    // Residual add: act = act + normed
-                    Self::dispatch_add(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(attn) post-block",
-                        so.activation,
-                        hs,
-                    );
-
-                    // FFN
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        attn.ffn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        1,
-                    )?;
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&attn.ffn_gate, &attn.ffn_up],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.ffn_gate, so.ffn_up],
-                        1,
-                    )?;
-                    Self::dispatch_swiglu(
-                        session,
-                        scratch,
-                        so.ffn_gate,
-                        scratch,
-                        so.ffn_up,
-                        scratch,
-                        so.ffn_out,
-                        intermediate_size,
-                        1,
-                    )?;
-                    self.dispatch_mul_mat(
-                        session,
-                        &self.weights_buf,
-                        &attn.ffn_down,
-                        scratch,
-                        so.ffn_out,
-                        scratch,
-                        so.normed,
-                    )?;
-                    Self::dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
-                    Self::dispatch_add(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                    )?;
-                }
-                HexagonLayer::Conv(conv) => {
-                    // Conv RMS norm
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        conv.attn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        1,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) normed-act",
-                        so.normed,
-                        hs,
-                    );
-
-                    // in_proj: hs -> 3 * hs (b, c, x)
-                    self.dispatch_mul_mat(
-                        session,
-                        &self.weights_buf,
-                        &conv.in_proj,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.conv_in,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) conv-in",
-                        so.conv_in,
-                        3 * hs,
-                    );
-
-                    if self.use_ssm_conv {
-                        // bx = b * x (M=1 rows are contiguous, as in the manual path)
-                        Self::dispatch_mul(
-                            session,
-                            scratch,
-                            so.conv_in,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_in + 2 * hs * 4,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_bx,
                             hs,
+                            1,
                         )?;
-                        // State prepend: CONCAT([s0; s1] + bx-as-[1, hs])
-                        // into conv_x `[3, hs]` (same op as prefill; the
-                        // s0/s1 slab is adjacent by construction).
-                        Self::dispatch_concat_2d(
+                        self.debug_barrier(session, "Attention attn_norm")?;
+
+                        // Projections: Q, K, V (fused NX).
+                        self.dispatch_mul_mat_nx(
                             session,
+                            &self.weights_buf,
+                            &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.q, so.k, so.v],
+                            1,
+                        )?;
+                        self.debug_barrier(session, "Attention QKV proj")?;
+
+                        let n_kv_heads = attn.kv_dim / head_dim;
+
+                        // Optional Q/K norm
+                        if let Some(qn_offset) = attn.attn_q_norm_offset {
+                            Self::dispatch_rms_norm_mul(
+                                session,
+                                scratch,
+                                so.q,
+                                &self.weights_buf,
+                                qn_offset,
+                                scratch,
+                                so.q,
+                                eps,
+                                head_dim,
+                                n_heads,
+                            )?;
+                        }
+                        if let Some(kn_offset) = attn.attn_k_norm_offset {
+                            Self::dispatch_rms_norm_mul(
+                                session,
+                                scratch,
+                                so.k,
+                                &self.weights_buf,
+                                kn_offset,
+                                scratch,
+                                so.k,
+                                eps,
+                                head_dim,
+                                n_kv_heads,
+                            )?;
+                        }
+                        self.debug_barrier(session, "Attention QK norm")?;
+
+                        // RoPE on Q and K: DSP kernel by default, with an optional
+                        // host-CPU fallback (CERA_HEXAGON_CPU_ROPE=1) using the same
+                        // cpu::rope the CPU backend uses.
+                        if self.cpu_rope {
+                            // Host-CPU RoPE reads DSP-produced Q/K in place, so
+                            // this barrier is mandatory even in fused mode.
+                            if let Err(e) = session.flush() {
+                                return Err(CeraError::Backend(format!(
+                                    "Attention pre-RoPE flush failed: {e}"
+                                )));
+                            }
+                            let q_bytes = attn.q_dim * 4;
+                            let k_bytes = attn.kv_dim * 4;
+                            scratch.invalidate_cpu_cache(so.q, q_bytes);
+                            scratch.invalidate_cpu_cache(so.k, k_bytes);
+                            unsafe {
+                                let q = std::slice::from_raw_parts_mut(
+                                    scratch.as_mut_ptr().add(so.q) as *mut f32,
+                                    attn.q_dim,
+                                );
+                                let k = std::slice::from_raw_parts_mut(
+                                    scratch.as_mut_ptr().add(so.k) as *mut f32,
+                                    attn.kv_dim,
+                                );
+                                crate::backend::cpu::rope(
+                                    q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta,
+                                );
+                            }
+                            scratch.flush_cpu_cache(so.q, q_bytes);
+                            scratch.flush_cpu_cache(so.k, k_bytes);
+                        } else {
+                            Self::dispatch_rope(
+                                session,
+                                scratch,
+                                so.q,
+                                scratch,
+                                so.pos,
+                                head_dim,
+                                n_heads,
+                                max_seq_len,
+                                rope_theta,
+                            )?;
+                            Self::dispatch_rope(
+                                session,
+                                scratch,
+                                so.k,
+                                scratch,
+                                so.pos,
+                                head_dim,
+                                n_kv_heads,
+                                max_seq_len,
+                                rope_theta,
+                            )?;
+                            self.debug_barrier(session, "Attention RoPE")?;
+                        }
+
+                        // SetRows K and V into KV cache
+                        Self::dispatch_set_rows(
+                            session,
+                            scratch,
+                            so.k,
+                            scratch,
+                            so.pos,
                             &self.kv_state_buf,
-                            conv.state_offset,
-                            2,
-                            scratch,
-                            so.conv_bx,
-                            1,
-                            hs * 4,
-                            4,
-                            scratch,
-                            so.conv_x,
-                            hs,
+                            attn.k_offset,
+                            head_dim,
+                            n_kv_heads,
+                            max_seq_len,
                         )?;
-                        // y = shortconv(conv_x), channel-major [C, 1]
-                        self.dispatch_ssm_conv(
+                        Self::dispatch_set_rows(
+                            session,
+                            scratch,
+                            so.v,
+                            scratch,
+                            so.pos,
+                            &self.kv_state_buf,
+                            attn.v_offset,
+                            head_dim,
+                            n_kv_heads,
+                            max_seq_len,
+                        )?;
+                        self.debug_barrier(session, "Attention SetRows")?;
+
+                        // Flash Attention
+                        Self::dispatch_flash_attn_ext(
+                            session,
+                            scratch,
+                            so.q,
+                            &self.kv_state_buf,
+                            attn.k_offset,
+                            &self.kv_state_buf,
+                            attn.v_offset,
+                            &self.mask_buf,
+                            scratch,
+                            so.attn_out,
+                            head_dim,
+                            n_heads,
+                            n_kv_heads,
+                            pos + 1,
+                            max_seq_len,
+                            attn_scale,
+                        )?;
+                        self.debug_barrier(
+                            session,
+                            &format!("Attention layer {layer_idx} FlashAttnExt"),
+                        )?;
+
+                        // Attention output projection
+                        self.dispatch_mul_mat(
                             session,
                             &self.weights_buf,
-                            conv.conv_ssm_offset,
+                            &attn.attn_output,
                             scratch,
-                            so.conv_x,
+                            so.attn_out,
                             scratch,
-                            so.conv_ssm_y,
-                            3,
-                            hs,
-                            1,
+                            so.normed,
                         )?;
-                        // [C, 1] -> [1, C] is a flat copy (same bytes)
-                        Self::dispatch_cpy(
-                            session,
-                            scratch,
-                            so.conv_ssm_y,
-                            scratch,
-                            so.conv_y,
-                            hs,
-                        )?;
-                        Self::dump_hidden(
+
+                        self.dump_hidden(
                             session,
                             scratch,
                             layer_idx,
-                            "(conv) ssm-y",
+                            "(attn) block-out",
+                            so.normed,
+                            hs,
+                        );
+
+                        // Residual add: act = act + normed
+                        Self::dispatch_add(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(attn) post-block",
+                            so.activation,
+                            hs,
+                        );
+
+                        // FFN
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            scratch,
+                            so.activation,
+                            &self.weights_buf,
+                            attn.ffn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
+                            hs,
+                            1,
+                        )?;
+                        self.dispatch_mul_mat_nx(
+                            session,
+                            &self.weights_buf,
+                            &[&attn.ffn_gate, &attn.ffn_up],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.ffn_gate, so.ffn_up],
+                            1,
+                        )?;
+                        Self::dispatch_swiglu(
+                            session,
+                            scratch,
+                            so.ffn_gate,
+                            scratch,
+                            so.ffn_up,
+                            scratch,
+                            so.ffn_out,
+                            intermediate_size,
+                            1,
+                        )?;
+                        self.dispatch_mul_mat(
+                            session,
+                            &self.weights_buf,
+                            &attn.ffn_down,
+                            scratch,
+                            so.ffn_out,
+                            scratch,
+                            so.normed,
+                        )?;
+                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
+                        Self::dispatch_add(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
+                        )?;
+                    }
+                    HexagonLayer::Conv(conv) => {
+                        // Conv RMS norm
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            scratch,
+                            so.activation,
+                            &self.weights_buf,
+                            conv.attn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
+                            hs,
+                            1,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) normed-act",
+                            so.normed,
+                            hs,
+                        );
+
+                        // in_proj: hs -> 3 * hs (b, c, x)
+                        self.dispatch_mul_mat(
+                            session,
+                            &self.weights_buf,
+                            &conv.in_proj,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.conv_in,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) conv-in",
+                            so.conv_in,
+                            3 * hs,
+                        );
+
+                        if self.use_ssm_conv {
+                            // bx = b * x (M=1 rows are contiguous, as in the manual path)
+                            Self::dispatch_mul(
+                                session,
+                                scratch,
+                                so.conv_in,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_in + 2 * hs * 4,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_bx,
+                                hs,
+                            )?;
+                            // State prepend: CONCAT([s0; s1] + bx-as-[1, hs])
+                            // into conv_x `[3, hs]` (same op as prefill; the
+                            // s0/s1 slab is adjacent by construction).
+                            Self::dispatch_concat_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                2,
+                                scratch,
+                                so.conv_bx,
+                                1,
+                                hs * 4,
+                                4,
+                                scratch,
+                                so.conv_x,
+                                hs,
+                            )?;
+                            // y = shortconv(conv_x), channel-major [C, 1]
+                            self.dispatch_ssm_conv(
+                                session,
+                                &self.weights_buf,
+                                conv.conv_ssm_offset,
+                                scratch,
+                                so.conv_x,
+                                scratch,
+                                so.conv_ssm_y,
+                                3,
+                                hs,
+                                1,
+                            )?;
+                            // [C, 1] -> [1, C] is a flat copy (same bytes)
+                            Self::dispatch_cpy(
+                                session,
+                                scratch,
+                                so.conv_ssm_y,
+                                scratch,
+                                so.conv_y,
+                                hs,
+                            )?;
+                            self.dump_hidden(
+                                session,
+                                scratch,
+                                layer_idx,
+                                "(conv) ssm-y",
+                                so.conv_y,
+                                hs,
+                            );
+                            // Update states: s0 = s1; s1 = bx. The odd->even
+                            // shift overlaps in the interleaved slab, so it
+                            // stages through conv_t0 (unused on this path).
+                            Self::dispatch_cpy_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                hs,
+                                1,
+                                8,
+                                8,
+                                scratch,
+                                so.conv_t0,
+                                4,
+                                hs * 4,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_t0,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                8,
+                                8,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_bx,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                8,
+                                8,
+                            )?;
+                        } else {
+                            // bx = b * x
+                            Self::dispatch_mul(
+                                session,
+                                scratch,
+                                so.conv_in,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_in + 2 * hs * 4,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_bx,
+                                hs,
+                            )?;
+                            self.dump_hidden(
+                                session,
+                                scratch,
+                                layer_idx,
+                                "(conv) bx",
+                                so.conv_bx,
+                                hs,
+                            );
+
+                            // De-interleave [s0; s1] into conv_x rows 0-1
+                            // (conv_x is unused on the manual path); the MUL
+                            // worker only reads dense rows.
+                            Self::dispatch_cpy_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                hs,
+                                1,
+                                8,
+                                8,
+                                scratch,
+                                so.conv_x,
+                                4,
+                                hs * 4,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                hs,
+                                1,
+                                8,
+                                8,
+                                scratch,
+                                so.conv_x + hs * 4,
+                                4,
+                                hs * 4,
+                            )?;
+                            // Rolling conv: y = s0 * w0 + s1 * w1 + bx * w2
+                            Self::dispatch_mul(
+                                session,
+                                &self.weights_buf,
+                                conv.conv_w0_offset,
+                                HTP_TENSOR_WEIGHT,
+                                scratch,
+                                so.conv_x,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_t0,
+                                hs,
+                            )?;
+                            Self::dispatch_mul(
+                                session,
+                                &self.weights_buf,
+                                conv.conv_w1_offset,
+                                HTP_TENSOR_WEIGHT,
+                                scratch,
+                                so.conv_x + hs * 4,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_t1,
+                                hs,
+                            )?;
+                            Self::dispatch_mul(
+                                session,
+                                &self.weights_buf,
+                                conv.conv_w2_offset,
+                                HTP_TENSOR_WEIGHT,
+                                scratch,
+                                so.conv_bx,
+                                HTP_TENSOR_COMPUTE,
+                                scratch,
+                                so.conv_y,
+                                hs,
+                            )?;
+                            Self::dispatch_add(
+                                session, scratch, so.conv_t0, scratch, so.conv_t1, scratch,
+                                so.conv_t0, hs,
+                            )?;
+                            Self::dispatch_add(
+                                session, scratch, so.conv_y, scratch, so.conv_t0, scratch,
+                                so.conv_y, hs,
+                            )?;
+
+                            // Update states: s0 = s1; s1 = bx. The odd->even
+                            // shift stages through conv_ssm_y (unused on the
+                            // manual path).
+                            Self::dispatch_cpy_2d(
+                                session,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                hs,
+                                1,
+                                8,
+                                8,
+                                scratch,
+                                so.conv_ssm_y,
+                                4,
+                                hs * 4,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_ssm_y,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset,
+                                8,
+                                8,
+                            )?;
+                            Self::dispatch_cpy_2d(
+                                session,
+                                scratch,
+                                so.conv_bx,
+                                hs,
+                                1,
+                                4,
+                                hs * 4,
+                                &self.kv_state_buf,
+                                conv.state_offset + 4,
+                                8,
+                                8,
+                            )?;
+                        }
+
+                        // Gate: y = y * c
+                        Self::dispatch_mul(
+                            session,
+                            scratch,
+                            so.conv_in + hs * 4,
+                            HTP_TENSOR_COMPUTE,
+                            scratch,
+                            so.conv_y,
+                            HTP_TENSOR_COMPUTE,
+                            scratch,
+                            so.conv_y,
+                            hs,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) gated-y",
                             so.conv_y,
                             hs,
                         );
-                        // Update states: s0 = s1; s1 = bx. The odd->even
-                        // shift overlaps in the interleaved slab, so it
-                        // stages through conv_t0 (unused on this path).
-                        Self::dispatch_cpy_2d(
-                            session,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            hs,
-                            1,
-                            8,
-                            8,
-                            scratch,
-                            so.conv_t0,
-                            4,
-                            hs * 4,
-                        )?;
-                        Self::dispatch_cpy_2d(
-                            session,
-                            scratch,
-                            so.conv_t0,
-                            hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset,
-                            8,
-                            8,
-                        )?;
-                        Self::dispatch_cpy_2d(
-                            session,
-                            scratch,
-                            so.conv_bx,
-                            hs,
-                            1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            8,
-                            8,
-                        )?;
-                    } else {
-                        // bx = b * x
-                        Self::dispatch_mul(
-                            session,
-                            scratch,
-                            so.conv_in,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_in + 2 * hs * 4,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_bx,
-                            hs,
-                        )?;
-                        Self::dump_hidden(session, scratch, layer_idx, "(conv) bx", so.conv_bx, hs);
 
-                        // De-interleave [s0; s1] into conv_x rows 0-1
-                        // (conv_x is unused on the manual path); the MUL
-                        // worker only reads dense rows.
-                        Self::dispatch_cpy_2d(
-                            session,
-                            &self.kv_state_buf,
-                            conv.state_offset,
-                            hs,
-                            1,
-                            8,
-                            8,
-                            scratch,
-                            so.conv_x,
-                            4,
-                            hs * 4,
-                        )?;
-                        Self::dispatch_cpy_2d(
-                            session,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            hs,
-                            1,
-                            8,
-                            8,
-                            scratch,
-                            so.conv_x + hs * 4,
-                            4,
-                            hs * 4,
-                        )?;
-                        // Rolling conv: y = s0 * w0 + s1 * w1 + bx * w2
-                        Self::dispatch_mul(
+                        // out_proj: hs -> hs
+                        self.dispatch_mul_mat(
                             session,
                             &self.weights_buf,
-                            conv.conv_w0_offset,
-                            HTP_TENSOR_WEIGHT,
-                            scratch,
-                            so.conv_x,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_t0,
-                            hs,
-                        )?;
-                        Self::dispatch_mul(
-                            session,
-                            &self.weights_buf,
-                            conv.conv_w1_offset,
-                            HTP_TENSOR_WEIGHT,
-                            scratch,
-                            so.conv_x + hs * 4,
-                            HTP_TENSOR_COMPUTE,
-                            scratch,
-                            so.conv_t1,
-                            hs,
-                        )?;
-                        Self::dispatch_mul(
-                            session,
-                            &self.weights_buf,
-                            conv.conv_w2_offset,
-                            HTP_TENSOR_WEIGHT,
-                            scratch,
-                            so.conv_bx,
-                            HTP_TENSOR_COMPUTE,
+                            &conv.out_proj,
                             scratch,
                             so.conv_y,
-                            hs,
-                        )?;
-                        Self::dispatch_add(
-                            session, scratch, so.conv_t0, scratch, so.conv_t1, scratch, so.conv_t0,
-                            hs,
-                        )?;
-                        Self::dispatch_add(
-                            session, scratch, so.conv_y, scratch, so.conv_t0, scratch, so.conv_y,
-                            hs,
+                            scratch,
+                            so.normed,
                         )?;
 
-                        // Update states: s0 = s1; s1 = bx. The odd->even
-                        // shift stages through conv_ssm_y (unused on the
-                        // manual path).
-                        Self::dispatch_cpy_2d(
+                        self.dump_hidden(
                             session,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            hs,
-                            1,
-                            8,
-                            8,
                             scratch,
-                            so.conv_ssm_y,
-                            4,
-                            hs * 4,
+                            layer_idx,
+                            "(conv) block-out",
+                            so.normed,
+                            hs,
+                        );
+
+                        // Residual add: act = act + normed
+                        Self::dispatch_add(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
                         )?;
-                        Self::dispatch_cpy_2d(
+                        self.dump_hidden(
                             session,
                             scratch,
-                            so.conv_ssm_y,
+                            layer_idx,
+                            "(conv) post-block",
+                            so.activation,
+                            hs,
+                        );
+
+                        // FFN
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            scratch,
+                            so.activation,
+                            &self.weights_buf,
+                            conv.ffn_norm_offset,
+                            scratch,
+                            so.normed,
+                            eps,
                             hs,
                             1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset,
-                            8,
-                            8,
                         )?;
-                        Self::dispatch_cpy_2d(
+                        self.dump_hidden(
                             session,
                             scratch,
-                            so.conv_bx,
+                            layer_idx,
+                            "(conv) normed-ffn",
+                            so.normed,
                             hs,
+                        );
+                        self.dispatch_mul_mat_nx(
+                            session,
+                            &self.weights_buf,
+                            &[&conv.ffn_gate, &conv.ffn_up],
+                            scratch,
+                            so.normed,
+                            scratch,
+                            &[so.ffn_gate, so.ffn_up],
                             1,
-                            4,
-                            hs * 4,
-                            &self.kv_state_buf,
-                            conv.state_offset + 4,
-                            8,
-                            8,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) ffn-gate",
+                            so.ffn_gate,
+                            intermediate_size,
+                        );
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) ffn-up",
+                            so.ffn_up,
+                            intermediate_size,
+                        );
+                        Self::dispatch_swiglu(
+                            session,
+                            scratch,
+                            so.ffn_gate,
+                            scratch,
+                            so.ffn_up,
+                            scratch,
+                            so.ffn_out,
+                            intermediate_size,
+                            1,
+                        )?;
+                        self.dump_hidden(
+                            session,
+                            scratch,
+                            layer_idx,
+                            "(conv) ffn-out-act",
+                            so.ffn_out,
+                            intermediate_size,
+                        );
+                        self.dispatch_mul_mat(
+                            session,
+                            &self.weights_buf,
+                            &conv.ffn_down,
+                            scratch,
+                            so.ffn_out,
+                            scratch,
+                            so.normed,
+                        )?;
+                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
+                        Self::dispatch_add(
+                            session,
+                            scratch,
+                            so.activation,
+                            scratch,
+                            so.normed,
+                            scratch,
+                            so.activation,
+                            hs,
                         )?;
                     }
-
-                    // Gate: y = y * c
-                    Self::dispatch_mul(
-                        session,
-                        scratch,
-                        so.conv_in + hs * 4,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_y,
-                        HTP_TENSOR_COMPUTE,
-                        scratch,
-                        so.conv_y,
-                        hs,
-                    )?;
-                    Self::dump_hidden(session, scratch, layer_idx, "(conv) gated-y", so.conv_y, hs);
-
-                    // out_proj: hs -> hs
-                    self.dispatch_mul_mat(
-                        session,
-                        &self.weights_buf,
-                        &conv.out_proj,
-                        scratch,
-                        so.conv_y,
-                        scratch,
-                        so.normed,
-                    )?;
-
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) block-out",
-                        so.normed,
-                        hs,
-                    );
-
-                    // Residual add: act = act + normed
-                    Self::dispatch_add(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) post-block",
-                        so.activation,
-                        hs,
-                    );
-
-                    // FFN
-                    Self::dispatch_rms_norm_mul(
-                        session,
-                        scratch,
-                        so.activation,
-                        &self.weights_buf,
-                        conv.ffn_norm_offset,
-                        scratch,
-                        so.normed,
-                        eps,
-                        hs,
-                        1,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) normed-ffn",
-                        so.normed,
-                        hs,
-                    );
-                    self.dispatch_mul_mat_nx(
-                        session,
-                        &self.weights_buf,
-                        &[&conv.ffn_gate, &conv.ffn_up],
-                        scratch,
-                        so.normed,
-                        scratch,
-                        &[so.ffn_gate, so.ffn_up],
-                        1,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) ffn-gate",
-                        so.ffn_gate,
-                        intermediate_size,
-                    );
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) ffn-up",
-                        so.ffn_up,
-                        intermediate_size,
-                    );
-                    Self::dispatch_swiglu(
-                        session,
-                        scratch,
-                        so.ffn_gate,
-                        scratch,
-                        so.ffn_up,
-                        scratch,
-                        so.ffn_out,
-                        intermediate_size,
-                        1,
-                    )?;
-                    Self::dump_hidden(
-                        session,
-                        scratch,
-                        layer_idx,
-                        "(conv) ffn-out-act",
-                        so.ffn_out,
-                        intermediate_size,
-                    );
-                    self.dispatch_mul_mat(
-                        session,
-                        &self.weights_buf,
-                        &conv.ffn_down,
-                        scratch,
-                        so.ffn_out,
-                        scratch,
-                        so.normed,
-                    )?;
-                    Self::dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
-                    Self::dispatch_add(
-                        session,
-                        scratch,
-                        so.activation,
-                        scratch,
-                        so.normed,
-                        scratch,
-                        so.activation,
-                        hs,
-                    )?;
                 }
+
+                self.debug_barrier(session, &format!("Hexagon NPU layer {layer_idx}"))?;
+
+                self.dump_hidden(session, scratch, layer_idx, "post-ffn", so.activation, hs);
             }
 
-            if self.debug_barriers
-                && let Err(e) = session.flush()
-            {
-                return Err(CeraError::Backend(format!(
-                    "Hexagon NPU layer {layer_idx} execution failed: {e}"
-                )));
-            }
+            // Final output norm (fused): normed = rmsnorm(act) * output_norm
+            Self::dispatch_rms_norm_mul(
+                session,
+                scratch,
+                so.activation,
+                &self.weights_buf,
+                self.output_norm_offset,
+                scratch,
+                so.normed,
+                eps,
+                hs,
+                1,
+            )?;
 
-            Self::dump_hidden(session, scratch, layer_idx, "post-ffn", so.activation, hs);
-        }
+            // Final LM head: logits = mul_mat(lm_head, normed)
+            self.dispatch_mul_mat(
+                session,
+                &self.weights_buf,
+                &self.lm_head,
+                scratch,
+                so.normed,
+                scratch,
+                so.logits,
+            )?;
 
-        // Final output norm (fused): normed = rmsnorm(act) * output_norm
-        Self::dispatch_rms_norm_mul(
-            session,
-            scratch,
-            so.activation,
-            &self.weights_buf,
-            self.output_norm_offset,
-            scratch,
-            so.normed,
-            eps,
-            hs,
-            1,
-        )?;
+            // Flush remaining queued operations to DSP and await execution
+            // completion. (Decode flushes every `MAX_OPS_PER_FLUSH` ops
+            // for determinism; on failure, re-run with
+            // CERA_HEXAGON_BARRIERS=1 (per-group flushes) or
+            // CERA_HEXAGON_STEP=1 (per-op flush) to localize the bad op.)
+            session.flush().map_err(|e| {
+                CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
+            })?;
+            Ok(())
+        })();
 
-        // Final LM head: logits = mul_mat(lm_head, normed)
-        let vocab_size = self.config.vocab_size;
-        self.dispatch_mul_mat(
-            session,
-            &self.weights_buf,
-            &self.lm_head,
-            scratch,
-            so.normed,
-            scratch,
-            so.logits,
-        )?;
-
-        // Flush remaining queued operations to DSP and await execution
-        // completion. (Decode flushes every `MAX_OPS_PER_FLUSH` ops
-        // for determinism; on failure, re-run with
-        // CERA_HEXAGON_BARRIERS=1 (per-group flushes) or
-        // CERA_HEXAGON_STEP=1 (per-op flush) to localize the bad op.)
-        if let Err(e) = session.flush() {
-            session.set_max_ops_per_flush(None);
-            return Err(CeraError::Backend(format!(
-                "Hexagon NPU execution failed: {e}"
-            )));
-        }
         session.set_max_ops_per_flush(None);
+        if let Err(e) = run_res {
+            session.drop_pending_batch();
+            return Err(e);
+        }
 
         self.current_seq_len.store(pos + 1, Ordering::SeqCst);
         state.seq_len = pos + 1;
@@ -4324,27 +4310,8 @@ impl Model for HexagonLfm2Model {
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
         let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
-        state.truncate_to(len);
         self.current_seq_len.store(len, Ordering::SeqCst);
-    }
-
-    fn check_kv_rewind(&self, state: &InferenceState, len: usize) -> Result<(), KvRewindError> {
-        let current = self.current_seq_len.load(Ordering::SeqCst);
-        if len > current {
-            return Err(KvRewindError::OutOfBounds {
-                requested: len,
-                current,
-            });
-        }
-        state.check_truncate_to(len)
-    }
-
-    fn try_truncate_kv(&self, state: &mut InferenceState, len: usize) -> Result<(), KvRewindError> {
-        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
-        self.check_kv_rewind(state, len)?;
-        state.try_truncate_to(len)?;
-        self.current_seq_len.store(len, Ordering::SeqCst);
-        Ok(())
+        state.seq_len = len;
     }
 
     fn try_reset_kv(
@@ -4471,5 +4438,53 @@ mod prefill_chunk_tests {
         );
         // Empty input → zeros (no chunk ran, so `None`).
         assert_eq!(prefill_tail_logits(0, 0, None, 4), vec![0.0f32; 4]);
+    }
+
+    #[test]
+    fn test_scratch_offsets_alignment_and_non_overlapping() {
+        let offsets = ScratchOffsets::new(1024, 1024, 256, 4096, 32000, 2048);
+        let list = [
+            ("activation", offsets.activation),
+            ("normed", offsets.normed),
+            ("q", offsets.q),
+            ("k", offsets.k),
+            ("v", offsets.v),
+            ("attn_out", offsets.attn_out),
+            ("conv_in", offsets.conv_in),
+            ("conv_bx", offsets.conv_bx),
+            ("conv_t0", offsets.conv_t0),
+            ("conv_t1", offsets.conv_t1),
+            ("conv_y", offsets.conv_y),
+            ("conv_x", offsets.conv_x),
+            ("conv_ssm_y", offsets.conv_ssm_y),
+            ("ffn_gate", offsets.ffn_gate),
+            ("ffn_up", offsets.ffn_up),
+            ("ffn_out", offsets.ffn_out),
+            ("logits", offsets.logits),
+            ("pos", offsets.pos),
+            ("mask", offsets.mask),
+            ("total_size", offsets.total_size),
+        ];
+
+        // All offsets must be 4096-byte aligned.
+        for (name, offset) in &list {
+            assert_eq!(
+                offset % 4096,
+                0,
+                "offset for {name} ({offset}) must be 4096-byte aligned"
+            );
+        }
+
+        // Each section strictly proceeds the previous one without overlapping.
+        for i in 0..list.len() - 1 {
+            assert!(
+                list[i].1 < list[i + 1].1,
+                "offset for {} ({}) must be strictly less than next offset {} ({})",
+                list[i].0,
+                list[i].1,
+                list[i + 1].0,
+                list[i + 1].1
+            );
+        }
     }
 }

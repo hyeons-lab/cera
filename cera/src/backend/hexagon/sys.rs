@@ -244,16 +244,21 @@ impl FastRpcDriver {
 
     /// Allocate a shared memory buffer via `rpcmem`.
     pub fn rpcmem_alloc(&self, size: usize) -> Result<*mut u8, CeraError> {
-        if size == 0 || size > i32::MAX as usize {
-            return Err(CeraError::Backend(format!(
-                "invalid rpcmem allocation size: {size} bytes (must be between 1 and {} bytes)",
-                i32::MAX
-            )));
+        if size == 0 {
+            return Err(CeraError::Backend(
+                "invalid rpcmem allocation size: 0 bytes".into(),
+            ));
         }
 
         let ptr = if let Some(alloc2) = self.rpcmem_alloc2 {
             (alloc2)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size)
         } else {
+            if size > i32::MAX as usize {
+                return Err(CeraError::Backend(format!(
+                    "rpcmem_alloc requires size <= {} bytes when rpcmem_alloc2 is unavailable (got {size})",
+                    i32::MAX
+                )));
+            }
             (self.rpcmem_alloc)(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size as i32)
         };
 
@@ -470,19 +475,13 @@ impl FastRpcDriver {
         // Oppoll: timeout 0 turns the read non-blocking; the retry loop
         // below spins on EWOULDBLOCK until the response lands.
         let mut timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
-        // Oppoll hang guard: the same 30s budget blocking mode gets from
-        // its per-read timeouts. Without it a wedged DSP pins this thread
-        // at 100% forever, teardown included (`Drop` flushes through this
-        // loop). (llama.cpp spins unbounded here; the deadline is where
-        // cera deliberately differs.) Checked at the top of every iteration
-        // so no retry arm (including AEE_EINTERRUPTED) can bypass it; lazy
-        // so blocking mode pays no clock read for a budget it never uses.
-        let deadline = self
-            .oppoll
-            .then(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+        // Hang guard: 30s wall-clock budget for both oppoll and blocking modes.
+        // Without it, repeated AEE_EINTERRUPTED or a wedged DSP can spin or loop
+        // forever without bound. Checked at the top of every iteration.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut spins: u64 = 0;
         loop {
-            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if std::time::Instant::now() >= deadline {
                 return Err(CeraError::Backend(format!(
                     "dspqueue_read: no DSP response after 30s ({spins} spins)"
                 )));
@@ -543,5 +542,28 @@ impl Drop for FastRpcDriver {
                 libc::dlclose(self.handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remote_scalars_make() {
+        assert_eq!(remote_scalars_make(0, 0, 0), 0);
+        // method: 8, in_bufs: 0, out_bufs: 1 -> 0x08000100
+        assert_eq!(remote_scalars_make(8, 0, 1), 0x0800_0100);
+        // method: 2, in_bufs: 1, out_bufs: 0 -> 0x0201_0000
+        assert_eq!(remote_scalars_make(2, 1, 0), 0x0201_0000);
+        // method: 6, in_bufs: 1, out_bufs: 0 -> 0x0601_0000
+        assert_eq!(remote_scalars_make(6, 1, 0), 0x0601_0000);
+        // method: 3, in_bufs: 0, out_bufs: 0 -> 0x0300_0000
+        assert_eq!(remote_scalars_make(3, 0, 0), 0x0300_0000);
+        // Byte masking: values > 0xff should truncate to lowest 8 bits
+        assert_eq!(
+            remote_scalars_make(0x1ff, 0x2ff, 0x3ff),
+            0xffff_ff00
+        );
     }
 }

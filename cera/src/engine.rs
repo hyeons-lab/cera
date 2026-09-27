@@ -2346,7 +2346,20 @@ mod tests {
             BackendPreference::parse_str("Metal").unwrap(),
             BackendPreference::Metal
         );
-        assert!(BackendPreference::parse_str("nvidia").is_err());
+        assert_eq!(
+            BackendPreference::parse_str("Hexagon").unwrap(),
+            BackendPreference::Hexagon
+        );
+        assert_eq!(
+            BackendPreference::parse_str("npu").unwrap(),
+            BackendPreference::Hexagon
+        );
+        assert_eq!(
+            BackendPreference::parse_str("htp").unwrap(),
+            BackendPreference::Hexagon
+        );
+        let err = BackendPreference::parse_str("nvidia").unwrap_err();
+        assert!(err.to_string().contains("metal, or hexagon"));
     }
 
     #[test]

@@ -33,10 +33,6 @@ const TILE_LO_Q6_K: usize = 512;
 /// High-bit bytes per Q6_K tile (2 vectors x 128 bytes).
 const TILE_HI_Q6_K: usize = 256;
 
-fn ceil32(x: usize) -> usize {
-    x.next_multiple_of(32)
-}
-
 /// Tiled byte size with overflow-checked arithmetic: hostile GGUF dims must
 /// produce `Err`, not a debug panic or a wrapped release size. (Unreachable
 /// via `GgufFile::open`, which validates dims with checked math at load;
@@ -101,6 +97,11 @@ pub fn repack_q8_0(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if !ne0.is_multiple_of(32) {
+        return Err(CeraError::Backend(format!(
+            "repack_q8_0: ne0 ({ne0}) must be a multiple of 32"
+        )));
+    }
     let blocks_per_row = ne0.div_ceil(32);
     let block_size = std::mem::size_of::<BlockQ8_0>();
     let total_src_bytes = checked_src_bytes(ne1, blocks_per_row, block_size, "repack_q8_0")?;
@@ -112,12 +113,12 @@ pub fn repack_q8_0(
         )));
     }
 
-    // Checked first: a hostile dim must be `Err` before the `ceil32`
-    // calls below (which would panic on overflow), and the surviving
-    // plain-arithmetic uses are then provably in-range.
+    // Checked first: a hostile dim must be `Err` before the tile math below
+    // (which would panic on overflow), and the surviving plain-arithmetic
+    // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q8_0, "repack_q8_0")?;
-    let n_col_tiles = ceil32(ne1) / 32;
-    let n_k_tiles = ceil32(ne0) / 32;
+    let n_col_tiles = ne1.div_ceil(32);
+    let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: destination buffer too short (expected {} bytes, got {})",
@@ -169,6 +170,11 @@ pub fn repack_q4_0(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if !ne0.is_multiple_of(32) {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_0: ne0 ({ne0}) must be a multiple of 32"
+        )));
+    }
     let blocks_per_row = ne0.div_ceil(32);
     let block_size = std::mem::size_of::<BlockQ4_0>();
     let total_src_bytes = checked_src_bytes(ne1, blocks_per_row, block_size, "repack_q4_0")?;
@@ -180,12 +186,12 @@ pub fn repack_q4_0(
         )));
     }
 
-    // Checked first: a hostile dim must be `Err` before the `ceil32`
-    // calls below (which would panic on overflow), and the surviving
-    // plain-arithmetic uses are then provably in-range.
+    // Checked first: a hostile dim must be `Err` before the tile math below
+    // (which would panic on overflow), and the surviving plain-arithmetic
+    // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_0, "repack_q4_0")?;
-    let n_col_tiles = ceil32(ne1) / 32;
-    let n_k_tiles = ceil32(ne0) / 32;
+    let n_col_tiles = ne1.div_ceil(32);
+    let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: destination buffer too short (expected {} bytes, got {})",
@@ -258,11 +264,11 @@ pub fn repack_q4_k(
         )));
     }
 
-    // Checked first: a hostile dim must be `Err` before the `ceil32`
-    // calls below (which would panic on overflow), and the surviving
-    // plain-arithmetic uses are then provably in-range.
+    // Checked first: a hostile dim must be `Err` before the tile math below
+    // (which would panic on overflow), and the surviving plain-arithmetic
+    // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_K, "repack_q4_k")?;
-    let n_k_tiles = ceil32(ne0) / 32;
+    let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q4_k: destination buffer too short (expected {} bytes, got {})",
@@ -352,11 +358,11 @@ pub fn repack_q6_k(
         )));
     }
 
-    // Checked first: a hostile dim must be `Err` before the `ceil32`
-    // calls below (which would panic on overflow), and the surviving
-    // plain-arithmetic uses are then provably in-range.
+    // Checked first: a hostile dim must be `Err` before the tile math below
+    // (which would panic on overflow), and the surviving plain-arithmetic
+    // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q6_K, "repack_q6_k")?;
-    let n_k_tiles = ceil32(ne0) / 32;
+    let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
             "repack_q6_k: destination buffer too short (expected {} bytes, got {})",
@@ -737,7 +743,7 @@ mod tests {
         assert!(repack_q8_0(empty, huge, huge, &mut dst).is_err());
         assert!(repack_q4_0(empty, huge, huge, &mut dst).is_err());
         // Zero in one dim defeats the src-size check (0 times anything is 0)
-        // and used to reach the unchecked `ceil32` tile math and panic.
+        // and used to reach the unchecked tile math and panic.
         for (ne0, ne1) in [(0, usize::MAX), (usize::MAX, 0)] {
             assert!(repack_q8_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_0(empty, ne0, ne1, &mut dst).is_err());

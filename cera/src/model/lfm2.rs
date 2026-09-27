@@ -2423,7 +2423,7 @@ impl Lfm2Model {
                         {
                             let t_q = Instant::now();
                             transformer::quantize_rows(
-                                &normed,
+                                normed,
                                 hs,
                                 n,
                                 bq_scales,
@@ -2436,8 +2436,8 @@ impl Lfm2Model {
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 in_proj,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut proj_mat[..3 * hs * n],
                                 n,
                                 3 * hs,
@@ -2472,7 +2472,7 @@ impl Lfm2Model {
                         {
                             crate::lora::apply_prefill(
                                 t,
-                                &normed,
+                                normed,
                                 &mut proj_mat[..3 * hs * n],
                                 n,
                                 &mut state.scratch.lora_tmp,
@@ -2730,7 +2730,7 @@ impl Lfm2Model {
                         {
                             let t_q = Instant::now();
                             transformer::quantize_rows(
-                                &out_proj_input,
+                                out_proj_input,
                                 hs,
                                 n,
                                 bq_scales,
@@ -2743,8 +2743,8 @@ impl Lfm2Model {
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 out_proj,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut block_out[..hs * n],
                                 n,
                                 hs,
@@ -2779,7 +2779,7 @@ impl Lfm2Model {
                         {
                             crate::lora::apply_prefill(
                                 t,
-                                &out_proj_input,
+                                out_proj_input,
                                 block_out,
                                 n,
                                 &mut state.scratch.lora_tmp,
@@ -2867,7 +2867,7 @@ impl Lfm2Model {
                         {
                             let t_q = Instant::now();
                             transformer::quantize_rows(
-                                &normed,
+                                normed,
                                 hs,
                                 n,
                                 bq_scales,
@@ -2955,8 +2955,8 @@ impl Lfm2Model {
                                     crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
                                         p,
                                         s,
-                                        &bq_scales,
-                                        &bq_quants,
+                                        bq_scales,
+                                        bq_quants,
                                         &mut proj_mat[..qkv_dim * n],
                                         n,
                                         qkv_dim,
@@ -2966,8 +2966,8 @@ impl Lfm2Model {
                                     crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
                                         p,
                                         s,
-                                        &bq_scales,
-                                        &bq_quants,
+                                        bq_scales,
+                                        bq_quants,
                                         &mut proj_mat[..qkv_dim * n],
                                         n,
                                         qkv_dim,
@@ -2990,8 +2990,8 @@ impl Lfm2Model {
                                 transformer::gemm_preq_rowmajor(
                                     &self.gguf,
                                     attn_q_ref,
-                                    &bq_scales,
-                                    &bq_quants,
+                                    bq_scales,
+                                    bq_quants,
                                     &mut q_mat[..hs * n],
                                     n,
                                     hs,
@@ -3000,8 +3000,8 @@ impl Lfm2Model {
                                 transformer::gemm_preq_rowmajor(
                                     &self.gguf,
                                     attn_k_ref,
-                                    &bq_scales,
-                                    &bq_quants,
+                                    bq_scales,
+                                    bq_quants,
                                     &mut k_mat[..kv_dim * n],
                                     n,
                                     kv_dim,
@@ -3010,8 +3010,8 @@ impl Lfm2Model {
                                 transformer::gemm_preq_rowmajor(
                                     &self.gguf,
                                     attn_v_ref,
-                                    &bq_scales,
-                                    &bq_quants,
+                                    bq_scales,
+                                    bq_quants,
                                     &mut v_mat[..kv_dim * n],
                                     n,
                                     kv_dim,
@@ -3029,7 +3029,7 @@ impl Lfm2Model {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
                                 crate::lora::apply_prefill(
                                     t,
-                                    &normed,
+                                    normed,
                                     &mut q_mat[..hs * n],
                                     n,
                                     &mut state.scratch.lora_tmp,
@@ -3038,7 +3038,7 @@ impl Lfm2Model {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
                                 crate::lora::apply_prefill(
                                     t,
-                                    &normed,
+                                    normed,
                                     &mut k_mat[..kv_dim * n],
                                     n,
                                     &mut state.scratch.lora_tmp,
@@ -3047,7 +3047,7 @@ impl Lfm2Model {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
                                 crate::lora::apply_prefill(
                                     t,
-                                    &normed,
+                                    normed,
                                     &mut v_mat[..kv_dim * n],
                                     n,
                                     &mut state.scratch.lora_tmp,
@@ -3537,7 +3537,7 @@ impl Lfm2Model {
                         {
                             let t_q = Instant::now();
                             transformer::quantize_rows(
-                                &out_proj_input,
+                                out_proj_input,
                                 hs,
                                 n,
                                 bq_scales,
@@ -3550,8 +3550,8 @@ impl Lfm2Model {
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 attn_output_ref,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut block_out[..hs * n],
                                 n,
                                 hs,
@@ -3587,7 +3587,7 @@ impl Lfm2Model {
                         {
                             crate::lora::apply_prefill(
                                 t,
-                                &out_proj_input,
+                                out_proj_input,
                                 block_out,
                                 n,
                                 &mut state.scratch.lora_tmp,
@@ -3613,12 +3613,12 @@ impl Lfm2Model {
                 for j in 0..n {
                     col.copy_from_slice(&normed[j * hs..(j + 1) * hs]);
                     #[cfg(target_arch = "aarch64")]
-                    Self::quantize_to_scratch(&col, state);
+                    Self::quantize_to_scratch(col, state);
 
                     if is_conv {
-                        self.forward_conv_block(layer, &col, start_pos + j, state);
+                        self.forward_conv_block(layer, col, start_pos + j, state);
                     } else {
-                        self.forward_attn_block(layer, &col, start_pos + j, state);
+                        self.forward_attn_block(layer, col, start_pos + j, state);
                     }
 
                     block_out[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
@@ -3641,7 +3641,7 @@ impl Lfm2Model {
                 };
                 log_rms(
                     &format!("layer {layer} ({block_kind}) block-out"),
-                    &block_out,
+                    block_out,
                 );
             }
 
@@ -3720,7 +3720,7 @@ impl Lfm2Model {
                             moe,
                             hs,
                             n,
-                            &ffn_input,
+                            ffn_input,
                             ffn_out,
                             col,
                             state,
@@ -3748,7 +3748,7 @@ impl Lfm2Model {
                     {
                         let t_q = Instant::now();
                         transformer::quantize_rows(
-                            &ffn_input,
+                            ffn_input,
                             hs,
                             n,
                             bq_scales,
@@ -3800,8 +3800,8 @@ impl Lfm2Model {
                             && transformer::try_repacked_gate_up_silu_rowmajor(
                                 &dense.gate,
                                 &dense.up,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut gate_mat[..is * n],
                                 n,
                                 is,
@@ -3811,8 +3811,8 @@ impl Lfm2Model {
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 &dense.gate,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut gate_mat[..is * n],
                                 n,
                                 is,
@@ -3821,8 +3821,8 @@ impl Lfm2Model {
                             transformer::gemm_preq_rowmajor(
                                 &self.gguf,
                                 &dense.up,
-                                &bq_scales,
-                                &bq_quants,
+                                bq_scales,
+                                bq_quants,
                                 &mut up_mat[..is * n],
                                 n,
                                 is,
@@ -3832,7 +3832,7 @@ impl Lfm2Model {
                                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
                                     crate::lora::apply_prefill(
                                         t,
-                                        &ffn_input,
+                                        ffn_input,
                                         &mut gate_mat[..is * n],
                                         n,
                                         &mut state.scratch.lora_tmp,
@@ -3841,7 +3841,7 @@ impl Lfm2Model {
                                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
                                     crate::lora::apply_prefill(
                                         t,
-                                        &ffn_input,
+                                        ffn_input,
                                         &mut up_mat[..is * n],
                                         n,
                                         &mut state.scratch.lora_tmp,
@@ -3864,7 +3864,7 @@ impl Lfm2Model {
                     {
                         let t_q = Instant::now();
                         transformer::quantize_rows(
-                            &gate_mat,
+                            gate_mat,
                             is,
                             n,
                             dq_scales,
@@ -3908,8 +3908,8 @@ impl Lfm2Model {
                         transformer::gemm_preq_rowmajor(
                             &self.gguf,
                             &dense.down,
-                            &dq_scales,
-                            &dq_quants,
+                            dq_scales,
+                            dq_quants,
                             &mut ffn_out[..hs * n],
                             n,
                             hs,
@@ -3952,17 +3952,17 @@ impl Lfm2Model {
 
                         #[cfg(target_arch = "aarch64")]
                         {
-                            Self::quantize_to_scratch(&col, state);
+                            Self::quantize_to_scratch(col, state);
                             self.gemv_preq(
                                 &dense.gate,
-                                &col,
+                                col,
                                 &state.scratch.q8_scales,
                                 &state.scratch.q8_quants,
                                 gate_col,
                             );
                             self.gemv_preq(
                                 &dense.up,
-                                &col,
+                                col,
                                 &state.scratch.q8_scales,
                                 &state.scratch.q8_quants,
                                 up_col,
@@ -3980,7 +3980,7 @@ impl Lfm2Model {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
                                 crate::lora::apply_decode(
                                     t,
-                                    &col,
+                                    col,
                                     gate_col,
                                     &mut state.scratch.lora_tmp,
                                 );
@@ -3988,21 +3988,21 @@ impl Lfm2Model {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
                                 crate::lora::apply_decode(
                                     t,
-                                    &col,
+                                    col,
                                     up_col,
                                     &mut state.scratch.lora_tmp,
                                 );
                             }
                         }
 
-                        cpu::silu_mul_inplace(gate_col, &up_col);
+                        cpu::silu_mul_inplace(gate_col, up_col);
 
                         #[cfg(target_arch = "aarch64")]
                         {
-                            Self::quantize_to_scratch(&gate_col, state);
+                            Self::quantize_to_scratch(gate_col, state);
                             self.gemv_preq(
                                 &dense.down,
-                                &gate_col,
+                                gate_col,
                                 &state.scratch.q8_scales,
                                 &state.scratch.q8_quants,
                                 out_col,
@@ -4018,7 +4018,7 @@ impl Lfm2Model {
                         {
                             crate::lora::apply_decode(
                                 t,
-                                &gate_col,
+                                gate_col,
                                 out_col,
                                 &mut state.scratch.lora_tmp,
                             );
@@ -4030,7 +4030,7 @@ impl Lfm2Model {
             }
 
             if debug_hidden {
-                log_rms(&format!("layer {layer} ffn-out"), &ffn_out);
+                log_rms(&format!("layer {layer} ffn-out"), ffn_out);
             }
             let t_res2 = Instant::now();
             // Second residual: hidden += ffn_out

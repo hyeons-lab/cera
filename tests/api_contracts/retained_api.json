@@ -151,6 +151,7 @@
         "bos_token": "pub fn bos_token(&self) -> Option<u32>",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_prefix_cache": "pub fn clear_prefix_cache(&self)",
+        "configure_prefix_cache": "pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>)",
         "context_size": "pub fn context_size(&self) -> u64",
         "decode_tokens": "pub fn decode_tokens(&self, tokens: Vec<u32>) -> String",
         "default_generate_opts": "pub fn default_generate_opts(&self) -> GenerateOpts",

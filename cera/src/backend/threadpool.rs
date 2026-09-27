@@ -1426,6 +1426,7 @@ impl RowPool {
     /// semantics), then run the exact rows in parallel. `depth` feeds the
     /// work-based active cap (`0` = no cap); `min_chunk_rows` the steal floor;
     /// `max_active` explicitly limits active workers (`0` = no cap).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_inner<F>(
         &self,
         y: &mut [f32],
