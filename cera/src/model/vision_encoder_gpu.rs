@@ -1015,7 +1015,14 @@ impl VitGpuOps for WgpuVitOps {
     type Weight = WgpuVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
-        self.ctx.upload_f32(data, "vit")
+        let pad_len = data.len().next_multiple_of(32);
+        if pad_len == data.len() {
+            self.ctx.upload_f32(data, "vit")
+        } else {
+            let mut padded = data.to_vec();
+            padded.resize(pad_len, 0.0);
+            self.ctx.upload_f32(&padded, "vit")
+        }
     }
 
     fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
@@ -1047,9 +1054,11 @@ impl VitGpuOps for WgpuVitOps {
         out_dim: usize,
         in_dim: usize,
     ) -> Self::Buf {
+        let pad_tokens = tokens.next_multiple_of(32);
+        let pad_out = out_dim.next_multiple_of(32);
         let y = self
             .ctx
-            .create_storage_rw((tokens * out_dim * 4) as u64, "vit_linear_out");
+            .create_storage_rw((pad_tokens * pad_out * 4) as u64, "vit_linear_out");
         match w {
             WgpuVitWeight::Quant { buf, dtype } => {
                 // `upload_weight` only builds `Quant` for Q8_0/Q4_0, so those
@@ -1107,9 +1116,11 @@ impl VitGpuOps for WgpuVitOps {
         rows: usize,
         dim: usize,
     ) -> Self::Buf {
+        let pad_rows = rows.next_multiple_of(32);
+        let pad_dim = dim.next_multiple_of(32);
         let dst = self
             .ctx
-            .create_storage_rw((rows * dim * 4) as u64, "vit_ln_out");
+            .create_storage_rw((pad_rows * pad_dim * 4) as u64, "vit_ln_out");
         let params: [u32; 4] = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
         let p_buf = self
             .ctx
@@ -1144,9 +1155,11 @@ impl VitGpuOps for WgpuVitOps {
         head_dim: usize,
     ) -> Self::Buf {
         let dim = n_head * head_dim;
+        let pad_tokens = tokens.next_multiple_of(32);
+        let pad_dim = dim.next_multiple_of(32);
         let out = self
             .ctx
-            .create_storage_rw((tokens * dim * 4) as u64, "vit_attn_out");
+            .create_storage_rw((pad_tokens * pad_dim * 4) as u64, "vit_attn_out");
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let params: [u32; 4] = [
             tokens as u32,
@@ -1160,9 +1173,14 @@ impl VitGpuOps for WgpuVitOps {
         // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
         // reusing K/V tiles in shared memory) when head_dim fits its shared/
         // register sizing; else the scalar per-query kernel.
+        // On Android / Vulkan (Adreno, Mali), vit_attention_tiled.wgsl allocates
+        // 128 dynamic registers per thread across 256 threads that spill to DRAM,
+        // hanging the Qualcomm driver watchdog. vit_attention.wgsl uses workgroup
+        // shared memory (spill-free) and executes safely on mobile GPUs.
         const VIT_ATTN_TILED_Q: u32 = 256;
         const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
-        if head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM {
+        let use_tiled = cfg!(not(target_os = "android")) && head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM;
+        if use_tiled {
             self.dispatch(
                 &self.p_attn_tiled,
                 &[q, k, v, &out, &p_buf],

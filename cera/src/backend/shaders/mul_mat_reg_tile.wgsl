@@ -87,11 +87,11 @@ fn init_shmem_src1(thread_id: u32, offset_n: u32, k_outer: u32) {
         let tile_k = i % TILE_K;
         let global_n = offset_n + tile_n;
         let global_k = k_outer + tile_k;
-        sb[tile_k * SB_STRIDE + tile_n] = select(
-            0.0,
-            src1[global_n * params.x_stride + global_k],
-            global_n < params.n && global_k < params.k,
-        );
+        var val: f32 = 0.0;
+        if (global_n < params.n && global_k < params.k) {
+            val = src1[global_n * params.x_stride + global_k];
+        }
+        sb[tile_k * SB_STRIDE + tile_n] = val;
     }
 }
 
