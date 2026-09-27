@@ -32,26 +32,22 @@ vendoring them.
 
 ## Provenance
 
-- Source: llama.cpp `upstream/master` at `cf302539c` (clean tree, no
-  local patches), `ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`.
-- Build: llama.cpp `build_htp_skel(v73|v75|v79|v81)` CMake targets
-  (`ggml/src/ggml-hexagon/CMakeLists.txt`), one `-DDSP_VERSION` per
-  file. Requires `HEXAGON_SDK_ROOT` (proprietary Qualcomm toolchain;
-  headers/inlines only: the skels link no proprietary shared
-  library; `NEEDED` is DSP-side `libc.so` + `libgcc.so`, resolved
-  on-device).
-- SDK version used for these binaries: unknown (built before this
-  vendoring; behavior validated on Snapdragon 8 Elite / v79).
+- Source: llama.cpp branch `feat/hexagon-v85` at commit `00ccd6970`
+  (`ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`), including extended
+  Conv1D, ConvTranspose1D, Snake, and unary operations.
+- Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
+  whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
+  `-DDSP_VERSION`, and copying `v81` to `v85`.
 - License of the compiled sources: MIT (llama.cpp). Toolchain output
   is not SDK redistribution.
 
 ## Integrity (md5)
 
-- v73: 66c9716e5dc1e2ebd80a239c93d747a5
-- v75: 893f2be5814f7e2e85742668cd482117
-- v79: 8ad4796cced0a610f6c6a5a13db8d8c5
-- v81: c49cc4767b4fc198f1d0b76297d2183b
-- v85: dd259c62aaf67660a1417cfd11104dee
+- v73: 2dd73769a93d4de017f629c8ae3d4f55
+- v75: 890dcd26125b92925506beca537b06f7
+- v79: 7da1d562316ad431b4427ab97d8b6ae0
+- v81: 43349eab25ddcb744cf7907e0a1806dc
+- v85: 43349eab25ddcb744cf7907e0a1806dc
 
 ## Rebuilding
 
