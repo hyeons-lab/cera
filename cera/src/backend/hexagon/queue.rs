@@ -621,6 +621,8 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
         x if x == HtpOpCode::UnaryHardSigmoid as u32 => "UnaryHardSigmoid",
         x if x == HtpOpCode::UnaryHardSwish as u32 => "UnaryHardSwish",
         x if x == HtpOpCode::UnaryElu as u32 => "UnaryElu",
+        x if x == HtpOpCode::UnaryStep as u32 => "UnaryStep",
+        x if x == HtpOpCode::Sum as u32 => "Sum",
         _ => "unknown",
     }
 }
