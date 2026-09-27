@@ -64,12 +64,22 @@ pub struct HexagonVitBlockOffsets {
     pub ffn_down_b_off: usize,
 }
 
-/// Weight buffer layout offsets across all ViT blocks and post-norm.
+/// Offsets for the optional projector layers in `weights_buf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexagonVitProjectorOffsets {
+    pub mm1_w: HexagonVitWeightDesc,
+    pub mm1_b_off: usize,
+    pub mm2_w: HexagonVitWeightDesc,
+    pub mm2_b_off: usize,
+}
+
+/// Weight buffer layout offsets across all ViT blocks, post-norm, and projector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HexagonVitWeightOffsets {
     pub blocks: Vec<HexagonVitBlockOffsets>,
     pub post_ln_w_off: usize,
     pub post_ln_b_off: usize,
+    pub projector: Option<HexagonVitProjectorOffsets>,
     pub total_bytes: usize,
 }
 
@@ -155,10 +165,30 @@ impl HexagonVitWeightOffsets {
         let post_ln_w_off = plan_vec_f32(&mut cur_off, weights.post_ln_w.len());
         let post_ln_b_off = plan_vec_f32(&mut cur_off, weights.post_ln_b.len());
 
+        let projector = if (weights.projector.mm1_w.dtype == DType::Q8_0
+            || weights.projector.mm1_w.dtype == DType::Q4_0)
+            && (weights.projector.mm2_w.dtype == DType::Q8_0
+                || weights.projector.mm2_w.dtype == DType::Q4_0)
+        {
+            let mm1_w = plan_linear(&mut cur_off, &weights.projector.mm1_w)?;
+            let mm1_b_off = plan_vec_f32(&mut cur_off, weights.projector.mm1_b.len());
+            let mm2_w = plan_linear(&mut cur_off, &weights.projector.mm2_w)?;
+            let mm2_b_off = plan_vec_f32(&mut cur_off, weights.projector.mm2_b.len());
+            Some(HexagonVitProjectorOffsets {
+                mm1_w,
+                mm1_b_off,
+                mm2_w,
+                mm2_b_off,
+            })
+        } else {
+            None
+        };
+
         Ok(HexagonVitWeightOffsets {
             blocks: block_offsets,
             post_ln_w_off,
             post_ln_b_off,
+            projector,
             total_bytes: cur_off,
         })
     }
@@ -172,10 +202,14 @@ pub struct HexagonVitScratchOffsets {
     pub q_off: usize,
     pub k_off: usize,
     pub v_off: usize,
+    pub k_f16_off: usize,
+    pub v_f16_off: usize,
     pub attn_out_off: usize,
     pub proj_out_off: usize,
     pub ffn_mid_off: usize,
     pub ffn_out_off: usize,
+    pub proj_mid_off: usize,
+    pub proj_final_off: usize,
     pub total_bytes: usize,
 }
 
@@ -185,6 +219,7 @@ impl HexagonVitScratchOffsets {
         let align128 = |sz: usize| (sz + 127) & !127;
 
         let token_bytes = align128(MAX_VIT_TOKENS * n_embd * 4);
+        let token_f16_bytes = align128(MAX_VIT_TOKENS * n_embd * 2);
         let ffn_mid_bytes = align128(MAX_VIT_TOKENS * n_ff * 4);
 
         let mut off = 0;
@@ -203,6 +238,12 @@ impl HexagonVitScratchOffsets {
         let v_off = off;
         off += token_bytes;
 
+        let k_f16_off = off;
+        off += token_f16_bytes;
+
+        let v_f16_off = off;
+        off += token_f16_bytes;
+
         let attn_out_off = off;
         off += token_bytes;
 
@@ -215,16 +256,25 @@ impl HexagonVitScratchOffsets {
         let ffn_out_off = off;
         off += token_bytes;
 
+        // Projector runs after ViT blocks complete. Reusing ffn_mid_off and
+        // attn_out_off avoids inflating rpcmem scratch footprint.
+        let proj_mid_off = ffn_mid_off;
+        let proj_final_off = attn_out_off;
+
         Self {
             tokens_off,
             pre_norm_off,
             q_off,
             k_off,
             v_off,
+            k_f16_off,
+            v_f16_off,
             attn_out_off,
             proj_out_off,
             ffn_mid_off,
             ffn_out_off,
+            proj_mid_off,
+            proj_final_off,
             total_bytes: off,
         }
     }
@@ -315,6 +365,13 @@ impl HexagonVisionEncoder {
 
         copy_vec_f32(buf_slice, weights_offsets.post_ln_w_off, &weights.post_ln_w);
         copy_vec_f32(buf_slice, weights_offsets.post_ln_b_off, &weights.post_ln_b);
+
+        if let Some(proj_offs) = weights_offsets.projector {
+            copy_linear(buf_slice, proj_offs.mm1_w, &weights.projector.mm1_w)?;
+            copy_vec_f32(buf_slice, proj_offs.mm1_b_off, &weights.projector.mm1_b);
+            copy_linear(buf_slice, proj_offs.mm2_w, &weights.projector.mm2_w)?;
+            copy_vec_f32(buf_slice, proj_offs.mm2_b_off, &weights.projector.mm2_b);
+        }
 
         weights_buf.flush_cpu_cache(0, weights_offsets.total_bytes);
 
@@ -692,6 +749,139 @@ impl HexagonVisionEncoder {
             )
             .map_err(|e| CeraError::Backend(format!("dispatch_add_residual: {e}")))
     }
+
+    /// Dispatch Cpy from F32 to F16 on DSP.
+    fn dispatch_cpy_f32_to_f16(
+        session: &mut HexagonQueueSession,
+        src: &RpcmemBuffer,
+        src_offset: usize,
+        dst: &RpcmemBuffer,
+        dst_offset: usize,
+        dim: usize,
+        n_tokens: usize,
+    ) -> Result<(), CeraError> {
+        let src_bytes = n_tokens * dim * 4;
+        let dst_bytes = n_tokens * dim * 2;
+        let src_ti = session.add_tensor(
+            src,
+            src_offset,
+            src_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [dim as u32, n_tokens as u32, 1, 1],
+            [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
+        )?;
+        let dst_ti = session.add_tensor(
+            dst,
+            dst_offset,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F16 as u32,
+            [dim as u32, n_tokens as u32, 1, 1],
+            [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
+        )?;
+        let params = [0i32; 16];
+        let kparams = [0i32; 32];
+        session
+            .enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)
+            .map_err(|e| CeraError::Backend(format!("dispatch_cpy_f32_to_f16: {e}")))
+    }
+
+    /// Dispatch unmasked multi-head self-attention on DSP via FlashAttnExt.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_self_attention(
+        session: &mut HexagonQueueSession,
+        q: &RpcmemBuffer,
+        q_offset: usize,
+        k: &RpcmemBuffer,
+        k_offset: usize,
+        v: &RpcmemBuffer,
+        v_offset: usize,
+        dst: &RpcmemBuffer,
+        dst_offset: usize,
+        head_dim: usize,
+        n_heads: usize,
+        n_tokens: usize,
+        scale: f32,
+    ) -> Result<(), CeraError> {
+        let q_dim = head_dim * n_heads;
+        let q_bytes = q_dim * n_tokens * 4;
+        let kv_bytes = q_dim * n_tokens * 2;
+
+        let q_ti = session.add_tensor(
+            q,
+            q_offset,
+            q_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [head_dim as u32, n_tokens as u32, n_heads as u32, 1],
+            [4, (q_dim * 4) as u32, (head_dim * 4) as u32, q_bytes as u32],
+        )?;
+
+        let k_ti = session.add_tensor(
+            k,
+            k_offset,
+            kv_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F16 as u32,
+            [head_dim as u32, n_tokens as u32, n_heads as u32, 1],
+            [
+                2,
+                (q_dim * 2) as u32,
+                (head_dim * 2) as u32,
+                kv_bytes as u32,
+            ],
+        )?;
+
+        let v_ti = session.add_tensor(
+            v,
+            v_offset,
+            kv_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F16 as u32,
+            [head_dim as u32, n_tokens as u32, n_heads as u32, 1],
+            [
+                2,
+                (q_dim * 2) as u32,
+                (head_dim * 2) as u32,
+                kv_bytes as u32,
+            ],
+        )?;
+
+        let dst_ti = session.add_tensor(
+            dst,
+            dst_offset,
+            q_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [head_dim as u32, n_heads as u32, n_tokens as u32, 1],
+            [4, (head_dim * 4) as u32, (q_dim * 4) as u32, q_bytes as u32],
+        )?;
+
+        let mut params = [0i32; 16];
+        params[0] = scale.to_bits() as i32;
+
+        let kparams = crate::backend::hexagon::build_flash_attn_kernel_params(
+            head_dim,
+            n_heads,
+            n_heads,
+            n_tokens,
+            n_tokens,
+            scale,
+            session.dsp_threads(),
+            false,
+        );
+
+        session
+            .enqueue_op(
+                HtpOpCode::FlashAttnExt as u32,
+                &[q_ti, k_ti, v_ti],
+                &[dst_ti],
+                params,
+                kparams,
+            )
+            .map_err(|e| CeraError::Backend(format!("dispatch_self_attention: {e}")))
+    }
 }
 
 impl VisionGpuEncode for HexagonVisionEncoder {
@@ -787,13 +977,8 @@ impl VisionGpuEncode for HexagonVisionEncoder {
         let session = dev_guard.queue_session_mut();
         session.drop_pending_batch();
 
-        let mut scores = vec![0f32; n_patches];
-        let mut attn_out = vec![0f32; n_patches * n_embd];
-
         let run_vit_blocks = |session: &mut HexagonQueueSession,
-                              scratch_guard: &mut RpcmemBuffer,
-                              scores: &mut [f32],
-                              attn_out: &mut [f32]|
+                              scratch_guard: &mut RpcmemBuffer|
          -> Result<(), CeraError> {
             for blk in &self.weights_offsets.blocks {
                 // Pre-attention LayerNorm: tokens -> pre_norm
@@ -846,53 +1031,42 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     n_patches,
                 )?;
 
-                // Flush Q/K/V projections before attention
-                session.flush()?;
+                // Convert K and V from F32 to F16 in rpcmem for FlashAttnExt
+                Self::dispatch_cpy_f32_to_f16(
+                    session,
+                    scratch_guard,
+                    so.k_off,
+                    scratch_guard,
+                    so.k_f16_off,
+                    n_embd,
+                    n_patches,
+                )?;
+                Self::dispatch_cpy_f32_to_f16(
+                    session,
+                    scratch_guard,
+                    so.v_off,
+                    scratch_guard,
+                    so.v_f16_off,
+                    n_embd,
+                    n_patches,
+                )?;
 
-                // Compute attention directly into attn_out, then copy into scratch_guard
-                scratch_guard.invalidate_cpu_cache(so.q_off, tokens_bytes);
-                scratch_guard.invalidate_cpu_cache(so.k_off, tokens_bytes);
-                scratch_guard.invalidate_cpu_cache(so.v_off, tokens_bytes);
-
-                {
-                    let q_slice: &[f32] = bytemuck::cast_slice(
-                        &scratch_guard.as_slice()[so.q_off..so.q_off + tokens_bytes],
-                    );
-                    let k_slice: &[f32] = bytemuck::cast_slice(
-                        &scratch_guard.as_slice()[so.k_off..so.k_off + tokens_bytes],
-                    );
-                    let v_slice: &[f32] = bytemuck::cast_slice(
-                        &scratch_guard.as_slice()[so.v_off..so.v_off + tokens_bytes],
-                    );
-
-                    for h in 0..n_head {
-                        for q_idx in 0..n_patches {
-                            let q_off = q_idx * n_embd + h * head_dim;
-                            let q = &q_slice[q_off..q_off + head_dim];
-
-                            for (k_idx, score) in scores.iter_mut().enumerate() {
-                                let k_off = k_idx * n_embd + h * head_dim;
-                                let k = &k_slice[k_off..k_off + head_dim];
-                                *score = crate::backend::cpu::dot_f32(q, k) * scale;
-                            }
-                            crate::backend::cpu::softmax_inplace(scores);
-
-                            let out_off = q_idx * n_embd + h * head_dim;
-                            let out_head = &mut attn_out[out_off..out_off + head_dim];
-                            out_head.fill(0.0);
-                            for (k_idx, &s) in scores.iter().enumerate() {
-                                let v_off = k_idx * n_embd + h * head_dim;
-                                let v = &v_slice[v_off..v_off + head_dim];
-                                for (o, vv) in out_head.iter_mut().zip(v) {
-                                    *o += s * vv;
-                                }
-                            }
-                        }
-                    }
-                }
-                scratch_guard.as_mut_slice()[so.attn_out_off..so.attn_out_off + tokens_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(attn_out));
-                scratch_guard.flush_cpu_cache(so.attn_out_off, tokens_bytes);
+                // Full on-NPU Flash Attention
+                Self::dispatch_self_attention(
+                    session,
+                    scratch_guard,
+                    so.q_off,
+                    scratch_guard,
+                    so.k_f16_off,
+                    scratch_guard,
+                    so.v_f16_off,
+                    scratch_guard,
+                    so.attn_out_off,
+                    head_dim,
+                    n_head,
+                    n_patches,
+                    scale,
+                )?;
 
                 // Out projection + bias: attn_out -> proj_out
                 Self::dispatch_linear_m(
@@ -989,12 +1163,12 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 n_embd,
             )?;
 
-            // Execute all remaining queued operations on DSP
+            // Execute all queued operations on DSP
             session.flush()?;
             Ok(())
         };
 
-        let vit_res = run_vit_blocks(session, &mut scratch_guard, &mut scores, &mut attn_out);
+        let vit_res = run_vit_blocks(session, &mut scratch_guard);
         if vit_res.is_err() {
             session.drop_pending_batch();
         }
@@ -1009,10 +1183,72 @@ impl VisionGpuEncode for HexagonVisionEncoder {
         // 4. Pixel-shuffle pool over dynamic grid
         let pooled = pixel_shuffle(normed_slice, cfg, grid_w, grid_h);
 
+        // 5. 2-layer MLP Projector to LLM embedding dimension
+        if let Some(proj_offs) = self.weights_offsets.projector {
+            let in_dim = proj_offs.mm1_w.cols;
+            let mid_dim = proj_offs.mm1_w.rows;
+            let out_dim = cfg.projection_dim;
+            if in_dim > 0 && !pooled.is_empty() && pooled.len().is_multiple_of(in_dim) {
+                let n_tokens = pooled.len() / in_dim;
+                let in_bytes = pooled.len() * 4;
+                let out_bytes = n_tokens * out_dim * 4;
+
+                let session = dev_guard.queue_session_mut();
+                session.drop_pending_batch();
+
+                scratch_guard.as_mut_slice()[so.tokens_off..so.tokens_off + in_bytes]
+                    .copy_from_slice(bytemuck::cast_slice(&pooled));
+                scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
+
+                let proj_res = (|| -> Result<(), CeraError> {
+                    Self::dispatch_linear_m(
+                        session,
+                        &scratch_guard,
+                        so.tokens_off,
+                        &self.weights_buf,
+                        proj_offs.mm1_w,
+                        proj_offs.mm1_b_off,
+                        &scratch_guard,
+                        so.proj_mid_off,
+                        n_tokens,
+                    )?;
+                    Self::dispatch_gelu(
+                        session,
+                        &scratch_guard,
+                        so.proj_mid_off,
+                        mid_dim,
+                        n_tokens,
+                    )?;
+                    Self::dispatch_linear_m(
+                        session,
+                        &scratch_guard,
+                        so.proj_mid_off,
+                        &self.weights_buf,
+                        proj_offs.mm2_w,
+                        proj_offs.mm2_b_off,
+                        &scratch_guard,
+                        so.proj_final_off,
+                        n_tokens,
+                    )?;
+                    session.flush()?;
+                    Ok(())
+                })();
+
+                if proj_res.is_ok() {
+                    scratch_guard.invalidate_cpu_cache(so.proj_final_off, out_bytes);
+                    let out_slice: &[f32] = bytemuck::cast_slice(
+                        &scratch_guard.as_slice()[so.proj_final_off..so.proj_final_off + out_bytes],
+                    );
+                    return Ok(out_slice.to_vec());
+                } else {
+                    session.drop_pending_batch();
+                }
+            }
+        }
+
         drop(scratch_guard);
         drop(dev_guard);
 
-        // 5. 2-layer MLP Projector to LLM embedding dimension
         Ok(self.projector.forward(&pooled, cfg.projection_dim))
     }
 }
@@ -1078,11 +1314,15 @@ mod tests {
         assert_eq!(so.q_off % 128, 0);
         assert_eq!(so.k_off % 128, 0);
         assert_eq!(so.v_off % 128, 0);
+        assert_eq!(so.k_f16_off % 128, 0);
+        assert_eq!(so.v_f16_off % 128, 0);
         assert_eq!(so.attn_out_off % 128, 0);
         assert_eq!(so.proj_out_off % 128, 0);
         assert_eq!(so.ffn_mid_off % 128, 0);
         assert_eq!(so.ffn_out_off % 128, 0);
-        assert!(so.total_bytes > so.ffn_out_off);
+        assert_eq!(so.proj_mid_off % 128, 0);
+        assert_eq!(so.proj_final_off % 128, 0);
+        assert!(so.total_bytes > so.proj_final_off);
         assert!(so.total_bytes < 64 * 1024 * 1024);
     }
 
@@ -1099,11 +1339,15 @@ mod tests {
         assert_eq!(so.q_off % 128, 0);
         assert_eq!(so.k_off % 128, 0);
         assert_eq!(so.v_off % 128, 0);
+        assert_eq!(so.k_f16_off % 128, 0);
+        assert_eq!(so.v_f16_off % 128, 0);
         assert_eq!(so.attn_out_off % 128, 0);
         assert_eq!(so.proj_out_off % 128, 0);
         assert_eq!(so.ffn_mid_off % 128, 0);
         assert_eq!(so.ffn_out_off % 128, 0);
-        assert!(so.total_bytes > so.ffn_out_off);
+        assert_eq!(so.proj_mid_off % 128, 0);
+        assert_eq!(so.proj_final_off % 128, 0);
+        assert!(so.total_bytes > so.proj_final_off);
         assert!(so.total_bytes < 32 * 1024 * 1024);
     }
 
@@ -1219,5 +1463,73 @@ mod tests {
 
         let plan_res = HexagonVitWeightOffsets::plan(&weights);
         assert!(plan_res.is_err());
+    }
+
+    #[test]
+    fn test_hexagon_vit_weight_offsets_plan_q8_0() {
+        let make_q8 = |rows: usize, cols: usize| -> MmapWeight {
+            let n_blocks = (rows * cols) / 32;
+            let bytes = vec![0u8; n_blocks * 34];
+            MmapWeight::from_owned_bytes(bytes, DType::Q8_0, rows, cols)
+        };
+
+        let cfg = VisionEncoderConfig {
+            n_layer: 1,
+            n_embd: 64,
+            n_ff: 128,
+            n_head: 2,
+            eps: 1e-5,
+            image_size: 32,
+            patch_size: 16,
+            n_trained_patches: 4,
+            projection_dim: 32,
+            scale_factor: 2,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 32 * 32,
+            image_max_pixels: 32 * 32,
+        };
+        let weights = VisionEncoderWeights {
+            config: cfg,
+            patch_embed: PatchEmbedWeights {
+                conv_w: vec![0.0f32; 3 * 16 * 16 * 64],
+                conv_b: vec![0.0f32; 64],
+            },
+            position_embed: vec![0.0f32; 4 * 64],
+            blocks: vec![VitBlockWeights {
+                ln1_w: vec![1.0f32; 64],
+                ln1_b: vec![0.0f32; 64],
+                q_w: make_q8(64, 64),
+                q_b: vec![0.0f32; 64],
+                k_w: make_q8(64, 64),
+                k_b: vec![0.0f32; 64],
+                v_w: make_q8(64, 64),
+                v_b: vec![0.0f32; 64],
+                o_w: make_q8(64, 64),
+                o_b: vec![0.0f32; 64],
+                ln2_w: vec![1.0f32; 64],
+                ln2_b: vec![0.0f32; 64],
+                ffn_up_w: make_q8(128, 64),
+                ffn_up_b: vec![0.0f32; 128],
+                ffn_down_w: make_q8(64, 128),
+                ffn_down_b: vec![0.0f32; 64],
+            }],
+            post_ln_w: vec![1.0f32; 64],
+            post_ln_b: vec![0.0f32; 64],
+            projector: ProjectorWeights {
+                mm1_w: make_q8(64, 256),
+                mm1_b: vec![0.0f32; 64],
+                mm2_w: make_q8(32, 64),
+                mm2_b: vec![0.0f32; 32],
+            },
+        };
+
+        let plan = HexagonVitWeightOffsets::plan(&weights).expect("Q8_0 weights should plan");
+        assert_eq!(plan.blocks.len(), 1);
+        assert!(plan.projector.is_some());
+        let proj = plan.projector.unwrap();
+        assert_eq!(proj.mm1_w.format, HexagonWeightFormat::RepackedQ8_0);
+        assert_eq!(proj.mm2_w.format, HexagonWeightFormat::RepackedQ8_0);
+        assert!(plan.total_bytes > proj.mm2_b_off);
     }
 }
