@@ -3946,8 +3946,8 @@ impl Lfm2Model {
                         }
                         #[cfg(not(target_arch = "aarch64"))]
                         {
-                            self.gemv(&dense.gate, &col, gate_col);
-                            self.gemv(&dense.up, &col, up_col);
+                            self.gemv(&dense.gate, col, gate_col);
+                            self.gemv(&dense.up, col, up_col);
                         }
 
                         // LoRA on gate/up (per-token decode hook): this fallback loop
@@ -3985,7 +3985,7 @@ impl Lfm2Model {
                             );
                         }
                         #[cfg(not(target_arch = "aarch64"))]
-                        self.gemv(&dense.down, &gate_col, out_col);
+                        self.gemv(&dense.down, gate_col, out_col);
 
                         // LoRA on the down projection (per-token decode hook): input is
                         // the SiLU⊙up product in `gate_col`.
