@@ -37,6 +37,13 @@ pub fn build_rms_norm_params(eps: f32) -> [i32; 16] {
     params
 }
 
+/// Host-computed parameters for Layer norm (opcode 49 `Norm`).
+pub fn build_layer_norm_params(eps: f32) -> [i32; 16] {
+    let mut params = [0i32; 16];
+    params[0] = eps.to_bits() as i32;
+    params
+}
+
 /// Host-computed kernel parameters for unary operations (RMS norm, activations).
 ///
 /// Mirrors `ggml_hexagon_precompute_unary_params` + `htp_unary_vtcm_layout_build`.
@@ -1428,5 +1435,14 @@ mod tests {
         assert_eq!(fa32[8], 128);
         assert_eq!(fa32[28], init_fastdiv(512).mp as i32); // src0_div21
         assert_eq!(fa32[30], init_fastdiv(32).mp as i32); // src0_div1
+    }
+
+    #[test]
+    fn test_layer_norm_params() {
+        let ln = build_layer_norm_params(1e-5);
+        assert_eq!(ln[0], 1e-5f32.to_bits() as i32);
+        for &val in &ln[1..] {
+            assert_eq!(val, 0);
+        }
     }
 }

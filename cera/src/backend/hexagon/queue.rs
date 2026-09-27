@@ -610,6 +610,8 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
         x if x == HtpOpCode::Cpy as u32 => "Cpy",
         x if x == HtpOpCode::SsmConv as u32 => "SsmConv",
         x if x == HtpOpCode::Concat as u32 => "Concat",
+        x if x == HtpOpCode::Norm as u32 => "Norm",
+        x if x == HtpOpCode::UnaryGelu as u32 => "UnaryGelu",
         _ => "unknown",
     }
 }

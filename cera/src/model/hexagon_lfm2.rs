@@ -302,6 +302,23 @@ pub struct HexagonLfm2Model {
 unsafe impl Send for HexagonLfm2Model {}
 unsafe impl Sync for HexagonLfm2Model {}
 
+enum PrefillInput<'a> {
+    Tokens(&'a [u32]),
+    Embeddings(&'a [f32]),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum DecodeInput<'a> {
+    Token(u32),
+    Embedding(&'a [f32]),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DecodeOutput {
+    Logits,
+    Hidden,
+}
+
 impl HexagonLfm2Model {
     /// Load an LFM2 model onto the Hexagon NPU from GGUF.
     pub fn from_gguf(
@@ -2558,21 +2575,42 @@ impl HexagonLfm2Model {
         Ok(())
     }
 
-    /// Batched prefill for one chunk of `tokens.len() <= PREFILL_MAX_ROWS`
-    /// tokens at `start_pos`, returning last-position logits. All linears
+    /// Batched prefill for one chunk of up to `PREFILL_MAX_ROWS` rows
+    /// at `start_pos`, returning last-position logits. All linears
     /// run as M-row HVX GEMMs (weights stream once per chunk); attention
     /// uses multi-query flash attention over the valid prefix with a
     /// host-built causal mask; conv layers use one SsmConv per chunk.
-    fn try_forward_prefill_chunk(
+    fn try_forward_prefill_chunk_input(
         &self,
-        tokens: &[u32],
+        input: PrefillInput<'_>,
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        let m = tokens.len();
-        if tokens.is_empty() {
-            return Err(CeraError::EmptyInput);
-        }
+        let hs = self.config.hidden_size;
+        let m = match input {
+            PrefillInput::Tokens(tokens) => {
+                if tokens.is_empty() {
+                    return Err(CeraError::EmptyInput);
+                }
+                tokens.len()
+            }
+            PrefillInput::Embeddings(embeddings) => {
+                if embeddings.is_empty() {
+                    return Err(CeraError::EmptyInput);
+                }
+                if hs == 0 {
+                    return Err(CeraError::Backend("hidden_size is zero".to_string()));
+                }
+                if embeddings.len() % hs != 0 {
+                    return Err(CeraError::Backend(format!(
+                        "embeddings length ({}) is not a multiple of hidden_size ({hs})",
+                        embeddings.len()
+                    )));
+                }
+                embeddings.len() / hs
+            }
+        };
+
         if m > PREFILL_MAX_ROWS {
             return Err(CeraError::Backend(format!(
                 "prefill chunk size ({m}) exceeds maximum ({PREFILL_MAX_ROWS})"
@@ -2581,10 +2619,13 @@ impl HexagonLfm2Model {
         let fwd_start = std::time::Instant::now();
 
         let vocab_size = self.config.vocab_size;
-        if let Some(&bad) = tokens.iter().find(|&&t| (t as usize) >= vocab_size) {
-            return Err(CeraError::Backend(format!(
-                "token ID {bad} exceeds model vocab size {vocab_size}"
-            )));
+        if let PrefillInput::Tokens(tokens) = input {
+            let bad_token = tokens.iter().copied().find(|&t| (t as usize) >= vocab_size);
+            if let Some(bad) = bad_token {
+                return Err(CeraError::Backend(format!(
+                    "token ID {bad} exceeds model vocab size {vocab_size}"
+                )));
+            }
         }
 
         let max_seq_len = self.config.max_seq_len;
@@ -2598,18 +2639,28 @@ impl HexagonLfm2Model {
 
         let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
 
-        let hs = self.config.hidden_size;
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
 
-        // Gather token embeddings, positions, and the causal mask.
+        // Ingest token embeddings or raw float embeddings, positions, and causal mask.
         unsafe {
-            for (i, &t) in tokens.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(
-                    self.token_embd.as_ptr().add(t as usize * hs),
-                    scratch.as_mut_ptr().add(so.activation + i * hs * 4) as *mut f32,
-                    hs,
-                );
+            match input {
+                PrefillInput::Tokens(tokens) => {
+                    for (i, &t) in tokens.iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(
+                            self.token_embd.as_ptr().add(t as usize * hs),
+                            scratch.as_mut_ptr().add(so.activation + i * hs * 4) as *mut f32,
+                            hs,
+                        );
+                    }
+                }
+                PrefillInput::Embeddings(embeddings) => {
+                    std::ptr::copy_nonoverlapping(
+                        embeddings.as_ptr() as *const u8,
+                        scratch.as_mut_ptr().add(so.activation),
+                        m * hs * 4,
+                    );
+                }
             }
             let pos_slice =
                 std::slice::from_raw_parts_mut(scratch.as_mut_ptr().add(so.pos) as *mut i32, m);
@@ -3325,6 +3376,24 @@ impl HexagonLfm2Model {
         Ok(logits_slice.to_vec())
     }
 
+    fn try_forward_prefill_chunk(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.try_forward_prefill_chunk_input(PrefillInput::Tokens(tokens), start_pos, state)
+    }
+
+    fn try_forward_prefill_chunk_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.try_forward_prefill_chunk_input(PrefillInput::Embeddings(embeddings), start_pos, state)
+    }
+
     /// Run one prefill chunk, or `None` when the chunk failed. A failed
     /// chunk aborts the whole prefill (see `forward_prefill`): continuing
     /// would write later chunks' KV slots over the failed chunk's hole,
@@ -3351,24 +3420,35 @@ impl HexagonLfm2Model {
         }
     }
 
-    fn try_forward(
+    fn forward_prefill_chunk_from_embeddings(
         &self,
-        tokens: &[u32],
+        embeddings: &[f32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Option<Vec<f32>> {
+        match self.try_forward_prefill_chunk_from_embeddings(embeddings, start_pos, state) {
+            Ok(logits) => Some(logits),
+            Err(e) => {
+                tracing::error!("Hexagon NPU prefill chunk from embeddings failed: {e}");
+                eprintln!(
+                    "[cera-hexagon] prefill chunk from embeddings failed, aborting prefill: {e}"
+                );
+                record_first_fault(&self.decode_error, e);
+                None
+            }
+        }
+    }
+
+    fn try_forward_input(
+        &self,
+        input: DecodeInput<'_>,
+        output: DecodeOutput,
         pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
         let fwd_start = std::time::Instant::now();
-
-        let token = tokens[0] as usize;
-        if token >= self.config.vocab_size {
-            return Err(CeraError::Backend(format!(
-                "token ID {token} exceeds model vocab size {}",
-                self.config.vocab_size
-            )));
-        }
+        let vocab_size = self.config.vocab_size;
+        let hs = self.config.hidden_size;
 
         let max_seq = self.config.max_seq_len;
         if pos >= max_seq {
@@ -3380,20 +3460,45 @@ impl HexagonLfm2Model {
 
         let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
 
-        let hs = self.config.hidden_size;
-        let embd_start = token * hs;
-        let embd_slice = &self.token_embd[embd_start..embd_start + hs];
-
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
 
-        // Copy token embedding to activation buffer
+        match input {
+            DecodeInput::Token(token_id) => {
+                let token = token_id as usize;
+                if token >= vocab_size {
+                    return Err(CeraError::Backend(format!(
+                        "token ID {token} exceeds model vocab size {vocab_size}"
+                    )));
+                }
+                let embd_start = token * hs;
+                let embd_slice = &self.token_embd[embd_start..embd_start + hs];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        embd_slice.as_ptr() as *const u8,
+                        scratch.as_mut_ptr().add(so.activation),
+                        hs * 4,
+                    );
+                }
+            }
+            DecodeInput::Embedding(embedding) => {
+                if embedding.len() != hs {
+                    return Err(CeraError::Backend(format!(
+                        "embedding length ({}) != hidden_size ({hs})",
+                        embedding.len()
+                    )));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        embedding.as_ptr() as *const u8,
+                        scratch.as_mut_ptr().add(so.activation),
+                        hs * 4,
+                    );
+                }
+            }
+        }
+
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                embd_slice.as_ptr() as *const u8,
-                scratch.as_mut_ptr().add(so.activation),
-                hs * 4,
-            );
             let pos_slice =
                 std::slice::from_raw_parts_mut(scratch.as_mut_ptr().add(so.pos) as *mut i32, 2);
             pos_slice[0] = pos as i32;
@@ -4142,16 +4247,18 @@ impl HexagonLfm2Model {
                 1,
             )?;
 
-            // Final LM head: logits = mul_mat(lm_head, normed)
-            self.dispatch_mul_mat(
-                session,
-                &self.weights_buf,
-                &self.lm_head,
-                scratch,
-                so.normed,
-                scratch,
-                so.logits,
-            )?;
+            if output == DecodeOutput::Logits {
+                // Final LM head: logits = mul_mat(lm_head, normed)
+                self.dispatch_mul_mat(
+                    session,
+                    &self.weights_buf,
+                    &self.lm_head,
+                    scratch,
+                    so.normed,
+                    scratch,
+                    so.logits,
+                )?;
+            }
 
             // Flush remaining queued operations to DSP and await execution
             // completion. (Decode flushes every `MAX_OPS_PER_FLUSH` ops
@@ -4173,17 +4280,94 @@ impl HexagonLfm2Model {
         self.current_seq_len.store(pos + 1, Ordering::SeqCst);
         state.seq_len = pos + 1;
 
-        // Invalidate CPU cache for logits output buffer before reading
-        scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
-        let logits_slice = unsafe {
-            std::slice::from_raw_parts(scratch.as_ptr().add(so.logits) as *const f32, vocab_size)
+        let result = match output {
+            DecodeOutput::Logits => {
+                scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
+                let logits_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        scratch.as_ptr().add(so.logits) as *const f32,
+                        vocab_size,
+                    )
+                };
+                logits_slice.to_vec()
+            }
+            DecodeOutput::Hidden => {
+                scratch.invalidate_cpu_cache(so.normed, hs * 4);
+                let hidden_slice = unsafe {
+                    std::slice::from_raw_parts(scratch.as_ptr().add(so.normed) as *const f32, hs)
+                };
+                hidden_slice.to_vec()
+            }
         };
+
         if let Ok(mut adpf) = self.adpf.lock()
             && let Some(session) = adpf.as_mut()
         {
             session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
         }
-        Ok(logits_slice.to_vec())
+        Ok(result)
+    }
+
+    fn try_forward(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.try_forward_input(
+            DecodeInput::Token(tokens[0]),
+            DecodeOutput::Logits,
+            pos,
+            state,
+        )
+    }
+
+    fn try_forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.try_forward_input(
+            DecodeInput::Embedding(embedding),
+            DecodeOutput::Logits,
+            pos,
+            state,
+        )
+    }
+
+    fn try_forward_embedding(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        if tokens.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        self.try_forward_input(
+            DecodeInput::Token(tokens[0]),
+            DecodeOutput::Hidden,
+            pos,
+            state,
+        )
+    }
+
+    fn try_forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.try_forward_input(
+            DecodeInput::Embedding(embedding),
+            DecodeOutput::Hidden,
+            pos,
+            state,
+        )
     }
 }
 
@@ -4244,6 +4428,33 @@ fn prefill_tail_logits(
     }
 }
 
+fn run_scratch_chunks_embeddings(
+    embeddings: &[f32],
+    n_tokens: usize,
+    hidden_size: usize,
+    start_pos: usize,
+    state: &mut InferenceState,
+    mut runner: impl FnMut(&[f32], usize, &mut InferenceState) -> Option<Vec<f32>>,
+) -> (usize, Option<Vec<f32>>) {
+    if n_tokens == 0 || embeddings.is_empty() || hidden_size == 0 {
+        return (0, None);
+    }
+    let chunk_floats = PREFILL_MAX_ROWS * hidden_size;
+    let mut consumed = 0usize;
+    let mut logits = None;
+    for (chunk_idx, chunk) in embeddings.chunks(chunk_floats).enumerate() {
+        let chunk_tokens = chunk.len() / hidden_size;
+        match runner(chunk, start_pos + chunk_idx * PREFILL_MAX_ROWS, state) {
+            Some(logits_out) => {
+                consumed += chunk_tokens;
+                logits = Some(logits_out);
+            }
+            None => break,
+        }
+    }
+    (consumed, logits)
+}
+
 impl Model for HexagonLfm2Model {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -4251,6 +4462,94 @@ impl Model for HexagonLfm2Model {
 
     fn acquire_session(&self) -> Result<Option<ModelSessionLease>, CeraError> {
         self.session_gate.try_acquire().map(Some)
+    }
+
+    fn supports_embedding_input(&self) -> bool {
+        true
+    }
+
+    fn forward_from_embedding(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        match self.try_forward_from_embedding(embedding, pos, state) {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::error!("Hexagon NPU decode from embedding failed: {e}");
+                eprintln!(
+                    "[cera-hexagon] decode from embedding failed, returning zero logits: {e}"
+                );
+                record_first_fault(&self.decode_error, e);
+                vec![0.0f32; self.config.vocab_size]
+            }
+        }
+    }
+
+    fn forward_embedding(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        match self.try_forward_embedding(tokens, pos, state) {
+            Ok(hidden) => hidden,
+            Err(e) => {
+                tracing::error!("Hexagon NPU forward embedding failed: {e}");
+                eprintln!("[cera-hexagon] forward embedding failed, returning zero hidden: {e}");
+                record_first_fault(&self.decode_error, e);
+                vec![0.0f32; self.config.hidden_size]
+            }
+        }
+    }
+
+    fn forward_hidden_from_embedding(
+        &self,
+        embedding: &[f32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        match self.try_forward_hidden_from_embedding(embedding, pos, state) {
+            Ok(hidden) => hidden,
+            Err(e) => {
+                tracing::error!("Hexagon NPU forward hidden from embedding failed: {e}");
+                eprintln!(
+                    "[cera-hexagon] forward hidden from embedding failed, returning zero hidden: {e}"
+                );
+                record_first_fault(&self.decode_error, e);
+                vec![0.0f32; self.config.hidden_size]
+            }
+        }
+    }
+
+    fn forward_prefill_from_embeddings(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let hs = self.config.hidden_size;
+        assert!(
+            n_tokens > 0,
+            "forward_prefill_from_embeddings requires at least one frame"
+        );
+        assert_eq!(
+            embeddings.len(),
+            n_tokens * hs,
+            "embeddings.len() ({}) != n_tokens ({n_tokens}) * hidden_size ({hs})",
+            embeddings.len(),
+        );
+        let (consumed, logits) = run_scratch_chunks_embeddings(
+            embeddings,
+            n_tokens,
+            hs,
+            start_pos,
+            state,
+            |chunk, pos, state| self.forward_prefill_chunk_from_embeddings(chunk, pos, state),
+        );
+        prefill_tail_logits(consumed, n_tokens, logits, self.config.vocab_size)
     }
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
@@ -4443,6 +4742,67 @@ mod prefill_chunk_tests {
         );
         // Empty input → zeros (no chunk ran, so `None`).
         assert_eq!(prefill_tail_logits(0, 0, None, 4), vec![0.0f32; 4]);
+    }
+
+    #[test]
+    fn run_scratch_chunks_embeddings_all_ok() {
+        let config = tiny_config();
+        let mut state = InferenceState::from_config(&config).unwrap();
+        let n_tokens = PREFILL_MAX_ROWS * 2 + 5;
+        let hs = config.hidden_size;
+        let embeddings: Vec<f32> = (0..n_tokens * hs).map(|i| i as f32).collect();
+        let (consumed, logits) = run_scratch_chunks_embeddings(
+            &embeddings,
+            n_tokens,
+            hs,
+            0,
+            &mut state,
+            |_chunk, pos, _state| Some(vec![pos as f32; config.vocab_size]),
+        );
+        assert_eq!(consumed, n_tokens);
+        assert_eq!(
+            logits,
+            Some(vec![(PREFILL_MAX_ROWS * 2) as f32; config.vocab_size])
+        );
+    }
+
+    #[test]
+    fn run_scratch_chunks_embeddings_aborts_on_failure() {
+        let config = tiny_config();
+        let mut state = InferenceState::from_config(&config).unwrap();
+        let n_tokens = PREFILL_MAX_ROWS * 3;
+        let hs = config.hidden_size;
+        let embeddings: Vec<f32> = vec![0.5f32; n_tokens * hs];
+        let mut ran = 0;
+        let (consumed, logits) = run_scratch_chunks_embeddings(
+            &embeddings,
+            n_tokens,
+            hs,
+            0,
+            &mut state,
+            |_chunk, _pos, _state| {
+                ran += 1;
+                if ran == 2 {
+                    return None;
+                }
+                Some(vec![1.0f32; config.vocab_size])
+            },
+        );
+        assert_eq!(consumed, PREFILL_MAX_ROWS);
+        assert_eq!(ran, 2);
+        assert_eq!(logits, Some(vec![1.0f32; config.vocab_size]));
+    }
+
+    #[test]
+    fn run_scratch_chunks_embeddings_empty() {
+        let config = tiny_config();
+        let mut state = InferenceState::from_config(&config).unwrap();
+        let (consumed, logits) =
+            run_scratch_chunks_embeddings(&[], 0, config.hidden_size, 0, &mut state, |_, _, _| {
+                panic!("should not run")
+            });
+        assert_eq!(consumed, 0);
+        assert_eq!(logits, None);
     }
 
     #[test]

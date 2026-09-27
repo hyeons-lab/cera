@@ -213,6 +213,7 @@ impl VisionEncoderConfig {
 /// for `B` (the function does standard `C = A · B`, NOT `A · B^T`),
 /// so the forward pass calls it directly with no per-image
 /// transpose.
+#[derive(Clone)]
 pub struct PatchEmbedWeights {
     /// Row-major `[in_dim × n_embd]` kernel ready for matmul. Built
     /// from `v.patch_embd.weight` once at load time.
@@ -247,11 +248,41 @@ pub struct VitBlockWeights {
 /// into the LLM embedding dim. `mm.1` is `[n_embd·scale_factor² →
 /// projection_dim·2]`, GELU, `mm.2` is `[projection_dim·2 →
 /// projection_dim]` per llama.cpp's LFM2 projector layout.
+#[derive(Clone)]
 pub struct ProjectorWeights {
     pub mm1_w: MmapWeight,
     pub mm1_b: Vec<f32>,
     pub mm2_w: MmapWeight,
     pub mm2_b: Vec<f32>,
+}
+
+impl ProjectorWeights {
+    pub(crate) fn forward(&self, pooled: &[f32], projection_dim: usize) -> Vec<f32> {
+        let in_dim = self.mm1_w.cols;
+        let mid_dim = self.mm1_w.rows;
+        let out_dim = projection_dim;
+        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
+            return Vec::new();
+        }
+        let n_tokens = pooled.len() / in_dim;
+
+        let mut mid = vec![0f32; n_tokens * mid_dim];
+        let mut out = vec![0f32; n_tokens * out_dim];
+
+        self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
+        for t in 0..n_tokens {
+            let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
+            crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+            crate::backend::cpu::gelu_inplace(mid_row);
+        }
+
+        self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
+        for t in 0..n_tokens {
+            let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
+            crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
+        }
+        out
+    }
 }
 
 /// All vision-encoder weights, loaded from a multimodal_projector
@@ -722,31 +753,7 @@ impl VisionEncoderWeights {
     /// (3072 → 2048) + GELU → `mm.2` (2048 → 1024). Output:
     /// `[64, 1024]` flattened.
     fn projector_forward(&self, pooled: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
-        let p = &self.projector;
-        let in_dim = p.mm1_w.cols;
-        let mid_dim = p.mm1_w.rows; // intermediate (e.g., 2048)
-        let out_dim = cfg.projection_dim;
-        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
-            return Vec::new();
-        }
-        let n_tokens = pooled.len() / in_dim;
-
-        let mut mid = vec![0f32; n_tokens * mid_dim];
-        let mut out = vec![0f32; n_tokens * out_dim];
-
-        p.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
-        for t in 0..n_tokens {
-            let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
-            crate::backend::cpu::add_inplace(mid_row, &p.mm1_b);
-            crate::backend::cpu::gelu_inplace(mid_row);
-        }
-
-        p.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
-        for t in 0..n_tokens {
-            let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
-            crate::backend::cpu::add_inplace(out_row, &p.mm2_b);
-        }
-        out
+        self.projector.forward(pooled, cfg.projection_dim)
     }
 }
 
@@ -806,7 +813,7 @@ impl VitScratch {
 /// 8-core M-class CPU. Without the feature, falls through to the
 /// scalar single-thread path so embedded targets that disable
 /// `parallel` still build.
-fn patch_embed_compute(
+pub(crate) fn patch_embed_compute(
     image: &[f32],
     patch_embed: &PatchEmbedWeights,
     cfg: &VisionEncoderConfig,

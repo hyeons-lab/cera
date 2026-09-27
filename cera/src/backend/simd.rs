@@ -7198,7 +7198,9 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let nth = crate::backend::cpu::prefill_par_threads().max(1).min(max_active);
+                let nth = crate::backend::cpu::prefill_par_threads()
+                    .max(1)
+                    .min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
                 crate::backend::cpu::par_rows_n_chunked_active(
@@ -7326,7 +7328,9 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let nth = crate::backend::cpu::prefill_par_threads().max(1).min(max_active);
+                let nth = crate::backend::cpu::prefill_par_threads()
+                    .max(1)
+                    .min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
                 crate::backend::cpu::par_rows_n_chunked_active(

@@ -61,6 +61,8 @@ pub mod wgpu_audio_decoder;
 
 #[cfg(feature = "hexagon")]
 pub mod hexagon_lfm2;
+#[cfg(feature = "hexagon")]
+pub mod vision_encoder_hexagon;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

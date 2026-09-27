@@ -1513,18 +1513,39 @@ impl VisionGpuEncode for MetalVisionEncoder {
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
-/// or when the device/context can't be created — the caller then falls back to
-/// the CPU encoder. `Auto` prefers Metal, then wgpu.
+/// or when the device/context can't be created: the caller then falls back to
+/// the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu | BP::Hexagon => None,
+        BP::Cpu => None,
+        BP::Hexagon => {
+            #[cfg(feature = "hexagon")]
+            {
+                crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
+            }
+            #[cfg(not(feature = "hexagon"))]
+            {
+                None
+            }
+        }
         BP::Metal => try_metal_vision_encoder(weights),
         BP::Gpu => try_wgpu_vision_encoder(weights),
-        BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
+        BP::Auto => try_metal_vision_encoder(weights)
+            .or_else(|| {
+                #[cfg(feature = "hexagon")]
+                {
+                    crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
+                }
+                #[cfg(not(feature = "hexagon"))]
+                {
+                    None
+                }
+            })
+            .or_else(|| try_wgpu_vision_encoder(weights)),
     }
 }
 
@@ -1913,5 +1934,14 @@ mod tests {
             2e-1,
             4e-2, // 4-bit GEMM noise scales with magnitude (see run_parity)
         );
+    }
+
+    #[test]
+    fn test_build_gpu_vision_encoder_hexagon_preference_fallback() {
+        let enc = synth_encoder();
+        let result = build_gpu_vision_encoder(&enc, crate::engine::BackendPreference::Hexagon);
+        #[cfg(not(target_os = "android"))]
+        assert!(result.is_none());
+        let _ = result;
     }
 }

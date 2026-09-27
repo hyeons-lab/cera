@@ -1,0 +1,26 @@
+services:
+  hexagon-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UBUNTU_VERSION: "22.04"
+        INSTALL_NDK: "true"
+    image: hexagon-sdk-dev:latest
+    platform: linux/amd64
+    stdin_open: true
+    tty: true
+    volumes:
+      # Mount current repository into container workspace
+      - ../..:/workspace
+      # Persist downloaded Qualcomm SDK and cache across container restarts
+      - hexagon-qcom-cache:/opt/qcom
+      - hexagon-home-cache:/root
+    working_dir: /workspace
+    environment:
+      - HEXAGON_SDK_ROOT=/opt/qcom/Hexagon_SDK
+      - ANDROID_NDK_ROOT=/opt/android-ndk
+
+volumes:
+  hexagon-qcom-cache:
+  hexagon-home-cache:
