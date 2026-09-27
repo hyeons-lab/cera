@@ -561,9 +561,6 @@ mod tests {
         // method: 3, in_bufs: 0, out_bufs: 0 -> 0x0300_0000
         assert_eq!(remote_scalars_make(3, 0, 0), 0x0300_0000);
         // Byte masking: values > 0xff should truncate to lowest 8 bits
-        assert_eq!(
-            remote_scalars_make(0x1ff, 0x2ff, 0x3ff),
-            0xffff_ff00
-        );
+        assert_eq!(remote_scalars_make(0x1ff, 0x2ff, 0x3ff), 0xffff_ff00);
     }
 }

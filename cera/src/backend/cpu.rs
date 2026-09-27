@@ -514,20 +514,13 @@ pub fn par_range_prefill_active(
         );
     } else {
         let mut dummy = vec![0.0f32; n_chunks];
-        pool.dispatch_rows_chunked_active(
-            &mut dummy,
-            1,
-            1,
-            1,
-            max_active,
-            |t, slice| {
-                let m_start = t * chunk;
-                let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-                if count > 0 {
-                    f(m_start, count);
-                }
-            },
-        );
+        pool.dispatch_rows_chunked_active(&mut dummy, 1, 1, 1, max_active, |t, slice| {
+            let m_start = t * chunk;
+            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
+            if count > 0 {
+                f(m_start, count);
+            }
+        });
     }
 }
 
@@ -959,6 +952,24 @@ pub fn decode_par_threads() -> usize {
 /// answer is one, so a serial build takes that cheap path unconditionally.
 #[cfg(not(feature = "parallel"))]
 pub fn decode_par_threads() -> usize {
+    1
+}
+
+/// Number of threads in the prefill worker pool, or 1 when running serially.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+pub fn prefill_par_threads() -> usize {
+    super::threadpool::RowPool::prefill().num_threads()
+}
+
+/// See the `wasm32` note on [`par_rows`]: rayon there, not a `RowPool`.
+#[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+pub fn prefill_par_threads() -> usize {
+    crate::par::current_num_threads()
+}
+
+/// Always `1` without `parallel`: the dispatch runs on the calling thread.
+#[cfg(not(feature = "parallel"))]
+pub fn prefill_par_threads() -> usize {
     1
 }
 

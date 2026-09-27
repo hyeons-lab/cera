@@ -6542,11 +6542,16 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                crate::backend::cpu::par_range_prefill_active(sr_count, 1, max_active, |start_sr, count| {
-                    for sr in start_sr..start_sr + count {
-                        compute_super_row(sr);
-                    }
-                });
+                crate::backend::cpu::par_range_prefill_active(
+                    sr_count,
+                    1,
+                    max_active,
+                    |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    },
+                );
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
@@ -6852,11 +6857,16 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                crate::backend::cpu::par_range_prefill_active(sr_count, 1, max_active, |start_sr, count| {
-                    for sr in start_sr..start_sr + count {
-                        compute_super_row(sr);
-                    }
-                });
+                crate::backend::cpu::par_range_prefill_active(
+                    sr_count,
+                    1,
+                    max_active,
+                    |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    },
+                );
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
@@ -7188,8 +7198,7 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let pool = crate::backend::threadpool::RowPool::prefill();
-                let nth = pool.num_threads().max(1).min(max_active);
+                let nth = crate::backend::cpu::prefill_par_threads().max(1).min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
                 crate::backend::cpu::par_rows_n_chunked_active(
@@ -7317,8 +7326,7 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let pool = crate::backend::threadpool::RowPool::prefill();
-                let nth = pool.num_threads().max(1).min(max_active);
+                let nth = crate::backend::cpu::prefill_par_threads().max(1).min(max_active);
                 let chunk = sr_count.div_ceil(nth * 4).max(1);
                 let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
                 crate::backend::cpu::par_rows_n_chunked_active(

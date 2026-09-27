@@ -2422,13 +2422,7 @@ impl Lfm2Model {
                         #[cfg(not(has_blas))]
                         {
                             let t_q = Instant::now();
-                            transformer::quantize_rows(
-                                normed,
-                                hs,
-                                n,
-                                bq_scales,
-                                bq_quants,
-                            );
+                            transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
                             if profile_prefill {
                                 t_quant += t_q.elapsed();
                             }
@@ -2453,7 +2447,7 @@ impl Lfm2Model {
                             transformer::try_blas_prefill_gemm_rowmajor(
                                 &self.gguf,
                                 in_proj,
-                                &normed,
+                                normed,
                                 &mut proj_mat[..3 * hs * n],
                                 n,
                                 3 * hs,
@@ -2729,13 +2723,7 @@ impl Lfm2Model {
                         #[cfg(not(has_blas))]
                         {
                             let t_q = Instant::now();
-                            transformer::quantize_rows(
-                                out_proj_input,
-                                hs,
-                                n,
-                                bq_scales,
-                                bq_quants,
-                            );
+                            transformer::quantize_rows(out_proj_input, hs, n, bq_scales, bq_quants);
                             if profile_prefill {
                                 t_quant += t_q.elapsed();
                             }
@@ -2760,7 +2748,7 @@ impl Lfm2Model {
                             transformer::try_blas_prefill_gemm_rowmajor(
                                 &self.gguf,
                                 out_proj,
-                                &out_proj_input,
+                                out_proj_input,
                                 block_out,
                                 n,
                                 hs,
@@ -2846,7 +2834,7 @@ impl Lfm2Model {
                                 n,
                                 qkv_dim,
                                 hs,
-                                &normed,
+                                normed,
                                 &qkv_rows,
                                 &mut proj_mat[..qkv_dim * n],
                             );
@@ -2866,13 +2854,7 @@ impl Lfm2Model {
                         #[cfg(not(has_blas))]
                         {
                             let t_q = Instant::now();
-                            transformer::quantize_rows(
-                                normed,
-                                hs,
-                                n,
-                                bq_scales,
-                                bq_quants,
-                            );
+                            transformer::quantize_rows(normed, hs, n, bq_scales, bq_quants);
                             if profile_prefill {
                                 t_quant += t_q.elapsed();
                             }
@@ -3136,32 +3118,38 @@ impl Lfm2Model {
                             let rope_theta = cfg.rope_theta;
                             let eps = cfg.rms_norm_eps;
                             let max_active = cpu::prefill_threads_for_tokens(n);
-                            cpu::par_rows_n_active(&mut q_mat[..n * hs], hs, 4, max_active, move |(j, _)| unsafe {
-                                let pos = start_pos + j;
-                                let q = core::slice::from_raw_parts_mut(
-                                    (q_ptr as *mut f32).add(j * hs),
-                                    hs,
-                                );
-                                let k = core::slice::from_raw_parts_mut(
-                                    (k_ptr as *mut f32).add(j * kv_dim),
-                                    kv_dim,
-                                );
-                                for h in 0..n_heads {
-                                    cpu::rmsnorm(
-                                        &mut q[h * head_dim..(h + 1) * head_dim],
-                                        q_norm,
-                                        eps,
+                            cpu::par_rows_n_active(
+                                &mut q_mat[..n * hs],
+                                hs,
+                                4,
+                                max_active,
+                                move |(j, _)| unsafe {
+                                    let pos = start_pos + j;
+                                    let q = core::slice::from_raw_parts_mut(
+                                        (q_ptr as *mut f32).add(j * hs),
+                                        hs,
                                     );
-                                }
-                                for h in 0..n_kv_heads {
-                                    cpu::rmsnorm(
-                                        &mut k[h * head_dim..(h + 1) * head_dim],
-                                        k_norm,
-                                        eps,
+                                    let k = core::slice::from_raw_parts_mut(
+                                        (k_ptr as *mut f32).add(j * kv_dim),
+                                        kv_dim,
                                     );
-                                }
-                                cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta);
-                            });
+                                    for h in 0..n_heads {
+                                        cpu::rmsnorm(
+                                            &mut q[h * head_dim..(h + 1) * head_dim],
+                                            q_norm,
+                                            eps,
+                                        );
+                                    }
+                                    for h in 0..n_kv_heads {
+                                        cpu::rmsnorm(
+                                            &mut k[h * head_dim..(h + 1) * head_dim],
+                                            k_norm,
+                                            eps,
+                                        );
+                                    }
+                                    cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta);
+                                },
+                            );
                         } else {
                             for j in 0..n {
                                 let pos = start_pos + j;
@@ -3301,36 +3289,51 @@ impl Lfm2Model {
                             // of strided writes per layer is ~1ms serial.
                             let q_mat_ptr = q_mat.as_ptr() as usize;
                             let max_active = cpu::prefill_threads_for_tokens(n);
-                            cpu::par_rows_n_active(&mut q_col[..hs * n], n, 64, max_active, move |(r, row)| unsafe {
-                                let src =
-                                    core::slice::from_raw_parts(q_mat_ptr as *const f32, n * hs);
-                                for j in 0..n {
-                                    row[j] = src[j * hs + r];
-                                }
-                            });
+                            cpu::par_rows_n_active(
+                                &mut q_col[..hs * n],
+                                n,
+                                64,
+                                max_active,
+                                move |(r, row)| unsafe {
+                                    let src = core::slice::from_raw_parts(
+                                        q_mat_ptr as *const f32,
+                                        n * hs,
+                                    );
+                                    for j in 0..n {
+                                        row[j] = src[j * hs + r];
+                                    }
+                                },
+                            );
                             let q_ref = &q_col[..hs * n];
 
                             let is_causal = cfg.is_causal
                                 && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
-                            cpu::par_rows_n_chunked_active(flash_buf, head_chunk, 1, 1, max_active, |(h, chunk)| {
-                                let kv_h = h / group_size;
-                                cpu::flash_attention_gqa_cpu_opt(
-                                    q_ref,
-                                    k_cache,
-                                    v_cache,
-                                    chunk,
-                                    h,
-                                    1,
-                                    n,
-                                    n,
-                                    kv_dim,
-                                    kv_h * head_dim,
-                                    head_dim,
-                                    scale,
-                                    start_pos,
-                                    is_causal,
-                                );
-                            });
+                            cpu::par_rows_n_chunked_active(
+                                flash_buf,
+                                head_chunk,
+                                1,
+                                1,
+                                max_active,
+                                |(h, chunk)| {
+                                    let kv_h = h / group_size;
+                                    cpu::flash_attention_gqa_cpu_opt(
+                                        q_ref,
+                                        k_cache,
+                                        v_cache,
+                                        chunk,
+                                        h,
+                                        1,
+                                        n,
+                                        n,
+                                        kv_dim,
+                                        kv_h * head_dim,
+                                        head_dim,
+                                        scale,
+                                        start_pos,
+                                        is_causal,
+                                    );
+                                },
+                            );
 
                             // Output transpose back to token-major, row-parallel over
                             // tokens (each row gathers one head-block per head).
@@ -3349,7 +3352,7 @@ impl Lfm2Model {
                                         let src_base = h * n * head_dim + j * head_dim;
                                         let dst_base = h * head_dim;
                                         row[dst_base..dst_base + head_dim].copy_from_slice(
-                                             &src_all[src_base..src_base + head_dim],
+                                            &src_all[src_base..src_base + head_dim],
                                         );
                                     }
                                 },
@@ -3536,13 +3539,7 @@ impl Lfm2Model {
                         #[cfg(not(has_blas))]
                         {
                             let t_q = Instant::now();
-                            transformer::quantize_rows(
-                                out_proj_input,
-                                hs,
-                                n,
-                                bq_scales,
-                                bq_quants,
-                            );
+                            transformer::quantize_rows(out_proj_input, hs, n, bq_scales, bq_quants);
                             if profile_prefill {
                                 t_quant += t_q.elapsed();
                             }
@@ -3567,7 +3564,7 @@ impl Lfm2Model {
                             transformer::try_blas_prefill_gemm_rowmajor(
                                 &self.gguf,
                                 attn_output_ref,
-                                &out_proj_input,
+                                out_proj_input,
                                 block_out,
                                 n,
                                 hs,
@@ -3715,16 +3712,7 @@ impl Lfm2Model {
                 let dense = match &refs.ffn {
                     FfnRefs::Dense(d) => d,
                     FfnRefs::Moe(moe) => {
-                        self.prefill_moe_ffn(
-                            layer,
-                            moe,
-                            hs,
-                            n,
-                            ffn_input,
-                            ffn_out,
-                            col,
-                            state,
-                        );
+                        self.prefill_moe_ffn(layer, moe, hs, n, ffn_input, ffn_out, col, state);
                         break 'dense_ffn;
                     }
                 };
@@ -3747,13 +3735,7 @@ impl Lfm2Model {
                     #[cfg(not(has_blas))]
                     {
                         let t_q = Instant::now();
-                        transformer::quantize_rows(
-                            ffn_input,
-                            hs,
-                            n,
-                            bq_scales,
-                            bq_quants,
-                        );
+                        transformer::quantize_rows(ffn_input, hs, n, bq_scales, bq_quants);
                         if profile_prefill {
                             t_quant += t_q.elapsed();
                         }
@@ -3778,7 +3760,7 @@ impl Lfm2Model {
                             n,
                             2 * is,
                             hs,
-                            &ffn_input,
+                            ffn_input,
                             &gu_rows,
                             &mut gate_up_mat[..2 * is * n],
                         );
@@ -3863,13 +3845,7 @@ impl Lfm2Model {
                     #[cfg(not(has_blas))]
                     {
                         let t_q = Instant::now();
-                        transformer::quantize_rows(
-                            gate_mat,
-                            is,
-                            n,
-                            dq_scales,
-                            dq_quants,
-                        );
+                        transformer::quantize_rows(gate_mat, is, n, dq_scales, dq_quants);
                         if profile_prefill {
                             t_quant += t_q.elapsed();
                         }

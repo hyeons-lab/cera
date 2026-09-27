@@ -2103,24 +2103,31 @@ impl LlamaModel {
                 // would hand all heads to 2 workers. One head per steal unit lets
                 // every worker take a head.
                 let max_active = cpu::prefill_threads_for_tokens(n);
-                cpu::par_rows_n_chunked_active(flash_buf, head_chunk, 1, 1, max_active, |(h, chunk)| {
-                    let kv_h = h / group_size;
-                    cpu::flash_attention_gqa_cpu(
-                        q_ref,
-                        k_cache,
-                        v_cache,
-                        chunk,
-                        h,
-                        1,
-                        n,
-                        n,
-                        kv_dim,
-                        kv_h * head_dim,
-                        head_dim,
-                        scale,
-                        start_pos,
-                    );
-                });
+                cpu::par_rows_n_chunked_active(
+                    flash_buf,
+                    head_chunk,
+                    1,
+                    1,
+                    max_active,
+                    |(h, chunk)| {
+                        let kv_h = h / group_size;
+                        cpu::flash_attention_gqa_cpu(
+                            q_ref,
+                            k_cache,
+                            v_cache,
+                            chunk,
+                            h,
+                            1,
+                            n,
+                            n,
+                            kv_dim,
+                            kv_h * head_dim,
+                            head_dim,
+                            scale,
+                            start_pos,
+                        );
+                    },
+                );
                 // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
                 // n] (stride-n columns). d-then-j inner order keeps out writes
                 // sequential (stride 1) with small-stride reads from flash_buf.

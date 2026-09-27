@@ -227,7 +227,6 @@ impl HexagonDevice {
         self.arch
     }
 
-
     /// Mutable reference to the command queue session.
     pub fn queue_session_mut(&mut self) -> &mut HexagonQueueSession {
         &mut self.queue_session

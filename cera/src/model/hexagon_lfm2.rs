@@ -754,27 +754,29 @@ impl HexagonLfm2Model {
         kv_state_buf.flush_cpu_cache(0, kv_state_total);
 
         // Helper to copy F32 norm weights directly into weights_buf
-        let copy_norm =
-            |name: &str, offset: usize, buf: &mut RpcmemBuffer| -> Result<(), CeraError> {
-                let t = gguf
-                    .get_tensor(name)
-                    .map_err(|e| CeraError::Backend(format!("missing tensor {name}: {e}")))?;
-                let f32_vals = t.to_f32_vec();
-                let byte_size = f32_vals.len() * std::mem::size_of::<f32>();
-                if offset.saturating_add(byte_size) > buf.size() {
-                    return Err(CeraError::Backend(format!(
-                        "norm tensor {name} byte size ({byte_size}) exceeds weights buffer capacity at offset {offset}"
-                    )));
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        f32_vals.as_ptr() as *const u8,
-                        buf.as_mut_ptr().add(offset),
-                        byte_size,
-                    );
-                }
-                Ok(())
-            };
+        let copy_norm = |name: &str,
+                         offset: usize,
+                         buf: &mut RpcmemBuffer|
+         -> Result<(), CeraError> {
+            let t = gguf
+                .get_tensor(name)
+                .map_err(|e| CeraError::Backend(format!("missing tensor {name}: {e}")))?;
+            let f32_vals = t.to_f32_vec();
+            let byte_size = f32_vals.len() * std::mem::size_of::<f32>();
+            if offset.saturating_add(byte_size) > buf.size() {
+                return Err(CeraError::Backend(format!(
+                    "norm tensor {name} byte size ({byte_size}) exceeds weights buffer capacity at offset {offset}"
+                )));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    f32_vals.as_ptr() as *const u8,
+                    buf.as_mut_ptr().add(offset),
+                    byte_size,
+                );
+            }
+            Ok(())
+        };
 
         // Helper to repack 2D weight matrix directly into weights_buf
         let copy_weight =
@@ -908,7 +910,9 @@ impl HexagonLfm2Model {
                         })?;
                     let conv_f32 = conv_tensor.to_f32_vec();
                     let expected_conv_len = hidden_size.checked_mul(3).ok_or_else(|| {
-                        CeraError::Backend("hidden_size overflow calculating conv weight size".into())
+                        CeraError::Backend(
+                            "hidden_size overflow calculating conv weight size".into(),
+                        )
                     })?;
                     if conv_f32.len() != expected_conv_len {
                         return Err(CeraError::Backend(format!(
@@ -2729,7 +2733,8 @@ impl HexagonLfm2Model {
                                         q_dim,
                                     );
                                     let k = std::slice::from_raw_parts_mut(
-                                        scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
+                                        scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4)
+                                            as *mut f32,
                                         kv_dim,
                                     );
                                     crate::backend::cpu::rope(
@@ -4153,9 +4158,9 @@ impl HexagonLfm2Model {
             // for determinism; on failure, re-run with
             // CERA_HEXAGON_BARRIERS=1 (per-group flushes) or
             // CERA_HEXAGON_STEP=1 (per-op flush) to localize the bad op.)
-            session.flush().map_err(|e| {
-                CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
-            })?;
+            session
+                .flush()
+                .map_err(|e| CeraError::Backend(format!("Hexagon NPU execution failed: {e}")))?;
             Ok(())
         })();
 
