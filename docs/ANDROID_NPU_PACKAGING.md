@@ -46,7 +46,7 @@ a retail S25 Ultra, SELinux enforcing, via a normally installed APK):
    consumers automatically; `required=false` so devices without the lib
    still install (the probe then reports unavailable).
 2. **Embedded skels & `ADSP_LIBRARY_PATH`**: `libcera_ffi.so` embeds the
-   four DSP skels in `.rodata` via `include_bytes!`. At startup,
+   DSP skels (v73, v75, v79, v81, v85) in `.rodata` via `include_bytes!`. At startup,
    `HexagonNpu.setup(context)` writes them to `context.noBackupFilesDir/cera_skels`
    and points FastRPC's loader at that directory plus vendor fallback paths.
    Because skels are not packaged as host `.so` files in `jniLibs/`, all
@@ -73,11 +73,11 @@ tries all four and uses the first that opens).
 | 8 Gen 2 / 8+ Gen 1 / 7+ Gen 2 / X Elite | v73 | ✅ skel ships, same code path (not yet run) |
 | 8 Gen 1 / 7 Gen 1 | v69 | ❌ no skel (outside llama upstream scope) |
 | 888 / 888+ / 870 / 778G+ | v68 | ❌ no skel (outside llama upstream scope) |
-| 865 and older (v66-) | — | ❌ no HTP AI-stack path in this codebase |
+| 865 and older (v66-) | none | ❌ no HTP AI-stack path in this codebase |
 
 "Support all Snapdragons": **v73+ (2022 flagships onward) yes** with
 what ships today; **v68/v69 needs skel builds** (`-DDSP_VERSION=v68`
-from the same pinned sources) **plus** a device to validate on — the
+from the same pinned sources) **plus** a device to validate on: the
 host side already handles missing HMX (`n_hmx == 0` → HVX kernels), so
 the risk is bounded to worker/arch quirks; **v66- has no path** (no
 skel exists) and stays on CPU/GPU fallback. Non-Snapdragon devices:
@@ -95,7 +95,7 @@ How the stock tier works: the app cannot open `/dev/fastrpc-cdsp`
 itself, but `libcdsprpc.so` falls back to Qualcomm's DSP service,
 which opens the node and passes the fd back over binder; the session
 then creates an unsigned user PD as usual. No cera code is involved in
-the fallback — it is Qualcomm's own `open_device_node` logic — but it
+the fallback (it is Qualcomm's own `open_device_node` logic), but it
 rests on three device grants, all present on the S25 Ultra:
 
 - `allow appdomain vendor_qdsp_device (chr_file (ioctl read))`: apps
@@ -103,7 +103,7 @@ rests on three device grants, all present on the S25 Ultra:
 - `vendor_hal_dspmanager_client` includes `untrusted_app` (and
   `untrusted_app_25..32`, `isolated_compute_app`, ...): apps may find
   and call `vendor.qti.hardware.dsp.IDspService/default`. Note the
-  grant lives in system_ext/product policy, not vendor — grep every
+  grant lives in system_ext/product policy, not vendor: grep every
   partition's `.cil` before judging a new device.
 - `libcdsprpc.so` is on the vendor public list
   (`/vendor/etc/public.libraries.txt`), so the manifest entry above
@@ -117,13 +117,13 @@ measurement errors (recorded here so they are not repeated):
 
 1. Judging app access from `run-as`: `runas_app` is NOT a DSP-HAL
    client while `untrusted_app` IS, so a `run-as` denial proves
-   nothing about Play apps. Only a real installed APK counts — never
+   nothing about Play apps. Only a real installed APK counts: never
    `run-as`, never `service check` from a shell domain.
 2. Missing `<uses-native-library>`: without it the soname `dlopen`
    fails; with it, it resolves. (Absolute `/vendor/lib64` paths stay
    blocked by the linker namespace either way; the driver tries the
    soname first and treats absolute-path misses as non-fatal.)
-3. `lshal` shows no DSP service — but `IDspService` is AIDL and `lshal`
+3. `lshal` shows no DSP service, but `IDspService` is AIDL and `lshal`
    lists HIDL only; `service list` shows it.
 
 Caveats that still hold: raw FastRPC device opens remain blocked for
@@ -159,7 +159,7 @@ and is not needed for it.
 - OEM/SoC validation matrix: stock-APK probe route (`direct` vs
   `hal-fallback` vs clean failure) on one device per major OEM skin,
   since the DSP-service grant lives in per-OEM system_ext/product
-  policy — the S25U result must not be assumed universal.
+  policy: the S25U result must not be assumed universal.
 
 ## Head-to-head
 

@@ -13220,7 +13220,7 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
  */
 data class HexagonProbeInfo(
     /**
-     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
      */
     var `arch`: kotlin.String,
     var `threads`: kotlin.UInt,

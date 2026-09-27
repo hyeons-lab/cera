@@ -3,7 +3,7 @@ cera-ffi-android third-party notices
 
 This library embeds prebuilt Qualcomm Hexagon DSP worker libraries
 (`libggml-htp-v73.so`, `libggml-htp-v75.so`, `libggml-htp-v79.so`,
-`libggml-htp-v81.so`, inside libcera_ffi.so). They are compiled from
+`libggml-htp-v81.so`, `libggml-htp-v85.so`, inside libcera_ffi.so). They are compiled from
 unmodified llama.cpp sources:
 
   Copyright (c) 2023-2026 The ggml authors

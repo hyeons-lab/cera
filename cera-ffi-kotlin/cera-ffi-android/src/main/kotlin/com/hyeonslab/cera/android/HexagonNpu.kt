@@ -33,6 +33,7 @@ object HexagonNpu {
         "libggml-htp-v75.so",
         "libggml-htp-v79.so",
         "libggml-htp-v81.so",
+        "libggml-htp-v85.so",
     )
 
     /**

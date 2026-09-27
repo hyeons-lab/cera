@@ -1,10 +1,10 @@
 # Bundled Hexagon DSP skels
 
-`libggml-htp-v{73,75,79,81}.so` are the DSP-side (Hexagon ELF) worker
+`libggml-htp-v{73,75,79,81,85}.so` are the DSP-side (Hexagon ELF) worker
 libraries the NPU backend loads into the CDSP unsigned PD at runtime.
 They are built from unmodified llama.cpp sources; the host side
 (`sys.rs`, `queue.rs`, `params.rs`) speaks their `htp_iface` IDL, so the
-skel and host versions must move together — that is why they are
+skel and host versions must move together: that is why they are
 vendored here instead of fetched at install time.
 
 ## License (read before redistributing)
@@ -23,7 +23,7 @@ attribution: this directory travels with the crate, and the AAR ships
 
 Toolchain note: the skels were built with the proprietary Qualcomm
 Hexagon SDK (compiler + headers/inlines only; they link no proprietary
-shared library — `NEEDED` is DSP-side `libc.so` + `libgcc.so`,
+shared library; `NEEDED` is DSP-side `libc.so` + `libgcc.so`,
 resolved on-device). Shipping toolchain *output* is the SDK's intended
 use, but the team should confirm once against the installed SDK's EULA
 text; if it ever restricts binary redistribution, fall back to building
@@ -37,7 +37,7 @@ vendoring them.
 - Build: llama.cpp `build_htp_skel(v73|v75|v79|v81)` CMake targets
   (`ggml/src/ggml-hexagon/CMakeLists.txt`), one `-DDSP_VERSION` per
   file. Requires `HEXAGON_SDK_ROOT` (proprietary Qualcomm toolchain;
-  headers/inlines only — the skels link no proprietary shared
+  headers/inlines only: the skels link no proprietary shared
   library; `NEEDED` is DSP-side `libc.so` + `libgcc.so`, resolved
   on-device).
 - SDK version used for these binaries: unknown (built before this
@@ -51,19 +51,20 @@ vendoring them.
 - v75: 893f2be5814f7e2e85742668cd482117
 - v79: 8ad4796cced0a610f6c6a5a13db8d8c5
 - v81: c49cc4767b4fc198f1d0b76297d2183b
+- v85: dd259c62aaf67660a1417cfd11104dee
 
 ## Rebuilding
 
 ```bash
 # in a llama.cpp checkout with HEXAGON_SDK_ROOT set (Linux):
 cmake -S . -B build-snapdragon -DGGML_HEXAGON=ON <android preset>
-cmake --build build-snapdragon --target ggml-htp-v73 ggml-htp-v75 ggml-htp-v79 ggml-htp-v81
+cmake --build build-snapdragon --target ggml-htp-v73 ggml-htp-v75 ggml-htp-v79 ggml-htp-v81 ggml-htp-v85
 # outputs: build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-vXX.so
 ```
 
 After replacing any skel: update the md5s above and re-run the full
 on-device determinism matrix (logits m=1..8 x5, greedy md5 2x2x6,
-256-token pair) — skel/host skew fails silently as wrong numerics.
+256-token pair): skel/host skew fails silently as wrong numerics.
 
 ## Coverage
 

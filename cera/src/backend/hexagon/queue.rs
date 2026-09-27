@@ -612,6 +612,9 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
         x if x == HtpOpCode::Concat as u32 => "Concat",
         x if x == HtpOpCode::Norm as u32 => "Norm",
         x if x == HtpOpCode::UnaryGelu as u32 => "UnaryGelu",
+        x if x == HtpOpCode::Clamp as u32 => "Clamp",
+        x if x == HtpOpCode::Conv1D as u32 => "Conv1D",
+        x if x == HtpOpCode::UnarySnake as u32 => "UnarySnake",
         _ => "unknown",
     }
 }
@@ -651,5 +654,15 @@ mod tests {
         // A future batch's response is a desync, never drained past.
         assert_eq!(stale_drain_action(11, 10, 7), Future);
         assert_eq!(stale_drain_action(u64::MAX, 10, 0), Future);
+    }
+
+    #[test]
+    fn test_htp_opcode_name() {
+        assert_eq!(htp_opcode_name(HtpOpCode::Mul as u32), "Mul");
+        assert_eq!(htp_opcode_name(HtpOpCode::Norm as u32), "Norm");
+        assert_eq!(htp_opcode_name(HtpOpCode::Clamp as u32), "Clamp");
+        assert_eq!(htp_opcode_name(HtpOpCode::Conv1D as u32), "Conv1D");
+        assert_eq!(htp_opcode_name(HtpOpCode::UnarySnake as u32), "UnarySnake");
+        assert_eq!(htp_opcode_name(9999), "unknown");
     }
 }

@@ -106,6 +106,17 @@ pub enum HtpOpCode {
     Norm = 49,
     Concat = 50,
     Clamp = 51,
+    LeakyRelu = 52,
+    Im2col = 53,
+    Fence = 54,
+    Allreduce = 55,
+    AllreduceAdd = 56,
+    GluSwigluClamp = 57,
+    MdevGroup = 58,
+    Roll = 59,
+    Argmax = 62,
+    Conv1D = 63,
+    UnarySnake = 64,
 
     Invalid = 0xFFFF_FFFF,
 }

@@ -19,11 +19,13 @@ pub fn embedded_skel(arch: HexagonArch) -> &'static [u8] {
         HexagonArch::V75 => include_bytes!("skels/libggml-htp-v75.so"),
         HexagonArch::V79 => include_bytes!("skels/libggml-htp-v79.so"),
         HexagonArch::V81 => include_bytes!("skels/libggml-htp-v81.so"),
+        HexagonArch::V85 => include_bytes!("skels/libggml-htp-v85.so"),
     }
 }
 
 /// All architectures we ship skels for, probe order (most common first).
-pub const PROBE_ARCHS: [HexagonArch; 4] = [
+pub const PROBE_ARCHS: [HexagonArch; 5] = [
+    HexagonArch::V85,
     HexagonArch::V79,
     HexagonArch::V75,
     HexagonArch::V73,
@@ -46,7 +48,7 @@ static SKEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// sound against foreign threads (JVM, loader) racing a `getenv` from
 /// inside this process.
 ///
-/// The two staging flows — this function and Kotlin `HexagonNpu.setup` —
+/// The two staging flows (this function and Kotlin `HexagonNpu.setup`)
 /// serialize internally (this side via `SKEL_ENV_LOCK`) but against
 /// *different* monitors, so they may compose only sequentially, on one
 /// thread, during single-threaded startup. Concurrent composition can
@@ -123,7 +125,7 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
 /// occurrence wins. This is the one merge contract both staging flows
 /// implement (Kotlin `HexagonNpu.mergeAdspPaths` mirrors it case for
 /// case, and the unit tests below mirror its truth table), so composing
-/// the flows in either order — sequentially — yields the same dir set.
+/// the flows in either order (sequentially) yields the same dir set.
 fn merge_adsp_paths(staged: &str, current: Option<&str>) -> String {
     let mut seen = std::collections::HashSet::<&str>::new();
     staged
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn install_is_idempotent_and_repairs_corruption() {
         // NOTE: process-global env assertion; safe only because no other
-        // test in this binary may write `ADSP_LIBRARY_PATH` — not even via
+        // test in this binary may write `ADSP_LIBRARY_PATH`, not even via
         // a restore guard's `Drop`, which would race these exact-merge
         // assertions just the same. Save/restore so the suite leaves no
         // trace either way.
@@ -289,7 +291,7 @@ mod tests {
     #[test]
     fn install_rejects_semicolon_dir() {
         // No restore guard here on purpose: the `;` rejection returns before
-        // any env write, so there is nothing to restore — and a guard's
+        // any env write, so there is nothing to restore, and a guard's
         // `Drop` would race the idempotent test's phased assertions above
         // (see its NOTE). A second env writer in this binary is forbidden.
         let err = install_skels(std::path::Path::new("/tmp/skel-test-;")).unwrap_err();

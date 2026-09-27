@@ -44,6 +44,27 @@ pub fn build_layer_norm_params(eps: f32) -> [i32; 16] {
     params
 }
 
+/// Host-computed parameters for 1D convolution (`Conv1D`).
+///
+/// Encodes stride, padding, dilation, and channel groups into `op.params[0..4]`.
+pub fn build_conv1d_params(stride: usize, pad: usize, dilation: usize, groups: usize) -> [i32; 16] {
+    let mut params = [0i32; 16];
+    params[0] = stride.max(1) as i32;
+    params[1] = pad as i32;
+    params[2] = dilation.max(1) as i32;
+    params[3] = groups.max(1) as i32;
+    params
+}
+
+/// Host-computed parameters for Snake activation (`UnarySnake`).
+///
+/// Encodes frequency parameter `alpha` (default 1.0) into `op.params[0]`.
+pub fn build_snake_params(alpha: f32) -> [i32; 16] {
+    let mut params = [0i32; 16];
+    params[0] = alpha.to_bits() as i32;
+    params
+}
+
 /// Host-computed kernel parameters for unary operations (RMS norm, activations).
 ///
 /// Mirrors `ggml_hexagon_precompute_unary_params` + `htp_unary_vtcm_layout_build`.
@@ -1444,5 +1465,36 @@ mod tests {
         for &val in &ln[1..] {
             assert_eq!(val, 0);
         }
+    }
+
+    #[test]
+    fn test_conv1d_params() {
+        let p = build_conv1d_params(2, 3, 1, 4);
+        assert_eq!(p[0], 2);
+        assert_eq!(p[1], 3);
+        assert_eq!(p[2], 1);
+        assert_eq!(p[3], 4);
+        for &val in &p[4..] {
+            assert_eq!(val, 0);
+        }
+
+        // Test clamping of zero stride, dilation, groups to 1
+        let p_clamped = build_conv1d_params(0, 0, 0, 0);
+        assert_eq!(p_clamped[0], 1);
+        assert_eq!(p_clamped[1], 0);
+        assert_eq!(p_clamped[2], 1);
+        assert_eq!(p_clamped[3], 1);
+    }
+
+    #[test]
+    fn test_snake_params() {
+        let p = build_snake_params(1.5);
+        assert_eq!(p[0], 1.5f32.to_bits() as i32);
+        for &val in &p[1..] {
+            assert_eq!(val, 0);
+        }
+
+        let p_default = build_snake_params(1.0);
+        assert_eq!(p_default[0], 1.0f32.to_bits() as i32);
     }
 }

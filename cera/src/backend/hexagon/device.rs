@@ -17,6 +17,7 @@ pub enum HexagonArch {
     V75, // Snapdragon 8 Gen 3
     V79, // Snapdragon 8 Elite
     V81, // Next-gen Snapdragon
+    V85, // Snapdragon 8 Elite Gen 6
 }
 
 impl HexagonArch {
@@ -26,6 +27,7 @@ impl HexagonArch {
             Self::V75 => "libggml-htp-v75.so",
             Self::V79 => "libggml-htp-v79.so",
             Self::V81 => "libggml-htp-v81.so",
+            Self::V85 => "libggml-htp-v85.so",
         }
     }
 
@@ -38,6 +40,7 @@ impl HexagonArch {
             Self::V75 => "V75",
             Self::V79 => "V79",
             Self::V81 => "V81",
+            Self::V85 => "V85",
         }
     }
 
@@ -47,6 +50,7 @@ impl HexagonArch {
             75 => Some(Self::V75),
             79 => Some(Self::V79),
             81 => Some(Self::V81),
+            85 => Some(Self::V85),
             _ => None,
         }
     }
@@ -273,15 +277,17 @@ mod tests {
                 HexagonArch::V75 => "V75",
                 HexagonArch::V79 => "V79",
                 HexagonArch::V81 => "V81",
+                HexagonArch::V85 => "V85",
             };
             assert_eq!(arch.short_name(), expected);
         }
-        assert_eq!(super::super::skels::PROBE_ARCHS.len(), 4);
+        assert_eq!(super::super::skels::PROBE_ARCHS.len(), 5);
         // Membership + order: order decides the winning DSP on multi-arch
         // devices and the install set, so a dup or reorder must fail loudly.
         assert_eq!(
             super::super::skels::PROBE_ARCHS,
             [
+                HexagonArch::V85,
                 HexagonArch::V79,
                 HexagonArch::V75,
                 HexagonArch::V73,
@@ -296,6 +302,7 @@ mod tests {
         assert_eq!(HexagonArch::from_u32(75), Some(HexagonArch::V75));
         assert_eq!(HexagonArch::from_u32(79), Some(HexagonArch::V79));
         assert_eq!(HexagonArch::from_u32(81), Some(HexagonArch::V81));
+        assert_eq!(HexagonArch::from_u32(85), Some(HexagonArch::V85));
         assert_eq!(HexagonArch::from_u32(0), None);
         assert_eq!(HexagonArch::from_u32(72), None);
         assert_eq!(HexagonArch::from_u32(74), None);

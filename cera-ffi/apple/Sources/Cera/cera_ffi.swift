@@ -7875,7 +7875,7 @@ public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> R
  */
 public struct HexagonProbeInfo: Equatable, Hashable {
     /**
-     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
      */
     public var arch: String
     public var threads: UInt32
@@ -7887,7 +7887,7 @@ public struct HexagonProbeInfo: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+         * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
          */arch: String, threads: UInt32, hvxUnits: UInt32, hmxUnits: UInt32, vtcmBytes: UInt64) {
         self.arch = arch
         self.threads = threads

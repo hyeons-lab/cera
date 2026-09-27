@@ -408,7 +408,7 @@ impl From<cera::BackendPreference> for BackendPreference {
 /// hardware capabilities. See [`hexagon_probe`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct HexagonProbeInfo {
-    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
     pub arch: String,
     pub threads: u32,
     pub hvx_units: u32,
@@ -4262,6 +4262,7 @@ mod tests {
             (HexagonArch::V75, "V75"),
             (HexagonArch::V79, "V79"),
             (HexagonArch::V81, "V81"),
+            (HexagonArch::V85, "V85"),
         ] {
             let info = probe_info_from(&HexagonProbe {
                 arch,

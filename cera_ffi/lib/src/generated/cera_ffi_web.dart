@@ -1066,7 +1066,7 @@ class GenerateSummary {
 /// hardware capabilities. See [`hexagon_probe`].
 class HexagonProbeInfo {
   const HexagonProbeInfo({
-    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
     required this.arch,
     required this.threads,
     required this.hvxUnits,
@@ -1074,7 +1074,7 @@ class HexagonProbeInfo {
     required this.vtcmBytes,
   });
 
-  /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`).
+  /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
   final String arch;
   final int threads;
   final int hvxUnits;
