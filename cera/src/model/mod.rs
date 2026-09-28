@@ -1210,6 +1210,47 @@ pub mod vision_encoder;
 pub mod vision_encoder_gpu;
 #[cfg(feature = "vl-preprocess")]
 pub mod vision_preprocessor;
+#[cfg(feature = "vl-preprocess")]
+pub use vision_preprocessor::{
+    PreprocessedImage, calc_size_preserved_ratio, normalize_rgb8_to_nchw_f32, preprocess_image,
+    preprocess_image_with_opts, preprocess_raw_pixels, resize_bilinear_rgb,
+};
+
+/// Supported pixel layouts for uncompressed raw image buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+    Rgb8,
+    /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+    Rgba8,
+    /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+    Bgr8,
+    /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+    Bgra8,
+}
+
+impl PixelFormat {
+    /// Bytes per pixel for this format.
+    #[inline]
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgb8 | Self::Bgr8 => 3,
+            Self::Rgba8 | Self::Bgra8 => 4,
+        }
+    }
+
+    /// Zero-based byte offsets for (Red, Green, Blue) channels.
+    #[inline]
+    pub const fn channel_offsets(self) -> (usize, usize, usize) {
+        match self {
+            Self::Rgb8 => (0, 1, 2),
+            Self::Rgba8 => (0, 1, 2),
+            Self::Bgr8 => (2, 1, 0),
+            Self::Bgra8 => (2, 1, 0),
+        }
+    }
+}
+
 pub mod weights;
 
 // Compile-time proof that `Arc<dyn Model>` is `Send + Sync`. If a new

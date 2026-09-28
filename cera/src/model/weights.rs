@@ -271,6 +271,57 @@ impl MmapWeight {
             return;
         }
 
+        #[cfg(feature = "parallel")]
+        {
+            let num_threads = crate::par::current_num_threads();
+            let min_chunk = 16;
+            if num_threads > 1 && n_tokens >= min_chunk {
+                use rayon::prelude::*;
+                let chunk_tokens = (n_tokens / num_threads).max(min_chunk);
+                let chunk_y_size = chunk_tokens * self.rows;
+
+                if self.dtype == DType::F32
+                    && let Some(w_f32) = self.try_as_f32()
+                {
+                    y.par_chunks_mut(chunk_y_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, y_chunk)| {
+                            let t_start = chunk_idx * chunk_tokens;
+                            let chunk_len = y_chunk.len() / self.rows;
+                            let x_chunk =
+                                &x[t_start * self.cols..(t_start + chunk_len) * self.cols];
+                            for r in 0..self.rows {
+                                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                                for t in 0..chunk_len {
+                                    let x_row = &x_chunk[t * self.cols..(t + 1) * self.cols];
+                                    y_chunk[t * self.rows + r] =
+                                        crate::backend::cpu::dot_f32(x_row, w_row);
+                                }
+                            }
+                        });
+                    return;
+                }
+
+                y.par_chunks_mut(chunk_y_size).enumerate().for_each_init(
+                    || vec![0.0f32; self.cols],
+                    |row_buf, (chunk_idx, y_chunk)| {
+                        let t_start = chunk_idx * chunk_tokens;
+                        let chunk_len = y_chunk.len() / self.rows;
+                        let x_chunk = &x[t_start * self.cols..(t_start + chunk_len) * self.cols];
+                        for r in 0..self.rows {
+                            self.dequantize_row(r, row_buf);
+                            for t in 0..chunk_len {
+                                let x_row = &x_chunk[t * self.cols..(t + 1) * self.cols];
+                                y_chunk[t * self.rows + r] =
+                                    crate::backend::cpu::dot_f32(x_row, row_buf);
+                            }
+                        }
+                    },
+                );
+                return;
+            }
+        }
+
         // Fast path if already contiguous and properly aligned F32
         if self.dtype == DType::F32
             && let Some(w_f32) = self.try_as_f32()

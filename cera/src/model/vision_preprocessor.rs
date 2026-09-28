@@ -50,6 +50,8 @@ pub struct PreprocessedImage {
     pub grid_h: usize,
 }
 
+pub use crate::model::PixelFormat;
+
 /// Pick the smallest aspect-preserving resize of `(width, height)`
 /// that lands within `[min_pixels, max_pixels]` and is divisible by
 /// `align_size` on both axes. Mirrors llama.cpp's
@@ -223,50 +225,407 @@ pub fn preprocess_image_with_opts(
     debug_assert_eq!(target_w % cfg.patch_size, 0);
     debug_assert_eq!(target_h % cfg.patch_size, 0);
 
-    // Bilinear (Triangle) resize — matches llama.cpp's
-    // `RESIZE_ALGO_BILINEAR` for `PROJECTOR_TYPE_LFM2`. Resize the
-    // `DynamicImage` (in its native pixel format) before converting
-    // to RGB — a 4096×4096 RGBA8 input would otherwise allocate a
-    // ~50 MB intermediate `to_rgb8` buffer just to throw it away on
-    // resize. Resizing first means we only `into_rgb8` the
-    // post-resize buffer, which is bounded by `image_max_pixels`.
-    let rgb = if img.width() == target_w as u32 && img.height() == target_h as u32 {
-        img.into_rgb8()
-    } else {
-        img.resize_exact(
-            target_w as u32,
-            target_h as u32,
-            image::imageops::FilterType::Triangle,
-        )
-        .into_rgb8()
-    };
-
-    // Normalize: NCHW f32, `(rgb / 255 - mean) / std` per channel.
-    let h = rgb.height() as usize;
-    let w = rgb.width() as usize;
-    debug_assert_eq!(h, target_h);
-    debug_assert_eq!(w, target_w);
-    let mut pixels = vec![0f32; 3 * h * w];
-    let raw = rgb.as_raw(); // [h * w * 3] u8 in row-major HWC
-    for c in 0..3 {
-        let mean = cfg.image_mean[c];
-        let std_inv = 1.0 / cfg.image_std[c];
-        for y in 0..h {
-            for x in 0..w {
-                let src = (y * w + x) * 3 + c;
-                let dst = c * h * w + y * w + x;
-                let pixel = raw[src] as f32 / 255.0;
-                pixels[dst] = (pixel - mean) * std_inv;
+    // Fast path: use resize_bilinear_rgb directly from decoded DynamicImage
+    // instead of allocating an intermediate full-resolution RGB image.
+    let rgb_bytes = match img {
+        image::DynamicImage::ImageRgb8(rgb) => {
+            if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
+                rgb.into_raw()
+            } else {
+                resize_bilinear_rgb(
+                    rgb.as_raw(),
+                    rgb.width() as usize,
+                    rgb.height() as usize,
+                    PixelFormat::Rgb8,
+                    target_w,
+                    target_h,
+                )?
             }
         }
-    }
+        image::DynamicImage::ImageRgba8(rgba) => resize_bilinear_rgb(
+            rgba.as_raw(),
+            rgba.width() as usize,
+            rgba.height() as usize,
+            PixelFormat::Rgba8,
+            target_w,
+            target_h,
+        )?,
+        other => {
+            let rgb = other.into_rgb8();
+            if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
+                rgb.into_raw()
+            } else {
+                resize_bilinear_rgb(
+                    rgb.as_raw(),
+                    rgb.width() as usize,
+                    rgb.height() as usize,
+                    PixelFormat::Rgb8,
+                    target_w,
+                    target_h,
+                )?
+            }
+        }
+    };
+
+    let pixels = normalize_rgb8_to_nchw_f32(
+        &rgb_bytes,
+        target_w,
+        target_h,
+        &cfg.image_mean,
+        &cfg.image_std,
+    );
+
     Ok(PreprocessedImage {
         pixels,
-        target_w: w,
-        target_h: h,
-        grid_w: w / cfg.patch_size,
-        grid_h: h / cfg.patch_size,
+        target_w,
+        target_h,
+        grid_w: target_w / cfg.patch_size,
+        grid_h: target_h / cfg.patch_size,
     })
+}
+
+/// Preprocess an uncompressed raw pixel buffer (e.g. from an Android Bitmap
+/// or camera frame) into a [`PreprocessedImage`] ready for vision encoding.
+///
+/// Bypasses all image decompression overhead and applies fast bilinear
+/// resampling and SIMD/parallel NCHW normalization.
+pub fn preprocess_raw_pixels(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedImage, CeraError> {
+    if pixels.is_empty() || width == 0 || height == 0 {
+        return Err(CeraError::EmptyInput);
+    }
+
+    let bpp = format.bytes_per_pixel();
+    let min_src_len = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(bpp))
+        .ok_or_else(|| CeraError::Backend("image dimensions overflow usize".into()))?;
+    if pixels.len() < min_src_len {
+        return Err(CeraError::Backend(format!(
+            "preprocess_raw_pixels: buffer length {} is smaller than required {} ({}x{} @ {} bpp)",
+            pixels.len(),
+            min_src_len,
+            width,
+            height,
+            bpp,
+        )));
+    }
+
+    let align = cfg.patch_size * cfg.scale_factor;
+    let (mut target_w, mut target_h) = calc_size_preserved_ratio(
+        width,
+        height,
+        align,
+        cfg.image_min_pixels,
+        cfg.image_max_pixels,
+    );
+
+    if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
+        let long = target_w.max(target_h);
+        if long > cap {
+            let beta = cap as f64 / long as f64;
+            let floor_align = |x: f64| align.max(((x / align as f64).floor() as usize) * align);
+            target_w = floor_align(target_w as f64 * beta);
+            target_h = floor_align(target_h as f64 * beta);
+        }
+    }
+
+    debug_assert_eq!(target_w % cfg.patch_size, 0);
+    debug_assert_eq!(target_h % cfg.patch_size, 0);
+
+    let rgb_bytes = if width == target_w && height == target_h && format == PixelFormat::Rgb8 {
+        pixels[..3 * target_w * target_h].to_vec()
+    } else {
+        resize_bilinear_rgb(pixels, width, height, format, target_w, target_h)?
+    };
+
+    let norm_pixels = normalize_rgb8_to_nchw_f32(
+        &rgb_bytes,
+        target_w,
+        target_h,
+        &cfg.image_mean,
+        &cfg.image_std,
+    );
+
+    Ok(PreprocessedImage {
+        pixels: norm_pixels,
+        target_w,
+        target_h,
+        grid_w: target_w / cfg.patch_size,
+        grid_h: target_h / cfg.patch_size,
+    })
+}
+
+/// Resample an uncompressed pixel buffer in any supported [`PixelFormat`]
+/// to an interleaved 24-bit RGB8 buffer of dimensions `target_w x target_h`
+/// using bilinear interpolation.
+///
+/// Precomputes horizontal sample coordinates and interpolation weights once,
+/// and parallelizes row-wise across available threads when the `parallel`
+/// feature is enabled.
+pub fn resize_bilinear_rgb(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    format: PixelFormat,
+    target_w: usize,
+    target_h: usize,
+) -> Result<Vec<u8>, CeraError> {
+    if src_w == 0 || src_h == 0 || target_w == 0 || target_h == 0 {
+        return Err(CeraError::EmptyInput);
+    }
+    let bpp = format.bytes_per_pixel();
+    let min_src_len = src_w
+        .checked_mul(src_h)
+        .and_then(|px| px.checked_mul(bpp))
+        .ok_or_else(|| CeraError::Backend("image dimensions overflow usize".into()))?;
+    if src.len() < min_src_len {
+        return Err(CeraError::Backend(format!(
+            "resize_bilinear_rgb: source buffer length {} is smaller than required {} ({}x{} @ {} bpp)",
+            src.len(),
+            min_src_len,
+            src_w,
+            src_h,
+            bpp,
+        )));
+    }
+
+    if src_w == target_w && src_h == target_h {
+        if format == PixelFormat::Rgb8 {
+            return Ok(src[..min_src_len].to_vec());
+        }
+        let (r_off, g_off, b_off) = format.channel_offsets();
+        let mut dst = vec![0u8; target_w * target_h * 3];
+        for i in 0..target_w * target_h {
+            let s = &src[i * bpp..];
+            dst[i * 3] = s[r_off];
+            dst[i * 3 + 1] = s[g_off];
+            dst[i * 3 + 2] = s[b_off];
+        }
+        return Ok(dst);
+    }
+
+    let (r_off, g_off, b_off) = format.channel_offsets();
+    let src_stride = src_w * bpp;
+    let dst_stride = target_w * 3;
+    let total_dst = target_h
+        .checked_mul(dst_stride)
+        .ok_or_else(|| CeraError::Backend("target buffer size overflow usize".into()))?;
+    let mut dst = vec![0u8; total_dst];
+
+    let x_scale = src_w as f32 / target_w as f32;
+    let max_x = (src_w - 1) as f32;
+    let x_table: Vec<(usize, usize, f32, f32)> = (0..target_w)
+        .map(|dx| {
+            let sx = ((dx as f32 + 0.5) * x_scale - 0.5).clamp(0.0, max_x);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let wx1 = sx - x0 as f32;
+            let wx0 = 1.0 - wx1;
+            (x0, x1, wx0, wx1)
+        })
+        .collect();
+
+    let y_scale = src_h as f32 / target_h as f32;
+    let max_y = (src_h - 1) as f32;
+
+    let sample_row = |dy: usize, row_dst: &mut [u8]| {
+        let sy = ((dy as f32 + 0.5) * y_scale - 0.5).clamp(0.0, max_y);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let wy1 = sy - y0 as f32;
+        let wy0 = 1.0 - wy1;
+
+        let row0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
+        let row1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
+
+        for (dx, &(x0, x1, wx0, wx1)) in x_table.iter().enumerate() {
+            let p00 = &row0[x0 * bpp..];
+            let p01 = &row0[x1 * bpp..];
+            let p10 = &row1[x0 * bpp..];
+            let p11 = &row1[x1 * bpp..];
+
+            let p00_r = p00[r_off] as f32;
+            let p00_g = p00[g_off] as f32;
+            let p00_b = p00[b_off] as f32;
+
+            let p01_r = p01[r_off] as f32;
+            let p01_g = p01[g_off] as f32;
+            let p01_b = p01[b_off] as f32;
+
+            let p10_r = p10[r_off] as f32;
+            let p10_g = p10[g_off] as f32;
+            let p10_b = p10[b_off] as f32;
+
+            let p11_r = p11[r_off] as f32;
+            let p11_g = p11[g_off] as f32;
+            let p11_b = p11[b_off] as f32;
+
+            let top_r = wx0 * p00_r + wx1 * p01_r;
+            let bot_r = wx0 * p10_r + wx1 * p11_r;
+            let top_g = wx0 * p00_g + wx1 * p01_g;
+            let bot_g = wx0 * p10_g + wx1 * p11_g;
+            let top_b = wx0 * p00_b + wx1 * p01_b;
+            let bot_b = wx0 * p10_b + wx1 * p11_b;
+
+            let out_idx = dx * 3;
+            row_dst[out_idx] = (wy0 * top_r + wy1 * bot_r + 0.5).clamp(0.0, 255.0) as u8;
+            row_dst[out_idx + 1] = (wy0 * top_g + wy1 * bot_g + 0.5).clamp(0.0, 255.0) as u8;
+            row_dst[out_idx + 2] = (wy0 * top_b + wy1 * bot_b + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(dst_stride)
+            .enumerate()
+            .for_each(|(dy, row_dst)| {
+                sample_row(dy, row_dst);
+            });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (dy, row_dst) in dst.chunks_mut(dst_stride).enumerate() {
+            sample_row(dy, row_dst);
+        }
+    }
+
+    Ok(dst)
+}
+
+/// Normalize an interleaved RGB8 buffer into a planar NCHW f32 tensor.
+///
+/// Output layout: `[3 x height x width]`, where:
+/// - Channel 0 (R): `0 .. width * height`
+/// - Channel 1 (G): `width * height .. 2 * width * height`
+/// - Channel 2 (B): `2 * width * height .. 3 * width * height`
+///
+/// Uses NEON SIMD vectorization on aarch64 targets with fallback to
+/// auto-vectorized loops, and parallelizes across worker threads when
+/// `parallel` feature is active.
+pub fn normalize_rgb8_to_nchw_f32(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    mean: &[f32; 3],
+    std: &[f32; 3],
+) -> Vec<f32> {
+    let n_pixels = width * height;
+    let mut out = vec![0f32; 3 * n_pixels];
+    let (r_plane, rest) = out.split_at_mut(n_pixels);
+    let (g_plane, b_plane) = rest.split_at_mut(n_pixels);
+
+    let scale_r = 1.0 / (255.0 * std[0]);
+    let bias_r = -mean[0] / std[0];
+    let scale_g = 1.0 / (255.0 * std[1]);
+    let bias_g = -mean[1] / std[1];
+    let scale_b = 1.0 / (255.0 * std[2]);
+    let bias_b = -mean[2] / std[2];
+
+    let process_chunk =
+        |raw_chunk: &[u8], out_r: &mut [f32], out_g: &mut [f32], out_b: &mut [f32]| {
+            let chunk_len = out_r.len();
+            debug_assert_eq!(raw_chunk.len(), chunk_len * 3);
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let vscale_r = vdupq_n_f32(scale_r);
+                let vbias_r = vdupq_n_f32(bias_r);
+                let vscale_g = vdupq_n_f32(scale_g);
+                let vbias_g = vdupq_n_f32(bias_g);
+                let vscale_b = vdupq_n_f32(scale_b);
+                let vbias_b = vdupq_n_f32(bias_b);
+
+                let mut i = 0;
+                while i + 16 <= chunk_len {
+                    let ptr = raw_chunk.as_ptr().add(i * 3);
+                    let loaded = vld3q_u8(ptr);
+
+                    let process_16 = |u8_vec: uint8x16_t,
+                                      scale: float32x4_t,
+                                      bias: float32x4_t,
+                                      out_ptr: *mut f32| {
+                        let u16_low = vmovl_u8(vget_low_u8(u8_vec));
+                        let u32_0 = vmovl_u16(vget_low_u16(u16_low));
+                        let u32_1 = vmovl_u16(vget_high_u16(u16_low));
+                        let f0 = vmlaq_f32(bias, vcvtq_f32_u32(u32_0), scale);
+                        let f1 = vmlaq_f32(bias, vcvtq_f32_u32(u32_1), scale);
+                        vst1q_f32(out_ptr, f0);
+                        vst1q_f32(out_ptr.add(4), f1);
+
+                        let u16_high = vmovl_u8(vget_high_u8(u8_vec));
+                        let u32_2 = vmovl_u16(vget_low_u16(u16_high));
+                        let u32_3 = vmovl_u16(vget_high_u16(u16_high));
+                        let f2 = vmlaq_f32(bias, vcvtq_f32_u32(u32_2), scale);
+                        let f3 = vmlaq_f32(bias, vcvtq_f32_u32(u32_3), scale);
+                        vst1q_f32(out_ptr.add(8), f2);
+                        vst1q_f32(out_ptr.add(12), f3);
+                    };
+
+                    process_16(loaded.0, vscale_r, vbias_r, out_r.as_mut_ptr().add(i));
+                    process_16(loaded.1, vscale_g, vbias_g, out_g.as_mut_ptr().add(i));
+                    process_16(loaded.2, vscale_b, vbias_b, out_b.as_mut_ptr().add(i));
+
+                    i += 16;
+                }
+
+                while i < chunk_len {
+                    let src_idx = i * 3;
+                    let r = raw_chunk[src_idx] as f32;
+                    let g = raw_chunk[src_idx + 1] as f32;
+                    let b = raw_chunk[src_idx + 2] as f32;
+                    out_r[i] = r * scale_r + bias_r;
+                    out_g[i] = g * scale_g + bias_g;
+                    out_b[i] = b * scale_b + bias_b;
+                    i += 1;
+                }
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for i in 0..chunk_len {
+                    let src_idx = i * 3;
+                    let r = raw_chunk[src_idx] as f32;
+                    let g = raw_chunk[src_idx + 1] as f32;
+                    let b = raw_chunk[src_idx + 2] as f32;
+                    out_r[i] = r * scale_r + bias_r;
+                    out_g[i] = g * scale_g + bias_g;
+                    out_b[i] = b * scale_b + bias_b;
+                }
+            }
+        };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let num_threads = crate::par::current_num_threads();
+        let chunk_size = ((n_pixels / num_threads).max(1024) / 16) * 16;
+        if num_threads > 1 && n_pixels >= 4096 && chunk_size > 0 {
+            r_plane
+                .par_chunks_mut(chunk_size)
+                .zip(g_plane.par_chunks_mut(chunk_size))
+                .zip(b_plane.par_chunks_mut(chunk_size))
+                .enumerate()
+                .for_each(|(chunk_idx, ((chunk_r, chunk_g), chunk_b))| {
+                    let pixel_start = chunk_idx * chunk_size;
+                    let chunk_len = chunk_r.len();
+                    let raw_chunk = &rgb[pixel_start * 3..(pixel_start + chunk_len) * 3];
+                    process_chunk(raw_chunk, chunk_r, chunk_g, chunk_b);
+                });
+            return out;
+        }
+    }
+
+    process_chunk(rgb, r_plane, g_plane, b_plane);
+    out
 }
 
 #[cfg(test)]
@@ -525,5 +884,100 @@ mod tests {
         let n = 4 * 4;
         let r_avg = pre.pixels[0..n].iter().sum::<f32>() / (n as f32);
         assert!((r_avg - 2.5).abs() < 0.1, "R channel mean: {r_avg}");
+    }
+
+    #[test]
+    fn test_resize_bilinear_rgb_all_formats() {
+        let (w, h) = (8, 8);
+        let (tw, th) = (4, 4);
+        let (r, g, b) = (200u8, 100u8, 50u8);
+
+        let rgb_data: Vec<u8> = (0..w * h).flat_map(|_| [r, g, b]).collect();
+        let rgba_data: Vec<u8> = (0..w * h).flat_map(|_| [r, g, b, 255]).collect();
+        let bgr_data: Vec<u8> = (0..w * h).flat_map(|_| [b, g, r]).collect();
+        let bgra_data: Vec<u8> = (0..w * h).flat_map(|_| [b, g, r, 255]).collect();
+
+        for (fmt, data) in [
+            (PixelFormat::Rgb8, &rgb_data),
+            (PixelFormat::Rgba8, &rgba_data),
+            (PixelFormat::Bgr8, &bgr_data),
+            (PixelFormat::Bgra8, &bgra_data),
+        ] {
+            let out = resize_bilinear_rgb(data, w, h, fmt, tw, th).expect("resize");
+            assert_eq!(out.len(), tw * th * 3);
+            for px in out.chunks_exact(3) {
+                assert_eq!(px, [r, g, b], "format {fmt:?} channel mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_rgb8_to_nchw_f32_parity() {
+        let (w, h) = (64, 64);
+        let n_pixels = w * h;
+        let mean = [0.485f32, 0.456, 0.406];
+        let std = [0.229f32, 0.224, 0.225];
+
+        let mut raw = Vec::with_capacity(n_pixels * 3);
+        for i in 0..n_pixels {
+            raw.push((i % 256) as u8);
+            raw.push(((i * 7) % 256) as u8);
+            raw.push(((i * 13) % 256) as u8);
+        }
+
+        let out = normalize_rgb8_to_nchw_f32(&raw, w, h, &mean, &std);
+        assert_eq!(out.len(), 3 * n_pixels);
+
+        for c in 0..3 {
+            let m = mean[c];
+            let s = std[c];
+            let plane = &out[c * n_pixels..(c + 1) * n_pixels];
+            for i in 0..n_pixels {
+                let pixel_byte = raw[i * 3 + c];
+                let expected = (pixel_byte as f32 / 255.0 - m) / s;
+                let actual = plane[i];
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "channel {c} pixel {i}: actual {actual} vs expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_preprocess_raw_pixels_solid_color() {
+        let cfg = synth_cfg();
+        let (w, h) = (8, 8);
+        let rgba_data: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 0, 0, 255]).collect();
+        let pre = preprocess_raw_pixels(&rgba_data, w, h, PixelFormat::Rgba8, &cfg, None)
+            .expect("preprocess raw");
+        assert_eq!(pre.target_w, 4);
+        assert_eq!(pre.target_h, 4);
+        assert_eq!(pre.grid_w, 2);
+        assert_eq!(pre.grid_h, 2);
+
+        let n = 4 * 4;
+        for &v in &pre.pixels[0..n] {
+            assert!((v - 2.5).abs() < 1e-5, "R channel: {v}");
+        }
+        for &v in &pre.pixels[n..2 * n] {
+            assert!((v - (-1.6)).abs() < 1e-5, "G channel: {v}");
+        }
+        for &v in &pre.pixels[2 * n..3 * n] {
+            assert!((v - (-0.6)).abs() < 1e-5, "B channel: {v}");
+        }
+    }
+
+    #[test]
+    fn test_preprocess_raw_pixels_validation() {
+        let cfg = synth_cfg();
+        assert!(matches!(
+            preprocess_raw_pixels(&[], 4, 4, PixelFormat::Rgb8, &cfg, None),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            preprocess_raw_pixels(&[0u8; 10], 4, 4, PixelFormat::Rgb8, &cfg, None),
+            Err(CeraError::Backend(_))
+        ));
     }
 }

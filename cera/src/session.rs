@@ -1089,6 +1089,11 @@ impl Session {
         self.image_max_long_size = max_long_size;
     }
 
+    /// Current longest-side pixel cap configured on this session, if any.
+    pub fn image_max_long_size(&self) -> Option<u32> {
+        self.image_max_long_size
+    }
+
     /// What this session accepts as input / emits as output. Derived
     /// from the model's `inference_type` at construction — see
     /// [`ModalityCapabilities::from_inference_type`] for the mapping.
@@ -2138,21 +2143,6 @@ impl Session {
     /// Like [`Self::append_image`], but with an explicit per-call cap
     /// (`max_long_size`) on the longest side of the **encoded** image,
     /// overriding the session default ([`Self::set_image_max_long_size`]).
-    ///
-    /// When `Some(n)`, the resize target is shrunk (aspect-preserving,
-    /// re-aligned) so its longer side is at most `n` pixels — a
-    /// caller-controlled quality/cost knob (smaller = fewer image
-    /// tokens, faster, less detail). Each dimension is floored at one
-    /// aligned patch block (`patch_size · scale_factor`), so a very
-    /// small `n` rounds the encoded long side up to that minimum rather
-    /// than below it. The cap only ever *shrinks* the target (it never
-    /// upscales) and **takes precedence over the model's
-    /// `image_min_pixels` floor** — passing a small `n` is an explicit
-    /// request to trade detail for cost, down to one aligned patch
-    /// block. `None` (or `0`) applies no cap. See
-    /// [`crate::model::vision_preprocessor::preprocess_image_with_opts`].
-    ///
-    /// Errors are identical to [`Self::append_image`].
     #[cfg(feature = "vl-preprocess")]
     pub fn append_image_with_opts(
         &mut self,
@@ -2160,41 +2150,133 @@ impl Session {
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
-        // No empty-bytes check here: an empty input is caught by
-        // `preprocess_image_with_opts` below (which returns
-        // `EmptyInput`), so a third copy of the guard would be
-        // redundant. The capability/encoder checks run first so a
-        // non-VL session still reports `UnsupportedModality`.
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
-        let Some(encoder) = self.vision_encoder.as_ref() else {
-            return Err(CeraError::Backend(
-                "Session::append_image: no vision encoder attached. \
-                 Construct via CeraEngine on a VL bundle so the \
-                 encoder is auto-attached, or call \
-                 attach_vision_encoder(...) in test setup."
-                    .into(),
-            ));
+        let encoder = {
+            let Some(encoder) = self.vision_encoder.as_ref() else {
+                return Err(CeraError::Backend(
+                    "Session::append_image: no vision encoder attached. \
+                     Construct via CeraEngine on a VL bundle so the \
+                     encoder is auto-attached, or call \
+                     attach_vision_encoder(...) in test setup."
+                        .into(),
+                ));
+            };
+            let llm_hidden = self.model.config().hidden_size;
+            let proj_dim = encoder.config.projection_dim;
+            if proj_dim != llm_hidden {
+                return Err(CeraError::Backend(format!(
+                    "Session::append_image: vision encoder's projection_dim \
+                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
+                     The mmproj must pair with the LLM it was trained against."
+                )));
+            }
+            std::sync::Arc::clone(encoder)
         };
-        let llm_hidden = self.model.config().hidden_size;
-        let proj_dim = encoder.config.projection_dim;
-        if proj_dim != llm_hidden {
-            return Err(CeraError::Backend(format!(
-                "Session::append_image: vision encoder's projection_dim \
-                 ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
-                 The mmproj must pair with the LLM it was trained against."
-            )));
-        }
         let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
             bytes,
             &encoder.config,
             max_long_size,
         )?;
-        // Prefer the cached GPU encoder when one is attached and the patch
-        // grid fits the GPU attention kernel's capacity; otherwise (or for
-        // oversized grids) use the CPU encoder. The output is identical in
-        // shape and numerically equivalent either way.
+        self.encode_and_append_preprocessed_image(&pre, &encoder)
+    }
+
+    /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_image_with_opts(
+        &mut self,
+        _bytes: &[u8],
+        _max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        Err(CeraError::UnsupportedModality)
+    }
+
+    /// Append an uncompressed raw image to the conversation context.
+    ///
+    /// `pixels` is an uncompressed pixel buffer in the given [`crate::model::PixelFormat`].
+    /// Automatically applies aspect-preserving resizing and normalization,
+    /// then encodes with the vision encoder and appends image tokens.
+    pub fn append_raw_image(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        format: crate::model::PixelFormat,
+    ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        self.append_raw_image_with_opts(pixels, width, height, format, self.image_max_long_size)
+    }
+
+    /// Like [`Self::append_raw_image`], but with an explicit per-call cap
+    /// (`max_long_size`) on the longest side of the encoded image.
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_raw_image_with_opts(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        format: crate::model::PixelFormat,
+        max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        if !self.capabilities.image_in {
+            return Err(CeraError::UnsupportedModality);
+        }
+        let encoder = {
+            let Some(encoder) = self.vision_encoder.as_ref() else {
+                return Err(CeraError::Backend(
+                    "Session::append_raw_image: no vision encoder attached. \
+                     Construct via CeraEngine on a VL bundle so the \
+                     encoder is auto-attached, or call \
+                     attach_vision_encoder(...) in test setup."
+                        .into(),
+                ));
+            };
+            let llm_hidden = self.model.config().hidden_size;
+            let proj_dim = encoder.config.projection_dim;
+            if proj_dim != llm_hidden {
+                return Err(CeraError::Backend(format!(
+                    "Session::append_raw_image: vision encoder's projection_dim \
+                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
+                     The mmproj must pair with the LLM it was trained against."
+                )));
+            }
+            std::sync::Arc::clone(encoder)
+        };
+        let pre = crate::model::vision_preprocessor::preprocess_raw_pixels(
+            pixels,
+            width as usize,
+            height as usize,
+            format,
+            &encoder.config,
+            max_long_size,
+        )?;
+        self.encode_and_append_preprocessed_image(&pre, &encoder)
+    }
+
+    /// Stub `append_raw_image_with_opts` for builds without `vl-preprocess`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_raw_image_with_opts(
+        &mut self,
+        _pixels: &[u8],
+        _width: u32,
+        _height: u32,
+        _format: crate::model::PixelFormat,
+        _max_long_size: Option<u32>,
+    ) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        Err(CeraError::UnsupportedModality)
+    }
+
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_and_append_preprocessed_image(
+        &mut self,
+        pre: &crate::model::vision_preprocessor::PreprocessedImage,
+        encoder: &crate::model::vision_encoder::VisionEncoderWeights,
+    ) -> Result<(), CeraError> {
+        let proj_dim = encoder.config.projection_dim;
         let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
         let gpu = self
             .gpu_vision_encoder
@@ -2203,10 +2285,6 @@ impl Session {
         let img_tokens = if let Some(gpu) = gpu {
             match gpu.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
                 Ok(tokens) => tokens,
-                // A GPU runtime failure (device lost, OOM, command-buffer
-                // error) must not abort the append: the CPU encoder is always
-                // attached as the documented fallback and produces numerically
-                // equivalent output. Degrade to it instead of failing.
                 Err(e) => {
                     tracing::warn!("gpu vision encode failed ({e:#}); falling back to CPU encoder");
                     encoder
@@ -2219,14 +2297,11 @@ impl Session {
                 .encode_image(&pre.pixels, pre.grid_w, pre.grid_h)
                 .map_err(|e| CeraError::Backend(format!("encode_image: {e:#}")))?
         };
-        // Sanity-check the encoder output shape before handing off
-        // to `append_embeddings`. Integer division below would
-        // silently truncate a non-multiple length and surface as a
-        // less actionable mismatch error from `append_embeddings`.
+
         if img_tokens.len() % proj_dim != 0 {
             return Err(CeraError::Backend(format!(
-                "Session::append_image: encode_image returned {} f32s, \
-                 not a multiple of projection_dim ({proj_dim}) — encoder \
+                "Session::encode_image returned {} f32s, \
+                 not a multiple of projection_dim ({proj_dim}) - encoder \
                  produced a malformed image-token tensor",
                 img_tokens.len(),
             )));
@@ -2234,27 +2309,12 @@ impl Session {
         let n_tokens = img_tokens.len() / proj_dim;
         if n_tokens == 0 {
             return Err(CeraError::Backend(
-                "Session::append_image: encoder produced zero image tokens \
+                "Session::encode_image: encoder produced zero image tokens \
                  (preprocess + encode succeeded but yielded an empty tensor)"
                     .into(),
             ));
         }
         self.append_embeddings(&img_tokens, n_tokens)
-    }
-
-    /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
-    /// Same signature as the real method so conditionally-compiled
-    /// callers (FFI / wasm) still type-check; always returns
-    /// `UnsupportedModality`. (`append_image` delegates here, so it
-    /// needs no separate stub.)
-    #[cfg(not(feature = "vl-preprocess"))]
-    pub fn append_image_with_opts(
-        &mut self,
-        _bytes: &[u8],
-        _max_long_size: Option<u32>,
-    ) -> Result<(), CeraError> {
-        self.ensure_usable()?;
-        Err(CeraError::UnsupportedModality)
     }
 
     /// Append a multimodal chat conversation in one call: render the

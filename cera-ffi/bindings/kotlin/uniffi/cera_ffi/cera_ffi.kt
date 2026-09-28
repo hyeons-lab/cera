@@ -998,6 +998,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_append_image(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_append_raw_image(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_append_text(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_append_tokens(): Int
@@ -1037,6 +1039,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_image_max_long_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_import_checkpoint(): Int
 
@@ -1114,6 +1118,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
@@ -1137,6 +1143,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(): Int
 
@@ -1806,6 +1814,16 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_append_raw_image(
+        `ptr`: Long,
+        `pixels`: RustBuffer.ByValue,
+        `width`: Int,
+        `height`: Int,
+        `format`: RustBuffer.ByValue,
+        `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_append_text(
         `ptr`: Long,
         `text`: RustBuffer.ByValue,
@@ -1919,6 +1937,11 @@ internal object UniffiLib {
         `ptr`: Long,
         `tokens`: RustBuffer.ByValue,
         `adapters`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_image_max_long_size(
+        `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -2179,6 +2202,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
         `ptr`: Long,
         `data`: RustBuffer.ByValue,
@@ -2244,6 +2272,12 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
         `ptr`: Long,
         `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+        `ptr`: Long,
+        `maxLongSize`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -2856,6 +2890,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2916,6 +2953,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2946,7 +2986,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
@@ -3030,6 +3070,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3064,6 +3107,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
@@ -5443,6 +5489,11 @@ public interface ChatSessionInterface {
     ): GenerateSummary
 
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    fun `imageMaxLongSize`(): kotlin.UInt?
+
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     fun `importCheckpoint`(`data`: kotlin.ByteArray)
@@ -5514,6 +5565,11 @@ public interface ChatSessionInterface {
      * Save current chat session checkpoint to a file.
      */
     fun `saveCheckpoint`(`path`: kotlin.String)
+
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
 
     /**
      * Set tool wire format explicitly.
@@ -5871,6 +5927,22 @@ open class ChatSession :
         )
 
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    @Throws(FfiException::class)
+    override fun `imageMaxLongSize`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     @Throws(FfiException::class)
@@ -6070,6 +6142,21 @@ open class ChatSession :
                 UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
                     it,
                     FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    @Throws(FfiException::class)
+    override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+                    it,
+                    FfiConverterOptionalUInt.lower(`maxLongSize`),
                     _status,
                 )
             }
@@ -10890,6 +10977,22 @@ public interface SessionInterface {
     )
 
     /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     */
+    fun `appendRawImage`(
+        `pixels`: kotlin.ByteArray,
+        `width`: kotlin.UInt,
+        `height`: kotlin.UInt,
+        `format`: PixelFormat,
+        `maxLongSize`: kotlin.UInt?,
+    )
+
+    /**
      * Append raw text to the context, running a prefill over just
      * the new tokens. `EmptyInput` error if `text` is empty.
      */
@@ -11155,6 +11258,11 @@ public interface SessionInterface {
     ): List<kotlin.Float>
 
     /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    fun `imageMaxLongSize`(): kotlin.UInt?
+
+    /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
      */
     fun `importCheckpoint`(`data`: kotlin.ByteArray)
@@ -11236,13 +11344,7 @@ public interface SessionInterface {
 
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
 
@@ -11520,6 +11622,35 @@ open class Session :
             UniffiLib.uniffi_cera_ffi_fn_method_session_append_image(
                 it,
                 FfiConverterByteArray.lower(`bytes`),
+                FfiConverterOptionalUInt.lower(`maxLongSize`),
+                _status,
+            )
+        }
+    }
+
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     */
+    @Throws(FfiException::class)
+    override fun `appendRawImage`(
+        `pixels`: kotlin.ByteArray,
+        `width`: kotlin.UInt,
+        `height`: kotlin.UInt,
+        `format`: PixelFormat,
+        `maxLongSize`: kotlin.UInt?,
+    ) = callWithHandle {
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image(
+                it,
+                FfiConverterByteArray.lower(`pixels`),
+                FfiConverterUInt.lower(`width`),
+                FfiConverterUInt.lower(`height`),
+                FfiConverterTypePixelFormat.lower(`format`),
                 FfiConverterOptionalUInt.lower(`maxLongSize`),
                 _status,
             )
@@ -12026,6 +12157,22 @@ open class Session :
         )
 
     /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    @Throws(FfiException::class)
+    override fun `imageMaxLongSize`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
      */
     @Throws(FfiException::class)
@@ -12213,13 +12360,7 @@ open class Session :
 
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     @Throws(FfiException::class)
     override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
@@ -16165,6 +16306,57 @@ public object FfiConverterTypeModelSource : FfiConverterRustBuffer<ModelSource> 
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+/**
+ * Supported pixel layouts for uncompressed raw image buffers.
+ */
+
+enum class PixelFormat {
+    /**
+     * 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+     */
+    RGB8,
+
+    /**
+     * 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+     */
+    RGBA8,
+
+    /**
+     * 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+     */
+    BGR8,
+
+    /**
+     * 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+     */
+    BGRA8,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePixelFormat : FfiConverterRustBuffer<PixelFormat> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            PixelFormat.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: PixelFormat) = 4UL
+
+    override fun write(
+        value: PixelFormat,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 

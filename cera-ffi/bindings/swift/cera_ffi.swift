@@ -1862,6 +1862,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) throws  -> GenerateSummary
     
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    func imageMaxLongSize() throws  -> UInt32?
+    
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     func importCheckpoint(data: Data) throws 
@@ -1930,6 +1935,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Save current chat session checkpoint to a file.
      */
     func saveCheckpoint(path: String) throws 
+    
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    func setImageMaxLongSize(maxLongSize: UInt32?) throws 
     
     /**
      * Set tool wire format explicitly.
@@ -2188,6 +2198,17 @@ open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: Mo
 }
     
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+open func imageMaxLongSize()throws  -> UInt32?  {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
 open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2329,6 +2350,17 @@ open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
     uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
 }
@@ -5307,6 +5339,16 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func appendImage(bytes: Data, maxLongSize: UInt32?) throws 
     
     /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     */
+    func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?) throws 
+    
+    /**
      * Append raw text to the context, running a prefill over just
      * the new tokens. `EmptyInput` error if `text` is empty.
      */
@@ -5557,6 +5599,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry]) throws  -> [Float]
     
     /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    func imageMaxLongSize() throws  -> UInt32?
+    
+    /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
      */
     func importCheckpoint(data: Data) throws 
@@ -5631,13 +5678,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     func setImageMaxLongSize(maxLongSize: UInt32?) throws 
     
@@ -5856,6 +5897,26 @@ open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWi
     uniffi_cera_ffi_fn_method_session_append_image(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(bytes),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
+    )
+}
+}
+    
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     */
+open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_append_raw_image(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(pixels),
+        FfiConverterUInt32.lower(width),
+        FfiConverterUInt32.lower(height),
+        FfiConverterTypePixelFormat_lower(format),
         FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
@@ -6260,6 +6321,17 @@ open func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAd
 }
     
     /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+open func imageMaxLongSize()throws  -> UInt32?  {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_image_max_long_size(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
      */
 open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -6397,13 +6469,7 @@ open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: M
     
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
 open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
@@ -10831,6 +10897,102 @@ public func FfiConverterTypeModelSource_lower(_ value: ModelSource) -> RustBuffe
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Supported pixel layouts for uncompressed raw image buffers.
+ */
+
+public enum PixelFormat: Equatable, Hashable {
+    
+    /**
+     * 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+     */
+    case rgb8
+    /**
+     * 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+     */
+    case rgba8
+    /**
+     * 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+     */
+    case bgr8
+    /**
+     * 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+     */
+    case bgra8
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PixelFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePixelFormat: FfiConverterRustBuffer {
+    typealias SwiftType = PixelFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PixelFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .rgb8
+        
+        case 2: return .rgba8
+        
+        case 3: return .bgr8
+        
+        case 4: return .bgra8
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PixelFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .rgb8:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .rgba8:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bgr8:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .bgra8:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePixelFormat_lift(_ buf: RustBuffer) throws -> PixelFormat {
+    return try FfiConverterTypePixelFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePixelFormat_lower(_ value: PixelFormat) -> RustBuffer {
+    return FfiConverterTypePixelFormat.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Execution state after a failed whole-message append.
  */
 
@@ -12871,6 +13033,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12931,6 +13096,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12961,7 +13129,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
@@ -13045,6 +13213,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13079,6 +13250,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {

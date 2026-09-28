@@ -819,6 +819,11 @@ void uniffi_cera_ffi_fn_method_session_append_audio(uint64_t ptr, RustBuffer sam
 void uniffi_cera_ffi_fn_method_session_append_image(uint64_t ptr, RustBuffer bytes, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_RAW_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_RAW_IMAGE
+void uniffi_cera_ffi_fn_method_session_append_raw_image(uint64_t ptr, RustBuffer pixels, uint32_t width, uint32_t height, RustBuffer format, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_APPEND_TEXT
 void uniffi_cera_ffi_fn_method_session_append_text(uint64_t ptr, RustBuffer text, RustCallStatus *_Nonnull out_status
@@ -917,6 +922,11 @@ RustBuffer uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(uint64_t 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HIDDEN_STATES_MEAN_POOLED_WITH_ADAPTERS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_HIDDEN_STATES_MEAN_POOLED_WITH_ADAPTERS
 RustBuffer uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters(uint64_t ptr, RustBuffer tokens, RustBuffer adapters, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_IMAGE_MAX_LONG_SIZE
+RustBuffer uniffi_cera_ffi_fn_method_session_image_max_long_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_IMPORT_CHECKPOINT
@@ -1144,6 +1154,11 @@ uint64_t uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(uin
 RustBuffer uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(uint64_t ptr, RustBuffer opts, RustBuffer schema_json, uint64_t sink, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_IMAGE_MAX_LONG_SIZE
+RustBuffer uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_IMPORT_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_IMPORT_CHECKPOINT
 void uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(uint64_t ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
@@ -1202,6 +1217,11 @@ void uniffi_cera_ffi_fn_method_chatsession_reset(uint64_t ptr, RustCallStatus *_
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SAVE_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SAVE_CHECKPOINT
 void uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(uint64_t ptr, RustBuffer path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_IMAGE_MAX_LONG_SIZE
+void uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(uint64_t ptr, RustBuffer max_long_size, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CHATSESSION_SET_TOOL_FORMAT
@@ -2114,6 +2134,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_append_image(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_RAW_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_RAW_IMAGE
+uint16_t uniffi_cera_ffi_checksum_method_session_append_raw_image(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TEXT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_APPEND_TEXT
 uint16_t uniffi_cera_ffi_checksum_method_session_append_text(void
@@ -2231,6 +2257,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HIDDEN_STATES_MEAN_POOLED_WITH_ADAPTERS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_HIDDEN_STATES_MEAN_POOLED_WITH_ADAPTERS
 uint16_t uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_IMAGE_MAX_LONG_SIZE
+uint16_t uniffi_cera_ffi_checksum_method_session_image_max_long_size(void
     
 );
 #endif
@@ -2462,6 +2494,12 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(voi
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_IMAGE_MAX_LONG_SIZE
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_IMPORT_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_IMPORT_CHECKPOINT
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint(void
@@ -2531,6 +2569,12 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_reset(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SAVE_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SAVE_CHECKPOINT
 uint16_t uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_IMAGE_MAX_LONG_SIZE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CHATSESSION_SET_IMAGE_MAX_LONG_SIZE
+uint16_t uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size(void
     
 );
 #endif

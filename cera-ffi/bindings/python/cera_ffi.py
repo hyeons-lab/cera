@@ -619,6 +619,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
@@ -642,6 +644,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -775,6 +779,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227:
@@ -815,6 +821,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314:
@@ -837,7 +845,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283:
+    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1711,6 +1719,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.argtype
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1779,6 +1792,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2154,6 +2173,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_append_text.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2270,6 +2299,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adap
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2565,6 +2599,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.restype = ctypes.c_uint16
@@ -2601,6 +2638,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
@@ -2799,6 +2839,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.restype = ctypes.c_uint16
@@ -2859,6 +2902,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.res
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
@@ -9340,6 +9386,77 @@ class _UniffiFfiConverterTypeModelSource(_UniffiConverterRustBuffer):
 
 
 
+class PixelFormat(enum.Enum):
+    """
+    Supported pixel layouts for uncompressed raw image buffers.
+"""
+    
+    RGB8 = 0
+    """
+    24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+"""
+    
+    RGBA8 = 1
+    """
+    32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+"""
+    
+    BGR8 = 2
+    """
+    24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+"""
+    
+    BGRA8 = 3
+    """
+    32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+"""
+    
+
+
+class _UniffiFfiConverterTypePixelFormat(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return PixelFormat.RGB8
+        if variant == 2:
+            return PixelFormat.RGBA8
+        if variant == 3:
+            return PixelFormat.BGR8
+        if variant == 4:
+            return PixelFormat.BGRA8
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == PixelFormat.RGB8:
+            return
+        if value == PixelFormat.RGBA8:
+            return
+        if value == PixelFormat.BGR8:
+            return
+        if value == PixelFormat.BGRA8:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == PixelFormat.RGB8:
+            buf.write_i32(1)
+        if value == PixelFormat.RGBA8:
+            buf.write_i32(2)
+        if value == PixelFormat.BGR8:
+            buf.write_i32(3)
+        if value == PixelFormat.BGRA8:
+            buf.write_i32(4)
+
+
+
+
+
+
+
+
 class ToolFormat(enum.Enum):
     """
     The tool-call wire format a model family uses. Mirrors
@@ -9939,6 +10056,16 @@ class SessionProtocol(typing.Protocol):
         as `Backend`, not `Cancelled`).
 """
         raise NotImplementedError
+    def append_raw_image(self, pixels: bytes,width: int,height: int,format: PixelFormat,max_long_size: typing.Optional[int]) -> None:
+        """
+        Append an uncompressed raw image buffer to the session context.
+
+        `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+        `width` and `height` specify the source image dimensions in pixels.
+        Automatically applies aspect-preserving resizing and normalization,
+        then encodes with the vision encoder and appends image tokens.
+"""
+        raise NotImplementedError
     def append_text(self, text: str) -> None:
         """
         Append raw text to the context, running a prefill over just
@@ -10189,6 +10316,11 @@ class SessionProtocol(typing.Protocol):
         stack of [`Self::hidden_states_for_tokens_with_adapters`].
 """
         raise NotImplementedError
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the session-default cap on the longest side of an appended image, if any.
+"""
+        raise NotImplementedError
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore an inference session checkpoint from serialized binary bytes.
@@ -10278,13 +10410,7 @@ class SessionProtocol(typing.Protocol):
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
         """
         Set a session-default cap on the longest side of an appended
-        image, in pixels (`None` = no cap). Unlike the per-call
-        `max_long_size` argument to [`Self::append_image`], this default
-        is honored by every image-append path the session drives —
-        including chat-template flows — so a host can configure the
-        image-encode budget once. See [`Self::append_image`] for the cap
-        semantics (shrinks the encoded target, never upscales, takes
-        precedence over the model's minimum-resolution floor).
+        image, in pixels (`None` = no cap).
 """
         raise NotImplementedError
     def set_lora_adapters(self, adapters: typing.List[LoraAdapterEntry]) -> None:
@@ -10480,6 +10606,41 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def append_raw_image(self, pixels: bytes,width: int,height: int,format: PixelFormat,max_long_size: typing.Optional[int]) -> None:
+        """
+        Append an uncompressed raw image buffer to the session context.
+
+        `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+        `width` and `height` specify the source image dimensions in pixels.
+        Automatically applies aspect-preserving resizing and normalization,
+        then encodes with the vision encoder and appends image tokens.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(pixels)
+
+        _UniffiFfiConverterUInt32.check_lower(width)
+
+        _UniffiFfiConverterUInt32.check_lower(height)
+
+        _UniffiFfiConverterTypePixelFormat.check_lower(format)
+
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterBytes.lower(pixels),
+            _UniffiFfiConverterUInt32.lower(width),
+            _UniffiFfiConverterUInt32.lower(height),
+            _UniffiFfiConverterTypePixelFormat.lower(format),
+            _UniffiFfiConverterOptionalUInt32.lower(max_long_size),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10991,6 +11152,21 @@ class Session(SessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the session-default cap on the longest side of an appended image, if any.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore an inference session checkpoint from serialized binary bytes.
@@ -11217,13 +11393,7 @@ class Session(SessionProtocol):
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
         """
         Set a session-default cap on the longest side of an appended
-        image, in pixels (`None` = no cap). Unlike the per-call
-        `max_long_size` argument to [`Self::append_image`], this default
-        is honored by every image-append path the session drives —
-        including chat-template flows — so a host can configure the
-        image-encode budget once. See [`Self::append_image`] for the cap
-        semantics (shrinks the encoded target, never upscales, takes
-        precedence over the model's minimum-resolution floor).
+        image, in pixels (`None` = no cap).
 """
         
         _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
@@ -11387,6 +11557,11 @@ class ChatSessionProtocol(typing.Protocol):
         Stream generation output tokens into the specified sink, constrained by a JSON Schema.
 """
         raise NotImplementedError
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the longest-side pixel cap configured on the session, if any.
+"""
+        raise NotImplementedError
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore a chat session checkpoint from serialized binary bytes.
@@ -11455,6 +11630,11 @@ class ChatSessionProtocol(typing.Protocol):
     def save_checkpoint(self, path: str) -> None:
         """
         Save current chat session checkpoint to a file.
+"""
+        raise NotImplementedError
+    def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
+        """
+        Set an optional resolution cap on the longest side of encoded images.
 """
         raise NotImplementedError
     def set_tool_format(self, format: ToolFormat) -> None:
@@ -11749,6 +11929,21 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the longest-side pixel cap configured on the session, if any.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore a chat session checkpoint from serialized binary bytes.
@@ -11960,6 +12155,24 @@ class ChatSession(ChatSessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
+        """
+        Set an optional resolution cap on the longest side of encoded images.
+"""
+        
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterOptionalUInt32.lower(max_long_size),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -15767,6 +15980,7 @@ __all__ = [
     "FfiVadSampleRate",
     "LoadError",
     "ModelSource",
+    "PixelFormat",
     "ToolFormat",
     "AudioInput",
     "ChatMessage",

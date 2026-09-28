@@ -1633,6 +1633,23 @@ impl Chat<CoreExecution> {
     pub fn session(&self) -> &Session {
         self.execution.session()
     }
+
+    /// Mutably borrow the underlying [`Session`].
+    pub fn session_mut(&mut self) -> &mut Session {
+        self.execution.session_mut()
+    }
+
+    /// Set an optional resolution cap on the longest side of encoded images.
+    pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
+        self.execution
+            .session
+            .set_image_max_long_size(max_long_size);
+    }
+
+    /// Read the longest-side pixel cap configured on the session, if any.
+    pub fn image_max_long_size(&self) -> Option<u32> {
+        self.execution.session.image_max_long_size()
+    }
 }
 
 /// Wrap a [`Session`] in a [`Chat`] coordinator.
@@ -1672,6 +1689,11 @@ impl CoreExecution {
     /// Borrow the underlying [`Session`].
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Mutably borrow the underlying [`Session`].
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
     }
 
     fn validate_identity(&self) -> Result<(), ValidationError> {

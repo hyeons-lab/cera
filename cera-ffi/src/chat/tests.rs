@@ -1277,3 +1277,16 @@ fn tool_def_try_from_validates_parameters_json() {
     let err = cera::tools::ToolDef::try_from(array_tool).unwrap_err();
     assert!(matches!(err, FfiError::Backend { .. }));
 }
+
+#[test]
+fn chat_session_image_max_long_size_roundtrip() {
+    let session = test_session(0);
+    let chat = ChatSession::from_session(&session).unwrap();
+    assert_eq!(chat.image_max_long_size().unwrap(), None);
+
+    chat.set_image_max_long_size(Some(512)).unwrap();
+    assert_eq!(chat.image_max_long_size().unwrap(), Some(512));
+
+    chat.set_image_max_long_size(None).unwrap();
+    assert_eq!(chat.image_max_long_size().unwrap(), None);
+}

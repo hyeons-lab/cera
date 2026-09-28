@@ -404,6 +404,41 @@ impl From<cera::BackendPreference> for BackendPreference {
     }
 }
 
+/// Supported pixel layouts for uncompressed raw image buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PixelFormat {
+    /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+    Rgb8,
+    /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+    Rgba8,
+    /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+    Bgr8,
+    /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+    Bgra8,
+}
+
+impl From<PixelFormat> for cera::PixelFormat {
+    fn from(f: PixelFormat) -> Self {
+        match f {
+            PixelFormat::Rgb8 => Self::Rgb8,
+            PixelFormat::Rgba8 => Self::Rgba8,
+            PixelFormat::Bgr8 => Self::Bgr8,
+            PixelFormat::Bgra8 => Self::Bgra8,
+        }
+    }
+}
+
+impl From<cera::PixelFormat> for PixelFormat {
+    fn from(f: cera::PixelFormat) -> Self {
+        match f {
+            cera::PixelFormat::Rgb8 => Self::Rgb8,
+            cera::PixelFormat::Rgba8 => Self::Rgba8,
+            cera::PixelFormat::Bgr8 => Self::Bgr8,
+            cera::PixelFormat::Bgra8 => Self::Bgra8,
+        }
+    }
+}
+
 /// Successful Hexagon NPU probe: the working DSP architecture plus
 /// hardware capabilities. See [`hexagon_probe`].
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2657,17 +2692,43 @@ impl Session {
         Ok(())
     }
 
+    /// Append an uncompressed raw image buffer to the session context.
+    ///
+    /// `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+    /// `width` and `height` specify the source image dimensions in pixels.
+    /// Automatically applies aspect-preserving resizing and normalization,
+    /// then encodes with the vision encoder and appends image tokens.
+    pub fn append_raw_image(
+        &self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        max_long_size: Option<u32>,
+    ) -> Result<(), FfiError> {
+        let mut inner = self.lock_inner()?;
+        match max_long_size {
+            None => inner.append_raw_image(&pixels, width, height, format.into()),
+            Some(0) => {
+                inner.append_raw_image_with_opts(&pixels, width, height, format.into(), None)
+            }
+            Some(n) => {
+                inner.append_raw_image_with_opts(&pixels, width, height, format.into(), Some(n))
+            }
+        }?;
+        Ok(())
+    }
+
     /// Set a session-default cap on the longest side of an appended
-    /// image, in pixels (`None` = no cap). Unlike the per-call
-    /// `max_long_size` argument to [`Self::append_image`], this default
-    /// is honored by every image-append path the session drives —
-    /// including chat-template flows — so a host can configure the
-    /// image-encode budget once. See [`Self::append_image`] for the cap
-    /// semantics (shrinks the encoded target, never upscales, takes
-    /// precedence over the model's minimum-resolution floor).
+    /// image, in pixels (`None` = no cap).
     pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
         self.lock_inner()?.set_image_max_long_size(max_long_size);
         Ok(())
+    }
+
+    /// Read the session-default cap on the longest side of an appended image, if any.
+    pub fn image_max_long_size(&self) -> Result<Option<u32>, FfiError> {
+        Ok(self.lock_inner()?.image_max_long_size())
     }
 
     /// Returns default `GenerateOpts` for this session, pre-populated with
@@ -5441,5 +5502,20 @@ mod tests {
 
         let roundtrip: FfiWhisperTranscribeOpts = core_opts.into();
         assert_eq!(roundtrip, custom);
+    }
+
+    #[test]
+    fn pixel_format_ffi_conversions() {
+        for (ffi_fmt, core_fmt) in [
+            (PixelFormat::Rgb8, cera::PixelFormat::Rgb8),
+            (PixelFormat::Rgba8, cera::PixelFormat::Rgba8),
+            (PixelFormat::Bgr8, cera::PixelFormat::Bgr8),
+            (PixelFormat::Bgra8, cera::PixelFormat::Bgra8),
+        ] {
+            let to_core: cera::PixelFormat = ffi_fmt.into();
+            assert_eq!(to_core, core_fmt);
+            let back: PixelFormat = core_fmt.into();
+            assert_eq!(back, ffi_fmt);
+        }
     }
 }

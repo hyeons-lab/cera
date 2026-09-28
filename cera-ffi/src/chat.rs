@@ -776,6 +776,19 @@ impl ChatSession {
         self.with_chat(|chat| Ok(chat.tool_format().into()))
     }
 
+    /// Set an optional resolution cap on the longest side of encoded images.
+    pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
+        self.with_chat(|chat| {
+            chat.set_image_max_long_size(max_long_size);
+            Ok(())
+        })
+    }
+
+    /// Read the longest-side pixel cap configured on the session, if any.
+    pub fn image_max_long_size(&self) -> Result<Option<u32>, FfiError> {
+        self.with_chat(|chat| Ok(chat.image_max_long_size()))
+    }
+
     /// Ingest a tool execution response back into the conversation.
     pub fn ingest_tool_response(
         &self,
