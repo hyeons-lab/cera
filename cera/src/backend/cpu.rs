@@ -2037,6 +2037,172 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
 ///
 /// x86-only / `allow(dead_code)` under `blas` for the same reasons as
 /// [`repack_q4_0_8x8`].
+/// Repack `m x k` Q4_K weights into 8-row-interleaved layout for aarch64 dotprod prefill.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q4_k_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(256),
+        "repack_q4_k_8x8: k must be a multiple of 256"
+    );
+    let sb = k / 256;
+    let nb32 = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ4KM>();
+    assert_eq!(
+        src.len(),
+        m * sb * bsz,
+        "repack_q4_k_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * sb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb32 * 256];
+    let mut dsc = vec![0.0f32; sr_count * nb32 * 8];
+    let mut dmn = vec![0.0f32; sr_count * nb32 * 8];
+    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, d);
+    const DMIN_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, dmin);
+    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, scales);
+    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, qs);
+
+    let nibble = |row: usize, block: usize, e: usize| -> u8 {
+        let bi = block / 8;
+        let s = block % 8;
+        let qs = (row * sb + bi) * bsz + QS_OFF;
+        let byte = src[qs + (s / 2) * 32 + e];
+        if s.is_multiple_of(2) {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        }
+    };
+
+    for sr in 0..sr_count {
+        for bi in 0..sb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * sb + bi) * bsz;
+                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([
+                    src[off + DMIN_OFF],
+                    src[off + DMIN_OFF + 1],
+                ]));
+                let scales_bytes: &[u8; 12] =
+                    src[off + SC_OFF..off + SC_OFF + 12].try_into().unwrap();
+                let (sc, mn) = crate::quant::decode_q4km_scales(scales_bytes);
+                for s in 0..8 {
+                    let block = bi * 8 + s;
+                    dsc[(sr * nb32 + block) * 8 + r] = d * sc[s] as f32;
+                    dmn[(sr * nb32 + block) * 8 + r] = dmin * mn[s] as f32;
+                }
+            }
+            for s in 0..8usize {
+                let block = bi * 8 + s;
+                let base = (sr * nb32 + block) * 256;
+                for g in 0..8usize {
+                    for chunk in 0..2usize {
+                        for r in 0..4usize {
+                            for c in 0..4usize {
+                                let e = 4 * g + c;
+                                let val = nibble(8 * sr + chunk * 4 + r, block, e);
+                                packed[base + g * 32 + chunk * 16 + r * 4 + c] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (packed, dsc, dmn)
+}
+
+/// Repack `m x k` Q4_K weights into smmla-ready row-pair x 8-wide layout for aarch64.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q4_k_smmla_8x8(
+    src: &[u8],
+    m: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q4_k_smmla_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(256),
+        "repack_q4_k_smmla_8x8: k must be a multiple of 256"
+    );
+    let sb = k / 256;
+    let nb32 = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ4KM>();
+    assert_eq!(
+        src.len(),
+        m * sb * bsz,
+        "repack_q4_k_smmla_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * sb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb32 * 256];
+    let mut dsc = vec![0.0f32; sr_count * nb32 * 8];
+    let mut dmn = vec![0.0f32; sr_count * nb32 * 8];
+    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, d);
+    const DMIN_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, dmin);
+    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, scales);
+    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, qs);
+
+    let nibble = |row: usize, block: usize, e: usize| -> u8 {
+        let bi = block / 8;
+        let s = block % 8;
+        let qs = (row * sb + bi) * bsz + QS_OFF;
+        let byte = src[qs + (s / 2) * 32 + e];
+        if s.is_multiple_of(2) {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        }
+    };
+
+    for sr in 0..sr_count {
+        for bi in 0..sb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * sb + bi) * bsz;
+                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([
+                    src[off + DMIN_OFF],
+                    src[off + DMIN_OFF + 1],
+                ]));
+                let scales_bytes: &[u8; 12] =
+                    src[off + SC_OFF..off + SC_OFF + 12].try_into().unwrap();
+                let (sc, mn) = crate::quant::decode_q4km_scales(scales_bytes);
+                for s in 0..8 {
+                    let block = bi * 8 + s;
+                    dsc[(sr * nb32 + block) * 8 + r] = d * sc[s] as f32;
+                    dmn[(sr * nb32 + block) * 8 + r] = dmin * mn[s] as f32;
+                }
+            }
+            for s in 0..8usize {
+                let block = bi * 8 + s;
+                let base = (sr * nb32 + block) * 256;
+                for c in 0..4usize {
+                    for p in 0..4usize {
+                        for rr in 0..2usize {
+                            for e in 0..8usize {
+                                let val = nibble(8 * sr + 2 * p + rr, block, 8 * c + e);
+                                packed[base + c * 64 + p * 16 + rr * 8 + e] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (packed, dsc, dmn)
+}
+
+/// Repack `m x k` Q4_K weights into 8-row-interleaved layout for x86_64 prefill.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(has_blas, allow(dead_code))]
 pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
@@ -2120,15 +2286,20 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
 /// Whether a Q4_K_M weight of shape `m x k` should be repacked for prefill on
 /// this host. Like [`q4_0_repack_supported`], but K-quants need whole
 /// super-blocks (`k % 256 == 0`).
-#[cfg(all(target_arch = "x86_64", not(has_blas)))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
-    m.is_multiple_of(8) && k.is_multiple_of(256) && int8_gemm_available()
+    #[cfg(target_arch = "aarch64")]
+    return m.is_multiple_of(8)
+        && k.is_multiple_of(256)
+        && crate::backend::simd::neon::k_quant_gemm_available();
+    #[cfg(target_arch = "x86_64")]
+    return m.is_multiple_of(8) && k.is_multiple_of(256) && int8_gemm_available();
 }
 
-/// Run the repacked-Q4_K prefill GEMM on whichever x86 int8 tier this host has.
+/// Run the repacked-Q4_K prefill GEMM on whichever int8 tier this host has.
 /// Returns `true` when a kernel ran; see [`gemm_preq_repacked_q4_0_dispatch`] for
 /// why a `false` here is still an invariant break the caller must handle.
-#[cfg(all(target_arch = "x86_64", not(has_blas)))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_preq_repacked_q4_k_dispatch(
     packed: &[u8],
@@ -2142,41 +2313,337 @@ pub(crate) fn gemm_preq_repacked_q4_k_dispatch(
     k: usize,
 ) -> bool {
     let nb32 = k / 32;
-    assert!(
-        k.is_multiple_of(256) && m.is_multiple_of(8),
-        "gemm_preq_repacked_q4_k_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
-    );
-    assert!(
-        packed.len() >= (m / 8) * nb32 * 128
-            && dsc.len() >= (m / 8) * nb32 * 8
-            && dmn.len() >= (m / 8) * nb32 * 8,
-        "gemm_preq_repacked_q4_k_dispatch: repacked weights too small for {m}x{k}"
-    );
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_k_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 256;
+        assert!(
+            packed.len() >= (m / 8) * nb32 * expected_bytes_per_block
+                && dsc.len() >= (m / 8) * nb32 * 8
+                && dmn.len() >= (m / 8) * nb32 * 8,
+            "gemm_preq_repacked_q4_k_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_k_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        let expected_bytes_per_block = 128;
+        assert!(
+            packed.len() >= (m / 8) * nb32 * expected_bytes_per_block
+                && dsc.len() >= (m / 8) * nb32 * 8
+                && dmn.len() >= (m / 8) * nb32 * 8,
+            "gemm_preq_repacked_q4_k_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
     assert!(
         b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
         "gemm_preq_repacked_q4_k_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
 
-    #[cfg(feature = "avx512")]
-    if vnni_int8_available() {
-        // SAFETY: `vnni_int8_available()` proved the VNNI tier; the kernel
-        // re-asserts its own length invariants in debug.
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
         unsafe {
-            crate::backend::simd::avx512_vnni::gemm_q4_k_8x8_q8_0(
+            crate::backend::simd::neon::gemm_q4_k_8x8_q8_0(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
             );
         }
         return true;
     }
-    if avx2_int8_available() {
-        // SAFETY: `avx2_int8_available()` proved avx2+fma; same as above.
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(feature = "avx512")]
+        if vnni_int8_available() {
+            // SAFETY: `vnni_int8_available()` proved the VNNI tier; the kernel
+            // re-asserts its own length invariants in debug.
+            unsafe {
+                crate::backend::simd::avx512_vnni::gemm_q4_k_8x8_q8_0(
+                    packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+                );
+            }
+            return true;
+        }
+        if avx2_int8_available() {
+            // SAFETY: `avx2_int8_available()` proved avx2+fma; same as above.
+            unsafe {
+                crate::backend::simd::avx2_int8::gemm_q4_k_8x8_q8_0(
+                    packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+                );
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the smmla-repacked-Q4_K prefill GEMM (column-major `out[m, n]`). Consumes the
+/// [`repack_q4_k_smmla_8x8`] layout and needs the i8mm tier; returns `false` anywhere else.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_k_smmla_dispatch(
+    packed: &[u8],
+    dsc: &[f32],
+    dmn: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, dsc, dmn);
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_k_smmla_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb32 * 256
+                && dsc.len() >= (m / 8) * nb32 * 8
+                && dmn.len() >= (m / 8) * nb32 * 8,
+            "gemm_preq_repacked_q4_k_smmla_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q4_k_smmla_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
         unsafe {
-            crate::backend::simd::avx2_int8::gemm_q4_k_8x8_q8_0(
+            crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
             );
         }
         return true;
     }
+
+    false
+}
+
+/// Run the repacked-Q4_K prefill GEMM writing directly in row-major `out[n, m]` layout.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_k_rowmajor_dispatch(
+    packed: &[u8],
+    dsc: &[f32],
+    dmn: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, dsc, dmn);
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_k_rowmajor_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb32 * 256
+                && dsc.len() >= (m / 8) * nb32 * 8
+                && dmn.len() >= (m / 8) * nb32 * 8,
+            "gemm_preq_repacked_q4_k_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q4_k_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
+        unsafe {
+            crate::backend::simd::neon::gemm_q4_k_8x8_q8_0_rowmajor(
+                packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Run the smmla-repacked-Q4_K prefill GEMM writing directly in row-major `out[n, m]` layout.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
+    packed: &[u8],
+    dsc: &[f32],
+    dmn: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, dsc, dmn);
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb32 * 256
+                && dsc.len() >= (m / 8) * nb32 * 8
+                && dmn.len() >= (m / 8) * nb32 * 8,
+            "gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        unsafe {
+            crate::backend::simd::neon::gemm_q4_k_smmla_8x4_q8_0_rowmajor(
+                packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Dispatch a fused Gate + Up + SiLU GEMM for repacked Q4_K.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_preq_repacked_q4_k_gate_up_silu_dispatch(
+    gate_packed: &[u8],
+    gate_dsc: &[f32],
+    gate_dmn: &[f32],
+    up_packed: &[u8],
+    up_dsc: &[f32],
+    up_dmn: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (gate_packed, gate_dsc, gate_dmn, up_packed, up_dsc, up_dmn);
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            m.is_multiple_of(8) && k.is_multiple_of(256),
+            "gemm_preq_repacked_q4_k_gate_up_silu_dispatch: m={m} must be %8 and k={k} must be %256"
+        );
+        let sr_count = m / 8;
+        assert_eq!(gate_packed.len(), sr_count * nb32 * 256);
+        assert_eq!(up_packed.len(), sr_count * nb32 * 256);
+        assert_eq!(gate_dsc.len(), sr_count * nb32 * 8);
+        assert_eq!(up_dsc.len(), sr_count * nb32 * 8);
+        assert_eq!(gate_dmn.len(), sr_count * nb32 * 8);
+        assert_eq!(up_dmn.len(), sr_count * nb32 * 8);
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q4_k_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
+        unsafe {
+            crate::backend::simd::neon::gemm_q4_k_gate_up_silu_rowmajor(
+                gate_packed,
+                gate_dsc,
+                gate_dmn,
+                up_packed,
+                up_dsc,
+                up_dmn,
+                b_scales,
+                b_quants,
+                out,
+                n,
+                m,
+                k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Dispatch a fused Gate + Up + SiLU GEMM for smmla repacked Q4_K.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch(
+    gate_packed: &[u8],
+    gate_dsc: &[f32],
+    gate_dmn: &[f32],
+    up_packed: &[u8],
+    up_dsc: &[f32],
+    up_dmn: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (gate_packed, gate_dsc, gate_dmn, up_packed, up_dsc, up_dmn);
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            m.is_multiple_of(8) && k.is_multiple_of(256),
+            "gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch: m={m} must be %8 and k={k} must be %256"
+        );
+        let sr_count = m / 8;
+        assert_eq!(gate_packed.len(), sr_count * nb32 * 256);
+        assert_eq!(up_packed.len(), sr_count * nb32 * 256);
+        assert_eq!(gate_dsc.len(), sr_count * nb32 * 8);
+        assert_eq!(up_dsc.len(), sr_count * nb32 * 8);
+        assert_eq!(gate_dmn.len(), sr_count * nb32 * 8);
+        assert_eq!(up_dmn.len(), sr_count * nb32 * 8);
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        unsafe {
+            crate::backend::simd::neon::gemm_q4_k_smmla_gate_up_silu_rowmajor(
+                gate_packed,
+                gate_dsc,
+                gate_dmn,
+                up_packed,
+                up_dsc,
+                up_dmn,
+                b_scales,
+                b_quants,
+                out,
+                n,
+                m,
+                k,
+            );
+        }
+        return true;
+    }
+
     false
 }
 
@@ -9027,17 +9494,22 @@ mod tests {
         }
     }
 
-    /// The repacked-Q4_K dispatch must agree with the standard-layout dispatch —
+    /// The repacked-Q4_K dispatch must agree with the standard-layout dispatch:
     /// the Q4_K twin of `repacked_q4_0_dispatch_matches_standard_dispatch`, and
-    /// the only test that drives `repack_q4_k_8x8` →
+    /// the only test that drives `repack_q4_k_8x8` ->
     /// `gemm_preq_repacked_q4_k_dispatch` end to end (tier selection + length
     /// asserts + baked-scale hand-off). `k = 256` is one super-block; `n = 13`
     /// hits the column tile plus a remainder; `m = 16` is two super-rows.
-    #[cfg(all(target_arch = "x86_64", not(has_blas)))]
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
     #[test]
     fn repacked_q4_k_dispatch_matches_standard_dispatch() {
         use crate::tensor::DType;
+        #[cfg(target_arch = "x86_64")]
         if !int8_gemm_available() {
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !crate::backend::simd::neon::k_quant_gemm_available() {
             return;
         }
         let (m, n, k) = (16usize, 13usize, 256usize);
@@ -9099,6 +9571,77 @@ mod tests {
             assert!(
                 (g - w).abs() <= 1e-4 * w.abs().max(1.0),
                 "repacked Q4_K vs standard dispatch [{},{}]: {g} vs {w}",
+                i / n,
+                i % n,
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    #[test]
+    fn repacked_q4_k_smmla_dispatch_matches_standard_dispatch() {
+        use crate::tensor::DType;
+        if crate::backend::cpu_features::cpu_features().tier
+            != crate::backend::cpu_features::CpuTier::NeonI8mm
+        {
+            return;
+        }
+        let (m, n, k) = (16usize, 13usize, 256usize);
+        let sb = k / 256;
+        let nb = k / 32;
+
+        let mut st = 0x9e37_79b9u64;
+        let mut lcg = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (st >> 33) as u32
+        };
+        let bsz = size_of::<crate::quant::BlockQ4KM>();
+        let mut data = vec![0u8; m * sb * bsz];
+        for chunk in data.chunks_mut(bsz) {
+            let d = half::f16::from_f32(0.01 + 0.04 * (lcg() as f32 / u32::MAX as f32));
+            let dmin = half::f16::from_f32(0.02 + 0.03 * (lcg() as f32 / u32::MAX as f32));
+            chunk[0..2].copy_from_slice(&d.to_bits().to_le_bytes());
+            chunk[2..4].copy_from_slice(&dmin.to_bits().to_le_bytes());
+            for b in chunk[4..].iter_mut() {
+                *b = lcg() as u8;
+            }
+        }
+
+        let mut b_scales = vec![0.0f32; n * nb];
+        let mut b_quants = vec![0i8; n * k];
+        for j in 0..n {
+            let col: Vec<f32> = (0..k)
+                .map(|_| lcg() as f32 / u32::MAX as f32 * 2.0 - 1.0)
+                .collect();
+            quantize_f32_to_q8_0_into(
+                &col,
+                &mut b_scales[j * nb..(j + 1) * nb],
+                &mut b_quants[j * k..(j + 1) * k],
+            );
+        }
+
+        let mut want = vec![0.0f32; m * n];
+        assert!(gemm_preq_dispatch(
+            DType::Q4KM,
+            &data,
+            &b_scales,
+            &b_quants,
+            &mut want,
+            m,
+            n,
+            k
+        ));
+
+        let (packed, dsc, dmn) = repack_q4_k_smmla_8x8(&data, m, k);
+        let mut got = vec![0.0f32; m * n];
+        assert!(gemm_preq_repacked_q4_k_smmla_dispatch(
+            &packed, &dsc, &dmn, &b_scales, &b_quants, &mut got, m, n, k
+        ));
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "repacked smmla Q4_K vs standard dispatch [{},{}]: {g} vs {w}",
                 i / n,
                 i % n,
             );

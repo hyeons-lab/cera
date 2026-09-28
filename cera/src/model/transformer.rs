@@ -99,6 +99,15 @@ pub enum Repacked {
         dsc: Vec<f32>,
         dmn: Vec<f32>,
     },
+    /// Smmla (i8mm) twin of [`Repacked::Q4K`]: same shapes
+    /// (`(m/8)*nb32*256` packed bytes, `(m/8)*nb32*8` f32 scales) but the
+    /// [`crate::backend::cpu::repack_q4_k_smmla_8x8`] layout. Built instead of
+    /// `Q4K` when the process tier is `NeonI8mm` on aarch64.
+    Q4KSmmla {
+        packed: Vec<u8>,
+        dsc: Vec<f32>,
+        dmn: Vec<f32>,
+    },
 }
 
 /// A weight's `m x k` body repacked into the layout the prefill GEMM
@@ -122,6 +131,7 @@ impl std::fmt::Debug for RepackedWeight {
             Repacked::Q40 { packed, .. } => ("Q4_0", packed.len()),
             Repacked::Q40Smmla { packed, .. } => ("Q4_0+smmla", packed.len()),
             Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
+            Repacked::Q4KSmmla { packed, .. } => ("Q4_K+smmla", packed.len()),
         };
         f.debug_struct("RepackedWeight")
             .field("kind", &tag)
@@ -282,13 +292,9 @@ impl WeightRef {
             // fallback can warn instead of running slow-silent. Q4_0 and
             // Q4_K are disjoint dtypes, so one predicate covers both arms
             // (a weight that qualified for one can never take the other).
-            let mut qualifies =
-                self.dtype == DType::Q4_0 && cpu::q4_0_repack_supported(self.m, self.k);
-            #[cfg(target_arch = "x86_64")]
-            {
-                qualifies |=
-                    self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k);
-            }
+            let qualifies = (self.dtype == DType::Q4_0
+                && cpu::q4_0_repack_supported(self.m, self.k))
+                || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k));
             if !do_repack {
                 self.repacked = None;
                 self.repack_loader_skipped = qualifies;
@@ -313,9 +319,23 @@ impl WeightRef {
                     kind = Some(Repacked::Q40 { packed, scales });
                 }
             }
-            #[cfg(target_arch = "x86_64")]
-            {
-                if qualifies && self.dtype == DType::Q4KM {
+            if qualifies && self.dtype == DType::Q4KM {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if crate::backend::cpu_features::cpu_features().tier
+                        == crate::backend::cpu_features::CpuTier::NeonI8mm
+                    {
+                        let (packed, dsc, dmn) =
+                            cpu::repack_q4_k_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                        kind = Some(Repacked::Q4KSmmla { packed, dsc, dmn });
+                    } else {
+                        let (packed, dsc, dmn) =
+                            cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
+                        kind = Some(Repacked::Q4K { packed, dsc, dmn });
+                    }
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
                     let (packed, dsc, dmn) =
                         cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
@@ -1064,7 +1084,14 @@ pub(crate) fn try_repacked_gemm_rowmajor(
                     packed, scales, b_scales, b_quants, out, n, m, k,
                 )
             }
-            _ => false,
+            Repacked::Q4K { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_rowmajor_dispatch(
+                packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
+            ),
+            Repacked::Q4KSmmla { packed, dsc, dmn } => {
+                cpu::gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
+                    packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
+                )
+            }
         };
         if ran {
             return true;
@@ -1155,6 +1182,40 @@ pub(crate) fn try_repacked_gate_up_silu_rowmajor(
                 gp, gs, up, us, b_scales, b_quants, out, m, n, k,
             );
         }
+        if let (
+            Repacked::Q4K {
+                packed: gp,
+                dsc: gdsc,
+                dmn: gdmn,
+            },
+            Repacked::Q4K {
+                packed: up,
+                dsc: udsc,
+                dmn: udmn,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
+            return cpu::gemm_preq_repacked_q4_k_gate_up_silu_dispatch(
+                gp, gdsc, gdmn, up, udsc, udmn, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        if let (
+            Repacked::Q4KSmmla {
+                packed: gp,
+                dsc: gdsc,
+                dmn: gdmn,
+            },
+            Repacked::Q4KSmmla {
+                packed: up,
+                dsc: udsc,
+                dmn: udmn,
+            },
+        ) = (&g_rp.kind, &u_rp.kind)
+        {
+            return cpu::gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch(
+                gp, gdsc, gdmn, up, udsc, udmn, b_scales, b_quants, out, m, n, k,
+            );
+        }
     }
     false
 }
@@ -1226,12 +1287,12 @@ pub(crate) fn gemm_preq(
             Repacked::Q40Smmla { packed, scales } => cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
             ),
-            #[cfg(target_arch = "x86_64")]
             Repacked::Q4K { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_dispatch(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
             ),
-            #[allow(unreachable_patterns)]
-            _ => false,
+            Repacked::Q4KSmmla { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_smmla_dispatch(
+                packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+            ),
         };
         if ran {
             return true;
@@ -3164,14 +3225,14 @@ mod repack_flag_tests {
         assert!(!other.repack_loader_skipped);
     }
 
-    /// The x86-only Q4_K arm of `with_repack_if` flags qualifying weights
-    /// exactly like the Q4_0 arm (same `loader_skipped` contract, same
-    /// predicate-tracking shape). Zero payload: the `false` branch reads no
-    /// weight bytes, and the repack itself is multiplication-only over the
-    /// blocks (zero-safe) when the predicate holds.
-    #[cfg(target_arch = "x86_64")]
+    /// The Q4_K arm of `with_repack_if` flags qualifying weights exactly
+    /// like the Q4_0 arm (same `loader_skipped` contract, same predicate-
+    /// tracking shape). Zero payload: the `false` branch reads no weight bytes,
+    /// and the repack itself is multiplication-only over the blocks (zero-safe)
+    /// when the predicate holds.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn repack_skip_flag_marks_q4k_on_x86() {
+    fn repack_skip_flag_marks_q4k() {
         let (m, k) = (8usize, 256usize);
         let (gguf, start, size) = synth_gguf(m * (k / 256) * 144, |_| {});
         let can_repack = cpu::q4_k_repack_supported(m, k);
